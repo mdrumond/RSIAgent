@@ -22,6 +22,18 @@ from benchmarks.a5kernels.bz import (
 from benchmarks.a5kernels.protocol import ExecutionReceipt
 
 
+def _write_fake_catlass(root: Path, *, compatible: bool) -> None:
+    package = root / "catlass"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    exports = (
+        "AddressSpace = allocate = compile = flag = kernel = vector = object()\n"
+        if compatible
+        else "from_dlpack = object()\n"
+    )
+    (package / "tla.py").write_text(exports)
+
+
 class FakeBackend:
     def __init__(self, *, corrupt=False, exit_code=0, claimed_score="0"):
         self.corrupt = corrupt
@@ -183,6 +195,7 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
     )
     payload = json.dumps({"input_a": [1, 2.5], "input_b": [3, -0.5]})
     (tmp_path / "input.json").write_text(payload)
+    _write_fake_catlass(tmp_path, compatible=True)
 
     result = subprocess.run(
         [sys.executable, "host_driver.py", "kernel.py", "input.json"],
@@ -190,10 +203,39 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
         text=True,
         capture_output=True,
         check=False,
+        env={"PYTHONPATH": str(tmp_path)},
     )
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{OUTPUT_MARKER}[4.0,2.0]\n"
+
+
+def test_host_driver_preflight_rejects_legacy_catlass_before_kernel_import(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    (tmp_path / "kernel.py").write_text(
+        "from pathlib import Path\nPath('kernel-imported').touch()\n"
+    )
+    _write_fake_catlass(tmp_path, compatible=False)
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={"PYTHONPATH": str(tmp_path)},
+    )
+
+    assert result.returncode != 0
+    assert "incompatible Catlass DSL runtime" in result.stderr
+    assert "kernel" in result.stderr
+    assert str(tmp_path / "catlass" / "tla.py") in result.stderr
+    assert not (tmp_path / "kernel-imported").exists()
 
 
 def test_catlass_capacity_is_rejected_before_remote_execution():

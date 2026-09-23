@@ -95,6 +95,28 @@ from pathlib import Path
 import sys
 
 OUTPUT_MARKER = "A5KERNEL_OUTPUT="
+REQUIRED_TLA_API = (
+    "AddressSpace",
+    "allocate",
+    "compile",
+    "flag",
+    "kernel",
+    "vector",
+)
+
+
+def _preflight_runtime() -> None:
+    import catlass.tla as tla
+
+    missing = [name for name in REQUIRED_TLA_API if not hasattr(tla, name)]
+    if missing:
+        location = getattr(tla, "__file__", "<unknown>")
+        raise RuntimeError(
+            "incompatible Catlass DSL runtime: "
+            f"{location} is missing imperative catlass.tla APIs "
+            f"{','.join(missing)}; install a Catlass revision that provides "
+            "the @tla.kernel frontend and tla.compile before A5 dispatch"
+        )
 
 
 def _load_kernel(path: str):
@@ -126,6 +148,7 @@ def main() -> int:
     input_b = _numbers(payload["input_b"], "input_b")
     if len(input_a) != len(input_b):
         raise ValueError("input vectors must have equal length")
+    _preflight_runtime()
     output = _numbers(_load_kernel(sys.argv[1]).run(input_a, input_b), "output")
     print(OUTPUT_MARKER + json.dumps(output, separators=(",", ":"), allow_nan=False))
     return 0
