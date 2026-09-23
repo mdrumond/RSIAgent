@@ -60,11 +60,13 @@ def test_index_manifest_is_stable_and_collection_is_immutable(tmp_path):
             language="catlass",
             manifest_path=manifest_path,
         )
+        manifest_path.unlink()
         repeated = database.index(
             source_root,
             sources,
             collection="catlass-v1",
             language="catlass",
+            manifest_path=manifest_path,
         )
         assert repeated == manifest
         assert manifest.sources[0].path == "matrix.py"

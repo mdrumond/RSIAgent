@@ -240,6 +240,8 @@ class KnowledgeDB:
                 raise ValueError(
                     f"collection {collection!r} is immutable; use a new collection name"
                 )
+            if manifest_path:
+                manifest_path.write_text(current.to_json(), encoding="utf-8")
             return current
 
         chunks = [
