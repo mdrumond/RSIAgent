@@ -35,6 +35,12 @@ class SourceFingerprint:
 
 
 @dataclass(frozen=True)
+class _SourceSnapshot:
+    fingerprint: SourceFingerprint
+    data: bytes
+
+
+@dataclass(frozen=True)
 class CollectionManifest:
     collection: str
     language: str
@@ -95,10 +101,38 @@ def build_manifest(
     embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     embedding_revision: str = DEFAULT_EMBEDDING_REVISION,
 ) -> CollectionManifest:
-    sources = tuple(
-        SourceFingerprint(_relative_path(root, path), _sha256(path.read_bytes()), path.stat().st_size)
-        for path in sorted(paths, key=lambda item: _relative_path(root, item))
+    manifest, _snapshots = _snapshot_sources(
+        root,
+        paths,
+        collection=collection,
+        language=language,
+        embedding_model=embedding_model,
+        embedding_revision=embedding_revision,
     )
+    return manifest
+
+
+def _snapshot_sources(
+    root: Path,
+    paths: Iterable[Path],
+    *,
+    collection: str,
+    language: str,
+    embedding_model: str,
+    embedding_revision: str,
+) -> tuple[CollectionManifest, tuple[_SourceSnapshot, ...]]:
+    snapshots = []
+    for path in sorted(paths, key=lambda item: _relative_path(root, item)):
+        relative_path = _relative_path(root, path)
+        data = path.read_bytes()
+        snapshots.append(
+            _SourceSnapshot(
+                SourceFingerprint(relative_path, _sha256(data), len(data)),
+                data,
+            )
+        )
+    immutable_snapshots = tuple(snapshots)
+    sources = tuple(snapshot.fingerprint for snapshot in immutable_snapshots)
     identity = {
         "collection": collection,
         "language": language,
@@ -109,13 +143,16 @@ def build_manifest(
         "sources": [asdict(source) for source in sources],
     }
     fingerprint = _sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
-    return CollectionManifest(
-        collection=collection,
-        language=language,
-        embedding_model=embedding_model,
-        embedding_revision=embedding_revision,
-        sources=sources,
-        fingerprint=fingerprint,
+    return (
+        CollectionManifest(
+            collection=collection,
+            language=language,
+            embedding_model=embedding_model,
+            embedding_revision=embedding_revision,
+            sources=sources,
+            fingerprint=fingerprint,
+        ),
+        immutable_snapshots,
     )
 
 
@@ -258,7 +295,7 @@ class KnowledgeDB:
             raise ValueError("a collection must contain at least one source")
         if any(not path.is_file() or not path.is_relative_to(root) for path in source_paths):
             raise ValueError("all sources must be files beneath the collection root")
-        manifest = build_manifest(
+        manifest, snapshots = _snapshot_sources(
             root,
             source_paths,
             collection=collection,
@@ -281,8 +318,8 @@ class KnowledgeDB:
 
         chunks = [
             chunk
-            for source in manifest.sources
-            for chunk in chunk_source(source.path, root.joinpath(source.path).read_bytes())
+            for snapshot in snapshots
+            for chunk in chunk_source(snapshot.fingerprint.path, snapshot.data)
         ]
         vectors = self.embeddings.embed([chunk.text for chunk in chunks])
         if len(vectors) != len(chunks):

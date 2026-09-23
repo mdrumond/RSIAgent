@@ -86,6 +86,44 @@ def test_index_manifest_is_stable_and_collection_is_immutable(tmp_path):
             )
 
 
+def test_index_uses_one_immutable_read_for_manifest_and_chunks(tmp_path, monkeypatch):
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    source = source_root / "kernel.py"
+    initial = b"vector kernel from snapshot\n"
+    later = b"matrix kernel from a later read\n"
+    source.write_bytes(initial)
+    original_read_bytes = Path.read_bytes
+    source_reads = 0
+
+    def changing_read_bytes(path):
+        nonlocal source_reads
+        if path == source:
+            source_reads += 1
+            return initial if source_reads == 1 else later
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", changing_read_bytes)
+
+    with KnowledgeDB(tmp_path / "kdb.sqlite", FakeEmbeddings()) as database:
+        manifest = database.index(
+            source_root,
+            [source],
+            collection="catlass-snapshot",
+            language="catlass",
+        )
+        indexed_text = database.connection.execute(
+            "SELECT text FROM chunks WHERE collection = ?",
+            ("catlass-snapshot",),
+        ).fetchone()["text"]
+
+    assert source_reads == 1
+    assert manifest.sources[0].sha256 == hashlib.sha256(initial).hexdigest()
+    assert manifest.sources[0].size == len(initial)
+    assert indexed_text == initial.decode()
+    assert indexed_text != later.decode()
+
+
 def test_hybrid_query_is_language_isolated_and_repeatable(tmp_path):
     catlass = tmp_path / "catlass"
     ascendc = tmp_path / "ascendc"
