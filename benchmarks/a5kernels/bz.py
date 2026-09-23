@@ -79,11 +79,14 @@ class ProfileCommandExecutor:
         if uploaded.returncode != 0:
             return CommandResult(uploaded.returncode, uploaded.stdout, uploaded.stderr)
 
-        completed = self._call(invocation.argv, stdin=invocation.stdin)
+        completed = self._dispatch(invocation)
         handle = f"bz-a5:{_session_name(invocation.argv)}"
         return CommandResult(
             completed.returncode, completed.stdout, completed.stderr, handle
         )
+
+    def _dispatch(self, invocation: CommandInvocation):
+        return self._call(invocation.argv, stdin=invocation.stdin)
 
     def inspect(self, argv: tuple[str, ...]) -> CommandResult:
         completed = self._call(argv)
@@ -103,6 +106,59 @@ class ProfileCommandExecutor:
             check=False,
         )
 
+
+class CatlassValidationExecutor(ProfileCommandExecutor):
+    """Run staged Catlass fixtures against one explicit retained revision."""
+
+    def __init__(
+        self,
+        *,
+        upload_wrapper: str,
+        validation_wrapper: str,
+        catlass_source: str,
+        catlass_revision: str,
+        process_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        super().__init__(
+            upload_wrapper=upload_wrapper, process_runner=process_runner
+        )
+        if Path(validation_wrapper).name != "catlass-validation.sh":
+            raise ValueError(
+                "validation_wrapper must identify the checked-in catlass-validation.sh"
+            )
+        if not PurePosixPath(catlass_source).is_absolute():
+            raise ValueError("catlass_source must be an absolute retained BZ path")
+        if not _is_revision(catlass_revision):
+            raise ValueError("catlass_revision must be a lowercase 40-character SHA")
+        self._validation_wrapper = validation_wrapper
+        self._catlass_source = catlass_source
+        self._catlass_revision = catlass_revision
+
+    def _dispatch(self, invocation: CommandInvocation):
+        operation = _session_name(invocation.argv)
+        timeout = _option_value(invocation.argv, "--observe-timeout")
+        try:
+            command_index = invocation.argv.index("--") + 1
+        except ValueError as exc:
+            raise ValueError("session invocation is missing command separator") from exc
+        command = (*invocation.argv[command_index:], self._catlass_revision)
+        return self._call(
+            (
+                self._validation_wrapper,
+                "--profile",
+                "bz-a5",
+                "--operation",
+                operation,
+                "run",
+                "--catlass-src",
+                self._catlass_source,
+                "--timeout",
+                timeout,
+                "--",
+                *command,
+            ),
+            stdin=invocation.stdin,
+        )
 
 class BZSessionAdapter:
     """Translate execution plans into named durable BZ-A5 sessions."""
@@ -193,3 +249,14 @@ def _session_name(argv: tuple[str, ...]) -> str:
         return argv[argv.index("--name") + 1]
     except (ValueError, IndexError) as exc:
         raise ValueError("session invocation is missing --name") from exc
+
+
+def _option_value(argv: tuple[str, ...], option: str) -> str:
+    try:
+        return argv[argv.index(option) + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError(f"invocation is missing {option}") from exc
+
+
+def _is_revision(value: str) -> bool:
+    return len(value) == 40 and all(character in "0123456789abcdef" for character in value)

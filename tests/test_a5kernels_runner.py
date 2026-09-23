@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, replace
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import pytest
 from benchmarks.a5kernels import (
     A5KernelRunner,
     BZSessionAdapter,
+    CatlassValidationExecutor,
     Language,
     ProfileCommandExecutor,
     RunRequest,
@@ -22,7 +24,7 @@ from benchmarks.a5kernels.bz import (
 from benchmarks.a5kernels.protocol import ExecutionReceipt
 
 
-def _write_fake_catlass(root: Path, *, compatible: bool) -> None:
+def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
     package = root / "catlass"
     package.mkdir()
     (package / "__init__.py").write_text("")
@@ -32,6 +34,29 @@ def _write_fake_catlass(root: Path, *, compatible: bool) -> None:
         else "from_dlpack = object()\n"
     )
     (package / "tla.py").write_text(exports)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=A5 Test",
+            "-c",
+            "user.email=a5@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    return subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
 
 
 class FakeBackend:
@@ -195,15 +220,15 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
     )
     payload = json.dumps({"input_a": [1, 2.5], "input_b": [3, -0.5]})
     (tmp_path / "input.json").write_text(payload)
-    _write_fake_catlass(tmp_path, compatible=True)
+    revision = _write_fake_catlass(tmp_path, compatible=True)
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json"],
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
         cwd=tmp_path,
         text=True,
         capture_output=True,
         check=False,
-        env={"PYTHONPATH": str(tmp_path)},
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
     )
 
     assert result.returncode == 0, result.stderr
@@ -220,15 +245,15 @@ def test_host_driver_preflight_rejects_legacy_catlass_before_kernel_import(tmp_p
     (tmp_path / "kernel.py").write_text(
         "from pathlib import Path\nPath('kernel-imported').touch()\n"
     )
-    _write_fake_catlass(tmp_path, compatible=False)
+    revision = _write_fake_catlass(tmp_path, compatible=False)
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json"],
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
         cwd=tmp_path,
         text=True,
         capture_output=True,
         check=False,
-        env={"PYTHONPATH": str(tmp_path)},
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
     )
 
     assert result.returncode != 0
@@ -238,6 +263,30 @@ def test_host_driver_preflight_rejects_legacy_catlass_before_kernel_import(tmp_p
     assert not (tmp_path / "kernel-imported").exists()
 
 
+def test_host_driver_preflight_rejects_wrong_retained_revision(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    sources = {item.relative_path: item.content for item in fixture.files}
+    for name, content in sources.items():
+        (tmp_path / name).write_text(content)
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    _write_fake_catlass(tmp_path, compatible=True)
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", "0" * 40],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+    )
+
+    assert result.returncode != 0
+    assert "Catlass source revision mismatch" in result.stderr
+    assert "expected " + "0" * 40 in result.stderr
+
+
 def test_catlass_capacity_is_rejected_before_remote_execution():
     with pytest.raises(ValueError, match="cannot exceed 400"):
         A5KernelRunner(FakeBackend()).prepare(
@@ -245,8 +294,10 @@ def test_catlass_capacity_is_rejected_before_remote_execution():
         )
 
 
-def test_profile_executor_uploads_then_reads_durable_session_logs():
+def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence():
     calls = []
+    revision = "9a6ac627b5f4078060287844189730cf0d184800"
+    source = "/home/mariodrumond/worktrees/catlass/rsi-a5-imperative-hello"
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -257,6 +308,27 @@ def test_profile_executor_uploads_then_reads_durable_session_logs():
             assert (Path(argv[2]) / "kernel.py").is_file()
             assert (Path(argv[2]) / "input.json").is_file()
             return subprocess.CompletedProcess(argv, 0, "uploaded", "")
+        if argv[0].endswith("catlass-validation.sh"):
+            assert argv[:10] == (
+                "execution-profiles/catlass-validation.sh",
+                "--profile",
+                "bz-a5",
+                "--operation",
+                f"codex-a5hello-{plan.request_id[:8]}-trial-1",
+                "run",
+                "--catlass-src",
+                source,
+                "--timeout",
+                "600",
+            )
+            assert argv[-1] == revision
+            assert argv[-5:-1] == (
+                "python",
+                f".a5kernels/{plan.request_id}/trial-1/host_driver.py",
+                f".a5kernels/{plan.request_id}/trial-1/kernel.py",
+                f".a5kernels/{plan.request_id}/trial-1/input.json",
+            )
+            return subprocess.CompletedProcess(argv, 0, "completed", "")
         if argv[-1] == "logs":
             return subprocess.CompletedProcess(
                 argv, 0, f"{OUTPUT_MARKER}[3.0]\n", ""
@@ -266,8 +338,11 @@ def test_profile_executor_uploads_then_reads_durable_session_logs():
         return subprocess.CompletedProcess(argv, 0, "SESSION_STATE=completed", "")
 
     backend = BZSessionAdapter(
-        ProfileCommandExecutor(
+        CatlassValidationExecutor(
             upload_wrapper="execution-profiles/bz-a5/upload.sh",
+            validation_wrapper="execution-profiles/catlass-validation.sh",
+            catlass_source=source,
+            catlass_revision=revision,
             process_runner=run,
         ),
         session_wrapper="execution-profiles/bz-a5/session.sh",
@@ -281,6 +356,29 @@ def test_profile_executor_uploads_then_reads_durable_session_logs():
     assert receipt.output == (3.0,)
     assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.request_id[:8]}-trial-1"
     assert len(calls) == 4
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"catlass_source": "relative/worktree"}, "absolute retained BZ path"),
+        ({"catlass_revision": "master"}, "lowercase 40-character SHA"),
+        ({"validation_wrapper": "session.sh"}, "catlass-validation.sh"),
+    ],
+)
+def test_catlass_executor_rejects_implicit_or_unpinned_configuration(
+    overrides, message
+):
+    options = {
+        "upload_wrapper": "execution-profiles/bz-a5/upload.sh",
+        "validation_wrapper": "execution-profiles/catlass-validation.sh",
+        "catlass_source": "/home/mariodrumond/worktrees/catlass/retained",
+        "catlass_revision": "9a6ac627b5f4078060287844189730cf0d184800",
+    }
+    options.update(overrides)
+
+    with pytest.raises(ValueError, match=message):
+        CatlassValidationExecutor(**options)
 
 
 @pytest.mark.parametrize("stdout", ["no record", f"{OUTPUT_MARKER}[]\n{OUTPUT_MARKER}[]"])

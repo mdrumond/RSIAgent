@@ -91,7 +91,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 OUTPUT_MARKER = "A5KERNEL_OUTPUT="
@@ -105,12 +107,36 @@ REQUIRED_TLA_API = (
 )
 
 
-def _preflight_runtime() -> None:
+def _preflight_runtime(expected_revision: str) -> None:
+    source_value = os.environ.get("CATLASS_SRC")
+    if not source_value or not Path(source_value).is_absolute():
+        raise RuntimeError("CATLASS_SRC must name the explicit retained Catlass source")
+    source = Path(source_value).resolve()
+    revision = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    actual_revision = revision.stdout.strip()
+    if revision.returncode != 0 or actual_revision != expected_revision:
+        actual = actual_revision or "<unavailable>"
+        raise RuntimeError(
+            "Catlass source revision mismatch: "
+            f"expected {expected_revision}, found {actual} at {source}"
+        )
+
     import catlass.tla as tla
 
+    location = Path(getattr(tla, "__file__", "<unknown>")).resolve()
+    try:
+        location.relative_to(source)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Catlass import provenance mismatch: {location} is not under {source}"
+        ) from exc
     missing = [name for name in REQUIRED_TLA_API if not hasattr(tla, name)]
     if missing:
-        location = getattr(tla, "__file__", "<unknown>")
         raise RuntimeError(
             "incompatible Catlass DSL runtime: "
             f"{location} is missing imperative catlass.tla APIs "
@@ -138,8 +164,8 @@ def _numbers(value, name: str):
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: host_driver.py KERNEL.py INPUT.json")
+    if len(sys.argv) != 4:
+        raise SystemExit("usage: host_driver.py KERNEL.py INPUT.json CATLASS_REVISION")
     with Path(sys.argv[2]).open(encoding="utf-8") as input_file:
         payload = json.load(input_file)
     if not isinstance(payload, dict) or set(payload) != {"input_a", "input_b"}:
@@ -148,7 +174,7 @@ def main() -> int:
     input_b = _numbers(payload["input_b"], "input_b")
     if len(input_a) != len(input_b):
         raise ValueError("input vectors must have equal length")
-    _preflight_runtime()
+    _preflight_runtime(sys.argv[3])
     output = _numbers(_load_kernel(sys.argv[1]).run(input_a, input_b), "output")
     print(OUTPUT_MARKER + json.dumps(output, separators=(",", ":"), allow_nan=False))
     return 0
