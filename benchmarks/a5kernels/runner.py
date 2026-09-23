@@ -10,6 +10,7 @@ import re
 import uuid
 from typing import Protocol
 
+from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger, canonical_digest
 from benchmarks.a5kernels.fixtures import fixture_for
 from benchmarks.a5kernels.protocol import (
     ExecutionPlan,
@@ -27,9 +28,16 @@ class ExecutionBackend(Protocol):
 
 
 class A5KernelRunner:
-    def __init__(self, backend: ExecutionBackend, *, atol: float = 1e-5) -> None:
+    def __init__(
+        self,
+        backend: ExecutionBackend,
+        *,
+        atol: float = 1e-5,
+        evidence_ledger: EvidenceLedger | None = None,
+    ) -> None:
         self._backend = backend
         self._atol = atol
+        self._ledger = evidence_ledger
 
     def prepare(
         self, request: RunRequest, *, attempt_id: str | None = None
@@ -60,7 +68,22 @@ class A5KernelRunner:
         self, request: RunRequest, *, attempt_id: str | None = None
     ) -> VerifiedResult:
         plan = self.prepare(request, attempt_id=attempt_id)
-        receipt = self._backend.execute(plan)
+        self._record_plan(request, plan)
+        try:
+            receipt = self._backend.execute(plan)
+        except Exception as exc:
+            if self._ledger is not None:
+                self._ledger.append(
+                    EvidenceKind.RESULT,
+                    {
+                        "request_id": plan.request_id,
+                        "execution_id": plan.execution_id,
+                        "attempt_id": plan.attempt_id,
+                        "status": "execution_error",
+                        "error_type": type(exc).__name__,
+                    },
+                )
+            raise
         expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
         correct_length = len(receipt.output) == len(expected)
         finite = all(math.isfinite(value) for value in receipt.output)
@@ -98,4 +121,55 @@ class A5KernelRunner:
             "evidence_sha256": evidence_sha,
             "session_handle": receipt.session_handle,
         }
-        return VerifiedResult(**fields, attestation_sha256=canonical_hash(fields))
+        result = VerifiedResult(**fields, attestation_sha256=canonical_hash(fields))
+        if self._ledger is not None:
+            result_payload = dict(result.__dict__)
+            if not math.isfinite(result.max_abs_error):
+                result_payload["max_abs_error"] = None
+                result_payload["max_abs_error_status"] = "non-finite"
+            result_payload["status"] = "verified"
+            result_payload["execution_evidence"] = {
+                "retained_logs": receipt.stdout,
+                "diagnostics": receipt.stderr,
+                "result_exit_code": receipt.exit_code,
+                "output_sha256": result.output_sha256,
+            }
+            self._ledger.append(EvidenceKind.RESULT, result_payload)
+        return result
+
+    def _record_plan(self, request: RunRequest, plan: ExecutionPlan) -> None:
+        if self._ledger is None:
+            return
+        identity = {
+            "request_id": plan.request_id,
+            "execution_id": plan.execution_id,
+            "attempt_id": plan.attempt_id,
+        }
+        self._ledger.append(
+            EvidenceKind.REQUEST,
+            {**identity, "request": request.__dict__},
+        )
+        self._ledger.append(
+            EvidenceKind.ACTION,
+            {
+                **identity,
+                "language": plan.language,
+                "argv": plan.argv,
+                "inputs_sha256": canonical_digest(
+                    {"input_a": plan.input_a, "input_b": plan.input_b}
+                ),
+            },
+        )
+        self._ledger.append(
+            EvidenceKind.ARTIFACT,
+            {
+                **identity,
+                "source_fingerprint": plan.source_fingerprint,
+                "source_sha256": {
+                    source.relative_path: source.sha256 for source in plan.files
+                },
+                "artifact_sha256": {
+                    "source_bundle": plan.source_fingerprint,
+                },
+            },
+        )
