@@ -1,6 +1,6 @@
 """A5 kernel exploration and benchmark support."""
 
-from benchmarks.a5kernels.bz import BZSessionAdapter
+from benchmarks.a5kernels.bz import BZSessionAdapter, ProfileCommandExecutor
 from benchmarks.a5kernels.fixtures import Language, fixture_for
 from benchmarks.a5kernels.knowledge import (
     DEFAULT_EMBEDDING_MODEL,
@@ -23,6 +23,7 @@ __all__ = [
     "ExecutionBackend",
     "KnowledgeDB",
     "Language",
+    "ProfileCommandExecutor",
     "RunRequest",
     "SearchHit",
     "VerifiedResult",

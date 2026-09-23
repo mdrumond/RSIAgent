@@ -1,8 +1,19 @@
 from dataclasses import FrozenInstanceError, replace
+import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
-from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest, fixture_for
+from benchmarks.a5kernels import (
+    A5KernelRunner,
+    BZSessionAdapter,
+    Language,
+    ProfileCommandExecutor,
+    RunRequest,
+    fixture_for,
+)
 from benchmarks.a5kernels.bz import (
     CommandResult,
     OUTPUT_MARKER,
@@ -118,11 +129,8 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
     backend = BZSessionAdapter(
         command, session_wrapper="execution-profiles/bz-a5/session.sh"
     )
-    plan = replace(
-        A5KernelRunner(FakeBackend()).prepare(
-            RunRequest(Language.CATLASS_DSL.value, length=2), attempt_id="trial-1"
-        ),
-        argv=("python", "real_driver.py"),
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=2), attempt_id="trial-1"
     )
 
     receipt = backend.execute(plan)
@@ -136,8 +144,101 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
         f"codex-a5hello-{plan.request_id[:8]}-trial-1",
         "run",
     )
-    assert invocation.files == plan.files
+    assert invocation.files[:-1] == plan.files
+    assert invocation.files[-1].relative_path == "input.json"
+    assert json.loads(invocation.files[-1].content) == {
+        "input_a": list(plan.input_a),
+        "input_b": list(plan.input_b),
+    }
+    assert invocation.remote_directory == f".a5kernels/{plan.request_id}/trial-1"
+    assert invocation.argv[-4:] == (
+        "python",
+        f".a5kernels/{plan.request_id}/trial-1/host_driver.py",
+        f".a5kernels/{plan.request_id}/trial-1/kernel.py",
+        f".a5kernels/{plan.request_id}/trial-1/input.json",
+    )
+    assert invocation.stdin == ""
     assert [argv[-1] for argv in command.inspect_argv] == ["logs", "result"]
+
+
+def test_catlass_fixture_uses_current_imperative_runtime_api():
+    fixture = fixture_for(Language.CATLASS_DSL)
+    sources = {item.relative_path: item.content for item in fixture.files}
+
+    assert fixture.argv == ("python", "host_driver.py", "kernel.py", "input.json")
+    assert set(sources) == {"host_driver.py", "kernel.py"}
+    assert "tla.allocate" in sources["kernel.py"]
+    assert 'tla.vec.func(mode="simd")' in sources["kernel.py"]
+    assert ".mark_compact_shape_dynamic(0)" in sources["kernel.py"]
+    assert 'options="--npu-arch 3510"' in sources["kernel.py"]
+    assert "torch.npu.synchronize()" in sources["kernel.py"]
+
+
+def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "kernel.py").write_text(
+        "def run(a, b):\n    return [left + right for left, right in zip(a, b)]\n"
+    )
+    payload = json.dumps({"input_a": [1, 2.5], "input_b": [3, -0.5]})
+    (tmp_path / "input.json").write_text(payload)
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json"],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{OUTPUT_MARKER}[4.0,2.0]\n"
+
+
+def test_catlass_capacity_is_rejected_before_remote_execution():
+    with pytest.raises(ValueError, match="cannot exceed 400"):
+        A5KernelRunner(FakeBackend()).prepare(
+            RunRequest(Language.CATLASS_DSL.value, length=401)
+        )
+
+
+def test_profile_executor_uploads_then_reads_durable_session_logs():
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[0].endswith("upload.sh"):
+            assert argv[1] == "--recursive"
+            assert argv[3].startswith(".a5kernels/")
+            assert (Path(argv[2]) / "host_driver.py").is_file()
+            assert (Path(argv[2]) / "kernel.py").is_file()
+            assert (Path(argv[2]) / "input.json").is_file()
+            return subprocess.CompletedProcess(argv, 0, "uploaded", "")
+        if argv[-1] == "logs":
+            return subprocess.CompletedProcess(
+                argv, 0, f"{OUTPUT_MARKER}[3.0]\n", ""
+            )
+        if argv[-1] == "result":
+            return subprocess.CompletedProcess(argv, 0, "SESSION_STATE=completed", "")
+        return subprocess.CompletedProcess(argv, 0, "SESSION_STATE=completed", "")
+
+    backend = BZSessionAdapter(
+        ProfileCommandExecutor(
+            upload_wrapper="execution-profiles/bz-a5/upload.sh",
+            process_runner=run,
+        ),
+        session_wrapper="execution-profiles/bz-a5/session.sh",
+    )
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+
+    receipt = backend.execute(plan)
+
+    assert receipt.output == (3.0,)
+    assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.request_id[:8]}-trial-1"
+    assert len(calls) == 4
 
 
 @pytest.mark.parametrize("stdout", ["no record", f"{OUTPUT_MARKER}[]\n{OUTPUT_MARKER}[]"])

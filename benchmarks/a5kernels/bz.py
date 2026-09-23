@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
-from pathlib import Path
-from typing import Protocol
+from pathlib import Path, PurePosixPath
+import subprocess
+import tempfile
+from typing import Callable, Protocol
 
 from benchmarks.a5kernels.protocol import ExecutionPlan, ExecutionReceipt, SourceFile
 
@@ -24,6 +26,7 @@ class CommandInvocation:
     argv: tuple[str, ...]
     files: tuple[SourceFile, ...]
     stdin: str
+    remote_directory: str
 
 
 @dataclass(frozen=True)
@@ -44,6 +47,61 @@ class BZCommandExecutor(Protocol):
 
 class RuntimeUnavailableError(RuntimeError):
     """Raised before dispatch when no real language driver is registered."""
+
+
+class ProfileCommandExecutor:
+    """Stage registry files with the profile uploader, then run one session."""
+
+    def __init__(
+        self,
+        *,
+        upload_wrapper: str,
+        process_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    ) -> None:
+        if Path(upload_wrapper).name != "upload.sh":
+            raise ValueError("upload_wrapper must identify the checked-in upload.sh")
+        self._upload_wrapper = upload_wrapper
+        self._run = process_runner
+
+    def run(self, invocation: CommandInvocation) -> CommandResult:
+        with tempfile.TemporaryDirectory(prefix="a5kernel-") as temporary:
+            stage = Path(temporary)
+            for source in invocation.files:
+                relative = PurePosixPath(source.relative_path)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise ValueError(f"unsafe fixture path: {source.relative_path!r}")
+                destination = stage.joinpath(*relative.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(source.content, encoding="utf-8")
+            uploaded = self._call(
+                (self._upload_wrapper, "--recursive", f"{stage}/", invocation.remote_directory)
+            )
+        if uploaded.returncode != 0:
+            return CommandResult(uploaded.returncode, uploaded.stdout, uploaded.stderr)
+
+        completed = self._call(invocation.argv, stdin=invocation.stdin)
+        handle = f"bz-a5:{_session_name(invocation.argv)}"
+        return CommandResult(
+            completed.returncode, completed.stdout, completed.stderr, handle
+        )
+
+    def inspect(self, argv: tuple[str, ...]) -> CommandResult:
+        completed = self._call(argv)
+        return CommandResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            f"bz-a5:{_session_name(argv)}",
+        )
+
+    def _call(self, argv: tuple[str, ...], *, stdin: str | None = None):
+        return self._run(
+            argv,
+            input=stdin,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
 
 
 class BZSessionAdapter:
@@ -69,9 +127,16 @@ class BZSessionAdapter:
                 f"no executable runtime is registered for {plan.language}"
             )
         session_name = f"codex-a5hello-{plan.request_id[:8]}-{plan.attempt_id}"
+        remote_directory = f".a5kernels/{plan.request_id}/{plan.attempt_id}"
         payload = json.dumps(
             {"input_a": plan.input_a, "input_b": plan.input_b},
             separators=(",", ":"),
+        )
+        staged_files = (*plan.files, SourceFile("input.json", payload))
+        staged_paths = {item.relative_path for item in staged_files}
+        remote_argv = tuple(
+            f"{remote_directory}/{arg}" if arg in staged_paths else arg
+            for arg in plan.argv
         )
         invocation = CommandInvocation(
             argv=(
@@ -83,10 +148,11 @@ class BZSessionAdapter:
                 "--observe-timeout",
                 str(self._observe_timeout),
                 "--",
-                *plan.argv,
+                *remote_argv,
             ),
-            files=plan.files,
-            stdin=payload,
+            files=staged_files,
+            stdin="",
+            remote_directory=remote_directory,
         )
         dispatch = self._executor.run(invocation)
         logs = self._executor.inspect((self._wrapper, "--name", session_name, "logs"))
@@ -120,3 +186,10 @@ def _parse_output(stdout: str) -> tuple[float, ...]:
     ):
         raise ValueError("A5KERNEL_OUTPUT must be a JSON array of numbers")
     return tuple(float(value) for value in decoded)
+
+
+def _session_name(argv: tuple[str, ...]) -> str:
+    try:
+        return argv[argv.index("--name") + 1]
+    except (ValueError, IndexError) as exc:
+        raise ValueError("session invocation is missing --name") from exc
