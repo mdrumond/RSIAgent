@@ -1,0 +1,170 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from benchmarks.a5kernels.fixtures import Language
+from benchmarks.a5kernels.matrix import (
+    CapabilityUnavailableError,
+    ExperimentOrchestrator,
+    KnowledgeMode,
+    ProfilingMode,
+    RuntimeCapabilities,
+    Workload,
+    aggregate_report,
+    initial_matrix,
+)
+from run_a5kernels import main
+
+
+def test_initial_matrix_is_exact_cartesian_product_with_isolated_state() -> None:
+    plan = initial_matrix()
+
+    assert len(plan.cells) == 12
+    dimensions = {
+        (cell.language, cell.knowledge, cell.profiling) for cell in plan.cells
+    }
+    assert dimensions == {
+        (language, knowledge, profiling)
+        for language in Language
+        for knowledge in KnowledgeMode
+        for profiling in ProfilingMode
+    }
+    assert len({cell.context_id for cell in plan.cells}) == 12
+    assert len({cell.memory_id for cell in plan.cells}) == 12
+    assert len({cell.workspace_id for cell in plan.cells}) == 12
+    assert {cell.model.model_id for cell in plan.cells} == {"openai/gpt-5.6-sol"}
+    assert {cell.model.name for cell in plan.cells} == {"openai-gpt-5.6-sol-v1"}
+    assert {cell.model.provider for cell in plan.cells} == {"OpenAI"}
+    assert all(not cell.model.allow_fallback for cell in plan.cells)
+    assert plan.workloads == (Workload.SMOKE_VECTOR_ADD, Workload.SEMANTIC_GEMM)
+
+
+def test_determinism_schedule_is_three_catlass_baseline_repeats() -> None:
+    plan = initial_matrix()
+    trials = plan.determinism_trials
+    baseline = next(cell for cell in plan.cells if cell.cell_id == trials[0].cell_id)
+
+    assert [trial.repeat for trial in trials] == [1, 2, 3]
+    assert len({trial.trial_id for trial in trials}) == 3
+    assert len({trial.context_id for trial in trials}) == 3
+    assert len({trial.memory_id for trial in trials}) == 3
+    assert len({trial.workspace_id for trial in trials}) == 3
+    assert baseline.language is Language.CATLASS_DSL
+    assert baseline.knowledge is KnowledgeMode.WITHOUT_KDB
+    assert baseline.profiling is ProfilingMode.WITHOUT_GUIDANCE
+
+
+def test_orchestrator_fails_closed_for_every_unavailable_capability() -> None:
+    cell = next(
+        cell
+        for cell in initial_matrix().cells
+        if cell.knowledge is KnowledgeMode.WITH_KDB
+        and cell.profiling is ProfilingMode.WITH_GUIDANCE
+    )
+    orchestrator = ExperimentOrchestrator(
+        RuntimeCapabilities(languages=frozenset(), model_ids=frozenset())
+    )
+
+    with pytest.raises(CapabilityUnavailableError) as error:
+        orchestrator.schedule(cell, Workload.SEMANTIC_GEMM)
+
+    message = str(error.value)
+    assert f"runtime:{cell.language.value}" in message
+    assert "model:openai/gpt-5.6-sol" in message
+    assert "kdb" in message
+    assert "profiling-guidance" in message
+
+
+def test_orchestrator_schedules_without_claiming_a_result() -> None:
+    cell = initial_matrix().cells[0]
+    orchestrator = ExperimentOrchestrator(
+        RuntimeCapabilities(
+            languages=frozenset(Language),
+            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            kdb=True,
+            profiling_guidance=True,
+        )
+    )
+
+    scheduled = orchestrator.schedule(cell, Workload.SMOKE_VECTOR_ADD)
+
+    assert scheduled.cell == cell
+    assert scheduled.workload is Workload.SMOKE_VECTOR_ADD
+    assert not hasattr(scheduled, "passed")
+
+
+def test_matrix_cli_emits_machine_readable_plan(capsys) -> None:
+    assert main(["matrix"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert len(payload["cells"]) == 12
+    assert payload["workloads"] == ["smoke-vector-add", "semantic-gemm"]
+    assert len(payload["determinism_trials"]) == 3
+
+
+def test_report_cli_orders_correctness_before_performance(tmp_path, capsys) -> None:
+    input_path = tmp_path / "metrics.json"
+    input_path.write_text(
+        json.dumps(
+            [
+                {
+                    "cell_id": "cell-a",
+                    "workload": "smoke-vector-add",
+                    "correct": True,
+                    "kernel_time_us": 10.0,
+                    "exploration_succeeded": True,
+                    "iterations": 2,
+                    "tokens": 100,
+                    "wall_time_s": 3.0,
+                    "reproducible": True,
+                },
+                {
+                    "cell_id": "cell-b",
+                    "workload": "semantic-gemm",
+                    "correct": False,
+                    "kernel_time_us": 1.0,
+                    "exploration_succeeded": False,
+                    "iterations": 3,
+                    "tokens": 150,
+                    "wall_time_s": 4.0,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["report", str(input_path)]) == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert output.index('"correctness"') < output.index('"kernel_performance"')
+    assert payload["correctness"] == {"passed": 1, "total": 2}
+    assert payload["kernel_performance"]["mean_us_correct_runs"] == 10.0
+    assert payload["exploration_success"] == 1
+    assert payload["iterations"] == 5
+    assert payload["tokens"] == 250
+    assert payload["wall_time_s"] == 7.0
+    assert payload["reproducibility"] == {"measured": 1, "reproducible": 1}
+
+
+def test_aggregate_report_never_treats_incorrect_timing_as_performance() -> None:
+    from benchmarks.a5kernels.matrix import RunMetrics
+
+    report = aggregate_report(
+        [
+            RunMetrics(
+                cell_id="bad",
+                workload=Workload.SEMANTIC_GEMM,
+                correct=False,
+                kernel_time_us=0.01,
+                exploration_succeeded=True,
+                iterations=1,
+                tokens=1,
+                wall_time_s=1,
+            )
+        ]
+    )
+
+    assert report["kernel_performance"]["mean_us_correct_runs"] is None
