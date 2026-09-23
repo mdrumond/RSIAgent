@@ -21,7 +21,7 @@ from benchmarks.a5kernels.bz import (
     OUTPUT_MARKER,
     RuntimeUnavailableError,
 )
-from benchmarks.a5kernels.protocol import ExecutionReceipt
+from benchmarks.a5kernels.protocol import ExecutionReceipt, SourceFile
 
 
 def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
@@ -516,6 +516,37 @@ def test_runtime_revision_changes_identity_session_and_attestation():
     first_session = f"codex-a5hello-{first_result.execution_id[:8]}-same-attempt"
     second_session = f"codex-a5hello-{second_result.execution_id[:8]}-same-attempt"
     assert first_session != second_session
+
+
+@pytest.mark.parametrize("plan_field", ["source", "argv"])
+def test_plan_content_changes_identity_remote_directory_and_session(plan_field):
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="same-attempt"
+    )
+    if plan_field == "source":
+        changed_file = SourceFile(
+            plan.files[0].relative_path, plan.files[0].content + "\n# changed\n"
+        )
+        changed = replace(plan, files=(changed_file, *plan.files[1:]))
+    else:
+        assert plan.argv is not None
+        changed = replace(plan, argv=(*plan.argv, "--changed"))
+
+    assert plan.request_id == changed.request_id
+    assert plan.runtime_provenance == changed.runtime_provenance
+    assert plan.attempt_id == changed.attempt_id
+    assert plan.execution_id != changed.execution_id
+
+    invocations = []
+    for candidate in (plan, changed):
+        command = FakeCommandExecutor(CommandResult(9, "expected dispatch failure"))
+        BZSessionAdapter(
+            command, session_wrapper="execution-profiles/bz-a5/session.sh"
+        ).execute(candidate)
+        invocations.append(command.invocations[0])
+
+    assert invocations[0].remote_directory != invocations[1].remote_directory
+    assert invocations[0].argv[2] != invocations[1].argv[2]
 
 
 @pytest.mark.parametrize("stdout", ["no record", f"{OUTPUT_MARKER}[]\n{OUTPUT_MARKER}[]"])

@@ -64,8 +64,10 @@ class ExecutionPlan:
     def execution_id(self) -> str:
         return canonical_hash(
             {
+                "argv": self.argv,
                 "request_id": self.request_id,
                 "runtime_provenance": self.runtime_provenance,
+                "source_fingerprint": self.source_fingerprint,
             }
         )
 
