@@ -185,7 +185,7 @@ from core.imagery import fetch_look_image, grid_cells, prepare_look_images
 from llm.client import LLMTransportError, chat, durable_user_message
 from llm.client import pop_last_reasoning as _pop_last_reasoning, parse_object
 from core.actor import (FIDELITY_NOTE, NUDGE, ONE_ACTION_NUDGE, PREMATURE_DONE, REPEAT_WARNING,
-                         STRICT_NUDGE, SUMMARIZER_SYSTEM, VISION_AGENT_SYSTEM, Ask, Look, Program, build_system,
+                         STRICT_NUDGE, SUMMARIZER_SYSTEM, VISION_AGENT_SYSTEM, Ask, Done, Look, Program, build_system,
                          continuation_message, extract_plan, look_answer_message, look_message, multi_program_note,
                          opening_message, parse_turn, repair_message, trace_message)
 
@@ -497,6 +497,33 @@ class UserChannelInfrastructureError(RuntimeError):
     """
 
 
+@dataclass(frozen=True)
+class DomainActionResult:
+    """Trusted result returned by an opt-in domain action executor.
+
+    ``observation`` is delivered verbatim to the Actor on a non-terminal action.
+    Terminal actions stop atomically with ``status``; restricting terminal states
+    prevents a domain adapter from inventing states the outer lifecycle cannot
+    classify.  The executor, rather than core, owns domain-specific persistence and
+    evidence because core must not know the action schema.
+    """
+
+    observation: str
+    terminal: bool = False
+    status: str = "done"
+
+
+def _validate_domain_action_result(value) -> DomainActionResult:
+    if not isinstance(value, DomainActionResult):
+        raise TypeError("action_executor must return DomainActionResult")
+    if not value.observation.strip():
+        raise ValueError("DomainActionResult.observation must not be empty")
+    if value.terminal and value.status not in {
+            "done", "evolve", "stalled", "infra", "safety_ceiling"}:
+        raise ValueError("invalid terminal domain action status: " + value.status)
+    return value
+
+
 def _call_with_transport_pause(call, cfg, *, label: str = "LLM",
                                on_pause=None):
     """Run one semantic model operation, pausing on recoverable transport failure.
@@ -556,7 +583,8 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                 user_message_transform=None, surface_baseline=None,
                 instruction_is_complete_opening: bool = False,
                 verifier_failure_router=None, verifier_pass_router=None,
-                ask_user=None, opening_image=None):
+                ask_user=None, opening_image=None,
+                turn_parser=None, action_executor=None):
     """Run one attempt; returns (LoopResult, history). ``sink`` is an ArtifactSink.
     ``iters_budget``/``wall_budget`` override the config budgets (v15 resume passes
     the remainder); ``opening_extra`` is prepended to the opening message (the
@@ -585,6 +613,11 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
     observation to the first user turn of a recovered segment.  It is transport
     state, not a new observation, and defaults off for every ordinary Actor call.
     All of these default off, preserving existing call sites.
+    ``turn_parser`` optionally replaces ``parse_turn`` for a domain integration.
+    Parsed Program/Look/Ask/Done values retain their built-in behavior; any other
+    non-None value is accepted only when ``action_executor`` is also supplied. The
+    executor returns ``DomainActionResult`` and is responsible for enforcing and
+    recording its restricted action vocabulary. Both hooks are inert by default.
     ``verifier_failure_router`` is an optional separated-authority callback used
     only after a concrete Verifier Agent FAIL. It receives the complete report and
     returns ``(REVISE|EVOLVE, complete Curriculum Agent report)``. With no callback,
@@ -1014,7 +1047,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
         res.turns += 1
         sink.save_turn(res.turns, out)
         plan = extract_plan(out) or plan          # latest revision wins; survives turns
-        turn = parse_turn(out)
+        turn = (turn_parser or parse_turn)(out)
 
         if turn is None:                                   # genuine model dry turn
             dry += 1
@@ -1067,6 +1100,20 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
             cycle_tracker = _ActionRecurrence()
             cycle_iters = []
             cycle_active = False
+
+        if not isinstance(turn, (Program, Look, Ask, Done)):
+            if action_executor is None:
+                raise TypeError(
+                    "turn_parser returned a domain action without action_executor")
+            outcome = _validate_domain_action_result(action_executor(turn))
+            log.info("iter %d: domain action (%s) -> %s", res.iters,
+                     type(turn).__name__,
+                     "terminal " + outcome.status if outcome.terminal else "observation")
+            if outcome.terminal:
+                res.status = outcome.status
+                break
+            user = outcome.observation
+            continue
 
         if isinstance(turn, Program):
             dones = 0
