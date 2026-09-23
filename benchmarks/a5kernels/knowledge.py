@@ -73,6 +73,7 @@ class SearchHit:
     text: str
     score: float
     lexical_rank: int | None
+    lexical_score: float | None
     vector_rank: int | None
 
 
@@ -189,7 +190,8 @@ class KnowledgeDB:
                 name TEXT PRIMARY KEY,
                 language TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
-                manifest_json TEXT NOT NULL
+                manifest_json TEXT NOT NULL,
+                fts_table TEXT NOT NULL UNIQUE
             );
             CREATE TABLE IF NOT EXISTS chunks (
                 rowid INTEGER PRIMARY KEY,
@@ -202,11 +204,44 @@ class KnowledgeDB:
                 vector_json TEXT NOT NULL,
                 UNIQUE(collection, chunk_id)
             );
-            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-                text, content='chunks', content_rowid='rowid', tokenize='unicode61'
-            );
             """
         )
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(collections)")
+        }
+        if "fts_table" not in columns:
+            self._migrate_shared_fts()
+
+    @staticmethod
+    def _fts_table_name(collection: str) -> str:
+        # Only fixed ASCII plus a digest ever reaches a SQL identifier position.
+        return f"collection_fts_{_sha256(collection.encode())}"
+
+    def _ensure_fts_table(self, table: str) -> None:
+        self.connection.execute(
+            f"""CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING fts5(
+                text, content='chunks', content_rowid='rowid', tokenize='unicode61'
+            )"""
+        )
+
+    def _migrate_shared_fts(self) -> None:
+        """Upgrade the pre-release shared FTS schema without changing content."""
+        with self.connection:
+            self.connection.execute("ALTER TABLE collections ADD COLUMN fts_table TEXT")
+            collections = self.connection.execute("SELECT name FROM collections").fetchall()
+            for row in collections:
+                table = self._fts_table_name(row["name"])
+                self._ensure_fts_table(table)
+                self.connection.execute(
+                    f"""INSERT INTO {table}(rowid, text)
+                        SELECT rowid, text FROM chunks WHERE collection = ?""",
+                    (row["name"],),
+                )
+                self.connection.execute(
+                    "UPDATE collections SET fts_table = ? WHERE name = ?",
+                    (table, row["name"]),
+                )
+            self.connection.execute("DROP TABLE IF EXISTS chunks_fts")
 
     def index(
         self,
@@ -253,10 +288,14 @@ class KnowledgeDB:
         if len(vectors) != len(chunks):
             raise ValueError("embedding backend returned the wrong number of vectors")
         with self.connection:
+            fts_table = self._fts_table_name(collection)
             self.connection.execute(
-                "INSERT INTO collections VALUES (?, ?, ?, ?)",
-                (collection, language, manifest.fingerprint, manifest.to_json()),
+                """INSERT INTO collections
+                   (name, language, fingerprint, manifest_json, fts_table)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (collection, language, manifest.fingerprint, manifest.to_json(), fts_table),
             )
+            self._ensure_fts_table(fts_table)
             for chunk, vector in zip(chunks, vectors):
                 cursor = self.connection.execute(
                     """INSERT INTO chunks
@@ -273,7 +312,7 @@ class KnowledgeDB:
                     ),
                 )
                 self.connection.execute(
-                    "INSERT INTO chunks_fts(rowid, text) VALUES (?, ?)",
+                    f"INSERT INTO {fts_table}(rowid, text) VALUES (?, ?)",
                     (cursor.lastrowid, chunk.text),
                 )
         if manifest_path:
@@ -291,14 +330,30 @@ class KnowledgeDB:
     def query(self, collection: str, query: str, *, limit: int = 10) -> list[SearchHit]:
         if limit < 1:
             raise ValueError("limit must be positive")
-        self.manifest(collection)  # Fail clearly rather than returning an empty result.
+        collection_row = self.connection.execute(
+            "SELECT manifest_json, fts_table FROM collections WHERE name = ?", (collection,)
+        ).fetchone()
+        if not collection_row:
+            raise KeyError(collection)
+        manifest = CollectionManifest.from_json(collection_row["manifest_json"])
+        actual_embedding = (self.embeddings.model, self.embeddings.revision)
+        expected_embedding = (manifest.embedding_model, manifest.embedding_revision)
+        if actual_embedding != expected_embedding:
+            raise ValueError(
+                "embedding backend does not match collection manifest: "
+                f"expected {expected_embedding[0]}@{expected_embedding[1]}, "
+                f"got {actual_embedding[0]}@{actual_embedding[1]}"
+            )
         candidate_limit = max(limit * 4, 20)
         lexical_query = _fts_query(query)
+        fts_table = self._fts_table_name(collection)
+        if collection_row["fts_table"] != fts_table:
+            raise RuntimeError(f"invalid FTS metadata for collection {collection!r}")
         lexical_rows = [] if lexical_query is None else self.connection.execute(
-            """SELECT c.*, bm25(chunks_fts) AS rank
-               FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid
-               WHERE chunks_fts MATCH ? AND c.collection = ?
-               ORDER BY rank ASC, c.chunk_id ASC LIMIT ?""",
+            f"""SELECT c.*, bm25({fts_table}) AS lexical_score
+               FROM {fts_table} JOIN chunks c ON c.rowid = {fts_table}.rowid
+               WHERE {fts_table} MATCH ? AND c.collection = ?
+               ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?""",
             (lexical_query, collection, candidate_limit),
         ).fetchall()
         query_vectors = self.embeddings.embed([query])
@@ -316,6 +371,7 @@ class KnowledgeDB:
             ),
         )[:candidate_limit]
         lexical_rank = {row["chunk_id"]: rank for rank, row in enumerate(lexical_rows, 1)}
+        lexical_score = {row["chunk_id"]: row["lexical_score"] for row in lexical_rows}
         vector_rank = {row["chunk_id"]: rank for rank, row in enumerate(vector_rows, 1)}
         rows_by_id = {row["chunk_id"]: row for row in (*lexical_rows, *vector_rows)}
         scored = []
@@ -336,6 +392,7 @@ class KnowledgeDB:
                 text=row["text"],
                 score=score,
                 lexical_rank=lexical_rank.get(chunk_id),
+                lexical_score=lexical_score.get(chunk_id),
                 vector_rank=vector_rank.get(chunk_id),
             )
             for score, chunk_id, row in scored[:limit]
