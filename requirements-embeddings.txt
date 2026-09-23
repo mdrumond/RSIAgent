@@ -1,0 +1,4 @@
+# Optional production backend for benchmarks.a5kernels.PinnedBGEEmbeddings.
+# Keep the base RSIAgent installation free of the heavyweight model runtime.
+torch==2.10.0
+transformers==5.0.0

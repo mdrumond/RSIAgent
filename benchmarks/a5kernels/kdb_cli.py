@@ -9,6 +9,8 @@ from pathlib import Path
 
 from .knowledge import KnowledgeDB
 
+DEFAULT_BACKEND = "benchmarks.a5kernels.embeddings:PinnedBGEEmbeddings"
+
 
 def _backend(spec: str):
     module_name, separator, attribute = spec.partition(":")
@@ -20,7 +22,11 @@ def _backend(spec: str):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", type=Path, required=True)
-    parser.add_argument("--embedding-backend", required=True)
+    parser.add_argument(
+        "--embedding-backend",
+        default=DEFAULT_BACKEND,
+        help=f"MODULE:ATTRIBUTE factory (default: {DEFAULT_BACKEND}, offline-only)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     index = commands.add_parser("index")
     index.add_argument("--root", type=Path, required=True)
