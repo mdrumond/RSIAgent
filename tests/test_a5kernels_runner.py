@@ -471,6 +471,23 @@ def test_catlass_executor_rejects_implicit_or_unpinned_configuration(
         CatlassValidationExecutor(**options)
 
 
+def test_adapter_rejects_plan_bound_to_different_runtime_provenance():
+    executor = FakeCommandExecutor(
+        CommandResult(0, "must not run"),
+        runtime_provenance=(("catlass_revision", "1" * 40),),
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value), attempt_id="trial-1"
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="provenance does not match"):
+        backend.execute(plan)
+    assert executor.invocations == []
+
+
 def test_runtime_revision_changes_identity_session_and_attestation():
     source = "/home/mariodrumond/worktrees/catlass/retained"
     first_provenance = (
