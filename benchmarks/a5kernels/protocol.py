@@ -52,9 +52,10 @@ class ExecutionPlan:
     """Complete, registry-generated workload submitted to the BZ adapter."""
 
     request_id: str
+    attempt_id: str
     language: str
     files: tuple[SourceFile, ...]
-    argv: tuple[str, ...]
+    argv: tuple[str, ...] | None
     input_a: tuple[float, ...]
     input_b: tuple[float, ...]
 
@@ -86,6 +87,7 @@ class VerifiedResult:
     """Authoritative host-generated result packet."""
 
     request_id: str
+    attempt_id: str
     language: str
     passed: bool
     max_abs_error: float

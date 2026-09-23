@@ -6,6 +6,8 @@ import hashlib
 import json
 import math
 import random
+import re
+import uuid
 from typing import Protocol
 
 from benchmarks.a5kernels.fixtures import fixture_for
@@ -29,13 +31,19 @@ class A5KernelRunner:
         self._backend = backend
         self._atol = atol
 
-    def prepare(self, request: RunRequest) -> ExecutionPlan:
+    def prepare(
+        self, request: RunRequest, *, attempt_id: str | None = None
+    ) -> ExecutionPlan:
         fixture = fixture_for(request.language)
+        attempt_id = uuid.uuid4().hex if attempt_id is None else attempt_id
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", attempt_id):
+            raise ValueError("attempt_id must be a safe 1-64 character identifier")
         rng = random.Random(request.seed)
         input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
         input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
         return ExecutionPlan(
             request_id=request.request_id,
+            attempt_id=attempt_id,
             language=fixture.language.value,
             files=fixture.files,
             argv=fixture.argv,
@@ -43,8 +51,10 @@ class A5KernelRunner:
             input_b=input_b,
         )
 
-    def run(self, request: RunRequest) -> VerifiedResult:
-        plan = self.prepare(request)
+    def run(
+        self, request: RunRequest, *, attempt_id: str | None = None
+    ) -> VerifiedResult:
+        plan = self.prepare(request, attempt_id=attempt_id)
         receipt = self._backend.execute(plan)
         expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
         correct_length = len(receipt.output) == len(expected)
@@ -69,6 +79,7 @@ class A5KernelRunner:
         )
         fields = {
             "request_id": plan.request_id,
+            "attempt_id": plan.attempt_id,
             "language": plan.language,
             "passed": passed,
             "max_abs_error": max_error,

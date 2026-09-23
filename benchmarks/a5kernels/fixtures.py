@@ -18,7 +18,9 @@ class Language(str, Enum):
 class Fixture:
     language: Language
     files: tuple[SourceFile, ...]
-    argv: tuple[str, ...]
+    # Concrete runtime drivers are supplied by language-specific integrations.
+    # A missing argv is an explicit, fail-closed support boundary.
+    argv: tuple[str, ...] | None = None
 
 
 _CATLASS_SOURCE = '''\
@@ -88,17 +90,14 @@ _FIXTURES = {
     Language.CATLASS_DSL: Fixture(
         Language.CATLASS_DSL,
         (SourceFile("kernel.py", _CATLASS_SOURCE),),
-        ("python", "host_driver.py", "kernel.py"),
     ),
     Language.ASCEND_C: Fixture(
         Language.ASCEND_C,
         (SourceFile("kernel.cpp", _ASCEND_C_SOURCE),),
-        ("python", "host_driver.py", "kernel.cpp"),
     ),
     Language.TRITON_ASCEND: Fixture(
         Language.TRITON_ASCEND,
         (SourceFile("kernel.py", _TRITON_SOURCE),),
-        ("python", "host_driver.py", "kernel.py"),
     ),
 }
 

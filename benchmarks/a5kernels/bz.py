@@ -39,6 +39,12 @@ class BZCommandExecutor(Protocol):
 
     def run(self, invocation: CommandInvocation) -> CommandResult: ...
 
+    def inspect(self, argv: tuple[str, ...]) -> CommandResult: ...
+
+
+class RuntimeUnavailableError(RuntimeError):
+    """Raised before dispatch when no real language driver is registered."""
+
 
 class BZSessionAdapter:
     """Translate execution plans into named durable BZ-A5 sessions."""
@@ -58,7 +64,11 @@ class BZSessionAdapter:
         self._observe_timeout = observe_timeout
 
     def execute(self, plan: ExecutionPlan) -> ExecutionReceipt:
-        session_name = f"codex-a5hello-{plan.request_id[:12]}"
+        if plan.argv is None:
+            raise RuntimeUnavailableError(
+                f"no executable runtime is registered for {plan.language}"
+            )
+        session_name = f"codex-a5hello-{plan.request_id[:8]}-{plan.attempt_id}"
         payload = json.dumps(
             {"input_a": plan.input_a, "input_b": plan.input_b},
             separators=(",", ":"),
@@ -78,14 +88,25 @@ class BZSessionAdapter:
             files=plan.files,
             stdin=payload,
         )
-        result = self._executor.run(invocation)
-        output = _parse_output(result.stdout) if result.exit_code == 0 else ()
+        dispatch = self._executor.run(invocation)
+        logs = self._executor.inspect((self._wrapper, "--name", session_name, "logs"))
+        result = self._executor.inspect(
+            (self._wrapper, "--name", session_name, "result")
+        )
+        output = _parse_output(logs.stdout) if result.exit_code == 0 else ()
         return ExecutionReceipt(
             exit_code=result.exit_code,
             output=output,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            session_handle=result.session_handle,
+            stdout=logs.stdout,
+            stderr="\n".join(
+                part for part in (dispatch.stderr, logs.stderr, result.stderr) if part
+            ),
+            session_handle=(
+                result.session_handle
+                or logs.session_handle
+                or dispatch.session_handle
+                or f"bz-a5:{session_name}"
+            ),
         )
 
 

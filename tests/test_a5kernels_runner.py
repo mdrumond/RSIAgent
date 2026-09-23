@@ -1,9 +1,13 @@
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
 from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest, fixture_for
-from benchmarks.a5kernels.bz import CommandResult, OUTPUT_MARKER
+from benchmarks.a5kernels.bz import (
+    CommandResult,
+    OUTPUT_MARKER,
+    RuntimeUnavailableError,
+)
 from benchmarks.a5kernels.protocol import ExecutionReceipt
 
 
@@ -68,8 +72,8 @@ def test_requests_and_results_are_immutable_and_repeatable():
     request = RunRequest(Language.CATLASS_DSL.value, length=4, seed=3)
     runner = A5KernelRunner(FakeBackend())
 
-    first = runner.run(request)
-    second = runner.run(request)
+    first = runner.run(request, attempt_id="repeatable-1")
+    second = runner.run(request, attempt_id="repeatable-1")
 
     assert first == second
     with pytest.raises(FrozenInstanceError):
@@ -88,24 +92,37 @@ def test_invalid_lengths_are_rejected(length):
 
 
 class FakeCommandExecutor:
-    def __init__(self, result):
-        self.result = result
+    def __init__(self, dispatch, inspections=()):
+        self.dispatch = dispatch
+        self.inspections = list(inspections)
         self.invocations = []
+        self.inspect_argv = []
 
     def run(self, invocation):
         self.invocations.append(invocation)
-        return self.result
+        return self.dispatch
+
+    def inspect(self, argv):
+        self.inspect_argv.append(argv)
+        return self.inspections.pop(0)
 
 
-def test_bz_adapter_uses_named_session_and_parses_one_output_record():
+def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
     command = FakeCommandExecutor(
-        CommandResult(0, f"banner\n{OUTPUT_MARKER}[1.25,2]\n", session_handle="bz-a5:s1")
+        CommandResult(0, f"wrapper-only\n{OUTPUT_MARKER}[999]\n"),
+        (
+            CommandResult(0, f"banner\n{OUTPUT_MARKER}[1.25,2]\n"),
+            CommandResult(0, "SESSION_STATE=finished exit=0", session_handle="bz-a5:s1"),
+        ),
     )
     backend = BZSessionAdapter(
         command, session_wrapper="execution-profiles/bz-a5/session.sh"
     )
-    plan = A5KernelRunner(FakeBackend()).prepare(
-        RunRequest(Language.CATLASS_DSL.value, length=2)
+    plan = replace(
+        A5KernelRunner(FakeBackend()).prepare(
+            RunRequest(Language.CATLASS_DSL.value, length=2), attempt_id="trial-1"
+        ),
+        argv=("python", "real_driver.py"),
     )
 
     receipt = backend.execute(plan)
@@ -116,19 +133,73 @@ def test_bz_adapter_uses_named_session_and_parses_one_output_record():
     assert invocation.argv[:4] == (
         "execution-profiles/bz-a5/session.sh",
         "--name",
-        f"codex-a5hello-{plan.request_id[:12]}",
+        f"codex-a5hello-{plan.request_id[:8]}-trial-1",
         "run",
     )
     assert invocation.files == plan.files
+    assert [argv[-1] for argv in command.inspect_argv] == ["logs", "result"]
 
 
 @pytest.mark.parametrize("stdout", ["no record", f"{OUTPUT_MARKER}[]\n{OUTPUT_MARKER}[]"])
 def test_bz_adapter_rejects_missing_or_ambiguous_output(stdout):
     backend = BZSessionAdapter(
-        FakeCommandExecutor(CommandResult(0, stdout)),
+        FakeCommandExecutor(
+            CommandResult(0, "SESSION_STATE=finished exit=0"),
+            (CommandResult(0, stdout), CommandResult(0, "exit=0")),
+        ),
         session_wrapper="execution-profiles/bz-a5/session.sh",
     )
-    plan = A5KernelRunner(FakeBackend()).prepare(RunRequest(Language.ASCEND_C.value))
+    plan = replace(
+        A5KernelRunner(FakeBackend()).prepare(
+            RunRequest(Language.ASCEND_C.value), attempt_id="trial-1"
+        ),
+        argv=("run-ascend-c",),
+    )
 
     with pytest.raises(ValueError, match="exactly one"):
         backend.execute(plan)
+
+
+def test_foundational_fixture_fails_closed_without_concrete_driver():
+    command = FakeCommandExecutor(CommandResult(0, "unused"))
+    backend = BZSessionAdapter(
+        command, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.TRITON_ASCEND.value), attempt_id="trial-1"
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="no executable runtime"):
+        backend.execute(plan)
+    assert command.invocations == []
+
+
+def test_repeated_request_uses_distinct_host_owned_attempts_and_sessions():
+    runner = A5KernelRunner(FakeBackend())
+    request = RunRequest(Language.CATLASS_DSL.value)
+
+    first = runner.prepare(request)
+    second = runner.prepare(request)
+
+    assert first.request_id == second.request_id
+    assert first.attempt_id != second.attempt_id
+
+    executors = []
+    for plan in (first, second):
+        executor = FakeCommandExecutor(
+            CommandResult(0, "finished"),
+            (CommandResult(0, "workload failed"), CommandResult(1, "exit=1")),
+        )
+        BZSessionAdapter(
+            executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+        ).execute(replace(plan, argv=("real-driver",)))
+        executors.append(executor)
+    assert executors[0].invocations[0].argv[2] != executors[1].invocations[0].argv[2]
+
+
+@pytest.mark.parametrize("attempt_id", ["", "spaces are unsafe", "../escape"])
+def test_attempt_identifier_is_validated(attempt_id):
+    with pytest.raises(ValueError, match="attempt_id"):
+        A5KernelRunner(FakeBackend()).prepare(
+            RunRequest(Language.CATLASS_DSL.value), attempt_id=attempt_id
+        )
