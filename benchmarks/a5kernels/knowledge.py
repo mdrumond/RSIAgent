@@ -364,6 +364,38 @@ class KnowledgeDB:
             raise KeyError(collection)
         return CollectionManifest.from_json(row["manifest_json"])
 
+    def validate_citation(
+        self,
+        collection: str,
+        *,
+        chunk_id: str,
+        path: str,
+        start_line: int,
+        end_line: int,
+    ) -> None:
+        """Fail unless a citation exactly identifies an indexed chunk.
+
+        The chunk identifier is recomputed from the stored bytes rather than merely
+        compared with the row.  This makes the gate an independent check that the
+        path and line range returned to an Actor describe the indexed content.
+        """
+        manifest = self.manifest(collection)
+        row = self.connection.execute(
+            """SELECT chunk_id, path, start_line, end_line, text FROM chunks
+               WHERE collection = ? AND chunk_id = ?""",
+            (collection, chunk_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("citation does not reference an indexed chunk")
+        expected = (row["path"], row["start_line"], row["end_line"])
+        if expected != (path, start_line, end_line):
+            raise ValueError("citation location does not match the indexed chunk")
+        if path not in {source.path for source in manifest.sources}:
+            raise ValueError("citation path is absent from the collection manifest")
+        identity = f"{path}\0{start_line}\0{end_line}\0{row['text']}".encode()
+        if _sha256(identity) != chunk_id:
+            raise ValueError("citation chunk hash does not match indexed content")
+
     def query(self, collection: str, query: str, *, limit: int = 10) -> list[SearchHit]:
         if limit < 1:
             raise ValueError("limit must be positive")
