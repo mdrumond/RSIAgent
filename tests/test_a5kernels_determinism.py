@@ -328,7 +328,11 @@ def test_snapshot_rejects_identity_only_action(tmp_path):
         snapshot_from_ledger(replace_entry_payload(ledger.entries, 1, payload))
 
 
-def test_snapshot_accepts_runner_null_argv_boundary(tmp_path):
+def test_snapshot_accepts_runner_null_argv_boundary(tmp_path, monkeypatch):
+    from benchmarks.a5kernels import ascendc
+
+    unavailable = replace(fixture_for("ascend-c"), argv=None)
+    monkeypatch.setattr(ascendc, "ascendc_fixture", lambda: unavailable)
     ledger = write_ledger(
         tmp_path / "null-argv.jsonl", "one", language="ascend-c"
     )

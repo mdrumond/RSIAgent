@@ -441,22 +441,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 '''
 
-_ASCEND_C_SOURCE = '''\
-#include "kernel_operator.h"
-using namespace AscendC;
-
-extern "C" __global__ __aicore__ void vector_add(
-    GM_ADDR a, GM_ADDR b, GM_ADDR out, uint32_t n) {
-  GlobalTensor<float> ga, gb, gout;
-  ga.SetGlobalBuffer((__gm__ float*)a, n);
-  gb.SetGlobalBuffer((__gm__ float*)b, n);
-  gout.SetGlobalBuffer((__gm__ float*)out, n);
-  for (uint32_t i = GetBlockIdx(); i < n; i += GetBlockNum()) {
-    gout.SetValue(i, ga.GetValue(i) + gb.GetValue(i));
-  }
-}
-'''
-
 _TRITON_SOURCE = '''\
 import torch
 import triton
@@ -494,10 +478,6 @@ _FIXTURES = {
         ),
         400,
     ),
-    Language.ASCEND_C: Fixture(
-        Language.ASCEND_C,
-        (SourceFile("kernel.cpp", _ASCEND_C_SOURCE),),
-    ),
     Language.TRITON_ASCEND: Fixture(
         Language.TRITON_ASCEND,
         (SourceFile("kernel.py", _TRITON_SOURCE),),
@@ -507,7 +487,12 @@ _FIXTURES = {
 
 def fixture_for(language: Language | str) -> Fixture:
     try:
-        return _FIXTURES[Language(language)]
+        selected = Language(language)
     except ValueError as exc:
         supported = ", ".join(item.value for item in Language)
         raise ValueError(f"unsupported language {language!r}; choose {supported}") from exc
+    if selected is Language.ASCEND_C:
+        from benchmarks.a5kernels.ascendc import ascendc_fixture
+
+        return ascendc_fixture()
+    return _FIXTURES[selected]

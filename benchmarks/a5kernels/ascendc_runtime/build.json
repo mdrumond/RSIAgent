@@ -1,0 +1,7 @@
+{
+  "arch": "dav-3510",
+  "compiler": "bisheng",
+  "max_elements": 4096,
+  "output": "kernel.so",
+  "source": "kernel.cpp"
+}
