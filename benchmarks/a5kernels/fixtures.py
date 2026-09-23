@@ -125,6 +125,18 @@ def _preflight_runtime(expected_revision: str) -> None:
             "Catlass source revision mismatch: "
             f"expected {expected_revision}, found {actual} at {source}"
         )
+    worktree = subprocess.run(
+        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    changes = worktree.stdout.strip()
+    if worktree.returncode != 0 or changes:
+        detail = changes or worktree.stderr.strip() or "status unavailable"
+        raise RuntimeError(
+            f"Catlass retained source is not clean at {source}: {detail}"
+        )
 
     import catlass.tla as tla
 

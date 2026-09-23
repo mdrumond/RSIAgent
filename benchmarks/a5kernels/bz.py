@@ -44,6 +44,9 @@ class BZCommandExecutor(Protocol):
 
     def inspect(self, argv: tuple[str, ...]) -> CommandResult: ...
 
+    @property
+    def runtime_provenance(self) -> tuple[tuple[str, str], ...]: ...
+
 
 class RuntimeUnavailableError(RuntimeError):
     """Raised before dispatch when no real language driver is registered."""
@@ -62,6 +65,10 @@ class ProfileCommandExecutor:
             raise ValueError("upload_wrapper must identify the checked-in upload.sh")
         self._upload_wrapper = upload_wrapper
         self._run = process_runner
+
+    @property
+    def runtime_provenance(self) -> tuple[tuple[str, str], ...]:
+        return ()
 
     def run(self, invocation: CommandInvocation) -> CommandResult:
         with tempfile.TemporaryDirectory(prefix="a5kernel-") as temporary:
@@ -134,6 +141,14 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
         self._catlass_source = catlass_source
         self._catlass_revision = catlass_revision
 
+    @property
+    def runtime_provenance(self) -> tuple[tuple[str, str], ...]:
+        return (
+            ("catlass_revision", self._catlass_revision),
+            ("catlass_source", self._catlass_source),
+            ("execution_profile", "bz-a5"),
+        )
+
     def _dispatch(self, invocation: CommandInvocation):
         operation = _session_name(invocation.argv)
         timeout = _option_value(invocation.argv, "--observe-timeout")
@@ -177,13 +192,17 @@ class BZSessionAdapter:
         self._wrapper = str(wrapper)
         self._observe_timeout = observe_timeout
 
+    @property
+    def runtime_provenance(self) -> tuple[tuple[str, str], ...]:
+        return self._executor.runtime_provenance
+
     def execute(self, plan: ExecutionPlan) -> ExecutionReceipt:
         if plan.argv is None:
             raise RuntimeUnavailableError(
                 f"no executable runtime is registered for {plan.language}"
             )
-        session_name = f"codex-a5hello-{plan.request_id[:8]}-{plan.attempt_id}"
-        remote_directory = f".a5kernels/{plan.request_id}/{plan.attempt_id}"
+        session_name = f"codex-a5hello-{plan.execution_id[:8]}-{plan.attempt_id}"
+        remote_directory = f".a5kernels/{plan.execution_id}/{plan.attempt_id}"
         payload = json.dumps(
             {"input_a": plan.input_a, "input_b": plan.input_b},
             separators=(",", ":"),
@@ -211,6 +230,16 @@ class BZSessionAdapter:
             remote_directory=remote_directory,
         )
         dispatch = self._executor.run(invocation)
+        if dispatch.exit_code != 0 and not _proven_observation_uncertain(
+            dispatch, session_name
+        ):
+            return ExecutionReceipt(
+                exit_code=dispatch.exit_code,
+                output=(),
+                stdout=dispatch.stdout,
+                stderr=dispatch.stderr,
+                session_handle=dispatch.session_handle,
+            )
         logs = self._executor.inspect((self._wrapper, "--name", session_name, "logs"))
         result = self._executor.inspect(
             (self._wrapper, "--name", session_name, "result")
@@ -219,7 +248,7 @@ class BZSessionAdapter:
         return ExecutionReceipt(
             exit_code=result.exit_code,
             output=output,
-            stdout=logs.stdout,
+            stdout=_join_output(dispatch.stdout, logs.stdout),
             stderr="\n".join(
                 part for part in (dispatch.stderr, logs.stderr, result.stderr) if part
             ),
@@ -260,3 +289,15 @@ def _option_value(argv: tuple[str, ...], option: str) -> str:
 
 def _is_revision(value: str) -> bool:
     return len(value) == 40 and all(character in "0123456789abcdef" for character in value)
+
+
+def _proven_observation_uncertain(result: CommandResult, session_name: str) -> bool:
+    return (
+        result.exit_code == 75
+        and "CATLASS_VALIDATION_STATE=observation-unavailable" in result.stdout
+        and f"CATLASS_VALIDATION_HANDLE=bz-a5:{session_name}" in result.stdout
+    )
+
+
+def _join_output(*parts: str) -> str:
+    return "\n".join(part.rstrip("\n") for part in parts if part)

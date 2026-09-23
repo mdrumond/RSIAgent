@@ -60,10 +60,18 @@ def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
 
 
 class FakeBackend:
-    def __init__(self, *, corrupt=False, exit_code=0, claimed_score="0"):
+    def __init__(
+        self,
+        *,
+        corrupt=False,
+        exit_code=0,
+        claimed_score="0",
+        runtime_provenance=(),
+    ):
         self.corrupt = corrupt
         self.exit_code = exit_code
         self.claimed_score = claimed_score
+        self.runtime_provenance = runtime_provenance
         self.plans = []
 
     def execute(self, plan):
@@ -89,6 +97,7 @@ def test_each_language_fixture_runs_through_host_oracle(language):
     assert result.max_abs_error == 0
     assert backend.plans[0].language == language.value
     assert backend.plans[0].source_fingerprint == result.source_fingerprint
+    assert result.runtime_provenance == ()
     assert len(result.attestation_sha256) == 64
 
 
@@ -140,11 +149,12 @@ def test_invalid_lengths_are_rejected(length):
 
 
 class FakeCommandExecutor:
-    def __init__(self, dispatch, inspections=()):
+    def __init__(self, dispatch, inspections=(), runtime_provenance=()):
         self.dispatch = dispatch
         self.inspections = list(inspections)
         self.invocations = []
         self.inspect_argv = []
+        self.runtime_provenance = runtime_provenance
 
     def run(self, invocation):
         self.invocations.append(invocation)
@@ -178,7 +188,7 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
     assert invocation.argv[:4] == (
         "execution-profiles/bz-a5/session.sh",
         "--name",
-        f"codex-a5hello-{plan.request_id[:8]}-trial-1",
+        f"codex-a5hello-{plan.execution_id[:8]}-trial-1",
         "run",
     )
     assert invocation.files[:-1] == plan.files
@@ -187,14 +197,63 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
         "input_a": list(plan.input_a),
         "input_b": list(plan.input_b),
     }
-    assert invocation.remote_directory == f".a5kernels/{plan.request_id}/trial-1"
+    assert invocation.remote_directory == f".a5kernels/{plan.execution_id}/trial-1"
     assert invocation.argv[-4:] == (
         "python",
-        f".a5kernels/{plan.request_id}/trial-1/host_driver.py",
-        f".a5kernels/{plan.request_id}/trial-1/kernel.py",
-        f".a5kernels/{plan.request_id}/trial-1/input.json",
+        f".a5kernels/{plan.execution_id}/trial-1/host_driver.py",
+        f".a5kernels/{plan.execution_id}/trial-1/kernel.py",
+        f".a5kernels/{plan.execution_id}/trial-1/input.json",
     )
     assert invocation.stdin == ""
+    assert [argv[-1] for argv in command.inspect_argv] == ["logs", "result"]
+
+
+def test_bz_adapter_does_not_accept_stale_evidence_after_dispatch_failure():
+    command = FakeCommandExecutor(
+        CommandResult(9, "upload failed", "transfer error"),
+        (
+            CommandResult(0, f"{OUTPUT_MARKER}[3]\n"),
+            CommandResult(0, "old success"),
+        ),
+    )
+    backend = BZSessionAdapter(
+        command, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+
+    receipt = backend.execute(plan)
+
+    assert receipt.exit_code == 9
+    assert receipt.output == ()
+    assert receipt.stdout == "upload failed"
+    assert receipt.stderr == "transfer error"
+    assert command.inspect_argv == []
+
+
+def test_bz_adapter_observes_only_explicitly_identified_uncertain_dispatch():
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+    session = f"codex-a5hello-{plan.execution_id[:8]}-trial-1"
+    command = FakeCommandExecutor(
+        CommandResult(
+            75,
+            "CATLASS_VALIDATION_STATE=observation-unavailable\n"
+            f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n",
+        ),
+        (
+            CommandResult(0, f"{OUTPUT_MARKER}[3]\n"),
+            CommandResult(0, "exit=0"),
+        ),
+    )
+
+    receipt = BZSessionAdapter(
+        command, session_wrapper="execution-profiles/bz-a5/session.sh"
+    ).execute(plan)
+
+    assert receipt.output == (3.0,)
     assert [argv[-1] for argv in command.inspect_argv] == ["logs", "result"]
 
 
@@ -287,6 +346,37 @@ def test_host_driver_preflight_rejects_wrong_retained_revision(tmp_path):
     assert "expected " + "0" * 40 in result.stderr
 
 
+@pytest.mark.parametrize("dirty_kind", ["tracked", "untracked"])
+def test_host_driver_preflight_rejects_dirty_retained_source(tmp_path, dirty_kind):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    sources = {item.relative_path: item.content for item in fixture.files}
+    for name, content in sources.items():
+        (tmp_path / name).write_text(content)
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    if dirty_kind == "tracked":
+        dirty_path = tmp_path / "catlass" / "tla.py"
+        dirty_path.write_text(dirty_path.read_text() + "changed = True\n")
+    else:
+        dirty_path = tmp_path / "untracked-change.py"
+        dirty_path.write_text("changed = True\n")
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+    )
+
+    assert result.returncode != 0
+    assert "Catlass retained source is not clean" in result.stderr
+    assert dirty_path.name in result.stderr
+
+
 def test_catlass_capacity_is_rejected_before_remote_execution():
     with pytest.raises(ValueError, match="cannot exceed 400"):
         A5KernelRunner(FakeBackend()).prepare(
@@ -314,7 +404,7 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
                 "--profile",
                 "bz-a5",
                 "--operation",
-                f"codex-a5hello-{plan.request_id[:8]}-trial-1",
+                f"codex-a5hello-{plan.execution_id[:8]}-trial-1",
                 "run",
                 "--catlass-src",
                 source,
@@ -324,9 +414,9 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
             assert argv[-1] == revision
             assert argv[-5:-1] == (
                 "python",
-                f".a5kernels/{plan.request_id}/trial-1/host_driver.py",
-                f".a5kernels/{plan.request_id}/trial-1/kernel.py",
-                f".a5kernels/{plan.request_id}/trial-1/input.json",
+                f".a5kernels/{plan.execution_id}/trial-1/host_driver.py",
+                f".a5kernels/{plan.execution_id}/trial-1/kernel.py",
+                f".a5kernels/{plan.execution_id}/trial-1/input.json",
             )
             return subprocess.CompletedProcess(argv, 0, "completed", "")
         if argv[-1] == "logs":
@@ -347,14 +437,14 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
         ),
         session_wrapper="execution-profiles/bz-a5/session.sh",
     )
-    plan = A5KernelRunner(FakeBackend()).prepare(
+    plan = A5KernelRunner(backend).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
     )
 
     receipt = backend.execute(plan)
 
     assert receipt.output == (3.0,)
-    assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.request_id[:8]}-trial-1"
+    assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.execution_id[:8]}-trial-1"
     assert len(calls) == 4
 
 
@@ -379,6 +469,36 @@ def test_catlass_executor_rejects_implicit_or_unpinned_configuration(
 
     with pytest.raises(ValueError, match=message):
         CatlassValidationExecutor(**options)
+
+
+def test_runtime_revision_changes_identity_session_and_attestation():
+    source = "/home/mariodrumond/worktrees/catlass/retained"
+    first_provenance = (
+        ("catlass_revision", "1" * 40),
+        ("catlass_source", source),
+        ("execution_profile", "bz-a5"),
+    )
+    second_provenance = (
+        ("catlass_revision", "2" * 40),
+        ("catlass_source", source),
+        ("execution_profile", "bz-a5"),
+    )
+    request = RunRequest(Language.CATLASS_DSL.value, length=1)
+    first_result = A5KernelRunner(
+        FakeBackend(runtime_provenance=first_provenance)
+    ).run(request, attempt_id="same-attempt")
+    second_result = A5KernelRunner(
+        FakeBackend(runtime_provenance=second_provenance)
+    ).run(request, attempt_id="same-attempt")
+
+    assert first_result.request_id == second_result.request_id
+    assert first_result.execution_id != second_result.execution_id
+    assert first_result.runtime_provenance != second_result.runtime_provenance
+    assert first_result.evidence_sha256 != second_result.evidence_sha256
+    assert first_result.attestation_sha256 != second_result.attestation_sha256
+    first_session = f"codex-a5hello-{first_result.execution_id[:8]}-same-attempt"
+    second_session = f"codex-a5hello-{second_result.execution_id[:8]}-same-attempt"
+    assert first_session != second_session
 
 
 @pytest.mark.parametrize("stdout", ["no record", f"{OUTPUT_MARKER}[]\n{OUTPUT_MARKER}[]"])

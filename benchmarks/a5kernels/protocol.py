@@ -58,6 +58,16 @@ class ExecutionPlan:
     argv: tuple[str, ...] | None
     input_a: tuple[float, ...]
     input_b: tuple[float, ...]
+    runtime_provenance: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def execution_id(self) -> str:
+        return canonical_hash(
+            {
+                "request_id": self.request_id,
+                "runtime_provenance": self.runtime_provenance,
+            }
+        )
 
     @property
     def source_fingerprint(self) -> str:
@@ -87,8 +97,10 @@ class VerifiedResult:
     """Authoritative host-generated result packet."""
 
     request_id: str
+    execution_id: str
     attempt_id: str
     language: str
+    runtime_provenance: tuple[tuple[str, str], ...]
     passed: bool
     max_abs_error: float
     exit_code: int

@@ -53,6 +53,7 @@ class A5KernelRunner:
             argv=fixture.argv,
             input_a=input_a,
             input_b=input_b,
+            runtime_provenance=getattr(self._backend, "runtime_provenance", ()),
         )
 
     def run(
@@ -79,12 +80,16 @@ class A5KernelRunner:
                 "stderr": receipt.stderr,
                 "session_handle": receipt.session_handle,
                 "output_sha256": output_sha,
+                "execution_id": plan.execution_id,
+                "runtime_provenance": plan.runtime_provenance,
             }
         )
         fields = {
             "request_id": plan.request_id,
+            "execution_id": plan.execution_id,
             "attempt_id": plan.attempt_id,
             "language": plan.language,
+            "runtime_provenance": plan.runtime_provenance,
             "passed": passed,
             "max_abs_error": max_error,
             "exit_code": receipt.exit_code,
