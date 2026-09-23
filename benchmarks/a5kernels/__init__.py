@@ -15,6 +15,10 @@ from benchmarks.a5kernels.knowledge import (
     SearchHit,
 )
 from benchmarks.a5kernels.protocol import RunRequest, VerifiedResult
+from benchmarks.a5kernels.profiling import (
+    ProfileRequest,
+    ProfilingTreatmentController,
+)
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
 
 __all__ = [
@@ -29,6 +33,8 @@ __all__ = [
     "KnowledgeDB",
     "Language",
     "ProfileCommandExecutor",
+    "ProfileRequest",
+    "ProfilingTreatmentController",
     "RunRequest",
     "SearchHit",
     "VerifiedResult",
