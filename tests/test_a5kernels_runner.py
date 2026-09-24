@@ -377,11 +377,71 @@ def test_host_driver_preflight_rejects_dirty_retained_source(tmp_path, dirty_kin
     assert dirty_path.name in result.stderr
 
 
+def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    sources = {item.relative_path: item.content for item in fixture.files}
+    for name, content in sources.items():
+        (tmp_path / name).write_text(content)
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "A5 Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "a5@example.invalid"],
+        check=True,
+    )
+    (tmp_path / ".gitignore").write_text("catlass/runtime_shadow.py\n")
+    tracked_tla = tmp_path / "catlass" / "tla.py"
+    tracked_tla.write_text("import catlass.runtime_shadow\n" + tracked_tla.read_text())
+    subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore", "catlass/tla.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "load runtime artifact"], check=True)
+    revision = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    (tmp_path / "catlass" / "runtime_shadow.py").write_text("SHADOW = True\n")
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain", "--untracked-files=all"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout == ""
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+    )
+
+    assert result.returncode != 0
+    assert "Catlass import provenance mismatch" in result.stderr
+    assert "runtime_shadow.py" in result.stderr
+
+
 def test_catlass_capacity_is_rejected_before_remote_execution():
     with pytest.raises(ValueError, match="cannot exceed 400"):
         A5KernelRunner(FakeBackend()).prepare(
             RunRequest(Language.CATLASS_DSL.value, length=401)
         )
+
+
+def test_catlass_source_pads_to_full_tiles_and_preserves_public_capacity():
+    source = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
+        "kernel.py"
+    ]
+
+    assert "PADDED_VECTOR_ELE = 448" in source
+    assert "padded_length = ((original_length + VL_ELE - 1) // VL_ELE) * VL_ELE" in source
+    assert "return out[:original_length].cpu().tolist()" in source
+    A5KernelRunner(FakeBackend()).prepare(RunRequest(Language.CATLASS_DSL.value, length=400))
 
 
 def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence():
@@ -539,6 +599,32 @@ def test_plan_content_changes_identity_remote_directory_and_session(plan_field):
 
     invocations = []
     for candidate in (plan, changed):
+        command = FakeCommandExecutor(CommandResult(9, "expected dispatch failure"))
+        BZSessionAdapter(
+            command, session_wrapper="execution-profiles/bz-a5/session.sh"
+        ).execute(candidate)
+        invocations.append(command.invocations[0])
+
+    assert invocations[0].remote_directory != invocations[1].remote_directory
+    assert invocations[0].argv[2] != invocations[1].argv[2]
+
+
+def test_input_changes_with_same_sum_change_identity_remote_directory_and_session():
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=2), attempt_id="same-attempt"
+    )
+    changed = replace(plan, input_a=(1.0, 2.0), input_b=(0.0, 3.0))
+    original = replace(plan, input_a=(0.0, 3.0), input_b=(1.0, 2.0))
+
+    assert sum(original.input_a) == sum(changed.input_a)
+    assert sum(original.input_b) == sum(changed.input_b)
+    assert original.request_id == changed.request_id
+    assert original.runtime_provenance == changed.runtime_provenance
+    assert original.attempt_id == changed.attempt_id
+    assert original.execution_id != changed.execution_id
+
+    invocations = []
+    for candidate in (original, changed):
         command = FakeCommandExecutor(CommandResult(9, "expected dispatch failure"))
         BZSessionAdapter(
             command, session_wrapper="execution-profiles/bz-a5/session.sh"

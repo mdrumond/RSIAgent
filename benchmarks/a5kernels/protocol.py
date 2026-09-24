@@ -65,6 +65,8 @@ class ExecutionPlan:
         return canonical_hash(
             {
                 "argv": self.argv,
+                "input_a": self.input_a,
+                "input_b": self.input_b,
                 "request_id": self.request_id,
                 "runtime_provenance": self.runtime_provenance,
                 "source_fingerprint": self.source_fingerprint,

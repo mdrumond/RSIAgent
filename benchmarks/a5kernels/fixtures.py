@@ -28,6 +28,7 @@ _CATLASS_SOURCE = '''\
 import catlass.tla as tla
 
 VECTOR_ELE = 400
+PADDED_VECTOR_ELE = 448
 VL_ELE = 64
 
 @tla.kernel
@@ -36,9 +37,9 @@ def vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor) -> None:
     ub_loaded = tla.flag("ub_loaded", tla.arch.MTE2, tla.arch.VECTOR)
     vec_done = tla.flag("vec_done", tla.arch.VECTOR, tla.arch.MTE3)
 
-    ptr_a = tla.allocate(VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
-    ptr_b = tla.allocate(VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
-    ptr_c = tla.allocate(VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
+    ptr_a = tla.allocate(PADDED_VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
+    ptr_b = tla.allocate(PADDED_VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
+    ptr_c = tla.allocate(PADDED_VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
     ub_a = tla.make_tensor_like(ptr_a, gm_a, tla.arch.RowMajor)
     ub_b = tla.make_tensor_like(ptr_b, gm_b, tla.arch.RowMajor)
     ub_c = tla.make_tensor_like(ptr_c, gm_c, tla.arch.RowMajor)
@@ -67,6 +68,10 @@ def run(input_a, input_b):
 
     if not 0 < len(input_a) <= VECTOR_ELE or len(input_a) != len(input_b):
         raise ValueError(f"vector length must be in [1, {VECTOR_ELE}]")
+    original_length = len(input_a)
+    padded_length = ((original_length + VL_ELE - 1) // VL_ELE) * VL_ELE
+    input_a = [*input_a, *([0.0] * (padded_length - original_length))]
+    input_b = [*input_b, *([0.0] * (padded_length - original_length))]
     torch.npu.set_device(0)
     a = torch.tensor(input_a, dtype=torch.float32, device="npu")
     b = torch.tensor(input_b, dtype=torch.float32, device="npu")
@@ -83,7 +88,7 @@ def run(input_a, input_b):
     )
     artifact(tla_a, tla_b, tla_out, block_num=1)
     torch.npu.synchronize()
-    return out.cpu().tolist()
+    return out[:original_length].cpu().tolist()
 '''
 
 _CATLASS_DRIVER = '''\
@@ -140,13 +145,41 @@ def _preflight_runtime(expected_revision: str) -> None:
 
     import catlass.tla as tla
 
+    for name, module in sorted(sys.modules.items()):
+        if name != "catlass" and not name.startswith("catlass."):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        location = Path(module_file).resolve()
+        try:
+            relative = location.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Catlass import provenance mismatch: {name} at {location} "
+                f"is not under {source}"
+            ) from exc
+        expected_blob = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", f"{expected_revision}:{relative.as_posix()}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        actual_blob = subprocess.run(
+            ["git", "-C", str(source), "hash-object", "--no-filters", str(location)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        expected = expected_blob.stdout.strip()
+        actual = actual_blob.stdout.strip()
+        if expected_blob.returncode != 0 or actual_blob.returncode != 0 or actual != expected:
+            raise RuntimeError(
+                "Catlass import provenance mismatch: "
+                f"{name} at {location} is not the pinned "
+                f"{expected_revision}:{relative.as_posix()} blob"
+            )
     location = Path(getattr(tla, "__file__", "<unknown>")).resolve()
-    try:
-        location.relative_to(source)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"Catlass import provenance mismatch: {location} is not under {source}"
-        ) from exc
     missing = [name for name in REQUIRED_TLA_API if not hasattr(tla, name)]
     if missing:
         raise RuntimeError(
