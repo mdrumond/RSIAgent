@@ -559,6 +559,42 @@ def test_host_driver_rechecks_late_catlass_runtime_import(tmp_path):
     assert "must not run kernel" not in result.stderr
 
 
+def test_host_driver_rechecks_catlass_modules_loaded_during_run(tmp_path):
+    driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
+        "host_driver.py"
+    ]
+    (tmp_path / "host_driver.py").write_text(driver)
+    (tmp_path / "kernel.py").write_text(
+        "def run(a, b):\n"
+        "    import sys, types\n"
+        "    from pathlib import Path\n"
+        "    lazy = types.ModuleType('catlass.lazy_runtime')\n"
+        "    lazy.__file__ = str(Path(__file__).with_name('lazy_runtime.py'))\n"
+        "    sys.modules[lazy.__name__] = lazy\n"
+        "    return [left + right for left, right in zip(a, b)]\n"
+    )
+    (tmp_path / "input.json").write_text(json.dumps({"input_a": [1], "input_b": [2]}))
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "A5 Test"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "a5@example.invalid"], check=True)
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text(ignore.read_text() + "lazy_runtime.py\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "ignore lazy runtime"], check=True)
+    revision = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+    _write_native_manifest(tmp_path, revision)
+    (tmp_path / "lazy_runtime.py").write_text("# ignored lazy module\n")
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision), cwd=tmp_path, text=True, capture_output=True,
+        check=False, env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode != 0
+    assert "lazy_runtime.py" in result.stderr
+    assert OUTPUT_MARKER not in result.stdout
+
+
 def test_host_driver_preflight_accepts_manifested_generated_bridge(tmp_path):
     driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
         "host_driver.py"

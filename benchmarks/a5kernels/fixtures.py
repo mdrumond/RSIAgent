@@ -379,7 +379,9 @@ def main() -> int:
     source, native_location, native_sha256 = _preflight_runtime(*sys.argv[3:])
     kernel = _load_kernel(sys.argv[1])
     _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
-    output = _numbers(kernel.run(input_a, input_b), "output")
+    raw_output = kernel.run(input_a, input_b)
+    _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
+    output = _numbers(raw_output, "output")
     print(OUTPUT_MARKER + json.dumps(output, separators=(",", ":"), allow_nan=False))
     return 0
 
