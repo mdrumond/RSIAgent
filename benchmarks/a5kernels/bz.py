@@ -138,16 +138,61 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
         if not _is_revision(catlass_revision):
             raise ValueError("catlass_revision must be a lowercase 40-character SHA")
         self._validation_wrapper = validation_wrapper
+        self._provenance_wrapper = str(
+            Path(validation_wrapper).parent / "bz-a5" / "catlass-provenance.sh"
+        )
         self._catlass_source = catlass_source
         self._catlass_revision = catlass_revision
+        self._runtime_provenance: tuple[tuple[str, str], ...] | None = None
 
     @property
     def runtime_provenance(self) -> tuple[tuple[str, str], ...]:
-        return (
+        if self._runtime_provenance is not None:
+            return self._runtime_provenance
+        completed = self._call(
+            (
+                self._provenance_wrapper,
+                "--catlass-src",
+                self._catlass_source,
+                "--revision",
+                self._catlass_revision,
+            )
+        )
+        if completed.returncode != 0:
+            raise RuntimeUnavailableError(
+                f"Catlass runtime provenance probe failed: {completed.stderr.strip()}"
+            )
+        records = [
+            line.removeprefix("CATLASS_RUNTIME_PROVENANCE=")
+            for line in completed.stdout.splitlines()
+            if line.startswith("CATLASS_RUNTIME_PROVENANCE=")
+        ]
+        if len(records) != 1:
+            raise RuntimeUnavailableError("Catlass runtime provenance probe returned no unique record")
+        try:
+            record = json.loads(records[0])
+        except json.JSONDecodeError as exc:
+            raise RuntimeUnavailableError("Catlass runtime provenance probe returned invalid JSON") from exc
+        keys = {
+            "manifest_sha256",
+            "bridge_sha256",
+            "ascendnpu_ir_gitlink",
+            "ascendnpu_ir_install_commit",
+            "cann_version",
+        }
+        if not isinstance(record, dict) or set(record) != keys:
+            raise RuntimeUnavailableError("Catlass runtime provenance probe returned invalid fields")
+        if any(not isinstance(record[key], str) or not record[key] for key in keys):
+            raise RuntimeUnavailableError("Catlass runtime provenance probe returned empty fields")
+        if record["ascendnpu_ir_gitlink"] != record["ascendnpu_ir_install_commit"]:
+            raise RuntimeUnavailableError("Catlass dependency provenance probe mismatch")
+        self._runtime_provenance = (
             ("catlass_revision", self._catlass_revision),
             ("catlass_source", self._catlass_source),
             ("execution_profile", "bz-a5"),
+            *(tuple((key, record[key]) for key in sorted(keys))),
         )
+        return self._runtime_provenance
 
     def _dispatch(self, invocation: CommandInvocation):
         operation = _session_name(invocation.argv)
@@ -156,7 +201,16 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
             command_index = invocation.argv.index("--") + 1
         except ValueError as exc:
             raise ValueError("session invocation is missing command separator") from exc
-        command = (*invocation.argv[command_index:], self._catlass_revision)
+        provenance = dict(self.runtime_provenance)
+        command = (
+            *invocation.argv[command_index:],
+            self._catlass_revision,
+            provenance["manifest_sha256"],
+            provenance["bridge_sha256"],
+            provenance["ascendnpu_ir_gitlink"],
+            provenance["ascendnpu_ir_install_commit"],
+            provenance["cann_version"],
+        )
         return self._call(
             (
                 self._validation_wrapper,
@@ -194,7 +248,7 @@ class BZSessionAdapter:
 
     @property
     def runtime_provenance(self) -> tuple[tuple[str, str], ...]:
-        return self._executor.runtime_provenance
+        return tuple(getattr(self._executor, "runtime_provenance", ()))
 
     def execute(self, plan: ExecutionPlan) -> ExecutionReceipt:
         if plan.argv is None:

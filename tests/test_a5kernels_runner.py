@@ -41,8 +41,12 @@ from pathlib import Path
 native = types.ModuleType("catlass._tla_type_bridge_native")
 native.__file__ = str(Path(__file__).resolve().parents[1] / "python/tla_dsl/csrc/mlir/build/python/catlass/_tla_type_bridge_native.test.so")
 sys.modules[native.__name__] = native
+runtime = types.ModuleType("catlass.tla.runtime")
+runtime.__file__ = str(Path(__file__).with_name("tla_runtime.py"))
+sys.modules[runtime.__name__] = runtime
 """
     (package / "tla.py").write_text(native_setup + exports)
+    (package / "tla_runtime.py").write_text("# tracked runtime fixture\n")
     (root / ".gitignore").write_text("python/tla_dsl/csrc/mlir/build/\ndeps/\n")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
@@ -121,6 +125,27 @@ def _fake_runtime_env(root: Path):
         "CATLASS_SRC": str(root),
         "CATLASS_DSL_ASCENDNPU_IR_INSTALL_DIR": str(root / "deps"),
     }
+
+
+def _driver_argv(root: Path, revision: str):
+    manifest_path = root / "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
+    manifest = json.loads(manifest_path.read_text())
+    canonical = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    artifact = manifest["artifacts"][0]
+    return [
+        sys.executable,
+        "host_driver.py",
+        "kernel.py",
+        "input.json",
+        revision,
+        hashlib.sha256(canonical).hexdigest(),
+        artifact["sha256"],
+        manifest["ascendnpu_ir_gitlink"],
+        manifest["ascendnpu_ir_install_commit"],
+        manifest["cann_version"],
+    ]
 
 
 class FakeBackend:
@@ -346,7 +371,7 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
     revision = _write_fake_catlass(tmp_path, compatible=True)
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        _driver_argv(tmp_path, revision),
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -371,7 +396,7 @@ def test_host_driver_preflight_rejects_legacy_catlass_before_kernel_import(tmp_p
     revision = _write_fake_catlass(tmp_path, compatible=False)
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        _driver_argv(tmp_path, revision),
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -397,7 +422,7 @@ def test_host_driver_preflight_rejects_wrong_retained_revision(tmp_path):
     _write_fake_catlass(tmp_path, compatible=True)
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", "0" * 40],
+        _driver_argv(tmp_path, "0" * 40),
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -428,7 +453,7 @@ def test_host_driver_preflight_rejects_dirty_retained_source(tmp_path, dirty_kin
         dirty_path.write_text("changed = True\n")
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        _driver_argv(tmp_path, revision),
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -487,7 +512,7 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
     ).stdout == ""
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        _driver_argv(tmp_path, revision),
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -498,6 +523,40 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
     assert result.returncode != 0
     assert "Catlass import provenance mismatch" in result.stderr
     assert "runtime_shadow.py" in result.stderr
+
+
+def test_host_driver_rechecks_late_catlass_runtime_import(tmp_path):
+    driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
+        "host_driver.py"
+    ]
+    (tmp_path / "host_driver.py").write_text(driver)
+    (tmp_path / "kernel.py").write_text(
+        "import sys, types\nfrom pathlib import Path\n"
+        "late = types.ModuleType('catlass.tla.runtime')\n"
+        "late.__file__ = str(Path(__file__).with_name('late_runtime.py'))\n"
+        "sys.modules[late.__name__] = late\n"
+        "def run(a, b):\n    raise RuntimeError('must not run kernel')\n"
+    )
+    (tmp_path / "input.json").write_text(json.dumps({"input_a": [1], "input_b": [2]}))
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "A5 Test"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "a5@example.invalid"], check=True)
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text(ignore.read_text() + "late_runtime.py\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "ignore late runtime"], check=True)
+    revision = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+    _write_native_manifest(tmp_path, revision)
+    (tmp_path / "late_runtime.py").write_text("# ignored late module\n")
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision), cwd=tmp_path, text=True, capture_output=True,
+        check=False, env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode != 0
+    assert "late_runtime.py" in result.stderr
+    assert "must not run kernel" not in result.stderr
 
 
 def test_host_driver_preflight_accepts_manifested_generated_bridge(tmp_path):
@@ -514,7 +573,7 @@ def test_host_driver_preflight_accepts_manifested_generated_bridge(tmp_path):
     revision = _write_fake_catlass(tmp_path, compatible=True)
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        _driver_argv(tmp_path, revision),
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -537,6 +596,7 @@ def test_host_driver_preflight_rejects_invalid_native_manifest(tmp_path, invalid
         json.dumps({"input_a": [1], "input_b": [2]})
     )
     revision = _write_fake_catlass(tmp_path, compatible=True)
+    driver_argv = _driver_argv(tmp_path, revision)
     manifest_path = tmp_path / "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
     if invalid_kind == "missing":
         manifest_path.unlink()
@@ -551,7 +611,7 @@ def test_host_driver_preflight_rejects_invalid_native_manifest(tmp_path, invalid
         manifest_path.write_text(json.dumps(manifest))
 
     result = subprocess.run(
-        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        driver_argv,
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -586,9 +646,20 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
     calls = []
     revision = "9a6ac627b5f4078060287844189730cf0d184800"
     source = "/home/mariodrumond/worktrees/catlass/rsi-a5-imperative-hello"
+    probed = {
+        "manifest_sha256": "1" * 64,
+        "bridge_sha256": "2" * 64,
+        "ascendnpu_ir_gitlink": "3" * 40,
+        "ascendnpu_ir_install_commit": "3" * 40,
+        "cann_version": "9.1.0-system",
+    }
 
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
+        if argv[0].endswith("catlass-provenance.sh"):
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_RUNTIME_PROVENANCE=" + json.dumps(probed) + "\n", ""
+            )
         if argv[0].endswith("upload.sh"):
             assert argv[1] == "--recursive"
             assert argv[3].startswith(".a5kernels/")
@@ -609,8 +680,8 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
                 "--timeout",
                 "600",
             )
-            assert argv[-1] == revision
-            assert argv[-5:-1] == (
+            assert argv[-6] == revision
+            assert argv[-10:-6] == (
                 "python",
                 f".a5kernels/{plan.execution_id}/trial-1/host_driver.py",
                 f".a5kernels/{plan.execution_id}/trial-1/kernel.py",
@@ -643,7 +714,62 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
 
     assert receipt.output == (3.0,)
     assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.execution_id[:8]}-trial-1"
-    assert len(calls) == 4
+    assert len(calls) == 5
+
+
+def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
+    def make_backend(bridge_sha):
+        calls = []
+        record = {
+            "manifest_sha256": bridge_sha,
+            "bridge_sha256": bridge_sha,
+            "ascendnpu_ir_gitlink": "3" * 40,
+            "ascendnpu_ir_install_commit": "3" * 40,
+            "cann_version": "9.1.0-system",
+        }
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_RUNTIME_PROVENANCE=" + json.dumps(record) + "\n", ""
+            )
+        executor = CatlassValidationExecutor(
+            upload_wrapper="execution-profiles/bz-a5/upload.sh",
+            validation_wrapper="execution-profiles/catlass-validation.sh",
+            catlass_source="/retained/catlass",
+            catlass_revision="9" * 40,
+            process_runner=run,
+        )
+        backend = BZSessionAdapter(executor, session_wrapper="execution-profiles/bz-a5/session.sh")
+        return backend, calls
+
+    first_backend, first_calls = make_backend("1" * 64)
+    second_backend, _ = make_backend("2" * 64)
+    request = RunRequest(Language.CATLASS_DSL.value, length=1)
+    first = A5KernelRunner(first_backend).prepare(request, attempt_id="same")
+    second = A5KernelRunner(second_backend).prepare(request, attempt_id="same")
+    assert first.execution_id != second.execution_id
+    assert first_backend.runtime_provenance == first_backend.runtime_provenance
+    assert len(first_calls) == 1
+
+
+def test_bz_adapter_accepts_legacy_executor_without_runtime_provenance():
+    class LegacyExecutor:
+        def run(self, invocation):
+            return CommandResult(9, "legacy dispatch")
+        def inspect(self, argv):
+            raise AssertionError("failed dispatch must not inspect")
+
+    backend = BZSessionAdapter(
+        LegacyExecutor(), session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    assert backend.runtime_provenance == ()
+    plan = replace(
+        A5KernelRunner(FakeBackend()).prepare(
+            RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="legacy"
+        ),
+        argv=("legacy-driver",),
+    )
+    assert backend.execute(plan).exit_code == 9
 
 
 @pytest.mark.parametrize(

@@ -95,6 +95,7 @@ _CATLASS_DRIVER = '''\
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import hashlib
 import json
 import os
@@ -127,7 +128,15 @@ def _provenance_value(path: Path, names: tuple[str, ...]) -> str:
     return ""
 
 
-def _native_artifact(source: Path, expected_revision: str) -> tuple[Path, str]:
+def _native_artifact(
+    source: Path,
+    expected_revision: str,
+    expected_manifest_sha256: str,
+    expected_bridge_sha256: str,
+    expected_gitlink: str,
+    expected_install_commit: str,
+    expected_cann_version: str,
+) -> tuple[Path, str]:
     manifest_path = source / NATIVE_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -141,6 +150,11 @@ def _native_artifact(source: Path, expected_revision: str) -> tuple[Path, str]:
         "cann_version",
         "artifacts",
     }
+    canonical_manifest = json.dumps(
+        manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if hashlib.sha256(canonical_manifest).hexdigest() != expected_manifest_sha256:
+        raise RuntimeError("Catlass native provenance manifest digest mismatch")
     if not isinstance(manifest, dict) or set(manifest) != expected_keys:
         raise RuntimeError("Catlass native provenance manifest has an invalid schema")
     artifacts = manifest["artifacts"]
@@ -187,6 +201,9 @@ def _native_artifact(source: Path, expected_revision: str) -> tuple[Path, str]:
         or manifest["ascendnpu_ir_gitlink"] != gitlink
         or manifest["ascendnpu_ir_install_commit"] != install_commit
         or manifest["cann_version"] != cann_version
+        or gitlink != expected_gitlink
+        or install_commit != expected_install_commit
+        or cann_version != expected_cann_version
         or install_commit != gitlink
         or not cann_version
     ):
@@ -213,10 +230,58 @@ def _native_artifact(source: Path, expected_revision: str) -> tuple[Path, str]:
         location.relative_to(source)
     except ValueError as exc:
         raise RuntimeError("Catlass native provenance artifact escapes the retained source") from exc
+    if digest != expected_bridge_sha256:
+        raise RuntimeError("Catlass native provenance bridge digest mismatch")
     return location, digest
 
 
-def _preflight_runtime(expected_revision: str) -> None:
+def _verify_loaded_catlass_modules(
+    source: Path,
+    expected_revision: str,
+    native_location: Path,
+    native_sha256: str,
+) -> None:
+    native_seen = False
+    for name, module in sorted(sys.modules.items()):
+        if name != "catlass" and not name.startswith("catlass."):
+            continue
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            continue
+        location = Path(module_file).resolve()
+        if name == NATIVE_MODULE:
+            if native_seen or location != native_location:
+                raise RuntimeError(f"Catlass native import provenance mismatch: {name} at {location}")
+            if hashlib.sha256(location.read_bytes()).hexdigest() != native_sha256:
+                raise RuntimeError(f"Catlass native import provenance hash mismatch: {name} at {location}")
+            native_seen = True
+            continue
+        try:
+            relative = location.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError(f"Catlass import provenance mismatch: {name} at {location} is not under {source}") from exc
+        expected_blob = subprocess.run(
+            ["git", "-C", str(source), "rev-parse", f"{expected_revision}:{relative.as_posix()}"],
+            text=True, capture_output=True, check=False,
+        )
+        actual_blob = subprocess.run(
+            ["git", "-C", str(source), "hash-object", "--no-filters", str(location)],
+            text=True, capture_output=True, check=False,
+        )
+        if expected_blob.returncode or actual_blob.returncode or actual_blob.stdout.strip() != expected_blob.stdout.strip():
+            raise RuntimeError(f"Catlass import provenance mismatch: {name} at {location} is not the pinned {expected_revision}:{relative.as_posix()} blob")
+    if not native_seen:
+        raise RuntimeError("Catlass native import provenance is missing")
+
+
+def _preflight_runtime(
+    expected_revision: str,
+    expected_manifest_sha256: str,
+    expected_bridge_sha256: str,
+    expected_gitlink: str,
+    expected_install_commit: str,
+    expected_cann_version: str,
+):
     source_value = os.environ.get("CATLASS_SRC")
     if not source_value or not Path(source_value).is_absolute():
         raise RuntimeError("CATLASS_SRC must name the explicit retained Catlass source")
@@ -256,57 +321,19 @@ def _preflight_runtime(expected_revision: str) -> None:
         )
 
     import catlass.tla as tla
+    importlib.import_module("catlass.tla.runtime")
 
-    native_location, native_sha256 = _native_artifact(source, expected_revision)
-    native_seen = False
-    for name, module in sorted(sys.modules.items()):
-        if name != "catlass" and not name.startswith("catlass."):
-            continue
-        module_file = getattr(module, "__file__", None)
-        if module_file is None:
-            continue
-        location = Path(module_file).resolve()
-        if name == NATIVE_MODULE:
-            if native_seen or location != native_location:
-                raise RuntimeError(
-                    f"Catlass native import provenance mismatch: {name} at {location}"
-                )
-            actual_sha256 = hashlib.sha256(location.read_bytes()).hexdigest()
-            if actual_sha256 != native_sha256:
-                raise RuntimeError(
-                    f"Catlass native import provenance hash mismatch: {name} at {location}"
-                )
-            native_seen = True
-            continue
-        try:
-            relative = location.relative_to(source)
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Catlass import provenance mismatch: {name} at {location} "
-                f"is not under {source}"
-            ) from exc
-        expected_blob = subprocess.run(
-            ["git", "-C", str(source), "rev-parse", f"{expected_revision}:{relative.as_posix()}"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        actual_blob = subprocess.run(
-            ["git", "-C", str(source), "hash-object", "--no-filters", str(location)],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        expected = expected_blob.stdout.strip()
-        actual = actual_blob.stdout.strip()
-        if expected_blob.returncode != 0 or actual_blob.returncode != 0 or actual != expected:
-            raise RuntimeError(
-                "Catlass import provenance mismatch: "
-                f"{name} at {location} is not the pinned "
-                f"{expected_revision}:{relative.as_posix()} blob"
-            )
-    if not native_seen:
-        raise RuntimeError("Catlass native import provenance is missing")
+    native_location, native_sha256 = _native_artifact(
+        source,
+        expected_revision,
+        expected_manifest_sha256,
+        expected_bridge_sha256,
+        expected_gitlink,
+        expected_install_commit,
+        expected_cann_version,
+    )
+    _verify_loaded_catlass_modules(source, expected_revision, native_location, native_sha256)
+    """All Catlass imports above are verified before kernel or NPU setup."""
     location = Path(getattr(tla, "__file__", "<unknown>")).resolve()
     missing = [name for name in REQUIRED_TLA_API if not hasattr(tla, name)]
     if missing:
@@ -316,7 +343,7 @@ def _preflight_runtime(expected_revision: str) -> None:
             f"{','.join(missing)}; install a Catlass revision that provides "
             "the @tla.kernel frontend and tla.compile before A5 dispatch"
         )
-
+    return source, native_location, native_sha256
 
 def _load_kernel(path: str):
     source = Path(path)
@@ -337,8 +364,8 @@ def _numbers(value, name: str):
 
 
 def main() -> int:
-    if len(sys.argv) != 4:
-        raise SystemExit("usage: host_driver.py KERNEL.py INPUT.json CATLASS_REVISION")
+    if len(sys.argv) != 9:
+        raise SystemExit("usage: host_driver.py KERNEL.py INPUT.json REVISION MANIFEST_SHA BRIDGE_SHA GITLINK INSTALL_COMMIT CANN")
     with Path(sys.argv[2]).open(encoding="utf-8") as input_file:
         payload = json.load(input_file)
     if not isinstance(payload, dict) or set(payload) != {"input_a", "input_b"}:
@@ -347,8 +374,10 @@ def main() -> int:
     input_b = _numbers(payload["input_b"], "input_b")
     if len(input_a) != len(input_b):
         raise ValueError("input vectors must have equal length")
-    _preflight_runtime(sys.argv[3])
-    output = _numbers(_load_kernel(sys.argv[1]).run(input_a, input_b), "output")
+    source, native_location, native_sha256 = _preflight_runtime(*sys.argv[3:])
+    kernel = _load_kernel(sys.argv[1])
+    _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
+    output = _numbers(kernel.run(input_a, input_b), "output")
     print(OUTPUT_MARKER + json.dumps(output, separators=(",", ":"), allow_nan=False))
     return 0
 
