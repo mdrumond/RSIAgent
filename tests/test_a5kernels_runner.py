@@ -287,8 +287,9 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
         "input_b": list(plan.input_b),
     }
     assert invocation.remote_directory == f".a5kernels/{plan.execution_id}/trial-1"
-    assert invocation.argv[-4:] == (
+    assert invocation.argv[-5:] == (
         "python",
+        "-B",
         f".a5kernels/{plan.execution_id}/trial-1/host_driver.py",
         f".a5kernels/{plan.execution_id}/trial-1/kernel.py",
         f".a5kernels/{plan.execution_id}/trial-1/input.json",
@@ -350,7 +351,7 @@ def test_catlass_fixture_uses_current_imperative_runtime_api():
     fixture = fixture_for(Language.CATLASS_DSL)
     sources = {item.relative_path: item.content for item in fixture.files}
 
-    assert fixture.argv == ("python", "host_driver.py", "kernel.py", "input.json")
+    assert fixture.argv == ("python", "-B", "host_driver.py", "kernel.py", "input.json")
     assert set(sources) == {"host_driver.py", "kernel.py"}
     assert "tla.allocate" in sources["kernel.py"]
     assert 'tla.vec.func(mode="simd")' in sources["kernel.py"]
@@ -751,8 +752,9 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
                 "600",
             )
             assert argv[-6] == revision
-            assert argv[-10:-6] == (
+            assert argv[-11:-6] == (
                 "python",
+                "-B",
                 f".a5kernels/{plan.execution_id}/trial-1/host_driver.py",
                 f".a5kernels/{plan.execution_id}/trial-1/kernel.py",
                 f".a5kernels/{plan.execution_id}/trial-1/input.json",

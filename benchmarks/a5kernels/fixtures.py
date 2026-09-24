@@ -465,7 +465,7 @@ _FIXTURES = {
             SourceFile("kernel.py", _CATLASS_SOURCE),
             SourceFile("host_driver.py", _CATLASS_DRIVER),
         ),
-        ("python", "host_driver.py", "kernel.py", "input.json"),
+        ("python", "-B", "host_driver.py", "kernel.py", "input.json"),
         400,
     ),
     Language.ASCEND_C: Fixture(
