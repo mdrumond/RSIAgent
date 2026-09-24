@@ -495,7 +495,9 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
         check=True,
     ).stdout.strip()
     _write_native_manifest(tmp_path, revision)
-    (tmp_path / "catlass" / "runtime_shadow.py").write_text("SHADOW = True\n")
+    (tmp_path / "catlass" / "runtime_shadow.py").write_text(
+        "from pathlib import Path\nPath('ignored-helper-imported').touch()\n"
+    )
     assert subprocess.run(
         [
             "git",
@@ -521,8 +523,9 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
     )
 
     assert result.returncode != 0
-    assert "Catlass import provenance mismatch" in result.stderr
+    assert "untracked or ignored importable Catlass artifact" in result.stderr
     assert "runtime_shadow.py" in result.stderr
+    assert not (tmp_path / "ignored-helper-imported").exists()
 
 
 def test_host_driver_rechecks_late_catlass_runtime_import(tmp_path):

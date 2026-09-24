@@ -276,6 +276,39 @@ def _verify_loaded_catlass_modules(
         raise RuntimeError("Catlass native import provenance is missing")
 
 
+def _reject_untracked_importables(source: Path, native_location: Path) -> None:
+    discovered = set()
+    for extra in ((), ("--ignored",)):
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "ls-files",
+                "--others",
+                *extra,
+                "--exclude-standard",
+                "--",
+                "python/tla_dsl/catlass",
+                "catlass",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("Catlass package artifact scan failed")
+        discovered.update(line for line in result.stdout.splitlines() if line)
+    for relative_value in sorted(discovered):
+        location = (source / relative_value).resolve()
+        name = location.name.lower()
+        importable = name.endswith((".py", ".pyc", ".so", ".pyd", ".dll", ".dylib"))
+        if importable and location != native_location:
+            raise RuntimeError(
+                f"untracked or ignored importable Catlass artifact: {location}"
+            )
+
+
 def _preflight_runtime(
     expected_revision: str,
     expected_manifest_sha256: str,
@@ -331,6 +364,7 @@ def _preflight_runtime(
         expected_install_commit,
         expected_cann_version,
     )
+    _reject_untracked_importables(source, native_location)
     import catlass.tla as tla
     importlib.import_module("catlass.tla.runtime")
 
