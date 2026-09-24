@@ -585,6 +585,37 @@ def test_host_driver_preflight_accepts_manifested_generated_bridge(tmp_path):
     assert f"{OUTPUT_MARKER}[3.0]" in result.stdout
 
 
+def test_tampered_native_bridge_is_rejected_before_catlass_import(tmp_path):
+    driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
+        "host_driver.py"
+    ]
+    (tmp_path / "host_driver.py").write_text(driver)
+    (tmp_path / "kernel.py").write_text("raise RuntimeError('must not import kernel')\n")
+    (tmp_path / "input.json").write_text(json.dumps({"input_a": [1], "input_b": [2]}))
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "A5 Test"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "a5@example.invalid"], check=True)
+    tla = tmp_path / "catlass" / "tla.py"
+    tla.write_text("from pathlib import Path\nPath('catlass-imported').touch()\n" + tla.read_text())
+    subprocess.run(["git", "-C", str(tmp_path), "add", "catlass/tla.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "record import side effect"], check=True)
+    revision = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+    _write_native_manifest(tmp_path, revision)
+    argv = _driver_argv(tmp_path, revision)
+    bridge = tmp_path / "python/tla_dsl/csrc/mlir/build/python/catlass/_tla_type_bridge_native.test.so"
+    bridge.write_bytes(b"tampered after attestation")
+
+    result = subprocess.run(
+        argv, cwd=tmp_path, text=True, capture_output=True, check=False,
+        env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode != 0
+    assert "bridge contents mismatch" in result.stderr
+    assert not (tmp_path / "catlass-imported").exists()
+    assert "must not import kernel" not in result.stderr
+
+
 @pytest.mark.parametrize("invalid_kind", ["missing", "hash", "duplicate", "unknown"])
 def test_host_driver_preflight_rejects_invalid_native_manifest(tmp_path, invalid_kind):
     driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
@@ -748,6 +779,10 @@ def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
     first = A5KernelRunner(first_backend).prepare(request, attempt_id="same")
     second = A5KernelRunner(second_backend).prepare(request, attempt_id="same")
     assert first.execution_id != second.execution_id
+    assert f".a5kernels/{first.execution_id}/same" != f".a5kernels/{second.execution_id}/same"
+    assert f"codex-a5hello-{first.execution_id[:8]}-same" != f"codex-a5hello-{second.execution_id[:8]}-same"
+    assert dict(first.runtime_provenance)["manifest_sha256"] == "1" * 64
+    assert dict(second.runtime_provenance)["manifest_sha256"] == "2" * 64
     assert first_backend.runtime_provenance == first_backend.runtime_provenance
     assert len(first_calls) == 1
 

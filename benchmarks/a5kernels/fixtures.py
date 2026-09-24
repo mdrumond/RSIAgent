@@ -232,6 +232,8 @@ def _native_artifact(
         raise RuntimeError("Catlass native provenance artifact escapes the retained source") from exc
     if digest != expected_bridge_sha256:
         raise RuntimeError("Catlass native provenance bridge digest mismatch")
+    if hashlib.sha256(location.read_bytes()).hexdigest() != digest:
+        raise RuntimeError("Catlass native provenance bridge contents mismatch")
     return location, digest
 
 
@@ -320,9 +322,6 @@ def _preflight_runtime(
             f"Catlass retained source is not clean at {source}: {detail}"
         )
 
-    import catlass.tla as tla
-    importlib.import_module("catlass.tla.runtime")
-
     native_location, native_sha256 = _native_artifact(
         source,
         expected_revision,
@@ -332,6 +331,9 @@ def _preflight_runtime(
         expected_install_commit,
         expected_cann_version,
     )
+    import catlass.tla as tla
+    importlib.import_module("catlass.tla.runtime")
+
     _verify_loaded_catlass_modules(source, expected_revision, native_location, native_sha256)
     """All Catlass imports above are verified before kernel or NPU setup."""
     location = Path(getattr(tla, "__file__", "<unknown>")).resolve()
