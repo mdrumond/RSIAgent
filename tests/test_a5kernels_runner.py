@@ -1,5 +1,6 @@
 from dataclasses import FrozenInstanceError, replace
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -33,9 +34,30 @@ def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
         if compatible
         else "from_dlpack = object()\n"
     )
-    (package / "tla.py").write_text(exports)
+    native_setup = """\
+import sys
+import types
+from pathlib import Path
+native = types.ModuleType("catlass._tla_type_bridge_native")
+native.__file__ = str(Path(__file__).resolve().parents[1] / "python/tla_dsl/csrc/mlir/build/python/catlass/_tla_type_bridge_native.test.so")
+sys.modules[native.__name__] = native
+"""
+    (package / "tla.py").write_text(native_setup + exports)
+    (root / ".gitignore").write_text("python/tla_dsl/csrc/mlir/build/\ndeps/\n")
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{('1' * 40)},python/tla_dsl/3rdparty/AscendNPU-IR",
+        ],
+        check=True,
+    )
     subprocess.run(
         [
             "git",
@@ -51,12 +73,54 @@ def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
         ],
         check=True,
     )
-    return subprocess.run(
+    revision = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "HEAD"],
         text=True,
         capture_output=True,
         check=True,
     ).stdout.strip()
+    _write_native_manifest(root, revision)
+    return revision
+
+
+def _write_native_manifest(root: Path, revision: str, *, digest: str | None = None):
+    bridge = (
+        root
+        / "python/tla_dsl/csrc/mlir/build/python/catlass/_tla_type_bridge_native.test.so"
+    )
+    bridge.parent.mkdir(parents=True, exist_ok=True)
+    bridge.write_bytes(b"native bridge fixture")
+    actual_digest = hashlib.sha256(bridge.read_bytes()).hexdigest()
+    manifest = {
+        "schema": "catlass-native-build-v1",
+        "catlass_revision": revision,
+        "ascendnpu_ir_gitlink": "1" * 40,
+        "ascendnpu_ir_install_commit": "1" * 40,
+        "cann_version": "test-cann",
+        "artifacts": [
+            {
+                "module": "catlass._tla_type_bridge_native",
+                "path": bridge.relative_to(root).as_posix(),
+                "sha256": actual_digest if digest is None else digest,
+            }
+        ],
+    }
+    manifest_path = root / "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
+    manifest_path.write_text(json.dumps(manifest))
+    dep_root = root / "deps"
+    dep_root.mkdir(exist_ok=True)
+    (dep_root / ".cpl-build-provenance").write_text(
+        f"CAT_DEP_ASCENDNPU_IR_COMMIT={'1' * 40}\nASCEND_CANN_VERSION=test-cann\n"
+    )
+
+
+def _fake_runtime_env(root: Path):
+    return {
+        **os.environ,
+        "PYTHONPATH": str(root),
+        "CATLASS_SRC": str(root),
+        "CATLASS_DSL_ASCENDNPU_IR_INSTALL_DIR": str(root / "deps"),
+    }
 
 
 class FakeBackend:
@@ -287,7 +351,7 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+        env=_fake_runtime_env(tmp_path),
     )
 
     assert result.returncode == 0, result.stderr
@@ -312,7 +376,7 @@ def test_host_driver_preflight_rejects_legacy_catlass_before_kernel_import(tmp_p
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+        env=_fake_runtime_env(tmp_path),
     )
 
     assert result.returncode != 0
@@ -338,7 +402,7 @@ def test_host_driver_preflight_rejects_wrong_retained_revision(tmp_path):
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+        env=_fake_runtime_env(tmp_path),
     )
 
     assert result.returncode != 0
@@ -369,7 +433,7 @@ def test_host_driver_preflight_rejects_dirty_retained_source(tmp_path, dirty_kin
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+        env=_fake_runtime_env(tmp_path),
     )
 
     assert result.returncode != 0
@@ -393,7 +457,8 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
         ["git", "-C", str(tmp_path), "config", "user.email", "a5@example.invalid"],
         check=True,
     )
-    (tmp_path / ".gitignore").write_text("catlass/runtime_shadow.py\n")
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text(ignore.read_text() + "catlass/runtime_shadow.py\n")
     tracked_tla = tmp_path / "catlass" / "tla.py"
     tracked_tla.write_text("import catlass.runtime_shadow\n" + tracked_tla.read_text())
     subprocess.run(["git", "-C", str(tmp_path), "add", ".gitignore", "catlass/tla.py"], check=True)
@@ -404,9 +469,18 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
         capture_output=True,
         check=True,
     ).stdout.strip()
+    _write_native_manifest(tmp_path, revision)
     (tmp_path / "catlass" / "runtime_shadow.py").write_text("SHADOW = True\n")
     assert subprocess.run(
-        ["git", "-C", str(tmp_path), "status", "--porcelain", "--untracked-files=all"],
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ],
         text=True,
         capture_output=True,
         check=True,
@@ -418,12 +492,76 @@ def test_host_driver_preflight_rejects_ignored_imported_artifact(tmp_path):
         text=True,
         capture_output=True,
         check=False,
-        env={**os.environ, "PYTHONPATH": str(tmp_path), "CATLASS_SRC": str(tmp_path)},
+        env=_fake_runtime_env(tmp_path),
     )
 
     assert result.returncode != 0
     assert "Catlass import provenance mismatch" in result.stderr
     assert "runtime_shadow.py" in result.stderr
+
+
+def test_host_driver_preflight_accepts_manifested_generated_bridge(tmp_path):
+    driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
+        "host_driver.py"
+    ]
+    (tmp_path / "host_driver.py").write_text(driver)
+    (tmp_path / "kernel.py").write_text(
+        "def run(input_a, input_b):\n    return [a + b for a, b in zip(input_a, input_b)]\n"
+    )
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"{OUTPUT_MARKER}[3.0]" in result.stdout
+
+
+@pytest.mark.parametrize("invalid_kind", ["missing", "hash", "duplicate", "unknown"])
+def test_host_driver_preflight_rejects_invalid_native_manifest(tmp_path, invalid_kind):
+    driver = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
+        "host_driver.py"
+    ]
+    (tmp_path / "host_driver.py").write_text(driver)
+    (tmp_path / "kernel.py").write_text("raise RuntimeError('must not import kernel')\n")
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    manifest_path = tmp_path / "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
+    if invalid_kind == "missing":
+        manifest_path.unlink()
+    else:
+        manifest = json.loads(manifest_path.read_text())
+        if invalid_kind == "hash":
+            manifest["artifacts"][0]["sha256"] = "0" * 64
+        elif invalid_kind == "duplicate":
+            manifest["artifacts"].append(dict(manifest["artifacts"][0]))
+        else:
+            manifest["artifacts"][0]["unexpected"] = True
+        manifest_path.write_text(json.dumps(manifest))
+
+    result = subprocess.run(
+        [sys.executable, "host_driver.py", "kernel.py", "input.json", revision],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode != 0
+    assert "Catlass native" in result.stderr
+    assert "must not import kernel" not in result.stderr
 
 
 def test_catlass_capacity_is_rejected_before_remote_execution():

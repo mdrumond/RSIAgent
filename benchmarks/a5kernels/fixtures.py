@@ -95,6 +95,7 @@ _CATLASS_DRIVER = '''\
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -110,6 +111,109 @@ REQUIRED_TLA_API = (
     "kernel",
     "vector",
 )
+NATIVE_MANIFEST = "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
+NATIVE_MODULE = "catlass._tla_type_bridge_native"
+
+
+def _provenance_value(path: Path, names: tuple[str, ...]) -> str:
+    values = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in names:
+            values[key] = value
+    for name in names:
+        if values.get(name):
+            return values[name]
+    return ""
+
+
+def _native_artifact(source: Path, expected_revision: str) -> tuple[Path, str]:
+    manifest_path = source / NATIVE_MANIFEST
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Catlass native provenance is unavailable: {manifest_path}") from exc
+    expected_keys = {
+        "schema",
+        "catlass_revision",
+        "ascendnpu_ir_gitlink",
+        "ascendnpu_ir_install_commit",
+        "cann_version",
+        "artifacts",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+        raise RuntimeError("Catlass native provenance manifest has an invalid schema")
+    artifacts = manifest["artifacts"]
+    if (
+        manifest["schema"] != "catlass-native-build-v1"
+        or manifest["catlass_revision"] != expected_revision
+        or not isinstance(artifacts, list)
+        or len(artifacts) != 1
+        or not isinstance(artifacts[0], dict)
+        or set(artifacts[0]) != {"module", "path", "sha256"}
+        or artifacts[0]["module"] != NATIVE_MODULE
+    ):
+        raise RuntimeError("Catlass native provenance manifest has an invalid schema")
+    gitlink_result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source),
+            "ls-tree",
+            expected_revision,
+            "python/tla_dsl/3rdparty/AscendNPU-IR",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    fields = gitlink_result.stdout.split()
+    gitlink = fields[2] if gitlink_result.returncode == 0 and len(fields) >= 3 else ""
+    dep_root_value = os.environ.get("CATLASS_DSL_ASCENDNPU_IR_INSTALL_DIR")
+    if not dep_root_value:
+        raise RuntimeError("Catlass dependency provenance root is unavailable")
+    dep_provenance = Path(dep_root_value) / ".cpl-build-provenance"
+    try:
+        install_commit = _provenance_value(
+            dep_provenance, ("CAT_DEP_ASCENDNPU_IR_COMMIT",)
+        )
+        cann_version = _provenance_value(
+            dep_provenance, ("ASCEND_CANN_VERSION", "CANN_VERSION")
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Catlass dependency provenance is unavailable: {dep_provenance}") from exc
+    if (
+        not gitlink
+        or manifest["ascendnpu_ir_gitlink"] != gitlink
+        or manifest["ascendnpu_ir_install_commit"] != install_commit
+        or manifest["cann_version"] != cann_version
+        or install_commit != gitlink
+        or not cann_version
+    ):
+        raise RuntimeError("Catlass native provenance does not match the configured runtime")
+    artifact = artifacts[0]
+    relative_value = artifact["path"]
+    digest = artifact["sha256"]
+    if not isinstance(relative_value, str) or not isinstance(digest, str):
+        raise RuntimeError("Catlass native provenance artifact is invalid")
+    relative = Path(relative_value)
+    required_parent = Path("python/tla_dsl/csrc/mlir/build/python/catlass")
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.parent != required_parent
+        or not relative.name.startswith("_tla_type_bridge_native")
+        or not relative.name.endswith(".so")
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise RuntimeError("Catlass native provenance artifact is invalid")
+    location = (source / relative).resolve()
+    try:
+        location.relative_to(source)
+    except ValueError as exc:
+        raise RuntimeError("Catlass native provenance artifact escapes the retained source") from exc
+    return location, digest
 
 
 def _preflight_runtime(expected_revision: str) -> None:
@@ -131,7 +235,15 @@ def _preflight_runtime(expected_revision: str) -> None:
             f"expected {expected_revision}, found {actual} at {source}"
         )
     worktree = subprocess.run(
-        ["git", "-C", str(source), "status", "--porcelain", "--untracked-files=all"],
+        [
+            "git",
+            "-C",
+            str(source),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ],
         text=True,
         capture_output=True,
         check=False,
@@ -145,6 +257,8 @@ def _preflight_runtime(expected_revision: str) -> None:
 
     import catlass.tla as tla
 
+    native_location, native_sha256 = _native_artifact(source, expected_revision)
+    native_seen = False
     for name, module in sorted(sys.modules.items()):
         if name != "catlass" and not name.startswith("catlass."):
             continue
@@ -152,6 +266,18 @@ def _preflight_runtime(expected_revision: str) -> None:
         if module_file is None:
             continue
         location = Path(module_file).resolve()
+        if name == NATIVE_MODULE:
+            if native_seen or location != native_location:
+                raise RuntimeError(
+                    f"Catlass native import provenance mismatch: {name} at {location}"
+                )
+            actual_sha256 = hashlib.sha256(location.read_bytes()).hexdigest()
+            if actual_sha256 != native_sha256:
+                raise RuntimeError(
+                    f"Catlass native import provenance hash mismatch: {name} at {location}"
+                )
+            native_seen = True
+            continue
         try:
             relative = location.relative_to(source)
         except ValueError as exc:
@@ -179,6 +305,8 @@ def _preflight_runtime(expected_revision: str) -> None:
                 f"{name} at {location} is not the pinned "
                 f"{expected_revision}:{relative.as_posix()} blob"
             )
+    if not native_seen:
+        raise RuntimeError("Catlass native import provenance is missing")
     location = Path(getattr(tla, "__file__", "<unknown>")).resolve()
     missing = [name for name in REQUIRED_TLA_API if not hasattr(tla, name)]
     if missing:
