@@ -104,7 +104,9 @@ class FakeBackend:
 
     def time(self, command: TimingCommand) -> TimingResult:
         self.commands.append(command)
-        return TimingResult(7.5, SOURCE)
+        return TimingResult(
+            7.5, SOURCE, command.request.execution_id, command.replay_id
+        )
 
     def capture(self, command: CaptureCommand) -> ProfileCapture:
         self.commands.append(command)
@@ -112,6 +114,8 @@ class FakeBackend:
             return ProfileCapture(
                 command.metric,
                 SOURCE,
+                command.request.execution_id,
+                command.replay_id,
                 ("vector_add__kernel0",),
                 (("frequency_mhz", "1800"),),
                 archive("basic"),
@@ -119,6 +123,8 @@ class FakeBackend:
         return ProfileCapture(
             command.metric,
             SOURCE,
+            command.request.execution_id,
+            command.replay_id,
             ("vector_add__kernel0",),
             (("vector_ratio", "0.75"),),
             archive("pipe"),
@@ -213,7 +219,9 @@ def test_final_rejects_non_finite_timing(duration: float) -> None:
     class NonFiniteBackend(FakeBackend):
         def time(self, command: TimingCommand) -> TimingResult:
             self.commands.append(command)
-            return TimingResult(duration, SOURCE)
+            return TimingResult(
+                duration, SOURCE, command.request.execution_id, command.replay_id
+            )
 
     backend = NonFiniteBackend()
     with pytest.raises(ValueError, match="timing result"):
@@ -247,6 +255,10 @@ def test_basic_info_must_export_expected_kernel_exactly_once() -> None:
         ({"exported_kernels": ()}, "exact expected kernel"),
         ({"exported_kernels": ("vector_add",)}, "exact expected kernel"),
         ({"exported_kernels": ("vector_add__kernel0",) * 2}, "exact expected kernel"),
+        (
+            {"exported_kernels": ("vector_add__kernel0", "helper_kernel")},
+            "exact expected kernel",
+        ),
         ({"summary": ()}, "meaningful summary"),
         ({"summary": (("", "0.75"),)}, "meaningful summary"),
         ({"summary": (("vector_ratio", ""),)}, "meaningful summary"),
@@ -303,3 +315,27 @@ def test_capture_must_match_source_and_metric() -> None:
         ProfilingTreatmentController(
             MismatchBackend(), treatment_enabled=True
         ).run_intermediate(CORRECT, REQUEST)
+
+
+@pytest.mark.parametrize("result_kind", ["timing", "capture"])
+@pytest.mark.parametrize("identity", ["execution", "replay"])
+def test_measurements_must_match_execution_and_replay(result_kind, identity) -> None:
+    class MisdirectedBackend(FakeBackend):
+        def time(self, command: TimingCommand) -> TimingResult:
+            result = super().time(command)
+            if result_kind != "timing":
+                return result
+            field = "execution_id" if identity == "execution" else "replay_id"
+            return replace(result, **{field: f"wrong-{identity}"})
+
+        def capture(self, command: CaptureCommand) -> ProfileCapture:
+            result = super().capture(command)
+            if result_kind != "capture":
+                return result
+            field = "execution_id" if identity == "execution" else "replay_id"
+            return replace(result, **{field: f"wrong-{identity}"})
+
+    with pytest.raises(ValueError, match=f"submitted {identity}"):
+        ProfilingTreatmentController(
+            MisdirectedBackend(), treatment_enabled=True
+        ).run_final(CORRECT, REQUEST)

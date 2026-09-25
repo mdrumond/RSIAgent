@@ -165,12 +165,16 @@ class EvidenceArchive:
 class TimingResult:
     duration_us: float
     source_fingerprint: str
+    execution_id: str
+    replay_id: str
 
 
 @dataclass(frozen=True)
 class ProfileCapture:
     metric: ProfileMetric
     source_fingerprint: str
+    execution_id: str
+    replay_id: str
     exported_kernels: tuple[str, ...]
     summary: tuple[tuple[str, str], ...]
     evidence: EvidenceArchive
@@ -228,19 +232,22 @@ class ProfilingTreatmentController:
         """Run the same host evaluation regardless of treatment assignment."""
 
         self._validate_correctness(correctness, request)
-        timing = self._backend.time(
-            TimingCommand(
-                CampaignKind.FINAL,
-                request,
-                f"{request.attempt_id}-final-timing",
-            )
+        timing_command = TimingCommand(
+            CampaignKind.FINAL,
+            request,
+            f"{request.attempt_id}-final-timing",
         )
+        timing = self._backend.time(timing_command)
         if (
             not math.isfinite(timing.duration_us)
             or timing.duration_us <= 0
             or timing.source_fingerprint != request.source_fingerprint
         ):
             raise ValueError("timing result does not match the submitted source")
+        if timing.execution_id != request.execution_id:
+            raise ValueError("timing result does not match the submitted execution")
+        if timing.replay_id != timing_command.replay_id:
+            raise ValueError("timing result does not match the submitted replay")
         basic, pipe = self._captures(CampaignKind.FINAL, request)
         feedback = self._feedback(request.expected_kernel, basic, pipe)
         return FinalProfileResult(
@@ -254,28 +261,26 @@ class ProfilingTreatmentController:
     def _captures(
         self, campaign: CampaignKind, request: ProfileRequest
     ) -> tuple[ProfileCapture, ProfileCapture]:
-        basic = self._backend.capture(
-            CaptureCommand(
-                campaign,
-                request,
-                ProfileMetric.BASIC_INFO,
-                f"{request.attempt_id}-{campaign.value}-basic",
-            )
+        basic_command = CaptureCommand(
+            campaign,
+            request,
+            ProfileMetric.BASIC_INFO,
+            f"{request.attempt_id}-{campaign.value}-basic",
         )
-        self._validate_capture(basic, request, ProfileMetric.BASIC_INFO)
+        basic = self._backend.capture(basic_command)
+        self._validate_capture(basic, basic_command)
         if basic.exported_kernels.count(request.expected_kernel) != 1:
             raise ValueError("BasicInfo did not identify the exact expected kernel once")
-        pipe = self._backend.capture(
-            CaptureCommand(
-                campaign,
-                request,
-                ProfileMetric.PIPE_UTILIZATION,
-                f"{request.attempt_id}-{campaign.value}-pipe",
-                kernel_name=request.expected_kernel,
-            )
+        pipe_command = CaptureCommand(
+            campaign,
+            request,
+            ProfileMetric.PIPE_UTILIZATION,
+            f"{request.attempt_id}-{campaign.value}-pipe",
+            kernel_name=request.expected_kernel,
         )
-        self._validate_capture(pipe, request, ProfileMetric.PIPE_UTILIZATION)
-        if pipe.exported_kernels.count(request.expected_kernel) != 1:
+        pipe = self._backend.capture(pipe_command)
+        self._validate_capture(pipe, pipe_command)
+        if pipe.exported_kernels != (request.expected_kernel,):
             raise ValueError(
                 "PipeUtilization did not identify the exact expected kernel once"
             )
@@ -286,12 +291,17 @@ class ProfilingTreatmentController:
         return basic, pipe
 
     def _validate_capture(
-        self, capture: ProfileCapture, request: ProfileRequest, metric: ProfileMetric
+        self, capture: ProfileCapture, command: CaptureCommand
     ) -> None:
-        if capture.metric is not metric:
+        request = command.request
+        if capture.metric is not command.metric:
             raise ValueError("backend returned the wrong metric replay")
         if capture.source_fingerprint != request.source_fingerprint:
             raise ValueError("profile capture does not match the submitted source")
+        if capture.execution_id != request.execution_id:
+            raise ValueError("profile capture does not match the submitted execution")
+        if capture.replay_id != command.replay_id:
+            raise ValueError("profile capture does not match the submitted replay")
         capture.evidence.validate(self._max_archive_bytes)
 
     @staticmethod
