@@ -128,18 +128,24 @@ def write_ledger(
         "execution_id": plan.execution_id,
         "runtime_provenance": plan.runtime_provenance,
     })
+    attested_fields = {
+        **identity,
+        "language": plan.language,
+        "runtime_provenance": plan.runtime_provenance,
+        "passed": True,
+        "max_abs_error": 0.0,
+        "exit_code": 0,
+        "output_sha256": output,
+        "source_fingerprint": plan.source_fingerprint,
+        "evidence_sha256": evidence_sha256,
+        "session_handle": None,
+    }
     ledger.append(
         EvidenceKind.RESULT,
         {
-            **identity,
-            "output_sha256": output,
             "status": "verified",
-            "passed": True,
-            "exit_code": 0,
-            "max_abs_error": 0.0,
-            "runtime_provenance": plan.runtime_provenance,
-            "session_handle": None,
-            "evidence_sha256": evidence_sha256,
+            **attested_fields,
+            "attestation_sha256": canonical_hash(attested_fields),
             "execution_evidence": execution_evidence,
         },
     )
@@ -649,7 +655,7 @@ def test_snapshot_rejects_artifact_generation_outside_registered_fixture(tmp_pat
         },
     )
 
-    with pytest.raises(ValueError, match="registered fixture"):
+    with pytest.raises(ValueError, match="runner event order"):
         snapshot_from_ledger(ledger.entries)
 
 
@@ -663,6 +669,58 @@ def test_snapshot_rejects_consistent_but_fabricated_execution_id(tmp_path):
 
     with pytest.raises(ValueError, match="reconstructed plan"):
         snapshot_from_ledger(entries)
+
+
+def test_snapshot_rejects_result_before_artifact(tmp_path):
+    ledger = write_ledger(tmp_path / "wrong-order.jsonl", "one")
+    original = ledger.entries
+    payloads = [original[index].payload for index in (0, 1, 3, 2)]
+    kinds = [original[index].kind for index in (0, 1, 3, 2)]
+    rebuilt = []
+    previous = "0" * 64
+    for sequence, (kind, payload) in enumerate(zip(kinds, payloads)):
+        entry = EvidenceEntry.create(sequence, kind, payload, previous)
+        rebuilt.append(entry)
+        previous = entry.entry_sha256
+
+    with pytest.raises(ValueError, match="runner event order"):
+        snapshot_from_ledger(rebuilt)
+
+
+def test_snapshot_rejects_finite_error_with_non_finite_status(tmp_path):
+    ledger = write_ledger(tmp_path / "finite-status.jsonl", "one")
+    result = ledger.entries[-1]
+
+    with pytest.raises(ValueError, match="verified replay output"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                len(ledger.entries) - 1,
+                {**result.payload, "max_abs_error_status": "non-finite"},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("language", "ascend-c"),
+        ("source_fingerprint", "f" * 64),
+        ("attestation_sha256", "f" * 64),
+    ],
+)
+def test_snapshot_rejects_result_not_bound_to_plan(tmp_path, field, value):
+    ledger = write_ledger(tmp_path / f"result-{field}.jsonl", "one")
+    result = ledger.entries[-1]
+
+    with pytest.raises(ValueError, match="reconstructed plan|attestation"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                len(ledger.entries) - 1,
+                {**result.payload, field: value},
+            )
+        )
 
 
 @pytest.mark.parametrize("mutation", ["missing", "exit-code", "digest"])

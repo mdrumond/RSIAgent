@@ -143,6 +143,14 @@ def snapshot_from_ledger(
         raise ValueError("a replay requires exactly one request and one result entry")
     if len(actions) != 1:
         raise ValueError("a replay requires exactly one action entry")
+    kinds = [entry.kind for entry in entries]
+    if kinds != [
+        EvidenceKind.REQUEST.value,
+        EvidenceKind.ACTION.value,
+        *([EvidenceKind.ARTIFACT.value] * len(artifacts)),
+        EvidenceKind.RESULT.value,
+    ]:
+        raise ValueError("replay ledger entries are not in runner event order")
     action = actions[0].payload
     argv = action.get("argv")
     if (
@@ -246,6 +254,7 @@ def snapshot_from_ledger(
         and not isinstance(max_abs_error, bool)
         and math.isfinite(max_abs_error)
         and max_abs_error >= 0
+        and "max_abs_error_status" not in result
     ) or (
         max_abs_error is None
         and result.get("max_abs_error_status") == "non-finite"
@@ -287,6 +296,11 @@ def snapshot_from_ledger(
     )
     if execution_id != plan.execution_id:
         raise ValueError("execution_id does not match the reconstructed plan")
+    if (
+        result.get("language") != plan.language
+        or result.get("source_fingerprint") != plan.source_fingerprint
+    ):
+        raise ValueError("verified result does not match the reconstructed plan")
     execution_evidence = result.get("execution_evidence")
     if (
         not isinstance(execution_evidence, Mapping)
@@ -311,6 +325,24 @@ def snapshot_from_ledger(
     )
     if result.get("evidence_sha256") != expected_evidence_sha256:
         raise ValueError("result evidence digest does not match execution evidence")
+    attested_fields = {
+        "request_id": request_id,
+        "execution_id": execution_id,
+        "attempt_id": attempt_id,
+        "language": plan.language,
+        "runtime_provenance": plan.runtime_provenance,
+        "passed": result["passed"],
+        "max_abs_error": (
+            math.inf if max_abs_error is None else max_abs_error
+        ),
+        "exit_code": result["exit_code"],
+        "output_sha256": result["output_sha256"],
+        "source_fingerprint": plan.source_fingerprint,
+        "evidence_sha256": expected_evidence_sha256,
+        "session_handle": result.get("session_handle"),
+    }
+    if result.get("attestation_sha256") != canonical_hash(attested_fields):
+        raise ValueError("result attestation does not match verified result fields")
 
     ledger_head = entries[-1].entry_sha256 if entries else ""
     if metrics is not None and (
