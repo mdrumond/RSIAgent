@@ -133,6 +133,17 @@ def test_parser_preserves_duplicate_count_across_action_families():
     assert action == KnowledgeQuery("vector", dup=2)
 
 
+def test_parser_propagates_query_duplicates_to_builtin_action():
+    action = parse_knowledge_action(
+        '{"program":{"lang":"python","code":"print(1)"}}\n'
+        '{"knowledge_query":{"query":"draft"}}\n'
+        '{"knowledge_query":{"query":"vector"}}'
+    )
+
+    assert isinstance(action, Program)
+    assert action.dup == 2
+
+
 def test_read_only_view_preserves_relative_database_location(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     database = KnowledgeDB(Path("knowledge.sqlite"), FakeEmbeddings())

@@ -68,6 +68,7 @@ def parse_knowledge_action(value: str) -> Any:
     # Preserve the Actor parser's keep-working precedence. Programs, looks, and
     # asks outrank retrieval; retrieval outranks an otherwise terminal Done.
     if built_in is not None and not isinstance(built_in, Done):
+        built_in.dup = max(built_in.dup, len(candidates))
         return built_in
     raw = candidates[-1]
     if set(raw) != {"knowledge_query"}:
