@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any, Callable, Mapping, Sequence
@@ -152,7 +153,7 @@ def snapshot_from_ledger(
                     not isinstance(name, str)
                     or not name
                     or not isinstance(digest, str)
-                    or not digest
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
                     for name, digest in hashes.items()
                 )
             ):
@@ -175,6 +176,16 @@ def snapshot_from_ledger(
         raise ValueError(
             "ledger entries must belong to one request attempt and one execution_id"
         )
+    max_abs_error = result.get("max_abs_error")
+    valid_max_error = (
+        isinstance(max_abs_error, (int, float))
+        and not isinstance(max_abs_error, bool)
+        and math.isfinite(max_abs_error)
+        and max_abs_error >= 0
+    ) or (
+        max_abs_error is None
+        and result.get("max_abs_error_status") == "non-finite"
+    )
     if (
         result.get("status") != "verified"
         or not isinstance(result.get("output_sha256"), str)
@@ -182,7 +193,7 @@ def snapshot_from_ledger(
         or not isinstance(result.get("passed"), bool)
         or isinstance(result.get("exit_code"), bool)
         or not isinstance(result.get("exit_code"), int)
-        or "max_abs_error" not in result
+        or not valid_max_error
     ):
         raise ValueError("a replay requires verified replay output and metrics")
 

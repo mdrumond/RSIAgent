@@ -16,6 +16,12 @@ from benchmarks.a5kernels.evidence import EvidenceEntry, EvidenceKind, EvidenceL
 from benchmarks.a5kernels.protocol import RunRequest
 
 
+SOURCE_ONE = "1" * 64
+SOURCE_TWO = "2" * 64
+ARTIFACT_ONE = "a" * 64
+ARTIFACT_TWO = "b" * 64
+
+
 def snapshot(attempt_id: str, **changes) -> ReplaySnapshot:
     values = {
         "request_id": RunRequest("catlass-dsl", length=2, seed=7).request_id,
@@ -23,8 +29,8 @@ def snapshot(attempt_id: str, **changes) -> ReplaySnapshot:
         "actions": ({"language": "catlass-dsl", "argv": ["python", "run.py"]},),
         "source_artifacts": ({
             "sequence": 2,
-            "source_sha256": {"kernel.py": "source-1"},
-            "artifact_sha256": {"source_bundle": "artifact-1"},
+            "source_sha256": {"kernel.py": SOURCE_ONE},
+            "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
         },),
         "evidence": ("evidence-1",),
         "output": {"output_sha256": "output-1", "passed": True},
@@ -57,8 +63,8 @@ def write_ledger(
             EvidenceKind.ARTIFACT,
             {
                 **identity,
-                "source_sha256": {"kernel.py": "source-1"},
-                "artifact_sha256": {"source_bundle": "artifact-1"},
+                "source_sha256": {"kernel.py": SOURCE_ONE},
+                "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
             },
         )
     ledger.append(
@@ -169,7 +175,7 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
 
     assert replay.attempt_id == "one"
     assert replay.actions == ({"language": "catlass-dsl"},)
-    assert replay.source_artifacts[0]["source_sha256"]["kernel.py"] == "source-1"
+    assert replay.source_artifacts[0]["source_sha256"]["kernel.py"] == SOURCE_ONE
     assert replay.output["passed"] is True
     assert replay.metrics["supplemental"]["latency_us"] == 4.5
     assert len(replay.evidence) == 4
@@ -206,8 +212,8 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
         EvidenceKind.ARTIFACT,
         {
             **identity,
-            "source_sha256": {"kernel.py": "source-1"},
-            "artifact_sha256": {"source_bundle": "artifact-1"},
+            "source_sha256": {"kernel.py": SOURCE_ONE},
+            "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
             field: {},
         },
     )
@@ -241,14 +247,53 @@ def test_snapshot_rejects_execution_error_without_output(tmp_path):
         EvidenceKind.ARTIFACT,
         {
             **identity,
-            "source_sha256": {"kernel.py": "source-1"},
-            "artifact_sha256": {"source_bundle": "artifact-1"},
+            "source_sha256": {"kernel.py": SOURCE_ONE},
+            "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
         },
     )
     ledger.append(EvidenceKind.RESULT, {**identity, "status": "execution_error"})
 
     with pytest.raises(ValueError, match="verified replay output"):
         snapshot_from_ledger(ledger.entries)
+
+
+@pytest.mark.parametrize("digest", ["not-a-sha", "A" * 64])
+def test_snapshot_rejects_non_sha_artifact_values(tmp_path, digest):
+    ledger = write_ledger(tmp_path / "invalid-artifact.jsonl", "one")
+    entries = list(ledger.entries)
+    artifact = entries[2]
+    replacement = EvidenceEntry.create(
+        artifact.sequence,
+        artifact.kind,
+        {**artifact.payload, "source_sha256": {"kernel.py": digest}},
+        artifact.previous_sha256,
+    )
+    rebuilt = entries[:2] + [replacement]
+    for entry in entries[3:]:
+        rebuilt.append(
+            EvidenceEntry.create(
+                entry.sequence, entry.kind, entry.payload, rebuilt[-1].entry_sha256
+            )
+        )
+
+    with pytest.raises(ValueError, match="non-empty source_sha256 mapping"):
+        snapshot_from_ledger(rebuilt)
+
+
+@pytest.mark.parametrize("value", ["zero", True, -1.0, None])
+def test_snapshot_rejects_invalid_max_error_evidence(tmp_path, value):
+    ledger = write_ledger(tmp_path / "invalid-error.jsonl", "one")
+    entries = list(ledger.entries)
+    result = entries[-1]
+    replacement = EvidenceEntry.create(
+        result.sequence,
+        result.kind,
+        {**result.payload, "max_abs_error": value},
+        result.previous_sha256,
+    )
+
+    with pytest.raises(ValueError, match="verified replay output and metrics"):
+        snapshot_from_ledger([*entries[:-1], replacement])
 
 
 def test_snapshot_rejects_mixed_execution_ids(tmp_path):
@@ -329,14 +374,14 @@ def test_snapshot_preserves_ordered_artifact_generations(tmp_path):
                 "request_id": identity["request_id"],
                 "execution_id": identity["execution_id"],
                 "attempt_id": "one",
-            "source_sha256": {"kernel.py": "source-2"},
-            "artifact_sha256": {"source_bundle": "artifact-2"},
+            "source_sha256": {"kernel.py": SOURCE_TWO},
+            "artifact_sha256": {"source_bundle": ARTIFACT_TWO},
         },
     )
 
     replay = snapshot_from_ledger(ledger.entries)
 
     assert [item["source_sha256"]["kernel.py"] for item in replay.source_artifacts] == [
-        "source-1",
-        "source-2",
+        SOURCE_ONE,
+        SOURCE_TWO,
     ]
