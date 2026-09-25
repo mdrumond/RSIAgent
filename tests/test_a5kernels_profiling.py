@@ -36,6 +36,7 @@ def archive(metric: str) -> EvidenceArchive:
 REQUEST = ProfileRequest(
     "request-1",
     "attempt-1",
+    "execution-1",
     "catlass",
     "vector_add__kernel0",
     3,
@@ -79,6 +80,7 @@ def test_profile_request_binds_to_host_prepared_attempt() -> None:
 
     assert request.request_id == plan.request_id
     assert request.attempt_id == "host-attempt-7"
+    assert request.execution_id == plan.execution_id
     assert request.source_fingerprint == plan.source_fingerprint
 
 
@@ -117,7 +119,7 @@ class FakeBackend:
         return ProfileCapture(
             command.metric,
             SOURCE,
-            (),
+            ("vector_add__kernel0",),
             (("vector_ratio", "0.75"),),
             archive("pipe"),
         )
@@ -195,6 +197,33 @@ def test_correctness_must_belong_to_same_host_attempt() -> None:
     assert backend.commands == []
 
 
+def test_correctness_must_belong_to_same_execution() -> None:
+    backend = FakeBackend()
+
+    with pytest.raises(ValueError, match="different execution"):
+        ProfilingTreatmentController(backend, treatment_enabled=True).run_final(
+            replace(CORRECT, execution_id="other-execution"), REQUEST
+        )
+
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize("duration", [float("nan"), float("inf"), float("-inf")])
+def test_final_rejects_non_finite_timing(duration: float) -> None:
+    class NonFiniteBackend(FakeBackend):
+        def time(self, command: TimingCommand) -> TimingResult:
+            self.commands.append(command)
+            return TimingResult(duration, SOURCE)
+
+    backend = NonFiniteBackend()
+    with pytest.raises(ValueError, match="timing result"):
+        ProfilingTreatmentController(backend, treatment_enabled=True).run_final(
+            CORRECT, REQUEST
+        )
+
+    assert len(backend.commands) == 1
+
+
 def test_basic_info_must_export_expected_kernel_exactly_once() -> None:
     class WrongKernelBackend(FakeBackend):
         def capture(self, command: CaptureCommand) -> ProfileCapture:
@@ -210,6 +239,36 @@ def test_basic_info_must_export_expected_kernel_exactly_once() -> None:
         )
 
     assert len(backend.commands) == 1
+
+
+@pytest.mark.parametrize(
+    "replacement, message",
+    [
+        ({"exported_kernels": ()}, "exact expected kernel"),
+        ({"exported_kernels": ("vector_add",)}, "exact expected kernel"),
+        ({"exported_kernels": ("vector_add__kernel0",) * 2}, "exact expected kernel"),
+        ({"summary": ()}, "meaningful summary"),
+        ({"summary": (("", "0.75"),)}, "meaningful summary"),
+        ({"summary": (("vector_ratio", ""),)}, "meaningful summary"),
+    ],
+)
+def test_pipe_utilization_must_match_kernel_and_include_summary(
+    replacement, message
+) -> None:
+    class InvalidPipeBackend(FakeBackend):
+        def capture(self, command: CaptureCommand) -> ProfileCapture:
+            result = super().capture(command)
+            if command.metric is ProfileMetric.PIPE_UTILIZATION:
+                return replace(result, **replacement)
+            return result
+
+    backend = InvalidPipeBackend()
+    with pytest.raises(ValueError, match=message):
+        ProfilingTreatmentController(backend, treatment_enabled=True).run_intermediate(
+            CORRECT, REQUEST
+        )
+
+    assert len(backend.commands) == 2
 
 
 @pytest.mark.parametrize(

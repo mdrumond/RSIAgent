@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 import re
 from typing import Protocol
 
@@ -35,6 +36,7 @@ class ProfileRequest:
 
     request_id: str
     attempt_id: str
+    execution_id: str
     implementation: str
     expected_kernel: str
     device: int
@@ -73,6 +75,7 @@ class ProfileRequest:
         return cls(
             request_id=plan.request_id,
             attempt_id=plan.attempt_id,
+            execution_id=plan.execution_id,
             implementation=implementation,
             expected_kernel=expected_kernel,
             device=device,
@@ -232,7 +235,11 @@ class ProfilingTreatmentController:
                 f"{request.attempt_id}-final-timing",
             )
         )
-        if timing.duration_us <= 0 or timing.source_fingerprint != request.source_fingerprint:
+        if (
+            not math.isfinite(timing.duration_us)
+            or timing.duration_us <= 0
+            or timing.source_fingerprint != request.source_fingerprint
+        ):
             raise ValueError("timing result does not match the submitted source")
         basic, pipe = self._captures(CampaignKind.FINAL, request)
         feedback = self._feedback(request.expected_kernel, basic, pipe)
@@ -268,6 +275,14 @@ class ProfilingTreatmentController:
             )
         )
         self._validate_capture(pipe, request, ProfileMetric.PIPE_UTILIZATION)
+        if pipe.exported_kernels.count(request.expected_kernel) != 1:
+            raise ValueError(
+                "PipeUtilization did not identify the exact expected kernel once"
+            )
+        if not pipe.summary or any(
+            not key.strip() or not value.strip() for key, value in pipe.summary
+        ):
+            raise ValueError("PipeUtilization did not return a meaningful summary")
         return basic, pipe
 
     def _validate_capture(
@@ -287,6 +302,8 @@ class ProfilingTreatmentController:
             raise ValueError("correctness result belongs to a different request")
         if correctness.attempt_id != request.attempt_id:
             raise ValueError("correctness result belongs to a different attempt")
+        if correctness.execution_id != request.execution_id:
+            raise ValueError("correctness result belongs to a different execution")
         if correctness.source_fingerprint != request.source_fingerprint:
             raise ValueError("correctness result belongs to different source")
 
