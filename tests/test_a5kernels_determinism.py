@@ -806,3 +806,25 @@ def test_snapshot_rejects_invalid_execution_evidence(tmp_path, mutation):
                 ledger.entries, len(ledger.entries) - 1, payload
             )
         )
+
+
+@pytest.mark.parametrize("nested_exit_code", [False, 0.0])
+def test_snapshot_rejects_non_integer_execution_evidence_exit_code(
+    tmp_path, nested_exit_code
+):
+    ledger = write_ledger(tmp_path / "typed-exit-code.jsonl", "one")
+    result = ledger.entries[-1]
+    payload = {
+        **result.payload,
+        "execution_evidence": {
+            **result.payload["execution_evidence"],
+            "result_exit_code": nested_exit_code,
+        },
+    }
+
+    with pytest.raises(ValueError, match="execution evidence"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, len(ledger.entries) - 1, payload
+            )
+        )

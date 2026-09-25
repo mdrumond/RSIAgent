@@ -318,6 +318,8 @@ def snapshot_from_ledger(
         != {"retained_logs", "diagnostics", "result_exit_code", "output_sha256"}
         or not isinstance(execution_evidence.get("retained_logs"), str)
         or not isinstance(execution_evidence.get("diagnostics"), str)
+        or isinstance(execution_evidence.get("result_exit_code"), bool)
+        or not isinstance(execution_evidence.get("result_exit_code"), int)
         or execution_evidence.get("result_exit_code") != result["exit_code"]
         or execution_evidence.get("output_sha256") != result["output_sha256"]
     ):
