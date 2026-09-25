@@ -186,6 +186,28 @@ def test_snapshot_rejects_missing_execution_evidence(
         snapshot_from_ledger(ledger.entries)
 
 
+@pytest.mark.parametrize("field", ["source_sha256", "artifact_sha256"])
+def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
+    request = RunRequest("catlass-dsl", length=2, seed=7)
+    identity = {"request_id": request.request_id, "attempt_id": "one"}
+    ledger = EvidenceLedger(tmp_path / f"missing-{field}.jsonl")
+    ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
+    ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
+    ledger.append(
+        EvidenceKind.ARTIFACT,
+        {
+            **identity,
+            "source_sha256": {"kernel.py": "source-1"},
+            "artifact_sha256": {"source_bundle": "artifact-1"},
+            field: {},
+        },
+    )
+    ledger.append(EvidenceKind.RESULT, {**identity, "passed": True, "exit_code": 0})
+
+    with pytest.raises(ValueError, match=f"non-empty {field} mapping"):
+        snapshot_from_ledger(ledger.entries)
+
+
 def test_cli_writes_compact_machine_readable_three_replay_report(tmp_path):
     ledgers = []
     metrics = []

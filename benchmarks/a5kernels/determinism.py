@@ -142,6 +142,23 @@ def snapshot_from_ledger(
         raise ValueError("a replay requires exactly one action entry")
     if not artifacts:
         raise ValueError("a replay requires at least one artifact entry")
+    for artifact in artifacts:
+        for field in ("source_sha256", "artifact_sha256"):
+            hashes = artifact.payload.get(field)
+            if (
+                not isinstance(hashes, Mapping)
+                or not hashes
+                or any(
+                    not isinstance(name, str)
+                    or not name
+                    or not isinstance(digest, str)
+                    or not digest
+                    for name, digest in hashes.items()
+                )
+            ):
+                raise ValueError(
+                    f"artifact evidence requires a non-empty {field} mapping"
+                )
     request = requests[0].payload
     result = results[0].payload
     request_id = str(request.get("request_id", ""))
