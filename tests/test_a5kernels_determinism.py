@@ -1,5 +1,6 @@
 from dataclasses import replace
 import json
+import random
 
 import pytest
 
@@ -12,7 +13,12 @@ from benchmarks.a5kernels.determinism import (
     run_three_replays,
     snapshot_from_ledger,
 )
-from benchmarks.a5kernels.evidence import EvidenceEntry, EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.evidence import (
+    EvidenceEntry,
+    EvidenceKind,
+    EvidenceLedger,
+    canonical_digest,
+)
 from benchmarks.a5kernels.protocol import RunRequest
 
 
@@ -20,8 +26,15 @@ SOURCE_ONE = "1" * 64
 SOURCE_TWO = "2" * 64
 ARTIFACT_ONE = "a" * 64
 ARTIFACT_TWO = "b" * 64
-INPUTS_ONE = "d" * 64
 OUTPUT_ONE = "e" * 64
+
+
+def input_digest(request):
+    rng = random.Random(request.seed)
+    return canonical_digest({
+        "input_a": tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length)),
+        "input_b": tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length)),
+    })
 
 
 def snapshot(attempt_id: str, **changes) -> ReplaySnapshot:
@@ -65,7 +78,7 @@ def write_ledger(
                 **identity,
                 "language": request.language,
                 "argv": ["python", "run.py"],
-                "inputs_sha256": INPUTS_ONE,
+                "inputs_sha256": input_digest(request),
             },
         )
     if include_artifact:
@@ -203,7 +216,7 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
     assert replay.actions == ({
         "language": "catlass-dsl",
         "argv": ["python", "run.py"],
-        "inputs_sha256": INPUTS_ONE,
+        "inputs_sha256": input_digest(RunRequest("catlass-dsl", length=2, seed=7)),
     },)
     assert replay.source_artifacts[0]["source_sha256"]["kernel.py"] == SOURCE_ONE
     assert replay.output["passed"] is True
@@ -286,6 +299,41 @@ def test_snapshot_binds_action_language_to_recorded_request(tmp_path):
         )
 
 
+def test_snapshot_rejects_unregistered_request_language(tmp_path):
+    ledger = write_ledger(tmp_path / "unsupported-language.jsonl", "one")
+    request_entry = ledger.entries[0]
+    unsupported = RunRequest("made-up", length=2, seed=7)
+    request_payload = {
+        **request_entry.payload,
+        "request_id": unsupported.request_id,
+        "request": unsupported.__dict__,
+    }
+    rebuilt = replace_entry_payload(ledger.entries, 0, request_payload)
+    for index in range(1, len(rebuilt)):
+        payload = {
+            **rebuilt[index].payload,
+            "request_id": unsupported.request_id,
+        }
+        if index == 1:
+            payload["language"] = unsupported.language
+        rebuilt = replace_entry_payload(rebuilt, index, payload)
+
+    with pytest.raises(ValueError, match="unsupported language"):
+        snapshot_from_ledger(rebuilt)
+
+
+def test_snapshot_binds_input_digest_to_recorded_request(tmp_path):
+    ledger = write_ledger(tmp_path / "wrong-inputs.jsonl", "one")
+    action = ledger.entries[1]
+
+    with pytest.raises(ValueError, match="input digest"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, 1, {**action.payload, "inputs_sha256": "f" * 64}
+            )
+        )
+
+
 def test_snapshot_rejects_non_sha_output_digest(tmp_path):
     ledger = write_ledger(tmp_path / "invalid-output.jsonl", "one")
     result = ledger.entries[-1]
@@ -330,7 +378,7 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
             **identity,
             "language": request.language,
             "argv": ["python", "run.py"],
-            "inputs_sha256": INPUTS_ONE,
+            "inputs_sha256": input_digest(request),
         },
     )
     ledger.append(
@@ -373,7 +421,7 @@ def test_snapshot_rejects_execution_error_without_output(tmp_path):
             **identity,
             "language": request.language,
             "argv": ["python", "run.py"],
-            "inputs_sha256": INPUTS_ONE,
+            "inputs_sha256": input_digest(request),
         },
     )
     ledger.append(
@@ -427,6 +475,31 @@ def test_snapshot_rejects_invalid_max_error_evidence(tmp_path, value):
 
     with pytest.raises(ValueError, match="verified replay output and metrics"):
         snapshot_from_ledger([*entries[:-1], replacement])
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"passed": True, "exit_code": 1},
+        {
+            "passed": True,
+            "max_abs_error": None,
+            "max_abs_error_status": "non-finite",
+        },
+    ],
+)
+def test_snapshot_rejects_contradictory_pass_outcomes(tmp_path, changes):
+    ledger = write_ledger(tmp_path / "contradictory-result.jsonl", "one")
+    result = ledger.entries[-1]
+
+    with pytest.raises(ValueError, match="contradictory outcome"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                len(ledger.entries) - 1,
+                {**result.payload, **changes},
+            )
+        )
 
 
 def test_snapshot_rejects_mixed_execution_ids(tmp_path):

@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 import json
 import math
 from pathlib import Path
+import random
 import re
 from typing import Any, Callable, Mapping, Sequence
 
@@ -22,6 +23,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_digest,
 )
 from benchmarks.a5kernels.protocol import RunRequest
+from benchmarks.a5kernels.fixtures import fixture_for
 
 
 AUDITED_FIELDS = ("actions", "source_artifacts", "evidence", "output", "metrics")
@@ -192,8 +194,23 @@ def snapshot_from_ledger(
         raise ValueError("request evidence must contain a valid recorded request") from None
     if reconstructed_request.request_id != request_id:
         raise ValueError("request_id does not match the recorded request")
+    try:
+        fixture_for(reconstructed_request.language)
+    except ValueError:
+        raise ValueError("recorded request uses an unsupported language") from None
     if action["language"] != reconstructed_request.language:
         raise ValueError("action language does not match the recorded request")
+    rng = random.Random(reconstructed_request.seed)
+    input_a = tuple(
+        rng.uniform(-1.0, 1.0) for _ in range(reconstructed_request.length)
+    )
+    input_b = tuple(
+        rng.uniform(-1.0, 1.0) for _ in range(reconstructed_request.length)
+    )
+    if action["inputs_sha256"] != canonical_digest(
+        {"input_a": input_a, "input_b": input_b}
+    ):
+        raise ValueError("action input digest does not match the recorded request")
     if any(
         entry.payload.get("request_id") != request_id
         or entry.payload.get("execution_id") != execution_id
@@ -223,6 +240,10 @@ def snapshot_from_ledger(
         or not valid_max_error
     ):
         raise ValueError("a replay requires verified replay output and metrics")
+    if result["passed"] and (
+        result["exit_code"] != 0 or not isinstance(max_abs_error, (int, float))
+    ):
+        raise ValueError("verified replay result contains a contradictory outcome")
 
     ledger_head = entries[-1].entry_sha256 if entries else ""
     if metrics is not None and (
