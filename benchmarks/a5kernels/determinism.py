@@ -169,8 +169,8 @@ def snapshot_from_ledger(
         or re.fullmatch(r"[0-9a-f]{64}", action["inputs_sha256"]) is None
     ):
         raise ValueError("a replay requires substantive action evidence")
-    if not artifacts:
-        raise ValueError("a replay requires at least one artifact entry")
+    if len(artifacts) != 1:
+        raise ValueError("a replay requires exactly one artifact entry")
     for artifact in artifacts:
         for field in ("source_sha256", "artifact_sha256"):
             hashes = artifact.payload.get(field)

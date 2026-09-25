@@ -280,7 +280,7 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
     ("missing", "options", "message"),
     [
         ("action", {"include_action": False}, "exactly one action"),
-        ("artifact", {"include_artifact": False}, "at least one artifact"),
+        ("artifact", {"include_artifact": False}, "exactly one artifact"),
     ],
 )
 def test_snapshot_rejects_missing_execution_evidence(
@@ -684,6 +684,22 @@ def test_snapshot_rejects_result_before_artifact(tmp_path):
         previous = entry.entry_sha256
 
     with pytest.raises(ValueError, match="runner event order"):
+        snapshot_from_ledger(rebuilt)
+
+
+def test_snapshot_rejects_duplicate_artifact_entry(tmp_path):
+    ledger = write_ledger(tmp_path / "duplicate-artifact.jsonl", "one")
+    original = ledger.entries
+    payloads = [original[index].payload for index in (0, 1, 2, 2, 3)]
+    kinds = [original[index].kind for index in (0, 1, 2, 2, 3)]
+    rebuilt = []
+    previous = "0" * 64
+    for sequence, (kind, payload) in enumerate(zip(kinds, payloads)):
+        entry = EvidenceEntry.create(sequence, kind, payload, previous)
+        rebuilt.append(entry)
+        previous = entry.entry_sha256
+
+    with pytest.raises(ValueError, match="exactly one artifact"):
         snapshot_from_ledger(rebuilt)
 
 
