@@ -511,6 +511,7 @@ class DomainActionResult:
     observation: str
     terminal: bool = False
     status: str = "done"
+    candidate_progress: bool = True
 
 
 def _validate_domain_action_result(value) -> DomainActionResult:
@@ -522,6 +523,8 @@ def _validate_domain_action_result(value) -> DomainActionResult:
         raise ValueError("DomainActionResult.observation must not be empty")
     if type(value.terminal) is not bool:
         raise TypeError("DomainActionResult.terminal must be a bool")
+    if type(value.candidate_progress) is not bool:
+        raise TypeError("DomainActionResult.candidate_progress must be a bool")
     if value.terminal and value.status not in {
             "done", "evolve", "stalled", "infra", "safety_ceiling"}:
         raise ValueError("invalid terminal domain action status: " + value.status)
@@ -1118,8 +1121,9 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                 res.status = outcome.status
                 domain_terminal = True
                 break
-            dones = 0
-            progs_since_bounce += 1
+            if outcome.candidate_progress:
+                dones = 0
+                progs_since_bounce += 1
             user = outcome.observation
             continue
 

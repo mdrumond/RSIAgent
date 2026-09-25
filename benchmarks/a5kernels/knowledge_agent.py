@@ -225,7 +225,9 @@ class KnowledgeAgent:
             raise TypeError("Knowledge Agent accepts only KnowledgeQuery actions")
         results = self.query(action)
         if not self.enabled:
-            return DomainActionResult(self.DISABLED_OBSERVATION)
+            return DomainActionResult(
+                self.DISABLED_OBSERVATION, candidate_progress=False
+            )
         payload = {
             "knowledge_query": {
                 "available": True,
@@ -236,7 +238,8 @@ class KnowledgeAgent:
             }
         }
         return DomainActionResult(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            candidate_progress=False,
         )
 
     def _validated_result(self, hit: SearchHit) -> KnowledgeResult:
