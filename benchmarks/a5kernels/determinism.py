@@ -192,6 +192,8 @@ def snapshot_from_ledger(
         raise ValueError("request evidence must contain a valid recorded request") from None
     if reconstructed_request.request_id != request_id:
         raise ValueError("request_id does not match the recorded request")
+    if action["language"] != reconstructed_request.language:
+        raise ValueError("action language does not match the recorded request")
     if any(
         entry.payload.get("request_id") != request_id
         or entry.payload.get("execution_id") != execution_id

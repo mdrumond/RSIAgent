@@ -274,6 +274,18 @@ def test_snapshot_binds_request_id_to_recorded_request(tmp_path):
         snapshot_from_ledger(replace_entry_payload(ledger.entries, 0, payload))
 
 
+def test_snapshot_binds_action_language_to_recorded_request(tmp_path):
+    ledger = write_ledger(tmp_path / "wrong-language.jsonl", "one")
+    action = ledger.entries[1]
+
+    with pytest.raises(ValueError, match="action language"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, 1, {**action.payload, "language": "ascend-c"}
+            )
+        )
+
+
 def test_snapshot_rejects_non_sha_output_digest(tmp_path):
     ledger = write_ledger(tmp_path / "invalid-output.jsonl", "one")
     result = ledger.entries[-1]
