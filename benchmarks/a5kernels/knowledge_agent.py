@@ -77,7 +77,9 @@ def parse_knowledge_action(value: str) -> Any:
         return None
     try:
         return KnowledgeQuery(
-            payload.get("query"), payload.get("limit", 5), dup=len(candidates)
+            payload.get("query"),
+            payload.get("limit", 5),
+            dup=max(len(candidates), getattr(built_in, "dup", 1)),
         )
     except (TypeError, ValueError):
         return None

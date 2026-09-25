@@ -124,6 +124,15 @@ def test_parser_preserves_whole_reply_rejection_for_api_envelopes():
     assert action is None
 
 
+def test_parser_preserves_duplicate_count_across_action_families():
+    action = parse_knowledge_action(
+        '{"knowledge_query":{"query":"vector"}}\n'
+        '{"done":null}\n{"done":null}'
+    )
+
+    assert action == KnowledgeQuery("vector", dup=2)
+
+
 def test_read_only_view_preserves_relative_database_location(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     database = KnowledgeDB(Path("knowledge.sqlite"), FakeEmbeddings())
