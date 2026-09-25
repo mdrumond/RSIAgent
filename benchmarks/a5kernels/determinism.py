@@ -133,9 +133,15 @@ def snapshot_from_ledger(
         for kind in EvidenceKind
     }
     requests = by_kind[EvidenceKind.REQUEST.value]
+    actions = by_kind[EvidenceKind.ACTION.value]
+    artifacts = by_kind[EvidenceKind.ARTIFACT.value]
     results = by_kind[EvidenceKind.RESULT.value]
     if len(requests) != 1 or len(results) != 1:
         raise ValueError("a replay requires exactly one request and one result entry")
+    if len(actions) != 1:
+        raise ValueError("a replay requires exactly one action entry")
+    if not artifacts:
+        raise ValueError("a replay requires at least one artifact entry")
     request = requests[0].payload
     result = results[0].payload
     request_id = str(request.get("request_id", ""))

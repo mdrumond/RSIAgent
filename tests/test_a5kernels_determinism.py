@@ -34,20 +34,29 @@ def snapshot(attempt_id: str, **changes) -> ReplaySnapshot:
     return ReplaySnapshot(**values)
 
 
-def write_ledger(path, attempt_id: str, *, output="output-1") -> EvidenceLedger:
+def write_ledger(
+    path,
+    attempt_id: str,
+    *,
+    output="output-1",
+    include_action=True,
+    include_artifact=True,
+) -> EvidenceLedger:
     request = RunRequest("catlass-dsl", length=2, seed=7)
     identity = {"request_id": request.request_id, "attempt_id": attempt_id}
     ledger = EvidenceLedger(path)
     ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
-    ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
-    ledger.append(
-        EvidenceKind.ARTIFACT,
-        {
-            **identity,
-            "source_sha256": {"kernel.py": "source-1"},
-            "artifact_sha256": {"source_bundle": "artifact-1"},
-        },
-    )
+    if include_action:
+        ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
+    if include_artifact:
+        ledger.append(
+            EvidenceKind.ARTIFACT,
+            {
+                **identity,
+                "source_sha256": {"kernel.py": "source-1"},
+                "artifact_sha256": {"source_bundle": "artifact-1"},
+            },
+        )
     ledger.append(
         EvidenceKind.RESULT,
         {
@@ -159,6 +168,22 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
     assert replay.output["passed"] is True
     assert replay.metrics["supplemental"]["latency_us"] == 4.5
     assert len(replay.evidence) == 4
+
+
+@pytest.mark.parametrize(
+    ("missing", "options", "message"),
+    [
+        ("action", {"include_action": False}, "exactly one action"),
+        ("artifact", {"include_artifact": False}, "at least one artifact"),
+    ],
+)
+def test_snapshot_rejects_missing_execution_evidence(
+    tmp_path, missing, options, message
+):
+    ledger = write_ledger(tmp_path / f"missing-{missing}.jsonl", "one", **options)
+
+    with pytest.raises(ValueError, match=message):
+        snapshot_from_ledger(ledger.entries)
 
 
 def test_cli_writes_compact_machine_readable_three_replay_report(tmp_path):
