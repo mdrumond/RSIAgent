@@ -20,6 +20,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_digest,
 )
 from benchmarks.a5kernels.protocol import RunRequest
+from benchmarks.a5kernels.fixtures import fixture_for
 
 
 SOURCE_ONE = "1" * 64
@@ -35,6 +36,11 @@ def input_digest(request):
         "input_a": tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length)),
         "input_b": tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length)),
     })
+
+
+def fixture_argv(request):
+    argv = fixture_for(request.language).argv
+    return list(argv) if argv is not None else None
 
 
 def snapshot(attempt_id: str, **changes) -> ReplaySnapshot:
@@ -62,8 +68,9 @@ def write_ledger(
     output=OUTPUT_ONE,
     include_action=True,
     include_artifact=True,
+    language="catlass-dsl",
 ) -> EvidenceLedger:
-    request = RunRequest("catlass-dsl", length=2, seed=7)
+    request = RunRequest(language, length=2, seed=7)
     identity = {
         "request_id": request.request_id,
         "execution_id": "execution-1",
@@ -77,7 +84,7 @@ def write_ledger(
             {
                 **identity,
                 "language": request.language,
-                "argv": ["python", "run.py"],
+                "argv": fixture_argv(request),
                 "inputs_sha256": input_digest(request),
             },
         )
@@ -213,10 +220,11 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
     )
 
     assert replay.attempt_id == "one"
+    request = RunRequest("catlass-dsl", length=2, seed=7)
     assert replay.actions == ({
         "language": "catlass-dsl",
-        "argv": ["python", "run.py"],
-        "inputs_sha256": input_digest(RunRequest("catlass-dsl", length=2, seed=7)),
+        "argv": fixture_argv(request),
+        "inputs_sha256": input_digest(request),
     },)
     assert replay.source_artifacts[0]["source_sha256"]["kernel.py"] == SOURCE_ONE
     assert replay.output["passed"] is True
@@ -253,13 +261,10 @@ def test_snapshot_rejects_identity_only_action(tmp_path):
 
 
 def test_snapshot_accepts_runner_null_argv_boundary(tmp_path):
-    ledger = write_ledger(tmp_path / "null-argv.jsonl", "one")
-    action = ledger.entries[1]
-    replay = snapshot_from_ledger(
-        replace_entry_payload(
-            ledger.entries, 1, {**action.payload, "argv": None}
-        )
+    ledger = write_ledger(
+        tmp_path / "null-argv.jsonl", "one", language="ascend-c"
     )
+    replay = snapshot_from_ledger(ledger.entries)
 
     assert replay.actions[0]["argv"] is None
 
@@ -334,6 +339,42 @@ def test_snapshot_binds_input_digest_to_recorded_request(tmp_path):
         )
 
 
+def test_snapshot_binds_argv_to_registered_fixture(tmp_path):
+    ledger = write_ledger(tmp_path / "wrong-argv.jsonl", "one")
+    action = ledger.entries[1]
+
+    with pytest.raises(ValueError, match="registered fixture"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, 1, {**action.payload, "argv": ["python", "other.py"]}
+            )
+        )
+
+
+def test_snapshot_rejects_request_over_fixture_length_limit(tmp_path):
+    ledger = write_ledger(tmp_path / "oversized.jsonl", "one")
+    oversized = RunRequest("catlass-dsl", length=401, seed=7)
+    request = ledger.entries[0]
+    rebuilt = replace_entry_payload(
+        ledger.entries,
+        0,
+        {
+            **request.payload,
+            "request_id": oversized.request_id,
+            "request": oversized.__dict__,
+        },
+    )
+    for index in range(1, len(rebuilt)):
+        rebuilt = replace_entry_payload(
+            rebuilt,
+            index,
+            {**rebuilt[index].payload, "request_id": oversized.request_id},
+        )
+
+    with pytest.raises(ValueError, match="fixture length limit"):
+        snapshot_from_ledger(rebuilt)
+
+
 def test_snapshot_rejects_non_sha_output_digest(tmp_path):
     ledger = write_ledger(tmp_path / "invalid-output.jsonl", "one")
     result = ledger.entries[-1]
@@ -377,7 +418,7 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
         {
             **identity,
             "language": request.language,
-            "argv": ["python", "run.py"],
+            "argv": fixture_argv(request),
             "inputs_sha256": input_digest(request),
         },
     )
@@ -420,7 +461,7 @@ def test_snapshot_rejects_execution_error_without_output(tmp_path):
         {
             **identity,
             "language": request.language,
-            "argv": ["python", "run.py"],
+            "argv": fixture_argv(request),
             "inputs_sha256": input_digest(request),
         },
     )

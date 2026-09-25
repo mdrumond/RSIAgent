@@ -195,11 +195,19 @@ def snapshot_from_ledger(
     if reconstructed_request.request_id != request_id:
         raise ValueError("request_id does not match the recorded request")
     try:
-        fixture_for(reconstructed_request.language)
+        fixture = fixture_for(reconstructed_request.language)
     except ValueError:
         raise ValueError("recorded request uses an unsupported language") from None
+    if (
+        fixture.max_length is not None
+        and reconstructed_request.length > fixture.max_length
+    ):
+        raise ValueError("recorded request exceeds the fixture length limit")
     if action["language"] != reconstructed_request.language:
         raise ValueError("action language does not match the recorded request")
+    normalized_argv = tuple(argv) if argv is not None else None
+    if normalized_argv != fixture.argv:
+        raise ValueError("action argv does not match the registered fixture")
     rng = random.Random(reconstructed_request.seed)
     input_a = tuple(
         rng.uniform(-1.0, 1.0) for _ in range(reconstructed_request.length)
