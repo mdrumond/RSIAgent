@@ -72,10 +72,10 @@ def parse_knowledge_action(value: str) -> Any:
         return built_in
     raw = candidates[-1]
     if set(raw) != {"knowledge_query"}:
-        return None
+        return built_in
     payload = raw["knowledge_query"]
     if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
-        return None
+        return built_in
     try:
         return KnowledgeQuery(
             payload.get("query"),
@@ -83,7 +83,7 @@ def parse_knowledge_action(value: str) -> Any:
             dup=max(len(candidates), getattr(built_in, "dup", 1)),
         )
     except (TypeError, ValueError):
-        return None
+        return built_in
 
 
 def _json_values(value: str):

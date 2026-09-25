@@ -144,6 +144,15 @@ def test_parser_propagates_query_duplicates_to_builtin_action():
     assert action.dup == 2
 
 
+def test_parser_preserves_done_when_query_candidate_is_invalid():
+    action = parse_knowledge_action(
+        '{"done":null}\n'
+        '{"knowledge_query":{"query":"vector"},"metadata":"draft"}'
+    )
+
+    assert isinstance(action, Done)
+
+
 def test_read_only_view_preserves_relative_database_location(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     database = KnowledgeDB(Path("knowledge.sqlite"), FakeEmbeddings())
