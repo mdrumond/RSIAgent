@@ -34,28 +34,49 @@ class CampaignKind(str, Enum):
 class ProfileRequest:
     """Host-declared identity and launch settings for a kernel campaign."""
 
-    request_id: str
-    attempt_id: str
-    execution_id: str
+    plan: ExecutionPlan
     implementation: str
     expected_kernel: str
     device: int
-    workload_argv: tuple[str, ...]
-    source_fingerprint: str
     warm_up: int = 0
     launch_count: int = 1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.plan, ExecutionPlan):
+            raise TypeError("plan must be an immutable ExecutionPlan")
+        if self.plan.argv is None:
+            raise ValueError("profiling requires a concrete executable runtime plan")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", self.attempt_id):
             raise ValueError("attempt_id must be a safe host-owned identifier")
         if not self.expected_kernel.strip():
             raise ValueError("expected_kernel must be an exact non-empty name")
         if self.device < 0:
             raise ValueError("device must be non-negative")
-        if not self.workload_argv:
+        if not self.plan.argv:
             raise ValueError("workload_argv must not be empty")
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
+
+    @property
+    def request_id(self) -> str:
+        return self.plan.request_id
+
+    @property
+    def attempt_id(self) -> str:
+        return self.plan.attempt_id
+
+    @property
+    def execution_id(self) -> str:
+        return self.plan.execution_id
+
+    @property
+    def workload_argv(self) -> tuple[str, ...]:
+        assert self.plan.argv is not None
+        return self.plan.argv
+
+    @property
+    def source_fingerprint(self) -> str:
+        return self.plan.source_fingerprint
 
     @classmethod
     def from_execution_plan(
@@ -70,17 +91,11 @@ class ProfileRequest:
     ) -> ProfileRequest:
         """Bind profiling to the exact host-prepared executable attempt."""
 
-        if plan.argv is None:
-            raise ValueError("profiling requires a concrete executable runtime plan")
         return cls(
-            request_id=plan.request_id,
-            attempt_id=plan.attempt_id,
-            execution_id=plan.execution_id,
+            plan=plan,
             implementation=implementation,
             expected_kernel=expected_kernel,
             device=device,
-            workload_argv=plan.argv,
-            source_fingerprint=plan.source_fingerprint,
             warm_up=warm_up,
             launch_count=launch_count,
         )

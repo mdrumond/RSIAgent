@@ -15,11 +15,25 @@ from benchmarks.a5kernels.profiling import (
     TimingResult,
 )
 from benchmarks.a5kernels import A5KernelRunner, Language, RunRequest
-from benchmarks.a5kernels.protocol import ExecutionReceipt, VerifiedResult
+from benchmarks.a5kernels.protocol import (
+    ExecutionPlan,
+    ExecutionReceipt,
+    SourceFile,
+    VerifiedResult,
+)
 
 
 SHA = "a" * 64
-SOURCE = "b" * 64
+PLAN = ExecutionPlan(
+    request_id="request-1",
+    attempt_id="attempt-1",
+    language="catlass-dsl",
+    files=(SourceFile("kernel.py", "def kernel(): pass\n"),),
+    argv=("python", "run.py"),
+    input_a=(1.0,),
+    input_b=(2.0,),
+)
+SOURCE = PLAN.source_fingerprint
 
 
 def archive(metric: str) -> EvidenceArchive:
@@ -34,18 +48,14 @@ def archive(metric: str) -> EvidenceArchive:
 
 
 REQUEST = ProfileRequest(
-    "request-1",
-    "attempt-1",
-    "execution-1",
+    PLAN,
     "catlass",
     "vector_add__kernel0",
     3,
-    ("python", "run.py"),
-    SOURCE,
 )
 CORRECT = VerifiedResult(
     request_id="request-1",
-    execution_id="execution-1",
+    execution_id=PLAN.execution_id,
     attempt_id="attempt-1",
     language="catlass",
     runtime_provenance=(),
@@ -96,6 +106,22 @@ def test_profile_request_rejects_foundational_plan_without_runtime() -> None:
             expected_kernel="vector_add__kernel0",
             device=3,
         )
+
+
+def test_changed_argv_cannot_reuse_correctness_from_original_plan() -> None:
+    changed = ProfileRequest.from_execution_plan(
+        replace(PLAN, argv=("python", "other-driver.py")),
+        implementation="catlass",
+        expected_kernel="vector_add__kernel0",
+        device=3,
+    )
+
+    assert changed.workload_argv == ("python", "other-driver.py")
+    assert changed.execution_id != REQUEST.execution_id
+    with pytest.raises(ValueError, match="different execution"):
+        ProfilingTreatmentController(
+            FakeBackend(), treatment_enabled=True
+        ).run_final(CORRECT, changed)
 
 
 class FakeBackend:
