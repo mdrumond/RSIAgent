@@ -65,6 +65,19 @@ def test_ledger_appends_and_reopens_a_verified_chain(tmp_path):
     assert path.read_bytes().endswith(b"\n")
 
 
+def test_two_ledger_instances_refresh_the_chain_before_appending(tmp_path):
+    path = tmp_path / "shared.evidence.jsonl"
+    first = EvidenceLedger(path)
+    second = EvidenceLedger(path)
+
+    request = first.append(EvidenceKind.REQUEST, {"seed": 7})
+    action = second.append(EvidenceKind.ACTION, {"argv": ["python", "kernel.py"]})
+
+    reopened = EvidenceLedger(path)
+    assert [entry.sequence for entry in reopened.entries] == [0, 1]
+    assert action.previous_sha256 == request.entry_sha256
+
+
 def test_ledger_rejects_payload_tampering(tmp_path):
     path = tmp_path / "run.evidence.jsonl"
     EvidenceLedger(path).append(EvidenceKind.RESULT, {"passed": True})

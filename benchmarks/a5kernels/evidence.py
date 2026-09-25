@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
+import fcntl
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -111,21 +113,31 @@ class EvidenceLedger:
     def append(
         self, kind: EvidenceKind | str, payload: Mapping[str, Any]
     ) -> EvidenceEntry:
-        entry = EvidenceEntry.create(
-            len(self._entries), kind, _normalize(payload), self.head_sha256
-        )
+        normalized = _normalize(payload)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("ab") as stream:
+        with self.path.open("a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            stream.seek(0)
+            current = tuple(self._decode(stream.read()))
+            self.verify(current)
+            previous = current[-1].entry_sha256 if current else GENESIS_HASH
+            entry = EvidenceEntry.create(len(current), kind, normalized, previous)
+            stream.seek(0, os.SEEK_END)
             stream.write(canonical_bytes(entry.as_dict()) + b"\n")
             stream.flush()
-        self._entries += (entry,)
+            os.fsync(stream.fileno())
+        self._entries = current + (entry,)
         return entry
 
     def _read(self) -> Iterable[EvidenceEntry]:
         if not self.path.exists():
             return ()
+        return self._decode(self.path.read_bytes())
+
+    @staticmethod
+    def _decode(data: bytes) -> Iterable[EvidenceEntry]:
         entries = []
-        for line_number, line in enumerate(self.path.read_bytes().splitlines(), 1):
+        for line_number, line in enumerate(data.splitlines(), 1):
             try:
                 value = json.loads(line)
                 entries.append(EvidenceEntry(**value))
