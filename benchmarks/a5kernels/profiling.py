@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import math
+from pathlib import PurePosixPath
 import re
 from typing import Protocol
 
@@ -172,8 +173,18 @@ class EvidenceArchive:
         if not paths or paths != sorted(paths) or len(paths) != len(set(paths)):
             raise ValueError("evidence entries must be non-empty, unique, and sorted")
         for entry in self.entries:
-            if entry.relative_path.startswith("/") or ".." in entry.relative_path.split("/"):
-                raise ValueError("evidence paths must be archive-relative")
+            path = PurePosixPath(entry.relative_path)
+            normalized = path.as_posix()
+            if (
+                not entry.relative_path
+                or normalized == "."
+                or normalized != entry.relative_path
+                or path.is_absolute()
+                or ".." in path.parts
+            ):
+                raise ValueError(
+                    "evidence paths must be normalized non-empty archive-relative paths"
+                )
             if not _SHA256.fullmatch(entry.sha256) or entry.size_bytes < 0:
                 raise ValueError("invalid evidence entry metadata")
 

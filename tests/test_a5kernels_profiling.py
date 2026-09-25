@@ -414,6 +414,25 @@ def test_pipe_utilization_must_match_kernel_and_include_summary(
             ),
             "unique, and sorted",
         ),
+        (
+            replace(
+                archive("basic"), entries=(EvidenceEntry("", SHA, 1),)
+            ),
+            "normalized non-empty archive-relative",
+        ),
+        (
+            replace(
+                archive("basic"), entries=(EvidenceEntry(".", SHA, 1),)
+            ),
+            "normalized non-empty archive-relative",
+        ),
+        (
+            replace(
+                archive("basic"),
+                entries=(EvidenceEntry("summary//basic.json", SHA, 1),),
+            ),
+            "normalized non-empty archive-relative",
+        ),
     ],
 )
 def test_evidence_archive_contract(bad_archive: EvidenceArchive, message: str) -> None:
