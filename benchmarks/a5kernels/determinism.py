@@ -265,7 +265,8 @@ def snapshot_from_ledger(
         and max_abs_error >= 0
         and "max_abs_error_status" not in result
     ) or (
-        max_abs_error is None
+        "max_abs_error" in result
+        and max_abs_error is None
         and result.get("max_abs_error_status") == "non-finite"
     )
     if (

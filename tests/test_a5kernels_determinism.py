@@ -747,6 +747,23 @@ def test_snapshot_rejects_finite_error_with_non_finite_status(tmp_path):
         )
 
 
+def test_snapshot_requires_explicit_null_non_finite_error(tmp_path):
+    ledger = write_ledger(tmp_path / "missing-non-finite-error.jsonl", "one")
+    result = ledger.entries[-1]
+    payload = {
+        key: value for key, value in result.payload.items()
+        if key != "max_abs_error"
+    }
+    payload["max_abs_error_status"] = "non-finite"
+
+    with pytest.raises(ValueError, match="verified replay output"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, len(ledger.entries) - 1, payload
+            )
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
