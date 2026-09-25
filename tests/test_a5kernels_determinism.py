@@ -20,6 +20,8 @@ SOURCE_ONE = "1" * 64
 SOURCE_TWO = "2" * 64
 ARTIFACT_ONE = "a" * 64
 ARTIFACT_TWO = "b" * 64
+INPUTS_ONE = "d" * 64
+OUTPUT_ONE = "e" * 64
 
 
 def snapshot(attempt_id: str, **changes) -> ReplaySnapshot:
@@ -44,7 +46,7 @@ def write_ledger(
     path,
     attempt_id: str,
     *,
-    output="output-1",
+    output=OUTPUT_ONE,
     include_action=True,
     include_artifact=True,
 ) -> EvidenceLedger:
@@ -57,7 +59,15 @@ def write_ledger(
     ledger = EvidenceLedger(path)
     ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
     if include_action:
-        ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
+        ledger.append(
+            EvidenceKind.ACTION,
+            {
+                **identity,
+                "language": request.language,
+                "argv": ["python", "run.py"],
+                "inputs_sha256": INPUTS_ONE,
+            },
+        )
     if include_artifact:
         ledger.append(
             EvidenceKind.ARTIFACT,
@@ -79,6 +89,22 @@ def write_ledger(
         },
     )
     return ledger
+
+
+def replace_entry_payload(entries, index, payload):
+    rebuilt = list(entries[:index])
+    previous = rebuilt[-1].entry_sha256 if rebuilt else "0" * 64
+    original = entries[index]
+    rebuilt.append(
+        EvidenceEntry.create(original.sequence, original.kind, payload, previous)
+    )
+    for entry in entries[index + 1:]:
+        rebuilt.append(
+            EvidenceEntry.create(
+                entry.sequence, entry.kind, entry.payload, rebuilt[-1].entry_sha256
+            )
+        )
+    return rebuilt
 
 
 def test_runner_captures_exactly_three_unique_attempts_for_one_request():
@@ -174,7 +200,11 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
     )
 
     assert replay.attempt_id == "one"
-    assert replay.actions == ({"language": "catlass-dsl"},)
+    assert replay.actions == ({
+        "language": "catlass-dsl",
+        "argv": ["python", "run.py"],
+        "inputs_sha256": INPUTS_ONE,
+    },)
     assert replay.source_artifacts[0]["source_sha256"]["kernel.py"] == SOURCE_ONE
     assert replay.output["passed"] is True
     assert replay.metrics["supplemental"]["latency_us"] == 4.5
@@ -197,6 +227,41 @@ def test_snapshot_rejects_missing_execution_evidence(
         snapshot_from_ledger(ledger.entries)
 
 
+def test_snapshot_rejects_identity_only_action(tmp_path):
+    ledger = write_ledger(tmp_path / "empty-action.jsonl", "one")
+    action = ledger.entries[1]
+    payload = {
+        key: action.payload[key]
+        for key in ("request_id", "execution_id", "attempt_id")
+    }
+
+    with pytest.raises(ValueError, match="substantive action evidence"):
+        snapshot_from_ledger(replace_entry_payload(ledger.entries, 1, payload))
+
+
+def test_snapshot_binds_request_id_to_recorded_request(tmp_path):
+    ledger = write_ledger(tmp_path / "missing-request.jsonl", "one")
+    request = ledger.entries[0]
+    payload = {key: value for key, value in request.payload.items() if key != "request"}
+
+    with pytest.raises(ValueError, match="valid recorded request"):
+        snapshot_from_ledger(replace_entry_payload(ledger.entries, 0, payload))
+
+
+def test_snapshot_rejects_non_sha_output_digest(tmp_path):
+    ledger = write_ledger(tmp_path / "invalid-output.jsonl", "one")
+    result = ledger.entries[-1]
+
+    with pytest.raises(ValueError, match="verified replay output and metrics"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                len(ledger.entries) - 1,
+                {**result.payload, "output_sha256": "not-a-sha"},
+            )
+        )
+
+
 @pytest.mark.parametrize("field", ["source_sha256", "artifact_sha256"])
 def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
     request = RunRequest("catlass-dsl", length=2, seed=7)
@@ -207,7 +272,15 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
     }
     ledger = EvidenceLedger(tmp_path / f"missing-{field}.jsonl")
     ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
-    ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
+    ledger.append(
+        EvidenceKind.ACTION,
+        {
+            **identity,
+            "language": request.language,
+            "argv": ["python", "run.py"],
+            "inputs_sha256": INPUTS_ONE,
+        },
+    )
     ledger.append(
         EvidenceKind.ARTIFACT,
         {
@@ -222,7 +295,7 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
         {
             **identity,
             "status": "verified",
-            "output_sha256": "output-1",
+            "output_sha256": OUTPUT_ONE,
             "passed": True,
             "exit_code": 0,
             "max_abs_error": 0.0,
@@ -242,7 +315,15 @@ def test_snapshot_rejects_execution_error_without_output(tmp_path):
     }
     ledger = EvidenceLedger(tmp_path / "execution-error.jsonl")
     ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
-    ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
+    ledger.append(
+        EvidenceKind.ACTION,
+        {
+            **identity,
+            "language": request.language,
+            "argv": ["python", "run.py"],
+            "inputs_sha256": INPUTS_ONE,
+        },
+    )
     ledger.append(
         EvidenceKind.ARTIFACT,
         {

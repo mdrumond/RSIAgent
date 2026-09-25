@@ -141,6 +141,17 @@ def snapshot_from_ledger(
         raise ValueError("a replay requires exactly one request and one result entry")
     if len(actions) != 1:
         raise ValueError("a replay requires exactly one action entry")
+    action = actions[0].payload
+    if (
+        not isinstance(action.get("language"), str)
+        or not action["language"]
+        or not isinstance(action.get("argv"), (list, tuple))
+        or not action["argv"]
+        or any(not isinstance(item, str) or not item for item in action["argv"])
+        or re.fullmatch(r"[0-9a-f]{64}", str(action.get("inputs_sha256", "")))
+        is None
+    ):
+        raise ValueError("a replay requires substantive action evidence")
     if not artifacts:
         raise ValueError("a replay requires at least one artifact entry")
     for artifact in artifacts:
@@ -167,6 +178,13 @@ def snapshot_from_ledger(
     attempt_id = str(request.get("attempt_id", ""))
     if not request_id or not execution_id or not attempt_id:
         raise ValueError("request evidence is missing replay identity")
+    recorded_request = request.get("request")
+    try:
+        reconstructed_request = RunRequest(**recorded_request)
+    except (TypeError, ValueError):
+        raise ValueError("request evidence must contain a valid recorded request") from None
+    if reconstructed_request.request_id != request_id:
+        raise ValueError("request_id does not match the recorded request")
     if any(
         entry.payload.get("request_id") != request_id
         or entry.payload.get("execution_id") != execution_id
@@ -188,8 +206,8 @@ def snapshot_from_ledger(
     )
     if (
         result.get("status") != "verified"
-        or not isinstance(result.get("output_sha256"), str)
-        or not result["output_sha256"]
+        or re.fullmatch(r"[0-9a-f]{64}", str(result.get("output_sha256", "")))
+        is None
         or not isinstance(result.get("passed"), bool)
         or isinstance(result.get("exit_code"), bool)
         or not isinstance(result.get("exit_code"), int)
