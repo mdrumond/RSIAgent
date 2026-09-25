@@ -104,8 +104,8 @@ class ProgressiveMemoryJournal:
     """Append-only query provenance owned by the mutable experiment memory."""
 
     def __init__(self, path: Path):
-        self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path.resolve()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def append(
         self,

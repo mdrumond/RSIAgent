@@ -139,6 +139,26 @@ def test_read_only_view_preserves_relative_database_location(tmp_path, monkeypat
     database.close()
 
 
+def test_journal_preserves_relative_path_after_chdir(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    journal = ProgressiveMemoryJournal(Path("memory") / "knowledge.jsonl")
+    original_path = journal.path
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    journal.append(
+        enabled=False,
+        collection=None,
+        query="vector",
+        citations=(),
+    )
+
+    assert journal.path == original_path
+    assert original_path.is_file()
+    assert journal.read()[0]["query"] == "vector"
+
+
 def test_gate_returns_validated_citations_and_journals_provenance(tmp_path):
     database = _database(tmp_path)
     journal = ProgressiveMemoryJournal(tmp_path / "memory" / "knowledge.jsonl")
