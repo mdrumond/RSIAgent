@@ -332,8 +332,38 @@ def test_snapshot_binds_request_id_to_recorded_request(tmp_path):
     request = ledger.entries[0]
     payload = {key: value for key, value in request.payload.items() if key != "request"}
 
-    with pytest.raises(ValueError, match="valid recorded request"):
+    with pytest.raises(ValueError, match="runner schema"):
         snapshot_from_ledger(replace_entry_payload(ledger.entries, 0, payload))
+
+
+def test_snapshot_requires_complete_recorded_request_schema(tmp_path):
+    ledger = write_ledger(tmp_path / "partial-request.jsonl", "one")
+    request = ledger.entries[0]
+    recorded = dict(request.payload["request"])
+    recorded.pop("seed")
+
+    with pytest.raises(ValueError, match="runner schema"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                0,
+                {**request.payload, "request": recorded},
+            )
+        )
+
+
+def test_snapshot_rejects_non_runner_attempt_id(tmp_path):
+    ledger = write_ledger(tmp_path / "unsafe-attempt.jsonl", "one")
+    entries = ledger.entries
+    for index in range(len(entries)):
+        entries = replace_entry_payload(
+            entries,
+            index,
+            {**entries[index].payload, "attempt_id": "bad/attempt"},
+        )
+
+    with pytest.raises(ValueError, match="runner-safe"):
+        snapshot_from_ledger(entries)
 
 
 def test_snapshot_binds_action_language_to_recorded_request(tmp_path):

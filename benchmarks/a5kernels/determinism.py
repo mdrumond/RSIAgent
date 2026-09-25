@@ -195,7 +195,16 @@ def snapshot_from_ledger(
     attempt_id = str(request.get("attempt_id", ""))
     if not request_id or not execution_id or not attempt_id:
         raise ValueError("request evidence is missing replay identity")
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", attempt_id) is None:
+        raise ValueError("attempt_id is not a runner-safe identifier")
     recorded_request = request.get("request")
+    if not isinstance(recorded_request, Mapping) or set(recorded_request) != {
+        "language",
+        "length",
+        "seed",
+        "dtype",
+    }:
+        raise ValueError("recorded request does not have the runner schema")
     try:
         reconstructed_request = RunRequest(**recorded_request)
     except (TypeError, ValueError):
