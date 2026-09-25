@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -112,6 +113,30 @@ def test_knowledge_query_precedes_terminal_done_in_mixed_reply():
     )
 
     assert action == KnowledgeQuery("vector")
+
+
+def test_parser_preserves_whole_reply_rejection_for_api_envelopes():
+    action = parse_knowledge_action(
+        '{"name":"bash","arguments":{"code":"echo not executed"}}\n'
+        '{"knowledge_query":{"query":"vector"}}'
+    )
+
+    assert action is None
+
+
+def test_read_only_view_preserves_relative_database_location(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    database = KnowledgeDB(Path("knowledge.sqlite"), FakeEmbeddings())
+    original_path = database.path
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    with database.read_only_view() as view:
+        assert view.path == original_path
+        assert view.connection.execute("SELECT count(*) FROM collections").fetchone()[0] == 0
+
+    database.close()
 
 
 def test_gate_returns_validated_citations_and_journals_provenance(tmp_path):

@@ -205,9 +205,9 @@ class KnowledgeDB:
     """SQLite FTS5 store with deterministic vector/lexical rank fusion."""
 
     def __init__(self, path: Path, embeddings: EmbeddingBackend):
-        self.path = path
+        self.path = path.resolve()
         self.embeddings = embeddings
-        self.connection = sqlite3.connect(path)
+        self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
 

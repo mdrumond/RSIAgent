@@ -54,11 +54,15 @@ def parse_knowledge_action(value: str) -> Any:
     from core.actor import Done, parse_turn
 
     built_in = parse_turn(value)
-    candidates = [
-        raw
-        for raw in _json_values(value or "")
-        if isinstance(raw, dict) and "knowledge_query" in raw
-    ]
+    objects = [raw for raw in _json_values(value or "") if isinstance(raw, dict)]
+    if any(
+        isinstance(raw.get("name"), str)
+        and raw["name"].strip()
+        and isinstance(raw.get("arguments"), (dict, str))
+        for raw in objects
+    ):
+        return None
+    candidates = [raw for raw in objects if "knowledge_query" in raw]
     if not candidates:
         return built_in
     # Preserve the Actor parser's keep-working precedence. Programs, looks, and
