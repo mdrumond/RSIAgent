@@ -535,6 +535,7 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
             ("cann_version", "9.1"),
             ("catlass_revision", "revision"),
             ("catlass_source", "/remote/catlass"),
+            ("execution_profile", "bz-a5"),
             ("manifest_sha256", "manifest"),
         ),
     )
@@ -610,6 +611,7 @@ def test_concrete_backend_rejects_relative_remote_tree(tmp_path: Path) -> None:
                 ("cann_version", "9.1"),
                 ("catlass_revision", "revision"),
                 ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
                 ("manifest_sha256", "manifest"),
             ),
         ),
@@ -637,6 +639,53 @@ def test_concrete_backend_rejects_non_catlass_plan(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="catlass-dsl execution plan"):
         backend.time(command)
+
+
+@pytest.mark.parametrize("execution_profile", [None, "gz-a3"])
+def test_concrete_backend_rejects_non_bz_execution_provenance(
+    tmp_path: Path, execution_profile: str | None
+) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        raise AssertionError("invalid provenance must fail before dispatch")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    provenance = {
+        "ascendnpu_ir_gitlink": "gitlink",
+        "ascendnpu_ir_install_commit": "install",
+        "bridge_sha256": "bridge",
+        "cann_version": "9.1",
+        "catlass_revision": "revision",
+        "catlass_source": "/remote/catlass",
+        "manifest_sha256": "manifest",
+    }
+    if execution_profile is not None:
+        provenance["execution_profile"] = execution_profile
+    request = replace(
+        REQUEST,
+        plan=replace(PLAN, runtime_provenance=tuple(sorted(provenance.items()))),
+    )
+    timing = TimingCommand(CampaignKind.FINAL, request, "profile-" + "a" * 64)
+    capture = CaptureCommand(
+        CampaignKind.FINAL,
+        request,
+        ProfileMetric.BASIC_INFO,
+        "profile-" + "b" * 64,
+    )
+
+    with pytest.raises(ValueError, match="bz-a5 execution provenance"):
+        backend.time(timing)
+    with pytest.raises(ValueError, match="bz-a5 execution provenance"):
+        backend.capture(capture)
+    assert calls == []
 
 
 def test_real_catlass_fixture_exposes_host_owned_timing_and_device_contract() -> None:

@@ -155,6 +155,8 @@ class BZProfileBackend:
         if request.implementation not in {"catlass", "catlass-dsl", "dsl"}:
             raise ValueError("BZProfileBackend supports only Catlass DSL requests")
         provenance = dict(request.plan.runtime_provenance)
+        if provenance.get("execution_profile") != "bz-a5":
+            raise ValueError("profiling request requires bz-a5 execution provenance")
         required = (
             "catlass_revision",
             "catlass_source",
