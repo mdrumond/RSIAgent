@@ -688,6 +688,44 @@ def test_concrete_backend_rejects_non_bz_execution_provenance(
     assert calls == []
 
 
+def test_concrete_backend_enforces_host_subprocess_timeout(tmp_path: Path) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        timeout=37,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+    command = TimingCommand(CampaignKind.FINAL, request, "profile-" + "a" * 64)
+
+    with pytest.raises(RuntimeError, match="exceeded its timeout"):
+        backend.time(command)
+    assert calls[0][1]["timeout"] == 37
+
+
 def test_real_catlass_fixture_exposes_host_owned_timing_and_device_contract() -> None:
     plan = A5KernelRunner(PreparingBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value), attempt_id="timed-fixture"

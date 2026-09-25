@@ -235,7 +235,16 @@ class BZProfileBackend:
         )
 
     def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
-        return self._run(argv, text=True, capture_output=True, check=False)
+        try:
+            return self._run(
+                argv,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=self._timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("profiling subprocess exceeded its timeout") from exc
 
 
 def _marked_values(output: str, marker: str) -> list[str]:
