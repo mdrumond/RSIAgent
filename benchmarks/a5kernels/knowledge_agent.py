@@ -71,7 +71,10 @@ def parse_knowledge_action(value: str) -> Any:
         built_in.dup = max(built_in.dup, len(candidates))
         return built_in
     raw = candidates[-1]
-    if set(raw) != {"knowledge_query"}:
+    extra_keys = set(raw) - {"knowledge_query"}
+    if extra_keys and not (
+        isinstance(built_in, Done) and extra_keys <= {"done", "checks"}
+    ):
         return built_in
     payload = raw["knowledge_query"]
     if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
