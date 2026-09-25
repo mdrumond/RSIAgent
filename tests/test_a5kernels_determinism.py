@@ -251,6 +251,20 @@ def test_snapshot_accepts_runner_null_argv_boundary(tmp_path):
     assert replay.actions[0]["argv"] is None
 
 
+def test_snapshot_rejects_numeric_input_digest(tmp_path):
+    ledger = write_ledger(tmp_path / "numeric-input.jsonl", "one")
+    action = ledger.entries[1]
+
+    with pytest.raises(ValueError, match="substantive action evidence"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                1,
+                {**action.payload, "inputs_sha256": int("1" * 64)},
+            )
+        )
+
+
 def test_snapshot_binds_request_id_to_recorded_request(tmp_path):
     ledger = write_ledger(tmp_path / "missing-request.jsonl", "one")
     request = ledger.entries[0]

@@ -155,8 +155,8 @@ def snapshot_from_ledger(
                 or any(not isinstance(item, str) or not item for item in argv)
             )
         )
-        or re.fullmatch(r"[0-9a-f]{64}", str(action.get("inputs_sha256", "")))
-        is None
+        or not isinstance(action.get("inputs_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", action["inputs_sha256"]) is None
     ):
         raise ValueError("a replay requires substantive action evidence")
     if not artifacts:
