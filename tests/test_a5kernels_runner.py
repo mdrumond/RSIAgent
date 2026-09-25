@@ -351,7 +351,16 @@ def test_catlass_fixture_uses_current_imperative_runtime_api():
     fixture = fixture_for(Language.CATLASS_DSL)
     sources = {item.relative_path: item.content for item in fixture.files}
 
-    assert fixture.argv == ("python", "-B", "host_driver.py", "kernel.py", "input.json")
+    assert fixture.argv == (
+        "env",
+        "-u",
+        "PYTHONPYCACHEPREFIX",
+        "python",
+        "-B",
+        "host_driver.py",
+        "kernel.py",
+        "input.json",
+    )
     assert set(sources) == {"host_driver.py", "kernel.py"}
     assert "tla.allocate" in sources["kernel.py"]
     assert 'tla.vec.func(mode="simd")' in sources["kernel.py"]
@@ -382,6 +391,52 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{OUTPUT_MARKER}[4.0,2.0]\n"
+
+
+def test_host_driver_rejects_external_pycache_prefix_before_catlass_import(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "kernel.py").write_text("def run(a, b):\n    return [3.0]\n")
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "A5 Test"], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "a5@example.invalid"],
+        check=True,
+    )
+    tla = tmp_path / "catlass" / "tla.py"
+    tla.write_text(
+        "from pathlib import Path\nPath('catlass-imported').touch()\n" + tla.read_text()
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "catlass/tla.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "import marker"], check=True)
+    revision = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    _write_native_manifest(tmp_path, revision)
+    environment = _fake_runtime_env(tmp_path)
+    environment["PYTHONPYCACHEPREFIX"] = str(tmp_path / "external-cache")
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision),
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=environment,
+    )
+
+    assert result.returncode != 0
+    assert "PYTHONPYCACHEPREFIX to be unset" in result.stderr
+    assert not (tmp_path / "catlass-imported").exists()
 
 
 def test_host_driver_preflight_rejects_legacy_catlass_before_kernel_import(tmp_path):

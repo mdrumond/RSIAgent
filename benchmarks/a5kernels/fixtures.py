@@ -317,6 +317,11 @@ def _preflight_runtime(
     expected_install_commit: str,
     expected_cann_version: str,
 ):
+    if "PYTHONPYCACHEPREFIX" in os.environ or sys.pycache_prefix is not None:
+        raise RuntimeError(
+            "Catlass runtime requires PYTHONPYCACHEPREFIX to be unset and "
+            "sys.pycache_prefix to be None before import"
+        )
     source_value = os.environ.get("CATLASS_SRC")
     if not source_value or not Path(source_value).is_absolute():
         raise RuntimeError("CATLASS_SRC must name the explicit retained Catlass source")
@@ -465,7 +470,16 @@ _FIXTURES = {
             SourceFile("kernel.py", _CATLASS_SOURCE),
             SourceFile("host_driver.py", _CATLASS_DRIVER),
         ),
-        ("python", "-B", "host_driver.py", "kernel.py", "input.json"),
+        (
+            "env",
+            "-u",
+            "PYTHONPYCACHEPREFIX",
+            "python",
+            "-B",
+            "host_driver.py",
+            "kernel.py",
+            "input.json",
+        ),
         400,
     ),
     Language.ASCEND_C: Fixture(
