@@ -22,7 +22,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_bytes,
     canonical_digest,
 )
-from benchmarks.a5kernels.protocol import RunRequest
+from benchmarks.a5kernels.protocol import ExecutionPlan, RunRequest, canonical_hash
 from benchmarks.a5kernels.fixtures import fixture_for
 
 
@@ -219,6 +219,18 @@ def snapshot_from_ledger(
         {"input_a": input_a, "input_b": input_b}
     ):
         raise ValueError("action input digest does not match the recorded request")
+    expected_sources = {
+        source.relative_path: source.sha256 for source in fixture.files
+    }
+    expected_source_fingerprint = canonical_hash(expected_sources)
+    if any(
+        artifact.payload.get("source_sha256") != expected_sources
+        or artifact.payload.get("source_fingerprint") != expected_source_fingerprint
+        or artifact.payload.get("artifact_sha256")
+        != {"source_bundle": expected_source_fingerprint}
+        for artifact in artifacts
+    ):
+        raise ValueError("artifact evidence does not match the registered fixture")
     if any(
         entry.payload.get("request_id") != request_id
         or entry.payload.get("execution_id") != execution_id
@@ -252,6 +264,53 @@ def snapshot_from_ledger(
         result["exit_code"] != 0 or not isinstance(max_abs_error, (int, float))
     ):
         raise ValueError("verified replay result contains a contradictory outcome")
+    runtime_provenance = result.get("runtime_provenance")
+    if (
+        not isinstance(runtime_provenance, (list, tuple))
+        or any(
+            not isinstance(item, (list, tuple))
+            or len(item) != 2
+            or any(not isinstance(value, str) for value in item)
+            for item in runtime_provenance
+        )
+    ):
+        raise ValueError("result runtime provenance has an invalid schema")
+    plan = ExecutionPlan(
+        request_id=request_id,
+        attempt_id=attempt_id,
+        language=fixture.language.value,
+        files=fixture.files,
+        argv=fixture.argv,
+        input_a=input_a,
+        input_b=input_b,
+        runtime_provenance=tuple(tuple(item) for item in runtime_provenance),
+    )
+    if execution_id != plan.execution_id:
+        raise ValueError("execution_id does not match the reconstructed plan")
+    execution_evidence = result.get("execution_evidence")
+    if (
+        not isinstance(execution_evidence, Mapping)
+        or set(execution_evidence)
+        != {"retained_logs", "diagnostics", "result_exit_code", "output_sha256"}
+        or not isinstance(execution_evidence.get("retained_logs"), str)
+        or not isinstance(execution_evidence.get("diagnostics"), str)
+        or execution_evidence.get("result_exit_code") != result["exit_code"]
+        or execution_evidence.get("output_sha256") != result["output_sha256"]
+    ):
+        raise ValueError("result execution evidence is invalid")
+    expected_evidence_sha256 = canonical_hash(
+        {
+            "exit_code": result["exit_code"],
+            "stdout": execution_evidence["retained_logs"],
+            "stderr": execution_evidence["diagnostics"],
+            "session_handle": result.get("session_handle"),
+            "output_sha256": result["output_sha256"],
+            "execution_id": execution_id,
+            "runtime_provenance": plan.runtime_provenance,
+        }
+    )
+    if result.get("evidence_sha256") != expected_evidence_sha256:
+        raise ValueError("result evidence digest does not match execution evidence")
 
     ledger_head = entries[-1].entry_sha256 if entries else ""
     if metrics is not None and (

@@ -19,7 +19,7 @@ from benchmarks.a5kernels.evidence import (
     EvidenceLedger,
     canonical_digest,
 )
-from benchmarks.a5kernels.protocol import RunRequest
+from benchmarks.a5kernels.protocol import ExecutionPlan, RunRequest, canonical_hash
 from benchmarks.a5kernels.fixtures import fixture_for
 
 
@@ -71,9 +71,22 @@ def write_ledger(
     language="catlass-dsl",
 ) -> EvidenceLedger:
     request = RunRequest(language, length=2, seed=7)
+    fixture = fixture_for(language)
+    rng = random.Random(request.seed)
+    input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+    input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+    plan = ExecutionPlan(
+        request_id=request.request_id,
+        attempt_id=attempt_id,
+        language=language,
+        files=fixture.files,
+        argv=fixture.argv,
+        input_a=input_a,
+        input_b=input_b,
+    )
     identity = {
         "request_id": request.request_id,
-        "execution_id": "execution-1",
+        "execution_id": plan.execution_id,
         "attempt_id": attempt_id,
     }
     ledger = EvidenceLedger(path)
@@ -93,10 +106,28 @@ def write_ledger(
             EvidenceKind.ARTIFACT,
             {
                 **identity,
-                "source_sha256": {"kernel.py": SOURCE_ONE},
-                "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
+                "source_fingerprint": plan.source_fingerprint,
+                "source_sha256": {
+                    source.relative_path: source.sha256 for source in fixture.files
+                },
+                "artifact_sha256": {"source_bundle": plan.source_fingerprint},
             },
         )
+    execution_evidence = {
+        "retained_logs": "",
+        "diagnostics": "",
+        "result_exit_code": 0,
+        "output_sha256": output,
+    }
+    evidence_sha256 = canonical_hash({
+        "exit_code": 0,
+        "stdout": "",
+        "stderr": "",
+        "session_handle": None,
+        "output_sha256": output,
+        "execution_id": plan.execution_id,
+        "runtime_provenance": plan.runtime_provenance,
+    })
     ledger.append(
         EvidenceKind.RESULT,
         {
@@ -106,6 +137,10 @@ def write_ledger(
             "passed": True,
             "exit_code": 0,
             "max_abs_error": 0.0,
+            "runtime_provenance": plan.runtime_provenance,
+            "session_handle": None,
+            "evidence_sha256": evidence_sha256,
+            "execution_evidence": execution_evidence,
         },
     )
     return ledger
@@ -226,7 +261,10 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
         "argv": fixture_argv(request),
         "inputs_sha256": input_digest(request),
     },)
-    assert replay.source_artifacts[0]["source_sha256"]["kernel.py"] == SOURCE_ONE
+    fixture = fixture_for("catlass-dsl")
+    assert replay.source_artifacts[0]["source_sha256"] == {
+        source.relative_path: source.sha256 for source in fixture.files
+    }
     assert replay.output["passed"] is True
     assert replay.metrics["supplemental"]["latency_us"] == 4.5
     assert len(replay.evidence) == 4
@@ -448,35 +486,20 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
 
 
 def test_snapshot_rejects_execution_error_without_output(tmp_path):
-    request = RunRequest("catlass-dsl", length=2, seed=7)
+    ledger = write_ledger(tmp_path / "execution-error.jsonl", "one")
+    result = ledger.entries[-1]
     identity = {
-        "request_id": request.request_id,
-        "execution_id": "execution-1",
-        "attempt_id": "one",
+        key: result.payload[key]
+        for key in ("request_id", "execution_id", "attempt_id")
     }
-    ledger = EvidenceLedger(tmp_path / "execution-error.jsonl")
-    ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
-    ledger.append(
-        EvidenceKind.ACTION,
-        {
-            **identity,
-            "language": request.language,
-            "argv": fixture_argv(request),
-            "inputs_sha256": input_digest(request),
-        },
-    )
-    ledger.append(
-        EvidenceKind.ARTIFACT,
-        {
-            **identity,
-            "source_sha256": {"kernel.py": SOURCE_ONE},
-            "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
-        },
-    )
-    ledger.append(EvidenceKind.RESULT, {**identity, "status": "execution_error"})
 
     with pytest.raises(ValueError, match="verified replay output"):
-        snapshot_from_ledger(ledger.entries)
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, len(ledger.entries) - 1,
+                {**identity, "status": "execution_error"},
+            )
+        )
 
 
 @pytest.mark.parametrize("digest", ["not-a-sha", "A" * 64])
@@ -611,7 +634,7 @@ def test_metrics_packet_rejects_reserved_keys_and_wrong_ledger(tmp_path):
         )
 
 
-def test_snapshot_preserves_ordered_artifact_generations(tmp_path):
+def test_snapshot_rejects_artifact_generation_outside_registered_fixture(tmp_path):
     path = tmp_path / "one.jsonl"
     ledger = write_ledger(path, "one")
     identity = ledger.entries[0].payload
@@ -626,9 +649,39 @@ def test_snapshot_preserves_ordered_artifact_generations(tmp_path):
         },
     )
 
-    replay = snapshot_from_ledger(ledger.entries)
+    with pytest.raises(ValueError, match="registered fixture"):
+        snapshot_from_ledger(ledger.entries)
 
-    assert [item["source_sha256"]["kernel.py"] for item in replay.source_artifacts] == [
-        SOURCE_ONE,
-        SOURCE_TWO,
-    ]
+
+def test_snapshot_rejects_consistent_but_fabricated_execution_id(tmp_path):
+    ledger = write_ledger(tmp_path / "fabricated-execution.jsonl", "one")
+    entries = ledger.entries
+    for index, entry in enumerate(tuple(entries)):
+        entries = replace_entry_payload(
+            entries, index, {**entries[index].payload, "execution_id": "execution-1"}
+        )
+
+    with pytest.raises(ValueError, match="reconstructed plan"):
+        snapshot_from_ledger(entries)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "exit-code", "digest"])
+def test_snapshot_rejects_invalid_execution_evidence(tmp_path, mutation):
+    ledger = write_ledger(tmp_path / f"evidence-{mutation}.jsonl", "one")
+    result = ledger.entries[-1]
+    payload = dict(result.payload)
+    if mutation == "missing":
+        payload.pop("execution_evidence")
+    elif mutation == "exit-code":
+        payload["execution_evidence"] = {
+            **payload["execution_evidence"], "result_exit_code": 1
+        }
+    else:
+        payload["evidence_sha256"] = "f" * 64
+
+    with pytest.raises(ValueError, match="execution evidence|evidence digest"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, len(ledger.entries) - 1, payload
+            )
+        )
