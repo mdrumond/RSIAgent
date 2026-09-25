@@ -516,6 +516,8 @@ class DomainActionResult:
 def _validate_domain_action_result(value) -> DomainActionResult:
     if not isinstance(value, DomainActionResult):
         raise TypeError("action_executor must return DomainActionResult")
+    if not isinstance(value.observation, str):
+        raise TypeError("DomainActionResult.observation must be a string")
     if not value.observation.strip():
         raise ValueError("DomainActionResult.observation must not be empty")
     if value.terminal and value.status not in {

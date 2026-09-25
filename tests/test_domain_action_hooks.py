@@ -129,6 +129,8 @@ def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
     "outcome, error",
     [
         ("untyped", "must return DomainActionResult"),
+        (loop.DomainActionResult(b"bytes"), "observation must be a string"),
+        (loop.DomainActionResult(None), "observation must be a string"),
         (loop.DomainActionResult(""), "observation must not be empty"),
         (loop.DomainActionResult("x", terminal=True, status="passed"),
          "invalid terminal domain action status"),
