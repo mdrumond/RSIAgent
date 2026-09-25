@@ -184,6 +184,57 @@ def test_domain_actions_break_consecutive_failed_done_streak(monkeypatch, tmp_pa
     assert executed == ["compile", "compile", "submit"]
 
 
+def test_domain_progress_prevents_hollow_done_reclassification(monkeypatch, tmp_path):
+    class CheckVM(VM):
+        def run_command(self, command, *_args, **_kwargs):
+            return "PASS" if "echo PASS" in command else ""
+
+    class Findings:
+        doubts = ""
+
+        def __str__(self):
+            return "host verifier report"
+
+    cfg = _cfg()
+    cfg.practice_mode = False
+    cfg.independent_verify = True
+    cfg.doubt_escalation = True
+    cfg.escalation_model = "review-model"
+    done = '{"done":{"checks":[{"desc":"host check","probe":"ls / && echo PASS"}]}}'
+    replies = iter([done, "compile", done])
+    verdicts = iter(["wrong", "pass"])
+    verify_calls = []
+
+    def verify(*_args, **_kwargs):
+        verify_calls.append(True)
+        verdict = next(verdicts)
+        return verdict, ("wrong report" if verdict == "wrong" else Findings())
+
+    monkeypatch.setattr(loop, "chat", lambda *_args, **_kwargs: next(replies))
+    monkeypatch.setattr(loop, "verify_independent", verify)
+    monkeypatch.setattr(
+        loop,
+        "second_opinion",
+        lambda *_args, **_kwargs: pytest.fail("domain progress was classified as hollow"),
+    )
+
+    result, _ = loop.run_attempt(
+        "author a kernel",
+        CheckVM(),
+        cfg,
+        ArtifactSink(str(tmp_path)),
+        allow_noop_done=True,
+        turn_parser=lambda text: (
+            KernelAction("compile") if text == "compile" else loop.parse_turn(text)
+        ),
+        action_executor=lambda _action: loop.DomainActionResult("compiled"),
+    )
+
+    assert result.status == "done"
+    assert result.programs_run == 0
+    assert len(verify_calls) == 2
+
+
 def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
     with pytest.raises(TypeError, match="without action_executor"):
         _run(monkeypatch, tmp_path, ["compile"],

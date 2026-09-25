@@ -1119,6 +1119,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                 domain_terminal = True
                 break
             dones = 0
+            progs_since_bounce += 1
             user = outcome.observation
             continue
 
