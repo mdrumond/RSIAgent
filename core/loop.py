@@ -520,6 +520,8 @@ def _validate_domain_action_result(value) -> DomainActionResult:
         raise TypeError("DomainActionResult.observation must be a string")
     if not value.observation.strip():
         raise ValueError("DomainActionResult.observation must not be empty")
+    if type(value.terminal) is not bool:
+        raise TypeError("DomainActionResult.terminal must be a bool")
     if value.terminal and value.status not in {
             "done", "evolve", "stalled", "infra", "safety_ceiling"}:
         raise ValueError("invalid terminal domain action status: " + value.status)
