@@ -38,6 +38,10 @@ class A5KernelRunner:
         attempt_id = uuid.uuid4().hex if attempt_id is None else attempt_id
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", attempt_id):
             raise ValueError("attempt_id must be a safe 1-64 character identifier")
+        if fixture.max_length is not None and request.length > fixture.max_length:
+            raise ValueError(
+                f"{fixture.language.value} hello length cannot exceed {fixture.max_length}"
+            )
         rng = random.Random(request.seed)
         input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
         input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
@@ -49,6 +53,7 @@ class A5KernelRunner:
             argv=fixture.argv,
             input_a=input_a,
             input_b=input_b,
+            runtime_provenance=getattr(self._backend, "runtime_provenance", ()),
         )
 
     def run(
@@ -75,12 +80,16 @@ class A5KernelRunner:
                 "stderr": receipt.stderr,
                 "session_handle": receipt.session_handle,
                 "output_sha256": output_sha,
+                "execution_id": plan.execution_id,
+                "runtime_provenance": plan.runtime_provenance,
             }
         )
         fields = {
             "request_id": plan.request_id,
+            "execution_id": plan.execution_id,
             "attempt_id": plan.attempt_id,
             "language": plan.language,
+            "runtime_provenance": plan.runtime_provenance,
             "passed": passed,
             "max_abs_error": max_error,
             "exit_code": receipt.exit_code,
