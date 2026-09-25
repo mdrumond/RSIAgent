@@ -4,6 +4,10 @@ import json
 
 import pytest
 
+import core.loop as loop
+from config.settings import load
+from core.actor import Done
+from core.trace import ArtifactSink
 from benchmarks.a5kernels.knowledge import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_REVISION,
@@ -41,7 +45,6 @@ def _database(tmp_path):
     [
         ('{"knowledge_query":{"query":"vector add"}}', KnowledgeQuery("vector add")),
         ('{"knowledge_query":{"query":"matrix", "limit":2}}', KnowledgeQuery("matrix", 2)),
-        ('{"program":{"code":"read db"}}', None),
         ('{"knowledge_query":{"query":"x", "collection":"ascendc"}}', None),
         ('{"knowledge_query":{"query":"", "limit":1}}', None),
         ('{"knowledge_query":{"query":"x", "limit":21}}', None),
@@ -49,6 +52,28 @@ def _database(tmp_path):
 )
 def test_restricted_action_parser(value, expected):
     assert parse_knowledge_action(value) == expected
+
+
+@pytest.mark.parametrize(
+    "query, limit, error",
+    [
+        ("   ", 5, ValueError),
+        ("x", True, TypeError),
+        ("x", 0, ValueError),
+        ("x", 21, ValueError),
+    ],
+)
+def test_public_query_enforces_parser_invariants(query, limit, error):
+    with pytest.raises(error):
+        KnowledgeQuery(query, limit=limit)
+
+
+def test_public_query_normalizes_whitespace():
+    assert KnowledgeQuery("  vector add  ").query == "vector add"
+
+
+def test_parser_delegates_builtin_done():
+    assert isinstance(parse_knowledge_action('{"done":null}'), Done)
 
 
 def test_gate_returns_validated_citations_and_journals_provenance(tmp_path):
@@ -112,7 +137,7 @@ def test_gate_detects_citation_location_or_content_tampering(tmp_path):
 
 def test_enabled_gate_makes_database_query_only(tmp_path):
     database = _database(tmp_path)
-    KnowledgeAgent(
+    agent = KnowledgeAgent(
         enabled=True,
         database=database,
         collection="catlass",
@@ -120,7 +145,9 @@ def test_enabled_gate_makes_database_query_only(tmp_path):
     )
 
     with pytest.raises(Exception, match="readonly"):
-        database.connection.execute("DELETE FROM chunks")
+        agent.database.connection.execute("DELETE FROM chunks")
+    database.connection.execute("CREATE TABLE caller_remains_writable (value TEXT)")
+    agent.close()
 
 
 def test_gate_rejects_embedding_mismatch_without_journaling(tmp_path):
@@ -182,3 +209,49 @@ def test_progressive_memory_journal_appends_stable_sequence(tmp_path):
 
     assert [entry["sequence"] for entry in journal.read()] == [1, 2]
     assert [entry["query"] for entry in journal.read()] == ["first", "second"]
+
+
+def test_two_journal_instances_serialize_sequence_assignment(tmp_path):
+    path = tmp_path / "memory" / "knowledge.jsonl"
+    first = ProgressiveMemoryJournal(path)
+    second = ProgressiveMemoryJournal(path)
+
+    first.append(enabled=False, collection=None, query="first", citations=())
+    second.append(enabled=False, collection=None, query="second", citations=())
+
+    assert [entry["sequence"] for entry in first.read()] == [1, 2]
+
+
+def test_query_then_builtin_done_terminates_actor_loop(monkeypatch, tmp_path):
+    class VM:
+        def run_command(self, *_args, **_kwargs):
+            return ""
+
+    replies = iter([
+        '{"knowledge_query":{"query":"vector"}}',
+        '{"done":null}',
+    ])
+    monkeypatch.setattr(loop, "chat", lambda *_args, **_kwargs: next(replies))
+    cfg = load(None)
+    cfg.max_iters = 3
+    cfg.wall_clock_secs = 60
+    cfg.history_keep_pairs = 0
+    cfg.independent_verify = False
+    cfg.practice_mode = True
+    agent = KnowledgeAgent(
+        enabled=False,
+        journal=ProgressiveMemoryJournal(tmp_path / "memory" / "knowledge.jsonl"),
+    )
+
+    result, _ = loop.run_attempt(
+        "consult references",
+        VM(),
+        cfg,
+        ArtifactSink(str(tmp_path / "trace")),
+        allow_noop_done=True,
+        turn_parser=parse_knowledge_action,
+        action_executor=agent.execute,
+    )
+
+    assert result.status == "done"
+    assert result.iters == 2

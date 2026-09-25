@@ -214,6 +214,19 @@ class KnowledgeDB:
     def close(self) -> None:
         self.connection.close()
 
+    def read_only_view(self) -> "KnowledgeDB":
+        """Open an independently owned read-only view of this file-backed DB."""
+
+        view = object.__new__(KnowledgeDB)
+        view.path = self.path
+        view.embeddings = self.embeddings
+        view.connection = sqlite3.connect(
+            self.path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+        view.connection.row_factory = sqlite3.Row
+        view.connection.execute("PRAGMA query_only = ON")
+        return view
+
     def __enter__(self) -> "KnowledgeDB":
         return self
 

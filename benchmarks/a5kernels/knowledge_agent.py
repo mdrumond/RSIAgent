@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -22,6 +23,15 @@ class KnowledgeQuery:
     limit: int = 5
     dup: int = 1
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.query, str) or not self.query.strip():
+            raise ValueError("query must be a non-empty string")
+        if isinstance(self.limit, bool) or not isinstance(self.limit, int):
+            raise TypeError("limit must be an integer")
+        if not 1 <= self.limit <= 20:
+            raise ValueError("limit must be between 1 and 20")
+        object.__setattr__(self, "query", self.query.strip())
+
 
 @dataclass(frozen=True)
 class Citation:
@@ -39,24 +49,23 @@ class KnowledgeResult:
     score: float
 
 
-def parse_knowledge_action(value: str) -> KnowledgeQuery | None:
-    """Parse one exact ``knowledge_query`` JSON action, rejecting other powers."""
+def parse_knowledge_action(value: str) -> Any:
+    """Parse a query action, delegating built-in Actor actions to core."""
     try:
         raw = json.loads(value)
     except (TypeError, json.JSONDecodeError):
-        return None
+        raw = None
     if not isinstance(raw, dict) or set(raw) != {"knowledge_query"}:
-        return None
+        from core.loop import parse_turn
+
+        return parse_turn(value)
     payload = raw["knowledge_query"]
     if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
         return None
-    query = payload.get("query")
-    limit = payload.get("limit", 5)
-    if not isinstance(query, str) or not query.strip():
+    try:
+        return KnowledgeQuery(payload.get("query"), payload.get("limit", 5))
+    except (TypeError, ValueError):
         return None
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
-        return None
-    return KnowledgeQuery(query=query.strip(), limit=limit)
 
 
 class ProgressiveMemoryJournal:
@@ -77,32 +86,39 @@ class ProgressiveMemoryJournal:
     ) -> dict[str, Any]:
         if enabled != (manifest is not None):
             raise ValueError("enabled provenance requires exactly one collection manifest")
-        entries = self.read()
-        entry = {
-            "sequence": len(entries) + 1,
-            "kind": "knowledge_query",
-            "enabled": enabled,
-            "query": query,
-            "collection": collection if enabled else None,
-            "collection_fingerprint": manifest.fingerprint if manifest else None,
-            "embedding": (
-                {"model": manifest.embedding_model, "revision": manifest.embedding_revision}
-                if manifest else None
-            ),
-            "citations": [asdict(citation) for citation in citations] if enabled else [],
-        }
-        # One JSON object per line keeps the journal inspectable and append-only.
-        with self.path.open("a", encoding="utf-8") as stream:
+        with self.path.open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            stream.seek(0)
+            entries = self._decode(stream.read())
+            entry = {
+                "sequence": len(entries) + 1,
+                "kind": "knowledge_query",
+                "enabled": enabled,
+                "query": query,
+                "collection": collection if enabled else None,
+                "collection_fingerprint": manifest.fingerprint if manifest else None,
+                "embedding": (
+                    {"model": manifest.embedding_model, "revision": manifest.embedding_revision}
+                    if manifest else None
+                ),
+                "citations": [asdict(citation) for citation in citations] if enabled else [],
+            }
+            stream.seek(0, os.SEEK_END)
             stream.write(json.dumps(entry, sort_keys=True, separators=(",", ":")) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         return entry
 
     def read(self) -> list[dict[str, Any]]:
-        if not self.path.exists():
-            return []
+        with self.path.open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+            stream.seek(0)
+            return self._decode(stream.read())
+
+    @staticmethod
+    def _decode(value: str) -> list[dict[str, Any]]:
         entries = []
-        for sequence, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
+        for sequence, line in enumerate(value.splitlines(), 1):
             entry = json.loads(line)
             if entry.get("sequence") != sequence or entry.get("kind") != "knowledge_query":
                 raise ValueError("invalid progressive-memory knowledge journal")
@@ -142,8 +158,12 @@ class KnowledgeAgent:
         self.collection = collection
         self.manifest = None
         if database is not None:
-            self.manifest = database.manifest(collection)
-            database.connection.execute("PRAGMA query_only = ON")
+            self.database = database.read_only_view()
+            self.manifest = self.database.manifest(collection)
+
+    def close(self) -> None:
+        if self.database is not None:
+            self.database.close()
 
     def query(self, action: KnowledgeQuery) -> tuple[KnowledgeResult, ...]:
         if not self.enabled:
