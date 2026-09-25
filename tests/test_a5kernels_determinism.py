@@ -846,3 +846,18 @@ def test_snapshot_requires_explicit_session_handle(tmp_path):
                 ledger.entries, len(ledger.entries) - 1, payload
             )
         )
+
+
+@pytest.mark.parametrize("session_handle", [[], {}])
+def test_snapshot_rejects_non_string_session_handle(tmp_path, session_handle):
+    ledger = write_ledger(tmp_path / "typed-session-handle.jsonl", "one")
+    result = ledger.entries[-1]
+
+    with pytest.raises(ValueError, match="session handle"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                len(ledger.entries) - 1,
+                {**result.payload, "session_handle": session_handle},
+            )
+        )

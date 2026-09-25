@@ -300,6 +300,10 @@ def snapshot_from_ledger(
         expected_result_keys.add("max_abs_error_status")
     if set(result) != expected_result_keys:
         raise ValueError("verified result does not have the runner schema")
+    if result["session_handle"] is not None and not isinstance(
+        result["session_handle"], str
+    ):
+        raise ValueError("verified result session handle must be a string or null")
     if result["passed"] and (
         result["exit_code"] != 0 or not isinstance(max_abs_error, (int, float))
     ):
