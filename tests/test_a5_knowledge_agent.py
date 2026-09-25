@@ -76,6 +76,26 @@ def test_parser_delegates_builtin_done():
     assert isinstance(parse_knowledge_action('{"done":null}'), Done)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        'I should consult the reference first.\n{"knowledge_query":{"query":"vector"}}',
+        '```json\n{"knowledge_query":{"query":"vector"}}\n```',
+    ],
+)
+def test_parser_accepts_normal_actor_reply_shapes(value):
+    assert parse_knowledge_action(value) == KnowledgeQuery("vector")
+
+
+def test_parser_uses_last_knowledge_query_and_reports_duplicates():
+    action = parse_knowledge_action(
+        '{"knowledge_query":{"query":"draft"}}\n'
+        'Correction: {"knowledge_query":{"query":"vector", "limit":2}}'
+    )
+
+    assert action == KnowledgeQuery("vector", limit=2, dup=2)
+
+
 def test_gate_returns_validated_citations_and_journals_provenance(tmp_path):
     database = _database(tmp_path)
     journal = ProgressiveMemoryJournal(tmp_path / "memory" / "knowledge.jsonl")

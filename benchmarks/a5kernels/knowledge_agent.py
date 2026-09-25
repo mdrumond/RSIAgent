@@ -51,21 +51,44 @@ class KnowledgeResult:
 
 def parse_knowledge_action(value: str) -> Any:
     """Parse a query action, delegating built-in Actor actions to core."""
-    try:
-        raw = json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        raw = None
-    if not isinstance(raw, dict) or set(raw) != {"knowledge_query"}:
+    candidates = [
+        raw
+        for raw in _json_values(value or "")
+        if isinstance(raw, dict) and "knowledge_query" in raw
+    ]
+    if not candidates:
         from core.loop import parse_turn
 
         return parse_turn(value)
+    raw = candidates[-1]
+    if set(raw) != {"knowledge_query"}:
+        return None
     payload = raw["knowledge_query"]
     if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
         return None
     try:
-        return KnowledgeQuery(payload.get("query"), payload.get("limit", 5))
+        return KnowledgeQuery(
+            payload.get("query"), payload.get("limit", 5), dup=len(candidates)
+        )
     except (TypeError, ValueError):
         return None
+
+
+def _json_values(value: str):
+    """Yield JSON values embedded in a prose or Markdown response."""
+    decoder = json.JSONDecoder()
+    offset = 0
+    while offset < len(value):
+        if value[offset] not in "[{":
+            offset += 1
+            continue
+        try:
+            decoded, end = decoder.raw_decode(value, offset)
+        except json.JSONDecodeError:
+            offset += 1
+            continue
+        yield decoded
+        offset = end
 
 
 class ProgressiveMemoryJournal:
