@@ -161,6 +161,15 @@ def test_query_precedes_done_within_one_mixed_object():
     assert action == KnowledgeQuery("vector")
 
 
+def test_parser_selects_last_valid_query_candidate():
+    action = parse_knowledge_action(
+        '{"knowledge_query":{"query":"vector"}}\n'
+        '{"knowledge_query":{"query":""}}'
+    )
+
+    assert action == KnowledgeQuery("vector")
+
+
 def test_read_only_view_preserves_relative_database_location(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     database = KnowledgeDB(Path("knowledge.sqlite"), FakeEmbeddings())

@@ -65,28 +65,35 @@ def parse_knowledge_action(value: str) -> Any:
     candidates = [raw for raw in objects if "knowledge_query" in raw]
     if not candidates:
         return built_in
+    valid_queries = []
+    for raw in candidates:
+        extra_keys = set(raw) - {"knowledge_query"}
+        if extra_keys and not (
+            isinstance(built_in, Done) and extra_keys <= {"done", "checks"}
+        ):
+            continue
+        payload = raw["knowledge_query"]
+        if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
+            continue
+        try:
+            valid_queries.append(
+                KnowledgeQuery(payload.get("query"), payload.get("limit", 5))
+            )
+        except (TypeError, ValueError):
+            continue
+    if not valid_queries:
+        return built_in
     # Preserve the Actor parser's keep-working precedence. Programs, looks, and
     # asks outrank retrieval; retrieval outranks an otherwise terminal Done.
     if built_in is not None and not isinstance(built_in, Done):
-        built_in.dup = max(built_in.dup, len(candidates))
+        built_in.dup = max(built_in.dup, len(valid_queries))
         return built_in
-    raw = candidates[-1]
-    extra_keys = set(raw) - {"knowledge_query"}
-    if extra_keys and not (
-        isinstance(built_in, Done) and extra_keys <= {"done", "checks"}
-    ):
-        return built_in
-    payload = raw["knowledge_query"]
-    if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
-        return built_in
-    try:
-        return KnowledgeQuery(
-            payload.get("query"),
-            payload.get("limit", 5),
-            dup=max(len(candidates), getattr(built_in, "dup", 1)),
-        )
-    except (TypeError, ValueError):
-        return built_in
+    selected = valid_queries[-1]
+    return KnowledgeQuery(
+        selected.query,
+        selected.limit,
+        dup=max(len(valid_queries), getattr(built_in, "dup", 1)),
+    )
 
 
 def _json_values(value: str):
