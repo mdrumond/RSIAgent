@@ -1,4 +1,9 @@
 from dataclasses import replace
+import gzip
+import io
+from pathlib import Path
+import subprocess
+import tarfile
 
 import pytest
 
@@ -14,6 +19,7 @@ from benchmarks.a5kernels.profiling import (
     TimingCommand,
     TimingResult,
 )
+from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels import A5KernelRunner, Language, RunRequest
 from benchmarks.a5kernels.protocol import (
     ExecutionPlan,
@@ -473,3 +479,262 @@ def test_measurements_must_match_execution_and_replay(result_kind, identity) -> 
         ProfilingTreatmentController(
             MisdirectedBackend(), treatment_enabled=True
         ).run_final(CORRECT, REQUEST)
+
+
+def _write_compact_archive(destination: Path) -> None:
+    basic_data = gzip.compress(
+        b"Kernel Name,Vector Ratio\nvector_add__kernel0,0.75\n", mtime=0
+    )
+    pipe_data = gzip.compress(
+        b"block_id,sub_block_id,aiv_vec_ratio\n0,vector0,0.75\n", mtime=0
+    )
+    archive_path = destination / "ascend-profile-summary.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive_file:
+        info = tarfile.TarInfo("metrics/OpBasicInfo.csv.gz")
+        info.size = len(basic_data)
+        archive_file.addfile(info, io.BytesIO(basic_data))
+        info = tarfile.TarInfo("metrics/PipeUtilization.csv.gz")
+        info.size = len(pipe_data)
+        archive_file.addfile(info, io.BytesIO(pipe_data))
+
+
+def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        if Path(argv[0]).name == "collect_profile.sh":
+            destination = Path(argv[argv.index("--output") + 1])
+            destination.mkdir(parents=True, exist_ok=True)
+            _write_compact_archive(destination)
+            return subprocess.CompletedProcess(argv, 0, "REMOTE_RAW=/remote/raw\n", "")
+        action = argv[argv.index("--operation") + 2]
+        if action == "run":
+            return subprocess.CompletedProcess(
+                argv, 0, "A5KERNEL_TIMING_US=7.5\n", ""
+            )
+        replay = argv[argv.index("--operation") + 1]
+        return subprocess.CompletedProcess(
+            argv, 0, f"MSPROF_PROFILE_REMOTE_DIR=/remote/{replay}\n", ""
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    profiled_plan = replace(
+        PLAN,
+        argv=("python", "kernel.py", "input.json"),
+        runtime_provenance=(
+            ("ascendnpu_ir_gitlink", "gitlink"),
+            ("ascendnpu_ir_install_commit", "install"),
+            ("bridge_sha256", "bridge"),
+            ("cann_version", "9.1"),
+            ("catlass_revision", "revision"),
+            ("catlass_source", "/remote/catlass"),
+            ("execution_profile", "bz-a5"),
+            ("manifest_sha256", "manifest"),
+        ),
+    )
+    profiled_request = replace(REQUEST, plan=profiled_plan)
+    correctness = _correctness_for(profiled_request)
+    result = ProfilingTreatmentController(
+        backend, treatment_enabled=False
+    ).run_final(correctness, profiled_request)
+
+    assert result.duration_us == 7.5
+    assert result.pipe_utilization
+    assert all(
+        key.startswith("PipeUtilization.csv.gz:")
+        for key, _value in result.pipe_utilization
+    )
+    timing_call = next(
+        call
+        for call in calls
+        if "--operation" in call and call[call.index("--operation") + 2] == "run"
+    )
+    separator = timing_call.index("--")
+    assert timing_call[separator + 1 : separator + 4] == (
+        "env",
+        f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
+        "A5KERNEL_EMIT_TIMING=1",
+    )
+    profile_calls = [
+        call
+        for call in calls
+        if "--operation" in call and call[call.index("--operation") + 2] == "profile"
+    ]
+    assert [call[call.index("--metric") + 1] for call in profile_calls] == [
+        "BasicInfo",
+        "PipeUtilization",
+    ]
+    assert "--kernel-name" not in profile_calls[0]
+    assert (
+        profile_calls[1][profile_calls[1].index("--kernel-name") + 1]
+        == profiled_request.expected_kernel
+    )
+    assert len(
+        [call for call in calls if Path(call[0]).name == "collect_profile.sh"]
+    ) == 2
+    collection_calls = [
+        call for call in calls if Path(call[0]).name == "collect_profile.sh"
+    ]
+    assert "--kernel-name" in collection_calls[0]
+    assert "--kernel-name" not in collection_calls[1]
+    assert all(call[call.index("--operation") + 1].startswith("profile-") for call in profile_calls)
+
+
+def test_concrete_backend_rejects_relative_remote_tree(tmp_path: Path) -> None:
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(
+            argv, 0, "MSPROF_PROFILE_REMOTE_DIR=relative/tree\n", ""
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    profiled_request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+    command = CaptureCommand(
+        CampaignKind.FINAL,
+        profiled_request,
+        ProfileMetric.BASIC_INFO,
+        "profile-" + "a" * 64,
+    )
+
+    with pytest.raises(RuntimeError, match="non-absolute retained tree"):
+        backend.capture(command)
+
+
+def test_concrete_backend_rejects_non_catlass_plan(tmp_path: Path) -> None:
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+    )
+    request = replace(REQUEST, plan=replace(PLAN, language="ascend-c"))
+    command = TimingCommand(CampaignKind.FINAL, request, "profile-" + "a" * 64)
+
+    with pytest.raises(ValueError, match="catlass-dsl execution plan"):
+        backend.time(command)
+
+
+@pytest.mark.parametrize("execution_profile", [None, "gz-a3"])
+def test_concrete_backend_rejects_non_bz_execution_provenance(
+    tmp_path: Path, execution_profile: str | None
+) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        raise AssertionError("invalid provenance must fail before dispatch")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    provenance = {
+        "ascendnpu_ir_gitlink": "gitlink",
+        "ascendnpu_ir_install_commit": "install",
+        "bridge_sha256": "bridge",
+        "cann_version": "9.1",
+        "catlass_revision": "revision",
+        "catlass_source": "/remote/catlass",
+        "manifest_sha256": "manifest",
+    }
+    if execution_profile is not None:
+        provenance["execution_profile"] = execution_profile
+    request = replace(
+        REQUEST,
+        plan=replace(PLAN, runtime_provenance=tuple(sorted(provenance.items()))),
+    )
+    timing = TimingCommand(CampaignKind.FINAL, request, "profile-" + "a" * 64)
+    capture = CaptureCommand(
+        CampaignKind.FINAL,
+        request,
+        ProfileMetric.BASIC_INFO,
+        "profile-" + "b" * 64,
+    )
+
+    with pytest.raises(ValueError, match="bz-a5 execution provenance"):
+        backend.time(timing)
+    with pytest.raises(ValueError, match="bz-a5 execution provenance"):
+        backend.capture(capture)
+    assert calls == []
+
+
+def test_concrete_backend_enforces_host_subprocess_timeout(tmp_path: Path) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        timeout=37,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+    command = TimingCommand(CampaignKind.FINAL, request, "profile-" + "a" * 64)
+
+    with pytest.raises(RuntimeError, match="exceeded its timeout"):
+        backend.time(command)
+    assert calls[0][1]["timeout"] == 37
+
+
+def test_real_catlass_fixture_exposes_host_owned_timing_and_device_contract() -> None:
+    plan = A5KernelRunner(PreparingBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value), attempt_id="timed-fixture"
+    )
+    kernel_source = next(
+        source.content for source in plan.files if source.relative_path == "kernel.py"
+    )
+
+    assert 'os.environ.get("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0")' in kernel_source
+    assert 'os.environ.get("A5KERNEL_EMIT_TIMING") == "1"' in kernel_source
+    assert "torch.npu.synchronize()" in kernel_source
+    assert 'print(f"A5KERNEL_TIMING_US={duration_us:.6f}")' in kernel_source
