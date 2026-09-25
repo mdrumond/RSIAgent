@@ -279,6 +279,27 @@ def snapshot_from_ledger(
         or not valid_max_error
     ):
         raise ValueError("a replay requires verified replay output and metrics")
+    expected_result_keys = {
+        "request_id",
+        "execution_id",
+        "attempt_id",
+        "language",
+        "runtime_provenance",
+        "passed",
+        "max_abs_error",
+        "exit_code",
+        "output_sha256",
+        "source_fingerprint",
+        "evidence_sha256",
+        "session_handle",
+        "attestation_sha256",
+        "status",
+        "execution_evidence",
+    }
+    if "max_abs_error_status" in result:
+        expected_result_keys.add("max_abs_error_status")
+    if set(result) != expected_result_keys:
+        raise ValueError("verified result does not have the runner schema")
     if result["passed"] and (
         result["exit_code"] != 0 or not isinstance(max_abs_error, (int, float))
     ):

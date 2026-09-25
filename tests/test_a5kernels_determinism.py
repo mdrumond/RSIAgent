@@ -800,7 +800,9 @@ def test_snapshot_rejects_invalid_execution_evidence(tmp_path, mutation):
     else:
         payload["evidence_sha256"] = "f" * 64
 
-    with pytest.raises(ValueError, match="execution evidence|evidence digest"):
+    with pytest.raises(
+        ValueError, match="runner schema|execution evidence|evidence digest"
+    ):
         snapshot_from_ledger(
             replace_entry_payload(
                 ledger.entries, len(ledger.entries) - 1, payload
@@ -823,6 +825,22 @@ def test_snapshot_rejects_non_integer_execution_evidence_exit_code(
     }
 
     with pytest.raises(ValueError, match="execution evidence"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, len(ledger.entries) - 1, payload
+            )
+        )
+
+
+def test_snapshot_requires_explicit_session_handle(tmp_path):
+    ledger = write_ledger(tmp_path / "missing-session-handle.jsonl", "one")
+    result = ledger.entries[-1]
+    payload = {
+        key: value for key, value in result.payload.items()
+        if key != "session_handle"
+    }
+
+    with pytest.raises(ValueError, match="runner schema"):
         snapshot_from_ledger(
             replace_entry_payload(
                 ledger.entries, len(ledger.entries) - 1, payload
