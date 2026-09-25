@@ -277,7 +277,7 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
     assert invocation.argv[:4] == (
         "execution-profiles/bz-a5/session.sh",
         "--name",
-        f"codex-a5hello-{plan.execution_id[:8]}-trial-1",
+        f"codex-a5hello-{plan.execution_id}-trial-1",
         "run",
     )
     assert invocation.files[:-1] == plan.files
@@ -326,7 +326,7 @@ def test_bz_adapter_observes_only_explicitly_identified_uncertain_dispatch():
     plan = A5KernelRunner(FakeBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
     )
-    session = f"codex-a5hello-{plan.execution_id[:8]}-trial-1"
+    session = f"codex-a5hello-{plan.execution_id}-trial-1"
     command = FakeCommandExecutor(
         CommandResult(
             75,
@@ -345,6 +345,43 @@ def test_bz_adapter_observes_only_explicitly_identified_uncertain_dispatch():
 
     assert receipt.output == (3.0,)
     assert [argv[-1] for argv in command.inspect_argv] == ["logs", "result"]
+
+
+def test_bz_adapter_uses_full_execution_id_to_isolate_colliding_prefixes():
+    class ForcedExecutionIdentity:
+        def __init__(self, plan, execution_id):
+            self._plan = plan
+            self.execution_id = execution_id
+
+        def __getattr__(self, name):
+            return getattr(self._plan, name)
+
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="same"
+    )
+    identities = ("deadbeef" + "a" * 56, "deadbeef" + "b" * 56)
+    commands = []
+    for identity in identities:
+        command = FakeCommandExecutor(
+            CommandResult(0, "dispatched"),
+            (
+                CommandResult(0, f"{OUTPUT_MARKER}[3.0]\n"),
+                CommandResult(0, "exit=0"),
+            ),
+        )
+        BZSessionAdapter(
+            command, session_wrapper="execution-profiles/bz-a5/session.sh"
+        ).execute(ForcedExecutionIdentity(plan, identity))
+        commands.append(command)
+
+    sessions = [command.invocations[0].argv[2] for command in commands]
+    assert sessions == [f"codex-a5hello-{identity}-same" for identity in identities]
+    assert sessions[0] != sessions[1]
+    assert all(
+        argv[2] == session
+        for command, session in zip(commands, sessions)
+        for argv in command.inspect_argv
+    )
 
 
 def test_catlass_fixture_uses_current_imperative_runtime_api():
@@ -799,7 +836,7 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
                 "--profile",
                 "bz-a5",
                 "--operation",
-                f"codex-a5hello-{plan.execution_id[:8]}-trial-1",
+                f"codex-a5hello-{plan.execution_id}-trial-1",
                 "run",
                 "--catlass-src",
                 source,
@@ -840,7 +877,7 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
     receipt = backend.execute(plan)
 
     assert receipt.output == (3.0,)
-    assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.execution_id[:8]}-trial-1"
+    assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.execution_id}-trial-1"
     assert len(calls) == 5
 
 
@@ -876,7 +913,7 @@ def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
     second = A5KernelRunner(second_backend).prepare(request, attempt_id="same")
     assert first.execution_id != second.execution_id
     assert f".a5kernels/{first.execution_id}/same" != f".a5kernels/{second.execution_id}/same"
-    assert f"codex-a5hello-{first.execution_id[:8]}-same" != f"codex-a5hello-{second.execution_id[:8]}-same"
+    assert f"codex-a5hello-{first.execution_id}-same" != f"codex-a5hello-{second.execution_id}-same"
     assert dict(first.runtime_provenance)["manifest_sha256"] == "1" * 64
     assert dict(second.runtime_provenance)["manifest_sha256"] == "2" * 64
     assert first_backend.runtime_provenance == first_backend.runtime_provenance
@@ -968,8 +1005,8 @@ def test_runtime_revision_changes_identity_session_and_attestation():
     assert first_result.runtime_provenance != second_result.runtime_provenance
     assert first_result.evidence_sha256 != second_result.evidence_sha256
     assert first_result.attestation_sha256 != second_result.attestation_sha256
-    first_session = f"codex-a5hello-{first_result.execution_id[:8]}-same-attempt"
-    second_session = f"codex-a5hello-{second_result.execution_id[:8]}-same-attempt"
+    first_session = f"codex-a5hello-{first_result.execution_id}-same-attempt"
+    second_session = f"codex-a5hello-{second_result.execution_id}-same-attempt"
     assert first_session != second_session
 
 

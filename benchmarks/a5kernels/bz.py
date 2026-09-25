@@ -259,7 +259,7 @@ class BZSessionAdapter:
             raise RuntimeUnavailableError(
                 "execution plan runtime provenance does not match the configured backend"
             )
-        session_name = f"codex-a5hello-{plan.execution_id[:8]}-{plan.attempt_id}"
+        session_name = f"codex-a5hello-{plan.execution_id}-{plan.attempt_id}"
         remote_directory = f".a5kernels/{plan.execution_id}/{plan.attempt_id}"
         payload = json.dumps(
             {"input_a": plan.input_a, "input_b": plan.input_b},
