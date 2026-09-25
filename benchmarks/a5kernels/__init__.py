@@ -5,7 +5,6 @@ from benchmarks.a5kernels.bz import (
     CatlassValidationExecutor,
     ProfileCommandExecutor,
 )
-from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.fixtures import Language, fixture_for
 from benchmarks.a5kernels.knowledge import (
     DEFAULT_EMBEDDING_MODEL,
@@ -27,8 +26,6 @@ __all__ = [
     "DEFAULT_EMBEDDING_REVISION",
     "EmbeddingBackend",
     "ExecutionBackend",
-    "EvidenceKind",
-    "EvidenceLedger",
     "KnowledgeDB",
     "Language",
     "ProfileCommandExecutor",
