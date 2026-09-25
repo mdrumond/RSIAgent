@@ -6,7 +6,7 @@ import pytest
 
 import core.loop as loop
 from config.settings import load
-from core.actor import Done
+from core.actor import Done, Program
 from core.trace import ArtifactSink
 from benchmarks.a5kernels.knowledge import (
     DEFAULT_EMBEDDING_MODEL,
@@ -94,6 +94,24 @@ def test_parser_uses_last_knowledge_query_and_reports_duplicates():
     )
 
     assert action == KnowledgeQuery("vector", limit=2, dup=2)
+
+
+def test_parser_preserves_builtin_keep_working_precedence():
+    action = parse_knowledge_action(
+        '{"program":{"lang":"python","code":"print(1)"}}\n'
+        '{"knowledge_query":{"query":"vector"}}'
+    )
+
+    assert isinstance(action, Program)
+    assert action.code == "print(1)"
+
+
+def test_knowledge_query_precedes_terminal_done_in_mixed_reply():
+    action = parse_knowledge_action(
+        '{"knowledge_query":{"query":"vector"}}\n{"done":null}'
+    )
+
+    assert action == KnowledgeQuery("vector")
 
 
 def test_gate_returns_validated_citations_and_journals_provenance(tmp_path):

@@ -51,15 +51,20 @@ class KnowledgeResult:
 
 def parse_knowledge_action(value: str) -> Any:
     """Parse a query action, delegating built-in Actor actions to core."""
+    from core.actor import Done, parse_turn
+
+    built_in = parse_turn(value)
     candidates = [
         raw
         for raw in _json_values(value or "")
         if isinstance(raw, dict) and "knowledge_query" in raw
     ]
     if not candidates:
-        from core.loop import parse_turn
-
-        return parse_turn(value)
+        return built_in
+    # Preserve the Actor parser's keep-working precedence. Programs, looks, and
+    # asks outrank retrieval; retrieval outranks an otherwise terminal Done.
+    if built_in is not None and not isinstance(built_in, Done):
+        return built_in
     raw = candidates[-1]
     if set(raw) != {"knowledge_query"}:
         return None
