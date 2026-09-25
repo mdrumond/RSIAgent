@@ -142,7 +142,7 @@ class FakeBackend:
                 SOURCE,
                 command.request.execution_id,
                 command.replay_id,
-                ("vector_add__kernel0",),
+                (command.request.expected_kernel,),
                 (("frequency_mhz", "1800"),),
                 archive("basic"),
             )
@@ -151,7 +151,7 @@ class FakeBackend:
             SOURCE,
             command.request.execution_id,
             command.replay_id,
-            ("vector_add__kernel0",),
+            (command.request.expected_kernel,),
             (("vector_ratio", "0.75"),),
             archive("pipe"),
         )
@@ -204,6 +204,68 @@ def test_final_contract_is_identical_for_both_arms(treatment_enabled: bool) -> N
         ProfileMetric.BASIC_INFO,
         ProfileMetric.PIPE_UTILIZATION,
     ]
+
+
+def _correctness_for(request: ProfileRequest) -> VerifiedResult:
+    return replace(
+        CORRECT,
+        request_id=request.request_id,
+        execution_id=request.execution_id,
+        attempt_id=request.attempt_id,
+        source_fingerprint=request.source_fingerprint,
+    )
+
+
+def _final_replay_ids(request: ProfileRequest) -> tuple[str, ...]:
+    backend = FakeBackend()
+    ProfilingTreatmentController(backend, treatment_enabled=True).run_final(
+        _correctness_for(request), request
+    )
+    return tuple(command.replay_id for command in backend.commands)
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        replace(REQUEST, implementation="ascendc"),
+        replace(REQUEST, expected_kernel="vector_add__kernel1"),
+        replace(REQUEST, device=4),
+        replace(REQUEST, warm_up=1),
+        replace(REQUEST, launch_count=2),
+        replace(REQUEST, plan=replace(PLAN, argv=("python", "other-driver.py"))),
+    ],
+)
+def test_every_profiling_setting_changes_all_replay_ids(changed) -> None:
+    assert changed.configuration_id != REQUEST.configuration_id
+    assert _final_replay_ids(changed) != _final_replay_ids(REQUEST)
+    assert all(
+        changed_id != original_id
+        for changed_id, original_id in zip(
+            _final_replay_ids(changed), _final_replay_ids(REQUEST)
+        )
+    )
+
+
+@pytest.mark.parametrize("stale_kind", ["timing", "capture"])
+def test_packets_from_another_profiling_configuration_are_rejected(stale_kind) -> None:
+    baseline = _final_replay_ids(REQUEST)
+    changed = replace(REQUEST, device=4)
+
+    class StaleConfigurationBackend(FakeBackend):
+        def time(self, command: TimingCommand) -> TimingResult:
+            result = super().time(command)
+            return replace(result, replay_id=baseline[0]) if stale_kind == "timing" else result
+
+        def capture(self, command: CaptureCommand) -> ProfileCapture:
+            result = super().capture(command)
+            if stale_kind == "capture" and command.metric is ProfileMetric.BASIC_INFO:
+                return replace(result, replay_id=baseline[1])
+            return result
+
+    with pytest.raises(ValueError, match="submitted replay"):
+        ProfilingTreatmentController(
+            StaleConfigurationBackend(), treatment_enabled=True
+        ).run_final(_correctness_for(changed), changed)
 
 
 def test_failed_correctness_stops_before_any_measurement() -> None:

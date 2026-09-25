@@ -78,6 +78,21 @@ class ProfileRequest:
     def source_fingerprint(self) -> str:
         return self.plan.source_fingerprint
 
+    @property
+    def configuration_id(self) -> str:
+        """Identity of the executable and every profiling launch setting."""
+
+        return canonical_hash(
+            {
+                "device": self.device,
+                "execution_id": self.execution_id,
+                "expected_kernel": self.expected_kernel,
+                "implementation": self.implementation,
+                "launch_count": self.launch_count,
+                "warm_up": self.warm_up,
+            }
+        )
+
     @classmethod
     def from_execution_plan(
         cls,
@@ -218,6 +233,18 @@ class ProfileBackend(Protocol):
     def capture(self, command: CaptureCommand) -> ProfileCapture: ...
 
 
+def _replay_id(
+    request: ProfileRequest, campaign: CampaignKind, kind: str
+) -> str:
+    return "profile-" + canonical_hash(
+        {
+            "campaign": campaign.value,
+            "configuration_id": request.configuration_id,
+            "kind": kind,
+        }
+    )
+
+
 class ProfilingTreatmentController:
     """Run treatment feedback and treatment-independent final evaluation."""
 
@@ -250,7 +277,7 @@ class ProfilingTreatmentController:
         timing_command = TimingCommand(
             CampaignKind.FINAL,
             request,
-            f"{request.attempt_id}-final-timing",
+            _replay_id(request, CampaignKind.FINAL, "timing"),
         )
         timing = self._backend.time(timing_command)
         if (
@@ -280,7 +307,7 @@ class ProfilingTreatmentController:
             campaign,
             request,
             ProfileMetric.BASIC_INFO,
-            f"{request.attempt_id}-{campaign.value}-basic",
+            _replay_id(request, campaign, "basic"),
         )
         basic = self._backend.capture(basic_command)
         self._validate_capture(basic, basic_command)
@@ -291,7 +318,7 @@ class ProfilingTreatmentController:
             campaign,
             request,
             ProfileMetric.PIPE_UTILIZATION,
-            f"{request.attempt_id}-{campaign.value}-pipe",
+            _replay_id(request, campaign, "pipe"),
             kernel_name=request.expected_kernel,
         )
         pipe = self._backend.capture(pipe_command)
