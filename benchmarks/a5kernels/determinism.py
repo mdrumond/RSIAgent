@@ -162,15 +162,29 @@ def snapshot_from_ledger(
     request = requests[0].payload
     result = results[0].payload
     request_id = str(request.get("request_id", ""))
+    execution_id = str(request.get("execution_id", ""))
     attempt_id = str(request.get("attempt_id", ""))
-    if not request_id or not attempt_id:
+    if not request_id or not execution_id or not attempt_id:
         raise ValueError("request evidence is missing replay identity")
     if any(
         entry.payload.get("request_id") != request_id
+        or entry.payload.get("execution_id") != execution_id
         or entry.payload.get("attempt_id") != attempt_id
         for entry in entries
     ):
-        raise ValueError("ledger entries must belong to one request attempt")
+        raise ValueError(
+            "ledger entries must belong to one request attempt and one execution_id"
+        )
+    if (
+        result.get("status") != "verified"
+        or not isinstance(result.get("output_sha256"), str)
+        or not result["output_sha256"]
+        or not isinstance(result.get("passed"), bool)
+        or isinstance(result.get("exit_code"), bool)
+        or not isinstance(result.get("exit_code"), int)
+        or "max_abs_error" not in result
+    ):
+        raise ValueError("a replay requires verified replay output and metrics")
 
     ledger_head = entries[-1].entry_sha256 if entries else ""
     if metrics is not None and (
@@ -191,7 +205,7 @@ def snapshot_from_ledger(
             {
                 key: value
                 for key, value in entry.payload.items()
-                if key not in ("request_id", "attempt_id")
+                if key not in ("request_id", "execution_id", "attempt_id")
             }
             for entry in by_kind[EvidenceKind.ACTION.value]
         ),

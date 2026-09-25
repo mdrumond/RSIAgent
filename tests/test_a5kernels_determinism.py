@@ -12,7 +12,7 @@ from benchmarks.a5kernels.determinism import (
     run_three_replays,
     snapshot_from_ledger,
 )
-from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.evidence import EvidenceEntry, EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.protocol import RunRequest
 
 
@@ -43,7 +43,11 @@ def write_ledger(
     include_artifact=True,
 ) -> EvidenceLedger:
     request = RunRequest("catlass-dsl", length=2, seed=7)
-    identity = {"request_id": request.request_id, "attempt_id": attempt_id}
+    identity = {
+        "request_id": request.request_id,
+        "execution_id": "execution-1",
+        "attempt_id": attempt_id,
+    }
     ledger = EvidenceLedger(path)
     ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
     if include_action:
@@ -62,6 +66,7 @@ def write_ledger(
         {
             **identity,
             "output_sha256": output,
+            "status": "verified",
             "passed": True,
             "exit_code": 0,
             "max_abs_error": 0.0,
@@ -189,7 +194,11 @@ def test_snapshot_rejects_missing_execution_evidence(
 @pytest.mark.parametrize("field", ["source_sha256", "artifact_sha256"])
 def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
     request = RunRequest("catlass-dsl", length=2, seed=7)
-    identity = {"request_id": request.request_id, "attempt_id": "one"}
+    identity = {
+        "request_id": request.request_id,
+        "execution_id": "execution-1",
+        "attempt_id": "one",
+    }
     ledger = EvidenceLedger(tmp_path / f"missing-{field}.jsonl")
     ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
     ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
@@ -202,10 +211,66 @@ def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
             field: {},
         },
     )
-    ledger.append(EvidenceKind.RESULT, {**identity, "passed": True, "exit_code": 0})
+    ledger.append(
+        EvidenceKind.RESULT,
+        {
+            **identity,
+            "status": "verified",
+            "output_sha256": "output-1",
+            "passed": True,
+            "exit_code": 0,
+            "max_abs_error": 0.0,
+        },
+    )
 
     with pytest.raises(ValueError, match=f"non-empty {field} mapping"):
         snapshot_from_ledger(ledger.entries)
+
+
+def test_snapshot_rejects_execution_error_without_output(tmp_path):
+    request = RunRequest("catlass-dsl", length=2, seed=7)
+    identity = {
+        "request_id": request.request_id,
+        "execution_id": "execution-1",
+        "attempt_id": "one",
+    }
+    ledger = EvidenceLedger(tmp_path / "execution-error.jsonl")
+    ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
+    ledger.append(EvidenceKind.ACTION, {**identity, "language": request.language})
+    ledger.append(
+        EvidenceKind.ARTIFACT,
+        {
+            **identity,
+            "source_sha256": {"kernel.py": "source-1"},
+            "artifact_sha256": {"source_bundle": "artifact-1"},
+        },
+    )
+    ledger.append(EvidenceKind.RESULT, {**identity, "status": "execution_error"})
+
+    with pytest.raises(ValueError, match="verified replay output"):
+        snapshot_from_ledger(ledger.entries)
+
+
+def test_snapshot_rejects_mixed_execution_ids(tmp_path):
+    ledger = write_ledger(tmp_path / "mixed-execution.jsonl", "one")
+    entries = list(ledger.entries)
+    action = entries[1]
+    replacement = EvidenceEntry.create(
+        action.sequence,
+        action.kind,
+        {**action.payload, "execution_id": "execution-2"},
+        action.previous_sha256,
+    )
+    rebuilt = [entries[0], replacement]
+    for entry in entries[2:]:
+        rebuilt.append(
+            EvidenceEntry.create(
+                entry.sequence, entry.kind, entry.payload, rebuilt[-1].entry_sha256
+            )
+        )
+
+    with pytest.raises(ValueError, match="one execution_id"):
+        snapshot_from_ledger(rebuilt)
 
 
 def test_cli_writes_compact_machine_readable_three_replay_report(tmp_path):
@@ -260,9 +325,10 @@ def test_snapshot_preserves_ordered_artifact_generations(tmp_path):
     identity = ledger.entries[0].payload
     ledger.append(
         EvidenceKind.ARTIFACT,
-        {
-            "request_id": identity["request_id"],
-            "attempt_id": "one",
+            {
+                "request_id": identity["request_id"],
+                "execution_id": identity["execution_id"],
+                "attempt_id": "one",
             "source_sha256": {"kernel.py": "source-2"},
             "artifact_sha256": {"source_bundle": "artifact-2"},
         },
