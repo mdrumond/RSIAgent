@@ -142,12 +142,19 @@ def snapshot_from_ledger(
     if len(actions) != 1:
         raise ValueError("a replay requires exactly one action entry")
     action = actions[0].payload
+    argv = action.get("argv")
     if (
         not isinstance(action.get("language"), str)
         or not action["language"]
-        or not isinstance(action.get("argv"), (list, tuple))
-        or not action["argv"]
-        or any(not isinstance(item, str) or not item for item in action["argv"])
+        or "argv" not in action
+        or (
+            argv is not None
+            and (
+                not isinstance(argv, (list, tuple))
+                or not argv
+                or any(not isinstance(item, str) or not item for item in argv)
+            )
+        )
         or re.fullmatch(r"[0-9a-f]{64}", str(action.get("inputs_sha256", "")))
         is None
     ):
@@ -206,8 +213,8 @@ def snapshot_from_ledger(
     )
     if (
         result.get("status") != "verified"
-        or re.fullmatch(r"[0-9a-f]{64}", str(result.get("output_sha256", "")))
-        is None
+        or not isinstance(result.get("output_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", result["output_sha256"]) is None
         or not isinstance(result.get("passed"), bool)
         or isinstance(result.get("exit_code"), bool)
         or not isinstance(result.get("exit_code"), int)

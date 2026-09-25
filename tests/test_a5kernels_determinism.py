@@ -239,6 +239,18 @@ def test_snapshot_rejects_identity_only_action(tmp_path):
         snapshot_from_ledger(replace_entry_payload(ledger.entries, 1, payload))
 
 
+def test_snapshot_accepts_runner_null_argv_boundary(tmp_path):
+    ledger = write_ledger(tmp_path / "null-argv.jsonl", "one")
+    action = ledger.entries[1]
+    replay = snapshot_from_ledger(
+        replace_entry_payload(
+            ledger.entries, 1, {**action.payload, "argv": None}
+        )
+    )
+
+    assert replay.actions[0]["argv"] is None
+
+
 def test_snapshot_binds_request_id_to_recorded_request(tmp_path):
     ledger = write_ledger(tmp_path / "missing-request.jsonl", "one")
     request = ledger.entries[0]
@@ -258,6 +270,20 @@ def test_snapshot_rejects_non_sha_output_digest(tmp_path):
                 ledger.entries,
                 len(ledger.entries) - 1,
                 {**result.payload, "output_sha256": "not-a-sha"},
+            )
+        )
+
+
+def test_snapshot_rejects_numeric_output_digest(tmp_path):
+    ledger = write_ledger(tmp_path / "numeric-output.jsonl", "one")
+    result = ledger.entries[-1]
+
+    with pytest.raises(ValueError, match="verified replay output and metrics"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                len(ledger.entries) - 1,
+                {**result.payload, "output_sha256": int("1" * 64)},
             )
         )
 
