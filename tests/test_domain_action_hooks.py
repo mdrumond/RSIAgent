@@ -142,6 +142,48 @@ def test_custom_parser_receives_text_for_empty_reply_and_retries(monkeypatch, tm
     assert history[1]["content"] == "(empty reply)"
 
 
+def test_domain_actions_break_consecutive_failed_done_streak(monkeypatch, tmp_path):
+    cfg = _cfg()
+    cfg.max_iters = 6
+    cfg.max_consec_done = 2
+    cfg.practice_done_requires = "/required-output"
+    replies = iter([
+        '{"done":null}',
+        "compile",
+        '{"done":null}',
+        "compile",
+        "submit",
+    ])
+    executed = []
+
+    def parser(text):
+        if text in {"compile", "submit"}:
+            return KernelAction(text)
+        return loop.parse_turn(text)
+
+    def executor(action):
+        executed.append(action.kind)
+        return loop.DomainActionResult(
+            "host action completed",
+            terminal=action.kind == "submit",
+        )
+
+    monkeypatch.setattr(loop, "chat", lambda *_args, **_kwargs: next(replies))
+    result, _ = loop.run_attempt(
+        "author a kernel",
+        VM(),
+        cfg,
+        ArtifactSink(str(tmp_path)),
+        allow_noop_done=True,
+        turn_parser=parser,
+        action_executor=executor,
+    )
+
+    assert result.status == "done"
+    assert result.programs_run == 0
+    assert executed == ["compile", "compile", "submit"]
+
+
 def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
     with pytest.raises(TypeError, match="without action_executor"):
         _run(monkeypatch, tmp_path, ["compile"],

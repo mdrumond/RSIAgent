@@ -1118,6 +1118,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                 res.status = outcome.status
                 domain_terminal = True
                 break
+            dones = 0
             user = outcome.observation
             continue
 
