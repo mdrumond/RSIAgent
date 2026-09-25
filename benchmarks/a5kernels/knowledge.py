@@ -205,14 +205,27 @@ class KnowledgeDB:
     """SQLite FTS5 store with deterministic vector/lexical rank fusion."""
 
     def __init__(self, path: Path, embeddings: EmbeddingBackend):
-        self.path = path
+        self.path = path.resolve()
         self.embeddings = embeddings
-        self.connection = sqlite3.connect(path)
+        self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
 
     def close(self) -> None:
         self.connection.close()
+
+    def read_only_view(self) -> "KnowledgeDB":
+        """Open an independently owned read-only view of this file-backed DB."""
+
+        view = object.__new__(KnowledgeDB)
+        view.path = self.path
+        view.embeddings = self.embeddings
+        view.connection = sqlite3.connect(
+            self.path.resolve().as_uri() + "?mode=ro", uri=True
+        )
+        view.connection.row_factory = sqlite3.Row
+        view.connection.execute("PRAGMA query_only = ON")
+        return view
 
     def __enter__(self) -> "KnowledgeDB":
         return self
@@ -363,6 +376,38 @@ class KnowledgeDB:
         if not row:
             raise KeyError(collection)
         return CollectionManifest.from_json(row["manifest_json"])
+
+    def validate_citation(
+        self,
+        collection: str,
+        *,
+        chunk_id: str,
+        path: str,
+        start_line: int,
+        end_line: int,
+    ) -> None:
+        """Fail unless a citation exactly identifies an indexed chunk.
+
+        The chunk identifier is recomputed from the stored bytes rather than merely
+        compared with the row.  This makes the gate an independent check that the
+        path and line range returned to an Actor describe the indexed content.
+        """
+        manifest = self.manifest(collection)
+        row = self.connection.execute(
+            """SELECT chunk_id, path, start_line, end_line, text FROM chunks
+               WHERE collection = ? AND chunk_id = ?""",
+            (collection, chunk_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("citation does not reference an indexed chunk")
+        expected = (row["path"], row["start_line"], row["end_line"])
+        if expected != (path, start_line, end_line):
+            raise ValueError("citation location does not match the indexed chunk")
+        if path not in {source.path for source in manifest.sources}:
+            raise ValueError("citation path is absent from the collection manifest")
+        identity = f"{path}\0{start_line}\0{end_line}\0{row['text']}".encode()
+        if _sha256(identity) != chunk_id:
+            raise ValueError("citation chunk hash does not match indexed content")
 
     def query(self, collection: str, query: str, *, limit: int = 10) -> list[SearchHit]:
         if limit < 1:
