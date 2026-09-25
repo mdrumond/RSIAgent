@@ -82,6 +82,32 @@ def test_domain_parser_and_executor_exchange_observations(monkeypatch, tmp_path)
     assert history[-1]["content"] == "submit candidate"
 
 
+def test_terminal_domain_stall_skips_legacy_recovery(monkeypatch, tmp_path):
+    cfg = _cfg()
+    cfg.independent_verify = True
+    monkeypatch.setattr(loop, "chat", lambda *_args, **_kwargs: "stop")
+    monkeypatch.setattr(
+        loop,
+        "verify_independent",
+        lambda *_args, **_kwargs: pytest.fail("terminal domain result was reverified"),
+    )
+
+    result, _ = loop.run_attempt(
+        "author a kernel",
+        VM(),
+        cfg,
+        ArtifactSink(str(tmp_path)),
+        turn_parser=lambda _text: KernelAction("submit"),
+        action_executor=lambda _action: loop.DomainActionResult(
+            "host verification stalled", terminal=True, status="stalled"
+        ),
+    )
+
+    assert result.status == "stalled"
+    assert result.surface_delta is None
+    assert result.inspections == []
+
+
 def test_custom_parser_can_delegate_builtin_actions(monkeypatch, tmp_path):
     # Integrations may extend the grammar while retaining ordinary Done semantics.
     result, _ = _run(

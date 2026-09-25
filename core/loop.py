@@ -686,6 +686,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
     #                  unverified verdict into acceptance, but never replace the Actor
     #                  Agent or discard its semantic-repair context.
     forced = False   # the one end-of-budget forced inspection has been spent
+    domain_terminal = False  # a domain executor's terminal result is authoritative
     summary = ""     # summary-mode compaction: the model's own running WORK LOG
     covered = 0      # pairs already folded into the summary
     fidelity_sent = False   # the JIT rich-save reminder fires once per attempt
@@ -1111,6 +1112,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                      "terminal " + outcome.status if outcome.terminal else "observation")
             if outcome.terminal:
                 res.status = outcome.status
+                domain_terminal = True
                 break
             user = outcome.observation
             continue
@@ -1574,7 +1576,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
             break
         user = repair_message(results, rejections)
 
-    if res.status == "stalled":
+    if res.status == "stalled" and not domain_terminal:
         # v18: one mechanical file-delta at the stall exit. "" is a PROOF that no
         # candidate deliverable was created or modified — the signal that separates
         # "banked work, continue it" from "doomed strategy draw, pivot" upstream.
@@ -1582,7 +1584,8 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
             vm, baseline, excluded_paths=private_surface_paths)
             if baseline else None)
 
-    if (res.status == "stalled" and cfg.independent_verify and not forced
+    if (res.status == "stalled" and not domain_terminal
+            and cfg.independent_verify and not forced
             and time.time() - t0 <= wall_cap):
         # v11: a stall is EXACTLY the situation the forced inspection exists for —
         # work possibly complete (or well underway) but never declared/accepted; runs
