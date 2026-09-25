@@ -161,6 +161,15 @@ def test_query_precedes_done_within_one_mixed_object():
     assert action == KnowledgeQuery("vector")
 
 
+def test_query_candidate_cannot_borrow_terminal_validation_from_other_object():
+    action = parse_knowledge_action(
+        '{"done":null}\n'
+        '{"knowledge_query":{"query":"vector"},"checks":"invalid"}'
+    )
+
+    assert isinstance(action, Done)
+
+
 def test_parser_selects_last_valid_query_candidate():
     action = parse_knowledge_action(
         '{"knowledge_query":{"query":"vector"}}\n'

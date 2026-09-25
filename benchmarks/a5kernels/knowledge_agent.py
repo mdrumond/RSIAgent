@@ -68,10 +68,14 @@ def parse_knowledge_action(value: str) -> Any:
     valid_queries = []
     for raw in candidates:
         extra_keys = set(raw) - {"knowledge_query"}
-        if extra_keys and not (
-            isinstance(built_in, Done) and extra_keys <= {"done", "checks"}
-        ):
-            continue
+        if extra_keys:
+            if not extra_keys <= {"done", "checks"}:
+                continue
+            terminal = parse_turn(
+                json.dumps({key: raw[key] for key in extra_keys})
+            )
+            if not isinstance(terminal, Done):
+                continue
         payload = raw["knowledge_query"]
         if not isinstance(payload, dict) or not set(payload) <= {"query", "limit"}:
             continue
