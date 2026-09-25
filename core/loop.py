@@ -1052,7 +1052,7 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
         res.turns += 1
         sink.save_turn(res.turns, out)
         plan = extract_plan(out) or plan          # latest revision wins; survives turns
-        turn = (turn_parser or parse_turn)(out)
+        turn = (turn_parser or parse_turn)(out or "")
 
         if turn is None:                                   # genuine model dry turn
             dry += 1

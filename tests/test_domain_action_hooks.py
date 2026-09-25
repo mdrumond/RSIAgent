@@ -119,6 +119,29 @@ def test_custom_parser_can_delegate_builtin_actions(monkeypatch, tmp_path):
     assert result.status == "done"
 
 
+def test_custom_parser_receives_text_for_empty_reply_and_retries(monkeypatch, tmp_path):
+    seen = []
+
+    def parser(text):
+        seen.append(text)
+        assert isinstance(text, str)
+        return loop.parse_turn(text)
+
+    result, history = _run(
+        monkeypatch,
+        tmp_path,
+        [None, '{"done":null}'],
+        turn_parser=parser,
+        action_executor=lambda _action: pytest.fail("built-in action was delegated"),
+        allow_noop_done=True,
+    )
+
+    assert result.status == "done"
+    assert result.turns == 2
+    assert seen == ["", '{"done":null}']
+    assert history[1]["content"] == "(empty reply)"
+
+
 def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
     with pytest.raises(TypeError, match="without action_executor"):
         _run(monkeypatch, tmp_path, ["compile"],
