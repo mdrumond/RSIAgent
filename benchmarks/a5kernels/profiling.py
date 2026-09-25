@@ -271,6 +271,7 @@ class ProfilingTreatmentController:
         self._validate_capture(basic, basic_command)
         if basic.exported_kernels.count(request.expected_kernel) != 1:
             raise ValueError("BasicInfo did not identify the exact expected kernel once")
+        self._validate_summary(basic, "BasicInfo")
         pipe_command = CaptureCommand(
             campaign,
             request,
@@ -284,10 +285,7 @@ class ProfilingTreatmentController:
             raise ValueError(
                 "PipeUtilization did not identify the exact expected kernel once"
             )
-        if not pipe.summary or any(
-            not key.strip() or not value.strip() for key, value in pipe.summary
-        ):
-            raise ValueError("PipeUtilization did not return a meaningful summary")
+        self._validate_summary(pipe, "PipeUtilization")
         return basic, pipe
 
     def _validate_capture(
@@ -303,6 +301,13 @@ class ProfilingTreatmentController:
         if capture.replay_id != command.replay_id:
             raise ValueError("profile capture does not match the submitted replay")
         capture.evidence.validate(self._max_archive_bytes)
+
+    @staticmethod
+    def _validate_summary(capture: ProfileCapture, metric_name: str) -> None:
+        if not capture.summary or any(
+            not key.strip() or not value.strip() for key, value in capture.summary
+        ):
+            raise ValueError(f"{metric_name} did not return a meaningful summary")
 
     @staticmethod
     def _validate_correctness(correctness: VerifiedResult, request: ProfileRequest) -> None:

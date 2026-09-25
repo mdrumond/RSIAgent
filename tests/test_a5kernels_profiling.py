@@ -250,6 +250,33 @@ def test_basic_info_must_export_expected_kernel_exactly_once() -> None:
 
 
 @pytest.mark.parametrize(
+    "summary",
+    [
+        (),
+        (("", "1800"),),
+        (("frequency_mhz", ""),),
+        (("  ", "1800"),),
+        (("frequency_mhz", "  "),),
+    ],
+)
+def test_basic_info_must_include_meaningful_summary(summary) -> None:
+    class InvalidBasicInfoBackend(FakeBackend):
+        def capture(self, command: CaptureCommand) -> ProfileCapture:
+            result = super().capture(command)
+            if command.metric is ProfileMetric.BASIC_INFO:
+                return replace(result, summary=summary)
+            return result
+
+    backend = InvalidBasicInfoBackend()
+    with pytest.raises(ValueError, match="BasicInfo.*meaningful summary"):
+        ProfilingTreatmentController(backend, treatment_enabled=True).run_intermediate(
+            CORRECT, REQUEST
+        )
+
+    assert len(backend.commands) == 1
+
+
+@pytest.mark.parametrize(
     "replacement, message",
     [
         ({"exported_kernels": ()}, "exact expected kernel"),
