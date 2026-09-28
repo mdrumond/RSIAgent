@@ -6,7 +6,9 @@ from copy import copy
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
@@ -96,10 +98,13 @@ class CandidateRun:
     plan: ExecutionPlan
     verified: VerifiedResult
     kernel_name: str
+    workload: Workload
 
     def __post_init__(self) -> None:
         if not self.kernel_name.strip():
             raise ValueError("kernel_name must be an exact non-empty name")
+        if not isinstance(self.workload, Workload):
+            raise ValueError("workload must be a Workload")
         expected = {
             "request_id": self.plan.request_id,
             "execution_id": self.plan.execution_id,
@@ -159,7 +164,8 @@ class CoreAttemptDriver:
         cfg.model = profile.model
         cfg.max_tokens = profile.generation.max_tokens
         cfg.temperature = profile.generation.temperature
-        cfg.primary_temperature = -1.0
+        cfg.primary_temperature = profile.generation.temperature
+        cfg.retry_temperature = profile.generation.temperature
         cfg.top_p = profile.generation.top_p
         cfg.reasoning_effort = profile.generation.reasoning_effort
         cfg.allow_truncation_retry = profile.generation.allow_truncation_retry
@@ -253,18 +259,32 @@ class TrialActionExecutor:
     def _compile(self, _payload) -> ActionOutcome:
         if not self._has_source():
             return self._observation("compile", error="write kernel source first")
-        return self._observation("compile", result=dict(
-            self.backend.compile(self.workspace, self.language)))
+        try:
+            result = dict(self.backend.compile(self.workspace, self.language))
+        except ValueError as exc:
+            return self._observation("compile", status="source-validation-error",
+                                     error=str(exc))
+        return self._observation("compile", result=result)
 
     def _run(self, _payload) -> ActionOutcome:
         if not self._has_source():
             return self._observation("run", error="write kernel source first")
-        self.latest_run = self.backend.run(
-            self.workspace, self.language, self.workload,
-            f"candidate-{self.actions}", self.ledger)
+        self.latest_run = None
+        try:
+            candidate = self.backend.run(
+                self.workspace, self.language, self.workload,
+                f"candidate-{self.actions}", self.ledger)
+            self._validate_candidate(candidate)
+        except ValueError as exc:
+            return self._observation("run", status="source-validation-error",
+                                     error=str(exc))
+        self.latest_run = candidate
         result = self.latest_run.verified
-        return self._observation("run", passed=result.passed,
-                                 max_abs_error=result.max_abs_error)
+        finite_error = math.isfinite(result.max_abs_error)
+        return self._observation(
+            "run", passed=result.passed,
+            max_abs_error=result.max_abs_error if finite_error else None,
+            error_status=None if finite_error else "non-finite-max-abs-error")
 
     def _query_knowledge(self, payload) -> ActionOutcome:
         results = self.knowledge.query(KnowledgeQuery(**payload))
@@ -288,8 +308,16 @@ class TrialActionExecutor:
     def _submit(self, _payload) -> ActionOutcome:
         if not self._has_source():
             return self._observation("submit", error="write kernel source first")
-        self.final_run = self.backend.run(
-            self.workspace, self.language, self.workload, "final", self.ledger)
+        self.final_run = None
+        self.final_profile = None
+        try:
+            candidate = self.backend.run(
+                self.workspace, self.language, self.workload, "final", self.ledger)
+            self._validate_candidate(candidate)
+        except ValueError as exc:
+            return self._observation("submit", status="source-validation-error",
+                                     error=str(exc))
+        self.final_run = candidate
         if self.final_run.verified.passed:
             self.final_profile = self.profiling.final(self.final_run)
         else:
@@ -303,6 +331,14 @@ class TrialActionExecutor:
 
     def _has_source(self) -> bool:
         return (self.workspace / _SOURCE_PATHS[self.language]).is_file()
+
+    def _validate_candidate(self, candidate: CandidateRun) -> None:
+        if not isinstance(candidate, CandidateRun):
+            raise TypeError("kernel backend must return a CandidateRun")
+        if candidate.plan.language != self.language:
+            raise ValueError("candidate language does not match scheduled language")
+        if candidate.workload is not self.workload:
+            raise ValueError("candidate workload does not match scheduled workload")
 
     @staticmethod
     def _observation(event: str, terminal: bool = False, **fields) -> ActionOutcome:
@@ -335,12 +371,19 @@ class TrialOrchestrator:
         self.backend, self.actor = backend, actor
         self.knowledge_factory, self.profiling_factory = knowledge_factory, profiling_factory
 
-    def run(self, cell: ExperimentCell, workload: Workload) -> TrialResult:
+    def run(self, cell: ExperimentCell, workload: Workload,
+            *, run_identity: str | None = None) -> TrialResult:
         self.scheduler.schedule(cell, workload)
         profile = load_a5_model_profile()
         if cell.model.model_id != profile.model:
             raise ValueError("experiment cell does not use the fixed A5 model profile")
         trial_root = self.root / cell.workspace_id / workload.value
+        if run_identity is not None:
+            if (not isinstance(run_identity, str)
+                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
+                                    run_identity) is None):
+                raise ValueError("run_identity must be a safe host-owned identifier")
+            trial_root /= run_identity
         trial_root.mkdir(parents=True, exist_ok=False)
         workspace, memory, context = (trial_root / name for name in
                                       ("workspace", "memory", "context"))

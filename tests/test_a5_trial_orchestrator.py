@@ -26,11 +26,13 @@ from benchmarks.a5kernels.trial import (
 )
 
 
-def _candidate(passed: bool, attempt: str) -> CandidateRun:
+def _candidate(passed: bool, attempt: str, *,
+               workload=Workload.SMOKE_VECTOR_ADD,
+               language="catlass-dsl", max_abs_error=9.0) -> CandidateRun:
     plan = ExecutionPlan(
         request_id="r" * 64,
         attempt_id=attempt,
-        language="catlass-dsl",
+        language=language,
         files=(SourceFile("kernel.py", "agent source"),),
         argv=("python", "driver.py"),
         input_a=(1.0,),
@@ -41,12 +43,12 @@ def _candidate(passed: bool, attempt: str) -> CandidateRun:
         request_id=plan.request_id, execution_id=plan.execution_id,
         attempt_id=attempt, language=plan.language,
         runtime_provenance=plan.runtime_provenance,
-        passed=passed, max_abs_error=9.0, exit_code=0,
+        passed=passed, max_abs_error=max_abs_error, exit_code=0,
         output_sha256="o" * 64, source_fingerprint=plan.source_fingerprint,
         evidence_sha256="e" * 64, session_handle="fake",
         attestation_sha256="a" * 64,
     )
-    return CandidateRun(plan, verified, "vector_add_generated")
+    return CandidateRun(plan, verified, "vector_add_generated", workload)
 
 
 class FakeBackend:
@@ -62,7 +64,8 @@ class FakeBackend:
     def run(self, workspace, language, workload, attempt_id, ledger):
         assert (workspace / "kernel.py").read_text() == "agent source"
         self.runs.append((language, workload, attempt_id, ledger.path))
-        return _candidate(self.passed, attempt_id)
+        return _candidate(self.passed, attempt_id, workload=workload,
+                          language=language)
 
 
 class FakeProfile:
@@ -238,6 +241,27 @@ def test_distinct_workloads_receive_distinct_trial_directories(tmp_path):
     assert "semantic-gemm" in gemm_actor.instruction
 
 
+def test_explicit_run_identity_isolates_preregistered_repeats(tmp_path):
+    def run(identity):
+        return TrialOrchestrator(
+            tmp_path, _caps(), FakeBackend(True), ScriptedActor([
+                '{"write":{"slot":"kernel","content":"agent source"}}',
+                '{"submit":{}}',
+            ]),
+            knowledge_factory=lambda memory, _cell: KnowledgeAgent(
+                enabled=False, journal=ProgressiveMemoryJournal(memory / "k.jsonl")),
+            profiling_factory=lambda _cell: FakeProfile(),
+        ).run(_cell(), Workload.SMOKE_VECTOR_ADD, run_identity=identity)
+
+    first = run("repeat-1")
+    second = run("repeat-2")
+    assert first.workspace.parent.name == "repeat-1"
+    assert second.workspace.parent.name == "repeat-2"
+
+    with pytest.raises(ValueError, match="safe host-owned"):
+        run("../repeat-3")
+
+
 @pytest.mark.parametrize("action", ["compile", "run", "submit"])
 def test_actions_before_write_return_recoverable_observations(tmp_path, action):
     actor = ScriptedActor([
@@ -283,7 +307,8 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
         turn_parser=parse_trial_action, action_executor=lambda _action: None,
     )
 
-    assert captured["cfg"].primary_temperature == -1.0
+    assert captured["cfg"].primary_temperature == 0.0
+    assert captured["cfg"].retry_temperature == 0.0
     assert captured["cfg"].temperature == 0.0
     assert captured["cfg"].allow_truncation_retry is False
     assert captured["kwargs"]["action_nudge"] == captured["kwargs"]["strict_action_nudge"]
@@ -321,3 +346,72 @@ def test_write_invalidates_previous_run_before_profile(tmp_path):
         "event": "profile",
     }
     assert profile.intermediate_runs == []
+
+
+def test_nonfinite_error_is_a_valid_explicit_json_observation(tmp_path):
+    class NonfiniteBackend(FakeBackend):
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            return _candidate(False, attempt_id, workload=workload,
+                              language=language, max_abs_error=float("inf"))
+
+    executor = _executor(tmp_path, NonfiniteBackend())
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    outcome = executor(parse_trial_action('{"run":{}}'))
+    assert json.loads(outcome.observation)["host"] == {
+        "event": "run", "passed": False, "max_abs_error": None,
+        "error_status": "non-finite-max-abs-error",
+    }
+    assert "Infinity" not in outcome.observation
+
+
+def _executor(tmp_path, backend):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    return TrialActionExecutor(
+        workspace=workspace, language="catlass-dsl",
+        workload=Workload.SMOKE_VECTOR_ADD, backend=backend,
+        ledger=EvidenceLedger(tmp_path / "evidence.jsonl"),
+        knowledge=type("Knowledge", (), {"enabled": False})(),
+        profiling=FakeProfile(), profiling_guidance=False,
+    )
+
+
+@pytest.mark.parametrize("action", ["compile", "run", "submit"])
+def test_source_validation_errors_are_recoverable(tmp_path, action):
+    class RejectingBackend(FakeBackend):
+        def compile(self, workspace, language):
+            raise ValueError("invalid candidate source")
+
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            raise ValueError("invalid candidate source")
+
+    executor = _executor(tmp_path, RejectingBackend())
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    outcome = executor(parse_trial_action(json.dumps({action: {}})))
+    assert not outcome.terminal
+    assert json.loads(outcome.observation)["host"] == {
+        "event": action, "status": "source-validation-error",
+        "error": "invalid candidate source",
+    }
+
+
+@pytest.mark.parametrize("mismatch", ["language", "workload"])
+def test_candidate_must_match_scheduled_language_and_workload(tmp_path, mismatch):
+    class MismatchBackend(FakeBackend):
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            return _candidate(
+                True, attempt_id,
+                language="ascend-c" if mismatch == "language" else language,
+                workload=(Workload.SEMANTIC_GEMM
+                          if mismatch == "workload" else workload),
+            )
+
+    executor = _executor(tmp_path, MismatchBackend())
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    outcome = executor(parse_trial_action('{"run":{}}'))
+    observation = json.loads(outcome.observation)["host"]
+    assert observation["status"] == "source-validation-error"
+    assert mismatch in observation["error"]
