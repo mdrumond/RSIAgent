@@ -181,12 +181,20 @@ class CapabilityUnavailableError(RuntimeError):
 @dataclass(frozen=True)
 class RuntimeCapabilities:
     languages: frozenset[Language]
-    model_ids: frozenset[str]
+    model_profiles: frozenset[ModelProfile]
     workloads: frozenset[Workload]
     kdb: bool = False
     profiling_guidance: bool = False
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.model_profiles, frozenset)
+            or any(
+                not isinstance(profile, ModelProfile)
+                for profile in self.model_profiles
+            )
+        ):
+            raise ValueError("model_profiles must be a frozenset of ModelProfile")
         if (
             not isinstance(self.workloads, frozenset)
             or not self.workloads
@@ -216,7 +224,7 @@ class ExperimentOrchestrator:
         missing: list[str] = []
         if cell.language not in self._capabilities.languages:
             missing.append(f"runtime:{cell.language.value}")
-        if cell.model.model_id not in self._capabilities.model_ids:
+        if cell.model not in self._capabilities.model_profiles:
             missing.append(f"model:{cell.model.model_id}")
         if workload not in self._capabilities.workloads:
             missing.append(f"workload:{workload.value}")

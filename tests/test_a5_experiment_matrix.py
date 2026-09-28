@@ -8,6 +8,7 @@ from benchmarks.a5kernels.fixtures import Language
 from benchmarks.a5kernels.matrix import (
     CapabilityUnavailableError,
     ExperimentOrchestrator,
+    GPT_5_6_SOL,
     KnowledgeMode,
     ModelProfile,
     ProfilingMode,
@@ -145,7 +146,7 @@ def test_orchestrator_fails_closed_for_every_unavailable_capability() -> None:
     orchestrator = ExperimentOrchestrator(
         RuntimeCapabilities(
             languages=frozenset(),
-            model_ids=frozenset(),
+            model_profiles=frozenset(),
             workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
         )
     )
@@ -175,8 +176,28 @@ def test_runtime_capabilities_require_typed_nonempty_workloads(workloads) -> Non
     ):
         RuntimeCapabilities(
             languages=frozenset(Language),
-            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            model_profiles=frozenset({GPT_5_6_SOL}),
             workloads=workloads,
+        )
+
+
+@pytest.mark.parametrize(
+    "model_profiles",
+    [
+        {GPT_5_6_SOL},
+        frozenset({"openai/gpt-5.6-sol"}),
+    ],
+)
+def test_runtime_capabilities_require_typed_immutable_model_routes(
+    model_profiles,
+) -> None:
+    with pytest.raises(
+        ValueError, match="model_profiles must be a frozenset of ModelProfile"
+    ):
+        RuntimeCapabilities(
+            languages=frozenset(Language),
+            model_profiles=model_profiles,
+            workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
         )
 
 
@@ -186,7 +207,7 @@ def test_runtime_capabilities_require_exact_boolean_treatments(field, value) -> 
     with pytest.raises(ValueError, match=rf"{field} must be a bool"):
         RuntimeCapabilities(
             languages=frozenset(Language),
-            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            model_profiles=frozenset({GPT_5_6_SOL}),
             workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
             **{field: value},
         )
@@ -197,7 +218,7 @@ def test_orchestrator_rejects_non_workload_schedule_input() -> None:
     orchestrator = ExperimentOrchestrator(
         RuntimeCapabilities(
             languages=frozenset(Language),
-            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            model_profiles=frozenset({GPT_5_6_SOL}),
             workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
         )
     )
@@ -211,7 +232,7 @@ def test_orchestrator_schedules_without_claiming_a_result() -> None:
     orchestrator = ExperimentOrchestrator(
         RuntimeCapabilities(
             languages=frozenset(Language),
-            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            model_profiles=frozenset({GPT_5_6_SOL}),
             workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
             kdb=True,
             profiling_guidance=True,
