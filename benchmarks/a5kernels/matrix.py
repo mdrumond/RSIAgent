@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 from typing import Iterable, Mapping
 
 from benchmarks.a5kernels.fixtures import Language
@@ -31,6 +32,17 @@ class ProfilingMode(str, Enum):
 class Workload(str, Enum):
     SMOKE_VECTOR_ADD = "smoke-vector-add"
     SEMANTIC_GEMM = "semantic-gemm"
+
+
+_SAFE_PATH_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def validate_path_component(value: object, field: str) -> str:
+    """Return one safe host-owned path component or fail closed."""
+
+    if not isinstance(value, str) or _SAFE_PATH_COMPONENT.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a safe single path component")
+    return value
 
 
 @dataclass(frozen=True)
@@ -97,9 +109,7 @@ class ExperimentCell:
             if not isinstance(value, expected):
                 raise ValueError(f"{field} must be a {expected.__name__}")
         for field in ("cell_id", "context_id", "memory_id", "workspace_id"):
-            value = getattr(self, field)
-            if not isinstance(value, str) or not value or value != value.strip():
-                raise ValueError(f"{field} must be a non-empty trimmed string")
+            validate_path_component(getattr(self, field), field)
 
 
 @dataclass(frozen=True)
@@ -111,6 +121,10 @@ class DeterminismTrial:
     memory_id: str
     workspace_id: str
     workload: Workload = Workload.SMOKE_VECTOR_ADD
+
+    def __post_init__(self) -> None:
+        for field in ("trial_id", "cell_id", "context_id", "memory_id", "workspace_id"):
+            validate_path_component(getattr(self, field), field)
 
 
 @dataclass(frozen=True)

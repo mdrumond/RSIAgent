@@ -297,6 +297,33 @@ def test_explicit_run_identity_isolates_preregistered_repeats(tmp_path):
         run("../repeat-3")
 
 
+def test_unsafe_workspace_identity_cannot_escape_trial_root(tmp_path):
+    cell = _cell()
+    unsafe = object.__new__(type(cell))
+    for field in cell.__dataclass_fields__:
+        object.__setattr__(
+            unsafe,
+            field,
+            "../escaped" if field == "workspace_id" else getattr(cell, field),
+        )
+    actor = ScriptedActor([
+        '{"write":{"slot":"kernel","content":"agent source"}}',
+        '{"submit":{}}',
+    ])
+    orchestrator = TrialOrchestrator(
+        tmp_path / "trials", _caps(), FakeBackend(True), actor,
+        knowledge_factory=lambda memory, _cell: KnowledgeAgent(
+            enabled=False, journal=ProgressiveMemoryJournal(memory / "k.jsonl")),
+        profiling_factory=lambda _cell: FakeProfile(),
+    )
+
+    with pytest.raises(ValueError, match="workspace_id must be a safe single path component"):
+        orchestrator.run(unsafe, Workload.SMOKE_VECTOR_ADD)
+
+    assert not (tmp_path / "escaped").exists()
+    assert actor.instruction is None
+
+
 @pytest.mark.parametrize("action", ["compile", "run", "submit"])
 def test_actions_before_write_return_recoverable_observations(tmp_path, action):
     actor = ScriptedActor([

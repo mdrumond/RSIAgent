@@ -7,6 +7,7 @@ import pytest
 from benchmarks.a5kernels.fixtures import Language
 from benchmarks.a5kernels.matrix import (
     CapabilityUnavailableError,
+    DeterminismTrial,
     ExperimentCell,
     ExperimentOrchestrator,
     GPT_5_6_SOL,
@@ -146,7 +147,13 @@ def test_experiment_cell_rejects_raw_reconstructed_dimensions(
 
 
 @pytest.mark.parametrize("field", ["cell_id", "context_id", "memory_id", "workspace_id"])
-@pytest.mark.parametrize("value", ["", " untrimmed ", 1])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "", ".", "..", "/absolute", "../escape", "nested/path", r"nested\path",
+        "a" * 129, 1,
+    ],
+)
 def test_experiment_cell_requires_well_formed_identifiers(field, value) -> None:
     cell = initial_matrix().cells[0]
     values = {
@@ -155,8 +162,22 @@ def test_experiment_cell_requires_well_formed_identifiers(field, value) -> None:
     }
     values[field] = value
 
-    with pytest.raises(ValueError, match=rf"{field} must be a non-empty trimmed string"):
+    with pytest.raises(ValueError, match=rf"{field} must be a safe single path component"):
         ExperimentCell(**values)
+
+
+@pytest.mark.parametrize("field", ["trial_id", "cell_id", "context_id", "memory_id", "workspace_id"])
+@pytest.mark.parametrize("value", [".", "..", "/absolute", "../escape", "nested/path"])
+def test_determinism_trial_requires_safe_identity_components(field, value) -> None:
+    trial = initial_matrix().determinism_trials[0]
+    values = {
+        name: getattr(trial, name)
+        for name in DeterminismTrial.__dataclass_fields__
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=rf"{field} must be a safe single path component"):
+        DeterminismTrial(**values)
 
 
 def test_determinism_schedule_is_three_catlass_baseline_repeats() -> None:
