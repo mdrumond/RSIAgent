@@ -224,8 +224,8 @@ def build_production_trial(paths: ProductionPaths):
         KnowledgeMode,
         RuntimeCapabilities,
         Workload,
+        initial_matrix,
     )
-    from benchmarks.a5kernels.model_profile import CANONICAL_MODEL
     from benchmarks.a5kernels.profiling import ProfilingTreatmentController
     from benchmarks.a5kernels.profiling_bz import BZProfileBackend
     from benchmarks.a5kernels.trial import CoreAttemptDriver, TrialOrchestrator
@@ -272,9 +272,12 @@ def build_production_trial(paths: ProductionPaths):
         )
         return CandidateProfileEvaluation(controller, device=paths.device)
 
+    pilot_profile = next(
+        cell.model for cell in initial_matrix().cells if cell.cell_id == PILOT_CELL_ID
+    )
     capabilities = RuntimeCapabilities(
         languages=frozenset({Language.CATLASS_DSL}),
-        model_ids=frozenset({CANONICAL_MODEL}),
+        model_profiles=frozenset({pilot_profile}),
         workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
         kdb=True,
         profiling_guidance=True,
