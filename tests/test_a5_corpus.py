@@ -89,6 +89,7 @@ def test_checked_in_corpora_are_strict_pinned_english_allowlists():
         ({"language": "zh"}, "language 'en'"),
         ({"revision": "main"}, "40-character"),
         ({"repository": "git@example.invalid:repo"}, "canonical HTTPS"),
+        ({"name": "../docs"}, "artifact-directory component"),
         ({"files": []}, "at least one"),
         (
             {"files": [{"path": "../secret", "sha256": "a" * 64}]},

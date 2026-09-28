@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -43,7 +44,9 @@ class CorpusSpec:
         return spec
 
     def validate(self) -> None:
-        if not self.name or not self.collection or self.language != "en":
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", self.name):
+            raise ValueError("corpus name must be a lowercase artifact-directory component")
+        if not self.collection or self.language != "en":
             raise ValueError("corpus requires nonempty names and language 'en'")
         if not self.repository.startswith("https://") or self.repository.endswith("/"):
             raise ValueError("repository must be a canonical HTTPS URL without trailing slash")
