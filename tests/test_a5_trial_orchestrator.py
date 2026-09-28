@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +20,7 @@ from benchmarks.a5kernels.model_profile import load_a5_model_profile
 from benchmarks.a5kernels.protocol import ExecutionPlan, SourceFile, VerifiedResult
 from benchmarks.a5kernels.trial import (
     ActorOutcome,
+    ActionOutcome,
     CandidateRun,
     CoreAttemptDriver,
     TrialActionExecutor,
@@ -158,7 +161,7 @@ def test_end_to_end_result_is_host_owned_and_treatments_off_do_not_leak(tmp_path
     assert actor.profile.allow_fallbacks is False
     assert "catlass-dsl" in actor.instruction
     assert "smoke-vector-add" in actor.instruction
-    assert backend.runs[-1][2] == "final"
+    assert backend.runs[-1][2].endswith("-final")
     knowledge_observation = actor.observations[3]
     assert knowledge_observation == {"knowledge_query": {"available": False, "results": []}}
     assert "secret" not in json.dumps(knowledge_observation)
@@ -200,7 +203,8 @@ def test_enabled_treatments_are_explicitly_routed(tmp_path):
     assert result.verified.passed
     assert queries == ["vector"]
     assert actor.observations[3]["host"]["result"] == {"pipe": "balanced"}
-    assert [run.plan.attempt_id for run in profile.intermediate_runs] == ["candidate-3"]
+    assert len(profile.intermediate_runs) == 1
+    assert profile.intermediate_runs[0].plan.attempt_id.endswith("-candidate-3")
     assert profile.final_runs == [result.run]
 
 
@@ -242,10 +246,15 @@ def test_distinct_workloads_receive_distinct_trial_directories(tmp_path):
 
 
 def test_explicit_run_identity_isolates_preregistered_repeats(tmp_path):
+    from benchmarks.a5kernels.bz import BZSessionAdapter, CommandResult
+
+    backend = FakeBackend(True)
+
     def run(identity):
         return TrialOrchestrator(
-            tmp_path, _caps(), FakeBackend(True), ScriptedActor([
+            tmp_path, _caps(), backend, ScriptedActor([
                 '{"write":{"slot":"kernel","content":"agent source"}}',
+                '{"run":{}}',
                 '{"submit":{}}',
             ]),
             knowledge_factory=lambda memory, _cell: KnowledgeAgent(
@@ -257,6 +266,23 @@ def test_explicit_run_identity_isolates_preregistered_repeats(tmp_path):
     second = run("repeat-2")
     assert first.workspace.parent.name == "repeat-1"
     assert second.workspace.parent.name == "repeat-2"
+    assert len({attempt for _, _, attempt, _ in backend.runs}) == 4
+    assert all(len(attempt) <= 64 for _, _, attempt, _ in backend.runs)
+    # Identical source/inputs have the same execution identity, but the BZ
+    # adapter must still dispatch them into distinct retained sessions.
+    assert first.run.plan.execution_id == second.run.plan.execution_id
+    sessions = []
+
+    def dispatch(invocation):
+        sessions.append(invocation.argv[2])
+        return CommandResult(1, "offline dispatch probe")
+
+    adapter = BZSessionAdapter(SimpleNamespace(
+        runtime_provenance=first.run.plan.runtime_provenance, run=dispatch,
+    ), session_wrapper="profiles/bz-a5/session.sh")
+    adapter.execute(first.run.plan)
+    adapter.execute(second.run.plan)
+    assert len(set(sessions)) == 2
 
     with pytest.raises(ValueError, match="safe host-owned"):
         run("../repeat-3")
@@ -317,6 +343,63 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
         assert action in captured["kwargs"]["action_nudge"]
     assert outcome.wall_time_s == 3.5
     assert outcome.tokens is None
+
+
+def test_core_driver_disables_inherited_compaction_without_mutating_config(monkeypatch, tmp_path):
+    import core.loop as loop
+    from config.settings import load
+    from core.trace import ArtifactSink
+
+    cfg = load(None)
+    cfg.max_iters = 4
+    cfg.history_keep_pairs = 1
+    cfg.keep_chars = 0
+    cfg.fold_batch = 1
+    cfg.ctx_high_water = 0
+    requests = []
+    replies = iter([
+        '{"propose":{"text":"first"}}',
+        '{"propose":{"text":"second"}}',
+        '{"submit":{}}',
+    ])
+
+    def chat(_model, system, _user, **kwargs):
+        assert system != loop.SUMMARIZER_SYSTEM
+        requests.append(kwargs)
+        return next(replies)
+
+    monkeypatch.setattr(loop, "chat", chat)
+    outcome = CoreAttemptDriver(object(), cfg, lambda path: ArtifactSink(str(path)))(
+        "task", profile=load_a5_model_profile(), workspace=tmp_path,
+        context=tmp_path / "context", turn_parser=parse_trial_action,
+        action_executor=lambda action: ActionOutcome("ok", action.kind == "submit"),
+    )
+
+    assert outcome.status == "done"
+    assert len(requests) == 3
+    assert all(request["allow_truncation_retry"] is False for request in requests)
+    assert all(request["top_p"] == 1.0 for request in requests)
+    assert cfg.history_keep_pairs == 1
+
+
+def test_failed_candidate_can_omit_undiscovered_kernel_name(tmp_path):
+    failed = replace(_candidate(False, "failed"), kernel_name=None)
+    assert failed.kernel_name is None
+    with pytest.raises(ValueError, match="passed candidates require"):
+        replace(_candidate(True, "passed"), kernel_name=None)
+    with pytest.raises(ValueError, match="exact non-empty"):
+        replace(_candidate(True, "passed"), kernel_name="  kernel  ")
+
+    class FailedBackend(FakeBackend):
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            return replace(_candidate(False, attempt_id), kernel_name=None)
+
+    executor = _executor(tmp_path, FailedBackend())
+    executor(parse_trial_action('{"write":{"slot":"kernel","content":"agent source"}}'))
+    outcome = executor(parse_trial_action('{"submit":{}}'))
+    assert outcome.terminal
+    assert json.loads(outcome.observation)["host"]["passed"] is False
+    assert executor.final_profile == {"available": False, "reason": "correctness-failed"}
 
 
 def test_write_invalidates_previous_run_before_profile(tmp_path):

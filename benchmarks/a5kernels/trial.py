@@ -93,15 +93,19 @@ class KernelTrialBackend(Protocol):
 
 @dataclass(frozen=True)
 class CandidateRun:
-    """One host-prepared plan and its matching authoritative result."""
+    """A matching host plan/result; failed runs may lack a discovered kernel name."""
 
     plan: ExecutionPlan
     verified: VerifiedResult
-    kernel_name: str
+    kernel_name: str | None
     workload: Workload
 
     def __post_init__(self) -> None:
-        if not self.kernel_name.strip():
+        if self.kernel_name is None:
+            if self.verified.passed:
+                raise ValueError("passed candidates require an exact kernel_name")
+        elif (not isinstance(self.kernel_name, str) or not self.kernel_name
+              or self.kernel_name != self.kernel_name.strip()):
             raise ValueError("kernel_name must be an exact non-empty name")
         if not isinstance(self.workload, Workload):
             raise ValueError("workload must be a Workload")
@@ -173,6 +177,9 @@ class CoreAttemptDriver:
         cfg.provider_allow_fallbacks = profile.allow_fallbacks
         cfg.provider_require_parameters = profile.require_parameters
         cfg.independent_verify = False
+        # Core's optional summarizer has its own generation policy. Keep the
+        # complete history so every A5 completion uses the fixed actor route.
+        cfg.history_keep_pairs = 0
         def execute(action):
             outcome = action_executor(action)
             return DomainActionResult(outcome.observation, outcome.terminal, outcome.status)
@@ -221,6 +228,10 @@ class TrialActionExecutor:
         self.knowledge, self.profiling = knowledge, profiling
         self.profiling_guidance = profiling_guidance
         self.max_actions, self.max_source_bytes = max_actions, max_source_bytes
+        # The same source can recur across cells and determinism repeats. BZ
+        # sessions use attempt IDs, so local workspace isolation must reach them.
+        self._attempt_namespace = hashlib.sha256(
+            str(workspace.resolve()).encode("utf-8")).hexdigest()[:24]
         self.actions = 0
         self.latest_run: CandidateRun | None = None
         self.final_run: CandidateRun | None = None
@@ -273,7 +284,7 @@ class TrialActionExecutor:
         try:
             candidate = self.backend.run(
                 self.workspace, self.language, self.workload,
-                f"candidate-{self.actions}", self.ledger)
+                f"{self._attempt_namespace}-candidate-{self.actions}", self.ledger)
             self._validate_candidate(candidate)
         except ValueError as exc:
             return self._observation("run", status="source-validation-error",
@@ -312,7 +323,8 @@ class TrialActionExecutor:
         self.final_profile = None
         try:
             candidate = self.backend.run(
-                self.workspace, self.language, self.workload, "final", self.ledger)
+                self.workspace, self.language, self.workload,
+                f"{self._attempt_namespace}-final", self.ledger)
             self._validate_candidate(candidate)
         except ValueError as exc:
             return self._observation("submit", status="source-validation-error",
