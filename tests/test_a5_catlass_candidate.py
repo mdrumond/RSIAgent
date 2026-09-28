@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -175,6 +176,7 @@ def test_run_returns_exact_plan_bound_candidate(tmp_path):
     )
 
     assert run.kernel_name == EXACT_KERNEL_NAME
+    assert run.candidate_source_sha256 == hashlib.sha256(SOURCE.encode()).hexdigest()
     assert run.verified.passed
     assert run.plan is execution.plans[0]
     assert run.plan.attempt_id == "candidate-4"

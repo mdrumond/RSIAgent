@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 from pathlib import Path
 from typing import Mapping
@@ -124,7 +125,10 @@ class CatlassCandidateBackend:
         plan = self._prepare(runner, request, source, attempt_id, compile_only=False)
         verified = runner.run_plan(request, plan)
         kernel_name = _discovered_kernel(capture.receipt) if verified.passed else None
-        return CandidateRun(plan, verified, kernel_name, workload)
+        return CandidateRun(
+            plan, verified, kernel_name, workload,
+            hashlib.sha256(source.encode("utf-8")).hexdigest(),
+        )
 
     def _request(self) -> RunRequest:
         return RunRequest(Language.CATLASS_DSL.value, length=self._length, seed=self._seed)
@@ -133,7 +137,7 @@ class CatlassCandidateBackend:
     def _source(workspace: Path, language: str) -> str:
         if language != Language.CATLASS_DSL.value:
             raise ValueError("Catlass candidate runtime requires catlass-dsl")
-        source = (workspace / "kernel.py").read_text(encoding="utf-8")
+        source = (workspace / "kernel.py").read_bytes().decode("utf-8")
         validate_candidate_source(source)
         return source
 
