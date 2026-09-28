@@ -282,7 +282,7 @@ def chat(model: str, system: str, user: str,
          image=None, reasoning_max_tokens: int = 0, top_p: float = -1.0,
          provider_order=None, provider_allow_fallbacks: bool = True,
          provider_require_parameters: bool = False,
-         json_object: bool = False) -> str:
+         json_object: bool = False, allow_truncation_retry: bool = True) -> str:
     """One chat completion. ``history`` is the growing conversation (working memory —
     dropping it was anchor's biggest bug). ``image`` (png/jpg bytes, or a LIST of
     them — v13 auto-tiling attaches an overview plus native-resolution tiles) rides
@@ -295,7 +295,9 @@ def chat(model: str, system: str, user: str,
     problem difficulty, not the knob). GLM-5.3 does not support disabling thinking, so
     its truncation recovery uses ``low``. None omits the field. ``provider_order`` is
     an optional OpenRouter route preference; when present, it is never silently dropped
-    after an API error because that would change the frozen experiment mid-run."""
+    after an API error because that would change the frozen experiment mid-run.
+    Set ``allow_truncation_retry=False`` to preserve generation controls even when
+    the reply hits its token limit; the partial text is returned unchanged."""
     messages = _request_messages(system, user, history=history, image=image)
     kwargs = {}
     if json_object:
@@ -414,7 +416,8 @@ def chat(model: str, system: str, user: str,
     txt = txt.strip()
     mandatory_reasoning = _reasoning_cannot_disable(model)
     retry_ceiling = 131072 if mandatory_reasoning else 40000
-    if truncated and max_tokens < retry_ceiling and (not txt or _looks_cut(txt)):
+    if (allow_truncation_retry and truncated and max_tokens < retry_ceiling
+            and (not txt or _looks_cut(txt))):
         # TOKEN-LIMIT TRUNCATION: the reply hit the length cap with either NO visible
         # text (hidden reasoning ate the budget) or a program CUT MID-STREAM (its JSON
         # action never closed). A same-budget retry truncates identically — retry once
@@ -437,7 +440,8 @@ def chat(model: str, system: str, user: str,
                     provider_order=order,
                     provider_allow_fallbacks=provider_allow_fallbacks,
                     provider_require_parameters=provider_require_parameters,
-                    json_object=json_object)
+                    json_object=json_object,
+                    allow_truncation_retry=allow_truncation_retry)
     if truncated:
         log.warning("%s hit the token limit; output may be cut", model)
     return txt

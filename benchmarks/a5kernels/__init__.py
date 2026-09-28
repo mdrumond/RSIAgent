@@ -27,9 +27,19 @@ from benchmarks.a5kernels.protocol import RunRequest, VerifiedResult
 from benchmarks.a5kernels.profiling import ProfileRequest, ProfilingTreatmentController
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
+from benchmarks.a5kernels.model_profile import (
+    A5Completion,
+    A5ModelProfile,
+    A5RunProvenance,
+    complete_a5,
+    load_a5_model_profile,
+)
 
 __all__ = [
     "A5KernelRunner",
+    "A5Completion",
+    "A5ModelProfile",
+    "A5RunProvenance",
     "BZSessionAdapter",
     "BZProfileBackend",
     "CatlassValidationExecutor",
@@ -55,4 +65,6 @@ __all__ = [
     "VerifiedResult",
     "fixture_for",
     "parse_knowledge_action",
+    "complete_a5",
+    "load_a5_model_profile",
 ]
