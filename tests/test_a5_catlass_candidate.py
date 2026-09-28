@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 
 import pytest
 
@@ -13,6 +14,7 @@ from benchmarks.a5kernels.candidate import (
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.protocol import ExecutionReceipt
+from benchmarks.a5kernels.trial import TrialAction, TrialActionExecutor
 
 
 SOURCE = '''\
@@ -143,6 +145,35 @@ def test_run_rejects_missing_or_unexpected_discovered_name(tmp_path):
             backend.run(
                 tmp_path, "catlass-dsl", Workload.SMOKE_VECTOR_ADD, "final", ledger
             )
+
+
+def test_failed_run_without_kernel_marker_is_recoverable_action_observation(tmp_path):
+    execution = FakeExecution(marker=None, exit_code=1)
+    backend = CatlassCandidateBackend(execution)
+    executor = TrialActionExecutor(
+        workspace=tmp_path,
+        language="catlass-dsl",
+        workload=Workload.SMOKE_VECTOR_ADD,
+        backend=backend,
+        ledger=EvidenceLedger(tmp_path / "evidence.jsonl"),
+        knowledge=type("Knowledge", (), {"enabled": False})(),
+        profiling=object(),
+        profiling_guidance=False,
+    )
+    executor(TrialAction("write", {"slot": "kernel", "content": SOURCE}))
+
+    outcome = executor(TrialAction("run", {}))
+
+    assert outcome.terminal is False
+    assert json.loads(outcome.observation)["host"] == {
+        "event": "run",
+        "max_abs_error": None,
+        "error_status": "non-finite-max-abs-error",
+        "passed": False,
+    }
+    assert executor.latest_run is not None
+    assert executor.latest_run.kernel_name is None
+    assert executor.latest_run.verified.exit_code == 1
 
 
 def test_runtime_rejects_other_language_and_workload(tmp_path):

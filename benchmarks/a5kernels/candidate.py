@@ -124,7 +124,8 @@ class CatlassCandidateBackend:
         runner = A5KernelRunner(capture, evidence_ledger=ledger)
         plan = self._prepare(runner, request, source, attempt_id, compile_only=False)
         verified = runner.run_plan(request, plan)
-        return CandidateRun(plan, verified, _discovered_kernel(capture.receipt))
+        kernel_name = _discovered_kernel(capture.receipt) if verified.passed else None
+        return CandidateRun(plan, verified, kernel_name, workload)
 
     def _request(self) -> RunRequest:
         return RunRequest(Language.CATLASS_DSL.value, length=self._length, seed=self._seed)
