@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -117,6 +118,37 @@ def test_embed_batches_and_returns_unit_vectors():
         "truncation": True,
         "return_tensors": "pt",
     }
+
+
+@pytest.mark.parametrize("override", ["tokenizer", "model"])
+def test_single_loader_override_is_preserved(monkeypatch, override):
+    tokenizer = RecordingTokenizer()
+    encoder = FakeEncoder()
+    encoder.tokenizer = tokenizer
+    defaults = {
+        "tokenizer": MagicMock(return_value=tokenizer),
+        "model": MagicMock(return_value=encoder),
+    }
+    supplied = MagicMock(return_value=tokenizer if override == "tokenizer" else encoder)
+    monkeypatch.setitem(sys.modules, "transformers", SimpleNamespace(
+        AutoTokenizer=SimpleNamespace(from_pretrained=defaults["tokenizer"]),
+        AutoModel=SimpleNamespace(from_pretrained=defaults["model"]),
+    ))
+    backend = PinnedBGEEmbeddings(
+        **{f"{override}_loader": supplied}, torch_module=FakeTorch()
+    )
+
+    assert len(backend.embed(["kernel"])[0]) == 384
+
+    expected = {
+        "revision": DEFAULT_EMBEDDING_REVISION,
+        "local_files_only": True,
+        "trust_remote_code": False,
+    }
+    supplied.assert_called_once_with(DEFAULT_EMBEDDING_MODEL, **expected)
+    defaults[override].assert_not_called()
+    missing = "model" if override == "tokenizer" else "tokenizer"
+    defaults[missing].assert_called_once_with(DEFAULT_EMBEDDING_MODEL, **expected)
 
 
 @pytest.mark.parametrize(

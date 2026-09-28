@@ -57,10 +57,13 @@ class PinnedBGEEmbeddings:
                 import torch
 
                 self._torch = torch
-            if self._tokenizer_loader is None or self._model_loader is None:
-                from transformers import AutoModel, AutoTokenizer
+            if self._tokenizer_loader is None:
+                from transformers import AutoTokenizer
 
                 self._tokenizer_loader = AutoTokenizer.from_pretrained
+            if self._model_loader is None:
+                from transformers import AutoModel
+
                 self._model_loader = AutoModel.from_pretrained
             kwargs: dict[str, Any] = {
                 "revision": self.revision,
