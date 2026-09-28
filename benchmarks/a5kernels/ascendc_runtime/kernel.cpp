@@ -65,10 +65,11 @@ torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b) {
   const auto count = static_cast<uint32_t>(a.numel());
   const uint32_t buffer_bytes = (count * sizeof(float) + 31U) & ~31U;
   auto launch = [=]() -> int {
+    // BiSheng's C-style cast converts host pointers to the GM address space;
+    // reinterpret_cast cannot change that address-space qualifier.
     VectorAddKernel<<<1, nullptr, stream>>>(
-        reinterpret_cast<GM_ADDR>(a.data_ptr()),
-        reinterpret_cast<GM_ADDR>(b.data_ptr()),
-        reinterpret_cast<GM_ADDR>(output.data_ptr()), count, buffer_bytes);
+        (GM_ADDR)a.data_ptr(), (GM_ADDR)b.data_ptr(),
+        (GM_ADDR)output.data_ptr(), count, buffer_bytes);
     return 0;
   };
   at_npu::native::OpCommand::RunOpApi("A5VectorAdd", launch);

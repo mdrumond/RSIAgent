@@ -84,6 +84,19 @@ def test_concrete_plan_keeps_host_attempt_and_retained_result_lifecycle():
     assert receipt.session_handle == "bz-a5:ascend"
 
 
+def test_staged_launch_uses_bisheng_gm_address_space_conversion():
+    sources = {
+        source.relative_path: source.content
+        for source in fixture_for(Language.ASCEND_C).files
+    }
+    launch = sources["kernel.cpp"].split("auto launch =", 1)[1]
+
+    assert "VectorAddKernel<<<1, nullptr, stream>>>" in launch
+    for tensor in ("a", "b", "output"):
+        assert f"(GM_ADDR){tensor}.data_ptr()" in launch
+    assert "reinterpret_cast<GM_ADDR>" not in launch
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
