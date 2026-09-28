@@ -6,6 +6,7 @@ from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, EvidenceLedge
 from benchmarks.a5kernels.bz import RuntimeUnavailableError
 from benchmarks.a5kernels.evidence import (
     GENESIS_HASH,
+    EvidenceEntry,
     EvidenceKind,
     canonical_bytes,
     canonical_digest,
@@ -87,6 +88,28 @@ def test_ledger_rejects_payload_tampering(tmp_path):
 
     with pytest.raises(ValueError, match="invalid evidence digest"):
         EvidenceLedger(path)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        (EvidenceEntry.create(False, EvidenceKind.REQUEST, {}, GENESIS_HASH),),
+        (
+            EvidenceEntry.create(0, EvidenceKind.REQUEST, {}, GENESIS_HASH),
+            EvidenceEntry.create(
+                1.0,
+                EvidenceKind.ACTION,
+                {},
+                EvidenceEntry.create(
+                    0, EvidenceKind.REQUEST, {}, GENESIS_HASH
+                ).entry_sha256,
+            ),
+        ),
+    ],
+)
+def test_ledger_rejects_non_integer_sequence_with_valid_digest(entries):
+    with pytest.raises(ValueError, match="sequence type"):
+        EvidenceLedger.verify(entries)
 
 
 def test_runner_records_host_owned_lifecycle_without_agent_metadata(tmp_path):

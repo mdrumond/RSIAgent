@@ -149,6 +149,10 @@ class EvidenceLedger:
     def verify(entries: Iterable[EvidenceEntry]) -> None:
         previous = GENESIS_HASH
         for expected_sequence, entry in enumerate(entries):
+            if isinstance(entry.sequence, bool) or not isinstance(entry.sequence, int):
+                raise ValueError(
+                    f"invalid evidence sequence type at sequence {expected_sequence}"
+                )
             if entry.sequence != expected_sequence or entry.previous_sha256 != previous:
                 raise ValueError(f"broken evidence chain at sequence {expected_sequence}")
             expected = EvidenceEntry.create(
