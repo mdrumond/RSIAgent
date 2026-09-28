@@ -198,6 +198,7 @@ def build_production_trial(paths: ProductionPaths):
     from benchmarks.a5kernels.matrix import (
         KnowledgeMode,
         RuntimeCapabilities,
+        Workload,
     )
     from benchmarks.a5kernels.model_profile import CANONICAL_MODEL
     from benchmarks.a5kernels.profiling import ProfilingTreatmentController
@@ -249,6 +250,7 @@ def build_production_trial(paths: ProductionPaths):
     capabilities = RuntimeCapabilities(
         languages=frozenset({Language.CATLASS_DSL}),
         model_ids=frozenset({CANONICAL_MODEL}),
+        workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
         kdb=True,
         profiling_guidance=True,
     )
