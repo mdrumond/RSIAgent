@@ -14,6 +14,7 @@ from typing import Callable, Mapping, Protocol
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, KnowledgeQuery
 from benchmarks.a5kernels.matrix import (
+    CapabilityUnavailableError,
     ExperimentCell,
     ExperimentOrchestrator,
     ProfilingMode,
@@ -99,8 +100,13 @@ class CandidateRun:
     verified: VerifiedResult
     kernel_name: str | None
     workload: Workload
+    # Hash the authored kernel slot bytes before composing any host runtime.
+    candidate_source_sha256: str
 
     def __post_init__(self) -> None:
+        if (not isinstance(self.candidate_source_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", self.candidate_source_sha256) is None):
+            raise ValueError("candidate_source_sha256 must hash the exact authored source bytes")
         if self.kernel_name is None:
             if self.verified.passed:
                 raise ValueError("passed candidates require an exact kernel_name")
@@ -209,11 +215,30 @@ compile, run, query-knowledge, request-profile, or submit. Use the object shape 
 in the system instructions and no surrounding prose."""
 
 
+_TRIAL_CONTRACTS = {
+    ("catlass-dsl", Workload.SMOKE_VECTOR_ADD): {
+        "entry_point": "@tla.kernel\ndef vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor) -> None:",
+        "arguments": "gm_a and gm_b are inputs; gm_c is the output. All are contiguous one-dimensional float32 tla.Tensor values with equal shapes.",
+        "shape": "Logical length N is in [1, 400]. The host zero-pads inputs to P = ceil(N / 64) * 64 elements (at most 448). Read P from gm_a.origin_shape[0]; handle every element of that padded shape.",
+        "output": "Write gm_c[i] = gm_a[i] + gm_b[i] for 0 <= i < P. Do not mutate inputs. Return no value; the host evaluates the first N output elements.",
+        "correctness": "The host compares against its original input sums. Every output must be finite, have the expected length, and have maximum absolute error <= 1e-5.",
+        "source": "Import only 'import catlass.tla as tla'. Define exactly the single synchronous vector_add kernel above; use no helper functions, additional decorators, or top-level execution. Optional module constants must be numeric literals.",
+        "runtime": "The host owns allocation, compilation for A5 (3510), launch with block_num=1, synchronization, and verification. Supply only the kernel module, not a run function or host driver.",
+    },
+}
+
+
 def _trial_instruction(language: str, workload: Workload) -> str:
+    contract = _TRIAL_CONTRACTS.get((language, workload))
+    if contract is None:
+        raise CapabilityUnavailableError(
+            f"no executable trial contract for {language}/{workload.value}; "
+            "this combination is preregistered for future implementation")
     return (
         f"Develop a {language} kernel for the {workload.value} workload. "
         f"Write the complete source to the kernel slot ({_SOURCE_PATHS[language]}). "
-        "Use compile and run observations to revise it, then submit the final source."
+        "Use compile and run observations to revise it, then submit the final source.\n"
+        "Executable contract:\n" + json.dumps(contract, sort_keys=True, indent=2)
     )
 
 
@@ -245,14 +270,13 @@ class TrialActionExecutor:
             return ActionOutcome('{"error":"action budget exhausted"}', True,
                                  "safety_ceiling")
         handler = getattr(self, "_" + action.kind.replace("-", "_"))
-        outcome = handler(action.payload)
         self.ledger.append(EvidenceKind.ACTION, {
             "ordinal": self.actions,
             "action": action.kind,
             "payload_sha256": hashlib.sha256(
                 json.dumps(action.payload, sort_keys=True).encode()).hexdigest(),
         })
-        return outcome
+        return handler(action.payload)
 
     def _propose(self, payload) -> ActionOutcome:
         return self._observation("proposal-recorded", chars=len(payload["text"]))
@@ -353,6 +377,9 @@ class TrialActionExecutor:
             raise ValueError("candidate language does not match scheduled language")
         if candidate.workload is not self.workload:
             raise ValueError("candidate workload does not match scheduled workload")
+        current_source = (self.workspace / _SOURCE_PATHS[self.language]).read_bytes()
+        if candidate.candidate_source_sha256 != hashlib.sha256(current_source).hexdigest():
+            raise ValueError("candidate source does not match current workspace kernel")
 
     @staticmethod
     def _observation(event: str, terminal: bool = False, **fields) -> ActionOutcome:
@@ -388,6 +415,7 @@ class TrialOrchestrator:
     def run(self, cell: ExperimentCell, workload: Workload,
             *, run_identity: str | None = None) -> TrialResult:
         self.scheduler.schedule(cell, workload)
+        instruction = _trial_instruction(cell.language.value, workload)
         profile = load_a5_model_profile()
         if cell.model.model_id != profile.model:
             raise ValueError("experiment cell does not use the fixed A5 model profile")
@@ -418,7 +446,7 @@ class TrialOrchestrator:
             profiling=profiling,
             profiling_guidance=cell.profiling is ProfilingMode.WITH_GUIDANCE)
         outcome = self.actor(
-            _trial_instruction(cell.language.value, workload),
+            instruction,
             profile=profile, workspace=workspace, context=context,
             turn_parser=parse_trial_action, action_executor=executor)
         if executor.final_run is None or executor.final_profile is None:

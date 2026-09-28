@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a5kernels.evidence import EvidenceLedger
+from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.fixtures import Language
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, ProgressiveMemoryJournal
 from benchmarks.a5kernels.matrix import (
+    CapabilityUnavailableError,
     KnowledgeMode,
     ProfilingMode,
     RuntimeCapabilities,
@@ -25,6 +27,7 @@ from benchmarks.a5kernels.trial import (
     CoreAttemptDriver,
     TrialActionExecutor,
     TrialOrchestrator,
+    _trial_instruction,
     parse_trial_action,
 )
 
@@ -51,7 +54,8 @@ def _candidate(passed: bool, attempt: str, *,
         evidence_sha256="e" * 64, session_handle="fake",
         attestation_sha256="a" * 64,
     )
-    return CandidateRun(plan, verified, "vector_add_generated", workload)
+    return CandidateRun(plan, verified, "vector_add_generated", workload,
+                        hashlib.sha256(b"agent source").hexdigest())
 
 
 class FakeBackend:
@@ -224,7 +228,7 @@ def test_actor_must_submit_and_each_cell_workspace_is_fresh(tmp_path):
         orchestrator.run(_cell(), Workload.SMOKE_VECTOR_ADD)
 
 
-def test_distinct_workloads_receive_distinct_trial_directories(tmp_path):
+def test_future_workload_contract_fails_before_actor_or_workspace_creation(tmp_path):
     def orchestrator(actor):
         return TrialOrchestrator(
             tmp_path, _caps(), FakeBackend(True), actor,
@@ -241,10 +245,10 @@ def test_distinct_workloads_receive_distinct_trial_directories(tmp_path):
         '{"write":{"slot":"kernel","content":"agent source"}}',
         '{"submit":{}}',
     ])
-    gemm = orchestrator(gemm_actor).run(_cell(), Workload.SEMANTIC_GEMM)
-
-    assert smoke.workspace.parent != gemm.workspace.parent
-    assert "semantic-gemm" in gemm_actor.instruction
+    with pytest.raises(CapabilityUnavailableError, match="preregistered for future"):
+        orchestrator(gemm_actor).run(_cell(), Workload.SEMANTIC_GEMM)
+    assert not smoke.workspace.parent.parent.joinpath("semantic-gemm").exists()
+    assert gemm_actor.instruction is None
 
 
 def test_explicit_run_identity_isolates_preregistered_repeats(tmp_path):
@@ -528,3 +532,75 @@ def test_candidate_must_match_scheduled_language_and_workload(tmp_path, mismatch
     observation = json.loads(outcome.observation)["host"]
     assert observation["status"] == "source-validation-error"
     assert mismatch in observation["error"]
+
+
+@pytest.mark.parametrize("action", ["run", "submit"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_accepted_action_precedes_backend_evidence_and_survives_failure(tmp_path, action, fail):
+    class RecordingBackend(FakeBackend):
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            assert ledger.entries[-1].payload["action"] == action
+            ledger.append(EvidenceKind.REQUEST, {"attempt_id": attempt_id})
+            if fail:
+                raise RuntimeError("backend unavailable")
+            ledger.append(EvidenceKind.ARTIFACT, {"attempt_id": attempt_id})
+            ledger.append(EvidenceKind.RESULT, {"attempt_id": attempt_id})
+            return _candidate(True, attempt_id)
+
+    executor = _executor(tmp_path, RecordingBackend())
+    executor(parse_trial_action('{"write":{"slot":"kernel","content":"agent source"}}'))
+    parsed = parse_trial_action(json.dumps({action: {}}))
+    if fail:
+        with pytest.raises(RuntimeError, match="backend unavailable"):
+            executor(parsed)
+    else:
+        executor(parsed)
+    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    expected = ["action", "action", "request"]
+    assert [entry.kind for entry in entries] == expected + ([] if fail else ["artifact", "result"])
+    assert entries[1].payload["action"] == action
+
+
+@pytest.mark.parametrize("action", ["run", "submit"])
+def test_candidate_from_previous_source_is_rejected_before_profiling(tmp_path, action):
+    class StaleBackend(FakeBackend):
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            return _candidate(True, attempt_id)
+
+    executor = _executor(tmp_path, StaleBackend())
+    executor(parse_trial_action('{"write":{"slot":"kernel","content":"revised source"}}'))
+    outcome = executor(parse_trial_action(json.dumps({action: {}})))
+    assert not outcome.terminal
+    assert json.loads(outcome.observation)["host"] == {
+        "event": action, "status": "source-validation-error",
+        "error": "candidate source does not match current workspace kernel",
+    }
+    assert executor.latest_run is None
+    assert executor.final_run is None
+    assert executor.profiling.intermediate_runs == executor.profiling.final_runs == []
+
+
+def test_candidate_requires_an_exact_source_digest():
+    with pytest.raises(ValueError, match="candidate_source_sha256"):
+        replace(_candidate(True, "candidate"), candidate_source_sha256="unknown")
+
+
+def test_no_kdb_catlass_opening_specifies_executable_contract():
+    instruction = _trial_instruction("catlass-dsl", Workload.SMOKE_VECTOR_ADD)
+    contract = json.loads(instruction.split("Executable contract:\n", 1)[1])
+    assert "vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor)" in contract["entry_point"]
+    assert "float32" in contract["arguments"] and "one-dimensional" in contract["arguments"]
+    assert "[1, 400]" in contract["shape"] and "gm_a.origin_shape[0]" in contract["shape"]
+    assert "gm_a[i] + gm_b[i]" in contract["output"]
+    assert "1e-5" in contract["correctness"]
+    assert "import catlass.tla as tla" in contract["source"]
+    assert "block_num=1" in contract["runtime"]
+
+
+@pytest.mark.parametrize("language, workload", [
+    (language.value, workload) for language in Language for workload in Workload
+    if (language, workload) != (Language.CATLASS_DSL, Workload.SMOKE_VECTOR_ADD)
+])
+def test_unimplemented_trial_contracts_are_explicit(language, workload):
+    with pytest.raises(CapabilityUnavailableError, match="no executable trial contract"):
+        _trial_instruction(language, workload)
