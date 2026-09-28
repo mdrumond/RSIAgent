@@ -249,6 +249,7 @@ def _replay_id(
 ) -> str:
     return "profile-" + canonical_hash(
         {
+            "attempt_id": request.attempt_id,
             "campaign": campaign.value,
             "configuration_id": request.configuration_id,
             "kind": kind,

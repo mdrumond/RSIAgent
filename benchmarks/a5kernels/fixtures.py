@@ -26,6 +26,8 @@ class Fixture:
 
 _CATLASS_SOURCE = '''\
 import catlass.tla as tla
+import os
+import time
 
 VECTOR_ELE = 400
 PADDED_VECTOR_ELE = 448
@@ -72,7 +74,10 @@ def run(input_a, input_b):
     padded_length = ((original_length + VL_ELE - 1) // VL_ELE) * VL_ELE
     input_a = [*input_a, *([0.0] * (padded_length - original_length))]
     input_b = [*input_b, *([0.0] * (padded_length - original_length))]
-    torch.npu.set_device(0)
+    device = int(os.environ.get("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0"))
+    if device < 0:
+        raise ValueError("BZ_A5_PROFILE_PHYSICAL_DEVICE must be non-negative")
+    torch.npu.set_device(device)
     a = torch.tensor(input_a, dtype=torch.float32, device="npu")
     b = torch.tensor(input_b, dtype=torch.float32, device="npu")
     out = torch.empty_like(a)
@@ -86,8 +91,15 @@ def run(input_a, input_b):
     artifact = tla.compile(
         vector_add, tla_a, tla_b, tla_out, options="--npu-arch 3510"
     )
+    emit_timing = os.environ.get("A5KERNEL_EMIT_TIMING") == "1"
+    if emit_timing:
+        torch.npu.synchronize()
+        started_ns = time.perf_counter_ns()
     artifact(tla_a, tla_b, tla_out, block_num=1)
     torch.npu.synchronize()
+    if emit_timing:
+        duration_us = (time.perf_counter_ns() - started_ns) / 1_000
+        print(f"A5KERNEL_TIMING_US={duration_us:.6f}")
     return out[:original_length].cpu().tolist()
 '''
 
