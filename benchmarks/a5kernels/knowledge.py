@@ -19,7 +19,11 @@ RRF_K = 60
 
 
 class EmbeddingBackend(Protocol):
-    """Minimal embedding interface; production loading stays outside the DB."""
+    """Minimal embedding interface; production loading stays outside the DB.
+
+    Backends may also expose ``embed_query(texts)`` for query-specific encoding.
+    Indexing always uses ``embed``; querying falls back to it without that hook.
+    """
 
     model: str
     revision: str
@@ -440,7 +444,8 @@ class KnowledgeDB:
                ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?""",
             (lexical_query, collection, candidate_limit),
         ).fetchall()
-        query_vectors = self.embeddings.embed([query])
+        embed_query = getattr(self.embeddings, "embed_query", self.embeddings.embed)
+        query_vectors = embed_query([query])
         if len(query_vectors) != 1:
             raise ValueError("embedding backend must return one query vector")
         all_rows = self.connection.execute(

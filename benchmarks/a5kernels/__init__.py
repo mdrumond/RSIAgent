@@ -15,6 +15,7 @@ from benchmarks.a5kernels.knowledge import (
     KnowledgeDB,
     SearchHit,
 )
+from benchmarks.a5kernels.embeddings import EmbeddingLoadError, PinnedBGEEmbeddings
 from benchmarks.a5kernels.knowledge_agent import (
     Citation,
     KnowledgeAgent,
@@ -48,6 +49,7 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "DEFAULT_EMBEDDING_REVISION",
     "EmbeddingBackend",
+    "EmbeddingLoadError",
     "ExecutionBackend",
     "EvidenceKind",
     "EvidenceLedger",
@@ -56,6 +58,7 @@ __all__ = [
     "KnowledgeQuery",
     "KnowledgeResult",
     "Language",
+    "PinnedBGEEmbeddings",
     "ProfileCommandExecutor",
     "ProfileRequest",
     "ProfilingTreatmentController",
