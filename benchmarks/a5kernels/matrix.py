@@ -193,6 +193,9 @@ class RuntimeCapabilities:
             or any(not isinstance(workload, Workload) for workload in self.workloads)
         ):
             raise ValueError("workloads must be a non-empty frozenset of Workload")
+        for field in ("kdb", "profiling_guidance"):
+            if type(getattr(self, field)) is not bool:
+                raise ValueError(f"{field} must be a bool")
 
 
 @dataclass(frozen=True)

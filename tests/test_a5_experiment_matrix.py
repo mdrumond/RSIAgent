@@ -180,6 +180,18 @@ def test_runtime_capabilities_require_typed_nonempty_workloads(workloads) -> Non
         )
 
 
+@pytest.mark.parametrize("field", ["kdb", "profiling_guidance"])
+@pytest.mark.parametrize("value", ["false", 0, 1])
+def test_runtime_capabilities_require_exact_boolean_treatments(field, value) -> None:
+    with pytest.raises(ValueError, match=rf"{field} must be a bool"):
+        RuntimeCapabilities(
+            languages=frozenset(Language),
+            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
+            **{field: value},
+        )
+
+
 def test_orchestrator_rejects_non_workload_schedule_input() -> None:
     cell = initial_matrix().cells[0]
     orchestrator = ExperimentOrchestrator(
