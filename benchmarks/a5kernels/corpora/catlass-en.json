@@ -1,17 +1,16 @@
 {
-  "collection": "catlass-en-935e9f5",
+  "collection": "catlass-dsl-en-9a6ac62",
   "files": [
-    {"path": "README.md", "sha256": "eb86078a6f41d9df8d03dd5591e320a321a78580ddf42f4949ca50f6a8040447"},
-    {"path": "docs/api.md", "sha256": "9b4abb8d1865d051c104f5643851144b41f8dc5da74d1196bd7e03c247172539"},
-    {"path": "docs/quickstart.md", "sha256": "a4844f604d671772886d8af0f3bafe4ead829597e78ece9790cf5225febb2be7"},
-    {"path": "docs/tla/01_layout.md", "sha256": "c79c13f672206cd78f6d9b8159a101c25494f5c2b8343395ed8fd3b77e641b80"},
-    {"path": "docs/tla/02_tensor.md", "sha256": "6aa805d32079a84c7070abc6266261f7838e91b395a8731af898aff4331c69fe"},
-    {"path": "docs/tutorials.md", "sha256": "29c74aaf0f52075baa409f75efd58cd910f8c059f46c6ebbbed7307801fb6701"},
-    {"path": "examples/13_basic_matmul_tla/README.md", "sha256": "4ee54ef469155fc05aebd2a0ab3c12be76f45af60b620c70999151dcefa33d2b"},
-    {"path": "examples/13_basic_matmul_tla/basic_matmul_tla.cpp", "sha256": "c9ad73763899a0ba4934ce1b3f43c3f7219f6345fc97d4f5cd68fb66aedd6286"}
+    {"path": "python/tla_dsl/docs/en/api/host_api_reference.md", "sha256": "f4fdc8db92243156735a4d2bb81ce127c9effbdb1076b7a2ba971cceb921e0e1"},
+    {"path": "python/tla_dsl/docs/en/api/kernel_api_reference.md", "sha256": "9b472e9c7c9e165839c85323e6aef5a20c9d3e064ade3f0cca553478736a48f0"},
+    {"path": "python/tla_dsl/docs/en/core_concepts/control_flow.md", "sha256": "8fe45a54d0c246b8b2937350accc00fbec8132b0b423c5bbe6de5c3c33343481"},
+    {"path": "python/tla_dsl/docs/en/core_concepts/syntax_guide.md", "sha256": "ce383f5a4a379dd6eb8740f55864e899e66e5bce1ecc70739aa59b40d2a578fc"},
+    {"path": "python/tla_dsl/docs/en/index.md", "sha256": "82a2816935bde68373332b9ada76b908c47eea94212eb1b37aeaab0eaffb3529"},
+    {"path": "python/tla_dsl/examples/end_to_end/basic_vadd/basic_vadd.py", "sha256": "e98779688d823c1911889cc64d8bf46818558a933656f56183728857e247d9bd"},
+    {"path": "python/tla_dsl/examples/end_to_end/vector_ops/binary_op.py", "sha256": "f824a49f4ba266a1e1a9443afd368e033b527e2780a7f5bb620a644fbbfdb9c5"}
   ],
   "language": "en",
   "name": "catlass-en",
-  "repository": "https://gitee.com/ascend/catlass.git",
-  "revision": "935e9f5efc62f97ce2d7d6b61e6041ad562bb910"
+  "repository": "https://gitcode.com/cann/catlass.git",
+  "revision": "9a6ac627b5f4078060287844189730cf0d184800"
 }

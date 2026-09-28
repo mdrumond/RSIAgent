@@ -81,6 +81,11 @@ def test_checked_in_corpora_are_strict_pinned_english_allowlists():
     assert all(spec.files for spec in specs)
     assert all(tuple(sorted(spec.files, key=lambda item: item.path)) == spec.files for spec in specs)
     assert not any("../cat_dev" in path.read_text() for path in CORPORA.glob("*.json"))
+    catlass = next(spec for spec in specs if spec.name == "catlass-en")
+    assert catlass.repository == "https://gitcode.com/cann/catlass.git"
+    assert all(item.path.startswith("python/tla_dsl/") for item in catlass.files)
+    assert all("/docs/en/" in item.path or item.path.endswith(".py") for item in catlass.files)
+    assert any(item.path.endswith("basic_vadd.py") for item in catlass.files)
 
 
 @pytest.mark.parametrize(
