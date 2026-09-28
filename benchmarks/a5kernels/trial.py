@@ -444,19 +444,22 @@ class TrialOrchestrator:
             "model_profile_sha256": profile.fingerprint,
         })
         knowledge = self.knowledge_factory(memory, cell)
-        if knowledge.enabled != (cell.knowledge.value == "with-kdb"):
-            raise ValueError("Knowledge Agent treatment does not match experiment cell")
-        profiling = self.profiling_factory(cell)
-        executor = TrialActionExecutor(
-            workspace=workspace, language=cell.language.value, workload=workload,
-            backend=self.backend, ledger=ledger, knowledge=knowledge,
-            profiling=profiling,
-            profiling_guidance=cell.profiling is ProfilingMode.WITH_GUIDANCE)
-        outcome = self.actor(
-            instruction,
-            profile=profile, workspace=workspace, context=context,
-            turn_parser=parse_trial_action, action_executor=executor)
-        if executor.final_run is None or executor.final_profile is None:
-            raise RuntimeError("Actor ended without a host-verified submit action")
-        return TrialResult(outcome, executor.final_run, executor.final_profile,
-                           workspace, memory, context, ledger.head_sha256)
+        try:
+            if knowledge.enabled != (cell.knowledge.value == "with-kdb"):
+                raise ValueError("Knowledge Agent treatment does not match experiment cell")
+            profiling = self.profiling_factory(cell)
+            executor = TrialActionExecutor(
+                workspace=workspace, language=cell.language.value, workload=workload,
+                backend=self.backend, ledger=ledger, knowledge=knowledge,
+                profiling=profiling,
+                profiling_guidance=cell.profiling is ProfilingMode.WITH_GUIDANCE)
+            outcome = self.actor(
+                instruction,
+                profile=profile, workspace=workspace, context=context,
+                turn_parser=parse_trial_action, action_executor=executor)
+            if executor.final_run is None or executor.final_profile is None:
+                raise RuntimeError("Actor ended without a host-verified submit action")
+            return TrialResult(outcome, executor.final_run, executor.final_profile,
+                               workspace, memory, context, ledger.head_sha256)
+        finally:
+            knowledge.close()

@@ -70,7 +70,7 @@ def test_candidate_source_rejects_non_abi_modules(source, message):
 def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     (tmp_path / "kernel.py").write_text(SOURCE)
     execution = FakeExecution()
-    backend = CatlassCandidateBackend(execution, length=7, seed=19)
+    backend = CatlassCandidateBackend(execution, length=7, seed=19, device=5)
 
     first = backend.compile(tmp_path, "catlass-dsl", "compile-1")
     second = backend.compile(tmp_path, "catlass-dsl", "compile-2")
@@ -86,7 +86,8 @@ def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     assert plan.attempt_id != execution.plans[1].attempt_id
     assert replace(plan, attempt_id=execution.plans[1].attempt_id) == execution.plans[1]
     assert plan.argv[:2] == ("env", "A5KERNEL_COMPILE_ONLY=1")
-    assert plan.argv[2:5] == ("env", "-u", "PYTHONPYCACHEPREFIX")
+    assert plan.argv[2:4] == ("env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=5")
+    assert plan.argv[4:7] == ("env", "-u", "PYTHONPYCACHEPREFIX")
     candidate = next(item for item in plan.files if item.relative_path == "kernel.py")
     assert SOURCE.rstrip() in candidate.content
     assert "tla.compile(" in candidate.content
@@ -169,7 +170,7 @@ def test_compile_failure_returns_bounded_diagnostics_and_allows_retry(tmp_path):
 def test_run_returns_exact_plan_bound_candidate(tmp_path):
     (tmp_path / "kernel.py").write_text(SOURCE)
     execution = FakeExecution()
-    backend = CatlassCandidateBackend(execution, length=5)
+    backend = CatlassCandidateBackend(execution, length=5, device=6)
     ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
 
     run = backend.run(
@@ -182,6 +183,7 @@ def test_run_returns_exact_plan_bound_candidate(tmp_path):
     assert run.plan is execution.plans[0]
     assert run.plan.attempt_id == "candidate-4"
     assert "A5KERNEL_COMPILE_ONLY=1" not in run.plan.argv
+    assert run.plan.argv[:2] == ("env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=6")
     assert run.verified.execution_id == run.plan.execution_id
     assert run.verified.source_fingerprint == run.plan.source_fingerprint
 
@@ -273,6 +275,12 @@ def test_runtime_rejects_other_language_and_workload(tmp_path):
         backend.compile(tmp_path, "ascend-c", "compile-1")
     with pytest.raises(ValueError, match="only smoke-vector-add"):
         backend.run(tmp_path, "catlass-dsl", Workload.SEMANTIC_GEMM, "x", ledger)
+
+
+@pytest.mark.parametrize("device", [-1, True, 1.5])
+def test_runtime_rejects_invalid_device(device):
+    with pytest.raises(ValueError, match="non-negative integer"):
+        CatlassCandidateBackend(FakeExecution(), device=device)
 
 
 class FakeController:

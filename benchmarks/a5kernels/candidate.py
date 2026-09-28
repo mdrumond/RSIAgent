@@ -89,10 +89,14 @@ def validate_candidate_source(source: str) -> None:
 class CatlassCandidateBackend:
     """Turn workspace source into an immutable plan and execute it on BZ-A5."""
 
-    def __init__(self, execution_backend: ExecutionBackend, *, length: int = 32, seed: int = 0):
+    def __init__(self, execution_backend: ExecutionBackend, *, length: int = 32,
+                 seed: int = 0, device: int = 0):
+        if isinstance(device, bool) or not isinstance(device, int) or device < 0:
+            raise ValueError("device must be a non-negative integer")
         self._execution_backend = execution_backend
         self._length = length
         self._seed = seed
+        self._device = device
 
     def compile(self, workspace: Path, language: str,
                 attempt_id: str) -> Mapping[str, object]:
@@ -100,7 +104,10 @@ class CatlassCandidateBackend:
         request = self._request()
         capture = _CaptureExecution(self._execution_backend)
         runner = A5KernelRunner(capture)
-        plan = self._prepare(runner, request, source, attempt_id, compile_only=True)
+        plan = self._prepare(
+            runner, request, source, attempt_id,
+            compile_only=True, device=self._device
+        )
         result = runner.run_plan(request, plan)
         kernel_name = _discovered_kernel(capture.receipt) if result.passed else None
         diagnostics = CompileDiagnostics(
@@ -122,7 +129,9 @@ class CatlassCandidateBackend:
         request = self._request()
         capture = _CaptureExecution(self._execution_backend)
         runner = A5KernelRunner(capture, evidence_ledger=ledger)
-        plan = self._prepare(runner, request, source, attempt_id, compile_only=False)
+        plan = self._prepare(
+            runner, request, source, attempt_id, compile_only=False, device=self._device
+        )
         verified = runner.run_plan(request, plan)
         kernel_name = _discovered_kernel(capture.receipt) if verified.passed else None
         return CandidateRun(
@@ -146,11 +155,12 @@ class CatlassCandidateBackend:
 
     @staticmethod
     def _prepare(runner: A5KernelRunner, request: RunRequest, source: str,
-                 attempt_id: str, *, compile_only: bool) -> ExecutionPlan:
+                 attempt_id: str, *, compile_only: bool, device: int) -> ExecutionPlan:
         plan = runner.prepare(request, attempt_id=attempt_id)
         fixture = catlass_candidate_fixture(source)
         argv = fixture.argv
         assert argv is not None
+        argv = ("env", f"BZ_A5_PROFILE_PHYSICAL_DEVICE={device}", *argv)
         if compile_only:
             argv = ("env", "A5KERNEL_COMPILE_ONLY=1", *argv)
         return replace(plan, files=fixture.files, argv=argv)

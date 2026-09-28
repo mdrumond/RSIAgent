@@ -208,7 +208,8 @@ def build_production_trial(paths: ProductionPaths):
         catlass_revision=paths.catlass_revision,
     )
     candidate = CatlassCandidateBackend(
-        BZSessionAdapter(command, session_wrapper=str(paths.session_wrapper))
+        BZSessionAdapter(command, session_wrapper=str(paths.session_wrapper)),
+        device=paths.device,
     )
     embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(paths.bge_cache))
     database = KnowledgeDB.open_read_only(paths.kdb, embeddings)
@@ -250,7 +251,7 @@ def build_production_trial(paths: ProductionPaths):
         object(), Config(agent_decided_stop=True),
         lambda context: ArtifactSink(str(context)),
     )
-    return TrialOrchestrator(
+    orchestrator = TrialOrchestrator(
         paths.results_root,
         capabilities,
         candidate,
@@ -258,6 +259,25 @@ def build_production_trial(paths: ProductionPaths):
         knowledge_factory=knowledge_factory,
         profiling_factory=profiling_factory,
     )
+    return _OwnedProductionTrial(orchestrator, database)
+
+
+class _OwnedProductionTrial:
+    """One-shot pilot facade that releases the production database on every exit."""
+
+    def __init__(self, orchestrator, database):
+        self._orchestrator = orchestrator
+        self._database = database
+        self._closed = False
+
+    def run(self, cell, workload):
+        if self._closed:
+            raise RuntimeError("production trial is one-shot")
+        try:
+            return self._orchestrator.run(cell, workload)
+        finally:
+            self._closed = True
+            self._database.close()
 
 
 def run_pilot(paths: ProductionPaths) -> dict[str, object]:

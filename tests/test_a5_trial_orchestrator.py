@@ -193,6 +193,9 @@ def test_enabled_treatments_are_explicitly_routed(tmp_path):
     class Knowledge:
         enabled = True
 
+        def close(self):
+            pass
+
         def query(self, query):
             queries.append(query.query)
             return ()

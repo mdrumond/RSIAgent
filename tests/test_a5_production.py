@@ -186,7 +186,8 @@ def test_run_pilot_does_not_construct_actor_after_remote_preflight_failure(
 
 def test_production_composition_uses_read_only_kdb_and_no_guidance(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
-    orchestrator = build_production_trial(paths)
+    production = build_production_trial(paths)
+    orchestrator = production._orchestrator
     cell = next(
         cell
         for cell in __import__(
@@ -202,9 +203,26 @@ def test_production_composition_uses_read_only_kdb_and_no_guidance(tmp_path):
     with pytest.raises(Exception):
         knowledge.database.connection.execute("DELETE FROM chunks")
     assert profiling._controller._enabled is False
+    assert orchestrator.backend._device == paths.device
     # Final evaluation remains wired even though intermediate guidance is off.
     assert profiling._controller._backend._catlass_source == "/retained/catlass"
     knowledge.close()
+    production._database.close()
+
+
+def test_production_database_closes_when_orchestrator_raises(tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+    production = build_production_trial(paths)
+    production._orchestrator.run = lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("actor failed")
+    )
+
+    with pytest.raises(RuntimeError, match="actor failed"):
+        production.run(object(), object())
+    with pytest.raises(Exception):
+        production._database.connection.execute("SELECT 1")
+    with pytest.raises(RuntimeError, match="one-shot"):
+        production.run(object(), object())
 
 
 def test_run_pilot_routes_only_fixed_cell_and_workload(monkeypatch, tmp_path):
