@@ -219,7 +219,7 @@ _TRIAL_CONTRACTS = {
     ("catlass-dsl", Workload.SMOKE_VECTOR_ADD): {
         "entry_point": "@tla.kernel\ndef vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor) -> None:",
         "arguments": "gm_a and gm_b are inputs; gm_c is the output. All are contiguous one-dimensional float32 tla.Tensor values with equal shapes.",
-        "shape": "Logical length N is in [1, 400]. The host zero-pads inputs to P = ceil(N / 64) * 64 elements (at most 448). Read P from gm_a.origin_shape[0]; handle every element of that padded shape.",
+        "shape": "This production smoke case has logical length N = 32. The host zero-pads inputs to P = 64 elements. Read P from gm_a.origin_shape[0]; handle every element of that padded shape. This trial does not establish correctness for other logical lengths.",
         "output": "Write gm_c[i] = gm_a[i] + gm_b[i] for 0 <= i < P. Do not mutate inputs. Return no value; the host evaluates the first N output elements.",
         "correctness": "The host compares against its original input sums. Every output must be finite, have the expected length, and have maximum absolute error <= 1e-5.",
         "source": "Import only 'import catlass.tla as tla'. Define exactly the single synchronous vector_add kernel above; use no helper functions, additional decorators, or top-level execution. Optional module constants must be numeric literals.",
@@ -305,11 +305,12 @@ class TrialActionExecutor:
         if not self._has_source():
             return self._observation("run", error="write kernel source first")
         self.latest_run = None
+        attempt_id = f"{self._attempt_namespace}-candidate-{self.actions}"
         try:
             candidate = self.backend.run(
                 self.workspace, self.language, self.workload,
-                f"{self._attempt_namespace}-candidate-{self.actions}", self.ledger)
-            self._validate_candidate(candidate)
+                attempt_id, self.ledger)
+            self._validate_candidate(candidate, attempt_id)
         except ValueError as exc:
             return self._observation("run", status="source-validation-error",
                                      error=str(exc))
@@ -347,11 +348,12 @@ class TrialActionExecutor:
             return self._observation("submit", error="write kernel source first")
         self.final_run = None
         self.final_profile = None
+        attempt_id = f"{self._attempt_namespace}-final"
         try:
             candidate = self.backend.run(
                 self.workspace, self.language, self.workload,
-                f"{self._attempt_namespace}-final", self.ledger)
-            self._validate_candidate(candidate)
+                attempt_id, self.ledger)
+            self._validate_candidate(candidate, attempt_id)
         except ValueError as exc:
             return self._observation("submit", status="source-validation-error",
                                      error=str(exc))
@@ -370,9 +372,11 @@ class TrialActionExecutor:
     def _has_source(self) -> bool:
         return (self.workspace / _SOURCE_PATHS[self.language]).is_file()
 
-    def _validate_candidate(self, candidate: CandidateRun) -> None:
+    def _validate_candidate(self, candidate: CandidateRun, attempt_id: str) -> None:
         if not isinstance(candidate, CandidateRun):
             raise TypeError("kernel backend must return a CandidateRun")
+        if candidate.plan.attempt_id != attempt_id:
+            raise ValueError("candidate attempt_id does not match requested attempt")
         if candidate.plan.language != self.language:
             raise ValueError("candidate language does not match scheduled language")
         if candidate.workload is not self.workload:

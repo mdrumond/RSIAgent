@@ -585,12 +585,46 @@ def test_candidate_requires_an_exact_source_digest():
         replace(_candidate(True, "candidate"), candidate_source_sha256="unknown")
 
 
+@pytest.mark.parametrize("action", ["run", "submit"])
+def test_cached_same_source_candidate_cannot_satisfy_a_new_attempt(tmp_path, action):
+    class CachedBackend(FakeBackend):
+        cached = None
+
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            if self.cached is None:
+                self.cached = super().run(workspace, language, workload, attempt_id, ledger)
+            else:
+                assert self.cached.plan.attempt_id != attempt_id
+            return self.cached
+
+    executor = _executor(tmp_path, CachedBackend(passed=True))
+    executor(parse_trial_action('{"write":{"slot":"kernel","content":"agent source"}}'))
+    executor(parse_trial_action('{"run":{}}'))
+    assert executor.latest_run.verified.passed
+
+    outcome = executor(parse_trial_action(json.dumps({action: {}})))
+
+    assert not outcome.terminal
+    assert json.loads(outcome.observation)["host"] == {
+        "event": action, "status": "source-validation-error",
+        "error": "candidate attempt_id does not match requested attempt",
+    }
+    if action == "run":
+        assert executor.latest_run is None
+    assert executor.final_run is None
+    assert executor.final_profile is None
+    assert executor.profiling.intermediate_runs == executor.profiling.final_runs == []
+
+
 def test_no_kdb_catlass_opening_specifies_executable_contract():
     instruction = _trial_instruction("catlass-dsl", Workload.SMOKE_VECTOR_ADD)
     contract = json.loads(instruction.split("Executable contract:\n", 1)[1])
     assert "vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor)" in contract["entry_point"]
     assert "float32" in contract["arguments"] and "one-dimensional" in contract["arguments"]
-    assert "[1, 400]" in contract["shape"] and "gm_a.origin_shape[0]" in contract["shape"]
+    assert "N = 32" in contract["shape"] and "P = 64" in contract["shape"]
+    assert "gm_a.origin_shape[0]" in contract["shape"]
+    assert "does not establish correctness for other logical lengths" in contract["shape"]
+    assert "[1, 400]" not in instruction and "448" not in instruction
     assert "gm_a[i] + gm_b[i]" in contract["output"]
     assert "1e-5" in contract["correctness"]
     assert "import catlass.tla as tla" in contract["source"]
