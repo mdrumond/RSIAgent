@@ -969,6 +969,52 @@ def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
     assert len(first_calls) == 1
 
 
+def test_catlass_executor_probes_exact_device_through_checked_profile():
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "A5_PREFLIGHT_DEVICE=3\n", "")
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper="execution-profiles/bz-a5/upload.sh",
+        validation_wrapper="execution-profiles/catlass-validation.sh",
+        catlass_source="/retained/catlass",
+        catlass_revision="9" * 40,
+        process_runner=run,
+    )
+
+    executor.probe_device(3)
+
+    assert calls == [
+        (
+            "execution-profiles/catlass-validation.sh",
+            "--profile", "bz-a5",
+            "--operation", "codex-a5-preflight-device-3",
+            "run", "--catlass-src", "/retained/catlass",
+            "--timeout", "600", "--",
+            "env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=3",
+            "python", "-c", calls[0][-1],
+        )
+    ]
+
+
+def test_catlass_executor_rejects_unavailable_device():
+    def run(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "device unavailable")
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper="execution-profiles/bz-a5/upload.sh",
+        validation_wrapper="execution-profiles/catlass-validation.sh",
+        catlass_source="/retained/catlass",
+        catlass_revision="9" * 40,
+        process_runner=run,
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="device probe failed"):
+        executor.probe_device(9)
+
+
 def test_bz_adapter_accepts_legacy_executor_without_runtime_provenance():
     class LegacyExecutor:
         def run(self, invocation):

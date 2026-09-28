@@ -194,6 +194,40 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
         )
         return self._runtime_provenance
 
+    def probe_device(self, device: int) -> None:
+        """Prove the exact configured NPU is selectable through the BZ profile."""
+
+        if isinstance(device, bool) or not isinstance(device, int) or device < 0:
+            raise ValueError("device must be a non-negative integer")
+        marker = f"A5_PREFLIGHT_DEVICE={device}"
+        completed = self._call(
+            (
+                self._validation_wrapper,
+                "--profile",
+                "bz-a5",
+                "--operation",
+                f"codex-a5-preflight-device-{device}",
+                "run",
+                "--catlass-src",
+                self._catlass_source,
+                "--timeout",
+                "600",
+                "--",
+                "env",
+                f"BZ_A5_PROFILE_PHYSICAL_DEVICE={device}",
+                "python",
+                "-c",
+                (
+                    "import os, torch, torch_npu; "
+                    "device=int(os.environ['BZ_A5_PROFILE_PHYSICAL_DEVICE']); "
+                    "torch.npu.set_device(device); "
+                    f"print('{marker}')"
+                ),
+            )
+        )
+        if completed.returncode != 0 or marker not in completed.stdout.splitlines():
+            raise RuntimeUnavailableError("configured A5 device probe failed")
+
     def _dispatch(self, invocation: CommandInvocation):
         operation = _session_name(invocation.argv)
         timeout = _option_value(invocation.argv, "--observe-timeout")

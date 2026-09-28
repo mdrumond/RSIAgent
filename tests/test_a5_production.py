@@ -124,6 +124,26 @@ def test_dotenv_credential_syntax_matches_runtime_parser(tmp_path):
     assert accepted["checks"]["openrouter_credential"] is True
 
 
+def test_truthy_whitespace_environment_key_does_not_fall_back_to_dotenv(tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+    env_file = tmp_path / ".env"
+    env_file.write_text("OPENROUTER_API_KEY=runtime-visible\n", encoding="utf-8")
+
+    report = preflight(
+        paths,
+        environment={
+            "OPENROUTER_API_KEY": "   ",
+            "RSIAGENT_ENV_FILE": str(env_file),
+        },
+        embedding_probe=lambda _backend: None,
+        runtime_probe=lambda _paths: None,
+        query_probe=_query_schema,
+    )
+
+    assert report["checks"]["openrouter_credential"] is False
+    assert report["ready"] is False
+
+
 def test_preflight_checks_complete_local_inputs_without_model_or_bz_call(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
     report = preflight(
@@ -264,6 +284,31 @@ def test_preflight_validates_corrupted_chunk_beyond_first_query_hit(
     assert report["ready"] is False
 
 
+def test_preflight_rejects_missing_selected_collection_fts_row(monkeypatch, tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+    with sqlite3.connect(paths.kdb) as connection:
+        table = connection.execute(
+            "SELECT fts_table FROM collections WHERE name = ?", (paths.collection,)
+        ).fetchone()[0]
+        rowid = connection.execute(
+            "SELECT rowid FROM chunks WHERE collection = ? LIMIT 1", (paths.collection,)
+        ).fetchone()[0]
+        connection.execute(f"DELETE FROM {table} WHERE rowid = ?", (rowid,))
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.embeddings.PinnedBGEEmbeddings", TinyEmbeddings
+    )
+
+    report = preflight(
+        paths,
+        environment={"OPENROUTER_API_KEY": "configured"},
+        runtime_probe=lambda _paths: None,
+    )
+
+    assert report["checks"]["kdb_manifest"] is True
+    assert report["checks"]["kdb_query"] is False
+    assert report["ready"] is False
+
+
 def test_hugging_face_home_routes_its_hub_cache_to_embeddings(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
     (paths.bge_cache / "hub").mkdir()
@@ -321,6 +366,9 @@ def test_runtime_probe_binds_exact_source_and_revision(monkeypatch, tmp_path):
 
         runtime_provenance = (("catlass_revision", "a" * 40),)
 
+        def probe_device(self, device):
+            captured["device"] = device
+
     monkeypatch.setattr(
         "benchmarks.a5kernels.bz.CatlassValidationExecutor", FakeExecutor
     )
@@ -330,6 +378,34 @@ def test_runtime_probe_binds_exact_source_and_revision(monkeypatch, tmp_path):
     assert captured["catlass_revision"] == "a" * 40
     assert captured["validation_wrapper"].endswith("catlass-validation.sh")
     assert captured["upload_wrapper"].endswith("upload.sh")
+    assert captured["device"] == paths.device
+
+
+def test_runtime_probe_rejects_unavailable_configured_device(monkeypatch, tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+
+    class FakeExecutor:
+        runtime_provenance = (("catlass_revision", "a" * 40),)
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def probe_device(self, device):
+            raise RuntimeError(f"device {device} unavailable")
+
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.bz.CatlassValidationExecutor", FakeExecutor
+    )
+
+    report = preflight(
+        paths,
+        environment={"OPENROUTER_API_KEY": "configured"},
+        embedding_probe=lambda _backend: None,
+        query_probe=_query_schema,
+    )
+
+    assert report["checks"]["catlass_runtime"] is False
+    assert report["ready"] is False
 
 
 def test_missing_provenance_wrapper_prevents_remote_probe(tmp_path):

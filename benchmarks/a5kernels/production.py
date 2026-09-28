@@ -71,8 +71,12 @@ class ProductionPaths:
 
 
 def _credential_present(environment: Mapping[str, str], env_file: Path) -> bool:
-    if environment.get("OPENROUTER_API_KEY", "").strip():
-        return True
+    environment_value = environment.get("OPENROUTER_API_KEY", "")
+    if environment_value:
+        # Match llm.client._api_key's precedence: a present, truthy environment
+        # value wins even when it is unusable whitespace.  Do not claim that a
+        # dotenv key will rescue a runtime which will never consult that file.
+        return bool(environment_value.strip())
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
             if line.startswith("OPENROUTER_API_KEY=") and line.split("=", 1)[1].strip():
@@ -221,6 +225,24 @@ def _probe_knowledge_query(database, collection: str) -> None:
     if validated != total:
         raise RuntimeError("selected collection changed during read-only preflight")
 
+    fts_table = database._fts_table_name(collection)
+    # An external-content FTS table returns rows from ``chunks`` for an ordinary
+    # SELECT even when its search index is incomplete.  Its read-only docsize
+    # shadow table instead contains exactly one row for each indexed document.
+    indexed_rows = f"{fts_table}_docsize"
+    missing = database.connection.execute(
+        f"""SELECT rowid FROM chunks WHERE collection = ?
+            EXCEPT SELECT id FROM {indexed_rows} LIMIT 1""",
+        (collection,),
+    ).fetchone()
+    extra = database.connection.execute(
+        f"""SELECT id FROM {indexed_rows}
+            EXCEPT SELECT rowid FROM chunks WHERE collection = ? LIMIT 1""",
+        (collection,),
+    ).fetchone()
+    if missing is not None or extra is not None:
+        raise RuntimeError("selected collection FTS index is incomplete")
+
 
 def _probe_catlass_runtime(paths: ProductionPaths) -> None:
     """Use the checked profile's provenance probe for the exact retained runtime."""
@@ -233,10 +255,11 @@ def _probe_catlass_runtime(paths: ProductionPaths) -> None:
         catlass_source=paths.catlass_source,
         catlass_revision=paths.catlass_revision,
     )
-    # This checked wrapper probe validates the configured BZ route and binds the
-    # retained source to its exact revision without submitting a workload.
+    # The provenance probe binds the retained source to its exact revision; the
+    # checked validation wrapper then selects the configured device remotely.
     if not executor.runtime_provenance:
         raise RuntimeError("Catlass runtime provenance is unavailable")
+    executor.probe_device(paths.device)
 
 
 def build_production_trial(paths: ProductionPaths):
