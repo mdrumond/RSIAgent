@@ -20,6 +20,7 @@ from benchmarks.a5kernels.matrix import (
     ProfilingMode,
     RuntimeCapabilities,
     Workload,
+    validate_path_component,
 )
 from benchmarks.a5kernels.model_profile import A5ModelProfile, load_a5_model_profile
 from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult
@@ -426,13 +427,15 @@ class TrialOrchestrator:
         profile = load_a5_model_profile()
         if cell.model.model_id != profile.model:
             raise ValueError("experiment cell does not use the fixed A5 model profile")
-        trial_root = self.root / cell.workspace_id / workload.value
+        workspace_id = validate_path_component(cell.workspace_id, "workspace_id")
+        trial_root = self.root / workspace_id / workload.value
         if run_identity is not None:
-            if (not isinstance(run_identity, str)
-                    or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}",
-                                    run_identity) is None):
-                raise ValueError("run_identity must be a safe host-owned identifier")
-            trial_root /= run_identity
+            try:
+                trial_root /= validate_path_component(run_identity, "run_identity")
+            except ValueError as exc:
+                raise ValueError(
+                    "run_identity must be a safe host-owned identifier"
+                ) from exc
         trial_root.mkdir(parents=True, exist_ok=False)
         workspace, memory, context = (trial_root / name for name in
                                       ("workspace", "memory", "context"))
