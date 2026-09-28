@@ -182,8 +182,17 @@ class CapabilityUnavailableError(RuntimeError):
 class RuntimeCapabilities:
     languages: frozenset[Language]
     model_ids: frozenset[str]
+    workloads: frozenset[Workload]
     kdb: bool = False
     profiling_guidance: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.workloads, frozenset)
+            or not self.workloads
+            or any(not isinstance(workload, Workload) for workload in self.workloads)
+        ):
+            raise ValueError("workloads must be a non-empty frozenset of Workload")
 
 
 @dataclass(frozen=True)
@@ -199,11 +208,15 @@ class ExperimentOrchestrator:
         self._capabilities = capabilities
 
     def schedule(self, cell: ExperimentCell, workload: Workload) -> ScheduledRun:
+        if not isinstance(workload, Workload):
+            raise ValueError("workload must be a Workload")
         missing: list[str] = []
         if cell.language not in self._capabilities.languages:
             missing.append(f"runtime:{cell.language.value}")
         if cell.model.model_id not in self._capabilities.model_ids:
             missing.append(f"model:{cell.model.model_id}")
+        if workload not in self._capabilities.workloads:
+            missing.append(f"workload:{workload.value}")
         if cell.knowledge is KnowledgeMode.WITH_KDB and not self._capabilities.kdb:
             missing.append("kdb")
         if (

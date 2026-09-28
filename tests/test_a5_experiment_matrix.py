@@ -143,7 +143,11 @@ def test_orchestrator_fails_closed_for_every_unavailable_capability() -> None:
         and cell.profiling is ProfilingMode.WITH_GUIDANCE
     )
     orchestrator = ExperimentOrchestrator(
-        RuntimeCapabilities(languages=frozenset(), model_ids=frozenset())
+        RuntimeCapabilities(
+            languages=frozenset(),
+            model_ids=frozenset(),
+            workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
+        )
     )
 
     with pytest.raises(CapabilityUnavailableError) as error:
@@ -152,8 +156,42 @@ def test_orchestrator_fails_closed_for_every_unavailable_capability() -> None:
     message = str(error.value)
     assert f"runtime:{cell.language.value}" in message
     assert "model:openai/gpt-5.6-sol" in message
+    assert "workload:semantic-gemm" in message
     assert "kdb" in message
     assert "profiling-guidance" in message
+
+
+@pytest.mark.parametrize(
+    "workloads",
+    [
+        frozenset(),
+        {Workload.SMOKE_VECTOR_ADD},
+        frozenset({"smoke-vector-add"}),
+    ],
+)
+def test_runtime_capabilities_require_typed_nonempty_workloads(workloads) -> None:
+    with pytest.raises(
+        ValueError, match="workloads must be a non-empty frozenset of Workload"
+    ):
+        RuntimeCapabilities(
+            languages=frozenset(Language),
+            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            workloads=workloads,
+        )
+
+
+def test_orchestrator_rejects_non_workload_schedule_input() -> None:
+    cell = initial_matrix().cells[0]
+    orchestrator = ExperimentOrchestrator(
+        RuntimeCapabilities(
+            languages=frozenset(Language),
+            model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
+        )
+    )
+
+    with pytest.raises(ValueError, match="workload must be a Workload"):
+        orchestrator.schedule(cell, "smoke-vector-add")
 
 
 def test_orchestrator_schedules_without_claiming_a_result() -> None:
@@ -162,6 +200,7 @@ def test_orchestrator_schedules_without_claiming_a_result() -> None:
         RuntimeCapabilities(
             languages=frozenset(Language),
             model_ids=frozenset({"openai/gpt-5.6-sol"}),
+            workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
             kdb=True,
             profiling_guidance=True,
         )
