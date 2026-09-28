@@ -162,6 +162,8 @@ def index_corpus(
     model_cache: Path | None = None,
 ) -> None:
     snapshots = _verified_snapshots(spec, artifacts)
+    if database_path.resolve() == manifest_path.resolve():
+        raise ValueError("database and manifest paths must be different")
     database_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     embeddings = PinnedBGEEmbeddings(cache_dir=model_cache, local_files_only=True)

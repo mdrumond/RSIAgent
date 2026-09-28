@@ -259,3 +259,18 @@ def test_index_uses_verified_snapshot_when_prepared_source_changes(tmp_path, mon
         hit = database.query(spec.collection, "DataCopy", limit=1)[0]
         assert hit.text == original.decode()
         assert database.manifest(spec.collection).sources[0].sha256 == hashlib.sha256(original).hexdigest()
+
+
+def test_index_rejects_database_manifest_path_collision(tmp_path, monkeypatch):
+    files = {"README.md": b"verified\n"}
+    repository, revision = _repository(tmp_path, files)
+    spec = _spec(repository, revision, files)
+    artifacts = tmp_path / "artifacts"
+    prepare_corpus(spec, artifacts)
+    monkeypatch.setattr(corpus, "PinnedBGEEmbeddings", lambda **_kwargs: FakeEmbeddings())
+    shared = tmp_path / "kdb" / "shared-output"
+
+    with pytest.raises(ValueError, match="database and manifest paths must be different"):
+        index_corpus(spec, artifacts, shared, shared.parent / "." / shared.name)
+
+    assert not shared.exists()
