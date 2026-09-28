@@ -73,7 +73,7 @@ class CorpusSpec:
         return artifacts.resolve() / self.name / self.revision / "sources"
 
 
-def _run(argv: Sequence[str], *, cwd: Path) -> str:
+def _run_bytes(argv: Sequence[str], *, cwd: Path) -> bytes:
     try:
         result = subprocess.run(
             list(argv), cwd=cwd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -84,7 +84,11 @@ def _run(argv: Sequence[str], *, cwd: Path) -> str:
         raise RuntimeError(
             f"{command} failed: {stderr or f'exit {exc.returncode}'}"
         ) from exc
-    return result.stdout.decode("utf-8").strip()
+    return result.stdout
+
+
+def _run(argv: Sequence[str], *, cwd: Path) -> str:
+    return _run_bytes(argv, cwd=cwd).decode("utf-8").strip()
 
 
 def prepare_corpus(spec: CorpusSpec, artifacts: Path) -> Path:
@@ -107,13 +111,7 @@ def prepare_corpus(spec: CorpusSpec, artifacts: Path) -> Path:
         if resolved != spec.revision:
             raise ValueError(f"fetched revision mismatch: expected {spec.revision}, got {resolved}")
         for item in spec.files:
-            data = subprocess.run(
-                ["git", "show", f"{spec.revision}:{item.path}"],
-                cwd=repository,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            ).stdout
+            data = _run_bytes(["git", "show", f"{spec.revision}:{item.path}"], cwd=repository)
             actual = hashlib.sha256(data).hexdigest()
             if actual != item.sha256:
                 raise ValueError(f"hash mismatch for {item.path}: expected {item.sha256}, got {actual}")
@@ -162,8 +160,13 @@ def index_corpus(
     model_cache: Path | None = None,
 ) -> None:
     snapshots = _verified_snapshots(spec, artifacts)
-    if database_path.resolve() == manifest_path.resolve():
+    database = database_path.resolve()
+    manifest = manifest_path.resolve()
+    source_root = spec.source_root(artifacts)
+    if database == manifest:
         raise ValueError("database and manifest paths must be different")
+    if database.is_relative_to(source_root) or manifest.is_relative_to(source_root):
+        raise ValueError("database and manifest paths must be outside prepared sources")
     database_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     embeddings = PinnedBGEEmbeddings(cache_dir=model_cache, local_files_only=True)

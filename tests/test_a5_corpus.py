@@ -193,6 +193,14 @@ def test_prepare_surfaces_git_fetch_diagnostics(tmp_path):
         prepare_corpus(spec, tmp_path / "artifacts")
 
 
+def test_prepare_surfaces_git_show_diagnostics(tmp_path):
+    repository, revision = _repository(tmp_path, {"README.md": b"available\n"})
+    spec = _spec(repository, revision, {"missing.md": b"hypothetical\n"})
+
+    with pytest.raises(RuntimeError, match=r"git show failed: .*missing\.md"):
+        prepare_corpus(spec, tmp_path / "artifacts")
+
+
 def test_verify_rejects_tampering_and_unlisted_files(tmp_path):
     files = {"README.md": b"original\n"}
     repository, revision = _repository(tmp_path, files)
@@ -274,3 +282,20 @@ def test_index_rejects_database_manifest_path_collision(tmp_path, monkeypatch):
         index_corpus(spec, artifacts, shared, shared.parent / "." / shared.name)
 
     assert not shared.exists()
+
+
+@pytest.mark.parametrize("output", ["database", "manifest"])
+def test_index_rejects_outputs_inside_prepared_sources(tmp_path, monkeypatch, output):
+    files = {"README.md": b"verified\n"}
+    repository, revision = _repository(tmp_path, files)
+    spec = _spec(repository, revision, files)
+    artifacts = tmp_path / "artifacts"
+    root = prepare_corpus(spec, artifacts)
+    monkeypatch.setattr(corpus, "PinnedBGEEmbeddings", lambda **_kwargs: FakeEmbeddings())
+    database = root / "output.sqlite3" if output == "database" else tmp_path / "kdb.sqlite3"
+    manifest = root / "manifest.json" if output == "manifest" else tmp_path / "manifest.json"
+
+    with pytest.raises(ValueError, match="must be outside prepared sources"):
+        index_corpus(spec, artifacts, database, manifest)
+
+    assert set(path.relative_to(root).as_posix() for path in root.rglob("*") if path.is_file()) == set(files)
