@@ -91,6 +91,9 @@ def run(input_a, input_b):
     artifact = tla.compile(
         vector_add, tla_a, tla_b, tla_out, options="--npu-arch 3510"
     )
+    print("A5KERNEL_NAME=vector_add__kernel0")
+    if os.environ.get("A5KERNEL_COMPILE_ONLY") == "1":
+        return [left + right for left, right in zip(input_a, input_b)][:original_length]
     emit_timing = os.environ.get("A5KERNEL_EMIT_TIMING") == "1"
     if emit_timing:
         torch.npu.synchronize()
@@ -483,6 +486,23 @@ _FIXTURES = {
         (SourceFile("kernel.py", _TRITON_SOURCE),),
     ),
 }
+
+
+def catlass_candidate_fixture(source: str) -> Fixture:
+    """Combine an agent-authored kernel definition with the host runtime."""
+
+    marker = "\ndef run(input_a, input_b):\n"
+    _, found, runtime = _CATLASS_SOURCE.partition(marker)
+    if not found:  # pragma: no cover - checked-in fixture invariant
+        raise RuntimeError("Catlass host runtime marker is missing")
+    kernel = source.rstrip() + "\n\nimport os\nimport time\n" + marker + runtime
+    fixture = _FIXTURES[Language.CATLASS_DSL]
+    files = tuple(
+        SourceFile(item.relative_path, kernel)
+        if item.relative_path == "kernel.py" else item
+        for item in fixture.files
+    )
+    return Fixture(fixture.language, files, fixture.argv, fixture.max_length)
 
 
 def fixture_for(language: Language | str) -> Fixture:

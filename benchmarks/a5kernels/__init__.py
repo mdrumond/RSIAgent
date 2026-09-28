@@ -25,6 +25,12 @@ from benchmarks.a5kernels.knowledge_agent import (
     parse_knowledge_action,
 )
 from benchmarks.a5kernels.protocol import RunRequest, VerifiedResult
+from benchmarks.a5kernels.candidate import (
+    CandidateProfileEvaluation,
+    CatlassCandidateBackend,
+    CompileDiagnostics,
+    validate_candidate_source,
+)
 from benchmarks.a5kernels.profiling import ProfileRequest, ProfilingTreatmentController
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
@@ -57,6 +63,9 @@ __all__ = [
     "BZProfileBackend",
     "CatlassValidationExecutor",
     "CandidateRun",
+    "CandidateProfileEvaluation",
+    "CatlassCandidateBackend",
+    "CompileDiagnostics",
     "Citation",
     "CollectionManifest",
     "DEFAULT_EMBEDDING_MODEL",
@@ -88,6 +97,7 @@ __all__ = [
     "fixture_for",
     "parse_knowledge_action",
     "parse_trial_action",
+    "validate_candidate_source",
     "complete_a5",
     "load_a5_model_profile",
 ]

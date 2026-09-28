@@ -68,6 +68,15 @@ class A5KernelRunner:
         self, request: RunRequest, *, attempt_id: str | None = None
     ) -> VerifiedResult:
         plan = self.prepare(request, attempt_id=attempt_id)
+        return self.run_plan(request, plan)
+
+    def run_plan(self, request: RunRequest, plan: ExecutionPlan) -> VerifiedResult:
+        """Execute a host-prepared variant of the registered request fixture."""
+
+        if plan.request_id != request.request_id or plan.language != request.language:
+            raise ValueError("execution plan does not match its run request")
+        if len(plan.input_a) != request.length or len(plan.input_b) != request.length:
+            raise ValueError("execution plan inputs do not match its run request")
         self._record_plan(request, plan)
         try:
             receipt = self._backend.execute(plan)
