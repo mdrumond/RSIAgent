@@ -80,8 +80,10 @@ class ScriptedActor:
         self.replies = replies
         self.observations = []
         self.profile = None
+        self.instruction = None
 
     def __call__(self, instruction, **kwargs):
+        self.instruction = instruction
         self.profile = kwargs["profile"]
         assert kwargs["workspace"].parent.joinpath("memory").is_dir()
         assert kwargs["context"].is_dir()
@@ -147,6 +149,8 @@ def test_end_to_end_result_is_host_owned_and_treatments_off_do_not_leak(tmp_path
     assert result.outcome.status == "done"
     assert actor.profile.model == "openai/gpt-5.6-sol"
     assert actor.profile.allow_fallbacks is False
+    assert "catlass-dsl" in actor.instruction
+    assert "smoke-vector-add" in actor.instruction
     assert backend.runs[-1][2] == "final"
     knowledge_observation = actor.observations[3]
     assert knowledge_observation == {"knowledge_query": {"available": False, "results": []}}
@@ -205,3 +209,47 @@ def test_actor_must_submit_and_each_cell_workspace_is_fresh(tmp_path):
         orchestrator.run(_cell(), Workload.SMOKE_VECTOR_ADD)
     with pytest.raises(FileExistsError):
         orchestrator.run(_cell(), Workload.SMOKE_VECTOR_ADD)
+
+
+def test_distinct_workloads_receive_distinct_trial_directories(tmp_path):
+    def orchestrator(actor):
+        return TrialOrchestrator(
+            tmp_path, _caps(), FakeBackend(True), actor,
+            knowledge_factory=lambda memory, _cell: KnowledgeAgent(
+                enabled=False, journal=ProgressiveMemoryJournal(memory / "k.jsonl")),
+            profiling_factory=lambda _cell: FakeProfile(),
+        )
+
+    smoke = orchestrator(ScriptedActor([
+        '{"write":{"slot":"kernel","content":"agent source"}}',
+        '{"submit":{}}',
+    ])).run(_cell(), Workload.SMOKE_VECTOR_ADD)
+    gemm_actor = ScriptedActor([
+        '{"write":{"slot":"kernel","content":"agent source"}}',
+        '{"submit":{}}',
+    ])
+    gemm = orchestrator(gemm_actor).run(_cell(), Workload.SEMANTIC_GEMM)
+
+    assert smoke.workspace.parent != gemm.workspace.parent
+    assert "semantic-gemm" in gemm_actor.instruction
+
+
+@pytest.mark.parametrize("action", ["compile", "run", "submit"])
+def test_actions_before_write_return_recoverable_observations(tmp_path, action):
+    actor = ScriptedActor([
+        json.dumps({action: {}}),
+        '{"write":{"slot":"kernel","content":"agent source"}}',
+        '{"submit":{}}',
+    ])
+    result = TrialOrchestrator(
+        tmp_path, _caps(), FakeBackend(True), actor,
+        knowledge_factory=lambda memory, _cell: KnowledgeAgent(
+            enabled=False, journal=ProgressiveMemoryJournal(memory / "k.jsonl")),
+        profiling_factory=lambda _cell: FakeProfile(),
+    ).run(_cell(), Workload.SMOKE_VECTOR_ADD)
+
+    assert actor.observations[0]["host"] == {
+        "event": action,
+        "error": "write kernel source first",
+    }
+    assert result.verified.passed

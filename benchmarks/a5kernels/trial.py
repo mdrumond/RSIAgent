@@ -172,7 +172,11 @@ class CoreAttemptDriver:
             system_prompt=_SYSTEM_PROMPT, instruction_is_complete_opening=True,
             surface_baseline="",
         )
-        return ActorOutcome(result.status, result.iters)
+        return ActorOutcome(
+            result.status,
+            result.iters,
+            wall_time_s=result.wall_secs,
+        )
 
 
 _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON object:
@@ -180,6 +184,14 @@ _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON obj
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
 {"request-profile":{}}, or {"submit":{}}.
 You cannot choose paths or commands and cannot report a score or authoritative result."""
+
+
+def _trial_instruction(language: str, workload: Workload) -> str:
+    return (
+        f"Develop a {language} kernel for the {workload.value} workload. "
+        f"Write the complete source to the kernel slot ({_SOURCE_PATHS[language]}). "
+        "Use compile and run observations to revise it, then submit the final source."
+    )
 
 
 class TrialActionExecutor:
@@ -228,12 +240,14 @@ class TrialActionExecutor:
             content.encode()).hexdigest())
 
     def _compile(self, _payload) -> ActionOutcome:
-        self._require_source()
+        if not self._has_source():
+            return self._observation("compile", error="write kernel source first")
         return self._observation("compile", result=dict(
             self.backend.compile(self.workspace, self.language)))
 
     def _run(self, _payload) -> ActionOutcome:
-        self._require_source()
+        if not self._has_source():
+            return self._observation("run", error="write kernel source first")
         self.latest_run = self.backend.run(
             self.workspace, self.language, self.workload,
             f"candidate-{self.actions}", self.ledger)
@@ -261,7 +275,8 @@ class TrialActionExecutor:
                                  result=dict(self.profiling.intermediate(self.latest_run)))
 
     def _submit(self, _payload) -> ActionOutcome:
-        self._require_source()
+        if not self._has_source():
+            return self._observation("submit", error="write kernel source first")
         self.final_run = self.backend.run(
             self.workspace, self.language, self.workload, "final", self.ledger)
         if self.final_run.verified.passed:
@@ -275,9 +290,8 @@ class TrialActionExecutor:
                                  passed=self.final_run.verified.passed,
                                  attestation_sha256=self.final_run.verified.attestation_sha256)
 
-    def _require_source(self) -> None:
-        if not (self.workspace / _SOURCE_PATHS[self.language]).is_file():
-            raise ValueError("kernel source has not been written")
+    def _has_source(self) -> bool:
+        return (self.workspace / _SOURCE_PATHS[self.language]).is_file()
 
     @staticmethod
     def _observation(event: str, terminal: bool = False, **fields) -> ActionOutcome:
@@ -315,7 +329,7 @@ class TrialOrchestrator:
         profile = load_a5_model_profile()
         if cell.model.model_id != profile.model:
             raise ValueError("experiment cell does not use the fixed A5 model profile")
-        trial_root = self.root / cell.workspace_id
+        trial_root = self.root / cell.workspace_id / workload.value
         trial_root.mkdir(parents=True, exist_ok=False)
         workspace, memory, context = (trial_root / name for name in
                                       ("workspace", "memory", "context"))
@@ -336,7 +350,8 @@ class TrialOrchestrator:
             profiling=profiling,
             profiling_guidance=cell.profiling is ProfilingMode.WITH_GUIDANCE)
         outcome = self.actor(
-            _SYSTEM_PROMPT, profile=profile, workspace=workspace, context=context,
+            _trial_instruction(cell.language.value, workload),
+            profile=profile, workspace=workspace, context=context,
             turn_parser=parse_trial_action, action_executor=executor)
         if executor.final_run is None or executor.final_profile is None:
             raise RuntimeError("Actor ended without a host-verified submit action")
