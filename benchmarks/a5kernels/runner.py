@@ -50,9 +50,7 @@ class A5KernelRunner:
             raise ValueError(
                 f"{fixture.language.value} hello length cannot exceed {fixture.max_length}"
             )
-        rng = random.Random(request.seed)
-        input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
-        input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+        input_a, input_b = self._request_inputs(request)
         return ExecutionPlan(
             request_id=request.request_id,
             attempt_id=attempt_id,
@@ -75,7 +73,8 @@ class A5KernelRunner:
 
         if plan.request_id != request.request_id or plan.language != request.language:
             raise ValueError("execution plan does not match its run request")
-        if len(plan.input_a) != request.length or len(plan.input_b) != request.length:
+        expected_a, expected_b = self._request_inputs(request)
+        if plan.input_a != expected_a or plan.input_b != expected_b:
             raise ValueError("execution plan inputs do not match its run request")
         self._record_plan(request, plan)
         try:
@@ -145,6 +144,13 @@ class A5KernelRunner:
             }
             self._ledger.append(EvidenceKind.RESULT, result_payload)
         return result
+
+    @staticmethod
+    def _request_inputs(request: RunRequest) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        rng = random.Random(request.seed)
+        input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+        input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+        return input_a, input_b
 
     def _record_plan(self, request: RunRequest, plan: ExecutionPlan) -> None:
         if self._ledger is None:

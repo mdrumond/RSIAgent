@@ -207,6 +207,22 @@ def test_agent_claim_cannot_turn_correct_output_into_failure():
     assert result.passed is True
 
 
+def test_run_plan_rejects_same_length_inputs_not_derived_from_request_seed():
+    backend = FakeBackend()
+    runner = A5KernelRunner(backend)
+    request = RunRequest(Language.CATLASS_DSL.value, length=2, seed=42)
+    plan = runner.prepare(request, attempt_id="candidate-1")
+    substituted = replace(
+        plan,
+        input_a=tuple(reversed(plan.input_a)),
+        input_b=tuple(reversed(plan.input_b)),
+    )
+
+    with pytest.raises(ValueError, match="inputs do not match"):
+        runner.run_plan(request, substituted)
+    assert backend.plans == []
+
+
 def test_nonzero_exit_fails_even_with_correct_output():
     result = A5KernelRunner(FakeBackend(exit_code=9, claimed_score="1")).run(
         RunRequest(Language.TRITON_ASCEND.value)
