@@ -297,15 +297,22 @@ def run_pilot(paths: ProductionPaths) -> dict[str, object]:
 
     cell = next(cell for cell in initial_matrix().cells if cell.cell_id == PILOT_CELL_ID)
     result = build_production_trial(paths).run(cell, Workload.SMOKE_VECTOR_ADD)
+    final_profile = dict(result.final_profile)
+    kernel_time = final_profile.get("duration_us") if result.verified.passed else None
     return {
         "cell_id": cell.cell_id,
         "workload": PILOT_WORKLOAD,
+        # These fields are directly consumable by ``run_a5kernels.py report``.
+        "correct": result.verified.passed,
+        "kernel_time_us": kernel_time,
+        "exploration_succeeded": result.outcome.status == "done",
+        "reproducible": None,
         "passed": result.verified.passed,
         "iterations": result.outcome.iterations,
         "tokens": result.outcome.tokens,
         "wall_time_s": result.outcome.wall_time_s,
         "attestation_sha256": result.verified.attestation_sha256,
         "evidence_sha256": result.evidence_sha256,
-        "final_profile": dict(result.final_profile),
+        "final_profile": final_profile,
         "workspace": str(result.workspace),
     }

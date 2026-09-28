@@ -271,7 +271,8 @@ def test_run_pilot_routes_only_fixed_cell_and_workload(monkeypatch, tmp_path):
             calls.append((cell.cell_id, workload.value))
             return SimpleNamespace(
                 verified=SimpleNamespace(passed=True, attestation_sha256="a" * 64),
-                outcome=SimpleNamespace(iterations=4, tokens=None, wall_time_s=1.25),
+                outcome=SimpleNamespace(
+                    status="done", iterations=4, tokens=None, wall_time_s=1.25),
                 evidence_sha256="e" * 64,
                 final_profile={"duration_us": 2.5},
                 workspace=tmp_path / "workspace",
@@ -289,3 +290,10 @@ def test_run_pilot_routes_only_fixed_cell_and_workload(monkeypatch, tmp_path):
     assert calls == [(PILOT_CELL_ID, PILOT_WORKLOAD)]
     assert result["passed"] is True
     assert result["final_profile"] == {"duration_us": 2.5}
+    from benchmarks.a5kernels.matrix import RunMetrics
+
+    metrics = RunMetrics.from_mapping(result)
+    assert metrics.correct is True
+    assert metrics.kernel_time_us == 2.5
+    assert metrics.exploration_succeeded is True
+    assert metrics.tokens is None
