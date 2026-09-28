@@ -56,7 +56,7 @@ class FakeEncoder:
         batch_size = len(self.tokenizer.batches[-1][0])
         states = MagicMock()
         pooled = MagicMock()
-        states.__mul__.return_value.sum.return_value.__truediv__.return_value = pooled
+        states.__getitem__.return_value = pooled
         rows = [[float(index + 1), 2.0] * 192 for index in range(batch_size)]
         pooled.detach.return_value.cpu.return_value.tolist.return_value = rows
         return SimpleNamespace(last_hidden_state=states)
@@ -102,7 +102,7 @@ def test_loader_pins_identity_revision_cache_and_offline_mode(tmp_path):
     assert encoder.evaluating
 
 
-def test_embed_batches_mean_pools_and_returns_unit_vectors():
+def test_embed_batches_and_returns_unit_vectors():
     tokenizer = RecordingTokenizer()
     backend, _ = _fake_backend(tokenizer, FakeEncoder(), batch_size=2)
 
@@ -170,7 +170,7 @@ def test_cli_default_resolves_to_offline_pinned_backend():
     assert backend.local_files_only is True
 
 
-def test_real_tensor_pooling_ignores_padding_and_is_repeatable():
+def test_real_tensor_cls_pooling_ignores_other_tokens_and_is_repeatable():
     torch = pytest.importorskip("torch")
 
     class TensorTokenizer:
@@ -181,13 +181,16 @@ def test_real_tensor_pooling_ignores_padding_and_is_repeatable():
             }
 
     class TensorEncoder(FakeEncoder):
+        other_tokens = 1000
+
         def __call__(self, *, input_ids, attention_mask):
             assert not torch.is_grad_enabled()
             assert input_ids.device.type == "cpu"
             states = torch.zeros((len(input_ids), 3, 384))
             states[:, 0, 0] = 6
-            states[:, 1, 1] = 8
-            states[:, 2, 2] = 1000  # A padded token must not affect the vector.
+            states[:, 0, 1] = 8
+            # Neither an ordinary later token nor a padded token is pooled.
+            states[:, 1:, 2] = self.other_tokens
             return SimpleNamespace(last_hidden_state=states)
 
     encoder = TensorEncoder()
@@ -203,5 +206,7 @@ def test_real_tensor_pooling_ignores_padding_and_is_repeatable():
         assert first == backend.embed(["one", "two", "three"])
         assert torch.are_deterministic_algorithms_enabled()
         assert first == [[0.6, 0.8] + [0.0] * 382] * 3
+        encoder.other_tokens = -2000
+        assert first == backend.embed(["one", "two", "three"])
     finally:
         torch.use_deterministic_algorithms(previous)

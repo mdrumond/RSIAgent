@@ -111,9 +111,8 @@ class PinnedBGEEmbeddings:
                 tokens = {key: value.to("cpu") for key, value in tokens.items()}
                 with torch.inference_mode():
                     output = encoder(**tokens)
-                states = output.last_hidden_state
-                mask = tokens["attention_mask"].unsqueeze(-1).to(states.dtype)
-                pooled = (states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                # The pinned BGE 1_Pooling/config.json specifies CLS pooling.
+                pooled = output.last_hidden_state[:, 0]
                 rows = pooled.detach().cpu().tolist()
             except Exception as exc:
                 raise EmbeddingLoadError("BGE inference returned an invalid output") from exc
