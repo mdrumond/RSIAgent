@@ -169,7 +169,9 @@ def test_failed_run_without_kernel_marker_is_recoverable_action_observation(tmp_
         "event": "run",
         "max_abs_error": None,
         "error_status": "non-finite-max-abs-error",
+        "exit_code": 1,
         "passed": False,
+        "status": "runtime-error",
     }
     assert executor.latest_run is not None
     assert executor.latest_run.kernel_name is None
