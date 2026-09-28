@@ -38,6 +38,8 @@ class CompileDiagnostics:
     execution_id: str
     source_fingerprint: str
     attestation_sha256: str
+    kernel_name: str | None
+    diagnostics: str
 
 
 def validate_candidate_source(source: str) -> None:
@@ -100,13 +102,15 @@ class CatlassCandidateBackend:
         runner = A5KernelRunner(capture)
         plan = self._prepare(runner, request, source, attempt, compile_only=True)
         result = runner.run_plan(request, plan)
-        _discovered_kernel(capture.receipt)
+        kernel_name = _discovered_kernel(capture.receipt) if result.passed else None
         diagnostics = CompileDiagnostics(
             result.passed,
             result.exit_code,
             result.execution_id,
             result.source_fingerprint,
             result.attestation_sha256,
+            kernel_name,
+            _compile_diagnostics(capture.receipt, passed=result.passed),
         )
         return asdict(diagnostics)
 
@@ -167,6 +171,15 @@ def _discovered_kernel(receipt: ExecutionReceipt | None) -> str:
     if names != [EXACT_KERNEL_NAME]:
         raise RuntimeError("candidate execution did not report one exact kernel name")
     return names[0]
+
+
+def _compile_diagnostics(receipt: ExecutionReceipt | None, *, passed: bool) -> str:
+    if receipt is None:
+        raise RuntimeError("candidate execution returned no receipt")
+    if passed:
+        return "Catlass compilation succeeded"
+    detail = receipt.stderr.strip() or receipt.stdout.strip() or "Catlass compilation failed"
+    return detail[-4000:]
 
 
 class CandidateProfileEvaluation:

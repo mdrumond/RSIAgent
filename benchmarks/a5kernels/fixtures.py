@@ -495,7 +495,14 @@ def catlass_candidate_fixture(source: str) -> Fixture:
     _, found, runtime = _CATLASS_SOURCE.partition(marker)
     if not found:  # pragma: no cover - checked-in fixture invariant
         raise RuntimeError("Catlass host runtime marker is missing")
-    kernel = source.rstrip() + "\n\nimport os\nimport time\n" + marker + runtime
+    runtime = runtime.replace("VECTOR_ELE", "_HOST_VECTOR_ELE").replace(
+        "VL_ELE", "_HOST_VL_ELE"
+    )
+    host_prelude = (
+        "\n\nimport os\nimport time\n"
+        "_HOST_VECTOR_ELE = 400\n_HOST_VL_ELE = 64\n"
+    )
+    kernel = source.rstrip() + host_prelude + marker + runtime
     fixture = _FIXTURES[Language.CATLASS_DSL]
     files = tuple(
         SourceFile(item.relative_path, kernel)

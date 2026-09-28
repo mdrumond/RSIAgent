@@ -33,15 +33,20 @@ class FakeExecution:
         ("execution_profile", "bz-a5"),
     )
 
-    def __init__(self, *, marker=EXACT_KERNEL_NAME):
+    def __init__(self, *, marker=EXACT_KERNEL_NAME, exit_code=0):
         self.marker = marker
+        self.exit_code = exit_code
         self.plans = []
 
     def execute(self, plan):
         self.plans.append(plan)
         output = tuple(left + right for left, right in zip(plan.input_a, plan.input_b))
         marker = "" if self.marker is None else f"A5KERNEL_NAME={self.marker}\n"
-        return ExecutionReceipt(0, output, stdout=marker, session_handle="bz-a5:fake")
+        if self.exit_code:
+            output = ()
+        return ExecutionReceipt(self.exit_code, output, stdout=marker,
+                                stderr="ordinary compiler error" if self.exit_code else "",
+                                session_handle="bz-a5:fake")
 
 
 @pytest.mark.parametrize("source, message", [
@@ -68,6 +73,8 @@ def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     assert first == second
     assert first["passed"] is True
     assert first["exit_code"] == 0
+    assert first["kernel_name"] == EXACT_KERNEL_NAME
+    assert first["diagnostics"] == "Catlass compilation succeeded"
     plan = execution.plans[0]
     assert plan == execution.plans[1]
     assert plan.argv[:2] == ("env", "A5KERNEL_COMPILE_ONLY=1")
@@ -76,6 +83,36 @@ def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     assert SOURCE.rstrip() in candidate.content
     assert "tla.compile(" in candidate.content
     assert "--npu-arch 3510" in candidate.content
+
+
+def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
+    source = SOURCE.replace("\nVECTOR_ELE = 400\n", "\n")
+    (tmp_path / "kernel.py").write_text(source)
+    execution = FakeExecution()
+
+    result = CatlassCandidateBackend(execution).compile(tmp_path, "catlass-dsl")
+
+    assert result["passed"]
+    composed = next(item for item in execution.plans[0].files
+                    if item.relative_path == "kernel.py").content
+    assert "_HOST_VECTOR_ELE = 400" in composed
+    assert "_HOST_VL_ELE = 64" in composed
+
+
+def test_compile_failure_returns_bounded_diagnostics_and_allows_retry(tmp_path):
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    execution = FakeExecution(marker=None, exit_code=1)
+    backend = CatlassCandidateBackend(execution)
+
+    failed = backend.compile(tmp_path, "catlass-dsl")
+    execution.exit_code = 0
+    execution.marker = EXACT_KERNEL_NAME
+    retried = backend.compile(tmp_path, "catlass-dsl")
+
+    assert failed["passed"] is False
+    assert failed["kernel_name"] is None
+    assert failed["diagnostics"] == "ordinary compiler error"
+    assert retried["passed"] is True
 
 
 def test_run_returns_exact_plan_bound_candidate(tmp_path):
