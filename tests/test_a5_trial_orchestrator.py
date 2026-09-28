@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.fixtures import Language
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, ProgressiveMemoryJournal
 from benchmarks.a5kernels.matrix import (
@@ -13,10 +14,13 @@ from benchmarks.a5kernels.matrix import (
     Workload,
     initial_matrix,
 )
+from benchmarks.a5kernels.model_profile import load_a5_model_profile
 from benchmarks.a5kernels.protocol import ExecutionPlan, SourceFile, VerifiedResult
 from benchmarks.a5kernels.trial import (
     ActorOutcome,
     CandidateRun,
+    CoreAttemptDriver,
+    TrialActionExecutor,
     TrialOrchestrator,
     parse_trial_action,
 )
@@ -253,3 +257,66 @@ def test_actions_before_write_return_recoverable_observations(tmp_path, action):
         "error": "write kernel source first",
     }
     assert result.verified.passed
+
+
+def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_path):
+    captured = {}
+
+    class Config:
+        primary_temperature = 1.0
+
+    class Result:
+        status = "done"
+        iters = 2
+        wall_secs = 3.5
+
+    def run_attempt(*args, **kwargs):
+        captured["cfg"] = args[2]
+        captured["kwargs"] = kwargs
+        return Result(), []
+
+    monkeypatch.setattr("core.loop.run_attempt", run_attempt)
+    driver = CoreAttemptDriver(object(), Config(), lambda path: path)
+    outcome = driver(
+        "instruction", profile=load_a5_model_profile(),
+        workspace=tmp_path, context=tmp_path,
+        turn_parser=parse_trial_action, action_executor=lambda _action: None,
+    )
+
+    assert captured["cfg"].primary_temperature == -1.0
+    assert captured["cfg"].temperature == 0.0
+    assert captured["cfg"].allow_truncation_retry is False
+    assert captured["kwargs"]["action_nudge"] == captured["kwargs"]["strict_action_nudge"]
+    for action in ("propose", "write", "compile", "run", "query-knowledge",
+                   "request-profile", "submit"):
+        assert action in captured["kwargs"]["action_nudge"]
+    assert outcome.wall_time_s == 3.5
+
+
+def test_write_invalidates_previous_run_before_profile(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    backend = FakeBackend(True)
+    profile = FakeProfile()
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    executor = TrialActionExecutor(
+        workspace=workspace, language="catlass-dsl",
+        workload=Workload.SMOKE_VECTOR_ADD, backend=backend, ledger=ledger,
+        knowledge=type("Knowledge", (), {"enabled": False})(),
+        profiling=profile, profiling_guidance=True,
+    )
+
+    for text in (
+        '{"write":{"slot":"kernel","content":"agent source"}}',
+        '{"run":{}}',
+        '{"write":{"slot":"kernel","content":"revised source"}}',
+    ):
+        executor(parse_trial_action(text))
+
+    outcome = executor(parse_trial_action('{"request-profile":{}}'))
+    assert json.loads(outcome.observation)["host"] == {
+        "available": True,
+        "error": "run a correct candidate first",
+        "event": "profile",
+    }
+    assert profile.intermediate_runs == []

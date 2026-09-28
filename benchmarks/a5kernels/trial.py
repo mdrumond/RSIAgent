@@ -156,8 +156,10 @@ class CoreAttemptDriver:
         cfg.model = profile.model
         cfg.max_tokens = profile.generation.max_tokens
         cfg.temperature = profile.generation.temperature
+        cfg.primary_temperature = -1.0
         cfg.top_p = profile.generation.top_p
         cfg.reasoning_effort = profile.generation.reasoning_effort
+        cfg.allow_truncation_retry = profile.generation.allow_truncation_retry
         cfg.provider_order = (profile.provider,)
         cfg.provider_allow_fallbacks = profile.allow_fallbacks
         cfg.provider_require_parameters = profile.require_parameters
@@ -170,6 +172,7 @@ class CoreAttemptDriver:
             instruction, self.vm, cfg, self.sink_factory(context),
             turn_parser=turn_parser, action_executor=execute,
             system_prompt=_SYSTEM_PROMPT, instruction_is_complete_opening=True,
+            action_nudge=_ACTION_NUDGE, strict_action_nudge=_ACTION_NUDGE,
             surface_baseline="",
         )
         return ActorOutcome(
@@ -184,6 +187,10 @@ _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON obj
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
 {"request-profile":{}}, or {"submit":{}}.
 You cannot choose paths or commands and cannot report a score or authoritative result."""
+
+_ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
+compile, run, query-knowledge, request-profile, or submit. Use the object shape shown
+in the system instructions and no surrounding prose."""
 
 
 def _trial_instruction(language: str, workload: Workload) -> str:
@@ -236,6 +243,7 @@ class TrialActionExecutor:
             return self._observation("write-rejected", reason="source size")
         path = self.workspace / _SOURCE_PATHS[self.language]
         path.write_text(content, encoding="utf-8")
+        self.latest_run = None
         return self._observation("written", slot="kernel", sha256=hashlib.sha256(
             content.encode()).hexdigest())
 
