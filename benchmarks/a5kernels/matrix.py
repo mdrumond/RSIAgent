@@ -237,7 +237,7 @@ class RunMetrics:
     kernel_time_us: float | None
     exploration_succeeded: bool
     iterations: int
-    tokens: int
+    tokens: int | None
     wall_time_s: float
     reproducible: bool | None = None
 
@@ -253,7 +253,8 @@ class RunMetrics:
         if self.kernel_time_us is not None:
             self._nonnegative_number(self.kernel_time_us, "kernel_time_us")
         self._counter(self.iterations, "iterations")
-        self._counter(self.tokens, "tokens")
+        if self.tokens is not None:
+            self._counter(self.tokens, "tokens")
         self._nonnegative_number(self.wall_time_s, "wall_time_s")
 
     @staticmethod
@@ -290,7 +291,7 @@ class RunMetrics:
                 value["exploration_succeeded"], "exploration_succeeded"
             ),
             iterations=value["iterations"],
-            tokens=value["tokens"],
+            tokens=value.get("tokens"),
             wall_time_s=value["wall_time_s"],
             reproducible=(
                 None
@@ -323,6 +324,7 @@ def aggregate_report(results: Iterable[RunMetrics]) -> dict[str, object]:
         )
     ]
     reproducible = [row.reproducible for row in rows if row.reproducible is not None]
+    known_tokens = [row.tokens for row in rows if row.tokens is not None]
     return {
         "correctness": {"passed": correct, "total": len(rows)},
         "kernel_performance": {
@@ -335,7 +337,14 @@ def aggregate_report(results: Iterable[RunMetrics]) -> dict[str, object]:
         },
         "exploration_success": sum(row.exploration_succeeded for row in rows),
         "iterations": sum(row.iterations for row in rows),
-        "tokens": sum(row.tokens for row in rows),
+        # Preserve the original scalar for fully measured reports. A partial
+        # total would be indistinguishable from zero usage for unknown runs.
+        "tokens": sum(known_tokens) if len(known_tokens) == len(rows) else None,
+        "token_usage": {
+            "known_total": sum(known_tokens),
+            "measured": len(known_tokens),
+            "total": len(rows),
+        },
         "wall_time_s": sum(row.wall_time_s for row in rows),
         "reproducibility": {
             "reproducible": sum(value is True for value in reproducible),

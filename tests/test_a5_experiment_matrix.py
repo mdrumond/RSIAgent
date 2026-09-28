@@ -271,6 +271,11 @@ def test_report_cli_orders_correctness_before_performance(tmp_path, capsys) -> N
     assert payload["exploration_success"] == 1
     assert payload["iterations"] == 5
     assert payload["tokens"] == 250
+    assert payload["token_usage"] == {
+        "known_total": 250,
+        "measured": 2,
+        "total": 2,
+    }
     assert payload["wall_time_s"] == 7.0
     assert payload["reproducibility"] == {"measured": 1, "reproducible": 1}
 
@@ -326,6 +331,45 @@ def test_aggregate_report_never_treats_incorrect_timing_as_performance() -> None
     assert report["kernel_performance"]["mean_us_correct_runs"] is None
 
 
+@pytest.mark.parametrize("omit_tokens", [False, True])
+def test_report_cli_preserves_unknown_token_usage(tmp_path, capsys, omit_tokens) -> None:
+    rows = [
+        {
+            "cell_id": "known",
+            "workload": "smoke-vector-add",
+            "correct": True,
+            "kernel_time_us": 2.0,
+            "exploration_succeeded": True,
+            "iterations": 2,
+            "tokens": 17,
+            "wall_time_s": 3.0,
+        },
+        {
+            "cell_id": "unknown",
+            "workload": "smoke-vector-add",
+            "correct": False,
+            "kernel_time_us": None,
+            "exploration_succeeded": False,
+            "iterations": 1,
+            "tokens": None,
+            "wall_time_s": 1.0,
+        },
+    ]
+    if omit_tokens:
+        rows[1].pop("tokens")
+    path = tmp_path / "metrics.json"
+    path.write_text(json.dumps(rows), encoding="utf-8")
+
+    assert main(["report", str(path)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["tokens"] is None
+    assert report["token_usage"] == {
+        "known_total": 17,
+        "measured": 1,
+        "total": 2,
+    }
+
+
 def test_aggregate_report_does_not_pool_incomparable_timings() -> None:
     from benchmarks.a5kernels.matrix import RunMetrics
 
@@ -377,6 +421,9 @@ def test_aggregate_report_does_not_pool_incomparable_timings() -> None:
         ("iterations", 1.5),
         ("iterations", -1),
         ("tokens", "1"),
+        ("tokens", True),
+        ("tokens", 1.5),
+        ("tokens", -1),
         ("wall_time_s", float("inf")),
         ("wall_time_s", -1.0),
     ],
