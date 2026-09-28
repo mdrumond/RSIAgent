@@ -235,6 +235,47 @@ def test_domain_progress_prevents_hollow_done_reclassification(monkeypatch, tmp_
     assert len(verify_calls) == 2
 
 
+def test_read_only_domain_action_preserves_hollow_done_state(monkeypatch, tmp_path):
+    class CheckVM(VM):
+        def run_command(self, command, *_args, **_kwargs):
+            return "PASS" if "echo PASS" in command else ""
+
+    class Findings:
+        doubts = ""
+
+        def __str__(self):
+            return "host verifier report"
+
+    cfg = _cfg()
+    cfg.practice_mode = False
+    cfg.independent_verify = True
+    cfg.doubt_escalation = False
+    done = '{"done":{"checks":[{"desc":"host check","probe":"ls / && echo PASS"}]}}'
+    replies = iter([done, "inspect", done])
+    verdicts = iter([("wrong", "wrong report"), ("pass", Findings())])
+
+    monkeypatch.setattr(loop, "chat", lambda *_args, **_kwargs: next(replies))
+    monkeypatch.setattr(
+        loop, "verify_independent", lambda *_args, **_kwargs: next(verdicts)
+    )
+    result, _ = loop.run_attempt(
+        "author a kernel",
+        CheckVM(),
+        cfg,
+        ArtifactSink(str(tmp_path)),
+        allow_noop_done=True,
+        turn_parser=lambda text: (
+            KernelAction("inspect") if text == "inspect" else loop.parse_turn(text)
+        ),
+        action_executor=lambda _action: loop.DomainActionResult(
+            "read-only evidence", candidate_progress=False
+        ),
+    )
+
+    assert result.status == "done"
+    assert any(marker == "doubt:hollow" for _turn, marker in result.inspections)
+
+
 def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
     with pytest.raises(TypeError, match="without action_executor"):
         _run(monkeypatch, tmp_path, ["compile"],
@@ -251,6 +292,8 @@ def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
         (loop.DomainActionResult("x", terminal="false"), "terminal must be a bool"),
         (loop.DomainActionResult("x", terminal=0), "terminal must be a bool"),
         (loop.DomainActionResult("x", terminal=1), "terminal must be a bool"),
+        (loop.DomainActionResult("x", candidate_progress="false"),
+         "candidate_progress must be a bool"),
         (loop.DomainActionResult("x", terminal=True, status="passed"),
          "invalid terminal domain action status"),
     ],

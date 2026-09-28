@@ -26,6 +26,15 @@ class FakeEmbeddings:
         return [[float(text.lower().count(term)) for term in terms] for text in texts]
 
 
+def test_database_rejects_sqlite_memory_sentinel(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError, match="file-backed"):
+        KnowledgeDB(Path(":memory:"), FakeEmbeddings())
+
+    assert not (tmp_path / ":memory:").exists()
+
+
 def test_chunk_source_uses_80_lines_with_20_line_overlap():
     data = "".join(f"line {number}\n" for number in range(1, 142)).encode()
 

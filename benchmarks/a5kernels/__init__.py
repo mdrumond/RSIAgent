@@ -15,6 +15,14 @@ from benchmarks.a5kernels.knowledge import (
     KnowledgeDB,
     SearchHit,
 )
+from benchmarks.a5kernels.knowledge_agent import (
+    Citation,
+    KnowledgeAgent,
+    KnowledgeQuery,
+    KnowledgeResult,
+    ProgressiveMemoryJournal,
+    parse_knowledge_action,
+)
 from benchmarks.a5kernels.protocol import RunRequest, VerifiedResult
 from benchmarks.a5kernels.profiling import (
     ProfileRequest,
@@ -26,6 +34,7 @@ __all__ = [
     "A5KernelRunner",
     "BZSessionAdapter",
     "CatlassValidationExecutor",
+    "Citation",
     "CollectionManifest",
     "DEFAULT_EMBEDDING_MODEL",
     "DEFAULT_EMBEDDING_REVISION",
@@ -33,13 +42,18 @@ __all__ = [
     "ExecutionBackend",
     "EvidenceKind",
     "EvidenceLedger",
+    "KnowledgeAgent",
     "KnowledgeDB",
+    "KnowledgeQuery",
+    "KnowledgeResult",
     "Language",
     "ProfileCommandExecutor",
     "ProfileRequest",
     "ProfilingTreatmentController",
+    "ProgressiveMemoryJournal",
     "RunRequest",
     "SearchHit",
     "VerifiedResult",
     "fixture_for",
+    "parse_knowledge_action",
 ]
