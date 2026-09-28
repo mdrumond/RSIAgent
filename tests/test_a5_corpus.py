@@ -100,6 +100,10 @@ def test_checked_in_corpora_are_strict_pinned_english_allowlists():
             {"files": [{"path": "../secret", "sha256": "a" * 64}]},
             "unsafe corpus path",
         ),
+        (
+            {"files": [{"path": "docs//guide.md", "sha256": "a" * 64}]},
+            "unsafe corpus path",
+        ),
     ],
 )
 def test_spec_rejects_unpinned_or_unsafe_inputs(tmp_path, update, message):
@@ -174,6 +178,21 @@ def test_prepare_hash_failure_never_publishes_partial_corpus(tmp_path):
     assert not spec.source_root(artifacts).exists()
 
 
+def test_prepare_surfaces_git_fetch_diagnostics(tmp_path):
+    missing = tmp_path / "missing-upstream"
+    spec = CorpusSpec(
+        name="test-en",
+        collection="test-en-v1",
+        language="en",
+        repository=str(missing),
+        revision="a" * 40,
+        files=(CorpusFile("README.md", "0" * 64),),
+    )
+
+    with pytest.raises(RuntimeError, match=r"git fetch failed: .*missing-upstream"):
+        prepare_corpus(spec, tmp_path / "artifacts")
+
+
 def test_verify_rejects_tampering_and_unlisted_files(tmp_path):
     files = {"README.md": b"original\n"}
     repository, revision = _repository(tmp_path, files)
@@ -215,3 +234,28 @@ def test_index_uses_verified_sources_pinned_backend_and_exports_manifest(tmp_pat
         assert manifest.sources[0].path == "docs/guide.md"
         assert database.query(spec.collection, "DataCopy", limit=1)[0].path == "docs/guide.md"
     assert json.loads(manifest_path.read_text())["fingerprint"] == manifest.fingerprint
+
+
+def test_index_uses_verified_snapshot_when_prepared_source_changes(tmp_path, monkeypatch):
+    original = b"Use DataCopy for local tensors.\n"
+    files = {"docs/guide.md": original}
+    repository, revision = _repository(tmp_path, files)
+    spec = _spec(repository, revision, files)
+    artifacts = tmp_path / "artifacts"
+    prepared = prepare_corpus(spec, artifacts) / "docs/guide.md"
+
+    class MutatingEmbeddings(FakeEmbeddings):
+        def embed(self, texts):
+            prepared.write_bytes(b"changed after verification\n")
+            return super().embed(texts)
+
+    monkeypatch.setattr(corpus, "PinnedBGEEmbeddings", lambda **_kwargs: MutatingEmbeddings())
+    database_path = tmp_path / "knowledge.sqlite3"
+    manifest_path = tmp_path / "manifest.json"
+
+    index_corpus(spec, artifacts, database_path, manifest_path)
+
+    with KnowledgeDB(database_path, FakeEmbeddings()) as database:
+        hit = database.query(spec.collection, "DataCopy", limit=1)[0]
+        assert hit.text == original.decode()
+        assert database.manifest(spec.collection).sources[0].sha256 == hashlib.sha256(original).hexdigest()

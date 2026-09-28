@@ -59,7 +59,12 @@ class CorpusSpec:
             raise ValueError("corpus files must be unique and sorted by path")
         for item in self.files:
             pure = PurePosixPath(item.path)
-            if pure.is_absolute() or ".." in pure.parts or not pure.name:
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or not pure.name
+                or pure.as_posix() != item.path
+            ):
                 raise ValueError(f"unsafe corpus path: {item.path!r}")
             if len(item.sha256) != 64 or any(c not in "0123456789abcdef" for c in item.sha256):
                 raise ValueError(f"invalid sha256 for {item.path!r}")
@@ -69,9 +74,16 @@ class CorpusSpec:
 
 
 def _run(argv: Sequence[str], *, cwd: Path) -> str:
-    result = subprocess.run(
-        list(argv), cwd=cwd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
+    try:
+        result = subprocess.run(
+            list(argv), cwd=cwd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr.decode("utf-8", errors="replace").strip()
+        command = " ".join(argv[:2])
+        raise RuntimeError(
+            f"{command} failed: {stderr or f'exit {exc.returncode}'}"
+        ) from exc
     return result.stdout.decode("utf-8").strip()
 
 
@@ -114,6 +126,14 @@ def prepare_corpus(spec: CorpusSpec, artifacts: Path) -> Path:
 
 
 def verify_prepared(spec: CorpusSpec, artifacts: Path) -> tuple[Path, ...]:
+    snapshots = _verified_snapshots(spec, artifacts)
+    root = spec.source_root(artifacts)
+    return tuple(root / item.path for item, _data in snapshots)
+
+
+def _verified_snapshots(
+    spec: CorpusSpec, artifacts: Path
+) -> tuple[tuple[CorpusFile, bytes], ...]:
     root = spec.source_root(artifacts)
     expected = {item.path: item.sha256 for item in spec.files}
     actual_paths = {
@@ -123,11 +143,14 @@ def verify_prepared(spec: CorpusSpec, artifacts: Path) -> tuple[Path, ...]:
     } if root.is_dir() else {}
     if set(actual_paths) != set(expected):
         raise ValueError("prepared corpus does not exactly match its allowlist")
-    for relative, path in actual_paths.items():
-        actual = hashlib.sha256(path.read_bytes()).hexdigest()
-        if actual != expected[relative]:
-            raise ValueError(f"prepared hash mismatch for {relative}")
-    return tuple(actual_paths[path] for path in sorted(actual_paths))
+    snapshots = []
+    for item in spec.files:
+        data = actual_paths[item.path].read_bytes()
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != item.sha256:
+            raise ValueError(f"prepared hash mismatch for {item.path}")
+        snapshots.append((item, data))
+    return tuple(snapshots)
 
 
 def index_corpus(
@@ -138,18 +161,26 @@ def index_corpus(
     *,
     model_cache: Path | None = None,
 ) -> None:
-    sources = verify_prepared(spec, artifacts)
+    snapshots = _verified_snapshots(spec, artifacts)
     database_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     embeddings = PinnedBGEEmbeddings(cache_dir=model_cache, local_files_only=True)
-    with KnowledgeDB(database_path, embeddings) as database:
-        database.index(
-            spec.source_root(artifacts),
-            sources,
-            collection=spec.collection,
-            language=spec.language,
-            manifest_path=manifest_path,
-        )
+    with tempfile.TemporaryDirectory(prefix=f".{spec.name}-index-") as value:
+        snapshot_root = Path(value)
+        sources = []
+        for item, data in snapshots:
+            target = snapshot_root / item.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            sources.append(target)
+        with KnowledgeDB(database_path, embeddings) as database:
+            database.index(
+                snapshot_root,
+                sources,
+                collection=spec.collection,
+                language=spec.language,
+                manifest_path=manifest_path,
+            )
 
 
 def main() -> None:
