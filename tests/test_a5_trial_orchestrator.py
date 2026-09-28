@@ -443,9 +443,37 @@ def test_nonfinite_error_is_a_valid_explicit_json_observation(tmp_path):
     outcome = executor(parse_trial_action('{"run":{}}'))
     assert json.loads(outcome.observation)["host"] == {
         "event": "run", "passed": False, "max_abs_error": None,
+        "exit_code": 0, "status": "incorrect-output",
         "error_status": "non-finite-max-abs-error",
     }
     assert "Infinity" not in outcome.observation
+
+
+@pytest.mark.parametrize("passed, exit_code, status", [
+    (False, 1, "runtime-error"),
+    (False, 124, "runtime-error"),
+    (False, 0, "incorrect-output"),
+    (True, 0, "passed"),
+])
+def test_run_feedback_distinguishes_runtime_failure_from_incorrect_output(
+    tmp_path, passed, exit_code, status,
+):
+    class ResultBackend(FakeBackend):
+        def run(self, workspace, language, workload, attempt_id, ledger):
+            error = float("inf") if exit_code else 0.0 if passed else 9.0
+            candidate = _candidate(passed, attempt_id, max_abs_error=error)
+            return replace(candidate, verified=replace(candidate.verified, exit_code=exit_code))
+
+    executor = _executor(tmp_path, ResultBackend())
+    executor(parse_trial_action('{"write":{"slot":"kernel","content":"agent source"}}'))
+    outcome = executor(parse_trial_action('{"run":{}}'))
+
+    assert not outcome.terminal
+    assert json.loads(outcome.observation)["host"] == {
+        "event": "run", "passed": passed, "exit_code": exit_code, "status": status,
+        "max_abs_error": None if exit_code else 0.0 if passed else 9.0,
+        "error_status": "non-finite-max-abs-error" if exit_code else None,
+    }
 
 
 def _executor(tmp_path, backend):

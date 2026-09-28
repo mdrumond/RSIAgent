@@ -292,8 +292,10 @@ class TrialActionExecutor:
         self.latest_run = candidate
         result = self.latest_run.verified
         finite_error = math.isfinite(result.max_abs_error)
+        status = ("runtime-error" if result.exit_code != 0 else
+                  "passed" if result.passed else "incorrect-output")
         return self._observation(
-            "run", passed=result.passed,
+            "run", passed=result.passed, exit_code=result.exit_code, status=status,
             max_abs_error=result.max_abs_error if finite_error else None,
             error_status=None if finite_error else "non-finite-max-abs-error")
 
