@@ -11,6 +11,7 @@ from benchmarks.a5kernels.production import (
     PILOT_CELL_ID,
     PILOT_WORKLOAD,
     ProductionPaths,
+    _probe_catlass_runtime,
     build_production_trial,
     preflight,
     run_pilot,
@@ -73,6 +74,7 @@ def test_preflight_is_fail_closed_and_does_not_expose_secret(tmp_path):
         paths,
         environment={"OPENROUTER_API_KEY": ""},
         embedding_probe=lambda backend: probed.append((backend.model, backend.revision)),
+        runtime_probe=lambda _paths: None,
     )
 
     assert report["ready"] is False
@@ -88,6 +90,7 @@ def test_preflight_checks_complete_local_inputs_without_model_or_bz_call(tmp_pat
         paths,
         environment={"OPENROUTER_API_KEY": "present-but-never-reported"},
         embedding_probe=lambda _backend: None,
+        runtime_probe=lambda _paths: None,
     )
 
     assert report == {
@@ -107,6 +110,7 @@ def test_hugging_face_home_routes_its_hub_cache_to_embeddings(tmp_path):
         paths,
         environment={"OPENROUTER_API_KEY": "configured"},
         embedding_probe=lambda backend: observed.append(backend.cache_dir),
+        runtime_probe=lambda _paths: None,
     )
     assert observed == [paths.bge_cache / "hub"]
 
@@ -118,9 +122,66 @@ def test_existing_results_directory_prevents_accidental_overwrite(tmp_path):
         paths,
         environment={"OPENROUTER_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
+        runtime_probe=lambda _paths: None,
     )
     assert report["ready"] is False
     assert report["checks"]["results_absent"] is False
+
+
+def test_remote_runtime_failure_is_bounded_and_fails_closed(tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+
+    def unavailable(_paths):
+        raise RuntimeError("remote secret path and transport details")
+
+    report = preflight(
+        paths,
+        environment={"OPENROUTER_API_KEY": "configured"},
+        embedding_probe=lambda _backend: None,
+        runtime_probe=unavailable,
+    )
+
+    assert report["ready"] is False
+    assert report["checks"]["catlass_runtime"] is False
+    assert "remote secret" not in json.dumps(report)
+
+
+def test_runtime_probe_binds_exact_source_and_revision(monkeypatch, tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+    captured = {}
+
+    class FakeExecutor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        runtime_provenance = (("catlass_revision", "a" * 40),)
+
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.bz.CatlassValidationExecutor", FakeExecutor
+    )
+    _probe_catlass_runtime(paths)
+
+    assert captured["catlass_source"] == "/retained/catlass"
+    assert captured["catlass_revision"] == "a" * 40
+    assert captured["validation_wrapper"].endswith("catlass-validation.sh")
+    assert captured["upload_wrapper"].endswith("upload.sh")
+
+
+def test_run_pilot_does_not_construct_actor_after_remote_preflight_failure(
+    monkeypatch, tmp_path
+):
+    paths, _wrappers = _inputs(tmp_path)
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.production.preflight",
+        lambda _paths: {"ready": False, "checks": {"catlass_runtime": False}},
+    )
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.production.build_production_trial",
+        lambda _paths: pytest.fail("Actor runtime must not be constructed"),
+    )
+
+    with pytest.raises(RuntimeError, match="catlass_runtime"):
+        run_pilot(paths)
 
 
 def test_production_composition_uses_read_only_kdb_and_no_guidance(tmp_path):

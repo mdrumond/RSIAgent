@@ -82,6 +82,7 @@ def preflight(
     *,
     environment: Mapping[str, str] | None = None,
     embedding_probe: Callable[[object], None] | None = None,
+    runtime_probe: Callable[[ProductionPaths], None] | None = None,
 ) -> dict[str, object]:
     """Validate every local input before an Actor or BZ workload can start."""
 
@@ -105,6 +106,24 @@ def preflight(
         checks[name] = wrapper.is_file() and os.access(wrapper, os.X_OK)
     checks["bge_cache"] = paths.bge_cache.is_dir()
     checks["kdb"] = paths.kdb.is_file()
+
+    if all(
+        checks[name]
+        for name in (
+            "catlass_validation_wrapper",
+            "bz_session_wrapper",
+            "bz_upload_wrapper",
+        )
+    ):
+        try:
+            (runtime_probe or _probe_catlass_runtime)(paths)
+            checks["catlass_runtime"] = True
+        except Exception:
+            # Preflight output is deliberately bounded and never includes remote
+            # paths, wrapper logs, credentials, or transport diagnostics.
+            checks["catlass_runtime"] = False
+    else:
+        checks["catlass_runtime"] = False
 
     if checks["bge_cache"] and checks["kdb"]:
         embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(paths.bge_cache))
@@ -134,6 +153,23 @@ def preflight(
         "workload": PILOT_WORKLOAD,
         "checks": checks,
     }
+
+
+def _probe_catlass_runtime(paths: ProductionPaths) -> None:
+    """Use the checked profile's provenance probe for the exact retained runtime."""
+
+    from benchmarks.a5kernels.bz import CatlassValidationExecutor
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper=str(paths.upload_wrapper),
+        validation_wrapper=str(paths.validation_wrapper),
+        catlass_source=paths.catlass_source,
+        catlass_revision=paths.catlass_revision,
+    )
+    # This checked wrapper probe validates the configured BZ route and binds the
+    # retained source to its exact revision without submitting a workload.
+    if not executor.runtime_provenance:
+        raise RuntimeError("Catlass runtime provenance is unavailable")
 
 
 def build_production_trial(paths: ProductionPaths):
