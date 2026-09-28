@@ -121,7 +121,7 @@ def _cell(*, knowledge=KnowledgeMode.WITHOUT_KDB,
 def _caps(**kwargs):
     return RuntimeCapabilities(
         languages=frozenset({Language.CATLASS_DSL}),
-        model_ids=frozenset({"openai/gpt-5.6-sol"}),
+        model_profiles=frozenset({_cell().model}),
         workloads=frozenset(Workload),
         **kwargs)
 
