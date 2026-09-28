@@ -195,6 +195,30 @@ def test_preflight_rejects_legacy_shared_fts_without_migrating(
     assert "fts_table" not in columns
 
 
+def test_preflight_rejects_query_hit_with_corrupted_chunk_bytes(
+    monkeypatch, tmp_path
+):
+    paths, _wrappers = _inputs(tmp_path)
+    with sqlite3.connect(paths.kdb) as connection:
+        connection.execute(
+            "UPDATE chunks SET text = text || ? WHERE collection = ?",
+            ("corrupted", paths.collection),
+        )
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.embeddings.PinnedBGEEmbeddings", TinyEmbeddings
+    )
+
+    report = preflight(
+        paths,
+        environment={"OPENROUTER_API_KEY": "configured"},
+        runtime_probe=lambda _paths: None,
+    )
+
+    assert report["checks"]["kdb_manifest"] is True
+    assert report["checks"]["kdb_query"] is False
+    assert report["ready"] is False
+
+
 def test_hugging_face_home_routes_its_hub_cache_to_embeddings(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
     (paths.bge_cache / "hub").mkdir()

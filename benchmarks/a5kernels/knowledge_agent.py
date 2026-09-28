@@ -49,6 +49,28 @@ class KnowledgeResult:
     score: float
 
 
+def validate_knowledge_hit(
+    database: KnowledgeDB, collection: str, hit: SearchHit
+) -> KnowledgeResult:
+    """Apply the Knowledge Agent's citation gate to one retrieved hit."""
+
+    citation = Citation(
+        collection=collection,
+        path=hit.path,
+        start_line=hit.start_line,
+        end_line=hit.end_line,
+        chunk_hash=hit.chunk_id,
+    )
+    database.validate_citation(
+        citation.collection,
+        chunk_id=citation.chunk_hash,
+        path=citation.path,
+        start_line=citation.start_line,
+        end_line=citation.end_line,
+    )
+    return KnowledgeResult(citation=citation, text=hit.text, score=hit.score)
+
+
 def parse_knowledge_action(value: str) -> Any:
     """Parse a query action, delegating built-in Actor actions to core."""
     from core.actor import Done, normalize_action_text, parse_turn
@@ -262,18 +284,4 @@ class KnowledgeAgent:
 
     def _validated_result(self, hit: SearchHit) -> KnowledgeResult:
         assert self.database is not None and self.collection is not None
-        citation = Citation(
-            collection=self.collection,
-            path=hit.path,
-            start_line=hit.start_line,
-            end_line=hit.end_line,
-            chunk_hash=hit.chunk_id,
-        )
-        self.database.validate_citation(
-            citation.collection,
-            chunk_id=citation.chunk_hash,
-            path=citation.path,
-            start_line=citation.start_line,
-            end_line=citation.end_line,
-        )
-        return KnowledgeResult(citation=citation, text=hit.text, score=hit.score)
+        return validate_knowledge_hit(self.database, self.collection, hit)

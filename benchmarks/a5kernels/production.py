@@ -176,9 +176,13 @@ def preflight(
 def _probe_knowledge_query(database, collection: str) -> None:
     """Prove the selected read-only collection supports the production query path."""
 
+    from benchmarks.a5kernels.knowledge_agent import validate_knowledge_hit
+
     # This exercises current per-collection FTS metadata/table lookup, vector
-    # decoding, and query embeddings without writing or migrating the database.
-    database.query(collection, "A5 preflight", limit=1)
+    # decoding, query embeddings, and the same citation gate used before any hit
+    # reaches an Actor, without writing or migrating the database.
+    for hit in database.query(collection, "A5 preflight", limit=1):
+        validate_knowledge_hit(database, collection, hit)
 
 
 def _probe_catlass_runtime(paths: ProductionPaths) -> None:
