@@ -626,6 +626,7 @@ def test_no_kdb_catlass_opening_specifies_executable_contract():
     assert "does not establish correctness for other logical lengths" in contract["shape"]
     assert "[1, 400]" not in instruction and "448" not in instruction
     assert "gm_a[i] + gm_b[i]" in contract["output"]
+    assert "host evaluates all P output elements including the zero-padded tail" in contract["output"]
     assert "1e-5" in contract["correctness"]
     assert "import catlass.tla as tla" in contract["source"]
     assert "block_num=1" in contract["runtime"]

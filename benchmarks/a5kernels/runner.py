@@ -150,7 +150,8 @@ class A5KernelRunner:
         rng = random.Random(request.seed)
         input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
         input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
-        return input_a, input_b
+        padding = (0.0,) * ((request.padded_length or request.length) - request.length)
+        return input_a + padding, input_b + padding
 
     def _record_plan(self, request: RunRequest, plan: ExecutionPlan) -> None:
         if self._ledger is None:
@@ -162,7 +163,7 @@ class A5KernelRunner:
         }
         self._ledger.append(
             EvidenceKind.REQUEST,
-            {**identity, "request": request.__dict__},
+            {**identity, "request": request.to_dict()},
         )
         self._ledger.append(
             EvidenceKind.ACTION,

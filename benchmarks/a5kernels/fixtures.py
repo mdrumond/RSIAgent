@@ -498,9 +498,14 @@ def catlass_candidate_fixture(source: str) -> Fixture:
     runtime = runtime.replace("VECTOR_ELE", "_HOST_VECTOR_ELE").replace(
         "VL_ELE", "_HOST_VL_ELE"
     )
+    # Candidate plans already carry the complete padded verification extent.
+    # Poison every output slot so an unwritten zero-padding lane cannot pass.
+    runtime = runtime.replace("torch.empty_like(a)", "torch.full_like(a, float('nan'))")
+    runtime = runtime.replace("return out[:original_length].cpu().tolist()",
+                              "return out.cpu().tolist()")
     host_prelude = (
         "\n\nimport os\nimport time\n"
-        "_HOST_VECTOR_ELE = 400\n_HOST_VL_ELE = 64\n"
+        "_HOST_VECTOR_ELE = 448\n_HOST_VL_ELE = 64\n"
     )
     kernel = source.rstrip() + host_prelude + marker + runtime
     fixture = _FIXTURES[Language.CATLASS_DSL]

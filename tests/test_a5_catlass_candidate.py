@@ -15,7 +15,8 @@ from benchmarks.a5kernels.candidate import (
 )
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.matrix import Workload
-from benchmarks.a5kernels.protocol import ExecutionReceipt
+from benchmarks.a5kernels.protocol import ExecutionReceipt, RunRequest
+from benchmarks.a5kernels.runner import A5KernelRunner
 from benchmarks.a5kernels.trial import TrialAction, TrialActionExecutor
 
 
@@ -145,7 +146,7 @@ def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
     assert result["passed"]
     composed = next(item for item in execution.plans[0].files
                     if item.relative_path == "kernel.py").content
-    assert "_HOST_VECTOR_ELE = 400" in composed
+    assert "_HOST_VECTOR_ELE = 448" in composed
     assert "_HOST_VL_ELE = 64" in composed
 
 
@@ -183,6 +184,43 @@ def test_run_returns_exact_plan_bound_candidate(tmp_path):
     assert "A5KERNEL_COMPILE_ONLY=1" not in run.plan.argv
     assert run.verified.execution_id == run.plan.execution_id
     assert run.verified.source_fingerprint == run.plan.source_fingerprint
+
+
+def test_candidate_verifies_immutable_zero_padded_smoke_inputs(tmp_path):
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    execution = FakeExecution()
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    run = CatlassCandidateBackend(execution).run(
+        tmp_path, "catlass-dsl", Workload.SMOKE_VECTOR_ADD, "final", ledger,
+    )
+    unpadded = A5KernelRunner(FakeExecution()).prepare(RunRequest("catlass-dsl"))
+
+    assert run.verified.passed
+    assert run.plan.input_a == unpadded.input_a + (0.0,) * 32
+    assert run.plan.input_b == unpadded.input_b + (0.0,) * 32
+    request = ledger.entries[0].payload["request"]
+    assert request["length"] == 32 and request["padded_length"] == 64
+    assert RunRequest(**request).request_id == run.plan.request_id != unpadded.request_id
+    kernel = next(item.content for item in run.plan.files if item.relative_path == "kernel.py")
+    assert "torch.full_like(a, float('nan'))" in kernel
+    assert "return out.cpu().tolist()" in kernel
+    assert "return out[:original_length]" not in kernel
+
+
+@pytest.mark.parametrize("padding", [(), (float("nan"),) * 32, (1.0,) * 32])
+def test_half_work_candidate_output_cannot_pass(tmp_path, padding):
+    class HalfWorkExecution(FakeExecution):
+        def execute(self, plan):
+            receipt = super().execute(plan)
+            return replace(receipt, output=receipt.output[:32] + padding)
+
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    run = CatlassCandidateBackend(HalfWorkExecution()).run(
+        tmp_path, "catlass-dsl", Workload.SMOKE_VECTOR_ADD, "final",
+        EvidenceLedger(tmp_path / "evidence.jsonl"),
+    )
+    assert not run.verified.passed
+    assert run.kernel_name is None
 
 
 def test_run_rejects_missing_or_unexpected_discovered_name(tmp_path):

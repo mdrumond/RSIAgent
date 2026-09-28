@@ -131,7 +131,10 @@ class CatlassCandidateBackend:
         )
 
     def _request(self) -> RunRequest:
-        return RunRequest(Language.CATLASS_DSL.value, length=self._length, seed=self._seed)
+        return RunRequest(
+            Language.CATLASS_DSL.value, length=self._length, seed=self._seed,
+            padded_length=((self._length + 63) // 64) * 64,
+        )
 
     @staticmethod
     def _source(workspace: Path, language: str) -> str:

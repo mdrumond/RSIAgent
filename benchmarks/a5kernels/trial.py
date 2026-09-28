@@ -221,7 +221,7 @@ _TRIAL_CONTRACTS = {
         "entry_point": "@tla.kernel\ndef vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor) -> None:",
         "arguments": "gm_a and gm_b are inputs; gm_c is the output. All are contiguous one-dimensional float32 tla.Tensor values with equal shapes.",
         "shape": "This production smoke case has logical length N = 32. The host zero-pads inputs to P = 64 elements. Read P from gm_a.origin_shape[0]; handle every element of that padded shape. This trial does not establish correctness for other logical lengths.",
-        "output": "Write gm_c[i] = gm_a[i] + gm_b[i] for 0 <= i < P. Do not mutate inputs. Return no value; the host evaluates the first N output elements.",
+        "output": "Write gm_c[i] = gm_a[i] + gm_b[i] for 0 <= i < P. Do not mutate inputs. Return no value; the first N elements carry logical data, and the host evaluates all P output elements including the zero-padded tail.",
         "correctness": "The host compares against its original input sums. Every output must be finite, have the expected length, and have maximum absolute error <= 1e-5.",
         "source": "Import only 'import catlass.tla as tla'. Define exactly the single synchronous vector_add kernel above; use no helper functions, additional decorators, or top-level execution. Optional module constants must be numeric literals.",
         "runtime": "The host owns allocation, compilation for A5 (3510), launch with block_num=1, synchronization, and verification. Supply only the kernel module, not a run function or host driver.",

@@ -209,12 +209,15 @@ def snapshot_from_ledger(
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", attempt_id) is None:
         raise ValueError("attempt_id is not a runner-safe identifier")
     recorded_request = request.get("request")
-    if not isinstance(recorded_request, Mapping) or set(recorded_request) != {
+    request_fields = {
         "language",
         "length",
         "seed",
         "dtype",
-    }:
+    }
+    if not isinstance(recorded_request, Mapping) or set(recorded_request) not in (
+        request_fields, request_fields | {"padded_length"},
+    ):
         raise ValueError("recorded request does not have the runner schema")
     try:
         reconstructed_request = RunRequest(**recorded_request)
@@ -243,6 +246,11 @@ def snapshot_from_ledger(
     input_b = tuple(
         rng.uniform(-1.0, 1.0) for _ in range(reconstructed_request.length)
     )
+    padding = (0.0,) * (
+        (reconstructed_request.padded_length or reconstructed_request.length)
+        - reconstructed_request.length
+    )
+    input_a, input_b = input_a + padding, input_b + padding
     if action["inputs_sha256"] != canonical_digest(
         {"input_a": input_a, "input_b": input_b}
     ):

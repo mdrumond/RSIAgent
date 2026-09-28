@@ -223,6 +223,39 @@ def test_run_plan_rejects_same_length_inputs_not_derived_from_request_seed():
     assert backend.plans == []
 
 
+@pytest.mark.parametrize("padded_length", [31, True, 64.0])
+def test_request_rejects_invalid_padded_extent(padded_length):
+    with pytest.raises(ValueError, match="padded_length"):
+        RunRequest("catlass-dsl", padded_length=padded_length)
+
+
+def test_unpadded_requests_preserve_identity_and_input_defaults():
+    from benchmarks.a5kernels.protocol import canonical_hash
+
+    request = RunRequest("catlass-dsl")
+    assert request.to_dict() == {
+        "language": "catlass-dsl", "length": 32, "seed": 0, "dtype": "float32",
+    }
+    assert request.request_id == canonical_hash(request.to_dict())
+    plan = A5KernelRunner(FakeBackend()).prepare(request)
+    assert len(plan.input_a) == len(plan.input_b) == 32
+
+
+def test_padded_request_evidence_reconstructs_full_verification_extent(tmp_path):
+    from benchmarks.a5kernels.determinism import snapshot_from_ledger
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    runner = A5KernelRunner(FakeBackend(), evidence_ledger=ledger)
+    request = RunRequest("catlass-dsl", padded_length=64)
+    result = runner.run(request, attempt_id="padded-smoke")
+
+    snapshot = snapshot_from_ledger(ledger.entries)
+    assert result.passed
+    assert snapshot.request_id == request.request_id
+    assert ledger.entries[0].payload["request"]["padded_length"] == 64
+
+
 def test_nonzero_exit_fails_even_with_correct_output():
     result = A5KernelRunner(FakeBackend(exit_code=9, claimed_score="1")).run(
         RunRequest(Language.TRITON_ASCEND.value)

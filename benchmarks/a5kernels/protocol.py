@@ -25,16 +25,28 @@ class RunRequest:
     length: int = 32
     seed: int = 0
     dtype: str = "float32"
+    # Optional host-owned verification extent; extra inputs are exactly zero.
+    padded_length: int | None = None
 
     def __post_init__(self) -> None:
         if self.length < 1:
             raise ValueError("length must be positive")
         if self.dtype != "float32":
             raise ValueError("the hello fixture supports only float32")
+        if self.padded_length is not None and (
+            type(self.padded_length) is not int or self.padded_length < self.length
+        ):
+            raise ValueError("padded_length must be an integer at least length")
+
+    def to_dict(self) -> dict[str, Any]:
+        fields = asdict(self)
+        if self.padded_length is None:
+            fields.pop("padded_length")
+        return fields
 
     @property
     def request_id(self) -> str:
-        return canonical_hash(asdict(self))
+        return canonical_hash(self.to_dict())
 
 
 @dataclass(frozen=True)
