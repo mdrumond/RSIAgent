@@ -205,6 +205,8 @@ class KnowledgeDB:
     """SQLite FTS5 store with deterministic vector/lexical rank fusion."""
 
     def __init__(self, path: Path, embeddings: EmbeddingBackend):
+        if path == Path(":memory:"):
+            raise ValueError("KnowledgeDB requires a file-backed database")
         self.path = path.resolve()
         self.embeddings = embeddings
         self.connection = sqlite3.connect(self.path)
