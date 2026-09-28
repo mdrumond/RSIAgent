@@ -74,7 +74,9 @@ def _spec(repository: Path, revision: str, files: dict[str, bytes]) -> CorpusSpe
 def test_checked_in_corpora_are_strict_pinned_english_allowlists():
     specs = [CorpusSpec.load(path) for path in sorted(CORPORA.glob("*.json"))]
 
-    assert [spec.name for spec in specs] == ["ascendc-en", "catlass-en"]
+    assert [spec.name for spec in specs] == [
+        "a5-ascendc-architecture-en", "ascendc-en", "catlass-en",
+    ]
     assert all(spec.language == "en" for spec in specs)
     assert all(len(spec.revision) == 40 for spec in specs)
     assert all(spec.repository.startswith("https://") for spec in specs)
@@ -86,6 +88,69 @@ def test_checked_in_corpora_are_strict_pinned_english_allowlists():
     assert all(item.path.startswith("python/tla_dsl/") for item in catlass.files)
     assert all("/docs/en/" in item.path or item.path.endswith(".py") for item in catlass.files)
     assert any(item.path.endswith("basic_vadd.py") for item in catlass.files)
+
+
+def test_a5_cross_layer_reference_has_exact_pin_hash_and_selection():
+    path = CORPORA / "a5-ascendc-architecture-en.json"
+    spec = CorpusSpec.load(path)
+
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == (
+        "2f109bab00ac79449a0e862f3291351e4e1403480b0cc5fb0106544a53c34926"
+    )
+    assert spec.repository == "https://github.com/huawei-cpl-zurich/data-movement-benchmarks"
+    assert spec.revision == "23f39974d9175ea39ddad6e9fe84a7510ff8a56e"
+    assert spec.collection == "a5-ascendc-architecture-en-23f3997"
+    assert [item.path for item in spec.files] == [
+        "README.md", "analyse_msprof.py", "compute_results_a5.metadata.json",
+        "compute_throughput.asc", "load_results_a5_simt_float4.metadata.json",
+        "mte2_fixpipe_contention.asc", "mte2_prefetch.asc", "results_a5.metadata.json",
+        "run_compute_benchmarks.py", "run_load_benchmarks.py", "run_stride_sweep.py",
+        "simt_load.asc", "stride_results_a5.metadata.json",
+        "sub32_stride_results_a5.metadata.json",
+    ]
+    assert CorpusSpec.load(path) == spec
+
+
+@pytest.mark.parametrize("failure", ["revision", "missing", "drift"])
+def test_a5_cross_layer_prepare_fails_closed_on_upstream_mismatch(
+    tmp_path, monkeypatch, failure,
+):
+    spec = CorpusSpec.load(CORPORA / "a5-ascendc-architecture-en.json")
+    commands = []
+
+    def run(argv, *, cwd):
+        commands.append(argv)
+        if argv[1] == "rev-parse":
+            return "0" * 40 if failure == "revision" else spec.revision
+        return ""
+
+    def blob(argv, *, cwd):
+        commands.append(argv)
+        assert argv == ["git", "show", f"{spec.revision}:README.md"]
+        if failure == "missing":
+            raise RuntimeError("git show failed: missing pinned README.md")
+        return b"changed upstream bytes\n"
+
+    monkeypatch.setattr(corpus, "_run", run)
+    monkeypatch.setattr(corpus, "_run_bytes", blob)
+    message = {"revision": "revision mismatch", "missing": "missing pinned", "drift": "hash mismatch"}[failure]
+    with pytest.raises((ValueError, RuntimeError), match=message):
+        prepare_corpus(spec, tmp_path / "artifacts")
+    assert ["git", "fetch", "--quiet", "--depth=1", "origin", spec.revision] in commands
+    assert not spec.source_root(tmp_path / "artifacts").exists()
+
+
+def test_missing_cross_layer_snapshot_cannot_be_indexed_or_downloaded(tmp_path, monkeypatch):
+    spec = CorpusSpec.load(CORPORA / "a5-ascendc-architecture-en.json")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("missing sources must fail before model or network access")
+
+    monkeypatch.setattr(corpus, "PinnedBGEEmbeddings", forbidden)
+    monkeypatch.setattr(corpus, "_run_bytes", forbidden)
+    with pytest.raises(ValueError, match="exactly match its allowlist"):
+        index_corpus(spec, tmp_path / "missing", tmp_path / "db", tmp_path / "manifest")
+    assert not (tmp_path / "db").exists()
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,23 @@
+{
+  "collection": "a5-ascendc-architecture-en-23f3997",
+  "files": [
+    {"path": "README.md", "sha256": "fcc2d0044fdd38b0caa2b56693fa5d7a7bfd8744e18f50fd2269359b4cc3f618"},
+    {"path": "analyse_msprof.py", "sha256": "58e06fdbc157dd57ddee9fc388f21298a3c71989522f5df87dbb6366ec78349b"},
+    {"path": "compute_results_a5.metadata.json", "sha256": "c0b7b153b6a0f74ff76adfd845f1f67ba6e0980955077e37b314af758f2b61cd"},
+    {"path": "compute_throughput.asc", "sha256": "c06edce7de1a1bee353d88a43a89b7a0e97f1c475e785dea3572da0532dbf8f9"},
+    {"path": "load_results_a5_simt_float4.metadata.json", "sha256": "11c8c358722e3760967eba42b3e6e56f42464d8637bc528e3ffbdcc1d75104ec"},
+    {"path": "mte2_fixpipe_contention.asc", "sha256": "a57bfc70932a324b72306f9bcd046fbc3ffa0da77a4fd75ed8c0cfa7109c1c96"},
+    {"path": "mte2_prefetch.asc", "sha256": "46073c7486464733cfc447d223c1040067d89cd866af6481b95332f42a305f2e"},
+    {"path": "results_a5.metadata.json", "sha256": "c00ed42a707a9b082472a2d42c0333ecdccded21c0aa49176b97e0c3fd6f2d8d"},
+    {"path": "run_compute_benchmarks.py", "sha256": "93d0695547ea95cb324a169d9608d3d28febd65ba9db733d3aca1366eb01cbbb"},
+    {"path": "run_load_benchmarks.py", "sha256": "8cd1d1033dc08b7d6a9b95e47106b0395e4afffcc6b14543dbe5aefbb471c7a0"},
+    {"path": "run_stride_sweep.py", "sha256": "7b199d609458028cbb25aa934b067f1ef93980b5e7c871f5ed42a12f2886af15"},
+    {"path": "simt_load.asc", "sha256": "4a26f3de3987e2aae8c61a825dad04fb2bc651e54279f2c0f7901e9964557dfa"},
+    {"path": "stride_results_a5.metadata.json", "sha256": "978825c68923b358c7ad01ed938786ab1a2d682ded6f7942506b8abd09756591"},
+    {"path": "sub32_stride_results_a5.metadata.json", "sha256": "fe0cb1c3c66a8962b2817b6cc9eeef65ff3ca28db4d8fd0cc199fa9dddf174c8"}
+  ],
+  "language": "en",
+  "name": "a5-ascendc-architecture-en",
+  "repository": "https://github.com/huawei-cpl-zurich/data-movement-benchmarks",
+  "revision": "23f39974d9175ea39ddad6e9fe84a7510ff8a56e"
+}
