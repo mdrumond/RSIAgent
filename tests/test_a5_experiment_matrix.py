@@ -9,6 +9,7 @@ from benchmarks.a5kernels.matrix import (
     CapabilityUnavailableError,
     ExperimentOrchestrator,
     KnowledgeMode,
+    ModelProfile,
     ProfilingMode,
     RuntimeCapabilities,
     Workload,
@@ -39,6 +40,11 @@ def test_initial_matrix_is_exact_cartesian_product_with_isolated_state() -> None
     assert {cell.model.provider for cell in plan.cells} == {"OpenAI"}
     assert all(not cell.model.allow_fallback for cell in plan.cells)
     assert plan.workloads == (Workload.SMOKE_VECTOR_ADD, Workload.SEMANTIC_GEMM)
+
+
+def test_matrix_rejects_noncanonical_model_routes() -> None:
+    with pytest.raises(ValueError, match="canonical A5 model route"):
+        initial_matrix(ModelProfile("other", "openai/other", "OpenAI"))
 
 
 def test_determinism_schedule_is_three_catlass_baseline_repeats() -> None:
@@ -147,6 +153,36 @@ def test_report_cli_orders_correctness_before_performance(tmp_path, capsys) -> N
     assert payload["tokens"] == 250
     assert payload["wall_time_s"] == 7.0
     assert payload["reproducibility"] == {"measured": 1, "reproducible": 1}
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("correct", "false"),
+        ("exploration_succeeded", 1),
+        ("reproducible", "true"),
+    ],
+)
+def test_report_rejects_non_boolean_flags(tmp_path, field, value) -> None:
+    from benchmarks.a5kernels.matrix import load_metrics
+
+    payload = {
+        "cell_id": "cell-a",
+        "workload": "smoke-vector-add",
+        "correct": True,
+        "kernel_time_us": None,
+        "exploration_succeeded": False,
+        "iterations": 1,
+        "tokens": 1,
+        "wall_time_s": 1.0,
+        "reproducible": True,
+    }
+    payload[field] = value
+    path = tmp_path / "metrics.json"
+    path.write_text(json.dumps([payload]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field):
+        load_metrics(path)
 
 
 def test_aggregate_report_never_treats_incorrect_timing_as_performance() -> None:

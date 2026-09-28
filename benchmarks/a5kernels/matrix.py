@@ -40,7 +40,13 @@ class ModelProfile:
     allow_fallback: bool = False
 
     def __post_init__(self) -> None:
-        if self.allow_fallback:
+        if (self.name, self.model_id, self.provider) != (
+            CANONICAL_PROFILE_ID,
+            CANONICAL_MODEL,
+            CANONICAL_PROVIDER,
+        ):
+            raise ValueError("experiment matrix requires the canonical A5 model route")
+        if self.allow_fallback is not False:
             raise ValueError("experiment model profiles must disable provider fallback")
 
 
@@ -204,21 +210,31 @@ class RunMetrics:
     wall_time_s: float
     reproducible: bool | None = None
 
+    @staticmethod
+    def _boolean(value: object, field: str) -> bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field} must be a JSON boolean")
+        return value
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "RunMetrics":
         return cls(
             cell_id=str(value["cell_id"]),
             workload=Workload(str(value["workload"])),
-            correct=bool(value["correct"]),
+            correct=cls._boolean(value["correct"], "correct"),
             kernel_time_us=(
                 None if value.get("kernel_time_us") is None else float(value["kernel_time_us"])
             ),
-            exploration_succeeded=bool(value["exploration_succeeded"]),
+            exploration_succeeded=cls._boolean(
+                value["exploration_succeeded"], "exploration_succeeded"
+            ),
             iterations=int(value["iterations"]),
             tokens=int(value["tokens"]),
             wall_time_s=float(value["wall_time_s"]),
             reproducible=(
-                None if value.get("reproducible") is None else bool(value["reproducible"])
+                None
+                if value.get("reproducible") is None
+                else cls._boolean(value["reproducible"], "reproducible")
             ),
         )
 
