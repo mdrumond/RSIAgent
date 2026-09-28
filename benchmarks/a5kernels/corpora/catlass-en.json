@@ -1,0 +1,17 @@
+{
+  "collection": "catlass-en-935e9f5",
+  "files": [
+    {"path": "README.md", "sha256": "eb86078a6f41d9df8d03dd5591e320a321a78580ddf42f4949ca50f6a8040447"},
+    {"path": "docs/api.md", "sha256": "9b4abb8d1865d051c104f5643851144b41f8dc5da74d1196bd7e03c247172539"},
+    {"path": "docs/quickstart.md", "sha256": "a4844f604d671772886d8af0f3bafe4ead829597e78ece9790cf5225febb2be7"},
+    {"path": "docs/tla/01_layout.md", "sha256": "c79c13f672206cd78f6d9b8159a101c25494f5c2b8343395ed8fd3b77e641b80"},
+    {"path": "docs/tla/02_tensor.md", "sha256": "6aa805d32079a84c7070abc6266261f7838e91b395a8731af898aff4331c69fe"},
+    {"path": "docs/tutorials.md", "sha256": "29c74aaf0f52075baa409f75efd58cd910f8c059f46c6ebbbed7307801fb6701"},
+    {"path": "examples/13_basic_matmul_tla/README.md", "sha256": "4ee54ef469155fc05aebd2a0ab3c12be76f45af60b620c70999151dcefa33d2b"},
+    {"path": "examples/13_basic_matmul_tla/basic_matmul_tla.cpp", "sha256": "c9ad73763899a0ba4934ce1b3f43c3f7219f6345fc97d4f5cd68fb66aedd6286"}
+  ],
+  "language": "en",
+  "name": "catlass-en",
+  "repository": "https://gitee.com/ascend/catlass.git",
+  "revision": "935e9f5efc62f97ce2d7d6b61e6041ad562bb910"
+}
