@@ -9,6 +9,7 @@ from typing import Any, Callable, Sequence
 from .knowledge import DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_REVISION
 
 EXPECTED_EMBEDDING_DIMENSION = 384
+QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 
 
 class EmbeddingLoadError(RuntimeError):
@@ -100,7 +101,12 @@ class PinnedBGEEmbeddings:
         self._tokenizer, self._encoder = tokenizer, encoder
         return tokenizer, encoder, self._torch
 
+    def embed_query(self, texts: Sequence[str]) -> list[list[float]]:
+        """Encode retrieval queries with the pinned BGE query instruction."""
+        return self.embed([QUERY_INSTRUCTION + text for text in texts])
+
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        """Encode passages without adding a retrieval instruction."""
         if not texts:
             return []
         if any(not isinstance(text, str) for text in texts):

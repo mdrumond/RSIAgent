@@ -175,6 +175,25 @@ def test_vector_ties_use_chunk_hash_as_stable_tiebreaker(tmp_path):
     assert expected in {hit.chunk_id for hit in hits}
 
 
+def test_query_falls_back_to_embed_for_backends_without_query_hook(tmp_path):
+    calls = []
+
+    class LegacyEmbeddings(FakeEmbeddings):
+        def embed(self, texts):
+            calls.append(list(texts))
+            return super().embed(texts)
+
+    source = tmp_path / "kernel.txt"
+    source.write_text("vector addition kernel\n", encoding="utf-8")
+    with KnowledgeDB(tmp_path / "knowledge.sqlite", LegacyEmbeddings()) as database:
+        database.index(tmp_path, [source], collection="docs", language="catlass")
+        hits = database.query("docs", "vector addition")
+
+    assert calls == [["vector addition kernel\n"], ["vector addition"]]
+    assert hits[0].path == "kernel.txt"
+    assert hits[0].vector_rank == 1
+
+
 def test_query_rejects_a_different_embedding_space_before_embedding(tmp_path):
     root = tmp_path / "sources"
     root.mkdir()

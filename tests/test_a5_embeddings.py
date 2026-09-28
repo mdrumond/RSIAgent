@@ -13,6 +13,7 @@ from benchmarks.a5kernels.kdb_cli import DEFAULT_BACKEND, _backend as load_backe
 from benchmarks.a5kernels.knowledge import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_REVISION,
+    KnowledgeDB,
 )
 
 
@@ -200,6 +201,25 @@ def test_cli_default_resolves_to_offline_pinned_backend():
 
     assert isinstance(backend, PinnedBGEEmbeddings)
     assert backend.local_files_only is True
+
+
+def test_kdb_prefixes_bge_queries_but_not_indexed_passages(tmp_path):
+    tokenizer = RecordingTokenizer()
+    backend, _ = _fake_backend(tokenizer, FakeEncoder())
+    source = tmp_path / "kernel.txt"
+    source.write_text("vector addition kernel\n", encoding="utf-8")
+
+    with KnowledgeDB(tmp_path / "knowledge.sqlite", backend) as database:
+        database.index(tmp_path, [source], collection="docs", language="catlass")
+        hits = database.query("docs", "vector addition")
+
+    assert [batch for batch, _ in tokenizer.batches] == [
+        ["vector addition kernel\n"],
+        ["Represent this sentence for searching relevant passages: vector addition"],
+    ]
+    assert hits[0].path == "kernel.txt"
+    assert hits[0].lexical_rank == 1
+    assert hits[0].vector_rank == 1
 
 
 def test_real_tensor_cls_pooling_ignores_other_tokens_and_is_repeatable():
