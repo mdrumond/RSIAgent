@@ -117,7 +117,9 @@ def _cell(*, knowledge=KnowledgeMode.WITHOUT_KDB,
 def _caps(**kwargs):
     return RuntimeCapabilities(
         languages=frozenset({Language.CATLASS_DSL}),
-        model_ids=frozenset({"openai/gpt-5.6-sol"}), **kwargs)
+        model_ids=frozenset({"openai/gpt-5.6-sol"}),
+        workloads=frozenset(Workload),
+        **kwargs)
 
 
 @pytest.mark.parametrize("text", [
