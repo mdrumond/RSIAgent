@@ -355,6 +355,8 @@ def aggregate_report(results: Iterable[RunMetrics]) -> dict[str, object]:
 
 def load_metrics(path: Path) -> tuple[RunMetrics, ...]:
     payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, Mapping):
+        payload = [payload]
     if not isinstance(payload, list):
-        raise ValueError("report input must be a JSON list")
+        raise ValueError("report input must be a JSON object or list")
     return tuple(RunMetrics.from_mapping(item) for item in payload)

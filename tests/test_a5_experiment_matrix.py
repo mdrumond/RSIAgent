@@ -280,6 +280,28 @@ def test_report_cli_orders_correctness_before_performance(tmp_path, capsys) -> N
     assert payload["reproducibility"] == {"measured": 1, "reproducible": 1}
 
 
+def test_report_cli_accepts_one_trial_metrics_object(tmp_path, capsys) -> None:
+    input_path = tmp_path / "trial.json"
+    input_path.write_text(json.dumps({
+        "cell_id": "cell-a",
+        "workload": "smoke-vector-add",
+        "correct": True,
+        "kernel_time_us": 2.5,
+        "exploration_succeeded": True,
+        "iterations": 4,
+        "tokens": None,
+        "wall_time_s": 1.25,
+    }), encoding="utf-8")
+
+    assert main(["report", str(input_path)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["correctness"] == {"passed": 1, "total": 1}
+    assert payload["tokens"] is None
+    assert payload["token_usage"] == {
+        "known_total": 0, "measured": 0, "total": 1,
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
