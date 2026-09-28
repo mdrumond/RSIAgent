@@ -86,6 +86,21 @@ class ExperimentCell:
     memory_id: str
     workspace_id: str
 
+    def __post_init__(self) -> None:
+        dimensions = (
+            ("model", self.model, ModelProfile),
+            ("language", self.language, Language),
+            ("knowledge", self.knowledge, KnowledgeMode),
+            ("profiling", self.profiling, ProfilingMode),
+        )
+        for field, value, expected in dimensions:
+            if not isinstance(value, expected):
+                raise ValueError(f"{field} must be a {expected.__name__}")
+        for field in ("cell_id", "context_id", "memory_id", "workspace_id"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not value or value != value.strip():
+                raise ValueError(f"{field} must be a non-empty trimmed string")
+
 
 @dataclass(frozen=True)
 class DeterminismTrial:

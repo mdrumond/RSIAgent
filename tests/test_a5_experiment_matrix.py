@@ -7,6 +7,7 @@ import pytest
 from benchmarks.a5kernels.fixtures import Language
 from benchmarks.a5kernels.matrix import (
     CapabilityUnavailableError,
+    ExperimentCell,
     ExperimentOrchestrator,
     GPT_5_6_SOL,
     KnowledgeMode,
@@ -119,6 +120,43 @@ def test_initial_matrix_is_exact_cartesian_product_with_isolated_state() -> None
 def test_matrix_rejects_noncanonical_model_routes() -> None:
     with pytest.raises(ValueError, match="canonical A5 model route"):
         initial_matrix(ModelProfile("other", "openai/other", "OpenAI"))
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("model", {"model_id": "openai/gpt-5.6-sol"}, "ModelProfile"),
+        ("language", "catlass-dsl", "Language"),
+        ("knowledge", "with-kdb", "KnowledgeMode"),
+        ("profiling", "with-profiling-guidance", "ProfilingMode"),
+    ],
+)
+def test_experiment_cell_rejects_raw_reconstructed_dimensions(
+    field, value, expected
+) -> None:
+    cell = initial_matrix().cells[0]
+    values = {
+        name: getattr(cell, name)
+        for name in ExperimentCell.__dataclass_fields__
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=rf"{field} must be a {expected}"):
+        ExperimentCell(**values)
+
+
+@pytest.mark.parametrize("field", ["cell_id", "context_id", "memory_id", "workspace_id"])
+@pytest.mark.parametrize("value", ["", " untrimmed ", 1])
+def test_experiment_cell_requires_well_formed_identifiers(field, value) -> None:
+    cell = initial_matrix().cells[0]
+    values = {
+        name: getattr(cell, name)
+        for name in ExperimentCell.__dataclass_fields__
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=rf"{field} must be a non-empty trimmed string"):
+        ExperimentCell(**values)
 
 
 def test_determinism_schedule_is_three_catlass_baseline_repeats() -> None:
