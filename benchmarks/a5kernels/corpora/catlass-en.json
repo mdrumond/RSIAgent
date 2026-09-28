@@ -1,0 +1,16 @@
+{
+  "collection": "catlass-dsl-en-9a6ac62",
+  "files": [
+    {"path": "python/tla_dsl/docs/en/api/host_api_reference.md", "sha256": "f4fdc8db92243156735a4d2bb81ce127c9effbdb1076b7a2ba971cceb921e0e1"},
+    {"path": "python/tla_dsl/docs/en/api/kernel_api_reference.md", "sha256": "9b472e9c7c9e165839c85323e6aef5a20c9d3e064ade3f0cca553478736a48f0"},
+    {"path": "python/tla_dsl/docs/en/core_concepts/control_flow.md", "sha256": "8fe45a54d0c246b8b2937350accc00fbec8132b0b423c5bbe6de5c3c33343481"},
+    {"path": "python/tla_dsl/docs/en/core_concepts/syntax_guide.md", "sha256": "ce383f5a4a379dd6eb8740f55864e899e66e5bce1ecc70739aa59b40d2a578fc"},
+    {"path": "python/tla_dsl/docs/en/index.md", "sha256": "82a2816935bde68373332b9ada76b908c47eea94212eb1b37aeaab0eaffb3529"},
+    {"path": "python/tla_dsl/examples/end_to_end/basic_vadd/basic_vadd.py", "sha256": "e98779688d823c1911889cc64d8bf46818558a933656f56183728857e247d9bd"},
+    {"path": "python/tla_dsl/examples/end_to_end/vector_ops/binary_op.py", "sha256": "f824a49f4ba266a1e1a9443afd368e033b527e2780a7f5bb620a644fbbfdb9c5"}
+  ],
+  "language": "en",
+  "name": "catlass-en",
+  "repository": "https://gitcode.com/cann/catlass.git",
+  "revision": "9a6ac627b5f4078060287844189730cf0d184800"
+}

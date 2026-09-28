@@ -9,6 +9,7 @@ id_rsa*
 
 # Experiment state must stay outside the source release
 /results/
+/artifacts/
 /_preserve/
 /experiment_packages/
 /docker_vm_data/
