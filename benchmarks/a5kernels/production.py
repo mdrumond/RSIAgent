@@ -14,6 +14,8 @@ from config.runtime_paths import resolve_env_file
 
 PILOT_CELL_ID = "cell-97d03f4e20e35d21"
 PILOT_WORKLOAD = "smoke-vector-add"
+_MAX_PREFLIGHT_CHUNKS = 100_000
+_PREFLIGHT_CHUNK_BATCH = 512
 
 
 def _transformers_cache(path: Path) -> Path:
@@ -176,6 +178,7 @@ def preflight(
 def _probe_knowledge_query(database, collection: str) -> None:
     """Prove the selected read-only collection supports the production query path."""
 
+    from benchmarks.a5kernels.knowledge import SearchHit
     from benchmarks.a5kernels.knowledge_agent import validate_knowledge_hit
 
     # This exercises current per-collection FTS metadata/table lookup, vector
@@ -183,6 +186,40 @@ def _probe_knowledge_query(database, collection: str) -> None:
     # reaches an Actor, without writing or migrating the database.
     for hit in database.query(collection, "A5 preflight", limit=1):
         validate_knowledge_hit(database, collection, hit)
+
+    # Vector retrieval considers every stored chunk, not merely the first hit of
+    # this fixed query. Validate that complete reachable set through the identical
+    # citation gate in bounded pages. Oversized research collections fail closed
+    # rather than turning preflight into an unbounded scan.
+    total = database.connection.execute(
+        "SELECT count(*) FROM chunks WHERE collection = ?", (collection,)
+    ).fetchone()[0]
+    if total > _MAX_PREFLIGHT_CHUNKS:
+        raise ValueError("selected collection exceeds the preflight chunk bound")
+    cursor = 0
+    validated = 0
+    while True:
+        rows = database.connection.execute(
+            """SELECT rowid, chunk_id, path, start_line, end_line, text
+               FROM chunks WHERE collection = ? AND rowid > ?
+               ORDER BY rowid LIMIT ?""",
+            (collection, cursor, _PREFLIGHT_CHUNK_BATCH),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            validate_knowledge_hit(
+                database,
+                collection,
+                SearchHit(
+                    row["chunk_id"], row["path"], row["start_line"], row["end_line"],
+                    row["text"], 0.0, None, None, None,
+                ),
+            )
+        validated += len(rows)
+        cursor = rows[-1]["rowid"]
+    if validated != total:
+        raise RuntimeError("selected collection changed during read-only preflight")
 
 
 def _probe_catlass_runtime(paths: ProductionPaths) -> None:

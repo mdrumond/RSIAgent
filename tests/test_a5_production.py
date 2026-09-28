@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
@@ -207,6 +208,50 @@ def test_preflight_rejects_query_hit_with_corrupted_chunk_bytes(
     monkeypatch.setattr(
         "benchmarks.a5kernels.embeddings.PinnedBGEEmbeddings", TinyEmbeddings
     )
+
+    report = preflight(
+        paths,
+        environment={"OPENROUTER_API_KEY": "configured"},
+        runtime_probe=lambda _paths: None,
+    )
+
+    assert report["checks"]["kdb_manifest"] is True
+    assert report["checks"]["kdb_query"] is False
+    assert report["ready"] is False
+
+
+def test_preflight_validates_corrupted_chunk_beyond_first_query_hit(
+    monkeypatch, tmp_path
+):
+    paths, _wrappers = _inputs(tmp_path)
+    text = "unrelated second chunk\n"
+    chunk_id = hashlib.sha256(
+        f"vector.py\0{1}\0{1}\0{text}".encode()
+    ).hexdigest()
+    with sqlite3.connect(paths.kdb) as connection:
+        table = connection.execute(
+            "SELECT fts_table FROM collections WHERE name = ?", (paths.collection,)
+        ).fetchone()[0]
+        cursor = connection.execute(
+            """INSERT INTO chunks
+               (collection, chunk_id, path, start_line, end_line, text, vector_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (paths.collection, chunk_id, "vector.py", 1, 1, text, "[1.0,-1.0]"),
+        )
+        connection.execute(
+            f"INSERT INTO {table}(rowid, text) VALUES (?, ?)",
+            (cursor.lastrowid, text),
+        )
+        connection.execute(
+            "UPDATE chunks SET text = ? WHERE rowid = ?",
+            (text + "corrupted", cursor.lastrowid),
+        )
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.embeddings.PinnedBGEEmbeddings", TinyEmbeddings
+    )
+    with KnowledgeDB.open_read_only(paths.kdb, TinyEmbeddings()) as database:
+        first = database.query(paths.collection, "A5 preflight", limit=1)
+        assert first and first[0].chunk_id != chunk_id
 
     report = preflight(
         paths,
