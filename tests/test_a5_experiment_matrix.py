@@ -182,6 +182,22 @@ def test_runtime_capabilities_require_typed_nonempty_workloads(workloads) -> Non
 
 
 @pytest.mark.parametrize(
+    "languages",
+    [
+        {Language.CATLASS_DSL},
+        frozenset({"catlass-dsl"}),
+    ],
+)
+def test_runtime_capabilities_require_typed_immutable_languages(languages) -> None:
+    with pytest.raises(ValueError, match="languages must be a frozenset of Language"):
+        RuntimeCapabilities(
+            languages=languages,
+            model_profiles=frozenset({GPT_5_6_SOL}),
+            workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
+        )
+
+
+@pytest.mark.parametrize(
     "model_profiles",
     [
         {GPT_5_6_SOL},

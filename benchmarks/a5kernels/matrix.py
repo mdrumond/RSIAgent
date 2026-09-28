@@ -188,6 +188,11 @@ class RuntimeCapabilities:
 
     def __post_init__(self) -> None:
         if (
+            not isinstance(self.languages, frozenset)
+            or any(not isinstance(language, Language) for language in self.languages)
+        ):
+            raise ValueError("languages must be a frozenset of Language")
+        if (
             not isinstance(self.model_profiles, frozenset)
             or any(
                 not isinstance(profile, ModelProfile)
