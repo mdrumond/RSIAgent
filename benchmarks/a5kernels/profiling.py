@@ -8,12 +8,13 @@ side instead of trusting an exploring agent to describe its own performance.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
 from pathlib import PurePosixPath
 import re
-from typing import Protocol
+from statistics import median, pstdev
+from typing import Protocol, Sequence
 
 from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult, canonical_hash
 
@@ -386,3 +387,317 @@ class ProfilingTreatmentController:
             pipe.summary,
             (basic.evidence.manifest_sha256, pipe.evidence.manifest_sha256),
         )
+
+
+class StudyPreset(str, Enum):
+    TIMING_STUDY = "timing-study"
+    BASIC_INFO = "basic-info"
+    PIPE_UTILIZATION = "pipe-utilization"
+    OPTIMIZATION_COMPARISON = "optimization-comparison"
+
+
+class ShapeClass(str, Enum):
+    N32 = "n32"
+    N64 = "n64"
+    N128 = "n128"
+    N256 = "n256"
+    N512 = "n512"
+
+
+class PaddingClass(str, Enum):
+    NONE = "none"
+    ALIGN_64 = "align-64"
+    ALIGN_256 = "align-256"
+
+
+class AccessClass(str, Enum):
+    CONTIGUOUS = "contiguous"
+    STRIDED_2 = "strided-2"
+    TILED = "tiled"
+
+
+class ParallelismClass(int, Enum):
+    ONE = 1
+    TWO = 2
+    FOUR = 4
+    EIGHT = 8
+    SIXTEEN = 16
+    TWENTY_FOUR = 24
+    TWENTY_EIGHT = 28
+
+
+class MetricDomain(str, Enum):
+    TIMING = "timing"
+    BASIC_INFO = "basic-info"
+    PIPE_UTILIZATION = "pipe-utilization"
+
+
+@dataclass(frozen=True)
+class StudyDimensions:
+    """One point in the preregistered, bounded Phase 1 design space."""
+
+    shape: ShapeClass
+    padding: PaddingClass
+    access: AccessClass
+    parallelism: ParallelismClass
+
+    def __post_init__(self) -> None:
+        for name, expected in (
+            ("shape", ShapeClass),
+            ("padding", PaddingClass),
+            ("access", AccessClass),
+            ("parallelism", ParallelismClass),
+        ):
+            if not isinstance(getattr(self, name), expected):
+                raise ValueError(f"{name} must use the host-owned {expected.__name__}")
+
+    def as_dict(self) -> dict[str, str | int]:
+        return {
+            "shape": self.shape.value,
+            "padding": self.padding.value,
+            "access": self.access.value,
+            "parallelism": self.parallelism.value,
+        }
+
+
+@dataclass(frozen=True)
+class StudyVariant:
+    request: ProfileRequest
+    correctness: VerifiedResult
+    dimensions: StudyDimensions
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.request, ProfileRequest):
+            raise TypeError("request must be a ProfileRequest")
+        if not isinstance(self.correctness, VerifiedResult):
+            raise TypeError("correctness must be a VerifiedResult")
+        if not isinstance(self.dimensions, StudyDimensions):
+            raise TypeError("dimensions must be StudyDimensions")
+
+    @property
+    def variant_id(self) -> str:
+        return "variant-" + canonical_hash({
+            "attempt_id": self.request.attempt_id,
+            # Presets, not callers, own warmup and launch flags.  Bind only the
+            # invariant executable/profile identity here.
+            "device": self.request.device,
+            "dimensions": self.dimensions.as_dict(),
+            "execution_id": self.request.execution_id,
+            "implementation": self.request.implementation,
+            "kernel": self.request.expected_kernel,
+            "source_fingerprint": self.request.source_fingerprint,
+        })[:24]
+
+
+@dataclass(frozen=True)
+class StudyTimingSample:
+    duration_us: float
+    source_fingerprint: str
+    execution_id: str
+    replay_id: str
+    evidence_sha256: str
+
+
+class Phase1StudyBackend(Protocol):
+    """Measurement authority; callers never provide durations, summaries, or flags."""
+
+    def time_sample(self, command: TimingCommand) -> StudyTimingSample: ...
+
+    def capture(self, command: CaptureCommand) -> ProfileCapture: ...
+
+
+@dataclass(frozen=True)
+class TimingStudyResult:
+    variant_id: str
+    raw_samples_us: tuple[float, ...]
+    median_us: float
+    coefficient_of_variation: float
+    evidence_sha256: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MetricStudyResult:
+    variant_id: str
+    domain: MetricDomain
+    summary: tuple[tuple[str, str], ...]
+    evidence_manifest_sha256: str
+
+
+@dataclass(frozen=True)
+class OptimizationComparison:
+    baseline_variant_id: str
+    speedup_by_variant: tuple[tuple[str, float], ...]
+
+
+@dataclass(frozen=True)
+class Phase1StudyResult:
+    preset: StudyPreset
+    timing: tuple[TimingStudyResult, ...] = ()
+    metrics: tuple[MetricStudyResult, ...] = ()
+    comparison: OptimizationComparison | None = None
+
+
+class Phase1PerformanceStudy:
+    """Execute fixed Phase 1 presets against exact, correctness-approved variants."""
+
+    TIMING_WARM_UP = 5
+    TIMING_LAUNCH_COUNT = 20
+    TIMING_SAMPLES = 3
+
+    def __init__(
+        self,
+        backend: Phase1StudyBackend,
+        *,
+        max_archive_bytes: int = 16 * 1024 * 1024,
+    ) -> None:
+        self._backend = backend
+        self._max_archive_bytes = max_archive_bytes
+
+    def run(
+        self, preset: StudyPreset, variants: Sequence[StudyVariant]
+    ) -> Phase1StudyResult:
+        if not isinstance(preset, StudyPreset):
+            raise ValueError("preset must be a host-owned StudyPreset")
+        variants = tuple(variants)
+        if not variants:
+            raise ValueError("a Phase 1 study requires at least one variant")
+        if any(not isinstance(item, StudyVariant) for item in variants):
+            raise TypeError("variants must contain only StudyVariant values")
+        if preset is not StudyPreset.OPTIMIZATION_COMPARISON and len(variants) != 1:
+            raise ValueError(f"{preset.value} requires exactly one variant")
+        if preset is StudyPreset.OPTIMIZATION_COMPARISON and len(variants) < 2:
+            raise ValueError("optimization-comparison requires at least two variants")
+        if len({item.variant_id for item in variants}) != len(variants):
+            raise ValueError("study variants must have distinct exact identities")
+        if preset is StudyPreset.OPTIMIZATION_COMPARISON:
+            comparison_route = {
+                (
+                    item.request.device,
+                    item.request.expected_kernel,
+                    item.request.implementation,
+                )
+                for item in variants
+            }
+            if len(comparison_route) != 1:
+                raise ValueError(
+                    "optimization variants must share device, kernel, and implementation"
+                )
+        for variant in variants:
+            ProfilingTreatmentController._validate_correctness(
+                variant.correctness, variant.request
+            )
+
+        if preset in (StudyPreset.TIMING_STUDY, StudyPreset.OPTIMIZATION_COMPARISON):
+            timing = tuple(self._timing(preset, variant) for variant in variants)
+            comparison = None
+            if preset is StudyPreset.OPTIMIZATION_COMPARISON:
+                baseline = timing[0]
+                comparison = OptimizationComparison(
+                    baseline.variant_id,
+                    tuple(
+                        (result.variant_id, baseline.median_us / result.median_us)
+                        for result in timing
+                    ),
+                )
+            return Phase1StudyResult(preset, timing=timing, comparison=comparison)
+
+        variant = variants[0]
+        basic = self._capture(preset, variant, ProfileMetric.BASIC_INFO)
+        metrics = [self._metric_result(variant, basic)]
+        if preset is StudyPreset.PIPE_UTILIZATION:
+            if basic.exported_kernels.count(variant.request.expected_kernel) != 1:
+                raise ValueError("BasicInfo did not identify the exact expected kernel once")
+            pipe = self._capture(preset, variant, ProfileMetric.PIPE_UTILIZATION)
+            metrics.append(self._metric_result(variant, pipe))
+        return Phase1StudyResult(preset, metrics=tuple(metrics))
+
+    def _timing(self, preset: StudyPreset, variant: StudyVariant) -> TimingStudyResult:
+        request = replace(
+            variant.request,
+            warm_up=self.TIMING_WARM_UP,
+            launch_count=self.TIMING_LAUNCH_COUNT,
+        )
+        samples = []
+        for index in range(1, self.TIMING_SAMPLES + 1):
+            command = TimingCommand(
+                CampaignKind.FINAL,
+                request,
+                self._study_replay_id(preset, variant, MetricDomain.TIMING, index),
+            )
+            sample = self._backend.time_sample(command)
+            if (
+                not math.isfinite(sample.duration_us)
+                or sample.duration_us <= 0
+                or sample.source_fingerprint != request.source_fingerprint
+                or sample.execution_id != request.execution_id
+                or sample.replay_id != command.replay_id
+                or _SHA256.fullmatch(sample.evidence_sha256) is None
+            ):
+                raise ValueError("timing sample does not match the exact study replay")
+            samples.append(sample)
+        values = tuple(sample.duration_us for sample in samples)
+        mean = sum(values) / len(values)
+        return TimingStudyResult(
+            variant.variant_id,
+            values,
+            median(values),
+            pstdev(values) / mean,
+            tuple(sample.evidence_sha256 for sample in samples),
+        )
+
+    def _capture(
+        self, preset: StudyPreset, variant: StudyVariant, metric: ProfileMetric
+    ) -> ProfileCapture:
+        request = replace(variant.request, warm_up=0, launch_count=1)
+        command = CaptureCommand(
+            CampaignKind.FINAL,
+            request,
+            metric,
+            self._study_replay_id(
+                preset,
+                variant,
+                MetricDomain.BASIC_INFO if metric is ProfileMetric.BASIC_INFO
+                else MetricDomain.PIPE_UTILIZATION,
+                1,
+            ),
+            kernel_name=(
+                None if metric is ProfileMetric.BASIC_INFO else request.expected_kernel
+            ),
+        )
+        capture = self._backend.capture(command)
+        ProfilingTreatmentController._validate_capture(self, capture, command)
+        ProfilingTreatmentController._validate_summary(capture, metric.value)
+        if metric is ProfileMetric.BASIC_INFO:
+            if capture.exported_kernels.count(request.expected_kernel) != 1:
+                raise ValueError("BasicInfo did not identify the exact expected kernel once")
+        elif capture.exported_kernels != (request.expected_kernel,):
+            raise ValueError("PipeUtilization did not identify the exact expected kernel once")
+        return capture
+
+    @staticmethod
+    def _metric_result(variant: StudyVariant, capture: ProfileCapture) -> MetricStudyResult:
+        domain = (
+            MetricDomain.BASIC_INFO
+            if capture.metric is ProfileMetric.BASIC_INFO
+            else MetricDomain.PIPE_UTILIZATION
+        )
+        return MetricStudyResult(
+            variant.variant_id,
+            domain,
+            capture.summary,
+            capture.evidence.manifest_sha256,
+        )
+
+    @staticmethod
+    def _study_replay_id(
+        preset: StudyPreset,
+        variant: StudyVariant,
+        domain: MetricDomain,
+        ordinal: int,
+    ) -> str:
+        return "study-" + canonical_hash({
+            "domain": domain.value,
+            "ordinal": ordinal,
+            "preset": preset.value,
+            "variant_id": variant.variant_id,
+        })

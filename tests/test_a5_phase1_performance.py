@@ -1,0 +1,228 @@
+from dataclasses import replace
+
+import pytest
+
+from benchmarks.a5kernels.profiling import (
+    AccessClass,
+    MetricDomain,
+    PaddingClass,
+    ParallelismClass,
+    Phase1PerformanceStudy,
+    ProfileCapture,
+    ProfileMetric,
+    ShapeClass,
+    StudyDimensions,
+    StudyPreset,
+    StudyTimingSample,
+    StudyVariant,
+)
+from tests.test_a5kernels_profiling import (
+    CORRECT,
+    REQUEST,
+    SOURCE,
+    archive,
+)
+
+
+SHA = "b" * 64
+
+
+def dimensions(parallelism=ParallelismClass.ONE):
+    return StudyDimensions(
+        ShapeClass.N32,
+        PaddingClass.ALIGN_64,
+        AccessClass.CONTIGUOUS,
+        parallelism,
+    )
+
+
+def variant(*, parallelism=ParallelismClass.ONE, attempt="attempt-1"):
+    request = replace(REQUEST, plan=replace(REQUEST.plan, attempt_id=attempt))
+    correctness = replace(
+        CORRECT,
+        attempt_id=request.attempt_id,
+        execution_id=request.execution_id,
+        source_fingerprint=request.source_fingerprint,
+        request_id=request.request_id,
+    )
+    return StudyVariant(request, correctness, dimensions(parallelism))
+
+
+class FakeStudyBackend:
+    def __init__(self, timings=(10.0, 12.0, 11.0)):
+        self.timings = iter(timings)
+        self.commands = []
+
+    def time_sample(self, command):
+        self.commands.append(command)
+        return StudyTimingSample(
+            next(self.timings),
+            command.request.source_fingerprint,
+            command.request.execution_id,
+            command.replay_id,
+            SHA,
+        )
+
+    def capture(self, command):
+        self.commands.append(command)
+        summary = (
+            (("frequency_mhz", "1800"),)
+            if command.metric is ProfileMetric.BASIC_INFO
+            else (("vector_ratio", "0.75"),)
+        )
+        return ProfileCapture(
+            command.metric,
+            command.request.source_fingerprint,
+            command.request.execution_id,
+            command.replay_id,
+            (command.request.expected_kernel,),
+            summary,
+            archive(command.metric.value),
+        )
+
+
+def test_timing_study_is_three_fixed_minimally_instrumented_samples():
+    backend = FakeStudyBackend()
+    result = Phase1PerformanceStudy(backend).run(
+        StudyPreset.TIMING_STUDY, [variant()]
+    )
+
+    timing = result.timing[0]
+    assert timing.raw_samples_us == (10.0, 12.0, 11.0)
+    assert timing.median_us == 11.0
+    assert timing.coefficient_of_variation == pytest.approx(0.0742269)
+    assert timing.evidence_sha256 == (SHA, SHA, SHA)
+    assert len({command.replay_id for command in backend.commands}) == 3
+    assert all(command.request.warm_up == 5 for command in backend.commands)
+    assert all(command.request.launch_count == 20 for command in backend.commands)
+    assert all(command.profiler_enabled is False for command in backend.commands)
+
+
+def test_preset_ignores_caller_launch_flags_for_identity_and_commands():
+    normal = variant()
+    caller_flags = replace(
+        normal,
+        request=replace(normal.request, warm_up=99, launch_count=999),
+    )
+    backend = FakeStudyBackend()
+
+    Phase1PerformanceStudy(backend).run(StudyPreset.TIMING_STUDY, [caller_flags])
+
+    assert caller_flags.variant_id == normal.variant_id
+    assert all(command.request.warm_up == 5 for command in backend.commands)
+    assert all(command.request.launch_count == 20 for command in backend.commands)
+
+
+def test_basic_and_pipe_presets_keep_metric_domains_in_separate_replays():
+    basic_backend = FakeStudyBackend()
+    basic = Phase1PerformanceStudy(basic_backend).run(
+        StudyPreset.BASIC_INFO, [variant()]
+    )
+    assert [item.domain for item in basic.metrics] == [MetricDomain.BASIC_INFO]
+    assert basic_backend.commands[0].kernel_name is None
+
+    pipe_backend = FakeStudyBackend()
+    pipe = Phase1PerformanceStudy(pipe_backend).run(
+        StudyPreset.PIPE_UTILIZATION, [variant()]
+    )
+    assert [item.domain for item in pipe.metrics] == [
+        MetricDomain.BASIC_INFO,
+        MetricDomain.PIPE_UTILIZATION,
+    ]
+    assert [command.metric for command in pipe_backend.commands] == [
+        ProfileMetric.BASIC_INFO,
+        ProfileMetric.PIPE_UTILIZATION,
+    ]
+    assert pipe_backend.commands[1].kernel_name == REQUEST.expected_kernel
+    assert pipe.metrics[0].evidence_manifest_sha256 != ""
+    assert pipe.metrics[1].evidence_manifest_sha256 != ""
+
+
+def test_optimization_comparison_preserves_synthetic_parallelism_knee():
+    variants = [
+        variant(parallelism=ParallelismClass.ONE, attempt="p1"),
+        variant(parallelism=ParallelismClass.FOUR, attempt="p4"),
+        variant(parallelism=ParallelismClass.EIGHT, attempt="p8"),
+    ]
+    # Improvement is large through p4 and nearly flat at p8: retain raw results
+    # and host-computed speedups rather than asking an agent for measured values.
+    backend = FakeStudyBackend((100, 101, 99, 55, 54, 56, 53, 54, 52))
+    result = Phase1PerformanceStudy(backend).run(
+        StudyPreset.OPTIMIZATION_COMPARISON, variants
+    )
+
+    assert [item.median_us for item in result.timing] == [100, 55, 53]
+    assert result.comparison is not None
+    assert result.comparison.baseline_variant_id == variants[0].variant_id
+    assert dict(result.comparison.speedup_by_variant) == pytest.approx({
+        variants[0].variant_id: 1.0,
+        variants[1].variant_id: 100 / 55,
+        variants[2].variant_id: 100 / 53,
+    })
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("shape", "n32"),
+        ("padding", "align-64"),
+        ("access", "contiguous"),
+        ("parallelism", 28),
+    ],
+)
+def test_dimensions_reject_agent_selected_raw_values(field, value):
+    values = {
+        "shape": ShapeClass.N32,
+        "padding": PaddingClass.ALIGN_64,
+        "access": AccessClass.CONTIGUOUS,
+        "parallelism": ParallelismClass.ONE,
+    }
+    values[field] = value
+    with pytest.raises(ValueError, match="host-owned"):
+        StudyDimensions(**values)
+
+
+def test_failed_correctness_stops_before_study_side_effects():
+    backend = FakeStudyBackend()
+    failed = replace(variant(), correctness=replace(CORRECT, passed=False))
+
+    with pytest.raises(ValueError, match="correctness must pass"):
+        Phase1PerformanceStudy(backend).run(StudyPreset.TIMING_STUDY, [failed])
+    assert backend.commands == []
+
+
+@pytest.mark.parametrize("preset", list(StudyPreset))
+def test_presets_reject_unbounded_or_ambiguous_variant_counts(preset):
+    study = Phase1PerformanceStudy(FakeStudyBackend())
+    with pytest.raises(ValueError):
+        study.run(preset, [])
+    if preset is StudyPreset.OPTIMIZATION_COMPARISON:
+        with pytest.raises(ValueError, match="at least two"):
+            study.run(preset, [variant()])
+    else:
+        with pytest.raises(ValueError, match="exactly one"):
+            study.run(preset, [variant(attempt="one"), variant(attempt="two")])
+
+
+def test_backend_cannot_return_stale_identity_or_unhashed_timing():
+    class StaleBackend(FakeStudyBackend):
+        def time_sample(self, command):
+            return replace(super().time_sample(command), execution_id="stale", evidence_sha256="")
+
+    with pytest.raises(ValueError, match="exact study replay"):
+        Phase1PerformanceStudy(StaleBackend()).run(
+            StudyPreset.TIMING_STUDY, [variant()]
+        )
+
+
+def test_comparison_rejects_mixed_devices_before_measurement():
+    backend = FakeStudyBackend()
+    first = variant(attempt="device-3")
+    second = variant(attempt="device-4", parallelism=ParallelismClass.FOUR)
+    second = replace(second, request=replace(second.request, device=4))
+
+    with pytest.raises(ValueError, match="share device, kernel, and implementation"):
+        Phase1PerformanceStudy(backend).run(
+            StudyPreset.OPTIMIZATION_COMPARISON, [first, second]
+        )
+    assert backend.commands == []
