@@ -264,7 +264,13 @@ class TrialActionExecutor:
         self._require_source()
         self.final_run = self.backend.run(
             self.workspace, self.language, self.workload, "final", self.ledger)
-        self.final_profile = self.profiling.final(self.final_run)
+        if self.final_run.verified.passed:
+            self.final_profile = self.profiling.final(self.final_run)
+        else:
+            self.final_profile = {
+                "available": False,
+                "reason": "correctness-failed",
+            }
         return self._observation("submitted", terminal=True,
                                  passed=self.final_run.verified.passed,
                                  attestation_sha256=self.final_run.verified.attestation_sha256)

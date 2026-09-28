@@ -153,8 +153,11 @@ def test_end_to_end_result_is_host_owned_and_treatments_off_do_not_leak(tmp_path
     assert "secret" not in json.dumps(knowledge_observation)
     assert actor.observations[5] == {"host": {"available": False, "event": "profile"}}
     assert profile.intermediate_runs == []
-    assert profile.final_runs == [result.run]
-    assert result.final_profile["duration_us"] == 12.5
+    assert profile.final_runs == []
+    assert result.final_profile == {
+        "available": False,
+        "reason": "correctness-failed",
+    }
     assert result.workspace.parent.joinpath("memory", "knowledge.jsonl").is_file()
     assert len(result.evidence_sha256) == 64
 
