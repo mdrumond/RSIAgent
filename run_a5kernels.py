@@ -20,7 +20,7 @@ def _parser() -> argparse.ArgumentParser:
     for name, help_text in (
         (
             "preflight",
-            "check production inputs and run a bounded BZ device probe without model inference",
+            "check inputs and run a bounded BZ device probe without Actor/LLM inference",
         ),
         ("trial", "run the preregistered Catlass smoke-vector-add pilot"),
     ):
