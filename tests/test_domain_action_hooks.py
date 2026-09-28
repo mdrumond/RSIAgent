@@ -82,6 +82,27 @@ def test_domain_parser_and_executor_exchange_observations(monkeypatch, tmp_path)
     assert history[-1]["content"] == "submit candidate"
 
 
+def test_domain_loop_forwards_frozen_truncation_policy(monkeypatch, tmp_path):
+    requests = []
+    cfg = _cfg()
+    cfg.allow_truncation_retry = False
+
+    def fake_chat(*_args, **kwargs):
+        requests.append(kwargs)
+        return "submit candidate"
+
+    monkeypatch.setattr(loop, "chat", fake_chat)
+    result, _ = loop.run_attempt(
+        "author a kernel", VM(), cfg, ArtifactSink(str(tmp_path)),
+        turn_parser=lambda _text: KernelAction("submit"),
+        action_executor=lambda _action: loop.DomainActionResult(
+            "host verification passed", terminal=True),
+    )
+
+    assert result.status == "done"
+    assert requests[0]["allow_truncation_retry"] is False
+
+
 def test_terminal_domain_stall_skips_legacy_recovery(monkeypatch, tmp_path):
     cfg = _cfg()
     cfg.independent_verify = True
