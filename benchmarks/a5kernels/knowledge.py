@@ -220,18 +220,25 @@ class KnowledgeDB:
     def close(self) -> None:
         self.connection.close()
 
-    def read_only_view(self) -> "KnowledgeDB":
-        """Open an independently owned read-only view of this file-backed DB."""
+    @classmethod
+    def open_read_only(cls, path: Path, embeddings: EmbeddingBackend) -> "KnowledgeDB":
+        """Open an existing index without running schema creation or migrations."""
 
-        view = object.__new__(KnowledgeDB)
-        view.path = self.path
-        view.embeddings = self.embeddings
-        view.connection = sqlite3.connect(
-            self.path.resolve().as_uri() + "?mode=ro", uri=True
-        )
+        resolved = path.resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(resolved)
+        view = object.__new__(cls)
+        view.path = resolved
+        view.embeddings = embeddings
+        view.connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True)
         view.connection.row_factory = sqlite3.Row
         view.connection.execute("PRAGMA query_only = ON")
         return view
+
+    def read_only_view(self) -> "KnowledgeDB":
+        """Open an independently owned read-only view of this file-backed DB."""
+
+        return self.open_read_only(self.path, self.embeddings)
 
     def __enter__(self) -> "KnowledgeDB":
         return self
