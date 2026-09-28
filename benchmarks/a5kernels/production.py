@@ -60,6 +60,10 @@ class ProductionPaths:
         return self.tla_root / "execution-profiles/bz-a5/upload.sh"
 
     @property
+    def provenance_wrapper(self) -> Path:
+        return self.tla_root / "execution-profiles/bz-a5/catlass-provenance.sh"
+
+    @property
     def collection_wrapper(self) -> Path:
         return self.profiling_skill_root / "scripts/collect_profile.sh"
 
@@ -69,8 +73,7 @@ def _credential_present(environment: Mapping[str, str], env_file: Path) -> bool:
         return True
     try:
         for line in env_file.read_text(encoding="utf-8").splitlines():
-            name, separator, value = line.partition("=")
-            if separator and name.strip() == "OPENROUTER_API_KEY" and value.strip():
+            if line.startswith("OPENROUTER_API_KEY=") and line.split("=", 1)[1].strip():
                 return True
     except FileNotFoundError:
         pass
@@ -101,6 +104,7 @@ def preflight(
         "catlass_validation_wrapper": paths.validation_wrapper,
         "bz_session_wrapper": paths.session_wrapper,
         "bz_upload_wrapper": paths.upload_wrapper,
+        "catlass_provenance_wrapper": paths.provenance_wrapper,
         "profile_collection_wrapper": paths.collection_wrapper,
     }.items():
         checks[name] = wrapper.is_file() and os.access(wrapper, os.X_OK)
@@ -113,6 +117,7 @@ def preflight(
             "catlass_validation_wrapper",
             "bz_session_wrapper",
             "bz_upload_wrapper",
+            "catlass_provenance_wrapper",
         )
     ):
         try:

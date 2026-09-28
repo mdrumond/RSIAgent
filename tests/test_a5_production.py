@@ -35,6 +35,7 @@ def _inputs(tmp_path: Path) -> tuple[ProductionPaths, list[Path]]:
         tla / "execution-profiles/catlass-validation.sh",
         tla / "execution-profiles/bz-a5/session.sh",
         tla / "execution-profiles/bz-a5/upload.sh",
+        tla / "execution-profiles/bz-a5/catlass-provenance.sh",
         profile / "scripts/collect_profile.sh",
     ]
     for wrapper in wrappers:
@@ -82,6 +83,26 @@ def test_preflight_is_fail_closed_and_does_not_expose_secret(tmp_path):
     assert report["checks"]["kdb_manifest"] is True
     assert probed == [(TinyEmbeddings.model, TinyEmbeddings.revision)]
     assert "OPENROUTER_API_KEY" not in json.dumps(report)
+
+
+def test_dotenv_credential_syntax_matches_runtime_parser(tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+    env_file = tmp_path / ".env"
+    base = {"RSIAGENT_ENV_FILE": str(env_file)}
+
+    env_file.write_text(" OPENROUTER_API_KEY=not-runtime-visible\n", encoding="utf-8")
+    rejected = preflight(
+        paths, environment=base, embedding_probe=lambda _backend: None,
+        runtime_probe=lambda _paths: None,
+    )
+    env_file.write_text("OPENROUTER_API_KEY=runtime-visible\n", encoding="utf-8")
+    accepted = preflight(
+        paths, environment=base, embedding_probe=lambda _backend: None,
+        runtime_probe=lambda _paths: None,
+    )
+
+    assert rejected["checks"]["openrouter_credential"] is False
+    assert accepted["checks"]["openrouter_credential"] is True
 
 
 def test_preflight_checks_complete_local_inputs_without_model_or_bz_call(tmp_path):
@@ -165,6 +186,22 @@ def test_runtime_probe_binds_exact_source_and_revision(monkeypatch, tmp_path):
     assert captured["catlass_revision"] == "a" * 40
     assert captured["validation_wrapper"].endswith("catlass-validation.sh")
     assert captured["upload_wrapper"].endswith("upload.sh")
+
+
+def test_missing_provenance_wrapper_prevents_remote_probe(tmp_path):
+    paths, _wrappers = _inputs(tmp_path)
+    paths.provenance_wrapper.unlink()
+    calls = []
+    report = preflight(
+        paths,
+        environment={"OPENROUTER_API_KEY": "configured"},
+        embedding_probe=lambda _backend: None,
+        runtime_probe=lambda _paths: calls.append(True),
+    )
+
+    assert report["checks"]["catlass_provenance_wrapper"] is False
+    assert report["checks"]["catlass_runtime"] is False
+    assert calls == []
 
 
 def test_run_pilot_does_not_construct_actor_after_remote_preflight_failure(
