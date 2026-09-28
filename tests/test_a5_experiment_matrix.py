@@ -23,15 +23,88 @@ def test_initial_matrix_is_exact_cartesian_product_with_isolated_state() -> None
     plan = initial_matrix()
 
     assert len(plan.cells) == 12
-    dimensions = {
-        (cell.language, cell.knowledge, cell.profiling) for cell in plan.cells
-    }
-    assert dimensions == {
-        (language, knowledge, profiling)
-        for language in Language
-        for knowledge in KnowledgeMode
-        for profiling in ProfilingMode
-    }
+    assert [
+        (
+            cell.language.value,
+            cell.knowledge.value,
+            cell.profiling.value,
+            cell.cell_id,
+        )
+        for cell in plan.cells
+    ] == [
+        (
+            "catlass-dsl",
+            "without-kdb",
+            "without-profiling-guidance",
+            "cell-c82737a617458aec",
+        ),
+        (
+            "catlass-dsl",
+            "without-kdb",
+            "with-profiling-guidance",
+            "cell-2e8ae3a01ced7240",
+        ),
+        (
+            "catlass-dsl",
+            "with-kdb",
+            "without-profiling-guidance",
+            "cell-97d03f4e20e35d21",
+        ),
+        (
+            "catlass-dsl",
+            "with-kdb",
+            "with-profiling-guidance",
+            "cell-81f240b42785f7b8",
+        ),
+        (
+            "ascend-c",
+            "without-kdb",
+            "without-profiling-guidance",
+            "cell-d573b7b73a53c7b0",
+        ),
+        (
+            "ascend-c",
+            "without-kdb",
+            "with-profiling-guidance",
+            "cell-367667930dad49c5",
+        ),
+        (
+            "ascend-c",
+            "with-kdb",
+            "without-profiling-guidance",
+            "cell-72fb130cb2596232",
+        ),
+        (
+            "ascend-c",
+            "with-kdb",
+            "with-profiling-guidance",
+            "cell-42d9d469e0c26f40",
+        ),
+        (
+            "triton-ascend",
+            "without-kdb",
+            "without-profiling-guidance",
+            "cell-bca23414ed1536ff",
+        ),
+        (
+            "triton-ascend",
+            "without-kdb",
+            "with-profiling-guidance",
+            "cell-067c16f752ae28d1",
+        ),
+        (
+            "triton-ascend",
+            "with-kdb",
+            "without-profiling-guidance",
+            "cell-3de8364b311ad220",
+        ),
+        (
+            "triton-ascend",
+            "with-kdb",
+            "with-profiling-guidance",
+            "cell-b0a9bc751432d463",
+        ),
+    ]
     assert len({cell.context_id for cell in plan.cells}) == 12
     assert len({cell.memory_id for cell in plan.cells}) == 12
     assert len({cell.workspace_id for cell in plan.cells}) == 12

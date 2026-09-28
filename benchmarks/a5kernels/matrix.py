@@ -58,6 +58,23 @@ GPT_5_6_SOL = ModelProfile(
 )
 
 
+# These tuples are the preregistered initial experiment dimensions.  Keep them
+# explicit: extending one of the public enums must not silently alter this plan.
+_INITIAL_LANGUAGES = (
+    Language.CATLASS_DSL,
+    Language.ASCEND_C,
+    Language.TRITON_ASCEND,
+)
+_INITIAL_KNOWLEDGE_MODES = (
+    KnowledgeMode.WITHOUT_KDB,
+    KnowledgeMode.WITH_KDB,
+)
+_INITIAL_PROFILING_MODES = (
+    ProfilingMode.WITHOUT_GUIDANCE,
+    ProfilingMode.WITH_GUIDANCE,
+)
+
+
 @dataclass(frozen=True)
 class ExperimentCell:
     cell_id: str
@@ -112,9 +129,9 @@ def initial_matrix(model: ModelProfile = GPT_5_6_SOL) -> MatrixPlan:
     """Return the fixed 2 x 2 x 3 initial experiment matrix."""
 
     cells: list[ExperimentCell] = []
-    for language in Language:
-        for knowledge in KnowledgeMode:
-            for profiling in ProfilingMode:
+    for language in _INITIAL_LANGUAGES:
+        for knowledge in _INITIAL_KNOWLEDGE_MODES:
+            for profiling in _INITIAL_PROFILING_MODES:
                 dimensions = ":".join(
                     (model.model_id, language.value, knowledge.value, profiling.value)
                 )
