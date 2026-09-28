@@ -252,6 +252,19 @@ def test_every_profiling_setting_changes_all_replay_ids(changed) -> None:
     )
 
 
+def test_host_attempt_changes_all_replay_ids_without_changing_execution() -> None:
+    retry = replace(REQUEST, plan=replace(PLAN, attempt_id="attempt-2"))
+
+    assert retry.execution_id == REQUEST.execution_id
+    assert _final_replay_ids(retry) != _final_replay_ids(REQUEST)
+    assert all(
+        retry_id != original_id
+        for retry_id, original_id in zip(
+            _final_replay_ids(retry), _final_replay_ids(REQUEST)
+        )
+    )
+
+
 @pytest.mark.parametrize("stale_kind", ["timing", "capture"])
 def test_packets_from_another_profiling_configuration_are_rejected(stale_kind) -> None:
     baseline = _final_replay_ids(REQUEST)
@@ -544,6 +557,13 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     result = ProfilingTreatmentController(
         backend, treatment_enabled=False
     ).run_final(correctness, profiled_request)
+    retry_request = replace(
+        profiled_request,
+        plan=replace(profiled_plan, attempt_id="attempt-2"),
+    )
+    ProfilingTreatmentController(backend, treatment_enabled=False).run_final(
+        _correctness_for(retry_request), retry_request
+    )
 
     assert result.duration_us == 7.5
     assert result.pipe_utilization
@@ -570,21 +590,36 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     assert [call[call.index("--metric") + 1] for call in profile_calls] == [
         "BasicInfo",
         "PipeUtilization",
+        "BasicInfo",
+        "PipeUtilization",
     ]
     assert "--kernel-name" not in profile_calls[0]
     assert (
         profile_calls[1][profile_calls[1].index("--kernel-name") + 1]
         == profiled_request.expected_kernel
     )
-    assert len(
-        [call for call in calls if Path(call[0]).name == "collect_profile.sh"]
-    ) == 2
     collection_calls = [
         call for call in calls if Path(call[0]).name == "collect_profile.sh"
     ]
+    assert len(collection_calls) == 4
     assert "--kernel-name" in collection_calls[0]
     assert "--kernel-name" not in collection_calls[1]
-    assert all(call[call.index("--operation") + 1].startswith("profile-") for call in profile_calls)
+    assert "--kernel-name" in collection_calls[2]
+    assert "--kernel-name" not in collection_calls[3]
+    wrapper_operations = {
+        call[call.index("--operation") + 1]
+        for call in calls
+        if "--operation" in call
+    }
+    assert len(wrapper_operations) == 10
+    evidence_destinations = {
+        call[call.index("--output") + 1] for call in collection_calls
+    }
+    assert len(evidence_destinations) == 4
+    assert all(
+        call[call.index("--operation") + 1].startswith("profile-")
+        for call in profile_calls
+    )
 
 
 def test_concrete_backend_rejects_relative_remote_tree(tmp_path: Path) -> None:
