@@ -64,7 +64,7 @@ class FakeBackend:
         self.compiles = []
         self.runs = []
 
-    def compile(self, workspace, language):
+    def compile(self, workspace, language, attempt_id):
         self.compiles.append((workspace, language))
         return {"exit_code": 0}
 
@@ -497,7 +497,7 @@ def _executor(tmp_path, backend):
 @pytest.mark.parametrize("action", ["compile", "run", "submit"])
 def test_source_validation_errors_are_recoverable(tmp_path, action):
     class RejectingBackend(FakeBackend):
-        def compile(self, workspace, language):
+        def compile(self, workspace, language, attempt_id):
             raise ValueError("invalid candidate source")
 
         def run(self, workspace, language, workload, attempt_id, ledger):

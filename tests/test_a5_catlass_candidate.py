@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,16 +70,19 @@ def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     execution = FakeExecution()
     backend = CatlassCandidateBackend(execution, length=7, seed=19)
 
-    first = backend.compile(tmp_path, "catlass-dsl")
-    second = backend.compile(tmp_path, "catlass-dsl")
+    first = backend.compile(tmp_path, "catlass-dsl", "compile-1")
+    second = backend.compile(tmp_path, "catlass-dsl", "compile-2")
 
-    assert first == second
+    assert first["execution_id"] == second["execution_id"]
+    assert first["source_fingerprint"] == second["source_fingerprint"]
+    assert first["attestation_sha256"] != second["attestation_sha256"]
     assert first["passed"] is True
     assert first["exit_code"] == 0
     assert first["kernel_name"] == EXACT_KERNEL_NAME
     assert first["diagnostics"] == "Catlass compilation succeeded"
     plan = execution.plans[0]
-    assert plan == execution.plans[1]
+    assert plan.attempt_id != execution.plans[1].attempt_id
+    assert replace(plan, attempt_id=execution.plans[1].attempt_id) == execution.plans[1]
     assert plan.argv[:2] == ("env", "A5KERNEL_COMPILE_ONLY=1")
     assert plan.argv[2:5] == ("env", "-u", "PYTHONPYCACHEPREFIX")
     candidate = next(item for item in plan.files if item.relative_path == "kernel.py")
@@ -87,12 +91,55 @@ def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     assert "--npu-arch 3510" in candidate.content
 
 
+def test_same_source_compiles_have_isolated_trial_and_retry_sessions(tmp_path):
+    from benchmarks.a5kernels.bz import BZSessionAdapter, CommandResult
+
+    first = tmp_path / "repeat-1"
+    second = tmp_path / "repeat-2"
+    for workspace in (first, second):
+        workspace.mkdir()
+        (workspace / "kernel.py").write_text(SOURCE)
+    execution = FakeExecution()
+    executors = [TrialActionExecutor(
+        workspace=workspace, language="catlass-dsl", workload=Workload.SMOKE_VECTOR_ADD,
+        backend=CatlassCandidateBackend(execution),
+        ledger=EvidenceLedger(workspace / "evidence.jsonl"),
+        knowledge=type("Knowledge", (), {"enabled": False})(),
+        profiling=object(), profiling_guidance=False,
+    ) for workspace in (first, second)]
+    for executor in (executors[0], executors[1], executors[0]):
+        executor(TrialAction("compile", {}))
+
+    attempts = [plan.attempt_id for plan in execution.plans]
+    namespaces = [attempt.split("-")[0] for attempt in attempts]
+    assert namespaces[0] == namespaces[2] != namespaces[1]
+    assert attempts[0].endswith("-compile-1")
+    assert attempts[1].endswith("-compile-1")
+    assert attempts[2].endswith("-compile-2")
+    assert len(set(attempts)) == 3
+    assert all(len(attempt) <= 64 for attempt in attempts)
+    assert len({plan.execution_id for plan in execution.plans}) == 1
+    invocations = []
+
+    def dispatch(invocation):
+        invocations.append(invocation)
+        return CommandResult(1, "offline dispatch probe")
+
+    adapter = BZSessionAdapter(SimpleNamespace(
+        runtime_provenance=execution.runtime_provenance, run=dispatch,
+    ), session_wrapper="profiles/bz-a5/session.sh")
+    for plan in execution.plans:
+        adapter.execute(plan)
+    assert len({invocation.argv[2] for invocation in invocations}) == 3
+    assert len({invocation.remote_directory for invocation in invocations}) == 3
+
+
 def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
     source = SOURCE.replace("\nVECTOR_ELE = 400\n", "\n")
     (tmp_path / "kernel.py").write_text(source)
     execution = FakeExecution()
 
-    result = CatlassCandidateBackend(execution).compile(tmp_path, "catlass-dsl")
+    result = CatlassCandidateBackend(execution).compile(tmp_path, "catlass-dsl", "compile-1")
 
     assert result["passed"]
     composed = next(item for item in execution.plans[0].files
@@ -106,10 +153,10 @@ def test_compile_failure_returns_bounded_diagnostics_and_allows_retry(tmp_path):
     execution = FakeExecution(marker=None, exit_code=1)
     backend = CatlassCandidateBackend(execution)
 
-    failed = backend.compile(tmp_path, "catlass-dsl")
+    failed = backend.compile(tmp_path, "catlass-dsl", "compile-1")
     execution.exit_code = 0
     execution.marker = EXACT_KERNEL_NAME
-    retried = backend.compile(tmp_path, "catlass-dsl")
+    retried = backend.compile(tmp_path, "catlass-dsl", "compile-2")
 
     assert failed["passed"] is False
     assert failed["kernel_name"] is None
@@ -183,7 +230,7 @@ def test_runtime_rejects_other_language_and_workload(tmp_path):
     backend = CatlassCandidateBackend(FakeExecution())
     ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
     with pytest.raises(ValueError, match="requires catlass-dsl"):
-        backend.compile(tmp_path, "ascend-c")
+        backend.compile(tmp_path, "ascend-c", "compile-1")
     with pytest.raises(ValueError, match="only smoke-vector-add"):
         backend.run(tmp_path, "catlass-dsl", Workload.SEMANTIC_GEMM, "x", ledger)
 

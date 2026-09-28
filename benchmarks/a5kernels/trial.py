@@ -80,7 +80,8 @@ def parse_trial_action(text: str) -> TrialAction | None:
 class KernelTrialBackend(Protocol):
     """Concrete runtimes choose all commands and return host-attested results."""
 
-    def compile(self, workspace: Path, language: str) -> Mapping[str, object]: ...
+    def compile(self, workspace: Path, language: str,
+                attempt_id: str) -> Mapping[str, object]: ...
 
     def run(
         self,
@@ -295,7 +296,9 @@ class TrialActionExecutor:
         if not self._has_source():
             return self._observation("compile", error="write kernel source first")
         try:
-            result = dict(self.backend.compile(self.workspace, self.language))
+            result = dict(self.backend.compile(
+                self.workspace, self.language,
+                f"{self._attempt_namespace}-compile-{self.actions}"))
         except ValueError as exc:
             return self._observation("compile", status="source-validation-error",
                                      error=str(exc))

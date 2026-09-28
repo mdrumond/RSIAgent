@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 from dataclasses import asdict, dataclass, replace
-import hashlib
 import json
 from pathlib import Path
 from typing import Mapping
@@ -94,13 +93,13 @@ class CatlassCandidateBackend:
         self._length = length
         self._seed = seed
 
-    def compile(self, workspace: Path, language: str) -> Mapping[str, object]:
+    def compile(self, workspace: Path, language: str,
+                attempt_id: str) -> Mapping[str, object]:
         source = self._source(workspace, language)
         request = self._request()
-        attempt = "compile-" + hashlib.sha256(source.encode()).hexdigest()[:16]
         capture = _CaptureExecution(self._execution_backend)
         runner = A5KernelRunner(capture)
-        plan = self._prepare(runner, request, source, attempt, compile_only=True)
+        plan = self._prepare(runner, request, source, attempt_id, compile_only=True)
         result = runner.run_plan(request, plan)
         kernel_name = _discovered_kernel(capture.receipt) if result.passed else None
         diagnostics = CompileDiagnostics(
