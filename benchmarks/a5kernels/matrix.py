@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 import hashlib
 import json
+import math
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -210,27 +211,57 @@ class RunMetrics:
     wall_time_s: float
     reproducible: bool | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.cell_id, str) or not self.cell_id:
+            raise ValueError("cell_id must be a non-empty string")
+        if not isinstance(self.workload, Workload):
+            raise ValueError("workload must be a Workload")
+        self._boolean(self.correct, "correct")
+        self._boolean(self.exploration_succeeded, "exploration_succeeded")
+        if self.reproducible is not None:
+            self._boolean(self.reproducible, "reproducible")
+        if self.kernel_time_us is not None:
+            self._nonnegative_number(self.kernel_time_us, "kernel_time_us")
+        self._counter(self.iterations, "iterations")
+        self._counter(self.tokens, "tokens")
+        self._nonnegative_number(self.wall_time_s, "wall_time_s")
+
     @staticmethod
     def _boolean(value: object, field: str) -> bool:
         if not isinstance(value, bool):
             raise ValueError(f"{field} must be a JSON boolean")
         return value
 
+    @staticmethod
+    def _nonnegative_number(value: object, field: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field} must be a JSON number")
+        result = float(value)
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f"{field} must be finite and non-negative")
+        return result
+
+    @staticmethod
+    def _counter(value: object, field: str) -> int:
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{field} must be a non-negative JSON integer")
+        return value
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "RunMetrics":
+        if not isinstance(value, Mapping):
+            raise ValueError("each report row must be a JSON object")
         return cls(
-            cell_id=str(value["cell_id"]),
+            cell_id=value["cell_id"],
             workload=Workload(str(value["workload"])),
             correct=cls._boolean(value["correct"], "correct"),
-            kernel_time_us=(
-                None if value.get("kernel_time_us") is None else float(value["kernel_time_us"])
-            ),
+            kernel_time_us=value.get("kernel_time_us"),
             exploration_succeeded=cls._boolean(
                 value["exploration_succeeded"], "exploration_succeeded"
             ),
-            iterations=int(value["iterations"]),
-            tokens=int(value["tokens"]),
-            wall_time_s=float(value["wall_time_s"]),
+            iterations=value["iterations"],
+            tokens=value["tokens"],
+            wall_time_s=value["wall_time_s"],
             reproducible=(
                 None
                 if value.get("reproducible") is None
@@ -244,14 +275,33 @@ def aggregate_report(results: Iterable[RunMetrics]) -> dict[str, object]:
 
     rows = tuple(results)
     correct = sum(row.correct for row in rows)
-    valid_times = [row.kernel_time_us for row in rows if row.correct and row.kernel_time_us is not None]
+    timing_groups: dict[tuple[str, Workload], list[float]] = {}
+    for row in rows:
+        if row.correct and row.kernel_time_us is not None:
+            timing_groups.setdefault((row.cell_id, row.workload), []).append(
+                row.kernel_time_us
+            )
+    performance_groups = [
+        {
+            "cell_id": cell_id,
+            "workload": workload.value,
+            "mean_us_correct_runs": sum(times) / len(times),
+            "measured": len(times),
+        }
+        for (cell_id, workload), times in sorted(
+            timing_groups.items(), key=lambda item: (item[0][0], item[0][1].value)
+        )
+    ]
     reproducible = [row.reproducible for row in rows if row.reproducible is not None]
     return {
         "correctness": {"passed": correct, "total": len(rows)},
         "kernel_performance": {
             "mean_us_correct_runs": (
-                sum(valid_times) / len(valid_times) if valid_times else None
-            )
+                performance_groups[0]["mean_us_correct_runs"]
+                if len(performance_groups) == 1
+                else None
+            ),
+            "by_cell_workload": performance_groups,
         },
         "exploration_success": sum(row.exploration_succeeded for row in rows),
         "iterations": sum(row.iterations for row in rows),

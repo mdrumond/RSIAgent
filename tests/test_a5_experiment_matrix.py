@@ -148,6 +148,14 @@ def test_report_cli_orders_correctness_before_performance(tmp_path, capsys) -> N
     assert output.index('"correctness"') < output.index('"kernel_performance"')
     assert payload["correctness"] == {"passed": 1, "total": 2}
     assert payload["kernel_performance"]["mean_us_correct_runs"] == 10.0
+    assert payload["kernel_performance"]["by_cell_workload"] == [
+        {
+            "cell_id": "cell-a",
+            "workload": "smoke-vector-add",
+            "mean_us_correct_runs": 10.0,
+            "measured": 1,
+        }
+    ]
     assert payload["exploration_success"] == 1
     assert payload["iterations"] == 5
     assert payload["tokens"] == 250
@@ -204,3 +212,79 @@ def test_aggregate_report_never_treats_incorrect_timing_as_performance() -> None
     )
 
     assert report["kernel_performance"]["mean_us_correct_runs"] is None
+
+
+def test_aggregate_report_does_not_pool_incomparable_timings() -> None:
+    from benchmarks.a5kernels.matrix import RunMetrics
+
+    def metrics(cell_id, workload, timing):
+        return RunMetrics(
+            cell_id=cell_id,
+            workload=workload,
+            correct=True,
+            kernel_time_us=timing,
+            exploration_succeeded=True,
+            iterations=1,
+            tokens=1,
+            wall_time_s=1,
+        )
+
+    report = aggregate_report(
+        [
+            metrics("cell-b", Workload.SEMANTIC_GEMM, 100.0),
+            metrics("cell-a", Workload.SMOKE_VECTOR_ADD, 10.0),
+            metrics("cell-a", Workload.SMOKE_VECTOR_ADD, 20.0),
+        ]
+    )
+
+    performance = report["kernel_performance"]
+    assert performance["mean_us_correct_runs"] is None
+    assert performance["by_cell_workload"] == [
+        {
+            "cell_id": "cell-a",
+            "workload": "smoke-vector-add",
+            "mean_us_correct_runs": 15.0,
+            "measured": 2,
+        },
+        {
+            "cell_id": "cell-b",
+            "workload": "semantic-gemm",
+            "mean_us_correct_runs": 100.0,
+            "measured": 1,
+        },
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("kernel_time_us", "1.0"),
+        ("kernel_time_us", float("nan")),
+        ("kernel_time_us", -1.0),
+        ("iterations", True),
+        ("iterations", 1.5),
+        ("iterations", -1),
+        ("tokens", "1"),
+        ("wall_time_s", float("inf")),
+        ("wall_time_s", -1.0),
+    ],
+)
+def test_report_rejects_invalid_numeric_metrics(tmp_path, field, value) -> None:
+    from benchmarks.a5kernels.matrix import load_metrics
+
+    payload = {
+        "cell_id": "cell-a",
+        "workload": "smoke-vector-add",
+        "correct": True,
+        "kernel_time_us": 1.0,
+        "exploration_succeeded": True,
+        "iterations": 1,
+        "tokens": 1,
+        "wall_time_s": 1.0,
+    }
+    payload[field] = value
+    path = tmp_path / "metrics.json"
+    path.write_text(json.dumps([payload]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field):
+        load_metrics(path)
