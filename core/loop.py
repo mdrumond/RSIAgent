@@ -1038,6 +1038,8 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                 history=ctx,
                 image=sent_image,
                 reasoning_max_tokens=getattr(cfg, "reasoning_max_tokens", 0),
+                allow_truncation_retry=getattr(
+                    cfg, "allow_truncation_retry", True),
                 **transport_options,
                 **_provider_request(cfg)))                      # dry retry -> temp bump: at temp 0 a
         image = None                               # degenerated decoder re-samples the

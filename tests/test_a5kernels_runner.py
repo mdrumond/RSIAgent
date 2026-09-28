@@ -207,6 +207,55 @@ def test_agent_claim_cannot_turn_correct_output_into_failure():
     assert result.passed is True
 
 
+def test_run_plan_rejects_same_length_inputs_not_derived_from_request_seed():
+    backend = FakeBackend()
+    runner = A5KernelRunner(backend)
+    request = RunRequest(Language.CATLASS_DSL.value, length=2, seed=42)
+    plan = runner.prepare(request, attempt_id="candidate-1")
+    substituted = replace(
+        plan,
+        input_a=tuple(reversed(plan.input_a)),
+        input_b=tuple(reversed(plan.input_b)),
+    )
+
+    with pytest.raises(ValueError, match="inputs do not match"):
+        runner.run_plan(request, substituted)
+    assert backend.plans == []
+
+
+@pytest.mark.parametrize("padded_length", [31, True, 64.0])
+def test_request_rejects_invalid_padded_extent(padded_length):
+    with pytest.raises(ValueError, match="padded_length"):
+        RunRequest("catlass-dsl", padded_length=padded_length)
+
+
+def test_unpadded_requests_preserve_identity_and_input_defaults():
+    from benchmarks.a5kernels.protocol import canonical_hash
+
+    request = RunRequest("catlass-dsl")
+    assert request.to_dict() == {
+        "language": "catlass-dsl", "length": 32, "seed": 0, "dtype": "float32",
+    }
+    assert request.request_id == canonical_hash(request.to_dict())
+    plan = A5KernelRunner(FakeBackend()).prepare(request)
+    assert len(plan.input_a) == len(plan.input_b) == 32
+
+
+def test_padded_request_evidence_reconstructs_full_verification_extent(tmp_path):
+    from benchmarks.a5kernels.determinism import snapshot_from_ledger
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    runner = A5KernelRunner(FakeBackend(), evidence_ledger=ledger)
+    request = RunRequest("catlass-dsl", padded_length=64)
+    result = runner.run(request, attempt_id="padded-smoke")
+
+    snapshot = snapshot_from_ledger(ledger.entries)
+    assert result.passed
+    assert snapshot.request_id == request.request_id
+    assert ledger.entries[0].payload["request"]["padded_length"] == 64
+
+
 def test_nonzero_exit_fails_even_with_correct_output():
     result = A5KernelRunner(FakeBackend(exit_code=9, claimed_score="1")).run(
         RunRequest(Language.TRITON_ASCEND.value)
@@ -918,6 +967,52 @@ def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
     assert dict(second.runtime_provenance)["manifest_sha256"] == "2" * 64
     assert first_backend.runtime_provenance == first_backend.runtime_provenance
     assert len(first_calls) == 1
+
+
+def test_catlass_executor_probes_exact_device_through_checked_profile():
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "A5_PREFLIGHT_DEVICE=3\n", "")
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper="execution-profiles/bz-a5/upload.sh",
+        validation_wrapper="execution-profiles/catlass-validation.sh",
+        catlass_source="/retained/catlass",
+        catlass_revision="9" * 40,
+        process_runner=run,
+    )
+
+    executor.probe_device(3)
+
+    assert calls == [
+        (
+            "execution-profiles/catlass-validation.sh",
+            "--profile", "bz-a5",
+            "--operation", "codex-a5-preflight-device-3",
+            "run", "--catlass-src", "/retained/catlass",
+            "--timeout", "600", "--",
+            "env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=3",
+            "python", "-c", calls[0][-1],
+        )
+    ]
+
+
+def test_catlass_executor_rejects_unavailable_device():
+    def run(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "device unavailable")
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper="execution-profiles/bz-a5/upload.sh",
+        validation_wrapper="execution-profiles/catlass-validation.sh",
+        catlass_source="/retained/catlass",
+        catlass_revision="9" * 40,
+        process_runner=run,
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="device probe failed"):
+        executor.probe_device(9)
 
 
 def test_bz_adapter_accepts_legacy_executor_without_runtime_provenance():

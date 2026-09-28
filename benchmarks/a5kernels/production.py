@@ -1,0 +1,406 @@
+"""Production composition for the preregistered Catlass A5 pilot."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import json
+import os
+from pathlib import Path
+import re
+from typing import Callable, Mapping
+
+from config.runtime_paths import resolve_env_file
+
+
+PILOT_CELL_ID = "cell-97d03f4e20e35d21"
+PILOT_WORKLOAD = "smoke-vector-add"
+_MAX_PREFLIGHT_CHUNKS = 100_000
+_PREFLIGHT_CHUNK_BATCH = 512
+
+
+def _transformers_cache(path: Path) -> Path:
+    """Accept either a Hugging Face home or its direct ``hub`` cache."""
+
+    hub = path / "hub"
+    return hub if hub.is_dir() else path
+
+
+@dataclass(frozen=True)
+class ProductionPaths:
+    """Explicit machine-local inputs; none are persisted in experiment source."""
+
+    tla_root: Path
+    profiling_skill_root: Path
+    catlass_source: str
+    catlass_revision: str
+    bge_cache: Path
+    kdb: Path
+    collection: str
+    results_root: Path
+    device: int
+
+    def __post_init__(self) -> None:
+        if not self.catlass_source.startswith("/"):
+            raise ValueError("catlass_source must be an absolute retained BZ path")
+        if re.fullmatch(r"[0-9a-f]{40}", self.catlass_revision) is None:
+            raise ValueError("catlass_revision must be a lowercase 40-character SHA")
+        if not self.collection.strip():
+            raise ValueError("collection must be non-empty")
+        if self.device < 0:
+            raise ValueError("device must be non-negative")
+
+    @property
+    def validation_wrapper(self) -> Path:
+        return self.tla_root / "execution-profiles/catlass-validation.sh"
+
+    @property
+    def session_wrapper(self) -> Path:
+        return self.tla_root / "execution-profiles/bz-a5/session.sh"
+
+    @property
+    def upload_wrapper(self) -> Path:
+        return self.tla_root / "execution-profiles/bz-a5/upload.sh"
+
+    @property
+    def provenance_wrapper(self) -> Path:
+        return self.tla_root / "execution-profiles/bz-a5/catlass-provenance.sh"
+
+    @property
+    def collection_wrapper(self) -> Path:
+        return self.profiling_skill_root / "scripts/collect_profile.sh"
+
+
+def _credential_present(environment: Mapping[str, str], env_file: Path) -> bool:
+    environment_value = environment.get("OPENROUTER_API_KEY", "")
+    if environment_value:
+        # Match llm.client._api_key's precedence: a present, truthy environment
+        # value wins even when it is unusable whitespace.  Do not claim that a
+        # dotenv key will rescue a runtime which will never consult that file.
+        return bool(environment_value.strip())
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if line.startswith("OPENROUTER_API_KEY=") and line.split("=", 1)[1].strip():
+                return True
+    except FileNotFoundError:
+        pass
+    return False
+
+
+def preflight(
+    paths: ProductionPaths,
+    *,
+    environment: Mapping[str, str] | None = None,
+    embedding_probe: Callable[[object], None] | None = None,
+    runtime_probe: Callable[[ProductionPaths], None] | None = None,
+    query_probe: Callable[[object, str], None] | None = None,
+) -> dict[str, object]:
+    """Validate every local input before an Actor or BZ workload can start."""
+
+    from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+
+    values = os.environ if environment is None else environment
+    checks: dict[str, bool] = {
+        "openrouter_credential": _credential_present(
+            values, resolve_env_file(values)
+        ),
+        "results_parent": paths.results_root.parent.is_dir(),
+        "results_absent": not paths.results_root.exists(),
+    }
+    for name, wrapper in {
+        "catlass_validation_wrapper": paths.validation_wrapper,
+        "bz_session_wrapper": paths.session_wrapper,
+        "bz_upload_wrapper": paths.upload_wrapper,
+        "catlass_provenance_wrapper": paths.provenance_wrapper,
+        "profile_collection_wrapper": paths.collection_wrapper,
+    }.items():
+        checks[name] = wrapper.is_file() and os.access(wrapper, os.X_OK)
+    checks["bge_cache"] = paths.bge_cache.is_dir()
+    checks["kdb"] = paths.kdb.is_file()
+
+    if all(
+        checks[name]
+        for name in (
+            "catlass_validation_wrapper",
+            "bz_session_wrapper",
+            "bz_upload_wrapper",
+            "catlass_provenance_wrapper",
+        )
+    ):
+        try:
+            (runtime_probe or _probe_catlass_runtime)(paths)
+            checks["catlass_runtime"] = True
+        except Exception:
+            # Preflight output is deliberately bounded and never includes remote
+            # paths, wrapper logs, credentials, or transport diagnostics.
+            checks["catlass_runtime"] = False
+    else:
+        checks["catlass_runtime"] = False
+
+    if checks["bge_cache"] and checks["kdb"]:
+        embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(paths.bge_cache))
+        try:
+            # Loading and one CPU inference prove the pinned revision is complete,
+            # local-only, dimensionally valid, and usable by this process.
+            (embedding_probe or (lambda backend: backend.embed_query(["A5 preflight"])))(
+                embeddings
+            )
+            database = KnowledgeDB.open_read_only(paths.kdb, embeddings)
+            try:
+                manifest = database.manifest(paths.collection)
+                checks["kdb_manifest"] = (
+                    manifest.embedding_model == embeddings.model
+                    and manifest.embedding_revision == embeddings.revision
+                )
+                if checks["kdb_manifest"]:
+                    try:
+                        (query_probe or _probe_knowledge_query)(
+                            database, paths.collection
+                        )
+                        checks["kdb_query"] = True
+                    except Exception:
+                        checks["kdb_query"] = False
+                else:
+                    checks["kdb_query"] = False
+            finally:
+                database.close()
+        except Exception:
+            checks["kdb_manifest"] = False
+            checks["kdb_query"] = False
+    else:
+        checks["kdb_manifest"] = False
+        checks["kdb_query"] = False
+
+    return {
+        "ready": all(checks.values()),
+        "cell_id": PILOT_CELL_ID,
+        "workload": PILOT_WORKLOAD,
+        "checks": checks,
+    }
+
+
+def _probe_knowledge_query(database, collection: str) -> None:
+    """Prove the selected read-only collection supports the production query path."""
+
+    from benchmarks.a5kernels.knowledge import SearchHit
+    from benchmarks.a5kernels.knowledge_agent import validate_knowledge_hit
+
+    # This exercises current per-collection FTS metadata/table lookup, vector
+    # decoding, query embeddings, and the same citation gate used before any hit
+    # reaches an Actor, without writing or migrating the database.
+    for hit in database.query(collection, "A5 preflight", limit=1):
+        validate_knowledge_hit(database, collection, hit)
+
+    # Vector retrieval considers every stored chunk, not merely the first hit of
+    # this fixed query. Validate that complete reachable set through the identical
+    # citation gate in bounded pages. Oversized research collections fail closed
+    # rather than turning preflight into an unbounded scan.
+    total = database.connection.execute(
+        "SELECT count(*) FROM chunks WHERE collection = ?", (collection,)
+    ).fetchone()[0]
+    if total > _MAX_PREFLIGHT_CHUNKS:
+        raise ValueError("selected collection exceeds the preflight chunk bound")
+    cursor = 0
+    validated = 0
+    while True:
+        rows = database.connection.execute(
+            """SELECT rowid, chunk_id, path, start_line, end_line, text
+               FROM chunks WHERE collection = ? AND rowid > ?
+               ORDER BY rowid LIMIT ?""",
+            (collection, cursor, _PREFLIGHT_CHUNK_BATCH),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            validate_knowledge_hit(
+                database,
+                collection,
+                SearchHit(
+                    row["chunk_id"], row["path"], row["start_line"], row["end_line"],
+                    row["text"], 0.0, None, None, None,
+                ),
+            )
+        validated += len(rows)
+        cursor = rows[-1]["rowid"]
+    if validated != total:
+        raise RuntimeError("selected collection changed during read-only preflight")
+
+    fts_table = database._fts_table_name(collection)
+    # An external-content FTS table returns rows from ``chunks`` for an ordinary
+    # SELECT even when its search index is incomplete.  Its read-only docsize
+    # shadow table instead contains exactly one row for each indexed document.
+    indexed_rows = f"{fts_table}_docsize"
+    missing = database.connection.execute(
+        f"""SELECT rowid FROM chunks WHERE collection = ?
+            EXCEPT SELECT id FROM {indexed_rows} LIMIT 1""",
+        (collection,),
+    ).fetchone()
+    extra = database.connection.execute(
+        f"""SELECT id FROM {indexed_rows}
+            EXCEPT SELECT rowid FROM chunks WHERE collection = ? LIMIT 1""",
+        (collection,),
+    ).fetchone()
+    if missing is not None or extra is not None:
+        raise RuntimeError("selected collection FTS index is incomplete")
+
+
+def _probe_catlass_runtime(paths: ProductionPaths) -> None:
+    """Use the checked profile's provenance probe for the exact retained runtime."""
+
+    from benchmarks.a5kernels.bz import CatlassValidationExecutor
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper=str(paths.upload_wrapper),
+        validation_wrapper=str(paths.validation_wrapper),
+        catlass_source=paths.catlass_source,
+        catlass_revision=paths.catlass_revision,
+    )
+    # The provenance probe binds the retained source to its exact revision; the
+    # checked validation wrapper then selects the configured device remotely.
+    if not executor.runtime_provenance:
+        raise RuntimeError("Catlass runtime provenance is unavailable")
+    executor.probe_device(paths.device)
+
+
+def build_production_trial(paths: ProductionPaths):
+    """Compose the fixed model, KDB, BZ runtime, and profiling authorities."""
+
+    from benchmarks.a5kernels.bz import (
+        BZSessionAdapter,
+        CatlassValidationExecutor,
+    )
+    from benchmarks.a5kernels.candidate import (
+        CandidateProfileEvaluation,
+        CatlassCandidateBackend,
+    )
+    from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+    from benchmarks.a5kernels.fixtures import Language
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    from benchmarks.a5kernels.knowledge_agent import (
+        KnowledgeAgent,
+        ProgressiveMemoryJournal,
+    )
+    from benchmarks.a5kernels.matrix import (
+        KnowledgeMode,
+        RuntimeCapabilities,
+        Workload,
+        initial_matrix,
+    )
+    from benchmarks.a5kernels.profiling import ProfilingTreatmentController
+    from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+    from benchmarks.a5kernels.trial import CoreAttemptDriver, TrialOrchestrator
+    from config.settings import Config
+    from core.trace import ArtifactSink
+
+    command = CatlassValidationExecutor(
+        upload_wrapper=str(paths.upload_wrapper),
+        validation_wrapper=str(paths.validation_wrapper),
+        catlass_source=paths.catlass_source,
+        catlass_revision=paths.catlass_revision,
+    )
+    candidate = CatlassCandidateBackend(
+        BZSessionAdapter(command, session_wrapper=str(paths.session_wrapper)),
+        device=paths.device,
+    )
+    embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(paths.bge_cache))
+    database = KnowledgeDB.open_read_only(paths.kdb, embeddings)
+
+    profile_backend = BZProfileBackend(
+        validation_wrapper=str(paths.validation_wrapper),
+        collection_wrapper=str(paths.collection_wrapper),
+        catlass_source=paths.catlass_source,
+        evidence_directory=str(paths.results_root / "profile-evidence"),
+    )
+
+    def knowledge_factory(memory, cell):
+        if cell.knowledge is not KnowledgeMode.WITH_KDB:
+            return KnowledgeAgent(
+                enabled=False,
+                journal=ProgressiveMemoryJournal(memory / "knowledge.jsonl"),
+            )
+        return KnowledgeAgent(
+            enabled=True,
+            database=database,
+            collection=paths.collection,
+            journal=ProgressiveMemoryJournal(memory / "knowledge.jsonl"),
+        )
+
+    def profiling_factory(cell):
+        controller = ProfilingTreatmentController(
+            profile_backend,
+            treatment_enabled=cell.profiling.value == "with-profiling-guidance",
+        )
+        return CandidateProfileEvaluation(controller, device=paths.device)
+
+    pilot_profile = next(
+        cell.model for cell in initial_matrix().cells if cell.cell_id == PILOT_CELL_ID
+    )
+    capabilities = RuntimeCapabilities(
+        languages=frozenset({Language.CATLASS_DSL}),
+        model_profiles=frozenset({pilot_profile}),
+        workloads=frozenset({Workload.SMOKE_VECTOR_ADD}),
+        kdb=True,
+        profiling_guidance=True,
+    )
+    actor = CoreAttemptDriver(
+        object(), Config(agent_decided_stop=True),
+        lambda context: ArtifactSink(str(context)),
+    )
+    orchestrator = TrialOrchestrator(
+        paths.results_root,
+        capabilities,
+        candidate,
+        actor,
+        knowledge_factory=knowledge_factory,
+        profiling_factory=profiling_factory,
+    )
+    return _OwnedProductionTrial(orchestrator, database)
+
+
+class _OwnedProductionTrial:
+    """One-shot pilot facade that releases the production database on every exit."""
+
+    def __init__(self, orchestrator, database):
+        self._orchestrator = orchestrator
+        self._database = database
+        self._closed = False
+
+    def run(self, cell, workload):
+        if self._closed:
+            raise RuntimeError("production trial is one-shot")
+        try:
+            return self._orchestrator.run(cell, workload)
+        finally:
+            self._closed = True
+            self._database.close()
+
+
+def run_pilot(paths: ProductionPaths) -> dict[str, object]:
+    """Run only the preregistered Catlass/KDB/no-guidance pilot cell."""
+
+    report = preflight(paths)
+    if not report["ready"]:
+        raise RuntimeError("A5 pilot preflight failed: " + json.dumps(report["checks"]))
+    from benchmarks.a5kernels.matrix import Workload, initial_matrix
+
+    cell = next(cell for cell in initial_matrix().cells if cell.cell_id == PILOT_CELL_ID)
+    result = build_production_trial(paths).run(cell, Workload.SMOKE_VECTOR_ADD)
+    final_profile = dict(result.final_profile)
+    kernel_time = final_profile.get("duration_us") if result.verified.passed else None
+    return {
+        "cell_id": cell.cell_id,
+        "workload": PILOT_WORKLOAD,
+        # These fields are directly consumable by ``run_a5kernels.py report``.
+        "correct": result.verified.passed,
+        "kernel_time_us": kernel_time,
+        "exploration_succeeded": result.outcome.status == "done",
+        "reproducible": None,
+        "passed": result.verified.passed,
+        "iterations": result.outcome.iterations,
+        "tokens": result.outcome.tokens,
+        "wall_time_s": result.outcome.wall_time_s,
+        "attestation_sha256": result.verified.attestation_sha256,
+        "evidence_sha256": result.evidence_sha256,
+        "final_profile": final_profile,
+        "workspace": str(result.workspace),
+    }

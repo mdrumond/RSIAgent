@@ -50,9 +50,7 @@ class A5KernelRunner:
             raise ValueError(
                 f"{fixture.language.value} hello length cannot exceed {fixture.max_length}"
             )
-        rng = random.Random(request.seed)
-        input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
-        input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+        input_a, input_b = self._request_inputs(request)
         return ExecutionPlan(
             request_id=request.request_id,
             attempt_id=attempt_id,
@@ -68,6 +66,16 @@ class A5KernelRunner:
         self, request: RunRequest, *, attempt_id: str | None = None
     ) -> VerifiedResult:
         plan = self.prepare(request, attempt_id=attempt_id)
+        return self.run_plan(request, plan)
+
+    def run_plan(self, request: RunRequest, plan: ExecutionPlan) -> VerifiedResult:
+        """Execute a host-prepared variant of the registered request fixture."""
+
+        if plan.request_id != request.request_id or plan.language != request.language:
+            raise ValueError("execution plan does not match its run request")
+        expected_a, expected_b = self._request_inputs(request)
+        if plan.input_a != expected_a or plan.input_b != expected_b:
+            raise ValueError("execution plan inputs do not match its run request")
         self._record_plan(request, plan)
         try:
             receipt = self._backend.execute(plan)
@@ -137,6 +145,14 @@ class A5KernelRunner:
             self._ledger.append(EvidenceKind.RESULT, result_payload)
         return result
 
+    @staticmethod
+    def _request_inputs(request: RunRequest) -> tuple[tuple[float, ...], tuple[float, ...]]:
+        rng = random.Random(request.seed)
+        input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+        input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(request.length))
+        padding = (0.0,) * ((request.padded_length or request.length) - request.length)
+        return input_a + padding, input_b + padding
+
     def _record_plan(self, request: RunRequest, plan: ExecutionPlan) -> None:
         if self._ledger is None:
             return
@@ -147,7 +163,7 @@ class A5KernelRunner:
         }
         self._ledger.append(
             EvidenceKind.REQUEST,
-            {**identity, "request": request.__dict__},
+            {**identity, "request": request.to_dict()},
         )
         self._ledger.append(
             EvidenceKind.ACTION,
