@@ -291,6 +291,7 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
                    "request-profile", "submit"):
         assert action in captured["kwargs"]["action_nudge"]
     assert outcome.wall_time_s == 3.5
+    assert outcome.tokens is None
 
 
 def test_write_invalidates_previous_run_before_profile(tmp_path):

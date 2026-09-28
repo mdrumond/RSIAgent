@@ -125,7 +125,10 @@ class ProfileEvaluation(Protocol):
 class ActorOutcome:
     status: str
     iterations: int
-    tokens: int = 0
+    # Core currently logs provider usage but does not expose an authoritative
+    # per-attempt total.  Keep that absence explicit rather than recording a
+    # misleading zero in experiment results.
+    tokens: int | None = None
     wall_time_s: float = 0.0
 
 
