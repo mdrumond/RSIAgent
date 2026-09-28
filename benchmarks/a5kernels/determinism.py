@@ -152,6 +152,9 @@ def snapshot_from_ledger(
     ]:
         raise ValueError("replay ledger entries are not in runner event order")
     action = actions[0].payload
+    identity_keys = {"request_id", "execution_id", "attempt_id"}
+    if set(action) != identity_keys | {"language", "argv", "inputs_sha256"}:
+        raise ValueError("action evidence does not have the runner schema")
     argv = action.get("argv")
     if (
         not isinstance(action.get("language"), str)
@@ -172,6 +175,12 @@ def snapshot_from_ledger(
     if len(artifacts) != 1:
         raise ValueError("a replay requires exactly one artifact entry")
     for artifact in artifacts:
+        if set(artifact.payload) != identity_keys | {
+            "source_fingerprint",
+            "source_sha256",
+            "artifact_sha256",
+        }:
+            raise ValueError("artifact evidence does not have the runner schema")
         for field in ("source_sha256", "artifact_sha256"):
             hashes = artifact.payload.get(field)
             if (
@@ -190,6 +199,8 @@ def snapshot_from_ledger(
                 )
     request = requests[0].payload
     result = results[0].payload
+    if set(request) != identity_keys | {"request"}:
+        raise ValueError("request evidence does not have the runner schema")
     request_id = str(request.get("request_id", ""))
     execution_id = str(request.get("execution_id", ""))
     attempt_id = str(request.get("attempt_id", ""))
@@ -259,8 +270,7 @@ def snapshot_from_ledger(
         )
     max_abs_error = result.get("max_abs_error")
     valid_max_error = (
-        isinstance(max_abs_error, (int, float))
-        and not isinstance(max_abs_error, bool)
+        isinstance(max_abs_error, float)
         and math.isfinite(max_abs_error)
         and max_abs_error >= 0
         and "max_abs_error_status" not in result

@@ -168,6 +168,30 @@ def replace_entry_payload(entries, index, payload):
     return rebuilt
 
 
+def replace_result_and_attestation(entries, **changes):
+    result = entries[-1]
+    payload = {**result.payload, **changes}
+    attested_fields = {
+        key: payload[key]
+        for key in (
+            "request_id",
+            "execution_id",
+            "attempt_id",
+            "language",
+            "runtime_provenance",
+            "passed",
+            "max_abs_error",
+            "exit_code",
+            "output_sha256",
+            "source_fingerprint",
+            "evidence_sha256",
+            "session_handle",
+        )
+    }
+    payload["attestation_sha256"] = canonical_hash(attested_fields)
+    return replace_entry_payload(entries, len(entries) - 1, payload)
+
+
 def test_runner_captures_exactly_three_unique_attempts_for_one_request():
     request = RunRequest("catlass-dsl", length=2, seed=7)
     calls = []
@@ -300,7 +324,7 @@ def test_snapshot_rejects_identity_only_action(tmp_path):
         for key in ("request_id", "execution_id", "attempt_id")
     }
 
-    with pytest.raises(ValueError, match="substantive action evidence"):
+    with pytest.raises(ValueError, match="runner schema"):
         snapshot_from_ledger(replace_entry_payload(ledger.entries, 1, payload))
 
 
@@ -348,6 +372,26 @@ def test_snapshot_requires_complete_recorded_request_schema(tmp_path):
                 ledger.entries,
                 0,
                 {**request.payload, "request": recorded},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("entry_index", "entry_kind"),
+    [(0, "request"), (1, "action"), (2, "artifact")],
+)
+def test_snapshot_rejects_extra_runner_entry_fields(
+    tmp_path, entry_index, entry_kind
+):
+    ledger = write_ledger(tmp_path / f"extra-{entry_kind}.jsonl", "one")
+    entry = ledger.entries[entry_index]
+
+    with pytest.raises(ValueError, match=f"{entry_kind} evidence.*runner schema"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries,
+                entry_index,
+                {**entry.payload, "unexpected": "field"},
             )
         )
 
@@ -479,46 +523,15 @@ def test_snapshot_rejects_numeric_output_digest(tmp_path):
 
 @pytest.mark.parametrize("field", ["source_sha256", "artifact_sha256"])
 def test_snapshot_rejects_artifacts_without_hash_evidence(tmp_path, field):
-    request = RunRequest("catlass-dsl", length=2, seed=7)
-    identity = {
-        "request_id": request.request_id,
-        "execution_id": "execution-1",
-        "attempt_id": "one",
-    }
-    ledger = EvidenceLedger(tmp_path / f"missing-{field}.jsonl")
-    ledger.append(EvidenceKind.REQUEST, {**identity, "request": request.__dict__})
-    ledger.append(
-        EvidenceKind.ACTION,
-        {
-            **identity,
-            "language": request.language,
-            "argv": fixture_argv(request),
-            "inputs_sha256": input_digest(request),
-        },
-    )
-    ledger.append(
-        EvidenceKind.ARTIFACT,
-        {
-            **identity,
-            "source_sha256": {"kernel.py": SOURCE_ONE},
-            "artifact_sha256": {"source_bundle": ARTIFACT_ONE},
-            field: {},
-        },
-    )
-    ledger.append(
-        EvidenceKind.RESULT,
-        {
-            **identity,
-            "status": "verified",
-            "output_sha256": OUTPUT_ONE,
-            "passed": True,
-            "exit_code": 0,
-            "max_abs_error": 0.0,
-        },
-    )
+    ledger = write_ledger(tmp_path / f"missing-{field}.jsonl", "one")
+    artifact = ledger.entries[2]
 
     with pytest.raises(ValueError, match=f"non-empty {field} mapping"):
-        snapshot_from_ledger(ledger.entries)
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, 2, {**artifact.payload, field: {}}
+            )
+        )
 
 
 def test_snapshot_rejects_execution_error_without_output(tmp_path):
@@ -575,6 +588,15 @@ def test_snapshot_rejects_invalid_max_error_evidence(tmp_path, value):
 
     with pytest.raises(ValueError, match="verified replay output and metrics"):
         snapshot_from_ledger([*entries[:-1], replacement])
+
+
+def test_snapshot_rejects_reattested_integer_max_error(tmp_path):
+    ledger = write_ledger(tmp_path / "integer-error.jsonl", "one")
+
+    with pytest.raises(ValueError, match="verified replay output and metrics"):
+        snapshot_from_ledger(
+            replace_result_and_attestation(ledger.entries, max_abs_error=0)
+        )
 
 
 @pytest.mark.parametrize(
