@@ -86,6 +86,7 @@ def preflight(
     environment: Mapping[str, str] | None = None,
     embedding_probe: Callable[[object], None] | None = None,
     runtime_probe: Callable[[ProductionPaths], None] | None = None,
+    query_probe: Callable[[object, str], None] | None = None,
 ) -> dict[str, object]:
     """Validate every local input before an Actor or BZ workload can start."""
 
@@ -145,12 +146,24 @@ def preflight(
                     manifest.embedding_model == embeddings.model
                     and manifest.embedding_revision == embeddings.revision
                 )
+                if checks["kdb_manifest"]:
+                    try:
+                        (query_probe or _probe_knowledge_query)(
+                            database, paths.collection
+                        )
+                        checks["kdb_query"] = True
+                    except Exception:
+                        checks["kdb_query"] = False
+                else:
+                    checks["kdb_query"] = False
             finally:
                 database.close()
         except Exception:
             checks["kdb_manifest"] = False
+            checks["kdb_query"] = False
     else:
         checks["kdb_manifest"] = False
+        checks["kdb_query"] = False
 
     return {
         "ready": all(checks.values()),
@@ -158,6 +171,14 @@ def preflight(
         "workload": PILOT_WORKLOAD,
         "checks": checks,
     }
+
+
+def _probe_knowledge_query(database, collection: str) -> None:
+    """Prove the selected read-only collection supports the production query path."""
+
+    # This exercises current per-collection FTS metadata/table lookup, vector
+    # decoding, and query embeddings without writing or migrating the database.
+    database.query(collection, "A5 preflight", limit=1)
 
 
 def _probe_catlass_runtime(paths: ProductionPaths) -> None:

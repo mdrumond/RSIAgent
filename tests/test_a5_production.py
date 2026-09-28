@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -22,10 +24,25 @@ class TinyEmbeddings:
     model = "BAAI/bge-small-en-v1.5"
     revision = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 
+    def __init__(self, **_kwargs):
+        pass
+
     def embed(self, texts):
         return [[1.0, float(index + 1)] for index, _text in enumerate(texts)]
 
     embed_query = embed
+
+
+def _query_schema(database, collection):
+    row = database.connection.execute(
+        "SELECT fts_table FROM collections WHERE name = ?", (collection,)
+    ).fetchone()
+    assert row is not None
+    expected = database._fts_table_name(collection)
+    assert row["fts_table"] == expected
+    assert database.connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (expected,)
+    ).fetchone() is not None
 
 
 def _inputs(tmp_path: Path) -> tuple[ProductionPaths, list[Path]]:
@@ -76,6 +93,7 @@ def test_preflight_is_fail_closed_and_does_not_expose_secret(tmp_path):
         environment={"OPENROUTER_API_KEY": ""},
         embedding_probe=lambda backend: probed.append((backend.model, backend.revision)),
         runtime_probe=lambda _paths: None,
+        query_probe=_query_schema,
     )
 
     assert report["ready"] is False
@@ -93,12 +111,12 @@ def test_dotenv_credential_syntax_matches_runtime_parser(tmp_path):
     env_file.write_text(" OPENROUTER_API_KEY=not-runtime-visible\n", encoding="utf-8")
     rejected = preflight(
         paths, environment=base, embedding_probe=lambda _backend: None,
-        runtime_probe=lambda _paths: None,
+        runtime_probe=lambda _paths: None, query_probe=_query_schema,
     )
     env_file.write_text("OPENROUTER_API_KEY=runtime-visible\n", encoding="utf-8")
     accepted = preflight(
         paths, environment=base, embedding_probe=lambda _backend: None,
-        runtime_probe=lambda _paths: None,
+        runtime_probe=lambda _paths: None, query_probe=_query_schema,
     )
 
     assert rejected["checks"]["openrouter_credential"] is False
@@ -112,6 +130,7 @@ def test_preflight_checks_complete_local_inputs_without_model_or_bz_call(tmp_pat
         environment={"OPENROUTER_API_KEY": "present-but-never-reported"},
         embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: None,
+        query_probe=_query_schema,
     )
 
     assert report == {
@@ -123,6 +142,59 @@ def test_preflight_checks_complete_local_inputs_without_model_or_bz_call(tmp_pat
     assert "present-but-never-reported" not in json.dumps(report)
 
 
+def test_preflight_rejects_legacy_shared_fts_without_migrating(
+    monkeypatch, tmp_path
+):
+    paths, _wrappers = _inputs(tmp_path)
+    with sqlite3.connect(paths.kdb) as current:
+        manifest_json = current.execute(
+            "SELECT manifest_json FROM collections WHERE name = ?",
+            (paths.collection,),
+        ).fetchone()[0]
+    legacy = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(legacy) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE collections (
+                name TEXT PRIMARY KEY, language TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, manifest_json TEXT NOT NULL
+            );
+            CREATE TABLE chunks (
+                rowid INTEGER PRIMARY KEY, collection TEXT NOT NULL,
+                chunk_id TEXT NOT NULL, path TEXT NOT NULL,
+                start_line INTEGER NOT NULL, end_line INTEGER NOT NULL,
+                text TEXT NOT NULL, vector_json TEXT NOT NULL,
+                UNIQUE(collection, chunk_id)
+            );
+            CREATE VIRTUAL TABLE chunks_fts USING fts5(
+                text, content='chunks', content_rowid='rowid'
+            );
+            """
+        )
+        connection.execute(
+            "INSERT INTO collections VALUES (?, ?, ?, ?)",
+            (paths.collection, "en", "legacy", manifest_json),
+        )
+    monkeypatch.setattr(
+        "benchmarks.a5kernels.embeddings.PinnedBGEEmbeddings", TinyEmbeddings
+    )
+
+    report = preflight(
+        replace(paths, kdb=legacy),
+        environment={"OPENROUTER_API_KEY": "configured"},
+        runtime_probe=lambda _paths: None,
+    )
+
+    assert report["checks"]["kdb_manifest"] is True
+    assert report["checks"]["kdb_query"] is False
+    assert report["ready"] is False
+    with sqlite3.connect(legacy) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(collections)")
+        }
+    assert "fts_table" not in columns
+
+
 def test_hugging_face_home_routes_its_hub_cache_to_embeddings(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
     (paths.bge_cache / "hub").mkdir()
@@ -132,6 +204,7 @@ def test_hugging_face_home_routes_its_hub_cache_to_embeddings(tmp_path):
         environment={"OPENROUTER_API_KEY": "configured"},
         embedding_probe=lambda backend: observed.append(backend.cache_dir),
         runtime_probe=lambda _paths: None,
+        query_probe=_query_schema,
     )
     assert observed == [paths.bge_cache / "hub"]
 
@@ -144,6 +217,7 @@ def test_existing_results_directory_prevents_accidental_overwrite(tmp_path):
         environment={"OPENROUTER_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: None,
+        query_probe=_query_schema,
     )
     assert report["ready"] is False
     assert report["checks"]["results_absent"] is False
@@ -160,6 +234,7 @@ def test_remote_runtime_failure_is_bounded_and_fails_closed(tmp_path):
         environment={"OPENROUTER_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         runtime_probe=unavailable,
+        query_probe=_query_schema,
     )
 
     assert report["ready"] is False
@@ -197,6 +272,7 @@ def test_missing_provenance_wrapper_prevents_remote_probe(tmp_path):
         environment={"OPENROUTER_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: calls.append(True),
+        query_probe=_query_schema,
     )
 
     assert report["checks"]["catlass_provenance_wrapper"] is False
