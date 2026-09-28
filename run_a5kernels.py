@@ -18,7 +18,10 @@ def _parser() -> argparse.ArgumentParser:
     report = commands.add_parser("report", help="aggregate host-recorded JSON metrics")
     report.add_argument("input", type=Path)
     for name, help_text in (
-        ("preflight", "check production pilot inputs without running a model or BZ job"),
+        (
+            "preflight",
+            "check production inputs and run a bounded BZ device probe without model inference",
+        ),
         ("trial", "run the preregistered Catlass smoke-vector-add pilot"),
     ):
         command = commands.add_parser(name, help=help_text)
