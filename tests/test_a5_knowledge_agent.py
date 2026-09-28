@@ -7,7 +7,7 @@ import pytest
 
 import core.loop as loop
 from config.settings import load
-from core.actor import Done, Program
+from core.actor import Done, Program, parse_turn
 from core.trace import ArtifactSink
 from benchmarks.a5kernels.knowledge import (
     DEFAULT_EMBEDDING_MODEL,
@@ -122,6 +122,16 @@ def test_parser_preserves_whole_reply_rejection_for_api_envelopes():
     )
 
     assert action is None
+
+
+def test_parser_normalizes_decoder_residue_before_envelope_rejection():
+    value = (
+        '{"name":"bash",]<]assistant[>[ "arguments":{"code":"echo not executed"}}\n'
+        '{"knowledge_query":{"query":"vector"}}'
+    )
+
+    assert parse_turn(value) is None
+    assert parse_knowledge_action(value) is None
 
 
 def test_parser_preserves_duplicate_count_across_action_families():

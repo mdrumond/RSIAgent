@@ -682,6 +682,11 @@ class Ask:
     dup: int = 1
 
 
+def normalize_action_text(text: str) -> str:
+    """Remove known decoder residue before extracting action objects."""
+    return re.sub(r"\]<\][a-z]+\[>\[", " ", text or "")
+
+
 def parse_turn(text: str):
     """The model's action for this turn: Program, Look, Ask, Done, or None.
 
@@ -692,9 +697,7 @@ def parse_turn(text: str):
     program). Within a kind, the LAST wins (draft-then-correct). A bare {"lang","code"}
     object counts as a program; a bare {"checks": [...]} or an explicit {"done": null}
     counts as a done declaration (the latter with zero checks → check-feedback)."""
-    text = re.sub(r"\]<\][a-z]+\[>\[", " ", text or "")   # strip template-delimiter
-    #                                                       leak artifacts (decoder
-    #                                                       degeneration residue)
+    text = normalize_action_text(text)
     objs = [v for v in json_values(text) if isinstance(v, dict)]
     # These API-style envelopes are not the plain JSON action channel. Silently
     # ignoring them can select a trailing Done from a simulated tool transcript,

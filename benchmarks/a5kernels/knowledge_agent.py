@@ -51,10 +51,11 @@ class KnowledgeResult:
 
 def parse_knowledge_action(value: str) -> Any:
     """Parse a query action, delegating built-in Actor actions to core."""
-    from core.actor import Done, parse_turn
+    from core.actor import Done, normalize_action_text, parse_turn
 
+    value = normalize_action_text(value)
     built_in = parse_turn(value)
-    objects = [raw for raw in _json_values(value or "") if isinstance(raw, dict)]
+    objects = [raw for raw in _json_values(value) if isinstance(raw, dict)]
     if any(
         isinstance(raw.get("name"), str)
         and raw["name"].strip()
