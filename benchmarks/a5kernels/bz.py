@@ -308,11 +308,12 @@ class BZSessionAdapter:
         )
         dimensions = study_dimensions_from_plan(plan)
         if dimensions is not None:
-            remote_argv = (
-                "env",
-                f"A5KERNEL_BLOCK_NUM={dimensions.parallelism.value}",
-                *remote_argv,
+            environment = plan.environment.with_binding(
+                "A5KERNEL_BLOCK_NUM", str(dimensions.parallelism.value)
             )
+        else:
+            environment = plan.environment
+        remote_argv = environment.render(remote_argv)
         invocation = CommandInvocation(
             argv=(
                 self._wrapper,

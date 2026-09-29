@@ -148,16 +148,20 @@ class BZProfileBackend:
         workload = self._bound_workload_argv(request)
         dimensions = study_dimensions_from_plan(request.plan)
         block_num = 1 if dimensions is None else dimensions.parallelism.value
-        workload = ("env", f"A5KERNEL_BLOCK_NUM={block_num}", *workload)
+        environment = request.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", str(block_num)
+        ).with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(request.device)
+        )
         if action == "run":
-            workload = (
-                "env",
-                f"BZ_A5_PROFILE_PHYSICAL_DEVICE={request.device}",
-                "A5KERNEL_EMIT_TIMING=1",
-                f"A5KERNEL_WARM_UP={request.warm_up}",
-                f"A5KERNEL_LAUNCH_COUNT={request.launch_count}",
-                *workload,
+            environment = environment.with_binding(
+                "A5KERNEL_EMIT_TIMING", "1"
+            ).with_binding(
+                "A5KERNEL_WARM_UP", str(request.warm_up)
+            ).with_binding(
+                "A5KERNEL_LAUNCH_COUNT", str(request.launch_count)
             )
+        workload = environment.render(workload)
         return (
             self._validation,
             "--profile",

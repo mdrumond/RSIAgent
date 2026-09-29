@@ -251,9 +251,11 @@ def test_comparison_rejects_mixed_devices_before_measurement():
 def test_profile_request_rejects_mismatched_or_noncanonical_plan_device(encoded):
     plan = replace(
         REQUEST.plan,
-        argv=("env", f"BZ_A5_PROFILE_PHYSICAL_DEVICE={encoded}", *REQUEST.plan.argv),
+        environment=REQUEST.plan.environment.with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", encoded
+        ),
     )
-    with pytest.raises(ValueError, match="device bound in plan argv"):
+    with pytest.raises(ValueError, match="device bound in the plan environment"):
         replace(REQUEST, plan=plan)
 
 
@@ -261,7 +263,9 @@ def test_phase1_variant_rejects_missing_plan_device_binding():
     bound = variant()
     unbound_plan = replace(
         bound.request.plan,
-        argv=tuple(bound.request.plan.argv[2:]),
+        environment=bound.request.plan.environment.with_unset(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE"
+        ),
     )
     request = replace(bound.request, plan=unbound_plan)
     correctness = replace(bound.correctness, execution_id=request.execution_id)
@@ -272,16 +276,33 @@ def test_phase1_variant_rejects_missing_plan_device_binding():
 @pytest.mark.parametrize(
     "assignment",
     [
-        "A5KERNEL_EMIT_TIMING=0",
-        "A5KERNEL_WARM_UP=0",
-        "A5KERNEL_LAUNCH_COUNT=1",
-        "A5KERNEL_BLOCK_NUM=1",
+        ("A5KERNEL_EMIT_TIMING", "0"),
+        ("A5KERNEL_WARM_UP", "0"),
+        ("A5KERNEL_LAUNCH_COUNT", "1"),
     ],
 )
 def test_profile_request_rejects_plan_timing_policy_overrides(assignment):
-    plan = replace(REQUEST.plan, argv=("env", assignment, *REQUEST.plan.argv))
+    plan = replace(
+        REQUEST.plan,
+        environment=REQUEST.plan.environment.with_binding(*assignment),
+    )
     with pytest.raises(ValueError, match="host-owned timing policy"):
         replace(REQUEST, plan=plan)
+
+
+def test_phase1_variant_rejects_block_count_mismatched_with_parallelism():
+    bound = variant()
+    plan = replace(
+        bound.request.plan,
+        environment=bound.request.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", "2"
+        ),
+    )
+    request = replace(bound.request, plan=plan)
+    correctness = replace(bound.correctness, execution_id=request.execution_id)
+
+    with pytest.raises(ValueError, match="typed parallelism"):
+        StudyVariant(request, correctness, bound.dimensions)
 
 
 def test_optimization_comparison_caps_variants_before_measurement():

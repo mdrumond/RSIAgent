@@ -345,6 +345,7 @@ def snapshot_from_ledger(
         argv=fixture.argv,
         input_a=input_a,
         input_b=input_b,
+        environment=fixture.environment,
         runtime_provenance=tuple(tuple(item) for item in runtime_provenance),
     )
     if execution_id != plan.execution_id:

@@ -24,7 +24,11 @@ from benchmarks.a5kernels.knowledge_agent import (
     ProgressiveMemoryJournal,
     parse_knowledge_action,
 )
-from benchmarks.a5kernels.protocol import RunRequest, VerifiedResult
+from benchmarks.a5kernels.protocol import (
+    ExecutionEnvironment,
+    RunRequest,
+    VerifiedResult,
+)
 from benchmarks.a5kernels.candidate import (
     CandidateProfileEvaluation,
     CatlassCandidateBackend,
@@ -109,6 +113,7 @@ __all__ = [
     "EmbeddingBackend",
     "EmbeddingLoadError",
     "ExecutionBackend",
+    "ExecutionEnvironment",
     "EvidenceKind",
     "EvidenceLedger",
     "KnowledgeAgent",

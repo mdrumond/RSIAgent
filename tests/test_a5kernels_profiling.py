@@ -86,7 +86,13 @@ def test_profile_request_binds_to_host_prepared_attempt() -> None:
     plan = A5KernelRunner(PreparingBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value), attempt_id="host-attempt-7"
     )
-    plan = replace(plan, argv=("python", "driver.py"))
+    plan = replace(
+        plan,
+        argv=("python", "driver.py"),
+        environment=plan.environment.with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", "3"
+        ),
+    )
 
     request = ProfileRequest.from_execution_plan(
         plan,
@@ -586,10 +592,13 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         if "--operation" in call and call[call.index("--operation") + 2] == "run"
     )
     separator = timing_call.index("--")
-    assert timing_call[separator + 1 : separator + 4] == (
+    assert timing_call[separator + 1 : separator + 7] == (
         "env",
-        f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
+        "A5KERNEL_BLOCK_NUM=1",
         "A5KERNEL_EMIT_TIMING=1",
+        "A5KERNEL_LAUNCH_COUNT=1",
+        "A5KERNEL_WARM_UP=0",
+        f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
     )
     assert "A5KERNEL_WARM_UP=0" in timing_call
     assert "A5KERNEL_LAUNCH_COUNT=1" in timing_call

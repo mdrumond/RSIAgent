@@ -158,12 +158,14 @@ class CatlassCandidateBackend:
                  attempt_id: str, *, compile_only: bool, device: int) -> ExecutionPlan:
         plan = runner.prepare(request, attempt_id=attempt_id)
         fixture = catlass_candidate_fixture(source)
-        argv = fixture.argv
-        assert argv is not None
-        argv = ("env", f"BZ_A5_PROFILE_PHYSICAL_DEVICE={device}", *argv)
+        environment = fixture.environment.with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(device)
+        )
         if compile_only:
-            argv = ("env", "A5KERNEL_COMPILE_ONLY=1", *argv)
-        return replace(plan, files=fixture.files, argv=argv)
+            environment = environment.with_binding("A5KERNEL_COMPILE_ONLY", "1")
+        return replace(
+            plan, files=fixture.files, argv=fixture.argv, environment=environment
+        )
 
 
 class _CaptureExecution:

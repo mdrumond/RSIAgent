@@ -83,6 +83,7 @@ def write_ledger(
         argv=fixture.argv,
         input_a=input_a,
         input_b=input_b,
+        environment=fixture.environment,
     )
     identity = {
         "request_id": request.request_id,

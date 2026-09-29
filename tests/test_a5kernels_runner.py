@@ -336,6 +336,19 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
         "input_b": list(plan.input_b),
     }
     assert invocation.remote_directory == f".a5kernels/{plan.execution_id}/trial-1"
+    separator = invocation.argv.index("--")
+    rendered = invocation.argv[separator + 1 :]
+    assert rendered.count("env") == 1
+    assert rendered[:11] == (
+        "env",
+        "-u", "A5KERNEL_COMPILE_ONLY",
+        "-u", "A5KERNEL_EMIT_TIMING",
+        "-u", "A5KERNEL_LAUNCH_COUNT",
+        "-u", "A5KERNEL_WARM_UP",
+        "-u", "PYTHONPYCACHEPREFIX",
+    )
+    assert "A5KERNEL_BLOCK_NUM=1" in rendered
+    assert "BZ_A5_PROFILE_PHYSICAL_DEVICE=0" in rendered
     assert invocation.argv[-5:] == (
         "python",
         "-B",
@@ -438,15 +451,23 @@ def test_catlass_fixture_uses_current_imperative_runtime_api():
     sources = {item.relative_path: item.content for item in fixture.files}
 
     assert fixture.argv == (
-        "env",
-        "-u",
-        "PYTHONPYCACHEPREFIX",
         "python",
         "-B",
         "host_driver.py",
         "kernel.py",
         "input.json",
     )
+    assert dict(fixture.environment.bindings) == {
+        "A5KERNEL_BLOCK_NUM": "1",
+        "BZ_A5_PROFILE_PHYSICAL_DEVICE": "0",
+    }
+    assert set(fixture.environment.unset) == {
+        "A5KERNEL_COMPILE_ONLY",
+        "A5KERNEL_EMIT_TIMING",
+        "A5KERNEL_LAUNCH_COUNT",
+        "A5KERNEL_WARM_UP",
+        "PYTHONPYCACHEPREFIX",
+    }
     assert set(sources) == {"host_driver.py", "kernel.py"}
     assert "tla.allocate" in sources["kernel.py"]
     assert 'tla.vec.func(mode="simd")' in sources["kernel.py"]

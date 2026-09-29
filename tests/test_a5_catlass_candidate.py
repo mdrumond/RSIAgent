@@ -85,9 +85,13 @@ def test_compile_invokes_real_plan_with_host_owned_compile_mode(tmp_path):
     plan = execution.plans[0]
     assert plan.attempt_id != execution.plans[1].attempt_id
     assert replace(plan, attempt_id=execution.plans[1].attempt_id) == execution.plans[1]
-    assert plan.argv[:2] == ("env", "A5KERNEL_COMPILE_ONLY=1")
-    assert plan.argv[2:4] == ("env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=5")
-    assert plan.argv[4:7] == ("env", "-u", "PYTHONPYCACHEPREFIX")
+    assert plan.argv[:2] == ("python", "-B")
+    assert dict(plan.environment.bindings) == {
+        "A5KERNEL_BLOCK_NUM": "1",
+        "A5KERNEL_COMPILE_ONLY": "1",
+        "BZ_A5_PROFILE_PHYSICAL_DEVICE": "5",
+    }
+    assert "A5KERNEL_COMPILE_ONLY" not in plan.environment.unset
     candidate = next(item for item in plan.files if item.relative_path == "kernel.py")
     assert SOURCE.rstrip() in candidate.content
     assert "tla.compile(" in candidate.content
@@ -182,8 +186,11 @@ def test_run_returns_exact_plan_bound_candidate(tmp_path):
     assert run.verified.passed
     assert run.plan is execution.plans[0]
     assert run.plan.attempt_id == "candidate-4"
-    assert "A5KERNEL_COMPILE_ONLY=1" not in run.plan.argv
-    assert run.plan.argv[:2] == ("env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=6")
+    assert "A5KERNEL_COMPILE_ONLY" not in dict(run.plan.environment.bindings)
+    assert dict(run.plan.environment.bindings)[
+        "BZ_A5_PROFILE_PHYSICAL_DEVICE"
+    ] == "6"
+    assert run.plan.argv[:2] == ("python", "-B")
     assert run.verified.execution_id == run.plan.execution_id
     assert run.verified.source_fingerprint == run.plan.source_fingerprint
 
@@ -329,7 +336,9 @@ def test_profile_adapter_binds_both_campaigns_to_candidate(tmp_path):
         assert request.plan is run.plan
         assert request.expected_kernel == run.kernel_name
         assert request.device == 6
-        assert "BZ_A5_PROFILE_PHYSICAL_DEVICE=6" in request.plan.argv
+        assert dict(request.plan.environment.bindings)[
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE"
+        ] == "6"
 
 
 def test_profile_adapter_rejects_unbound_kernel_name(tmp_path):

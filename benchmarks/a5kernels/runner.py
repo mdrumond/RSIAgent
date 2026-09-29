@@ -59,6 +59,7 @@ class A5KernelRunner:
             argv=fixture.argv,
             input_a=input_a,
             input_b=input_b,
+            environment=fixture.environment,
             runtime_provenance=getattr(self._backend, "runtime_provenance", ()),
         )
 
