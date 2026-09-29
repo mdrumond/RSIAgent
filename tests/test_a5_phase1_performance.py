@@ -399,3 +399,19 @@ def test_variant_rejects_duplicate_phase1_provenance_keys():
 
     with pytest.raises(ValueError, match="complete Phase 1 dimension manifest"):
         StudyVariant(request, correctness, valid.dimensions)
+
+
+@pytest.mark.parametrize("mutation", ["reordered", "integer-spelling"])
+def test_variant_rejects_noncanonical_phase1_provenance(mutation):
+    valid = variant()
+    runtime = list(valid.request.plan.runtime_provenance)
+    if mutation == "reordered":
+        runtime[-2], runtime[-1] = runtime[-1], runtime[-2]
+    else:
+        runtime[-1] = ("phase1.parallelism", "01")
+    plan = replace(valid.request.plan, runtime_provenance=tuple(runtime))
+    request = replace(valid.request, plan=plan)
+    correctness = replace(valid.correctness, execution_id=request.execution_id)
+
+    with pytest.raises(ValueError, match="canonical Phase 1 dimension encoding"):
+        StudyVariant(request, correctness, valid.dimensions)
