@@ -105,6 +105,8 @@ def test_default_plan_meets_every_saturation_gate():
     assert plan["terminal_status"] == saturation_status(DEFAULT_PROPOSALS) == "SATURATED"
     projects = plan["projects"]
     assert [item["ordinal"] for item in projects] == list(range(1, 9))
+    assert projects[0]["family"] == "vector-add-baseline"
+    assert projects[1]["family"] == "padded-multitile"
     coverage = [tag for item in projects for tag in item["coverage"]]
     assert "functional-correctness" in coverage
     assert "padded-multitile" in coverage

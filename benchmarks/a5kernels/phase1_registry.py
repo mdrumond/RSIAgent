@@ -269,8 +269,11 @@ def _validated_proposals(
     identities = [item.identity for item in rows]
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate curriculum proposals are not allowed")
+    family_rank = {
+        registered.family: rank for rank, registered in enumerate(PROJECT_REGISTRY)
+    }
     return tuple(sorted(rows, key=lambda item: (
-        item.registered.wave, item.family.value, item.parameters,
+        item.registered.wave, family_rank[item.family], item.parameters,
     )))
 
 
