@@ -308,9 +308,13 @@ class BZSessionAdapter:
         )
         dimensions = study_dimensions_from_plan(plan)
         if dimensions is not None:
-            environment = plan.environment.with_binding(
-                "A5KERNEL_BLOCK_NUM", str(dimensions.parallelism.value)
-            )
+            block_num = str(dimensions.parallelism.value)
+            existing = dict(plan.environment.bindings).get("A5KERNEL_BLOCK_NUM")
+            if existing is not None and existing != block_num:
+                raise ValueError(
+                    "A5KERNEL_BLOCK_NUM binding does not match typed parallelism"
+                )
+            environment = plan.environment.with_binding("A5KERNEL_BLOCK_NUM", block_num)
         else:
             environment = plan.environment
         remote_argv = environment.render(remote_argv)

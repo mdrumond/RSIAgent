@@ -22,7 +22,11 @@ from benchmarks.a5kernels.bz import (
     OUTPUT_MARKER,
     RuntimeUnavailableError,
 )
-from benchmarks.a5kernels.protocol import ExecutionReceipt, SourceFile
+from benchmarks.a5kernels.protocol import (
+    ExecutionEnvironment,
+    ExecutionReceipt,
+    SourceFile,
+)
 
 
 def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
@@ -1125,6 +1129,65 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
     assert receipt.exit_code == 9
     assert len(executor.invocations) == 1
     assert f"A5KERNEL_BLOCK_NUM={parallelism}" in executor.invocations[0].argv
+
+
+@pytest.mark.parametrize("binding", ["1", None])
+def test_adapter_accepts_matching_or_missing_typed_parallelism_binding(binding):
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(9, "expected dispatch failure"), runtime_provenance=runtime
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend(runtime_provenance=runtime)).prepare(
+        RunRequest(Language.CATLASS_DSL.value, padded_length=64), attempt_id="trial-1"
+    )
+    environment = ExecutionEnvironment() if binding is None else ExecutionEnvironment(
+        bindings=(("A5KERNEL_BLOCK_NUM", binding),)
+    )
+    plan = replace(
+        plan,
+        environment=environment,
+        runtime_provenance=(
+            *plan.runtime_provenance,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+
+    assert backend.execute(plan).exit_code == 9
+    assert "A5KERNEL_BLOCK_NUM=1" in executor.invocations[0].argv
+
+
+def test_adapter_rejects_typed_parallelism_binding_mismatch_before_dispatch():
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(0, "must not run"), runtime_provenance=runtime
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend(runtime_provenance=runtime)).prepare(
+        RunRequest(Language.CATLASS_DSL.value, padded_length=64), attempt_id="trial-1"
+    )
+    plan = replace(
+        plan,
+        environment=ExecutionEnvironment(bindings=(("A5KERNEL_BLOCK_NUM", "4"),)),
+        runtime_provenance=(
+            *plan.runtime_provenance,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not match typed parallelism"):
+        backend.execute(plan)
+    assert executor.invocations == []
 
 
 @pytest.mark.parametrize(

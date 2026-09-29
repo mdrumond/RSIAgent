@@ -22,7 +22,12 @@ from benchmarks.a5kernels.evidence import (
     canonical_bytes,
     canonical_digest,
 )
-from benchmarks.a5kernels.protocol import ExecutionPlan, RunRequest, canonical_hash
+from benchmarks.a5kernels.protocol import (
+    ExecutionEnvironment,
+    ExecutionPlan,
+    RunRequest,
+    canonical_hash,
+)
 from benchmarks.a5kernels.fixtures import fixture_for
 
 
@@ -153,9 +158,31 @@ def snapshot_from_ledger(
         raise ValueError("replay ledger entries are not in runner event order")
     action = actions[0].payload
     identity_keys = {"request_id", "execution_id", "attempt_id"}
-    if set(action) != identity_keys | {"language", "argv", "inputs_sha256"}:
+    if set(action) != identity_keys | {
+        "language", "argv", "environment", "inputs_sha256",
+    }:
         raise ValueError("action evidence does not have the runner schema")
     argv = action.get("argv")
+    recorded_environment = action.get("environment")
+    try:
+        if not isinstance(recorded_environment, Mapping) or set(
+            recorded_environment
+        ) != {"bindings", "unset"}:
+            raise TypeError
+        environment = ExecutionEnvironment(
+            bindings=tuple(tuple(item) for item in recorded_environment["bindings"]),
+            unset=tuple(recorded_environment["unset"]),
+        )
+    except (TypeError, ValueError):
+        raise ValueError("a replay requires substantive action evidence") from None
+    if recorded_environment != {
+        "bindings": environment.bindings,
+        "unset": environment.unset,
+    } and recorded_environment != {
+        "bindings": [list(item) for item in environment.bindings],
+        "unset": list(environment.unset),
+    }:
+        raise ValueError("action environment is not canonical")
     if (
         not isinstance(action.get("language"), str)
         or not action["language"]
@@ -239,6 +266,8 @@ def snapshot_from_ledger(
     normalized_argv = tuple(argv) if argv is not None else None
     if normalized_argv != fixture.argv:
         raise ValueError("action argv does not match the registered fixture")
+    if environment != fixture.environment:
+        raise ValueError("action environment does not match the registered fixture")
     rng = random.Random(reconstructed_request.seed)
     input_a = tuple(
         rng.uniform(-1.0, 1.0) for _ in range(reconstructed_request.length)

@@ -172,6 +172,10 @@ class A5KernelRunner:
                 **identity,
                 "language": plan.language,
                 "argv": plan.argv,
+                "environment": {
+                    "bindings": plan.environment.bindings,
+                    "unset": plan.environment.unset,
+                },
                 "inputs_sha256": canonical_digest(
                     {"input_a": plan.input_a, "input_b": plan.input_b}
                 ),

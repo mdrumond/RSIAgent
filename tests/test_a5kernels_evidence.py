@@ -2,7 +2,13 @@ import json
 
 import pytest
 
-from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, EvidenceLedger, RunRequest
+from benchmarks.a5kernels import (
+    A5KernelRunner,
+    BZSessionAdapter,
+    EvidenceLedger,
+    RunRequest,
+    fixture_for,
+)
 from benchmarks.a5kernels.bz import RuntimeUnavailableError
 from benchmarks.a5kernels.evidence import (
     GENESIS_HASH,
@@ -130,6 +136,11 @@ def test_runner_records_host_owned_lifecycle_without_agent_metadata(tmp_path):
     assert ledger.entries[0].payload["attempt_id"] == result.attempt_id
     assert ledger.entries[0].payload["request"]["seed"] == 9
     assert ledger.entries[1].payload["attempt_id"] == result.attempt_id
+    fixture_environment = fixture_for("catlass-dsl").environment
+    assert ledger.entries[1].payload["environment"] == {
+        "bindings": [list(item) for item in fixture_environment.bindings],
+        "unset": list(fixture_environment.unset),
+    }
     assert ledger.entries[2].payload["source_fingerprint"] == result.source_fingerprint
     assert ledger.entries[3].payload["attestation_sha256"] == result.attestation_sha256
     assert "agent_claim" not in path_text(ledger.path)
