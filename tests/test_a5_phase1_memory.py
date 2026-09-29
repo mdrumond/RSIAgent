@@ -186,6 +186,30 @@ def test_project_memory_cannot_exist_without_host_fact():
         Phase1ProjectMemory(DEFAULT_PROPOSALS[0], "source", (), ())
 
 
+@pytest.mark.parametrize("actions", ["compile", {"compile": True}, ["compile"]])
+def test_project_actions_requires_exact_tuple(actions):
+    with pytest.raises(TypeError, match="actions must be a tuple"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", actions,
+            (HostFact("compile", "compiled", EVIDENCE),),
+        )
+
+
+@pytest.mark.parametrize("field", ["collection", "path"])
+def test_citation_identity_requires_nonempty_strings(field):
+    citation = {
+        "collection": "catlass", "path": "guide.py", "start_line": 1,
+        "end_line": 2, "chunk_hash": "b" * 64,
+    }
+    citation[field] = 1
+    with pytest.raises(ValueError, match="exact validated location"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", (),
+            (HostFact("host-verification", "passed", EVIDENCE),),
+            kdb_citations=(Citation(**citation),),
+        )
+
+
 @pytest.mark.parametrize("supports", [[EVIDENCE], EVIDENCE, {EVIDENCE: True}])
 def test_interpretation_supports_requires_exact_tuple(supports):
     with pytest.raises(TypeError, match="must be a tuple"):
@@ -205,3 +229,33 @@ def test_durable_interpretation_supports_requires_json_array(tmp_path, supports)
 
     with pytest.raises(ValueError, match="invalid Phase 1 project memory payload"):
         journal.read()
+
+
+@pytest.mark.parametrize("actions", ["compile", {"compile": True}])
+def test_durable_actions_reject_string_and_mapping(tmp_path, actions):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+    entry = json.loads(path.read_text())
+    entry["memory"]["actions"] = actions
+    payload = {key: value for key, value in entry.items() if key != "entry_sha256"}
+    entry["entry_sha256"] = phase1_memory._digest(payload)
+    path.write_text(json.dumps(entry) + "\n")
+
+    with pytest.raises(ValueError, match="invalid Phase 1 project memory payload"):
+        journal.project_context()
+
+
+@pytest.mark.parametrize("field", ["collection", "path"])
+def test_durable_citation_identity_rejects_numeric_fields(tmp_path, field):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+    entry = json.loads(path.read_text())
+    entry["memory"]["kdb_citations"][0][field] = 7
+    payload = {key: value for key, value in entry.items() if key != "entry_sha256"}
+    entry["entry_sha256"] = phase1_memory._digest(payload)
+    path.write_text(json.dumps(entry) + "\n")
+
+    with pytest.raises(ValueError, match="invalid Phase 1 project memory payload"):
+        journal.project_context()

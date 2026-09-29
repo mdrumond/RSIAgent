@@ -85,6 +85,8 @@ class Phase1ProjectMemory:
             raise ValueError("source_revision must be non-empty")
         if not self.host_facts:
             raise ValueError("a project memory requires at least one host fact")
+        if type(self.actions) is not tuple:
+            raise TypeError("actions must be a tuple")
         if any(not isinstance(item, str) or not item.strip() for item in self.actions):
             raise ValueError("actions must be non-empty strings")
         if not all(isinstance(item, HostFact) for item in self.host_facts):
@@ -95,7 +97,9 @@ class Phase1ProjectMemory:
             raise TypeError("kdb_citations must contain Citation values")
         for citation in self.kdb_citations:
             if (
-                not citation.collection
+                not isinstance(citation.collection, str)
+                or not citation.collection
+                or not isinstance(citation.path, str)
                 or not citation.path
                 or type(citation.start_line) is not int
                 or type(citation.end_line) is not int
