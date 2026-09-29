@@ -1162,6 +1162,43 @@ def test_adapter_accepts_matching_or_missing_typed_parallelism_binding(binding):
     assert "A5KERNEL_BLOCK_NUM=1" in executor.invocations[0].argv
 
 
+def test_runner_records_the_effective_adapter_environment(tmp_path):
+    from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(9, "expected dispatch failure"), runtime_provenance=runtime
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    runner = A5KernelRunner(backend, evidence_ledger=ledger)
+    request = RunRequest(Language.CATLASS_DSL.value, padded_length=64)
+    plan = replace(
+        runner.prepare(request, attempt_id="trial-1"),
+        environment=ExecutionEnvironment(),
+        runtime_provenance=(
+            *runtime,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+
+    result = runner.run_plan(request, plan)
+
+    action = next(
+        item for item in ledger.entries if item.kind == EvidenceKind.ACTION.value
+    )
+    assert action.payload["environment"]["bindings"] == [
+        ["A5KERNEL_BLOCK_NUM", "1"],
+    ]
+    assert result.execution_id == action.payload["execution_id"]
+    assert result.execution_id in executor.invocations[0].remote_directory
+
+
 def test_adapter_rejects_typed_parallelism_binding_mismatch_before_dispatch():
     runtime = (("catlass_revision", "1" * 40),)
     executor = FakeCommandExecutor(
