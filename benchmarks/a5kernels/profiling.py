@@ -42,6 +42,7 @@ class ProfileRequest:
     device: int
     warm_up: int = 0
     launch_count: int = 1
+    block_count: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, ExecutionPlan):
@@ -69,6 +70,18 @@ class ProfileRequest:
         }
         if reserved_timing.intersection(bindings):
             raise ValueError("plan environment must not override host-owned timing policy")
+        dimensions = study_dimensions_from_plan(self.plan)
+        expected_block = (
+            dimensions.parallelism.value
+            if dimensions is not None else self.block_count
+        )
+        if expected_block is not None:
+            if type(expected_block) is not int or not 1 <= expected_block <= 8:
+                raise ValueError("block_count must be an integer from 1 through 8")
+            if bindings.get("A5KERNEL_BLOCK_NUM") != str(expected_block):
+                raise ValueError(
+                    "plan block binding must match host-owned block metadata"
+                )
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -104,6 +117,7 @@ class ProfileRequest:
                 "expected_kernel": self.expected_kernel,
                 "implementation": self.implementation,
                 "launch_count": self.launch_count,
+                "block_count": self.block_count,
                 "warm_up": self.warm_up,
             }
         )
@@ -118,6 +132,7 @@ class ProfileRequest:
         device: int,
         warm_up: int = 0,
         launch_count: int = 1,
+        block_count: int | None = None,
     ) -> ProfileRequest:
         """Bind profiling to the exact host-prepared executable attempt."""
 
@@ -128,6 +143,7 @@ class ProfileRequest:
             device=device,
             warm_up=warm_up,
             launch_count=launch_count,
+            block_count=block_count,
         )
 
 
@@ -555,6 +571,16 @@ def _validate_dimensions_against_plan(
         raise ValueError("Phase 1 dimensions require a Catlass DSL execution plan")
     if dimensions.access is not AccessClass.CONTIGUOUS:
         raise ValueError("the current Catlass fixture supports only contiguous access")
+    block_environment = tuple(
+        argument
+        for argument in plan.argv or ()
+        if argument.startswith("A5KERNEL_BLOCK_NUM=")
+    )
+    expected_block = f"A5KERNEL_BLOCK_NUM={dimensions.parallelism.value}"
+    if block_environment and block_environment != (expected_block,):
+        raise ValueError(
+            "execution plan block binding must match the host-owned study block dimension"
+        )
     logical_length = int(dimensions.shape.value[1:])
     if dimensions.padding is PaddingClass.NONE:
         if logical_length % 64:

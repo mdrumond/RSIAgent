@@ -226,9 +226,13 @@ def _compile_diagnostics(receipt: ExecutionReceipt | None, *, passed: bool) -> s
 class CandidateProfileEvaluation:
     """Bind treatment and final campaigns to the exact candidate execution."""
 
-    def __init__(self, controller: ProfilingTreatmentController, *, device: int):
+    def __init__(self, controller: ProfilingTreatmentController, *, device: int,
+                 block_count: int = 1):
+        if type(block_count) is not int or not 1 <= block_count <= 8:
+            raise ValueError("block_count must be an integer in [1, 8]")
         self._controller = controller
         self._device = device
+        self._block_count = block_count
 
     def intermediate(self, run: CandidateRun) -> Mapping[str, object]:
         result = self._controller.run_intermediate(run.verified, self._request(run))
@@ -245,4 +249,5 @@ class CandidateProfileEvaluation:
             implementation="catlass-dsl",
             expected_kernel=run.kernel_name,
             device=self._device,
+            block_count=self._block_count,
         )
