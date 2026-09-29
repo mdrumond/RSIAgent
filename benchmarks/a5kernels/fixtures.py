@@ -81,6 +81,9 @@ def run(input_a, input_b):
     a = torch.tensor(input_a, dtype=torch.float32, device="npu")
     b = torch.tensor(input_b, dtype=torch.float32, device="npu")
     out = torch.empty_like(a)
+    block_num = int(os.environ.get("A5KERNEL_BLOCK_NUM", "1"))
+    if block_num < 1:
+        raise ValueError("A5KERNEL_BLOCK_NUM must be positive")
 
     def as_tla(tensor):
         return from_dlpack(
@@ -101,13 +104,13 @@ def run(input_a, input_b):
         if warm_up < 0 or launch_count < 1:
             raise ValueError("invalid host-owned timing policy")
         for _ in range(warm_up):
-            artifact(tla_a, tla_b, tla_out, block_num=1)
+            artifact(tla_a, tla_b, tla_out, block_num=block_num)
         torch.npu.synchronize()
         started_ns = time.perf_counter_ns()
         for _ in range(launch_count):
-            artifact(tla_a, tla_b, tla_out, block_num=1)
+            artifact(tla_a, tla_b, tla_out, block_num=block_num)
     else:
-        artifact(tla_a, tla_b, tla_out, block_num=1)
+        artifact(tla_a, tla_b, tla_out, block_num=block_num)
     torch.npu.synchronize()
     if emit_timing:
         duration_us = (time.perf_counter_ns() - started_ns) / 1_000 / launch_count

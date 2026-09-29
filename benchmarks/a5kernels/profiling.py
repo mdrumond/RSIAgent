@@ -468,6 +468,70 @@ class StudyDimensions:
         )
 
 
+_STUDY_PROVENANCE_KEYS = {
+    "phase1.shape", "phase1.padding", "phase1.access", "phase1.parallelism",
+}
+
+
+def study_dimensions_from_plan(plan: ExecutionPlan) -> StudyDimensions | None:
+    """Decode and validate the study configuration executed by ``plan``."""
+
+    values = {key: value for key, value in plan.runtime_provenance if key.startswith("phase1.")}
+    if not values:
+        return None
+    if set(values) != _STUDY_PROVENANCE_KEYS:
+        raise ValueError("execution plan requires a complete Phase 1 dimension manifest")
+    try:
+        dimensions = StudyDimensions(
+            ShapeClass(values["phase1.shape"]),
+            PaddingClass(values["phase1.padding"]),
+            AccessClass(values["phase1.access"]),
+            ParallelismClass(int(values["phase1.parallelism"])),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("execution plan has invalid Phase 1 dimensions") from exc
+    _validate_dimensions_against_plan(plan, dimensions)
+    return dimensions
+
+
+def bind_study_dimensions(
+    plan: ExecutionPlan, dimensions: StudyDimensions
+) -> ExecutionPlan:
+    """Atomically bind typed dimensions after checking the executable workload."""
+
+    if not isinstance(plan, ExecutionPlan) or not isinstance(dimensions, StudyDimensions):
+        raise TypeError("a host ExecutionPlan and StudyDimensions are required")
+    if any(key.startswith("phase1.") for key, _value in plan.runtime_provenance):
+        raise ValueError("execution plan already contains Phase 1 dimensions")
+    bound = replace(
+        plan,
+        runtime_provenance=(*plan.runtime_provenance, *dimensions.as_provenance()),
+    )
+    _validate_dimensions_against_plan(bound, dimensions)
+    return bound
+
+
+def _validate_dimensions_against_plan(
+    plan: ExecutionPlan, dimensions: StudyDimensions
+) -> None:
+    if plan.language != "catlass-dsl":
+        raise ValueError("Phase 1 dimensions require a Catlass DSL execution plan")
+    if dimensions.access is not AccessClass.CONTIGUOUS:
+        raise ValueError("the current Catlass fixture supports only contiguous access")
+    logical_length = int(dimensions.shape.value[1:])
+    if dimensions.padding is PaddingClass.NONE:
+        physical_length = logical_length
+    else:
+        alignment = 64 if dimensions.padding is PaddingClass.ALIGN_64 else 256
+        physical_length = ((logical_length + alignment - 1) // alignment) * alignment
+        if physical_length == logical_length:
+            raise ValueError("padding dimensions must add a real padded tail")
+    if len(plan.input_a) != physical_length or len(plan.input_b) != physical_length:
+        raise ValueError("Phase 1 shape and padding do not match the execution inputs")
+    if any(plan.input_a[logical_length:]) or any(plan.input_b[logical_length:]):
+        raise ValueError("Phase 1 padded input tails must contain host-generated zeros")
+
+
 @dataclass(frozen=True)
 class StudyVariant:
     request: ProfileRequest
@@ -481,9 +545,7 @@ class StudyVariant:
             raise TypeError("correctness must be a VerifiedResult")
         if not isinstance(self.dimensions, StudyDimensions):
             raise TypeError("dimensions must be StudyDimensions")
-        provenance = dict(self.request.plan.runtime_provenance)
-        expected = dict(self.dimensions.as_provenance())
-        if any(provenance.get(key) != value for key, value in expected.items()):
+        if study_dimensions_from_plan(self.request.plan) != self.dimensions:
             raise ValueError(
                 "study dimensions must match the host-owned execution-plan provenance"
             )

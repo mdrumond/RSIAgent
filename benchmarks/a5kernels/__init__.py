@@ -46,6 +46,8 @@ from benchmarks.a5kernels.profiling import (
     StudyTimingSample,
     StudyVariant,
     TimingStudyResult,
+    bind_study_dimensions,
+    study_dimensions_from_plan,
     ProfileRequest,
     ProfilingTreatmentController,
 )
@@ -120,6 +122,8 @@ __all__ = [
     "StudyTimingSample",
     "StudyVariant",
     "TimingStudyResult",
+    "bind_study_dimensions",
+    "study_dimensions_from_plan",
     "TrialAction",
     "TrialActionExecutor",
     "TrialOrchestrator",

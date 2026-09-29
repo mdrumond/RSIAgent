@@ -15,6 +15,7 @@ from benchmarks.a5kernels.profiling import (
     StudyPreset,
     StudyTimingSample,
     StudyVariant,
+    bind_study_dimensions,
 )
 from tests.test_a5kernels_profiling import (
     CORRECT,
@@ -38,13 +39,20 @@ def dimensions(parallelism=ParallelismClass.ONE):
 
 def variant(*, parallelism=ParallelismClass.ONE, attempt="attempt-1"):
     study_dimensions = dimensions(parallelism)
-    request = replace(
-        REQUEST,
-        plan=replace(
+    values_a = (*([1.0] * 32), *([0.0] * 32))
+    values_b = (*([2.0] * 32), *([0.0] * 32))
+    plan = bind_study_dimensions(
+        replace(
             REQUEST.plan,
             attempt_id=attempt,
-            runtime_provenance=study_dimensions.as_provenance(),
+            input_a=values_a,
+            input_b=values_b,
         ),
+        study_dimensions,
+    )
+    request = replace(
+        REQUEST,
+        plan=plan,
     )
     correctness = replace(
         CORRECT,
@@ -250,15 +258,19 @@ def test_comparison_rejects_mismatched_workloads_before_measurement():
     backend = FakeStudyBackend()
     first = variant(attempt="n32")
     other_dimensions = StudyDimensions(
-        ShapeClass.N512,
-        PaddingClass.ALIGN_64,
+        ShapeClass.N64,
+        PaddingClass.NONE,
         AccessClass.CONTIGUOUS,
         ParallelismClass.FOUR,
     )
-    other_plan = replace(
-        first.request.plan,
-        attempt_id="n512",
-        runtime_provenance=other_dimensions.as_provenance(),
+    other_plan = bind_study_dimensions(
+        replace(
+            REQUEST.plan,
+            attempt_id="n64",
+            input_a=tuple([1.0] * 64),
+            input_b=tuple([2.0] * 64),
+        ),
+        other_dimensions,
     )
     other_request = replace(first.request, plan=other_plan)
     other_correctness = replace(
@@ -292,3 +304,36 @@ def test_comparison_rejects_relabelled_duplicate_execution():
             StudyPreset.OPTIMIZATION_COMPARISON, [first, retry]
         )
     assert backend.commands == []
+
+
+@pytest.mark.parametrize(
+    "bad_dimensions",
+    [
+        StudyDimensions(
+            ShapeClass.N512,
+            PaddingClass.NONE,
+            AccessClass.CONTIGUOUS,
+            ParallelismClass.ONE,
+        ),
+        StudyDimensions(
+            ShapeClass.N32,
+            PaddingClass.NONE,
+            AccessClass.CONTIGUOUS,
+            ParallelismClass.ONE,
+        ),
+        StudyDimensions(
+            ShapeClass.N32,
+            PaddingClass.ALIGN_64,
+            AccessClass.STRIDED_2,
+            ParallelismClass.ONE,
+        ),
+    ],
+)
+def test_binding_rejects_mislabeled_shape_padding_or_access(bad_dimensions):
+    padded_n32 = replace(
+        REQUEST.plan,
+        input_a=(*([1.0] * 32), *([0.0] * 32)),
+        input_b=(*([2.0] * 32), *([0.0] * 32)),
+    )
+    with pytest.raises(ValueError):
+        bind_study_dimensions(padded_n32, bad_dimensions)
