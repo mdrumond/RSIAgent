@@ -123,6 +123,35 @@ def test_resume_rejects_other_plan_even_with_shared_first_project(tmp_path):
         Phase1LearningJournal(path, different_plan).read()
 
 
+def test_resume_ignores_torn_tail_and_next_append_recovers_framing(tmp_path):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    first = journal.append(memory(1))
+    with path.open("ab") as stream:
+        stream.write(b'{"schema":"a5-phase1-project-memory-v1","sequence":2')
+
+    resumed = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    assert resumed.resume_state().completed_projects == 1
+    assert resumed.resume_state().head_sha256 == first["entry_sha256"]
+    resumed.append(memory(2))
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 2
+    assert [entry["sequence"] for entry in resumed.read()] == [1, 2]
+    assert json.loads(lines[1])["memory"]["source_revision"] == "source-2"
+
+
+def test_resume_rejects_newline_terminated_incomplete_record(tmp_path):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+    with path.open("ab") as stream:
+        stream.write(b'{"sequence":2\n')
+
+    with pytest.raises(ValueError, match="invalid Phase 1 learning journal JSON"):
+        journal.resume_state()
+
+
 @pytest.mark.parametrize(
     "fact,error",
     [

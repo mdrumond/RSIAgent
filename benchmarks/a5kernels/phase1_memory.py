@@ -181,7 +181,9 @@ class Phase1LearningJournal:
         with self.path.open("a+", encoding="utf-8") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stream.seek(0)
-            entries = self._decode(stream.read())
+            value = stream.read()
+            committed, torn_tail = self._committed_content(value)
+            entries = self._decode(committed)
             ordinal = len(entries) + 1
             if ordinal > len(self.proposals):
                 raise ValueError("the Phase 1 plan is already complete")
@@ -195,6 +197,15 @@ class Phase1LearningJournal:
                 "memory": memory.as_dict(),
             }
             entry = {**payload, "entry_sha256": _digest(payload)}
+            if torn_tail:
+                # A final unterminated JSON fragment was never committed. Removing
+                # only those bytes preserves append-only semantics for every record.
+                stream.seek(len(committed))
+                stream.truncate()
+            elif committed and not committed.endswith("\n"):
+                # A complete fsynced record may have lost only its line delimiter.
+                stream.seek(0, os.SEEK_END)
+                stream.write("\n")
             stream.seek(0, os.SEEK_END)
             stream.write(_canonical(entry).decode("utf-8") + "\n")
             stream.flush()
@@ -233,6 +244,7 @@ class Phase1LearningJournal:
         return _canonical(payload).decode("utf-8")
 
     def _decode(self, value: str) -> list[dict[str, Any]]:
+        value, _torn_tail = self._committed_content(value)
         entries: list[dict[str, Any]] = []
         previous = _GENESIS
         for sequence, line in enumerate(value.splitlines(), 1):
@@ -263,3 +275,21 @@ class Phase1LearningJournal:
             previous = digest
             entries.append(entry)
         return entries
+
+    @staticmethod
+    def _committed_content(value: str) -> tuple[str, bool]:
+        """Separate an interrupted final write from newline-framed records.
+
+        Only an unterminated final fragment that is not complete JSON is recoverable.
+        Invalid JSON followed by a newline is a committed corrupt record and remains
+        a hard error in ``_decode``.
+        """
+        if not value or value.endswith("\n"):
+            return value, False
+        offset = value.rfind("\n") + 1
+        tail = value[offset:]
+        try:
+            json.loads(tail)
+        except json.JSONDecodeError:
+            return value[:offset], True
+        return value, False
