@@ -113,15 +113,29 @@ def test_recovery_fault_count_is_registry_owned():
 
 @pytest.mark.parametrize("options,message", [
     ({"length": True}, "length"),
-    ({"length": 401}, "length"),
+    ({"length": 0}, "length"),
     ({"padded_length": 63}, "padded_length"),
-    ({"padded_length": 512}, "padded_length"),
+    ({"padded_length": 96}, "padded_length"),
     ({"block_count": 0}, "block_count"),
     ({"block_count": True}, "block_count"),
 ])
 def test_candidate_backend_rejects_values_outside_host_contract(options, message):
     with pytest.raises(ValueError, match=message):
         CatlassCandidateBackend(FakeExecution(), **options)
+
+
+def test_generic_backend_accepts_extent_beyond_phase1_brief():
+    backend = CatlassCandidateBackend(
+        FakeExecution(), length=512, padded_length=512
+    )
+    request = backend._request()
+    assert request.length == request.padded_length == 512
+
+    phase1 = _proposal("vector-add-baseline")
+    with pytest.raises(ValueError, match="logical_length"):
+        Phase1ProjectRuntime(phase1, 512, 512, 1)
+    with pytest.raises(ValueError, match="padded_length"):
+        Phase1ProjectRuntime(phase1, 400, 512, 1)
 
 
 def test_recovery_templates_are_distinct_and_deterministic():

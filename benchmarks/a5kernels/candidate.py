@@ -94,14 +94,14 @@ class CatlassCandidateBackend:
                  seed: int = 0, device: int = 0):
         if isinstance(device, bool) or not isinstance(device, int) or device < 0:
             raise ValueError("device must be a non-negative integer")
-        if type(length) is not int or not 1 <= length <= 400:
-            raise ValueError("length must be an integer in [1, 400]")
+        if type(length) is not int or length < 1:
+            raise ValueError("length must be a positive integer")
         if padded_length is None:
             padded_length = ((length + 63) // 64) * 64
         if (type(padded_length) is not int or padded_length < length
-                or padded_length > 448 or padded_length % 64):
+                or padded_length % 64):
             raise ValueError(
-                "padded_length must be a 64-aligned integer in [length, 448]"
+                "padded_length must be a 64-aligned integer at least length"
             )
         if type(block_count) is not int or not 1 <= block_count <= 8:
             raise ValueError("block_count must be an integer in [1, 8]")
