@@ -179,6 +179,23 @@ def test_torn_tail_recovery_uses_utf8_byte_offset(tmp_path):
     assert entries[0]["memory"]["source_revision"] == "révision-1"
 
 
+def test_torn_tail_recovery_preserves_crlf_committed_entry(tmp_path):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    first = journal.append(memory(1))
+    committed = path.read_bytes().removesuffix(b"\n") + b"\r\n"
+    path.write_bytes(
+        committed + b'{"schema":"a5-phase1-project-memory-v1","sequence":2'
+    )
+
+    resumed = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    assert resumed.read()[0]["entry_sha256"] == first["entry_sha256"]
+    resumed.append(memory(2))
+
+    assert path.read_bytes().startswith(committed)
+    assert [entry["sequence"] for entry in resumed.read()] == [1, 2]
+
+
 def test_resume_rejects_newline_terminated_incomplete_record(tmp_path):
     path = tmp_path / "learning.jsonl"
     journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)

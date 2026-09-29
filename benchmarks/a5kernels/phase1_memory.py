@@ -199,7 +199,7 @@ class Phase1LearningJournal:
     def append(self, memory: Phase1ProjectMemory) -> Mapping[str, object]:
         if not isinstance(memory, Phase1ProjectMemory):
             raise TypeError("memory must be a Phase1ProjectMemory")
-        with self.path.open("a+", encoding="utf-8") as stream:
+        with self.path.open("a+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stream.seek(0)
             value = stream.read()
@@ -221,19 +221,19 @@ class Phase1LearningJournal:
             if torn_tail:
                 # A final unterminated JSON fragment was never committed. Removing
                 # only those bytes preserves append-only semantics for every record.
-                os.ftruncate(stream.fileno(), len(committed.encode("utf-8")))
-            elif committed and not committed.endswith("\n"):
+                os.ftruncate(stream.fileno(), len(committed))
+            elif committed and not committed.endswith(b"\n"):
                 # A complete fsynced record may have lost only its line delimiter.
                 stream.seek(0, os.SEEK_END)
-                stream.write("\n")
+                stream.write(b"\n")
             stream.seek(0, os.SEEK_END)
-            stream.write(_canonical(entry).decode("utf-8") + "\n")
+            stream.write(_canonical(entry) + b"\n")
             stream.flush()
             os.fsync(stream.fileno())
             return entry
 
     def read(self) -> tuple[Mapping[str, object], ...]:
-        with self.path.open("a+", encoding="utf-8") as stream:
+        with self.path.open("a+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
             stream.seek(0)
             return tuple(self._decode(stream.read()))
@@ -263,14 +263,15 @@ class Phase1LearningJournal:
         }
         return _canonical(payload).decode("utf-8")
 
-    def _decode(self, value: str) -> list[dict[str, Any]]:
+    def _decode(self, value: bytes) -> list[dict[str, Any]]:
         value, _torn_tail = self._committed_content(value)
         entries: list[dict[str, Any]] = []
         previous = _GENESIS
-        for sequence, line in enumerate(value.splitlines(), 1):
+        for sequence, raw_line in enumerate(value.splitlines(), 1):
             try:
+                line = raw_line.decode("utf-8")
                 entry = json.loads(line)
-            except json.JSONDecodeError as exc:
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise ValueError("invalid Phase 1 learning journal JSON") from exc
             required = {
                 "schema", "sequence", "plan_fingerprint", "previous_sha256",
@@ -298,19 +299,19 @@ class Phase1LearningJournal:
         return entries
 
     @staticmethod
-    def _committed_content(value: str) -> tuple[str, bool]:
+    def _committed_content(value: bytes) -> tuple[bytes, bool]:
         """Separate an interrupted final write from newline-framed records.
 
         Only an unterminated final fragment that is not complete JSON is recoverable.
         Invalid JSON followed by a newline is a committed corrupt record and remains
         a hard error in ``_decode``.
         """
-        if not value or value.endswith("\n"):
+        if not value or value.endswith(b"\n"):
             return value, False
-        offset = value.rfind("\n") + 1
+        offset = value.rfind(b"\n") + 1
         tail = value[offset:]
         try:
-            json.loads(tail)
-        except json.JSONDecodeError:
+            json.loads(tail.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
             return value[:offset], True
         return value, False
