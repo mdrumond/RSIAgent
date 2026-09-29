@@ -17,6 +17,7 @@ from benchmarks.a5kernels.phase1_runtime import (
     HOST_FAILURE_STARTER,
     Phase1ProjectRuntime,
     RecoveryEvidence,
+    RecoveryStarter,
 )
 from benchmarks.a5kernels.protocol import ExecutionReceipt
 
@@ -132,10 +133,34 @@ def test_generic_backend_accepts_extent_beyond_phase1_brief():
     assert request.length == request.padded_length == 512
 
     phase1 = _proposal("vector-add-baseline")
-    with pytest.raises(ValueError, match="logical_length"):
+    with pytest.raises(ValueError, match="exactly match"):
         Phase1ProjectRuntime(phase1, 512, 512, 1)
-    with pytest.raises(ValueError, match="padded_length"):
+    with pytest.raises(ValueError, match="exactly match"):
         Phase1ProjectRuntime(phase1, 400, 512, 1)
+
+
+@pytest.mark.parametrize("fields", [
+    (33, 64, 1, None),
+    (32, 128, 1, None),
+    (32, 64, 2, None),
+    (32, 64, 1, RecoveryStarter(HOST_FAILURE_STARTER,
+                                RecoveryEvidence.HOST_VERIFICATION_FAILURE, 1)),
+])
+def test_direct_baseline_construction_rejects_derived_field_mismatch(fields):
+    with pytest.raises(ValueError, match="exactly match"):
+        Phase1ProjectRuntime(_proposal("vector-add-baseline"), *fields)
+
+
+@pytest.mark.parametrize("recovery", [
+    None,
+    RecoveryStarter(HOST_FAILURE_STARTER, RecoveryEvidence.COMPILE_FAILURE, 1),
+    RecoveryStarter(COMPILE_FAILURE_STARTER,
+                    RecoveryEvidence.HOST_VERIFICATION_FAILURE, 1),
+    RecoveryStarter(COMPILE_FAILURE_STARTER, RecoveryEvidence.COMPILE_FAILURE, 2),
+])
+def test_direct_recovery_construction_rejects_metadata_mismatch(recovery):
+    with pytest.raises(ValueError, match="exactly match"):
+        Phase1ProjectRuntime(_proposal("compile-recovery"), 32, 64, 1, recovery)
 
 
 def test_recovery_templates_are_distinct_and_deterministic():

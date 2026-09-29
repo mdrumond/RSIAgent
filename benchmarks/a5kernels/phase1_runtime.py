@@ -29,6 +29,34 @@ class RecoveryStarter:
         return hashlib.sha256(self.source.encode("utf-8")).hexdigest()
 
 
+def _resolve_runtime(
+    proposal: CurriculumProposal,
+) -> tuple[int, int, int, RecoveryStarter | None]:
+    """Derive the only runtime fields admitted for a registered proposal."""
+
+    if not isinstance(proposal, CurriculumProposal):
+        raise ValueError("proposal must be a validated CurriculumProposal")
+    parameters = dict(proposal.parameters)
+    family = proposal.family
+    logical_length = int(parameters.get("length", 32))
+    block_count = int(parameters.get("block_count", 1))
+    recovery = None
+    if family is ProjectFamily.COMPILE_RECOVERY:
+        recovery = RecoveryStarter(
+            COMPILE_FAILURE_STARTER, RecoveryEvidence.COMPILE_FAILURE,
+            int(parameters["faults"]),
+        )
+    elif family is ProjectFamily.RUNTIME_RECOVERY:
+        recovery = RecoveryStarter(
+            HOST_FAILURE_STARTER, RecoveryEvidence.HOST_VERIFICATION_FAILURE,
+            int(parameters["faults"]),
+        )
+    return (
+        logical_length, ((logical_length + 63) // 64) * 64,
+        block_count, recovery,
+    )
+
+
 @dataclass(frozen=True)
 class Phase1ProjectRuntime:
     """Resolved, command-free runtime policy for one validated proposal."""
@@ -40,42 +68,18 @@ class Phase1ProjectRuntime:
     recovery: RecoveryStarter | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.proposal, CurriculumProposal):
-            raise ValueError("proposal must be a validated CurriculumProposal")
-        if type(self.logical_length) is not int or not 1 <= self.logical_length <= 400:
-            raise ValueError("logical_length must be in [1, 400]")
-        if (type(self.padded_length) is not int
-                or self.padded_length < self.logical_length
-                or self.padded_length > 448 or self.padded_length % 64):
-            raise ValueError("padded_length must be a 64-aligned extent through 448")
-        if type(self.block_count) is not int or not 1 <= self.block_count <= 8:
-            raise ValueError("block_count must be in [1, 8]")
+        expected = _resolve_runtime(self.proposal)
+        actual = (
+            self.logical_length, self.padded_length, self.block_count, self.recovery,
+        )
+        if actual != expected:
+            raise ValueError("runtime fields must exactly match the registered proposal")
 
     @classmethod
     def from_proposal(cls, proposal: CurriculumProposal) -> "Phase1ProjectRuntime":
         """Resolve all execution values from the immutable registry selection."""
 
-        if not isinstance(proposal, CurriculumProposal):
-            raise ValueError("proposal must be a validated CurriculumProposal")
-        parameters = dict(proposal.parameters)
-        family = proposal.family
-        logical_length = int(parameters.get("length", 32))
-        block_count = int(parameters.get("block_count", 1))
-        recovery = None
-        if family is ProjectFamily.COMPILE_RECOVERY:
-            recovery = RecoveryStarter(
-                COMPILE_FAILURE_STARTER, RecoveryEvidence.COMPILE_FAILURE,
-                int(parameters["faults"]),
-            )
-        elif family is ProjectFamily.RUNTIME_RECOVERY:
-            recovery = RecoveryStarter(
-                HOST_FAILURE_STARTER, RecoveryEvidence.HOST_VERIFICATION_FAILURE,
-                int(parameters["faults"]),
-            )
-        return cls(
-            proposal, logical_length, ((logical_length + 63) // 64) * 64,
-            block_count, recovery,
-        )
+        return cls(proposal, *_resolve_runtime(proposal))
 
     def backend(
         self, execution_backend: ExecutionBackend, *, seed: int = 0, device: int = 0
