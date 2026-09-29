@@ -83,6 +83,8 @@ class Phase1ProjectMemory:
             raise TypeError("proposal must be a CurriculumProposal")
         if not isinstance(self.source_revision, str) or not self.source_revision.strip():
             raise ValueError("source_revision must be non-empty")
+        if type(self.host_facts) is not tuple:
+            raise TypeError("host_facts must be a tuple")
         if not self.host_facts:
             raise ValueError("a project memory requires at least one host fact")
         if type(self.actions) is not tuple:
@@ -91,8 +93,12 @@ class Phase1ProjectMemory:
             raise ValueError("actions must be non-empty strings")
         if not all(isinstance(item, HostFact) for item in self.host_facts):
             raise TypeError("host_facts must contain HostFact values")
+        if type(self.interpretations) is not tuple:
+            raise TypeError("interpretations must be a tuple")
         if not all(isinstance(item, AgentInterpretation) for item in self.interpretations):
             raise TypeError("interpretations must contain AgentInterpretation values")
+        if type(self.kdb_citations) is not tuple:
+            raise TypeError("kdb_citations must be a tuple")
         if not all(isinstance(item, Citation) for item in self.kdb_citations):
             raise TypeError("kdb_citations must contain Citation values")
         for citation in self.kdb_citations:

@@ -210,6 +210,40 @@ def test_citation_identity_requires_nonempty_strings(field):
         )
 
 
+@pytest.mark.parametrize("shape", ["list", "generator", "mapping"])
+@pytest.mark.parametrize("field", ["host_facts", "interpretations", "kdb_citations"])
+def test_project_tuple_collections_reject_iterable_impostors(field, shape):
+    values = {
+        "host_facts": (HostFact("compile", "compiled", EVIDENCE),),
+        "interpretations": (AgentInterpretation("Observed", (EVIDENCE,)),),
+        "kdb_citations": (Citation("catlass", "guide.py", 1, 2, "b" * 64),),
+    }
+    original = values[field]
+    if shape == "list":
+        values[field] = list(original)
+    elif shape == "generator":
+        values[field] = (item for item in original)
+    else:
+        values[field] = {index: item for index, item in enumerate(original)}
+
+    with pytest.raises(TypeError, match=f"{field} must be a tuple"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", ("compile",), **values,
+        )
+
+
+def test_valid_tuple_collections_persist_and_reload(tmp_path):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+
+    reloaded = journal.read()[0]["memory"]
+    assert reloaded["actions"] == ["compile registered candidate", "run host verifier"]
+    assert reloaded["host_facts"][0]["category"] == "host-verification"
+    assert reloaded["agent_interpretations"][0]["supports"] == [EVIDENCE]
+    assert reloaded["kdb_citations"][0]["collection"] == "catlass"
+
+
 @pytest.mark.parametrize("supports", [[EVIDENCE], EVIDENCE, {EVIDENCE: True}])
 def test_interpretation_supports_requires_exact_tuple(supports):
     with pytest.raises(TypeError, match="must be a tuple"):
