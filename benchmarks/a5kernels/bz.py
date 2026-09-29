@@ -289,7 +289,7 @@ class BZSessionAdapter:
             raise RuntimeUnavailableError(
                 f"no executable runtime is registered for {plan.language}"
             )
-        if plan.runtime_provenance != self.runtime_provenance:
+        if not self._runtime_provenance_matches(plan.runtime_provenance):
             raise RuntimeUnavailableError(
                 "execution plan runtime provenance does not match the configured backend"
             )
@@ -351,6 +351,27 @@ class BZSessionAdapter:
                 or f"bz-a5:{session_name}"
             ),
         )
+
+    def _runtime_provenance_matches(
+        self, plan_provenance: tuple[tuple[str, str], ...]
+    ) -> bool:
+        """Accept only the typed Phase 1 study manifest beyond runtime identity."""
+
+        allowed = {
+            "phase1.shape": {"n32", "n64", "n128", "n256", "n512"},
+            "phase1.padding": {"none", "align-64", "align-256"},
+            "phase1.access": {"contiguous", "strided-2", "tiled"},
+            "phase1.parallelism": {"1", "2", "4", "8", "16", "24", "28"},
+        }
+        phase1 = tuple(item for item in plan_provenance if item[0] in allowed)
+        runtime = tuple(item for item in plan_provenance if item[0] not in allowed)
+        if runtime != self.runtime_provenance:
+            return False
+        if not phase1:
+            return True
+        if len(phase1) != len(allowed) or {key for key, _value in phase1} != set(allowed):
+            return False
+        return all(value in allowed[key] for key, value in phase1)
 
 
 def _parse_output(stdout: str) -> tuple[float, ...]:

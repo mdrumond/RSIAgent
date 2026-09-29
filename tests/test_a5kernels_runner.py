@@ -1075,6 +1075,61 @@ def test_adapter_rejects_plan_bound_to_different_runtime_provenance():
     assert executor.invocations == []
 
 
+def test_adapter_accepts_complete_typed_phase1_study_provenance():
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(9, "expected dispatch failure"),
+        runtime_provenance=runtime,
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend(runtime_provenance=runtime)).prepare(
+        RunRequest(Language.CATLASS_DSL.value), attempt_id="trial-1"
+    )
+    plan = replace(
+        plan,
+        runtime_provenance=(
+            *plan.runtime_provenance,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "4"),
+        ),
+    )
+
+    receipt = backend.execute(plan)
+
+    assert receipt.exit_code == 9
+    assert len(executor.invocations) == 1
+
+
+@pytest.mark.parametrize(
+    "study_provenance",
+    [
+        (("phase1.shape", "n32"),),
+        (
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "999"),
+        ),
+    ],
+)
+def test_adapter_rejects_incomplete_or_untyped_phase1_provenance(study_provenance):
+    executor = FakeCommandExecutor(CommandResult(0, "must not run"))
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value), attempt_id="trial-1"
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="provenance does not match"):
+        backend.execute(replace(plan, runtime_provenance=study_provenance))
+    assert executor.invocations == []
+
+
 def test_runtime_revision_changes_identity_session_and_attestation():
     source = "/home/mariodrumond/worktrees/catlass/retained"
     first_provenance = (
