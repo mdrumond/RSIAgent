@@ -16,6 +16,7 @@ import tempfile
 from typing import Callable, Protocol
 
 from benchmarks.a5kernels.protocol import ExecutionPlan, ExecutionReceipt, SourceFile
+from benchmarks.a5kernels.profiling import study_dimensions_from_plan
 
 
 OUTPUT_MARKER = "A5KERNEL_OUTPUT="
@@ -289,7 +290,7 @@ class BZSessionAdapter:
             raise RuntimeUnavailableError(
                 f"no executable runtime is registered for {plan.language}"
             )
-        if plan.runtime_provenance != self.runtime_provenance:
+        if not self._runtime_provenance_matches(plan):
             raise RuntimeUnavailableError(
                 "execution plan runtime provenance does not match the configured backend"
             )
@@ -305,6 +306,13 @@ class BZSessionAdapter:
             f"{remote_directory}/{arg}" if arg in staged_paths else arg
             for arg in plan.argv
         )
+        dimensions = study_dimensions_from_plan(plan)
+        if dimensions is not None:
+            remote_argv = (
+                "env",
+                f"A5KERNEL_BLOCK_NUM={dimensions.parallelism.value}",
+                *remote_argv,
+            )
         invocation = CommandInvocation(
             argv=(
                 self._wrapper,
@@ -351,6 +359,23 @@ class BZSessionAdapter:
                 or f"bz-a5:{session_name}"
             ),
         )
+
+    def _runtime_provenance_matches(
+        self, plan: ExecutionPlan
+    ) -> bool:
+        """Accept only the typed Phase 1 study manifest beyond runtime identity."""
+
+        phase1 = tuple(item for item in plan.runtime_provenance if item[0].startswith("phase1."))
+        runtime = tuple(item for item in plan.runtime_provenance if not item[0].startswith("phase1."))
+        if runtime != self.runtime_provenance:
+            return False
+        if not phase1:
+            return True
+        try:
+            study_dimensions_from_plan(plan)
+        except (TypeError, ValueError):
+            return False
+        return True
 
 
 def _parse_output(stdout: str) -> tuple[float, ...]:

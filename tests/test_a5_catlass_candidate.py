@@ -303,9 +303,9 @@ class _FinalResult:
     kernel_name: str
 
 
-def _candidate(tmp_path):
+def _candidate(tmp_path, *, device=0):
     (tmp_path / "kernel.py").write_text(SOURCE)
-    return CatlassCandidateBackend(FakeExecution(), length=3).run(
+    return CatlassCandidateBackend(FakeExecution(), length=3, device=device).run(
         tmp_path,
         "catlass-dsl",
         Workload.SMOKE_VECTOR_ADD,
@@ -315,7 +315,7 @@ def _candidate(tmp_path):
 
 
 def test_profile_adapter_binds_both_campaigns_to_candidate(tmp_path):
-    run = _candidate(tmp_path)
+    run = _candidate(tmp_path, device=6)
     controller = FakeController(None)
     evaluation = CandidateProfileEvaluation(controller, device=6)
 
@@ -329,6 +329,7 @@ def test_profile_adapter_binds_both_campaigns_to_candidate(tmp_path):
         assert request.plan is run.plan
         assert request.expected_kernel == run.kernel_name
         assert request.device == 6
+        assert "BZ_A5_PROFILE_PHYSICAL_DEVICE=6" in request.plan.argv
 
 
 def test_profile_adapter_rejects_unbound_kernel_name(tmp_path):

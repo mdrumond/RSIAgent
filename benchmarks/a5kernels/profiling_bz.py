@@ -18,8 +18,10 @@ from benchmarks.a5kernels.profiling import (
     ProfileCapture,
     ProfileMetric,
     ProfileRequest,
+    StudyTimingSample,
     TimingCommand,
     TimingResult,
+    study_dimensions_from_plan,
 )
 
 
@@ -56,6 +58,27 @@ class BZProfileBackend:
         self._timeout = timeout
 
     def time(self, command: TimingCommand) -> TimingResult:
+        duration, _evidence_sha256 = self._timing_replay(command)
+        return TimingResult(
+            duration,
+            command.request.source_fingerprint,
+            command.request.execution_id,
+            command.replay_id,
+        )
+
+    def time_sample(self, command: TimingCommand) -> StudyTimingSample:
+        """Run one fixed-policy sample and bind it to its raw stdout evidence."""
+
+        duration, evidence_sha256 = self._timing_replay(command)
+        return StudyTimingSample(
+            duration,
+            command.request.source_fingerprint,
+            command.request.execution_id,
+            command.replay_id,
+            evidence_sha256,
+        )
+
+    def _timing_replay(self, command: TimingCommand) -> tuple[float, str]:
         completed = self._call(
             self._adapter_argv(command.replay_id, "run", command.request)
         )
@@ -70,12 +93,8 @@ class BZProfileBackend:
             raise RuntimeError(
                 "canonical timing replay returned an invalid duration"
             ) from exc
-        return TimingResult(
-            duration,
-            command.request.source_fingerprint,
-            command.request.execution_id,
-            command.replay_id,
-        )
+        evidence_sha256 = hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest()
+        return duration, evidence_sha256
 
     def capture(self, command: CaptureCommand) -> ProfileCapture:
         request = command.request
@@ -127,11 +146,16 @@ class BZProfileBackend:
         self, replay_id: str, action: str, request: ProfileRequest
     ) -> tuple[str, ...]:
         workload = self._bound_workload_argv(request)
+        dimensions = study_dimensions_from_plan(request.plan)
+        block_num = 1 if dimensions is None else dimensions.parallelism.value
+        workload = ("env", f"A5KERNEL_BLOCK_NUM={block_num}", *workload)
         if action == "run":
             workload = (
                 "env",
                 f"BZ_A5_PROFILE_PHYSICAL_DEVICE={request.device}",
                 "A5KERNEL_EMIT_TIMING=1",
+                f"A5KERNEL_WARM_UP={request.warm_up}",
+                f"A5KERNEL_LAUNCH_COUNT={request.launch_count}",
                 *workload,
             )
         return (
