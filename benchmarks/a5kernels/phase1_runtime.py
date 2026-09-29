@@ -43,13 +43,13 @@ def _resolve_runtime(
     recovery = None
     if family is ProjectFamily.COMPILE_RECOVERY:
         recovery = RecoveryStarter(
-            COMPILE_FAILURE_STARTER, RecoveryEvidence.COMPILE_FAILURE,
-            int(parameters["faults"]),
+            _recovery_starter(family, int(parameters["faults"])),
+            RecoveryEvidence.COMPILE_FAILURE, int(parameters["faults"]),
         )
     elif family is ProjectFamily.RUNTIME_RECOVERY:
         recovery = RecoveryStarter(
-            HOST_FAILURE_STARTER, RecoveryEvidence.HOST_VERIFICATION_FAILURE,
-            int(parameters["faults"]),
+            _recovery_starter(family, int(parameters["faults"])),
+            RecoveryEvidence.HOST_VERIFICATION_FAILURE, int(parameters["faults"]),
         )
     return (
         logical_length, ((logical_length + 63) // 64) * 64,
@@ -113,8 +113,28 @@ def vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor) -> None:
     with tla.vector():
 """
 
-# Both starters satisfy the public source ABI. The first reaches the compiler
-# with an undefined symbol. The second can compile but host comparison catches
-# that it copied one input instead of adding both inputs.
-COMPILE_FAILURE_STARTER = _SOURCE_HEAD + "        tla.copy(gm_c, missing_input)\n"
-HOST_FAILURE_STARTER = _SOURCE_HEAD + "        tla.copy(gm_c, gm_a)\n"
+_COMPILE_FAULTS = (
+    "        tla.copy(gm_c, missing_input)\n",
+    "        tla.copy(gm_c, missing_input_second)\n",
+)
+_RUNTIME_FAULTS = (
+    "        tla.copy(gm_c, gm_a)\n",
+    "        tla.copy(gm_c, gm_b)\n",
+)
+
+
+def _recovery_starter(family: ProjectFamily, fault_count: int) -> str:
+    if fault_count not in (1, 2):  # pragma: no cover - registry invariant
+        raise ValueError("recovery fault count must be 1 or 2")
+    if family is ProjectFamily.COMPILE_RECOVERY:
+        faults = _COMPILE_FAULTS
+    elif family is ProjectFamily.RUNTIME_RECOVERY:
+        faults = _RUNTIME_FAULTS
+    else:  # pragma: no cover - internal call invariant
+        raise ValueError("recovery starter requires a recovery family")
+    return _SOURCE_HEAD + "".join(faults[:fault_count])
+
+
+# Stable public one-fault fixtures retained for callers and default proposals.
+COMPILE_FAILURE_STARTER = _recovery_starter(ProjectFamily.COMPILE_RECOVERY, 1)
+HOST_FAILURE_STARTER = _recovery_starter(ProjectFamily.RUNTIME_RECOVERY, 1)

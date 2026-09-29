@@ -102,14 +102,31 @@ def test_recovery_contracts_supply_stable_abi_valid_starters(family, evidence):
     assert first.recovery.source_sha256 in encoded
 
 
-def test_recovery_fault_count_is_registry_owned():
-    proposal = CurriculumProposal.from_mapping({
-        "family": "compile-recovery", "parameters": {"faults": 2},
-        "hypothesis": "Two bounded compiler corrections exercise recovery.",
-        "evidence_preset": "ordinary-recovery",
-    })
-    runtime = Phase1ProjectRuntime.from_proposal(proposal)
-    assert runtime.recovery is not None and runtime.recovery.fault_count == 2
+@pytest.mark.parametrize("family,fault_prefix,second_fault", [
+    ("compile-recovery", "tla.copy(gm_c, missing_input", "missing_input_second"),
+    ("runtime-recovery", "tla.copy(gm_c, gm_", "tla.copy(gm_c, gm_b)"),
+])
+def test_recovery_source_encodes_requested_fault_count(
+    family, fault_prefix, second_fault
+):
+    def runtime(faults):
+        proposal = CurriculumProposal.from_mapping({
+            "family": family, "parameters": {"faults": faults},
+            "hypothesis": f"{faults} bounded faults exercise recovery.",
+            "evidence_preset": "ordinary-recovery",
+        })
+        return Phase1ProjectRuntime.from_proposal(proposal)
+
+    one = runtime(1).recovery
+    two = runtime(2).recovery
+    assert one is not None and two is not None
+    assert one.fault_count == one.source.count(fault_prefix) == 1
+    assert two.fault_count == two.source.count(fault_prefix) == 2
+    assert second_fault not in one.source and second_fault in two.source
+    assert one.source != two.source
+    assert one.source_sha256 != two.source_sha256
+    validate_candidate_source(one.source)
+    validate_candidate_source(two.source)
 
 
 @pytest.mark.parametrize("options,message", [
