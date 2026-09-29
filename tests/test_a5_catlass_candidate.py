@@ -3,7 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -14,6 +15,7 @@ from benchmarks.a5kernels.candidate import (
     validate_candidate_source,
 )
 from benchmarks.a5kernels.evidence import EvidenceLedger
+from benchmarks.a5kernels.fixtures import catlass_candidate_fixture
 from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.protocol import ExecutionReceipt, RunRequest
 from benchmarks.a5kernels.runner import A5KernelRunner
@@ -153,6 +155,52 @@ def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
                     if item.relative_path == "kernel.py").content
     assert "_HOST_VECTOR_ELE = 448" in composed
     assert "_HOST_VL_ELE = 64" in composed
+
+
+def test_candidate_fixture_compile_path_accepts_physical_n400_extent(monkeypatch):
+    fixture = catlass_candidate_fixture(SOURCE)
+    source = next(
+        item.content for item in fixture.files if item.relative_path == "kernel.py"
+    )
+    catlass = ModuleType("catlass")
+    catlass.__path__ = []
+    tla = ModuleType("catlass.tla")
+    tla.Tensor = object
+    tla.kernel = lambda function: function
+    tla.arch = SimpleNamespace(RowMajor=object())
+    tla.compile = lambda *args, **kwargs: (lambda *args, **kwargs: None)
+    runtime = ModuleType("catlass.tla.runtime")
+
+    class FakeTensor:
+        def contiguous(self):
+            return self
+
+    class FakeTLATensor:
+        def mark_compact_shape_dynamic(self, _axis):
+            return self
+
+    runtime.from_dlpack = lambda _tensor, layout_tag: FakeTLATensor()
+    torch = ModuleType("torch")
+    torch.float32 = object()
+    torch.npu = SimpleNamespace(set_device=lambda _device: None)
+    torch.tensor = lambda *args, **kwargs: FakeTensor()
+    torch.full_like = lambda _tensor, _value: FakeTensor()
+    catlass.tla = tla
+    monkeypatch.setitem(sys.modules, "catlass", catlass)
+    monkeypatch.setitem(sys.modules, "catlass.tla", tla)
+    monkeypatch.setitem(sys.modules, "catlass.tla.runtime", runtime)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setenv("A5KERNEL_COMPILE_ONLY", "1")
+    namespace = {}
+    exec(compile(source, "candidate-kernel.py", "exec"), namespace)
+    input_a = [*([1.0] * 400), *([0.0] * 48)]
+    input_b = [*([2.0] * 400), *([0.0] * 48)]
+
+    output = namespace["run"](input_a, input_b)
+
+    assert len(output) == 448
+    assert output == [*([3.0] * 400), *([0.0] * 48)]
 
 
 def test_compile_failure_returns_bounded_diagnostics_and_allows_retry(tmp_path):
