@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 
 import pytest
 
 from benchmarks.a5kernels.candidate import (
     EXACT_KERNEL_NAME,
+    CandidateProfileEvaluation,
     CatlassCandidateBackend,
     validate_candidate_source,
 )
@@ -85,6 +87,22 @@ def test_runtime_parameters_are_bound_into_plan_and_host_evidence(tmp_path):
         "language": "catlass-dsl", "length": 32, "seed": 9,
         "dtype": "float32", "padded_length": 64,
     }
+
+    @dataclass(frozen=True)
+    class ProfileResult:
+        block_count: int
+
+    class Controller:
+        request = None
+
+        def run_final(self, verified, request):
+            self.request = request
+            return ProfileResult(request.block_count)
+
+    controller = Controller()
+    profile = CandidateProfileEvaluation(controller, device=3).final(run)
+    assert profile == {"block_count": 6}
+    assert controller.request.plan is run.plan
 
 
 @pytest.mark.parametrize("family,evidence", [

@@ -310,9 +310,12 @@ class _FinalResult:
     kernel_name: str
 
 
-def _candidate(tmp_path, *, device=0):
+def _candidate(tmp_path, *, device=0, block_count=1):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "kernel.py").write_text(SOURCE)
-    return CatlassCandidateBackend(FakeExecution(), length=3, device=device).run(
+    return CatlassCandidateBackend(
+        FakeExecution(), length=3, device=device, block_count=block_count
+    ).run(
         tmp_path,
         "catlass-dsl",
         Workload.SMOKE_VECTOR_ADD,
@@ -336,9 +339,45 @@ def test_profile_adapter_binds_both_campaigns_to_candidate(tmp_path):
         assert request.plan is run.plan
         assert request.expected_kernel == run.kernel_name
         assert request.device == 6
+        assert request.block_count == 1
         assert dict(request.plan.environment.bindings)[
             "BZ_A5_PROFILE_PHYSICAL_DEVICE"
         ] == "6"
+
+
+def test_profile_adapter_derives_multiblock_identity_from_executed_plan(tmp_path):
+    default_run = _candidate(tmp_path / "default", block_count=1)
+    multiblock_run = _candidate(tmp_path / "multiblock", block_count=6)
+    controller = FakeController(None)
+    evaluation = CandidateProfileEvaluation(controller, device=0)
+
+    evaluation.final(default_run)
+    evaluation.final(multiblock_run)
+
+    default_request = controller.calls[0][2]
+    multiblock_request = controller.calls[1][2]
+    assert default_request.block_count == 1
+    assert multiblock_request.block_count == 6
+    assert default_request.configuration_id != multiblock_request.configuration_id
+
+
+@pytest.mark.parametrize("encoded", [None, "0", "9", "01", "+1", " 1", "1 "])
+def test_profile_adapter_rejects_unbound_or_noncanonical_plan_block_count(
+    tmp_path, encoded
+):
+    run = _candidate(tmp_path)
+    environment = run.plan.environment.with_unset("A5KERNEL_BLOCK_NUM")
+    if encoded is not None:
+        environment = environment.with_binding("A5KERNEL_BLOCK_NUM", encoded)
+    plan = replace(run.plan, environment=environment)
+    run = replace(
+        run, plan=plan,
+        verified=replace(run.verified, execution_id=plan.execution_id),
+    )
+
+    evaluation = CandidateProfileEvaluation(FakeController(None), device=0)
+    with pytest.raises(ValueError, match="canonical integer"):
+        evaluation.final(run)
 
 
 def test_profile_adapter_rejects_unbound_kernel_name(tmp_path):

@@ -226,13 +226,9 @@ def _compile_diagnostics(receipt: ExecutionReceipt | None, *, passed: bool) -> s
 class CandidateProfileEvaluation:
     """Bind treatment and final campaigns to the exact candidate execution."""
 
-    def __init__(self, controller: ProfilingTreatmentController, *, device: int,
-                 block_count: int = 1):
-        if type(block_count) is not int or not 1 <= block_count <= 8:
-            raise ValueError("block_count must be an integer in [1, 8]")
+    def __init__(self, controller: ProfilingTreatmentController, *, device: int):
         self._controller = controller
         self._device = device
-        self._block_count = block_count
 
     def intermediate(self, run: CandidateRun) -> Mapping[str, object]:
         result = self._controller.run_intermediate(run.verified, self._request(run))
@@ -244,10 +240,19 @@ class CandidateProfileEvaluation:
     def _request(self, run: CandidateRun) -> ProfileRequest:
         if run.kernel_name != EXACT_KERNEL_NAME:
             raise ValueError("candidate run did not report the host-discovered kernel")
+        bindings = dict(run.plan.environment.bindings)
+        encoded_block_count = bindings.get("A5KERNEL_BLOCK_NUM")
+        if encoded_block_count is None or not encoded_block_count.isascii() or not (
+            len(encoded_block_count) == 1 and "1" <= encoded_block_count <= "8"
+        ):
+            raise ValueError(
+                "candidate plan must bind A5KERNEL_BLOCK_NUM to a canonical "
+                "integer in [1, 8]"
+            )
         return ProfileRequest.from_execution_plan(
             run.plan,
             implementation="catlass-dsl",
             expected_kernel=run.kernel_name,
             device=self._device,
-            block_count=self._block_count,
+            block_count=int(encoded_block_count),
         )
