@@ -669,6 +669,18 @@ class Phase1PerformanceStudy:
                 raise ValueError(
                     "optimization variants must share shape, padding, and access"
                 )
+            inputs = {
+                (
+                    item.request.request_id,
+                    item.request.plan.input_a,
+                    item.request.plan.input_b,
+                )
+                for item in variants
+            }
+            if len(inputs) != 1:
+                raise ValueError(
+                    "optimization variants must share the exact request and inputs"
+                )
         for variant in variants:
             ProfilingTreatmentController._validate_correctness(
                 variant.correctness, variant.request

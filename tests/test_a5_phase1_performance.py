@@ -313,6 +313,29 @@ def test_comparison_rejects_relabelled_duplicate_execution():
     assert backend.commands == []
 
 
+def test_comparison_rejects_different_input_values():
+    backend = FakeStudyBackend()
+    first = variant(attempt="input-a", revision="input-a")
+    second = variant(attempt="input-b", revision="input-b")
+    changed_plan = replace(
+        second.request.plan,
+        input_a=(3.0, *second.request.plan.input_a[1:]),
+    )
+    changed_request = replace(second.request, plan=changed_plan)
+    changed_correctness = replace(
+        second.correctness,
+        execution_id=changed_request.execution_id,
+        source_fingerprint=changed_request.source_fingerprint,
+    )
+    second = StudyVariant(changed_request, changed_correctness, second.dimensions)
+
+    with pytest.raises(ValueError, match="exact request and inputs"):
+        Phase1PerformanceStudy(backend).run(
+            StudyPreset.OPTIMIZATION_COMPARISON, [first, second]
+        )
+    assert backend.commands == []
+
+
 @pytest.mark.parametrize(
     "bad_dimensions",
     [
