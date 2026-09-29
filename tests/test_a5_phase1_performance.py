@@ -401,14 +401,16 @@ def test_variant_rejects_duplicate_phase1_provenance_keys():
         StudyVariant(request, correctness, valid.dimensions)
 
 
-@pytest.mark.parametrize("mutation", ["reordered", "integer-spelling"])
+@pytest.mark.parametrize("mutation", ["reordered", "integer-spelling", "not-suffix"])
 def test_variant_rejects_noncanonical_phase1_provenance(mutation):
     valid = variant()
     runtime = list(valid.request.plan.runtime_provenance)
     if mutation == "reordered":
         runtime[-2], runtime[-1] = runtime[-1], runtime[-2]
-    else:
+    elif mutation == "integer-spelling":
         runtime[-1] = ("phase1.parallelism", "01")
+    else:
+        runtime.insert(-2, ("runtime-marker", "value"))
     plan = replace(valid.request.plan, runtime_provenance=tuple(runtime))
     request = replace(valid.request, plan=plan)
     correctness = replace(valid.correctness, execution_id=request.execution_id)

@@ -491,7 +491,10 @@ def study_dimensions_from_plan(plan: ExecutionPlan) -> StudyDimensions | None:
         )
     except (TypeError, ValueError) as exc:
         raise ValueError("execution plan has invalid Phase 1 dimensions") from exc
-    if entries != dimensions.as_provenance():
+    if (
+        entries != dimensions.as_provenance()
+        or tuple(plan.runtime_provenance[-len(entries):]) != entries
+    ):
         raise ValueError("execution plan requires canonical Phase 1 dimension encoding")
     _validate_dimensions_against_plan(plan, dimensions)
     return dimensions
