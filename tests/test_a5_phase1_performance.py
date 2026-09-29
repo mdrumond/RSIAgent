@@ -37,7 +37,8 @@ def dimensions(parallelism=ParallelismClass.ONE):
     )
 
 
-def variant(*, parallelism=ParallelismClass.ONE, attempt="attempt-1"):
+def variant(*, attempt="attempt-1", revision="baseline"):
+    parallelism = ParallelismClass.ONE
     study_dimensions = dimensions(parallelism)
     values_a = (*([1.0] * 32), *([0.0] * 32))
     values_b = (*([2.0] * 32), *([0.0] * 32))
@@ -45,6 +46,7 @@ def variant(*, parallelism=ParallelismClass.ONE, attempt="attempt-1"):
         replace(
             REQUEST.plan,
             attempt_id=attempt,
+            files=(replace(REQUEST.plan.files[0], content=f"# {revision}\n"),),
             input_a=values_a,
             input_b=values_b,
         ),
@@ -156,9 +158,9 @@ def test_basic_and_pipe_presets_keep_metric_domains_in_separate_replays():
 
 def test_optimization_comparison_preserves_synthetic_parallelism_knee():
     variants = [
-        variant(parallelism=ParallelismClass.ONE, attempt="p1"),
-        variant(parallelism=ParallelismClass.FOUR, attempt="p4"),
-        variant(parallelism=ParallelismClass.EIGHT, attempt="p8"),
+        variant(attempt="baseline", revision="baseline"),
+        variant(attempt="optimization-1", revision="optimization-1"),
+        variant(attempt="optimization-2", revision="optimization-2"),
     ]
     # Improvement is large through p4 and nearly flat at p8: retain raw results
     # and host-computed speedups rather than asking an agent for measured values.
@@ -234,7 +236,7 @@ def test_backend_cannot_return_stale_identity_or_unhashed_timing():
 def test_comparison_rejects_mixed_devices_before_measurement():
     backend = FakeStudyBackend()
     first = variant(attempt="device-3")
-    second = variant(attempt="device-4", parallelism=ParallelismClass.FOUR)
+    second = variant(attempt="device-4", revision="device-4")
     second = replace(second, request=replace(second.request, device=4))
 
     with pytest.raises(ValueError, match="share device, kernel, and implementation"):
@@ -250,7 +252,12 @@ def test_variant_rejects_dimensions_not_bound_to_execution_plan():
         StudyVariant(
             bound.request,
             bound.correctness,
-            dimensions(ParallelismClass.FOUR),
+            StudyDimensions(
+                ShapeClass.N64,
+                PaddingClass.NONE,
+                AccessClass.CONTIGUOUS,
+                ParallelismClass.ONE,
+            ),
         )
 
 
@@ -261,7 +268,7 @@ def test_comparison_rejects_mismatched_workloads_before_measurement():
         ShapeClass.N64,
         PaddingClass.NONE,
         AccessClass.CONTIGUOUS,
-        ParallelismClass.FOUR,
+        ParallelismClass.ONE,
     )
     other_plan = bind_study_dimensions(
         replace(

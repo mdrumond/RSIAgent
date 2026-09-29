@@ -417,12 +417,6 @@ class AccessClass(str, Enum):
 
 class ParallelismClass(int, Enum):
     ONE = 1
-    TWO = 2
-    FOUR = 4
-    EIGHT = 8
-    SIXTEEN = 16
-    TWENTY_FOUR = 24
-    TWENTY_EIGHT = 28
 
 
 class MetricDomain(str, Enum):

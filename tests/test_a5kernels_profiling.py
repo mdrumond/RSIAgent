@@ -598,6 +598,7 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         for call in calls
         if "--operation" in call and call[call.index("--operation") + 2] == "profile"
     ]
+    assert all("A5KERNEL_BLOCK_NUM=1" in call for call in profile_calls)
     assert [call[call.index("--metric") + 1] for call in profile_calls] == [
         "BasicInfo",
         "PipeUtilization",

@@ -1075,8 +1075,8 @@ def test_adapter_rejects_plan_bound_to_different_runtime_provenance():
     assert executor.invocations == []
 
 
-@pytest.mark.parametrize("parallelism", ["1", "4", "8"])
-def test_adapter_applies_complete_typed_phase1_study_provenance(parallelism):
+def test_adapter_applies_complete_typed_phase1_study_provenance():
+    parallelism = "1"
     runtime = (("catlass_revision", "1" * 40),)
     executor = FakeCommandExecutor(
         CommandResult(9, "expected dispatch failure"),

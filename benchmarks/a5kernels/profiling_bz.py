@@ -146,16 +146,16 @@ class BZProfileBackend:
         self, replay_id: str, action: str, request: ProfileRequest
     ) -> tuple[str, ...]:
         workload = self._bound_workload_argv(request)
+        dimensions = study_dimensions_from_plan(request.plan)
+        block_num = 1 if dimensions is None else dimensions.parallelism.value
+        workload = ("env", f"A5KERNEL_BLOCK_NUM={block_num}", *workload)
         if action == "run":
-            dimensions = study_dimensions_from_plan(request.plan)
-            block_num = 1 if dimensions is None else dimensions.parallelism.value
             workload = (
                 "env",
                 f"BZ_A5_PROFILE_PHYSICAL_DEVICE={request.device}",
                 "A5KERNEL_EMIT_TIMING=1",
                 f"A5KERNEL_WARM_UP={request.warm_up}",
                 f"A5KERNEL_LAUNCH_COUNT={request.launch_count}",
-                f"A5KERNEL_BLOCK_NUM={block_num}",
                 *workload,
             )
         return (
