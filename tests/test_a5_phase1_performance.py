@@ -246,6 +246,16 @@ def test_comparison_rejects_mixed_devices_before_measurement():
     assert backend.commands == []
 
 
+@pytest.mark.parametrize("encoded", ["4", "03"])
+def test_profile_request_rejects_mismatched_or_noncanonical_plan_device(encoded):
+    plan = replace(
+        REQUEST.plan,
+        argv=("env", f"BZ_A5_PROFILE_PHYSICAL_DEVICE={encoded}", *REQUEST.plan.argv),
+    )
+    with pytest.raises(ValueError, match="device bound in plan argv"):
+        replace(REQUEST, plan=plan)
+
+
 def test_variant_rejects_dimensions_not_bound_to_execution_plan():
     bound = variant()
     with pytest.raises(ValueError, match="execution-plan provenance"):

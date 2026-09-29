@@ -56,6 +56,17 @@ class ProfileRequest:
             raise ValueError("device must be non-negative")
         if not self.plan.argv:
             raise ValueError("workload_argv must not be empty")
+        device_environment = tuple(
+            argument
+            for argument in self.plan.argv
+            if argument.startswith("BZ_A5_PROFILE_PHYSICAL_DEVICE=")
+        )
+        if device_environment and device_environment != (
+            f"BZ_A5_PROFILE_PHYSICAL_DEVICE={self.device}",
+        ):
+            raise ValueError(
+                "profile device must match the canonical device bound in plan argv"
+            )
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
