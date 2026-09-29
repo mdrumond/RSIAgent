@@ -281,7 +281,8 @@ class Phase1LearningJournal:
                 raise ValueError("invalid Phase 1 learning journal entry")
             digest = entry.pop("entry_sha256")
             valid = (
-                entry["sequence"] == sequence
+                type(entry["sequence"]) is int
+                and entry["sequence"] == sequence
                 and entry["plan_fingerprint"] == self.plan_fingerprint
                 and entry["previous_sha256"] == previous
                 and digest == _digest(entry)

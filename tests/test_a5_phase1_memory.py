@@ -244,6 +244,29 @@ def test_valid_tuple_collections_persist_and_reload(tmp_path):
     assert reloaded["kdb_citations"][0]["collection"] == "catlass"
 
 
+@pytest.mark.parametrize("sequence", [True, 1.0])
+def test_durable_sequence_requires_exact_integer(tmp_path, sequence):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+    entry = json.loads(path.read_text())
+    entry["sequence"] = sequence
+    payload = {key: value for key, value in entry.items() if key != "entry_sha256"}
+    entry["entry_sha256"] = phase1_memory._digest(payload)
+    path.write_text(json.dumps(entry) + "\n")
+
+    with pytest.raises(ValueError, match="failed resume validation"):
+        journal.read()
+
+
+def test_durable_sequence_accepts_ordinary_integer(tmp_path):
+    journal = Phase1LearningJournal(tmp_path / "learning.jsonl", DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+
+    assert journal.read()[0]["sequence"] == 1
+    assert type(journal.read()[0]["sequence"]) is int
+
+
 @pytest.mark.parametrize("supports", [[EVIDENCE], EVIDENCE, {EVIDENCE: True}])
 def test_interpretation_supports_requires_exact_tuple(supports):
     with pytest.raises(TypeError, match="must be a tuple"):
