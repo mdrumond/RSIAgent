@@ -705,9 +705,8 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
             ("phase1.parallelism", "1"),
         ),
     )
-    mismatched_request = replace(profiled_request, plan=mismatched_study_plan)
-    with pytest.raises(ValueError, match="block count must match"):
-        backend._adapter_argv("mismatched-study", "run", mismatched_request)
+    with pytest.raises(ValueError, match="Phase 1 dimensions"):
+        replace(profiled_request, plan=mismatched_study_plan)
 
     wrapper_operations = {
         call[call.index("--operation") + 1]

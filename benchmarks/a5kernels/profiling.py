@@ -505,8 +505,6 @@ def bind_profile_parallelism(
         raise TypeError("plan must be an ExecutionPlan")
     if not isinstance(parallelism, ParallelismClass):
         raise ValueError("parallelism must be a host-owned ParallelismClass")
-    if "A5KERNEL_BLOCK_NUM" in dict(plan.environment.bindings):
-        raise ValueError("execution plan already contains a block binding")
     return replace(
         plan,
         environment=plan.environment.with_binding(

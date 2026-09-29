@@ -1161,8 +1161,11 @@ def test_adapter_applies_complete_typed_phase1_study_provenance(
     )
     plan = replace(
         plan,
-        argv=("env", f"A5KERNEL_BLOCK_NUM={parallelism}", *plan.argv)
-        if plan_bound else plan.argv,
+        environment=(
+            plan.environment.with_binding("A5KERNEL_BLOCK_NUM", parallelism)
+            if plan_bound
+            else plan.environment
+        ),
         runtime_provenance=(
             *plan.runtime_provenance,
             ("phase1.shape", "n32"),

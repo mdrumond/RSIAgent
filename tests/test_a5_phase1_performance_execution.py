@@ -212,6 +212,8 @@ def test_cross_layer_registered_block_count_dispatches_fixed_timing():
     assert result.preset is StudyPreset.TIMING_STUDY
     assert len(backend.commands) == 3
     assert all(
-        command.request.plan.argv.count("A5KERNEL_BLOCK_NUM=6") == 1
+        dict(command.request.plan.environment.bindings).get(
+            "A5KERNEL_BLOCK_NUM"
+        ) == "6"
         for command in backend.commands
     )
