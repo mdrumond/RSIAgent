@@ -275,3 +275,20 @@ def test_comparison_rejects_mismatched_workloads_before_measurement():
             StudyPreset.OPTIMIZATION_COMPARISON, [first, second]
         )
     assert backend.commands == []
+
+
+def test_comparison_rejects_relabelled_duplicate_execution():
+    backend = FakeStudyBackend()
+    first = variant(attempt="first")
+    retry_request = replace(
+        first.request,
+        plan=replace(first.request.plan, attempt_id="retry"),
+    )
+    retry_correctness = replace(first.correctness, attempt_id="retry")
+    retry = StudyVariant(retry_request, retry_correctness, first.dimensions)
+
+    with pytest.raises(ValueError, match="distinct execution identities"):
+        Phase1PerformanceStudy(backend).run(
+            StudyPreset.OPTIMIZATION_COMPARISON, [first, retry]
+        )
+    assert backend.commands == []

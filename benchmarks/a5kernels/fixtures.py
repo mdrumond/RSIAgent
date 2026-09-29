@@ -96,12 +96,21 @@ def run(input_a, input_b):
         return [left + right for left, right in zip(input_a, input_b)][:original_length]
     emit_timing = os.environ.get("A5KERNEL_EMIT_TIMING") == "1"
     if emit_timing:
+        warm_up = int(os.environ.get("A5KERNEL_WARM_UP", "0"))
+        launch_count = int(os.environ.get("A5KERNEL_LAUNCH_COUNT", "1"))
+        if warm_up < 0 or launch_count < 1:
+            raise ValueError("invalid host-owned timing policy")
+        for _ in range(warm_up):
+            artifact(tla_a, tla_b, tla_out, block_num=1)
         torch.npu.synchronize()
         started_ns = time.perf_counter_ns()
-    artifact(tla_a, tla_b, tla_out, block_num=1)
+        for _ in range(launch_count):
+            artifact(tla_a, tla_b, tla_out, block_num=1)
+    else:
+        artifact(tla_a, tla_b, tla_out, block_num=1)
     torch.npu.synchronize()
     if emit_timing:
-        duration_us = (time.perf_counter_ns() - started_ns) / 1_000
+        duration_us = (time.perf_counter_ns() - started_ns) / 1_000 / launch_count
         print(f"A5KERNEL_TIMING_US={duration_us:.6f}")
     return out[:original_length].cpu().tolist()
 '''

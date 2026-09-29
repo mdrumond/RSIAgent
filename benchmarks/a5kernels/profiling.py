@@ -584,6 +584,10 @@ class Phase1PerformanceStudy:
         if len({item.variant_id for item in variants}) != len(variants):
             raise ValueError("study variants must have distinct exact identities")
         if preset is StudyPreset.OPTIMIZATION_COMPARISON:
+            if len({item.request.execution_id for item in variants}) != len(variants):
+                raise ValueError(
+                    "optimization variants must have distinct execution identities"
+                )
             comparison_route = {
                 (
                     item.request.device,

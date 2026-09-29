@@ -1,5 +1,6 @@
 from dataclasses import replace
 import gzip
+import hashlib
 import io
 from pathlib import Path
 import subprocess
@@ -557,6 +558,10 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     result = ProfilingTreatmentController(
         backend, treatment_enabled=False
     ).run_final(correctness, profiled_request)
+    study_request = replace(profiled_request, warm_up=5, launch_count=20)
+    sample = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, study_request, "phase1-sample")
+    )
     retry_request = replace(
         profiled_request,
         plan=replace(profiled_plan, attempt_id="attempt-2"),
@@ -566,6 +571,10 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     )
 
     assert result.duration_us == 7.5
+    assert sample.duration_us == 7.5
+    assert sample.evidence_sha256 == hashlib.sha256(
+        b"A5KERNEL_TIMING_US=7.5\n"
+    ).hexdigest()
     assert result.pipe_utilization
     assert all(
         key.startswith("PipeUtilization.csv.gz:")
@@ -582,6 +591,8 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
         "A5KERNEL_EMIT_TIMING=1",
     )
+    assert "A5KERNEL_WARM_UP=0" in timing_call
+    assert "A5KERNEL_LAUNCH_COUNT=1" in timing_call
     profile_calls = [
         call
         for call in calls
@@ -611,7 +622,15 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         for call in calls
         if "--operation" in call
     }
-    assert len(wrapper_operations) == 10
+    assert len(wrapper_operations) == 11
+    study_call = next(
+        call
+        for call in calls
+        if "--operation" in call
+        and call[call.index("--operation") + 1] == "phase1-sample"
+    )
+    assert "A5KERNEL_WARM_UP=5" in study_call
+    assert "A5KERNEL_LAUNCH_COUNT=20" in study_call
     evidence_destinations = {
         call[call.index("--output") + 1] for call in collection_calls
     }
@@ -771,5 +790,7 @@ def test_real_catlass_fixture_exposes_host_owned_timing_and_device_contract() ->
 
     assert 'os.environ.get("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0")' in kernel_source
     assert 'os.environ.get("A5KERNEL_EMIT_TIMING") == "1"' in kernel_source
+    assert 'os.environ.get("A5KERNEL_WARM_UP", "0")' in kernel_source
+    assert 'os.environ.get("A5KERNEL_LAUNCH_COUNT", "1")' in kernel_source
     assert "torch.npu.synchronize()" in kernel_source
     assert 'print(f"A5KERNEL_TIMING_US={duration_us:.6f}")' in kernel_source
