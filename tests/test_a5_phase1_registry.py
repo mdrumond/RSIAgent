@@ -53,6 +53,7 @@ def test_proposal_rejects_commands_and_arbitrary_fields(extra):
 
 @pytest.mark.parametrize("parameters", [
     {"length": 31},
+    {"length": 96},
     {"length": 401},
     {"length": True},
     {"length": 128, "command": "run"},
@@ -61,6 +62,23 @@ def test_proposal_rejects_commands_and_arbitrary_fields(extra):
 def test_proposal_rejects_out_of_bounds_or_arbitrary_parameters(parameters):
     with pytest.raises(ValueError, match="parameter"):
         proposal(parameters=parameters)
+
+
+@pytest.mark.parametrize("length", [32, 64, 128, 256, 400])
+def test_length_knee_accepts_every_host_representable_shape(length):
+    assert dict(proposal(parameters={"length": length}).parameters) == {
+        "length": length
+    }
+
+
+def test_padded_multitile_preserves_continuous_length_range():
+    registered = CurriculumProposal.from_mapping({
+        "family": "padded-multitile",
+        "parameters": {"length": 96},
+        "hypothesis": "A non-knee padded extent remains registered.",
+        "evidence_preset": "correctness",
+    })
+    assert dict(registered.parameters) == {"length": 96}
 
 
 def test_proposal_rejects_unregistered_family_and_wrong_evidence():
@@ -87,10 +105,11 @@ def test_duplicate_and_over_budget_plans_fail_closed():
     with pytest.raises(ValueError, match="duplicate"):
         dry_run_plan([proposal(), proposal()])
     with pytest.raises(ValueError, match="at most 8"):
-        dry_run_plan([
-            proposal(parameters={"length": length})
-            for length in range(32, 41)
-        ])
+        dry_run_plan([*DEFAULT_PROPOSALS, CurriculumProposal.from_mapping({
+            "family": "runtime-recovery", "parameters": {"faults": 2},
+            "hypothesis": "A second runtime recovery exceeds the project budget.",
+            "evidence_preset": "ordinary-recovery",
+        })])
 
 
 def test_default_plan_meets_every_saturation_gate():

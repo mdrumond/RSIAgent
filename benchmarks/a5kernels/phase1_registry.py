@@ -45,11 +45,11 @@ class ParameterSpec:
     name: str
     minimum: int | None = None
     maximum: int | None = None
-    choices: tuple[str, ...] = ()
+    choices: tuple[int | str, ...] = ()
 
     def validate(self, value: object) -> int | str:
         if self.choices:
-            if not isinstance(value, str) or value not in self.choices:
+            if type(value) not in (int, str) or value not in self.choices:
                 raise ValueError(f"parameter {self.name} must be one of {self.choices}")
             return value
         if type(value) is not int:
@@ -108,7 +108,7 @@ PROJECT_REGISTRY = (
     ),
     RegisteredProject(
         ProjectFamily.LENGTH_KNEE, 3,
-        (ParameterSpec("length", 32, 400),),
+        (ParameterSpec("length", choices=(32, 64, 128, 256, 400)),),
         frozenset({EvidencePreset.CORRECTNESS_TIMING}),
         frozenset({Coverage.PERFORMANCE_KNEE}),
     ),

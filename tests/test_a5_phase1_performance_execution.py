@@ -166,6 +166,16 @@ def test_length_knee_rejects_variant_for_different_length_before_dispatch():
     assert backend.commands == []
 
 
+def test_unsupported_knee_length_is_rejected_before_backend_dispatch():
+    backend = RecordingBackend()
+
+    with pytest.raises(ValueError, match="must be one of"):
+        unsupported = proposal("length-knee", {"length": 96}, "correctness-timing")
+        Phase1PerformanceExecution(backend).run(unsupported, [variant()])
+
+    assert backend.commands == []
+
+
 def test_cross_layer_rejects_variant_for_different_block_count():
     backend = RecordingBackend()
 

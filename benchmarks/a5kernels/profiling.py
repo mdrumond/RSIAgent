@@ -20,8 +20,6 @@ from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult, canonic
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-
-
 class ProfileMetric(str, Enum):
     BASIC_INFO = "BasicInfo"
     PIPE_UTILIZATION = "PipeUtilization"
@@ -76,6 +74,29 @@ class ProfileRequest:
             raise ValueError(
                 "plan block binding must be a canonical integer from 1 through 8"
             )
+        parallelism_values = tuple(
+            value
+            for key, value in self.plan.runtime_provenance
+            if key == "phase1.parallelism"
+        )
+        if len(parallelism_values) == 1 and parallelism_values[0] in {
+            str(item.value) for item in ParallelismClass
+        }:
+            parallelism = ParallelismClass(int(parallelism_values[0]))
+            if encoded_block_count not in (None, str(parallelism.value)) or (
+                encoded_block_count is None
+                and parallelism is not ParallelismClass.ONE
+            ):
+                raise ValueError(
+                    "plan environment block binding does not match Phase 1 dimensions"
+                )
+        if self.block_count is not None:
+            if type(self.block_count) is not int or not 1 <= self.block_count <= 8:
+                raise ValueError("block_count must be an integer from 1 through 8")
+            if encoded_block_count != str(self.block_count):
+                raise ValueError(
+                    "plan block binding must match host-owned block metadata"
+                )
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -484,15 +505,14 @@ def bind_profile_parallelism(
         raise TypeError("plan must be an ExecutionPlan")
     if not isinstance(parallelism, ParallelismClass):
         raise ValueError("parallelism must be a host-owned ParallelismClass")
-    assert plan.argv is not None
-    if any(argument.startswith("A5KERNEL_BLOCK_NUM=") for argument in plan.argv):
+    if "A5KERNEL_BLOCK_NUM" in dict(plan.environment.bindings):
         raise ValueError("execution plan already contains a block binding")
-    assignment = f"A5KERNEL_BLOCK_NUM={parallelism.value}"
-    if plan.argv and plan.argv[0] == "env":
-        argv = ("env", assignment, *plan.argv[1:])
-    else:
-        argv = ("env", assignment, *plan.argv)
-    return replace(plan, argv=argv)
+    return replace(
+        plan,
+        environment=plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", str(parallelism.value)
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -650,18 +670,6 @@ class StudyVariant:
         if study_dimensions_from_plan(self.request.plan) != self.dimensions:
             raise ValueError(
                 "study dimensions must match the host-owned execution-plan provenance"
-            )
-        block_environment = tuple(
-            argument
-            for argument in self.request.plan.argv or ()
-            if argument.startswith("A5KERNEL_BLOCK_NUM=")
-        )
-        expected_block = f"A5KERNEL_BLOCK_NUM={self.dimensions.parallelism.value}"
-        if block_environment not in ((), (expected_block,)) or (
-            not block_environment and self.dimensions.parallelism is not ParallelismClass.ONE
-        ):
-            raise ValueError(
-                "study parallelism must match the canonical execution-plan block binding"
             )
 
     @property

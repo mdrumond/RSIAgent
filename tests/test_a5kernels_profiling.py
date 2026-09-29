@@ -25,7 +25,6 @@ from benchmarks.a5kernels.profiling import (
     TimingCommand,
     TimingResult,
     bind_profile_device,
-    bind_profile_parallelism,
     bind_study_dimensions,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
@@ -770,7 +769,7 @@ def test_concrete_backend_rejects_divergent_reuse_of_timing_replay(tmp_path: Pat
         backend.time_sample(command)
 
 
-def test_concrete_backend_preserves_one_registered_block_six_binding(tmp_path: Path) -> None:
+def test_concrete_backend_injects_default_block_before_positional_lookalike(tmp_path: Path) -> None:
     calls = []
 
     def run(argv, **kwargs):
@@ -798,21 +797,23 @@ def test_concrete_backend_preserves_one_registered_block_six_binding(tmp_path: P
         ShapeClass.N64,
         PaddingClass.NONE,
         AccessClass.CONTIGUOUS,
-        ParallelismClass.SIX,
+        ParallelismClass.ONE,
     )
     plan = bind_study_dimensions(
-        bind_profile_parallelism(
-            bind_profile_device(
-                replace(
-                    PLAN,
-                    argv=("python", "kernel.py", "input.json"),
-                    input_a=tuple([1.0] * 64),
-                    input_b=tuple([2.0] * 64),
-                    runtime_provenance=provenance,
+        bind_profile_device(
+            replace(
+                PLAN,
+                argv=(
+                    "python",
+                    "kernel.py",
+                    "input.json",
+                    "A5KERNEL_BLOCK_NUM=7",
                 ),
-                REQUEST.device,
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
+                runtime_provenance=provenance,
             ),
-            ParallelismClass.SIX,
+            REQUEST.device,
         ),
         dimensions,
     )
@@ -821,7 +822,8 @@ def test_concrete_backend_preserves_one_registered_block_six_binding(tmp_path: P
     backend.time_sample(TimingCommand(CampaignKind.FINAL, request, "study-block-six"))
 
     workload = calls[0][calls[0].index("--") + 1 :]
-    assert workload.count("A5KERNEL_BLOCK_NUM=6") == 1
+    assert workload.count("A5KERNEL_BLOCK_NUM=1") == 1
+    assert workload.count("A5KERNEL_BLOCK_NUM=7") == 1
 
 
 def test_concrete_backend_rejects_relative_remote_tree(tmp_path: Path) -> None:

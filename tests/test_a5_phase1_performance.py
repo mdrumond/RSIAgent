@@ -18,6 +18,7 @@ from benchmarks.a5kernels.profiling import (
     bind_study_dimensions,
     bind_profile_parallelism,
     bind_profile_device,
+    leading_environment_bindings,
 )
 from tests.test_a5kernels_profiling import (
     CORRECT,
@@ -353,6 +354,38 @@ def test_profile_request_rejects_noncanonical_block_bindings(assignment):
         replace(REQUEST, plan=plan)
 
 
+def test_block_binding_recognizes_only_leading_env_assignment_slots():
+    argv = (
+        "env",
+        "OTHER=value",
+        "A5KERNEL_BLOCK_NUM=6",
+        "python",
+        "kernel.py",
+        "A5KERNEL_BLOCK_NUM=7",
+    )
+    assert leading_environment_bindings(argv, "A5KERNEL_BLOCK_NUM") == (
+        "A5KERNEL_BLOCK_NUM=6",
+    )
+    assert leading_environment_bindings(
+        ("python", "kernel.py", "A5KERNEL_BLOCK_NUM=6"),
+        "A5KERNEL_BLOCK_NUM",
+    ) == ()
+
+
+def test_profile_request_rejects_duplicate_leading_block_bindings():
+    plan = replace(
+        REQUEST.plan,
+        argv=(
+            "env",
+            "A5KERNEL_BLOCK_NUM=6",
+            "A5KERNEL_BLOCK_NUM=6",
+            *REQUEST.plan.argv,
+        ),
+    )
+    with pytest.raises(ValueError, match="at most one"):
+        replace(REQUEST, plan=plan)
+
+
 def test_registered_n400_align64_variant_uses_physical_448_inputs():
     dimensions = StudyDimensions(
         ShapeClass.N400,
@@ -417,7 +450,7 @@ def test_registered_block_count_six_is_bound_to_variant_plan():
     assert dict(registered.request.plan.environment.bindings)["A5KERNEL_BLOCK_NUM"] == "6"
 
 
-def test_variant_rejects_parallelism_without_matching_block_binding():
+def test_profile_request_rejects_parallelism_without_matching_block_binding():
     dimensions = StudyDimensions(
         ShapeClass.N64,
         PaddingClass.NONE,
@@ -435,15 +468,31 @@ def test_variant_rejects_parallelism_without_matching_block_binding():
         ),
         dimensions,
     )
-    request = replace(REQUEST, plan=plan)
-    correctness = replace(
-        CORRECT,
-        execution_id=request.execution_id,
-        source_fingerprint=request.source_fingerprint,
-    )
+    with pytest.raises(ValueError, match="block binding does not match"):
+        replace(REQUEST, plan=plan)
 
-    with pytest.raises(ValueError, match="parallelism must match"):
-        StudyVariant(request, correctness, dimensions)
+
+def test_profile_request_does_not_treat_post_executable_argument_as_block_binding():
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                argv=(*REQUEST.plan.argv, "A5KERNEL_BLOCK_NUM=6"),
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    with pytest.raises(ValueError, match="block binding does not match"):
+        replace(REQUEST, plan=plan)
 
 
 def test_optimization_comparison_caps_variants_before_measurement():
