@@ -221,8 +221,7 @@ class Phase1LearningJournal:
             if torn_tail:
                 # A final unterminated JSON fragment was never committed. Removing
                 # only those bytes preserves append-only semantics for every record.
-                stream.seek(len(committed))
-                stream.truncate()
+                os.ftruncate(stream.fileno(), len(committed.encode("utf-8")))
             elif committed and not committed.endswith("\n"):
                 # A complete fsynced record may have lost only its line delimiter.
                 stream.seek(0, os.SEEK_END)

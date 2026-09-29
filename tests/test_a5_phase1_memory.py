@@ -157,6 +157,28 @@ def test_resume_ignores_torn_tail_and_next_append_recovers_framing(tmp_path):
     assert json.loads(lines[1])["memory"]["source_revision"] == "source-2"
 
 
+def test_torn_tail_recovery_uses_utf8_byte_offset(tmp_path):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+    entry = json.loads(path.read_text())
+    entry["memory"]["source_revision"] = "révision-1"
+    payload = {key: value for key, value in entry.items() if key != "entry_sha256"}
+    entry["entry_sha256"] = phase1_memory._digest(payload)
+    committed = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+    path.write_text(committed, encoding="utf-8")
+    with path.open("ab") as stream:
+        stream.write(b'{"schema":"a5-phase1-project-memory-v1","sequence":2')
+
+    resumed = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    assert resumed.read()[0]["memory"]["source_revision"] == "révision-1"
+    resumed.append(memory(2))
+
+    entries = resumed.read()
+    assert [entry["sequence"] for entry in entries] == [1, 2]
+    assert entries[0]["memory"]["source_revision"] == "révision-1"
+
+
 def test_resume_rejects_newline_terminated_incomplete_record(tmp_path):
     path = tmp_path / "learning.jsonl"
     journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
