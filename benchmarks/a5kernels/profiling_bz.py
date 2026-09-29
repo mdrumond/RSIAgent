@@ -147,10 +147,17 @@ class BZProfileBackend:
     ) -> tuple[str, ...]:
         workload = self._bound_workload_argv(request)
         dimensions = study_dimensions_from_plan(request.plan)
-        block_num = 1 if dimensions is None else dimensions.parallelism.value
-        environment = request.plan.environment.with_binding(
-            "A5KERNEL_BLOCK_NUM", str(block_num)
-        ).with_binding(
+        environment = request.plan.environment
+        if dimensions is not None:
+            block_num = str(dimensions.parallelism.value)
+            if dict(environment.bindings).get("A5KERNEL_BLOCK_NUM") != block_num:
+                raise ValueError(
+                    "profiling block count must match typed Phase 1 parallelism"
+                )
+            environment = environment.with_binding(
+                "A5KERNEL_BLOCK_NUM", block_num
+            )
+        environment = environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(request.device)
         )
         if action == "run":

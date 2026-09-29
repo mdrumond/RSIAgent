@@ -77,6 +77,24 @@ def test_environment_changes_execution_identity():
     assert plan.execution_id != changed.execution_id
 
 
+def test_plan_preserves_legacy_positional_runtime_provenance_argument():
+    provenance = (("execution_profile", "bz-a5"),)
+
+    plan = ExecutionPlan(
+        "request",
+        "attempt",
+        "catlass-dsl",
+        (SourceFile("kernel.py", "pass\n"),),
+        ("python", "kernel.py"),
+        (1.0,),
+        (2.0,),
+        provenance,
+    )
+
+    assert plan.runtime_provenance == provenance
+    assert plan.environment == ExecutionEnvironment()
+
+
 @pytest.mark.parametrize("executable", ["env", "/usr/bin/env", "bin/env"])
 def test_plan_rejects_env_wrapped_argv(executable):
     with pytest.raises(ValueError, match="env wrapper"):

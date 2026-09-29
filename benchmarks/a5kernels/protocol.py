@@ -124,8 +124,8 @@ class ExecutionPlan:
     argv: tuple[str, ...] | None
     input_a: tuple[float, ...]
     input_b: tuple[float, ...]
-    environment: ExecutionEnvironment = ExecutionEnvironment()
     runtime_provenance: tuple[tuple[str, str], ...] = ()
+    environment: ExecutionEnvironment = ExecutionEnvironment()
 
     def __post_init__(self) -> None:
         if not isinstance(self.environment, ExecutionEnvironment):
