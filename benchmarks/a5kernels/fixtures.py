@@ -526,7 +526,8 @@ def catlass_candidate_fixture(source: str) -> Fixture:
     runtime = runtime.replace("VECTOR_ELE", "_HOST_VECTOR_ELE").replace(
         "VL_ELE", "_HOST_VL_ELE"
     )
-    # Candidate plans carry the physical align-64 extent: logical N400 is 448.
+    # Candidate plans can carry the largest accepted physical study extent:
+    # logical N400 with align-256 padding is 512.
     # Keep this capacity separate from the base hello fixture's logical N400 cap.
     # Poison every output slot so an unwritten zero-padding lane cannot pass.
     runtime = runtime.replace("torch.empty_like(a)", "torch.full_like(a, float('nan'))")

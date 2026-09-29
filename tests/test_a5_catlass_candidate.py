@@ -153,11 +153,20 @@ def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
     assert result["passed"]
     composed = next(item for item in execution.plans[0].files
                     if item.relative_path == "kernel.py").content
-    assert "_HOST_VECTOR_ELE = 448" in composed
+    assert "_HOST_VECTOR_ELE = 512" in composed
     assert "_HOST_VL_ELE = 64" in composed
 
 
-def test_candidate_fixture_compile_path_accepts_physical_n400_extent(monkeypatch):
+@pytest.mark.parametrize(
+    "physical_length",
+    [
+        pytest.param(448, id="n400-align-64"),
+        pytest.param(512, id="n400-align-256"),
+    ],
+)
+def test_candidate_fixture_compile_path_accepts_physical_n400_extent(
+    monkeypatch, physical_length
+):
     fixture = catlass_candidate_fixture(SOURCE)
     source = next(
         item.content for item in fixture.files if item.relative_path == "kernel.py"
@@ -194,13 +203,14 @@ def test_candidate_fixture_compile_path_accepts_physical_n400_extent(monkeypatch
     monkeypatch.setenv("A5KERNEL_COMPILE_ONLY", "1")
     namespace = {}
     exec(compile(source, "candidate-kernel.py", "exec"), namespace)
-    input_a = [*([1.0] * 400), *([0.0] * 48)]
-    input_b = [*([2.0] * 400), *([0.0] * 48)]
+    padding = physical_length - 400
+    input_a = [*([1.0] * 400), *([0.0] * padding)]
+    input_b = [*([2.0] * 400), *([0.0] * padding)]
 
     output = namespace["run"](input_a, input_b)
 
-    assert len(output) == 448
-    assert output == [*([3.0] * 400), *([0.0] * 48)]
+    assert len(output) == physical_length
+    assert output == [*([3.0] * 400), *([0.0] * padding)]
 
 
 def test_compile_failure_returns_bounded_diagnostics_and_allows_retry(tmp_path):
