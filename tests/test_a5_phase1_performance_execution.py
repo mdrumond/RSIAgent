@@ -97,6 +97,18 @@ def test_non_performance_evidence_has_no_profile_side_effects(registered):
     assert backend.commands == []
 
 
+def test_padded_non_shape_length_is_noop_without_variant_validation():
+    backend = RecordingBackend()
+    padded = proposal("padded-multitile", {"length": 96}, "correctness")
+
+    result = Phase1PerformanceExecution(backend).run(
+        padded, ["correctness-runtime-owns-this-value"]
+    )
+
+    assert result is None
+    assert backend.commands == []
+
+
 def test_correctness_timing_maps_to_fixed_timing_study():
     backend = RecordingBackend()
 

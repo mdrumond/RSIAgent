@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -877,6 +878,49 @@ def test_catlass_source_pads_to_full_tiles_and_preserves_public_capacity():
     assert "padded_length = ((original_length + VL_ELE - 1) // VL_ELE) * VL_ELE" in source
     assert "return out[:original_length].cpu().tolist()" in source
     A5KernelRunner(FakeBackend()).prepare(RunRequest(Language.CATLASS_DSL.value, length=400))
+
+
+def test_catlass_fixture_compile_path_accepts_host_owned_block_six(monkeypatch):
+    source = {
+        item.relative_path: item.content
+        for item in fixture_for(Language.CATLASS_DSL).files
+    }["kernel.py"]
+    catlass = ModuleType("catlass")
+    catlass.__path__ = []
+    tla = ModuleType("catlass.tla")
+    tla.Tensor = object
+    tla.kernel = lambda function: function
+    tla.arch = SimpleNamespace(RowMajor=object())
+    artifact = lambda *args, **kwargs: None
+    tla.compile = lambda *args, **kwargs: artifact
+    runtime = ModuleType("catlass.tla.runtime")
+    catlass.tla = tla
+
+    class FakeTensor:
+        def contiguous(self):
+            return self
+
+    class FakeTLATensor:
+        def mark_compact_shape_dynamic(self, _axis):
+            return self
+
+    runtime.from_dlpack = lambda _tensor, layout_tag: FakeTLATensor()
+    torch = ModuleType("torch")
+    torch.float32 = object()
+    torch.npu = SimpleNamespace(set_device=lambda _device: None)
+    torch.tensor = lambda *args, **kwargs: FakeTensor()
+    torch.empty_like = lambda _tensor: FakeTensor()
+    monkeypatch.setitem(sys.modules, "catlass", catlass)
+    monkeypatch.setitem(sys.modules, "catlass.tla", tla)
+    monkeypatch.setitem(sys.modules, "catlass.tla.runtime", runtime)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setenv("A5KERNEL_BLOCK_NUM", "6")
+    monkeypatch.setenv("A5KERNEL_COMPILE_ONLY", "1")
+    namespace = {}
+    exec(compile(source, "kernel.py", "exec"), namespace)
+
+    assert namespace["run"]([1.0, 2.0], [3.0, 4.0]) == [4.0, 6.0]
 
 
 def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence():

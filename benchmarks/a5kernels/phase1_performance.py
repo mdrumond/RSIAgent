@@ -50,13 +50,13 @@ class Phase1PerformanceExecution:
 
         if not isinstance(proposal, CurriculumProposal):
             raise ValueError("proposal must be a validated CurriculumProposal")
+        preset = _STUDY_BY_EVIDENCE.get(proposal.evidence_preset)
+        if preset is None:
+            return None
         variants = tuple(variants)
         if not variants or any(not isinstance(item, StudyVariant) for item in variants):
             raise ValueError("proposal execution requires StudyVariant values")
         self._validate_dimensions(proposal, variants)
-        preset = _STUDY_BY_EVIDENCE.get(proposal.evidence_preset)
-        if preset is None:
-            return None
         return self._study.run(preset, variants)
 
     @staticmethod
