@@ -180,10 +180,9 @@ class CatlassCandidateBackend:
         environment = fixture.environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(device)
         )
-        if self._block_count != 1:
-            environment = environment.with_binding(
-                "A5KERNEL_BLOCK_NUM", str(self._block_count)
-            )
+        environment = environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", str(self._block_count)
+        )
         if compile_only:
             environment = environment.with_binding("A5KERNEL_COMPILE_ONLY", "1")
         return replace(
