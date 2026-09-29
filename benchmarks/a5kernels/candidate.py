@@ -90,11 +90,25 @@ class CatlassCandidateBackend:
     """Turn workspace source into an immutable plan and execute it on BZ-A5."""
 
     def __init__(self, execution_backend: ExecutionBackend, *, length: int = 32,
+                 padded_length: int | None = None, block_count: int = 1,
                  seed: int = 0, device: int = 0):
         if isinstance(device, bool) or not isinstance(device, int) or device < 0:
             raise ValueError("device must be a non-negative integer")
+        if type(length) is not int or not 1 <= length <= 400:
+            raise ValueError("length must be an integer in [1, 400]")
+        if padded_length is None:
+            padded_length = ((length + 63) // 64) * 64
+        if (type(padded_length) is not int or padded_length < length
+                or padded_length > 448 or padded_length % 64):
+            raise ValueError(
+                "padded_length must be a 64-aligned integer in [length, 448]"
+            )
+        if type(block_count) is not int or not 1 <= block_count <= 8:
+            raise ValueError("block_count must be an integer in [1, 8]")
         self._execution_backend = execution_backend
         self._length = length
+        self._padded_length = padded_length
+        self._block_count = block_count
         self._seed = seed
         self._device = device
 
@@ -142,7 +156,7 @@ class CatlassCandidateBackend:
     def _request(self) -> RunRequest:
         return RunRequest(
             Language.CATLASS_DSL.value, length=self._length, seed=self._seed,
-            padded_length=((self._length + 63) // 64) * 64,
+            padded_length=self._padded_length,
         )
 
     @staticmethod
@@ -153,14 +167,17 @@ class CatlassCandidateBackend:
         validate_candidate_source(source)
         return source
 
-    @staticmethod
-    def _prepare(runner: A5KernelRunner, request: RunRequest, source: str,
+    def _prepare(self, runner: A5KernelRunner, request: RunRequest, source: str,
                  attempt_id: str, *, compile_only: bool, device: int) -> ExecutionPlan:
         plan = runner.prepare(request, attempt_id=attempt_id)
         fixture = catlass_candidate_fixture(source)
         environment = fixture.environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(device)
         )
+        if self._block_count != 1:
+            environment = environment.with_binding(
+                "A5KERNEL_BLOCK_NUM", str(self._block_count)
+            )
         if compile_only:
             environment = environment.with_binding("A5KERNEL_COMPILE_ONLY", "1")
         return replace(

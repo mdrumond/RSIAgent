@@ -90,6 +90,11 @@ from benchmarks.a5kernels.phase1_memory import (
     Phase1ProjectMemory,
     Phase1ResumeState,
 )
+from benchmarks.a5kernels.phase1_runtime import (
+    Phase1ProjectRuntime,
+    RecoveryEvidence,
+    RecoveryStarter,
+)
 
 __all__ = [
     "A5KernelRunner",
@@ -127,6 +132,7 @@ __all__ = [
     "PaddingClass",
     "ParallelismClass",
     "Phase1PerformanceStudy",
+    "Phase1ProjectRuntime",
     "Phase1StudyBackend",
     "Phase1StudyResult",
     "ProfileCommandExecutor",
@@ -141,6 +147,8 @@ __all__ = [
     "Phase1ProjectMemory",
     "Phase1ResumeState",
     "ProgressiveMemoryJournal",
+    "RecoveryEvidence",
+    "RecoveryStarter",
     "RunRequest",
     "SearchHit",
     "ShapeClass",

@@ -83,8 +83,8 @@ def run(input_a, input_b):
     b = torch.tensor(input_b, dtype=torch.float32, device="npu")
     out = torch.empty_like(a)
     block_num = int(os.environ.get("A5KERNEL_BLOCK_NUM", "1"))
-    if block_num != 1:
-        raise ValueError("the hello fixture supports only block_num=1")
+    if not 1 <= block_num <= 8:
+        raise ValueError("A5KERNEL_BLOCK_NUM must be in [1, 8]")
 
     def as_tla(tensor):
         return from_dlpack(
