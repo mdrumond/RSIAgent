@@ -17,6 +17,10 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser("matrix", help="print the immutable initial experiment plan")
     report = commands.add_parser("report", help="aggregate host-recorded JSON metrics")
     report.add_argument("input", type=Path)
+    phase1 = commands.add_parser(
+        "phase1-plan", help="print the deterministic host-owned Phase1 dry-run plan"
+    )
+    phase1.add_argument("--proposals", type=Path)
     for name, help_text in (
         (
             "preflight",
@@ -59,6 +63,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = initial_matrix().as_dict()
     elif args.command == "report":
         payload = aggregate_report(load_metrics(args.input))
+    elif args.command == "phase1-plan":
+        from benchmarks.a5kernels.phase1_registry import dry_run_plan, load_proposals
+
+        proposals = load_proposals(args.proposals) if args.proposals is not None else None
+        payload = dry_run_plan() if proposals is None else dry_run_plan(proposals)
     else:
         # Production dependencies stay lazy for matrix/report users.
         from benchmarks.a5kernels.production import preflight, run_pilot

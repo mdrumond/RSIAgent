@@ -52,6 +52,13 @@ from benchmarks.a5kernels.model_profile import (
     complete_a5,
     load_a5_model_profile,
 )
+from benchmarks.a5kernels.phase1_registry import (
+    PHASE1_BRIEF,
+    PROJECT_REGISTRY,
+    CurriculumProposal,
+    dry_run_plan,
+    saturation_status,
+)
 
 __all__ = [
     "A5KernelRunner",
@@ -86,6 +93,8 @@ __all__ = [
     "ProfileEvaluation",
     "ProfileRequest",
     "ProfilingTreatmentController",
+    "PROJECT_REGISTRY",
+    "PHASE1_BRIEF",
     "ProgressiveMemoryJournal",
     "RunRequest",
     "SearchHit",
@@ -93,10 +102,13 @@ __all__ = [
     "TrialActionExecutor",
     "TrialOrchestrator",
     "TrialResult",
+    "CurriculumProposal",
     "VerifiedResult",
     "fixture_for",
+    "dry_run_plan",
     "parse_knowledge_action",
     "parse_trial_action",
+    "saturation_status",
     "validate_candidate_source",
     "complete_a5",
     "load_a5_model_profile",
