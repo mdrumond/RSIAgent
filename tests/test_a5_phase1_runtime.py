@@ -122,12 +122,14 @@ def test_recovery_contracts_supply_stable_abi_valid_starters(family, evidence):
     assert first.recovery.source_sha256 in encoded
 
 
-@pytest.mark.parametrize("family,fault_prefix,second_fault", [
-    ("compile-recovery", "tla.copy(gm_c, missing_input", "missing_input_second"),
-    ("runtime-recovery", "tla.copy(gm_c, gm_", "tla.copy(gm_c, gm_b)"),
+@pytest.mark.parametrize("family,one_prefix,two_prefix,second_fault", [
+    ("compile-recovery", "tla.copy(gm_c, missing_input",
+     "tla.copy(gm_c, missing_input", "missing_input_second"),
+    ("runtime-recovery", "tla.copy(gm_c, gm_a)",
+     "tla.copy(gm_c[", "gm_c[32:64]"),
 ])
 def test_recovery_source_encodes_requested_fault_count(
-    family, fault_prefix, second_fault
+    family, one_prefix, two_prefix, second_fault
 ):
     def runtime(faults):
         proposal = CurriculumProposal.from_mapping({
@@ -140,13 +142,27 @@ def test_recovery_source_encodes_requested_fault_count(
     one = runtime(1).recovery
     two = runtime(2).recovery
     assert one is not None and two is not None
-    assert one.fault_count == one.source.count(fault_prefix) == 1
-    assert two.fault_count == two.source.count(fault_prefix) == 2
+    assert one.fault_count == one.source.count(one_prefix) == 1
+    assert two.fault_count == two.source.count(two_prefix) == 2
     assert second_fault not in one.source and second_fault in two.source
     assert one.source != two.source
     assert one.source_sha256 != two.source_sha256
     validate_candidate_source(one.source)
     validate_candidate_source(two.source)
+
+
+def test_two_runtime_faults_write_disjoint_output_regions():
+    proposal = CurriculumProposal.from_mapping({
+        "family": "runtime-recovery", "parameters": {"faults": 2},
+        "hypothesis": "Two disjoint faults exercise recovery.",
+        "evidence_preset": "ordinary-recovery",
+    })
+    recovery = Phase1ProjectRuntime.from_proposal(proposal).recovery
+
+    assert recovery is not None
+    assert "gm_c[0:32]" in recovery.source
+    assert "gm_c[32:64]" in recovery.source
+    assert "tla.copy(gm_c, " not in recovery.source
 
 
 @pytest.mark.parametrize("options,message", [
