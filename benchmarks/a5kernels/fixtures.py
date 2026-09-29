@@ -8,6 +8,10 @@ from enum import Enum
 from benchmarks.a5kernels.protocol import ExecutionEnvironment, SourceFile
 
 
+CATLASS_MAX_LENGTH = 400
+CATLASS_MAX_PADDED_LENGTH = 448
+
+
 class Language(str, Enum):
     CATLASS_DSL = "catlass-dsl"
     ASCEND_C = "ascend-c"
@@ -489,7 +493,7 @@ _FIXTURES = {
             "kernel.py",
             "input.json",
         ),
-        400,
+        CATLASS_MAX_LENGTH,
         ExecutionEnvironment(
             bindings=(
                 ("A5KERNEL_BLOCK_NUM", "1"),
@@ -528,7 +532,7 @@ def catlass_candidate_fixture(source: str) -> Fixture:
                               "return out.cpu().tolist()")
     host_prelude = (
         "\n\nimport os\nimport time\n"
-        "_HOST_VECTOR_ELE = 448\n_HOST_VL_ELE = 64\n"
+        f"_HOST_VECTOR_ELE = {CATLASS_MAX_PADDED_LENGTH}\n_HOST_VL_ELE = 64\n"
     )
     kernel = source.rstrip() + host_prelude + marker + runtime
     fixture = _FIXTURES[Language.CATLASS_DSL]

@@ -115,8 +115,10 @@ def test_recovery_fault_count_is_registry_owned():
 @pytest.mark.parametrize("options,message", [
     ({"length": True}, "length"),
     ({"length": 0}, "length"),
+    ({"length": 401}, "length"),
     ({"padded_length": 63}, "padded_length"),
     ({"padded_length": 96}, "padded_length"),
+    ({"padded_length": 512}, "padded_length"),
     ({"block_count": 0}, "block_count"),
     ({"block_count": True}, "block_count"),
 ])
@@ -125,18 +127,23 @@ def test_candidate_backend_rejects_values_outside_host_contract(options, message
         CatlassCandidateBackend(FakeExecution(), **options)
 
 
-def test_generic_backend_accepts_extent_beyond_phase1_brief():
-    backend = CatlassCandidateBackend(
-        FakeExecution(), length=512, padded_length=512
-    )
+def test_candidate_backend_accepts_maximum_executable_fixture_extent():
+    execution = FakeExecution()
+    backend = CatlassCandidateBackend(execution, length=400, padded_length=448)
     request = backend._request()
-    assert request.length == request.padded_length == 512
+    assert request.length == 400 and request.padded_length == 448
+    assert execution.plans == []
 
-    phase1 = _proposal("vector-add-baseline")
-    with pytest.raises(ValueError, match="exactly match"):
-        Phase1ProjectRuntime(phase1, 512, 512, 1)
-    with pytest.raises(ValueError, match="exactly match"):
-        Phase1ProjectRuntime(phase1, 400, 512, 1)
+
+@pytest.mark.parametrize("options", [
+    {"length": 401, "padded_length": 448},
+    {"length": 400, "padded_length": 512},
+])
+def test_candidate_backend_rejects_unexecutable_extent_before_dispatch(options):
+    execution = FakeExecution()
+    with pytest.raises(ValueError):
+        CatlassCandidateBackend(execution, **options)
+    assert execution.plans == []
 
 
 @pytest.mark.parametrize("fields", [
