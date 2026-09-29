@@ -129,6 +129,25 @@ class ProfileRequest:
         )
 
 
+def bind_profile_device(plan: ExecutionPlan, device: int) -> ExecutionPlan:
+    """Bind the physical device before correctness execution and profiling."""
+
+    if not isinstance(plan, ExecutionPlan):
+        raise TypeError("plan must be an ExecutionPlan")
+    if isinstance(device, bool) or not isinstance(device, int) or device < 0:
+        raise ValueError("device must be a non-negative integer")
+    assert plan.argv is not None
+    if any(
+        argument.startswith("BZ_A5_PROFILE_PHYSICAL_DEVICE=")
+        for argument in plan.argv
+    ):
+        raise ValueError("execution plan already contains a device binding")
+    return replace(
+        plan,
+        argv=("env", f"BZ_A5_PROFILE_PHYSICAL_DEVICE={device}", *plan.argv),
+    )
+
+
 @dataclass(frozen=True)
 class TimingCommand:
     """Canonical minimally instrumented timing run."""
@@ -564,6 +583,15 @@ class StudyVariant:
             raise TypeError("correctness must be a VerifiedResult")
         if not isinstance(self.dimensions, StudyDimensions):
             raise TypeError("dimensions must be StudyDimensions")
+        expected_device = f"BZ_A5_PROFILE_PHYSICAL_DEVICE={self.request.device}"
+        if tuple(
+            argument
+            for argument in self.request.plan.argv or ()
+            if argument.startswith("BZ_A5_PROFILE_PHYSICAL_DEVICE=")
+        ) != (expected_device,):
+            raise ValueError(
+                "Phase 1 variants require one canonical device-bound execution plan"
+            )
         if study_dimensions_from_plan(self.request.plan) != self.dimensions:
             raise ValueError(
                 "study dimensions must match the host-owned execution-plan provenance"

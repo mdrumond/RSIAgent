@@ -16,6 +16,7 @@ from benchmarks.a5kernels.profiling import (
     StudyTimingSample,
     StudyVariant,
     bind_study_dimensions,
+    bind_profile_device,
 )
 from tests.test_a5kernels_profiling import (
     CORRECT,
@@ -37,24 +38,25 @@ def dimensions(parallelism=ParallelismClass.ONE):
     )
 
 
-def variant(*, attempt="attempt-1", revision="baseline"):
+def variant(*, attempt="attempt-1", revision="baseline", device=REQUEST.device):
     parallelism = ParallelismClass.ONE
     study_dimensions = dimensions(parallelism)
     values_a = (*([1.0] * 32), *([0.0] * 32))
     values_b = (*([2.0] * 32), *([0.0] * 32))
     plan = bind_study_dimensions(
-        replace(
+        bind_profile_device(replace(
             REQUEST.plan,
             attempt_id=attempt,
             files=(replace(REQUEST.plan.files[0], content=f"# {revision}\n"),),
             input_a=values_a,
             input_b=values_b,
-        ),
+        ), device),
         study_dimensions,
     )
     request = replace(
         REQUEST,
         plan=plan,
+        device=device,
     )
     correctness = replace(
         CORRECT,
@@ -236,8 +238,7 @@ def test_backend_cannot_return_stale_identity_or_unhashed_timing():
 def test_comparison_rejects_mixed_devices_before_measurement():
     backend = FakeStudyBackend()
     first = variant(attempt="device-3")
-    second = variant(attempt="device-4", revision="device-4")
-    second = replace(second, request=replace(second.request, device=4))
+    second = variant(attempt="device-4", revision="device-4", device=4)
 
     with pytest.raises(ValueError, match="share device, kernel, and implementation"):
         Phase1PerformanceStudy(backend).run(
@@ -254,6 +255,18 @@ def test_profile_request_rejects_mismatched_or_noncanonical_plan_device(encoded)
     )
     with pytest.raises(ValueError, match="device bound in plan argv"):
         replace(REQUEST, plan=plan)
+
+
+def test_phase1_variant_rejects_missing_plan_device_binding():
+    bound = variant()
+    unbound_plan = replace(
+        bound.request.plan,
+        argv=tuple(bound.request.plan.argv[2:]),
+    )
+    request = replace(bound.request, plan=unbound_plan)
+    correctness = replace(bound.correctness, execution_id=request.execution_id)
+    with pytest.raises(ValueError, match="device-bound execution plan"):
+        StudyVariant(request, correctness, bound.dimensions)
 
 
 def test_variant_rejects_dimensions_not_bound_to_execution_plan():
@@ -282,7 +295,7 @@ def test_comparison_rejects_mismatched_workloads_before_measurement():
     )
     other_plan = bind_study_dimensions(
         replace(
-            REQUEST.plan,
+            bind_profile_device(REQUEST.plan, REQUEST.device),
             attempt_id="n64",
             input_a=tuple([1.0] * 64),
             input_b=tuple([2.0] * 64),
