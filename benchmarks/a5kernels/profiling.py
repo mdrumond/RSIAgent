@@ -496,23 +496,6 @@ class MetricDomain(str, Enum):
     PIPE_UTILIZATION = "pipe-utilization"
 
 
-def bind_profile_parallelism(
-    plan: ExecutionPlan, parallelism: ParallelismClass
-) -> ExecutionPlan:
-    """Bind one canonical host-owned A5 block count into an execution plan."""
-
-    if not isinstance(plan, ExecutionPlan):
-        raise TypeError("plan must be an ExecutionPlan")
-    if not isinstance(parallelism, ParallelismClass):
-        raise ValueError("parallelism must be a host-owned ParallelismClass")
-    return replace(
-        plan,
-        environment=plan.environment.with_binding(
-            "A5KERNEL_BLOCK_NUM", str(parallelism.value)
-        ),
-    )
-
-
 @dataclass(frozen=True)
 class StudyDimensions:
     """One point in the preregistered, bounded Phase 1 design space."""

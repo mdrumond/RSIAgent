@@ -16,7 +16,6 @@ from benchmarks.a5kernels.profiling import (
     StudyTimingSample,
     StudyVariant,
     bind_study_dimensions,
-    bind_profile_parallelism,
     bind_profile_device,
 )
 from tests.test_a5kernels_profiling import (
@@ -381,16 +380,13 @@ def test_registered_block_count_six_is_bound_to_variant_plan():
         ParallelismClass.SIX,
     )
     plan = bind_study_dimensions(
-        bind_profile_parallelism(
-            bind_profile_device(
-                replace(
-                    REQUEST.plan,
-                    input_a=tuple([1.0] * 64),
-                    input_b=tuple([2.0] * 64),
-                ),
-                REQUEST.device,
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
             ),
-            ParallelismClass.SIX,
+            REQUEST.device,
         ),
         dimensions,
     )

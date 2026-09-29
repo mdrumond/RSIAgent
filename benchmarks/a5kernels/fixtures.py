@@ -9,7 +9,7 @@ from benchmarks.a5kernels.protocol import ExecutionEnvironment, SourceFile
 
 
 CATLASS_MAX_LENGTH = 400
-CATLASS_MAX_PADDED_LENGTH = 448
+CATLASS_MAX_PADDED_LENGTH = 512
 
 
 class Language(str, Enum):

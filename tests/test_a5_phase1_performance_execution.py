@@ -11,7 +11,6 @@ from benchmarks.a5kernels.profiling import (
     ProfileMetric,
     StudyPreset,
     StudyTimingSample,
-    bind_profile_parallelism,
     bind_study_dimensions,
 )
 from tests.test_a5_phase1_performance import SHA, variant
@@ -68,9 +67,7 @@ def block_variant(block_count):
             if not item[0].startswith("phase1.")
         ),
     )
-    plan = bind_study_dimensions(
-        bind_profile_parallelism(plan, ParallelismClass(block_count)), dimensions
-    )
+    plan = bind_study_dimensions(plan, dimensions)
     request = replace(candidate.request, plan=plan)
     correctness = replace(
         candidate.correctness,

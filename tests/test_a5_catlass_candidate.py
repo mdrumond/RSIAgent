@@ -3,8 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import json
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,8 +14,17 @@ from benchmarks.a5kernels.candidate import (
     validate_candidate_source,
 )
 from benchmarks.a5kernels.evidence import EvidenceLedger
-from benchmarks.a5kernels.fixtures import catlass_candidate_fixture
 from benchmarks.a5kernels.matrix import Workload
+from benchmarks.a5kernels.profiling import (
+    AccessClass,
+    PaddingClass,
+    ParallelismClass,
+    ProfileRequest,
+    ShapeClass,
+    StudyDimensions,
+    StudyVariant,
+    bind_study_dimensions,
+)
 from benchmarks.a5kernels.protocol import ExecutionReceipt, RunRequest
 from benchmarks.a5kernels.runner import A5KernelRunner
 from benchmarks.a5kernels.trial import TrialAction, TrialActionExecutor
@@ -157,62 +165,6 @@ def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
     assert "_HOST_VL_ELE = 64" in composed
 
 
-@pytest.mark.parametrize(
-    "physical_length",
-    [
-        pytest.param(448, id="n400-align-64"),
-        pytest.param(512, id="n400-align-256"),
-    ],
-)
-def test_candidate_fixture_compile_path_accepts_physical_n400_extent(
-    monkeypatch, physical_length
-):
-    fixture = catlass_candidate_fixture(SOURCE)
-    source = next(
-        item.content for item in fixture.files if item.relative_path == "kernel.py"
-    )
-    catlass = ModuleType("catlass")
-    catlass.__path__ = []
-    tla = ModuleType("catlass.tla")
-    tla.Tensor = object
-    tla.kernel = lambda function: function
-    tla.arch = SimpleNamespace(RowMajor=object())
-    tla.compile = lambda *args, **kwargs: (lambda *args, **kwargs: None)
-    runtime = ModuleType("catlass.tla.runtime")
-
-    class FakeTensor:
-        def contiguous(self):
-            return self
-
-    class FakeTLATensor:
-        def mark_compact_shape_dynamic(self, _axis):
-            return self
-
-    runtime.from_dlpack = lambda _tensor, layout_tag: FakeTLATensor()
-    torch = ModuleType("torch")
-    torch.float32 = object()
-    torch.npu = SimpleNamespace(set_device=lambda _device: None)
-    torch.tensor = lambda *args, **kwargs: FakeTensor()
-    torch.full_like = lambda _tensor, _value: FakeTensor()
-    catlass.tla = tla
-    monkeypatch.setitem(sys.modules, "catlass", catlass)
-    monkeypatch.setitem(sys.modules, "catlass.tla", tla)
-    monkeypatch.setitem(sys.modules, "catlass.tla.runtime", runtime)
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
-    monkeypatch.setenv("A5KERNEL_COMPILE_ONLY", "1")
-    namespace = {}
-    exec(compile(source, "candidate-kernel.py", "exec"), namespace)
-    padding = physical_length - 400
-    input_a = [*([1.0] * 400), *([0.0] * padding)]
-    input_b = [*([2.0] * 400), *([0.0] * padding)]
-
-    output = namespace["run"](input_a, input_b)
-
-    assert len(output) == physical_length
-    assert output == [*([3.0] * 400), *([0.0] * padding)]
-
-
 def test_compile_failure_returns_bounded_diagnostics_and_allows_retry(tmp_path):
     (tmp_path / "kernel.py").write_text(SOURCE)
     execution = FakeExecution(marker=None, exit_code=1)
@@ -272,6 +224,47 @@ def test_candidate_verifies_immutable_zero_padded_smoke_inputs(tmp_path):
     assert "torch.full_like(a, float('nan'))" in kernel
     assert "return out.cpu().tolist()" in kernel
     assert "return out[:original_length]" not in kernel
+
+
+def test_n400_align256_candidate_runs_and_forms_study_variant(tmp_path):
+    """The supported backend, verifier, and study model share the 512 extent."""
+
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    run = CatlassCandidateBackend(
+        FakeExecution(), length=400, padded_length=512, block_count=6, device=2
+    ).run(
+        tmp_path,
+        "catlass-dsl",
+        Workload.SMOKE_VECTOR_ADD,
+        "n400-align256",
+        EvidenceLedger(tmp_path / "evidence.jsonl"),
+    )
+    dimensions = StudyDimensions(
+        ShapeClass.N400,
+        PaddingClass.ALIGN_256,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(run.plan, dimensions)
+    request = ProfileRequest.from_execution_plan(
+        plan,
+        implementation="catlass-dsl",
+        expected_kernel=run.kernel_name,
+        device=2,
+        block_count=6,
+    )
+    correctness = replace(
+        run.verified,
+        execution_id=plan.execution_id,
+        source_fingerprint=plan.source_fingerprint,
+    )
+
+    registered = StudyVariant(request, correctness, dimensions)
+
+    assert run.verified.passed
+    assert len(plan.input_a) == len(plan.input_b) == 512
+    assert plan.input_a[400:] == plan.input_b[400:] == (0.0,) * 112
+    assert registered.dimensions.padding is PaddingClass.ALIGN_256
 
 
 @pytest.mark.parametrize("padding", [(), (float("nan"),) * 32, (1.0,) * 32])
