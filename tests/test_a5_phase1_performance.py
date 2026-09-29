@@ -290,6 +290,37 @@ def test_profile_request_rejects_plan_timing_policy_overrides(assignment):
         replace(REQUEST, plan=plan)
 
 
+@pytest.mark.parametrize("block_count", [True, 0, 9])
+def test_profile_request_rejects_invalid_block_count(block_count):
+    with pytest.raises(ValueError, match="integer from 1 through 8"):
+        replace(REQUEST, block_count=block_count)
+
+
+def test_profile_request_rejects_block_count_mismatched_with_environment():
+    plan = replace(
+        REQUEST.plan,
+        environment=REQUEST.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", "2"
+        ),
+    )
+    with pytest.raises(ValueError, match="host-owned block metadata"):
+        replace(REQUEST, plan=plan, block_count=1)
+
+
+def test_profile_request_does_not_parse_assignment_shaped_positional_arguments():
+    plan = replace(
+        REQUEST.plan,
+        argv=("python", "tool.py", "A5KERNEL_BLOCK_NUM=not-environment"),
+        environment=REQUEST.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", "1"
+        ),
+    )
+
+    request = replace(REQUEST, plan=plan, block_count=1)
+
+    assert request.workload_argv[-1] == "A5KERNEL_BLOCK_NUM=not-environment"
+
+
 def test_phase1_variant_rejects_block_count_mismatched_with_parallelism():
     bound = variant()
     plan = replace(

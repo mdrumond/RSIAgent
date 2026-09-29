@@ -76,9 +76,11 @@ def test_runtime_parameters_are_bound_into_plan_and_host_evidence(tmp_path):
 
     assert run.verified.passed
     assert len(run.plan.input_a) == 64
-    assert run.plan.argv[:4] == (
-        "env", "A5KERNEL_BLOCK_NUM=6", "env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=3",
-    )
+    assert run.plan.argv[:2] == ("python", "-B")
+    assert dict(run.plan.environment.bindings) == {
+        "A5KERNEL_BLOCK_NUM": "6",
+        "BZ_A5_PROFILE_PHYSICAL_DEVICE": "3",
+    }
     assert ledger.entries[0].payload["request"] == {
         "language": "catlass-dsl", "length": 32, "seed": 9,
         "dtype": "float32", "padded_length": 64,

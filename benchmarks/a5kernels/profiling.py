@@ -70,15 +70,10 @@ class ProfileRequest:
         }
         if reserved_timing.intersection(bindings):
             raise ValueError("plan environment must not override host-owned timing policy")
-        dimensions = study_dimensions_from_plan(self.plan)
-        expected_block = (
-            dimensions.parallelism.value
-            if dimensions is not None else self.block_count
-        )
-        if expected_block is not None:
-            if type(expected_block) is not int or not 1 <= expected_block <= 8:
+        if self.block_count is not None:
+            if type(self.block_count) is not int or not 1 <= self.block_count <= 8:
                 raise ValueError("block_count must be an integer from 1 through 8")
-            if bindings.get("A5KERNEL_BLOCK_NUM") != str(expected_block):
+            if bindings.get("A5KERNEL_BLOCK_NUM") != str(self.block_count):
                 raise ValueError(
                     "plan block binding must match host-owned block metadata"
                 )
@@ -571,15 +566,13 @@ def _validate_dimensions_against_plan(
         raise ValueError("Phase 1 dimensions require a Catlass DSL execution plan")
     if dimensions.access is not AccessClass.CONTIGUOUS:
         raise ValueError("the current Catlass fixture supports only contiguous access")
-    block_environment = tuple(
-        argument
-        for argument in plan.argv or ()
-        if argument.startswith("A5KERNEL_BLOCK_NUM=")
+    block_environment = dict(plan.environment.bindings).get(
+        "A5KERNEL_BLOCK_NUM"
     )
-    expected_block = f"A5KERNEL_BLOCK_NUM={dimensions.parallelism.value}"
-    if block_environment and block_environment != (expected_block,):
+    expected_block = str(dimensions.parallelism.value)
+    if block_environment != expected_block:
         raise ValueError(
-            "execution plan block binding must match the host-owned study block dimension"
+            "execution plan block count must match the host-owned study block dimension"
         )
     logical_length = int(dimensions.shape.value[1:])
     if dimensions.padding is PaddingClass.NONE:
