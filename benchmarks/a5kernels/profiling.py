@@ -513,6 +513,8 @@ def _validate_dimensions_against_plan(
         raise ValueError("the current Catlass fixture supports only contiguous access")
     logical_length = int(dimensions.shape.value[1:])
     if dimensions.padding is PaddingClass.NONE:
+        if logical_length % 64:
+            raise ValueError("unpadded shapes must match the fixture vector alignment")
         physical_length = logical_length
     else:
         alignment = 64 if dimensions.padding is PaddingClass.ALIGN_64 else 256

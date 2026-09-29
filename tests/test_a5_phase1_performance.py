@@ -344,3 +344,19 @@ def test_binding_rejects_mislabeled_shape_padding_or_access(bad_dimensions):
     )
     with pytest.raises(ValueError):
         bind_study_dimensions(padded_n32, bad_dimensions)
+
+
+def test_binding_rejects_n32_none_because_runtime_would_pad_it():
+    unpadded_n32 = replace(
+        REQUEST.plan,
+        input_a=tuple([1.0] * 32),
+        input_b=tuple([2.0] * 32),
+    )
+    dimensions = StudyDimensions(
+        ShapeClass.N32,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.ONE,
+    )
+    with pytest.raises(ValueError, match="vector alignment"):
+        bind_study_dimensions(unpadded_n32, dimensions)

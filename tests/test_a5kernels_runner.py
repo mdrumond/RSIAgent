@@ -1086,14 +1086,14 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
         executor, session_wrapper="execution-profiles/bz-a5/session.sh"
     )
     plan = A5KernelRunner(FakeBackend(runtime_provenance=runtime)).prepare(
-        RunRequest(Language.CATLASS_DSL.value), attempt_id="trial-1"
+        RunRequest(Language.CATLASS_DSL.value, padded_length=64), attempt_id="trial-1"
     )
     plan = replace(
         plan,
         runtime_provenance=(
             *plan.runtime_provenance,
             ("phase1.shape", "n32"),
-            ("phase1.padding", "none"),
+            ("phase1.padding", "align-64"),
             ("phase1.access", "contiguous"),
             ("phase1.parallelism", parallelism),
         ),
