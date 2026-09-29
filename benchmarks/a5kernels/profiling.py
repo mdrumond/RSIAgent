@@ -459,6 +459,14 @@ class StudyDimensions:
             "parallelism": self.parallelism.value,
         }
 
+    def as_provenance(self) -> tuple[tuple[str, str], ...]:
+        """Canonical host-owned plan metadata binding this study point."""
+
+        return tuple(
+            (f"phase1.{name}", str(value))
+            for name, value in self.as_dict().items()
+        )
+
 
 @dataclass(frozen=True)
 class StudyVariant:
@@ -473,6 +481,12 @@ class StudyVariant:
             raise TypeError("correctness must be a VerifiedResult")
         if not isinstance(self.dimensions, StudyDimensions):
             raise TypeError("dimensions must be StudyDimensions")
+        provenance = dict(self.request.plan.runtime_provenance)
+        expected = dict(self.dimensions.as_provenance())
+        if any(provenance.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                "study dimensions must match the host-owned execution-plan provenance"
+            )
 
     @property
     def variant_id(self) -> str:
@@ -581,6 +595,18 @@ class Phase1PerformanceStudy:
             if len(comparison_route) != 1:
                 raise ValueError(
                     "optimization variants must share device, kernel, and implementation"
+                )
+            workload = {
+                (
+                    item.dimensions.shape,
+                    item.dimensions.padding,
+                    item.dimensions.access,
+                )
+                for item in variants
+            }
+            if len(workload) != 1:
+                raise ValueError(
+                    "optimization variants must share shape, padding, and access"
                 )
         for variant in variants:
             ProfilingTreatmentController._validate_correctness(

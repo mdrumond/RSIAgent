@@ -37,7 +37,15 @@ def dimensions(parallelism=ParallelismClass.ONE):
 
 
 def variant(*, parallelism=ParallelismClass.ONE, attempt="attempt-1"):
-    request = replace(REQUEST, plan=replace(REQUEST.plan, attempt_id=attempt))
+    study_dimensions = dimensions(parallelism)
+    request = replace(
+        REQUEST,
+        plan=replace(
+            REQUEST.plan,
+            attempt_id=attempt,
+            runtime_provenance=study_dimensions.as_provenance(),
+        ),
+    )
     correctness = replace(
         CORRECT,
         attempt_id=request.attempt_id,
@@ -45,7 +53,7 @@ def variant(*, parallelism=ParallelismClass.ONE, attempt="attempt-1"):
         source_fingerprint=request.source_fingerprint,
         request_id=request.request_id,
     )
-    return StudyVariant(request, correctness, dimensions(parallelism))
+    return StudyVariant(request, correctness, study_dimensions)
 
 
 class FakeStudyBackend:
@@ -222,6 +230,47 @@ def test_comparison_rejects_mixed_devices_before_measurement():
     second = replace(second, request=replace(second.request, device=4))
 
     with pytest.raises(ValueError, match="share device, kernel, and implementation"):
+        Phase1PerformanceStudy(backend).run(
+            StudyPreset.OPTIMIZATION_COMPARISON, [first, second]
+        )
+    assert backend.commands == []
+
+
+def test_variant_rejects_dimensions_not_bound_to_execution_plan():
+    bound = variant()
+    with pytest.raises(ValueError, match="execution-plan provenance"):
+        StudyVariant(
+            bound.request,
+            bound.correctness,
+            dimensions(ParallelismClass.FOUR),
+        )
+
+
+def test_comparison_rejects_mismatched_workloads_before_measurement():
+    backend = FakeStudyBackend()
+    first = variant(attempt="n32")
+    other_dimensions = StudyDimensions(
+        ShapeClass.N512,
+        PaddingClass.ALIGN_64,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.FOUR,
+    )
+    other_plan = replace(
+        first.request.plan,
+        attempt_id="n512",
+        runtime_provenance=other_dimensions.as_provenance(),
+    )
+    other_request = replace(first.request, plan=other_plan)
+    other_correctness = replace(
+        first.correctness,
+        attempt_id=other_request.attempt_id,
+        execution_id=other_request.execution_id,
+        source_fingerprint=other_request.source_fingerprint,
+        request_id=other_request.request_id,
+    )
+    second = StudyVariant(other_request, other_correctness, other_dimensions)
+
+    with pytest.raises(ValueError, match="share shape, padding, and access"):
         Phase1PerformanceStudy(backend).run(
             StudyPreset.OPTIMIZATION_COMPARISON, [first, second]
         )
