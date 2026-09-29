@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from benchmarks.a5kernels.phase1_registry import EvidencePreset
+from benchmarks.a5kernels.phase1_registry import (
+    CurriculumProposal,
+    EvidencePreset,
+    ProjectFamily,
+)
 from benchmarks.a5kernels.profiling import (
     Phase1PerformanceStudy,
     Phase1StudyBackend,
@@ -35,18 +39,45 @@ class Phase1PerformanceExecution:
 
     def run(
         self,
-        evidence_preset: EvidencePreset,
+        proposal: CurriculumProposal,
         variants: Sequence[StudyVariant],
     ) -> Phase1StudyResult | None:
-        """Run the fixed study for ``evidence_preset``, if it requests one.
+        """Run the study registered by ``proposal`` for its exact variants.
 
         Correctness and recovery evidence are produced by their project runtimes;
         they deliberately do not cause timing or profiler dispatch here.
         """
 
-        if not isinstance(evidence_preset, EvidencePreset):
-            raise ValueError("evidence_preset must be a host-owned EvidencePreset")
-        preset = _STUDY_BY_EVIDENCE.get(evidence_preset)
+        if not isinstance(proposal, CurriculumProposal):
+            raise ValueError("proposal must be a validated CurriculumProposal")
+        variants = tuple(variants)
+        if not variants or any(not isinstance(item, StudyVariant) for item in variants):
+            raise ValueError("proposal execution requires StudyVariant values")
+        self._validate_dimensions(proposal, variants)
+        preset = _STUDY_BY_EVIDENCE.get(proposal.evidence_preset)
         if preset is None:
             return None
         return self._study.run(preset, variants)
+
+    @staticmethod
+    def _validate_dimensions(
+        proposal: CurriculumProposal, variants: Sequence[StudyVariant]
+    ) -> None:
+        parameters = dict(proposal.parameters)
+        if proposal.family in {
+            ProjectFamily.VECTOR_ADD_BASELINE,
+            ProjectFamily.PADDED_MULTITILE,
+            ProjectFamily.LENGTH_KNEE,
+        }:
+            expected = parameters["length"]
+            if any(
+                int(item.dimensions.shape.value.removeprefix("n")) != expected
+                for item in variants
+            ):
+                raise ValueError("study shape does not match proposal length")
+        elif proposal.family is ProjectFamily.CROSS_LAYER_LAUNCH:
+            expected = parameters["block_count"]
+            if any(item.dimensions.parallelism.value != expected for item in variants):
+                raise ValueError(
+                    "study parallelism does not match proposal block_count"
+                )
