@@ -401,7 +401,6 @@ class ShapeClass(str, Enum):
     N64 = "n64"
     N128 = "n128"
     N256 = "n256"
-    N512 = "n512"
 
 
 class PaddingClass(str, Enum):

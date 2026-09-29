@@ -310,7 +310,7 @@ def test_comparison_rejects_relabelled_duplicate_execution():
     "bad_dimensions",
     [
         StudyDimensions(
-            ShapeClass.N512,
+            ShapeClass.N128,
             PaddingClass.NONE,
             AccessClass.CONTIGUOUS,
             ParallelismClass.ONE,
