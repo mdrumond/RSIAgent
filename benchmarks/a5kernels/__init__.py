@@ -79,6 +79,13 @@ from benchmarks.a5kernels.phase1_registry import (
     dry_run_plan,
     saturation_status,
 )
+from benchmarks.a5kernels.phase1_memory import (
+    AgentInterpretation,
+    HostFact,
+    Phase1LearningJournal,
+    Phase1ProjectMemory,
+    Phase1ResumeState,
+)
 
 __all__ = [
     "A5KernelRunner",
@@ -123,6 +130,11 @@ __all__ = [
     "ProfilingTreatmentController",
     "PROJECT_REGISTRY",
     "PHASE1_BRIEF",
+    "AgentInterpretation",
+    "HostFact",
+    "Phase1LearningJournal",
+    "Phase1ProjectMemory",
+    "Phase1ResumeState",
     "ProgressiveMemoryJournal",
     "RunRequest",
     "SearchHit",
