@@ -469,11 +469,19 @@ _STUDY_PROVENANCE_KEYS = {
 def study_dimensions_from_plan(plan: ExecutionPlan) -> StudyDimensions | None:
     """Decode and validate the study configuration executed by ``plan``."""
 
-    values = {key: value for key, value in plan.runtime_provenance if key.startswith("phase1.")}
-    if not values:
+    entries = tuple(
+        (key, value)
+        for key, value in plan.runtime_provenance
+        if key.startswith("phase1.")
+    )
+    if not entries:
         return None
-    if set(values) != _STUDY_PROVENANCE_KEYS:
+    if (
+        len(entries) != len(_STUDY_PROVENANCE_KEYS)
+        or {key for key, _value in entries} != _STUDY_PROVENANCE_KEYS
+    ):
         raise ValueError("execution plan requires a complete Phase 1 dimension manifest")
+    values = dict(entries)
     try:
         dimensions = StudyDimensions(
             ShapeClass(values["phase1.shape"]),

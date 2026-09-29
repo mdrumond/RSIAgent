@@ -383,3 +383,19 @@ def test_binding_rejects_n32_none_because_runtime_would_pad_it():
     )
     with pytest.raises(ValueError, match="vector alignment"):
         bind_study_dimensions(unpadded_n32, dimensions)
+
+
+def test_variant_rejects_duplicate_phase1_provenance_keys():
+    valid = variant()
+    duplicate = replace(
+        valid.request.plan,
+        runtime_provenance=(
+            *valid.request.plan.runtime_provenance,
+            ("phase1.parallelism", "1"),
+        ),
+    )
+    request = replace(valid.request, plan=duplicate)
+    correctness = replace(valid.correctness, execution_id=request.execution_id)
+
+    with pytest.raises(ValueError, match="complete Phase 1 dimension manifest"):
+        StudyVariant(request, correctness, valid.dimensions)
