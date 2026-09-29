@@ -16,6 +16,7 @@ from benchmarks.a5kernels.profiling import (
     StudyTimingSample,
     StudyVariant,
     bind_study_dimensions,
+    bind_profile_parallelism,
     bind_profile_device,
 )
 from tests.test_a5kernels_profiling import (
@@ -330,6 +331,119 @@ def test_phase1_variant_rejects_block_count_mismatched_with_parallelism():
 
     with pytest.raises(ValueError, match="typed parallelism"):
         StudyVariant(request, correctness, bound.dimensions)
+
+
+@pytest.mark.parametrize("encoded", ["0", "9", "06"])
+def test_profile_request_rejects_noncanonical_block_bindings(encoded):
+    plan = replace(
+        REQUEST.plan,
+        environment=REQUEST.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", encoded
+        ),
+    )
+    with pytest.raises(ValueError, match="invalid host-owned block binding"):
+        replace(REQUEST, plan=plan)
+@pytest.mark.parametrize(
+    "assignment",
+    ["A5KERNEL_BLOCK_NUM=0", "A5KERNEL_BLOCK_NUM=9", "A5KERNEL_BLOCK_NUM=06"],
+)
+def test_profile_request_rejects_noncanonical_block_bindings(assignment):
+    plan = replace(REQUEST.plan, argv=("env", assignment, *REQUEST.plan.argv))
+    with pytest.raises(ValueError, match="invalid host-owned block binding"):
+        replace(REQUEST, plan=plan)
+
+
+def test_registered_n400_align64_variant_uses_physical_448_inputs():
+    dimensions = StudyDimensions(
+        ShapeClass.N400,
+        PaddingClass.ALIGN_64,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.ONE,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                input_a=(*([1.0] * 400), *([0.0] * 48)),
+                input_b=(*([2.0] * 400), *([0.0] * 48)),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    request = replace(REQUEST, plan=plan)
+    correctness = replace(
+        CORRECT,
+        execution_id=request.execution_id,
+        source_fingerprint=request.source_fingerprint,
+    )
+
+    registered = StudyVariant(request, correctness, dimensions)
+
+    assert registered.dimensions.shape is ShapeClass.N400
+    assert len(registered.request.plan.input_a) == 448
+
+
+def test_registered_block_count_six_is_bound_to_variant_plan():
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_parallelism(
+            bind_profile_device(
+                replace(
+                    REQUEST.plan,
+                    input_a=tuple([1.0] * 64),
+                    input_b=tuple([2.0] * 64),
+                ),
+                REQUEST.device,
+            ),
+            ParallelismClass.SIX,
+        ),
+        dimensions,
+    )
+    request = replace(REQUEST, plan=plan)
+    correctness = replace(
+        CORRECT,
+        execution_id=request.execution_id,
+        source_fingerprint=request.source_fingerprint,
+    )
+
+    registered = StudyVariant(request, correctness, dimensions)
+
+    assert dict(registered.request.plan.environment.bindings)["A5KERNEL_BLOCK_NUM"] == "6"
+
+
+def test_variant_rejects_parallelism_without_matching_block_binding():
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    request = replace(REQUEST, plan=plan)
+    correctness = replace(
+        CORRECT,
+        execution_id=request.execution_id,
+        source_fingerprint=request.source_fingerprint,
+    )
+
+    with pytest.raises(ValueError, match="parallelism must match"):
+        StudyVariant(request, correctness, dimensions)
 
 
 def test_optimization_comparison_caps_variants_before_measurement():

@@ -1100,8 +1100,10 @@ def test_adapter_rejects_plan_bound_to_different_runtime_provenance():
     assert executor.invocations == []
 
 
-def test_adapter_applies_complete_typed_phase1_study_provenance():
-    parallelism = "1"
+@pytest.mark.parametrize(("parallelism", "plan_bound"), [("1", False), ("6", True)])
+def test_adapter_applies_complete_typed_phase1_study_provenance(
+    parallelism, plan_bound
+):
     runtime = (("catlass_revision", "1" * 40),)
     executor = FakeCommandExecutor(
         CommandResult(9, "expected dispatch failure"),
@@ -1115,6 +1117,8 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
     )
     plan = replace(
         plan,
+        argv=("env", f"A5KERNEL_BLOCK_NUM={parallelism}", *plan.argv)
+        if plan_bound else plan.argv,
         runtime_provenance=(
             *plan.runtime_provenance,
             ("phase1.shape", "n32"),
@@ -1128,7 +1132,9 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
 
     assert receipt.exit_code == 9
     assert len(executor.invocations) == 1
-    assert f"A5KERNEL_BLOCK_NUM={parallelism}" in executor.invocations[0].argv
+    assert executor.invocations[0].argv.count(
+        f"A5KERNEL_BLOCK_NUM={parallelism}"
+    ) == 1
 
 
 @pytest.mark.parametrize("binding", ["1", None])

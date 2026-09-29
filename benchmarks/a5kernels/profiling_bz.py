@@ -93,8 +93,25 @@ class BZProfileBackend:
             raise RuntimeError(
                 "canonical timing replay returned an invalid duration"
             ) from exc
-        evidence_sha256 = hashlib.sha256(completed.stdout.encode("utf-8")).hexdigest()
+        evidence_sha256 = self._retain_timing_evidence(
+            command.replay_id, completed.stdout
+        )
         return duration, evidence_sha256
+
+    def _retain_timing_evidence(self, replay_id: str, stdout: str) -> str:
+        data = stdout.encode("utf-8")
+        destination = self._evidence_directory / replay_id
+        destination.mkdir(parents=True, exist_ok=True)
+        path = destination / "timing-stdout.txt"
+        try:
+            with path.open("xb") as stream:
+                stream.write(data)
+        except FileExistsError:
+            if path.read_bytes() != data:
+                raise RuntimeError(
+                    "timing replay conflicts with retained evidence"
+                ) from None
+        return hashlib.sha256(data).hexdigest()
 
     def capture(self, command: CaptureCommand) -> ProfileCapture:
         request = command.request
@@ -154,9 +171,7 @@ class BZProfileBackend:
                 raise ValueError(
                     "profiling block count must match typed Phase 1 parallelism"
                 )
-            environment = environment.with_binding(
-                "A5KERNEL_BLOCK_NUM", block_num
-            )
+            environment = environment.with_binding("A5KERNEL_BLOCK_NUM", block_num)
         environment = environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(request.device)
         )

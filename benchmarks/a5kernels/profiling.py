@@ -443,6 +443,7 @@ class ShapeClass(str, Enum):
     N64 = "n64"
     N128 = "n128"
     N256 = "n256"
+    N400 = "n400"
 
 
 class PaddingClass(str, Enum):
@@ -459,12 +460,39 @@ class AccessClass(str, Enum):
 
 class ParallelismClass(int, Enum):
     ONE = 1
+    TWO = 2
+    THREE = 3
+    FOUR = 4
+    FIVE = 5
+    SIX = 6
+    SEVEN = 7
+    EIGHT = 8
 
 
 class MetricDomain(str, Enum):
     TIMING = "timing"
     BASIC_INFO = "basic-info"
     PIPE_UTILIZATION = "pipe-utilization"
+
+
+def bind_profile_parallelism(
+    plan: ExecutionPlan, parallelism: ParallelismClass
+) -> ExecutionPlan:
+    """Bind one canonical host-owned A5 block count into an execution plan."""
+
+    if not isinstance(plan, ExecutionPlan):
+        raise TypeError("plan must be an ExecutionPlan")
+    if not isinstance(parallelism, ParallelismClass):
+        raise ValueError("parallelism must be a host-owned ParallelismClass")
+    assert plan.argv is not None
+    if any(argument.startswith("A5KERNEL_BLOCK_NUM=") for argument in plan.argv):
+        raise ValueError("execution plan already contains a block binding")
+    assignment = f"A5KERNEL_BLOCK_NUM={parallelism.value}"
+    if plan.argv and plan.argv[0] == "env":
+        argv = ("env", assignment, *plan.argv[1:])
+    else:
+        argv = ("env", assignment, *plan.argv)
+    return replace(plan, argv=argv)
 
 
 @dataclass(frozen=True)
@@ -622,6 +650,18 @@ class StudyVariant:
         if study_dimensions_from_plan(self.request.plan) != self.dimensions:
             raise ValueError(
                 "study dimensions must match the host-owned execution-plan provenance"
+            )
+        block_environment = tuple(
+            argument
+            for argument in self.request.plan.argv or ()
+            if argument.startswith("A5KERNEL_BLOCK_NUM=")
+        )
+        expected_block = f"A5KERNEL_BLOCK_NUM={self.dimensions.parallelism.value}"
+        if block_environment not in ((), (expected_block,)) or (
+            not block_environment and self.dimensions.parallelism is not ParallelismClass.ONE
+        ):
+            raise ValueError(
+                "study parallelism must match the canonical execution-plan block binding"
             )
 
     @property

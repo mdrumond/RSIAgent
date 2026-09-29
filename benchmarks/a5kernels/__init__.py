@@ -51,12 +51,14 @@ from benchmarks.a5kernels.profiling import (
     StudyVariant,
     TimingStudyResult,
     bind_study_dimensions,
+    bind_profile_parallelism,
     bind_profile_device,
     study_dimensions_from_plan,
     ProfileRequest,
     ProfilingTreatmentController,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
 from benchmarks.a5kernels.trial import (
     ActorOutcome,
@@ -133,6 +135,7 @@ __all__ = [
     "ParallelismClass",
     "Phase1PerformanceStudy",
     "Phase1ProjectRuntime",
+    "Phase1PerformanceExecution",
     "Phase1StudyBackend",
     "Phase1StudyResult",
     "ProfileCommandExecutor",
@@ -158,6 +161,7 @@ __all__ = [
     "StudyVariant",
     "TimingStudyResult",
     "bind_study_dimensions",
+    "bind_profile_parallelism",
     "bind_profile_device",
     "study_dimensions_from_plan",
     "TrialAction",

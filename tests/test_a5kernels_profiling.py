@@ -17,8 +17,16 @@ from benchmarks.a5kernels.profiling import (
     ProfileMetric,
     ProfileRequest,
     ProfilingTreatmentController,
+    AccessClass,
+    PaddingClass,
+    ParallelismClass,
+    ShapeClass,
+    StudyDimensions,
     TimingCommand,
     TimingResult,
+    bind_profile_device,
+    bind_profile_parallelism,
+    bind_study_dimensions,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest
@@ -612,6 +620,9 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     assert sample.evidence_sha256 == hashlib.sha256(
         b"A5KERNEL_TIMING_US=7.5\n"
     ).hexdigest()
+    assert (
+        tmp_path / "phase1-sample" / "timing-stdout.txt"
+    ).read_bytes() == b"A5KERNEL_TIMING_US=7.5\n"
     assert result.pipe_utilization
     assert all(
         key.startswith("PipeUtilization.csv.gz:")
@@ -721,6 +732,96 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         call[call.index("--operation") + 1].startswith("profile-")
         for call in profile_calls
     )
+
+
+def test_concrete_backend_rejects_divergent_reuse_of_timing_replay(tmp_path: Path) -> None:
+    outputs = iter(("A5KERNEL_TIMING_US=7.5\n", "A5KERNEL_TIMING_US=8.0\n"))
+
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, next(outputs), "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+    command = TimingCommand(CampaignKind.FINAL, request, "study-replay")
+
+    backend.time_sample(command)
+    with pytest.raises(RuntimeError, match="conflicts with retained evidence"):
+        backend.time_sample(command)
+
+
+def test_concrete_backend_preserves_one_registered_block_six_binding(tmp_path: Path) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(argv, 0, "A5KERNEL_TIMING_US=7.5\n", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    provenance = (
+        ("ascendnpu_ir_gitlink", "gitlink"),
+        ("ascendnpu_ir_install_commit", "install"),
+        ("bridge_sha256", "bridge"),
+        ("cann_version", "9.1"),
+        ("catlass_revision", "revision"),
+        ("catlass_source", "/remote/catlass"),
+        ("execution_profile", "bz-a5"),
+        ("manifest_sha256", "manifest"),
+    )
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_parallelism(
+            bind_profile_device(
+                replace(
+                    PLAN,
+                    argv=("python", "kernel.py", "input.json"),
+                    input_a=tuple([1.0] * 64),
+                    input_b=tuple([2.0] * 64),
+                    runtime_provenance=provenance,
+                ),
+                REQUEST.device,
+            ),
+            ParallelismClass.SIX,
+        ),
+        dimensions,
+    )
+    request = replace(REQUEST, plan=plan)
+
+    backend.time_sample(TimingCommand(CampaignKind.FINAL, request, "study-block-six"))
+
+    workload = calls[0][calls[0].index("--") + 1 :]
+    assert workload.count("A5KERNEL_BLOCK_NUM=6") == 1
 
 
 def test_concrete_backend_rejects_relative_remote_tree(tmp_path: Path) -> None:
