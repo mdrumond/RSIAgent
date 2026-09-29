@@ -67,6 +67,17 @@ class ProfileRequest:
             raise ValueError(
                 "profile device must match the canonical device bound in plan argv"
             )
+        reserved_timing = (
+            "A5KERNEL_EMIT_TIMING=",
+            "A5KERNEL_WARM_UP=",
+            "A5KERNEL_LAUNCH_COUNT=",
+            "A5KERNEL_BLOCK_NUM=",
+        )
+        if any(
+            argument.startswith(reserved_timing)
+            for argument in self.plan.argv
+        ):
+            raise ValueError("plan argv must not override host-owned timing policy")
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -666,6 +677,7 @@ class Phase1PerformanceStudy:
     TIMING_WARM_UP = 5
     TIMING_LAUNCH_COUNT = 20
     TIMING_SAMPLES = 3
+    MAX_OPTIMIZATION_VARIANTS = 8
 
     def __init__(
         self,
@@ -690,6 +702,14 @@ class Phase1PerformanceStudy:
             raise ValueError(f"{preset.value} requires exactly one variant")
         if preset is StudyPreset.OPTIMIZATION_COMPARISON and len(variants) < 2:
             raise ValueError("optimization-comparison requires at least two variants")
+        if (
+            preset is StudyPreset.OPTIMIZATION_COMPARISON
+            and len(variants) > self.MAX_OPTIMIZATION_VARIANTS
+        ):
+            raise ValueError(
+                "optimization-comparison accepts at most "
+                f"{self.MAX_OPTIMIZATION_VARIANTS} variants"
+            )
         if len({item.variant_id for item in variants}) != len(variants):
             raise ValueError("study variants must have distinct exact identities")
         if preset is StudyPreset.OPTIMIZATION_COMPARISON:

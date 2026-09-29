@@ -269,6 +269,34 @@ def test_phase1_variant_rejects_missing_plan_device_binding():
         StudyVariant(request, correctness, bound.dimensions)
 
 
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "A5KERNEL_EMIT_TIMING=0",
+        "A5KERNEL_WARM_UP=0",
+        "A5KERNEL_LAUNCH_COUNT=1",
+        "A5KERNEL_BLOCK_NUM=1",
+    ],
+)
+def test_profile_request_rejects_plan_timing_policy_overrides(assignment):
+    plan = replace(REQUEST.plan, argv=("env", assignment, *REQUEST.plan.argv))
+    with pytest.raises(ValueError, match="host-owned timing policy"):
+        replace(REQUEST, plan=plan)
+
+
+def test_optimization_comparison_caps_variants_before_measurement():
+    backend = FakeStudyBackend()
+    variants = [
+        variant(attempt=f"variant-{index}", revision=f"revision-{index}")
+        for index in range(9)
+    ]
+    with pytest.raises(ValueError, match="at most 8 variants"):
+        Phase1PerformanceStudy(backend).run(
+            StudyPreset.OPTIMIZATION_COMPARISON, variants
+        )
+    assert backend.commands == []
+
+
 def test_variant_rejects_dimensions_not_bound_to_execution_plan():
     bound = variant()
     with pytest.raises(ValueError, match="execution-plan provenance"):
