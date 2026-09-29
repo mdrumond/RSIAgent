@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import benchmarks.a5kernels.phase1_memory as phase1_memory
 from benchmarks.a5kernels.knowledge_agent import Citation
 from benchmarks.a5kernels.phase1_memory import (
     AgentInterpretation,
@@ -123,6 +124,21 @@ def test_resume_rejects_other_plan_even_with_shared_first_project(tmp_path):
         Phase1LearningJournal(path, different_plan).read()
 
 
+def test_resume_rejects_derived_plan_drift_with_same_proposals(tmp_path, monkeypatch):
+    path = tmp_path / "learning.jsonl"
+    Phase1LearningJournal(path, DEFAULT_PROPOSALS).append(memory(1))
+    original = phase1_memory.dry_run_plan
+
+    def changed_plan(proposals):
+        plan = original(proposals)
+        plan["projects"][0]["coverage"] = ["derived-plan-drift"]
+        return plan
+
+    monkeypatch.setattr(phase1_memory, "dry_run_plan", changed_plan)
+    with pytest.raises(ValueError, match="failed resume validation"):
+        Phase1LearningJournal(path, DEFAULT_PROPOSALS).read()
+
+
 def test_resume_ignores_torn_tail_and_next_append_recovers_framing(tmp_path):
     path = tmp_path / "learning.jsonl"
     journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
@@ -168,3 +184,24 @@ def test_host_fact_requires_named_host_evidence(fact, error):
 def test_project_memory_cannot_exist_without_host_fact():
     with pytest.raises(ValueError, match="host fact"):
         Phase1ProjectMemory(DEFAULT_PROPOSALS[0], "source", (), ())
+
+
+@pytest.mark.parametrize("supports", [[EVIDENCE], EVIDENCE, {EVIDENCE: True}])
+def test_interpretation_supports_requires_exact_tuple(supports):
+    with pytest.raises(TypeError, match="must be a tuple"):
+        AgentInterpretation("Interpretation", supports)
+
+
+@pytest.mark.parametrize("supports", [EVIDENCE, {EVIDENCE: True}])
+def test_durable_interpretation_supports_requires_json_array(tmp_path, supports):
+    path = tmp_path / "learning.jsonl"
+    journal = Phase1LearningJournal(path, DEFAULT_PROPOSALS)
+    journal.append(memory(1))
+    entry = json.loads(path.read_text())
+    entry["memory"]["agent_interpretations"][0]["supports"] = supports
+    payload = {key: value for key, value in entry.items() if key != "entry_sha256"}
+    entry["entry_sha256"] = phase1_memory._digest(payload)
+    path.write_text(json.dumps(entry) + "\n")
+
+    with pytest.raises(ValueError, match="invalid Phase 1 project memory payload"):
+        journal.read()

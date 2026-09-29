@@ -61,6 +61,8 @@ class AgentInterpretation:
     def __post_init__(self) -> None:
         if not isinstance(self.statement, str) or not self.statement.strip():
             raise ValueError("agent interpretation must be non-empty")
+        if type(self.supports) is not tuple:
+            raise TypeError("interpretation supports must be a tuple")
         if any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in self.supports):
             raise ValueError("interpretation supports must be evidence SHA-256 values")
 
@@ -133,14 +135,25 @@ class Phase1ProjectMemory:
                 actions, facts, interpretations, citations
             )):
                 raise TypeError("project memory collections must be JSON arrays")
+            if any(
+                not isinstance(item, Mapping)
+                or set(item) != {"statement", "supports"}
+                or not isinstance(item["supports"], list)
+                for item in interpretations
+            ):
+                raise TypeError("interpretation supports must be a JSON array")
             return cls(
                 proposal=CurriculumProposal.from_mapping(value["proposal"]),
                 source_revision=value["source_revision"],
                 actions=tuple(actions),
                 host_facts=tuple(HostFact(**item) for item in facts),
-                interpretations=tuple(AgentInterpretation(
-                    statement=item["statement"], supports=tuple(item["supports"])
-                ) for item in interpretations),
+                interpretations=tuple(
+                    AgentInterpretation(
+                        statement=item["statement"],
+                        supports=tuple(item["supports"]),
+                    )
+                    for item in interpretations
+                ),
                 kdb_citations=tuple(Citation(**item) for item in citations),
             )
         except (KeyError, TypeError, ValueError) as exc:
@@ -171,9 +184,7 @@ class Phase1LearningJournal:
             })
             for item in plan["projects"]
         )
-        self.plan_fingerprint = _digest(
-            [proposal.as_dict() for proposal in self.proposals]
-        )
+        self.plan_fingerprint = _digest(plan)
 
     def append(self, memory: Phase1ProjectMemory) -> Mapping[str, object]:
         if not isinstance(memory, Phase1ProjectMemory):
