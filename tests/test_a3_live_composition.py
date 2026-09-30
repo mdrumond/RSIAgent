@@ -31,8 +31,7 @@ def config(tmp_path):
     corpus = tmp_path / "corpus"; corpus.mkdir()
     database = tmp_path / "kdb.sqlite"; database.write_bytes(b"db")
     manifest = tmp_path / "manifest.json"; manifest.write_text("{}")
-    driver = tmp_path / "a3_profile_driver.py"; driver.write_text("# a3 fixed\n")
-    return Phase1Config(tmp_path / "state", wrapper, embedding, corpus, database, manifest, driver)
+    return Phase1Config(tmp_path / "state", wrapper, embedding, corpus, database, manifest)
 
 
 class FakeCandidate:
