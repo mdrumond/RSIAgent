@@ -137,7 +137,7 @@ def test_profile_driver_asset_has_explicit_bytes_and_digest_contract():
 
 
 def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, capsys):
-    _candidate_directory(tmp_path, length=4, block_count=1)
+    _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
     def process(argv, **kwargs):
         calls.append((tuple(argv), kwargs))
@@ -145,7 +145,7 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
         return subprocess.CompletedProcess(
             argv, 0,
             "A3INNER_TIMING_US=2.000000\nA3INNER_TIMING_US=4.000000\n"
-            "A3KERNEL_OUTPUT=[3,3,3,3]\n", "",
+            "A3KERNEL_OUTPUT=[3,3,3,3,0,0]\n", "",
         )
 
     result = a3_profile_driver.main(
@@ -161,11 +161,13 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
     )
     assert "A3TIMING_US=2.000000" in output
     assert "A3TIMING_US=4.000000" in output
+    staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
+    assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 3)
 
 
 @pytest.mark.parametrize("metric", ["Basic", "PipeUtilization"])
 def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
-    _candidate_directory(tmp_path, length=4, block_count=1)
+    _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
 
     def process(argv, **kwargs):
@@ -178,7 +180,7 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
                 "Op Name,Duration(us),Raw Counter\nvector_add,12.5,7\n"
             )
             return subprocess.CompletedProcess(argv, 0, "", "")
-        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
+        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3,0,0]\n", "")
 
     assert a3_profile_driver.main(
         ["profile", *_driver_args(tmp_path, block_count=4), "--metric", metric, "--kernel", "vector_add"],
@@ -210,7 +212,8 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
     assert f"--aic-metrics={metric}" in profile
     application = next(item.split("=", 1)[1] for item in profile if item.startswith("--application="))
     assert "host_driver.py --mode replay --warm-up 0 --launch-count 1 .a3-profile-input.json" in application
-    assert json.loads((tmp_path / ".a3-profile-input.json").read_text())["block_count"] == 4
+    staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
+    assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)
 
 
 def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):
@@ -228,12 +231,16 @@ def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_
         )
 
 
-def _candidate_directory(root: Path, *, length: int, block_count: int) -> None:
+def _candidate_directory(
+    root: Path, *, length: int, block_count: int, padded_length: int | None = None,
+) -> None:
+    padded = padded_length or length
+    padding = [0] * (padded - length)
     for name in ("host_driver.py", "input.json", "a3_candidate.so"):
         (root / name).write_text("{}" if name == "input.json" else "staged")
     (root / "input.json").write_text(json.dumps({
-        "input_a": [1] * length, "input_b": [2] * length,
-        "logical_length": length, "padded_length": length, "block_count": block_count,
+        "input_a": [1] * length + padding, "input_b": [2] * length + padding,
+        "logical_length": length, "padded_length": padded, "block_count": block_count,
     }))
 
 

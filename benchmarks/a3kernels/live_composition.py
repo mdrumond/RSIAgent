@@ -284,25 +284,18 @@ class RemoteCandidateBundle:
         self.planner = A3CandidateBackend(lambda *args, **kwargs: None)
         self.results: dict[str, VerifiedResult | FailedEvidence] = {}
         self.plans = {}
+        self.compilations: dict[str, CandidateCompilation] = {}
 
     def _plan(self, source, options):
         return self.planner.plan(source, **options)
 
     def compile(self, source, workdir, **options):
         plan = self._plan(source, options)
-        result = self.backend.run(plan, workdir)
-        if isinstance(result, FailedEvidence):
-            return result
-        self.results[plan.execution_id] = result
-        self.plans[plan.execution_id] = plan
-        body = {
-            "plan": plan, "library_sha256": self.backend.library_sha256(plan),
-            "stdout": "retained by managed GZ-A3 evidence", "stderr": "",
-        }
-        return CandidateCompilation(
-            plan, body["library_sha256"], body["stdout"], "",
-            canonical_digest(body),
-        )
+        result = self.backend.compile(plan, workdir)
+        if isinstance(result, CandidateCompilation):
+            self.compilations[plan.execution_id] = result
+            self.plans[plan.execution_id] = plan
+        return result
 
     def run(self, source, workdir, **options):
         plan = self._plan(source, options)
@@ -315,8 +308,10 @@ class RemoteCandidateBundle:
                 and retained_plan.input_a == plan.input_a
                 and retained_plan.input_b == plan.input_b
             ):
-                return self.results[execution_id]
-        return self.backend.run(plan, workdir)
+                result = self.backend.execute(self.compilations[execution_id])
+                self.results[execution_id] = result
+                return result
+        raise ValueError("successful compile is required before managed execution")
 
 
 class _LazyGZProfiler:
@@ -382,6 +377,7 @@ def managed_live_dependencies(
             client=client, server=server,
             validation_wrapper=str(config.validation_wrapper), remote=remote,
             remote_workspace=remote_workspace, physical_device=physical_device,
+            state_directory=_paths.root / "remote-candidate-state" / _proposal.project_id,
         ))
 
     def profiler_factory(_cell, _proposal, paths, candidate):

@@ -6,7 +6,10 @@ from pathlib import Path
 import subprocess
 import tarfile
 
+import pytest
+
 from benchmarks.a3kernels.candidate import A3CandidateBackend
+from benchmarks.a3kernels.candidate import CandidateCompilation
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
 
@@ -60,27 +63,33 @@ def test_remote_vertical_flow_health_upload_poll_wrapper_and_verify(tmp_path):
             return _completed(argv, '{"id":"upload-7","status":"queued"}')
         if "transfer" in argv and "status" in argv:
             return _completed(argv, '{"id":"upload-7","status":"succeeded"}')
-        plan = _plan()
+        plan = _plan(); executing = "a3-execute-" in " ".join(argv)
         output = [a + b for a, b in zip(plan.input_a, plan.input_b)]
-        stdout = "\n".join((
-            "A3REMOTE_STAGE=compile", "A3CANDIDATE_COMPILED=" + "a" * 64,
-            "A3REMOTE_STAGE=execute", "A3KERNEL_OUTPUT=" + json.dumps(output),
+        body = (
+            ("A3REMOTE_STAGE=execute", "A3KERNEL_OUTPUT=" + json.dumps(output))
+            if executing else
+            ("A3REMOTE_STAGE=compile", "A3CANDIDATE_COMPILED=" + "a" * 64)
+        )
+        stdout = "\n".join((*body,
             "CATLASS_VALIDATION_PROFILE=gz-a3",
             "CATLASS_VALIDATION_STATE=completed",
-            "CATLASS_VALIDATION_HANDLE=gz-a3:job-9",
+            "CATLASS_VALIDATION_HANDLE=" + ("gz-a3:run-9" if executing else "gz-a3:compile-9"),
             "CATLASS_VALIDATION_EXIT=0", "",
         ))
         return _completed(argv, stdout)
 
-    result = _backend(tmp_path, process).run(_plan(), tmp_path / "local")
+    backend = _backend(tmp_path, process)
+    compilation = backend.compile(_plan(), tmp_path / "local")
+    assert isinstance(compilation, CandidateCompilation)
+    result = backend.execute(compilation)
 
     assert isinstance(result, VerifiedResult) and result.passed
-    assert result.job_handle == "gz-a3:job-9"
+    assert result.job_handle == "gz-a3:run-9"
     upload = calls[0][0]
     assert upload[:4] == ("/checked/remote_agent_client.sh", "--server", "http://127.0.0.1:37787", "transfer")
     assert upload[4:7] == ("upload", "--remote", "a3-gz")
     assert calls[1][0][-2:] == ("--job-id", "upload-7")
-    wrapper = calls[2][0]
+    wrapper, execute = calls[2][0], calls[3][0]
     assert wrapper[:8] == (
         "/checked/catlass-validation.sh", "--profile", "gz-a3", "--operation",
         "a3-candidate-" + _plan().execution_id[:16], "run", "--native", "--runtime",
@@ -89,6 +98,8 @@ def test_remote_vertical_flow_health_upload_poll_wrapper_and_verify(tmp_path):
     bash = wrapper.index("bash")
     assert wrapper[bash:bash + 2] == ("bash", "-c")
     assert str(_backend(tmp_path, process).remote_candidate_directory(_plan())) in wrapper
+    assert "a3-execute-" + _plan().execution_id[:16] in execute
+    assert "host_driver.py input.json" in execute[execute.index("bash") + 2]
 
 
 def test_listener_gate_fails_closed_before_upload(tmp_path):
@@ -98,7 +109,7 @@ def test_listener_gate_fails_closed_before_upload(tmp_path):
         health=lambda: _health(transport="paramiko"),
     )
 
-    result = backend.run(_plan(), tmp_path / "local")
+    result = backend.compile(_plan(), tmp_path / "local")
 
     assert isinstance(result, FailedEvidence)
     assert result.stage == "prepare" and "asyncssh" in result.detail
@@ -109,7 +120,7 @@ def test_failed_transfer_and_remote_compile_are_structured(tmp_path):
     def transfer_failure(argv, **kwargs):
         return _completed(argv, "", "upload unavailable", 2)
 
-    upload = _backend(tmp_path / "upload", transfer_failure).run(
+    upload = _backend(tmp_path / "upload", transfer_failure).compile(
         _plan(), tmp_path / "upload" / "local"
     )
     assert isinstance(upload, FailedEvidence) and upload.stage == "prepare"
@@ -126,11 +137,79 @@ def test_failed_transfer_and_remote_compile_are_structured(tmp_path):
             "CATLASS_VALIDATION_EXIT=2\n", "bisheng error", 2,
         )
 
-    failed = _backend(tmp_path / "compile", compile_failure).run(
+    failed = _backend(tmp_path / "compile", compile_failure).compile(
         _plan(), tmp_path / "compile" / "local"
     )
     assert isinstance(failed, FailedEvidence)
     assert failed.stage == "compile" and "bisheng error" in failed.detail
+
+
+def test_execute_failure_is_runtime_evidence_and_does_not_reupload(tmp_path):
+    calls = []
+    def process(argv, **kwargs):
+        calls.append(tuple(argv))
+        if "upload" in argv: return _completed(argv, '{"id":"u1","status":"queued"}')
+        if "status" in argv: return _completed(argv, '{"id":"u1","status":"succeeded"}')
+        if "a3-candidate-" in " ".join(argv):
+            return _completed(argv, "A3REMOTE_STAGE=compile\nA3CANDIDATE_COMPILED=" + "a" * 64 + "\nCATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_HANDLE=gz-a3:c\nCATLASS_VALIDATION_EXIT=0")
+        return _completed(argv, "A3REMOTE_STAGE=execute\nCATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=failed\nCATLASS_VALIDATION_HANDLE=gz-a3:r\nCATLASS_VALIDATION_EXIT=2", "runtime failed", 2)
+    backend = _backend(tmp_path, process)
+    compilation = backend.compile(_plan(), tmp_path / "local")
+    result = backend.execute(compilation)
+    assert isinstance(result, FailedEvidence) and result.stage == "execute"
+    assert sum("upload" in call for call in calls) == 1
+
+
+def test_compile_observer_loss_reopens_same_handle_without_reupload(tmp_path):
+    calls = []
+    observations = 0
+    def process(argv, **kwargs):
+        nonlocal observations
+        calls.append(tuple(argv))
+        if "upload" in argv: return _completed(argv, '{"id":"u1","status":"queued"}')
+        if "status" in argv: return _completed(argv, '{"id":"u1","status":"succeeded"}')
+        if "observe" in argv:
+            observations += 1
+            if observations == 1:
+                return _completed(argv, "", "listener temporarily unavailable", 2)
+            return _completed(argv, "A3REMOTE_STAGE=compile\nA3CANDIDATE_COMPILED=" + "a" * 64 + "\nCATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_HANDLE=gz-a3:compile-pending\nCATLASS_VALIDATION_EXIT=0")
+        return _completed(argv, "CATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=observation-unavailable\nCATLASS_VALIDATION_HANDLE=gz-a3:compile-pending\nCATLASS_VALIDATION_EXIT=1", "observer lost", 1)
+
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
+    compilation = _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
+
+    assert isinstance(compilation, CandidateCompilation)
+    assert sum("upload" in call for call in calls) == 1
+    assert calls[-1][-3:] == ("observe", "--handle", "gz-a3:compile-pending")
+
+
+def test_execute_observer_loss_reopens_same_handle_without_resubmission(tmp_path):
+    calls = []
+    plan = _plan()
+    output = json.dumps([a + b for a, b in zip(plan.input_a, plan.input_b)])
+    def process(argv, **kwargs):
+        calls.append(tuple(argv))
+        if "upload" in argv: return _completed(argv, '{"id":"u1","status":"queued"}')
+        if "status" in argv: return _completed(argv, '{"id":"u1","status":"succeeded"}')
+        if "a3-candidate-" in " ".join(argv):
+            return _completed(argv, "A3REMOTE_STAGE=compile\nA3CANDIDATE_COMPILED=" + "b" * 64 + "\nCATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_HANDLE=gz-a3:compile\nCATLASS_VALIDATION_EXIT=0")
+        if "observe" in argv:
+            return _completed(argv, "A3REMOTE_STAGE=execute\nA3KERNEL_OUTPUT=" + output + "\nCATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_HANDLE=gz-a3:execute-pending\nCATLASS_VALIDATION_EXIT=0")
+        return _completed(argv, "CATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=observation-unavailable\nCATLASS_VALIDATION_HANDLE=gz-a3:execute-pending\nCATLASS_VALIDATION_EXIT=1", "observer lost", 1)
+
+    first = _backend(tmp_path, process)
+    compilation = first.compile(plan, tmp_path / "local")
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        first.execute(compilation)
+    result = _backend(tmp_path, process).execute(compilation)
+
+    assert isinstance(result, VerifiedResult) and result.passed
+    execute_submissions = [call for call in calls if "a3-execute-" in " ".join(call) and "run" in call]
+    assert len(execute_submissions) == 1
+    assert calls[-1][-3:] == ("observe", "--handle", "gz-a3:execute-pending")
 
 
 def _backend(tmp_path: Path, process, *, health=_health):
@@ -141,6 +220,7 @@ def _backend(tmp_path: Path, process, *, health=_health):
         remote="a3-gz", remote_workspace="/data2/research",
         physical_device=2, health_reader=health, process_runner=process,
         poll_interval=0, sleeper=lambda _: None,
+        state_directory=tmp_path / "state",
     )
 
 

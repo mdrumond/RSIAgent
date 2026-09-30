@@ -195,16 +195,19 @@ def test_deepseek_actor_uses_native_pinned_route_without_exposing_secret():
 
 def test_remote_bundle_compile_then_run_reuses_one_managed_execution(tmp_path):
     class Managed:
-        def __init__(self): self.calls = 0; self.libraries = {}
-        def run(self, plan, workdir):
-            self.calls += 1
-            self.libraries[plan.execution_id] = "3" * 64
+        def __init__(self): self.compile_calls = self.execute_calls = 0
+        def compile(self, plan, workdir):
+            self.compile_calls += 1
+            body = {"plan": plan, "library_sha256": "3" * 64, "stdout": "", "stderr": ""}
+            return CandidateCompilation(plan, "3" * 64, "", "", attest(body))
+        def execute(self, compilation):
+            self.execute_calls += 1
+            plan = compilation.plan
             output = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
             return VerifiedResult.from_receipt(
                 plan, ExecutionReceipt(0, output, job_handle="gz-a3:managed"),
                 max_abs_error=0.0,
             )
-        def library_sha256(self, plan): return self.libraries[plan.execution_id]
     managed = Managed(); bundle = RemoteCandidateBundle(managed)
     options = dict(request_id="cell", project_id="project", length=32,
                    padded_length=64, block_count=1, seed=0)
@@ -214,21 +217,22 @@ def test_remote_bundle_compile_then_run_reuses_one_managed_execution(tmp_path):
     assert isinstance(verified, VerifiedResult) and verified.passed
     assert verified.execution_id == compiled.plan.execution_id
     assert verified.attempt_id == "turn-2"
-    assert managed.calls == 1
+    assert (managed.compile_calls, managed.execute_calls) == (1, 1)
 
 
 def test_profile_uses_exact_retained_compile_binding_and_directory(tmp_path, monkeypatch):
     import benchmarks.a3kernels.live_composition as live
     class Managed:
-        def __init__(self): self.library = {}
-        def run(self, plan, workdir):
-            self.library[plan.execution_id] = "4" * 64
+        def compile(self, plan, workdir):
+            body = {"plan": plan, "library_sha256": "4" * 64, "stdout": "", "stderr": ""}
+            return CandidateCompilation(plan, "4" * 64, "", "", attest(body))
+        def execute(self, compilation):
+            plan = compilation.plan
             output = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
             return VerifiedResult.from_receipt(
                 plan, ExecutionReceipt(0, output, job_handle="gz-a3:exact"),
                 max_abs_error=0.0,
             )
-        def library_sha256(self, plan): return self.library[plan.execution_id]
         def remote_candidate_directory(self, plan):
             return PurePosixPath("/remote/candidates") / plan.execution_id
     managed = Managed()

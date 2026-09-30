@@ -7,16 +7,19 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tarfile
+import tempfile
 import time
 from typing import Callable, Mapping
 import urllib.parse
 import urllib.request
 
-from .phase1_protocol import ExecutionPlan, ExecutionReceipt, FailedEvidence, VerifiedResult
+from .candidate import CandidateCompilation
+from .phase1_protocol import ExecutionPlan, ExecutionReceipt, FailedEvidence, VerifiedResult, attest
 
 
 @dataclass(frozen=True)
@@ -26,7 +29,11 @@ class CandidateBundle:
     execution_id: str
 
 
-_REMOTE_SCRIPT = r'''set -eu
+class _PendingObservation(RuntimeError):
+    pass
+
+
+_COMPILE_SCRIPT = r'''set -eu
 archive=$1
 destination=$2
 expected_archive=$3
@@ -45,6 +52,15 @@ python -c 'import hashlib,json,os,sys; root=sys.argv[1]; p=json.load(open(os.pat
 cd "$destination"
 printf 'A3REMOTE_STAGE=compile\n'
 python host_driver.py --compile-only
+'''
+
+_EXECUTE_SCRIPT = r'''set -eu
+destination=$1
+execution_id=$2
+source_fingerprint=$3
+library_sha256=$4
+python -c 'import hashlib,json,os,sys; root=sys.argv[1]; p=json.load(open(os.path.join(root,"manifest.json"))); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]; assert all(hashlib.sha256(open(os.path.join(root,n),"rb").read()).hexdigest() == h for n,h in p["files"].items()); assert hashlib.sha256(open(os.path.join(root,"a3_candidate.so"),"rb").read()).hexdigest() == sys.argv[4]' "$destination" "$execution_id" "$source_fingerprint" "$library_sha256"
+cd "$destination"
 printf 'A3REMOTE_STAGE=execute\n'
 python host_driver.py input.json
 '''
@@ -58,6 +74,7 @@ class GZA3RemoteCandidateBackend:
         process_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         sleeper: Callable[[float], None] = time.sleep, poll_interval: float = 1,
         timeout: int = 1200, max_polls: int = 1200,
+        state_directory: Path | None = None,
     ) -> None:
         parsed = urllib.parse.urlparse(server)
         if parsed.scheme != "http" or parsed.hostname != "127.0.0.1":
@@ -83,7 +100,7 @@ class GZA3RemoteCandidateBackend:
         self._poll_interval = poll_interval
         self._timeout = timeout
         self._max_polls = max_polls
-        self._libraries: dict[str, str] = {}
+        self._state_root = state_directory.resolve() if state_directory is not None else None
 
     def build_bundle(self, plan: ExecutionPlan, destination: Path) -> CandidateBundle:
         if not isinstance(plan, ExecutionPlan):
@@ -120,39 +137,88 @@ class GZA3RemoteCandidateBackend:
             destination, hashlib.sha256(destination.read_bytes()).hexdigest(), plan.execution_id
         )
 
-    def run(self, plan: ExecutionPlan, local_directory: Path) -> VerifiedResult | FailedEvidence:
+    def compile(
+        self, plan: ExecutionPlan, local_directory: Path
+    ) -> CandidateCompilation | FailedEvidence:
+        self._bind_state_root(local_directory)
+        pending = self._load_pending(plan, "compile")
+        if pending is None:
+            try:
+                self._require_listener()
+                bundle = self.build_bundle(plan, local_directory / f"{plan.execution_id}.tar")
+                remote_archive = (
+                    self._workspace / ".rsi-a3" / "uploads" / f"{plan.execution_id}.tar"
+                )
+                remote_directory = self.remote_candidate_directory(plan)
+                transfer_id = self._upload(bundle.path, remote_archive)
+                self._poll_transfer(transfer_id)
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                return FailedEvidence.create(
+                    plan, stage="prepare", error_type=type(exc).__name__, detail=str(exc)
+                )
+            argv = self._compile_argv(plan, bundle, remote_archive, remote_directory)
+        else:
+            argv = self._observe_argv(plan, "compile", pending["handle"])
         try:
-            self._require_listener()
-            bundle = self.build_bundle(plan, local_directory / f"{plan.execution_id}.tar")
-            remote_archive = (
-                self._workspace / ".rsi-a3" / "uploads" / f"{plan.execution_id}.tar"
-            )
-            remote_directory = self.remote_candidate_directory(plan)
-            transfer_id = self._upload(bundle.path, remote_archive)
-            self._poll_transfer(transfer_id)
-        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            completed = self._run_operation(plan, "compile", argv, pending)
+        except _PendingObservation:
+            raise
+        except RuntimeError as exc:
             return FailedEvidence.create(
-                plan, stage="prepare", error_type=type(exc).__name__, detail=str(exc)
+                plan, stage="compile", error_type="RuntimeError", detail=str(exc)
             )
-        argv = self._wrapper_argv(plan, bundle, remote_archive, remote_directory)
+        if completed.returncode != 0:
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="RemoteExecutionError",
+                detail=(completed.stderr or completed.stdout or "remote execution failed").strip(),
+            )
         try:
-            completed = self._call(argv)
+            self._validate_wrapper(completed.stdout)
+            libraries = self._markers(completed.stdout, "A3CANDIDATE_COMPILED=")
+            if len(libraries) != 1 or re.fullmatch(r"[0-9a-f]{64}", libraries[0]) is None:
+                raise ValueError("remote compile marker is invalid")
+        except ValueError as exc:
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="CompileOutputError", detail=str(exc)
+            )
+        body = {
+            "plan": plan, "library_sha256": libraries[0],
+            "stdout": completed.stdout, "stderr": completed.stderr,
+        }
+        result = CandidateCompilation(
+            plan, libraries[0], completed.stdout, completed.stderr, attest(body)
+        )
+        self._pending_path(plan, "compile").unlink(missing_ok=True)
+        return result
+
+    def execute(
+        self, compilation: CandidateCompilation
+    ) -> VerifiedResult | FailedEvidence:
+        if not isinstance(compilation, CandidateCompilation):
+            raise TypeError("execute requires a CandidateCompilation")
+        plan = compilation.plan
+        directory = self.remote_candidate_directory(plan)
+        pending = self._load_pending(plan, "execute")
+        argv = (
+            self._execute_argv(plan, directory, compilation.library_sha256)
+            if pending is None else self._observe_argv(plan, "execute", pending["handle"])
+        )
+        try:
+            completed = self._run_operation(plan, "execute", argv, pending)
+        except _PendingObservation:
+            raise
         except RuntimeError as exc:
             return FailedEvidence.create(
                 plan, stage="execute", error_type="RuntimeError", detail=str(exc)
             )
         if completed.returncode != 0:
-            stage = self._last_stage(completed.stdout)
             return FailedEvidence.create(
-                plan, stage=stage, error_type="RemoteExecutionError",
+                plan, stage="execute", error_type="RemoteExecutionError",
                 detail=(completed.stderr or completed.stdout or "remote execution failed").strip(),
             )
         try:
             handle = self._validate_wrapper(completed.stdout)
             output = self._parse_output(completed.stdout, plan.padded_length)
-            libraries = self._markers(completed.stdout, "A3CANDIDATE_COMPILED=")
-            if len(libraries) != 1 or re.fullmatch(r"[0-9a-f]{64}", libraries[0]) is None:
-                raise ValueError("remote compile marker is invalid")
         except ValueError as exc:
             return FailedEvidence.create(
                 plan, stage="verify", error_type="OutputError", detail=str(exc)
@@ -163,20 +229,17 @@ class GZA3RemoteCandidateBackend:
             exit_code=0, output=output, stdout=completed.stdout,
             stderr=completed.stderr, job_handle=handle,
             metadata=(
-                ("archive_sha256", bundle.sha256),
-                ("library_sha256", libraries[0]),
-                ("remote_candidate_directory", remote_directory.as_posix()),
+                ("library_sha256", compilation.library_sha256),
+                ("remote_candidate_directory", directory.as_posix()),
             ),
         )
-        self._libraries[plan.execution_id] = libraries[0]
-        return VerifiedResult.from_receipt(plan, receipt, max_abs_error=maximum)
+        result = VerifiedResult.from_receipt(plan, receipt, max_abs_error=maximum)
+        self._pending_path(plan, "execute").unlink(missing_ok=True)
+        return result
 
-    def library_sha256(self, plan: ExecutionPlan) -> str:
-        """Return the compiler-emitted library identity for this process run."""
-        try:
-            return self._libraries[plan.execution_id]
-        except KeyError as exc:
-            raise KeyError("candidate has no successful retained compile") from exc
+    def run(self, plan: ExecutionPlan, local_directory: Path) -> VerifiedResult | FailedEvidence:
+        compiled = self.compile(plan, local_directory)
+        return compiled if isinstance(compiled, FailedEvidence) else self.execute(compiled)
 
     def remote_candidate_directory(self, plan: ExecutionPlan) -> PurePosixPath:
         """Return the retained directory consumed by the A3 profiling backend."""
@@ -184,6 +247,100 @@ class GZA3RemoteCandidateBackend:
         if not isinstance(plan, ExecutionPlan):
             raise TypeError("plan must be an A3 ExecutionPlan")
         return self._workspace / ".rsi-a3" / "candidates" / plan.execution_id
+
+    def _bind_state_root(self, local_directory: Path) -> None:
+        selected = (local_directory / ".a3-remote-state").resolve()
+        if self._state_root is None:
+            self._state_root = selected
+
+    def _pending_path(self, plan: ExecutionPlan, operation: str) -> Path:
+        if self._state_root is None:
+            raise RuntimeError("remote candidate state directory is not configured")
+        return self._state_root / plan.execution_id / f"{operation}.json"
+
+    def _load_pending(self, plan: ExecutionPlan, operation: str) -> dict[str, str] | None:
+        path = self._pending_path(plan, operation)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("retained remote candidate operation is corrupt") from exc
+        expected = {
+            "execution_id": plan.execution_id, "source_fingerprint": plan.source_fingerprint,
+            "operation": operation,
+        }
+        if (
+            type(value) is not dict or set(value) != {*expected, "handle"}
+            or any(value.get(key) != item for key, item in expected.items())
+            or type(value.get("handle")) is not str
+            or not value["handle"].startswith("gz-a3:")
+        ):
+            raise RuntimeError("retained remote candidate operation is corrupt")
+        return value
+
+    def _publish_pending(
+        self, plan: ExecutionPlan, operation: str, handle: str
+    ) -> None:
+        path = self._pending_path(plan, operation)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps({
+            "execution_id": plan.execution_id,
+            "source_fingerprint": plan.source_fingerprint,
+            "operation": operation, "handle": handle,
+        }, sort_keys=True, separators=(",", ":")) + "\n"
+        if path.exists():
+            if path.read_text() != data:
+                raise RuntimeError("pending remote candidate operation conflicts")
+            return
+        with tempfile.NamedTemporaryFile(
+            "w", dir=path.parent, prefix=".pending-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_text() != data:
+                raise RuntimeError("pending remote candidate operation conflicts") from None
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _run_operation(
+        self, plan: ExecutionPlan, operation: str, argv: tuple[str, ...],
+        pending: dict[str, str] | None,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            completed = self._call(argv)
+        except RuntimeError as exc:
+            if pending is not None:
+                raise _PendingObservation(
+                    f"remote candidate observation incomplete; retry retained handle {pending['handle']}"
+                ) from exc
+            raise
+        handles = self._markers(completed.stdout, "CATLASS_VALIDATION_HANDLE=")
+        states = self._markers(completed.stdout, "CATLASS_VALIDATION_STATE=")
+        profiles = self._markers(completed.stdout, "CATLASS_VALIDATION_PROFILE=")
+        if (
+            completed.returncode != 0 and profiles == ["gz-a3"]
+            and states == ["observation-unavailable"] and len(handles) == 1
+            and handles[0].startswith("gz-a3:")
+        ):
+            if pending is not None and handles[0] != pending["handle"]:
+                raise RuntimeError("remote candidate observation returned a foreign handle")
+            self._publish_pending(plan, operation, handles[0])
+            raise _PendingObservation(
+                f"remote candidate observation unavailable; retry retained handle {handles[0]}"
+            )
+        if completed.returncode == 0 and pending is not None and handles != [pending["handle"]]:
+            raise RuntimeError("remote candidate observation returned a foreign handle")
+        if completed.returncode != 0 and pending is not None and states != ["failed"]:
+            raise _PendingObservation(
+                f"remote candidate observation incomplete; retry retained handle {pending['handle']}"
+            )
+        if completed.returncode != 0 and states == ["failed"]:
+            self._pending_path(plan, operation).unlink(missing_ok=True)
+        return completed
 
     def _read_health(self) -> Mapping[str, object]:
         with urllib.request.urlopen(self._server + "/api/v1/healthz", timeout=5) as response:
@@ -231,7 +388,7 @@ class GZA3RemoteCandidateBackend:
             self._sleep(self._poll_interval)
         raise RuntimeError(f"transfer {job_id} did not reach a terminal state")
 
-    def _wrapper_argv(
+    def _compile_argv(
         self, plan: ExecutionPlan, bundle: CandidateBundle,
         archive: PurePosixPath, directory: PurePosixPath,
     ) -> tuple[str, ...]:
@@ -239,9 +396,30 @@ class GZA3RemoteCandidateBackend:
             self._wrapper, "--profile", "gz-a3", "--operation",
             f"a3-candidate-{plan.execution_id[:16]}", "run", "--native",
             "--runtime", "py311-torch", "--device", str(self._device),
-            "--timeout", str(self._timeout), "--", "bash", "-c", _REMOTE_SCRIPT,
+            "--timeout", str(self._timeout), "--", "bash", "-c", _COMPILE_SCRIPT,
             "rsi-a3-candidate", archive.as_posix(), directory.as_posix(), bundle.sha256,
             plan.execution_id, plan.source_fingerprint,
+        )
+
+    def _execute_argv(
+        self, plan: ExecutionPlan, directory: PurePosixPath, library_sha256: str,
+    ) -> tuple[str, ...]:
+        return (
+            self._wrapper, "--profile", "gz-a3", "--operation",
+            f"a3-execute-{plan.execution_id[:16]}", "run", "--native",
+            "--runtime", "py311-torch", "--device", str(self._device),
+            "--timeout", str(self._timeout), "--", "bash", "-c", _EXECUTE_SCRIPT,
+            "rsi-a3-candidate", directory.as_posix(), plan.execution_id,
+            plan.source_fingerprint, library_sha256,
+        )
+
+    def _observe_argv(
+        self, plan: ExecutionPlan, operation: str, handle: str,
+    ) -> tuple[str, ...]:
+        prefix = "a3-candidate" if operation == "compile" else "a3-execute"
+        return (
+            self._wrapper, "--profile", "gz-a3", "--operation",
+            f"{prefix}-{plan.execution_id[:16]}", "observe", "--handle", handle,
         )
 
     def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
@@ -283,11 +461,5 @@ class GZA3RemoteCandidateBackend:
         ):
             raise ValueError("remote output must be a finite padded numeric array")
         return tuple(float(item) for item in value)
-
-    @classmethod
-    def _last_stage(cls, stdout: str) -> str:
-        stages = cls._markers(stdout, "A3REMOTE_STAGE=")
-        return stages[-1] if stages and stages[-1] in {"compile", "execute"} else "prepare"
-
 
 __all__ = ["CandidateBundle", "GZA3RemoteCandidateBackend"]

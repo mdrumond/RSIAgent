@@ -102,7 +102,7 @@ class GZA3ProfilingBackend:
         if retained is not None:
             return self._timing_from_dict(retained["result"], binding, dimensions)
         argv = self._wrapper_argv(replay, self._driver_argv("timing", dimensions))
-        completed = self._call(argv)
+        completed = self._run_or_observe(replay, request_id, "timing", argv)
         meta, handle, status = self._validated_output(completed, mode="timing")
         result = replace(
             TimingResult.from_samples(
@@ -135,7 +135,7 @@ class GZA3ProfilingBackend:
         argv = self._wrapper_argv(
             replay, self._driver_argv("profile", request.dimensions, extra)
         )
-        completed = self._call(argv)
+        completed = self._run_or_observe(replay, request.request_id, "profile", argv)
         meta, handle, status = self._validated_output(completed, mode="profile")
         compact = self._one_json_marker(completed.stdout, _MARKER_COMPACT, "compact profile")
         try:
@@ -209,12 +209,38 @@ class GZA3ProfilingBackend:
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("GZ-A3 profiling wrapper timed out") from exc
-        if completed.returncode != 0:
-            raise RuntimeError(
-                "GZ-A3 profiling failed: "
-                + (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
-            )
         return completed
+
+    def _run_or_observe(
+        self, replay: str, request_id: str, mode: str, submit_argv: tuple[str, ...]
+    ) -> subprocess.CompletedProcess[str]:
+        pending = self._load_pending(replay, request_id, mode)
+        argv = submit_argv if pending is None else (
+            self._wrapper, "--profile", "gz-a3", "--operation", replay,
+            "observe", "--handle", pending["handle"],
+        )
+        completed = self._call(argv)
+        if completed.returncode == 0:
+            if pending is not None:
+                handle = self._one_marker(completed.stdout, _STATE_MARKERS["handle"], "handle")
+                if handle != pending["handle"]:
+                    raise RuntimeError("GZ-A3 observation returned a foreign handle")
+            return completed
+        try:
+            profile = self._one_marker(completed.stdout, _STATE_MARKERS["profile"], "profile")
+            state = self._one_marker(completed.stdout, _STATE_MARKERS["state"], "state")
+            handle = self._one_marker(completed.stdout, _STATE_MARKERS["handle"], "handle")
+        except RuntimeError:
+            profile = state = handle = ""
+        if profile == "gz-a3" and state == "observation-unavailable" and handle.startswith("gz-a3:"):
+            if pending is not None and handle != pending["handle"]:
+                raise RuntimeError("GZ-A3 observation returned a foreign handle")
+            self._publish_pending(replay, request_id, mode, handle)
+            raise RuntimeError(f"GZ-A3 observation unavailable; retry retained handle {handle}")
+        raise RuntimeError(
+            "GZ-A3 profiling failed: "
+            + (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
+        )
 
     def _validated_output(
         self, completed: subprocess.CompletedProcess[str], *, mode: str
@@ -277,6 +303,57 @@ class GZA3ProfilingBackend:
     def _record_path(self, replay: str) -> Path:
         self._validate_replay(replay)
         return self._evidence_root / replay / "record.json"
+
+    def _pending_path(self, replay: str) -> Path:
+        self._validate_replay(replay)
+        return self._evidence_root / replay / "pending.json"
+
+    def _load_pending(
+        self, replay: str, request_id: str, mode: str
+    ) -> dict[str, str] | None:
+        path = self._pending_path(replay)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("retained GZ-A3 pending replay is corrupt") from exc
+        if (
+            type(value) is not dict
+            or set(value) != {"request_id", "mode", "handle"}
+            or type(value.get("handle")) is not str
+            or not value["handle"].startswith("gz-a3:")
+        ):
+            raise RuntimeError("retained GZ-A3 pending replay is corrupt")
+        if value["request_id"] != request_id or value["mode"] != mode:
+            raise ValueError("conflicting pending replay request")
+        return value
+
+    def _publish_pending(
+        self, replay: str, request_id: str, mode: str, handle: str
+    ) -> None:
+        destination = self._pending_path(replay)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(
+            {"request_id": request_id, "mode": mode, "handle": handle},
+            sort_keys=True, separators=(",", ":"),
+        ) + "\n"
+        if destination.exists():
+            if destination.read_text() != data:
+                raise RuntimeError("pending replay conflicts with retained handle")
+            return
+        with tempfile.NamedTemporaryFile(
+            "w", dir=destination.parent, prefix=".pending-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        try:
+            os.link(temporary, destination)
+        except FileExistsError:
+            if destination.read_text() != data:
+                raise RuntimeError("pending replay conflicts with retained handle") from None
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _load_replay(self, replay: str, request_id: str, mode: str) -> dict | None:
         path = self._record_path(replay)
@@ -344,6 +421,7 @@ class GZA3ProfilingBackend:
                 raise RuntimeError("replay conflicts with retained evidence") from None
         finally:
             temporary.unlink(missing_ok=True)
+        self._pending_path(replay).unlink(missing_ok=True)
 
     @staticmethod
     def _validate_replay(value: str) -> None:
