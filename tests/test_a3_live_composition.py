@@ -9,6 +9,7 @@ from benchmarks.a3kernels.live_composition import (
     AuthoritativeResultStore,
     LiveComposition,
     LiveDependencies,
+    RemoteCandidateBundle,
     model_actor_factory,
 )
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
@@ -140,3 +141,51 @@ def test_deepseek_actor_uses_native_pinned_route_without_exposing_secret():
     assert seen["base_url"] == DEEPSEEK_BASE_URL
     assert seen["api_key"] == "private-value"
     assert "private-value" not in json.dumps(completion.as_dict())
+
+
+def test_remote_bundle_compile_then_run_reuses_one_managed_execution(tmp_path):
+    class Managed:
+        def __init__(self): self.calls = 0; self.libraries = {}
+        def run(self, plan, workdir):
+            self.calls += 1
+            self.libraries[plan.execution_id] = "3" * 64
+            output = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
+            return VerifiedResult.from_receipt(
+                plan, ExecutionReceipt(0, output, job_handle="gz-a3:managed"),
+                max_abs_error=0.0,
+            )
+        def library_sha256(self, plan): return self.libraries[plan.execution_id]
+    managed = Managed(); bundle = RemoteCandidateBundle(managed)
+    options = dict(request_id="cell", project_id="project", length=32,
+                   padded_length=64, block_count=1, seed=0)
+    compiled = bundle.compile(SOURCE, tmp_path, attempt_id="turn-2", **options)
+    verified = bundle.run(SOURCE, tmp_path, attempt_id="turn-3", **options)
+    assert isinstance(compiled, CandidateCompilation)
+    assert isinstance(verified, VerifiedResult) and verified.passed
+    assert managed.calls == 1
+
+
+def test_cli_run_composes_all_eight_cells_with_injected_backends(
+    tmp_path, monkeypatch, capsys,
+):
+    import run_a3_phase1
+    cfg = config(tmp_path)
+    deps = dependencies([], [])
+    monkeypatch.setattr(run_a3_phase1, "managed_live_dependencies", lambda *a, **k: deps)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    argv = [
+        "run", "--state-root", str(cfg.state_root),
+        "--validation-wrapper", str(cfg.validation_wrapper),
+        "--embedding-cache", str(cfg.embedding_cache),
+        "--corpus-artifacts", str(cfg.corpus_artifacts),
+        "--knowledge-database", str(cfg.knowledge_database),
+        "--knowledge-manifest", str(cfg.knowledge_manifest),
+        "--remote-client", "/checked/remote_agent_client.sh",
+        "--server", "http://127.0.0.1:37787", "--remote", "a3-gz",
+        "--remote-workspace", "/data2/research", "--physical-device", "0",
+    ]
+    assert run_a3_phase1.main(argv) == 0
+    output = capsys.readouterr().out
+    assert len(json.loads(output)) == 8
+    assert "openrouter-secret" not in output and "deepseek-secret" not in output

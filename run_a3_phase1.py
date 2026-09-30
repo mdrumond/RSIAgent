@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from benchmarks.a3kernels.phase1_wave import Phase1Config, Phase1Wave, full_dry_run
+from benchmarks.a3kernels.live_composition import LiveComposition, managed_live_dependencies
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -23,6 +24,12 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--corpus-artifacts", type=Path, required=True)
         command.add_argument("--knowledge-database", type=Path, required=True)
         command.add_argument("--knowledge-manifest", type=Path, required=True)
+        if name in ("run", "resume"):
+            command.add_argument("--remote-client", required=True)
+            command.add_argument("--server", required=True)
+            command.add_argument("--remote", required=True)
+            command.add_argument("--remote-workspace", required=True)
+            command.add_argument("--physical-device", type=int, required=True)
     return parser
 
 
@@ -44,9 +51,16 @@ def main(argv=None) -> int:
         import os
         value = _config(args).preflight(os.environ)
     else:
-        raise SystemExit(
-            "live run/resume composition is intentionally deferred; use the injected Phase1Wave API"
+        import os
+        cfg = _config(args)
+        cfg.preflight(os.environ)
+        dependencies = managed_live_dependencies(
+            cfg, client=args.remote_client, server=args.server,
+            remote=args.remote, remote_workspace=args.remote_workspace,
+            physical_device=args.physical_device, environ=os.environ,
         )
+        wave = Phase1Wave(cfg, LiveComposition(cfg, dependencies).execute)
+        value = wave.run() if args.command == "run" else wave.resume()
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     return 0
 

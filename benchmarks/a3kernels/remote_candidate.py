@@ -83,6 +83,7 @@ class GZA3RemoteCandidateBackend:
         self._poll_interval = poll_interval
         self._timeout = timeout
         self._max_polls = max_polls
+        self._libraries: dict[str, str] = {}
 
     def build_bundle(self, plan: ExecutionPlan, destination: Path) -> CandidateBundle:
         if not isinstance(plan, ExecutionPlan):
@@ -167,7 +168,15 @@ class GZA3RemoteCandidateBackend:
                 ("remote_candidate_directory", remote_directory.as_posix()),
             ),
         )
+        self._libraries[plan.execution_id] = libraries[0]
         return VerifiedResult.from_receipt(plan, receipt, max_abs_error=maximum)
+
+    def library_sha256(self, plan: ExecutionPlan) -> str:
+        """Return the compiler-emitted library identity for this process run."""
+        try:
+            return self._libraries[plan.execution_id]
+        except KeyError as exc:
+            raise KeyError("candidate has no successful retained compile") from exc
 
     def remote_candidate_directory(self, plan: ExecutionPlan) -> PurePosixPath:
         """Return the retained directory consumed by the A3 profiling backend."""

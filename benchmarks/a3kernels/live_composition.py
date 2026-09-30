@@ -11,7 +11,7 @@ from typing import Callable, Mapping, Protocol
 
 from benchmarks.a3_experiments import A3ExperimentCell
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, complete_a3, load_a3_model_profile
-from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
 from benchmarks.a3kernels.embeddings import PinnedBGEEmbeddings
 from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
 from benchmarks.a3kernels.knowledge_agent import KnowledgeAgent, QueryJournal
@@ -21,6 +21,9 @@ from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
 from benchmarks.a3kernels.phase1_registry import CurriculumProposal, DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
 from benchmarks.a3kernels.profiling import CompactProfileResult
+from benchmarks.a3kernels.profiling import A3ProfilingSession
+from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
+from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
 from benchmarks.a3kernels.trial import A3TrialLoop
 
 
@@ -37,7 +40,7 @@ class CandidateFactory(Protocol):
 class ProfilerFactory(Protocol):
     def __call__(
         self, cell: A3ExperimentCell, proposal: CurriculumProposal, paths: CellPaths,
-        verified: Mapping[str, VerifiedResult],
+        candidate: object,
     ): ...
 
 
@@ -152,7 +155,7 @@ class LiveComposition:
             )
             profiler = _RecordingProfiler(
                 self.dependencies.profiler_factory(
-                    cell, proposal, paths, candidate.verified
+                    cell, proposal, paths, candidate
                 ),
                 store, proposal.project_id,
             )
@@ -190,6 +193,108 @@ def model_actor_factory(
     return factory
 
 
+class RemoteCandidateBundle:
+    """Expose separate trial actions over one managed compile+verify operation."""
+
+    def __init__(self, backend: GZA3RemoteCandidateBackend) -> None:
+        self.backend = backend
+        self.planner = A3CandidateBackend(lambda *args, **kwargs: None)
+        self.results: dict[str, VerifiedResult | FailedEvidence] = {}
+        self.plans = {}
+
+    def _plan(self, source, options):
+        return self.planner.plan(source, **options)
+
+    def compile(self, source, workdir, **options):
+        plan = self._plan(source, options)
+        result = self.backend.run(plan, workdir)
+        if isinstance(result, FailedEvidence):
+            return result
+        self.results[plan.execution_id] = result
+        self.plans[plan.execution_id] = plan
+        body = {
+            "plan": plan, "library_sha256": self.backend.library_sha256(plan),
+            "stdout": "retained by managed GZ-A3 evidence", "stderr": "",
+        }
+        return CandidateCompilation(
+            plan, body["library_sha256"], body["stdout"], "",
+            canonical_digest(body),
+        )
+
+    def run(self, source, workdir, **options):
+        plan = self._plan(source, options)
+        # Attempt ids intentionally differ between compile/run actions, while
+        # source and host policy remain identical. Match the retained source.
+        for execution_id, retained_plan in self.plans.items():
+            if (
+                retained_plan.source_fingerprint == plan.source_fingerprint
+                and retained_plan.project_id == plan.project_id
+                and retained_plan.input_a == plan.input_a
+                and retained_plan.input_b == plan.input_b
+            ):
+                return self.results[execution_id]
+        return self.backend.run(plan, workdir)
+
+
+class _LazyGZProfiler:
+    def __init__(
+        self, *, config: Phase1Config, paths: CellPaths,
+        candidate: _RecordingCandidate, physical_device: int,
+    ) -> None:
+        self.config, self.paths = config, paths
+        self.candidate, self.physical_device = candidate, physical_device
+
+    def profile(self, request):
+        remote = self.candidate.backend
+        if not isinstance(remote, RemoteCandidateBundle):
+            raise TypeError("GZ profiler requires the managed candidate backend")
+        plan = remote.plans.get(request.binding.execution_id)
+        if plan is None:
+            raise ValueError("profiling candidate has no retained remote directory")
+        backend = GZA3ProfilingBackend(
+            validation_wrapper=str(self.config.validation_wrapper),
+            remote_candidate_directory=remote.backend.remote_candidate_directory(plan).as_posix(),
+            evidence_directory=self.paths.root / "profiles",
+            physical_device=self.physical_device,
+            verified_results=self.candidate.verified,
+        )
+        return A3ProfilingSession(profiler=backend.profile).profile(request)
+
+
+def managed_live_dependencies(
+    config: Phase1Config, *, client: str, server: str, remote: str,
+    remote_workspace: str, physical_device: int,
+    environ: Mapping[str, str], transport=None,
+) -> LiveDependencies:
+    """Build the concrete checked-wrapper/managed-transfer dependency set."""
+    client_path = Path(client)
+    if (
+        not client_path.is_file() or not os.access(client_path, os.X_OK)
+        or client_path.name != "remote_agent_client.sh"
+    ):
+        raise ValueError("remote client must be the checked executable remote_agent_client.sh")
+
+    def candidate_factory(_cell, _proposal, _paths):
+        return RemoteCandidateBundle(GZA3RemoteCandidateBackend(
+            client=client, server=server,
+            validation_wrapper=str(config.validation_wrapper), remote=remote,
+            remote_workspace=remote_workspace, physical_device=physical_device,
+        ))
+
+    def profiler_factory(_cell, _proposal, paths, candidate):
+        return _LazyGZProfiler(
+            config=config, paths=paths, candidate=candidate,
+            physical_device=physical_device,
+        )
+
+    return LiveDependencies(
+        actor_factory=model_actor_factory(environ, transport),
+        candidate_factory=candidate_factory,
+        knowledge_factory=local_knowledge_factory(config),
+        profiler_factory=profiler_factory,
+    )
+
+
 def local_knowledge_factory(
     config: Phase1Config,
 ) -> Callable[[A3ExperimentCell, CellPaths], KnowledgeAgent]:
@@ -217,6 +322,6 @@ def local_knowledge_factory(
 
 
 __all__ = [
-    "AuthoritativeResultStore", "LiveComposition", "LiveDependencies",
-    "local_knowledge_factory", "model_actor_factory",
+    "AuthoritativeResultStore", "LiveComposition", "LiveDependencies", "RemoteCandidateBundle",
+    "local_knowledge_factory", "managed_live_dependencies", "model_actor_factory",
 ]
