@@ -110,3 +110,21 @@ def test_verified_result_cannot_claim_pass_on_failed_process():
         VerifiedResult.from_receipt(
             plan(), ExecutionReceipt(exit_code=2), max_abs_error=0.0
         )
+
+
+@pytest.mark.parametrize("metric", [-1.0, -0.000001, True])
+def test_verified_result_rejects_negative_or_boolean_error(metric):
+    with pytest.raises(ValueError, match="max_abs_error"):
+        VerifiedResult.from_receipt(
+            plan(), ExecutionReceipt(exit_code=0, output=(4.0, 3.0)),
+            max_abs_error=metric,
+        )
+
+
+@pytest.mark.parametrize("tolerance", [-1.0, float("inf"), True])
+def test_verified_result_rejects_invalid_tolerance(tolerance):
+    with pytest.raises(ValueError, match="tolerance"):
+        VerifiedResult.from_receipt(
+            plan(), ExecutionReceipt(exit_code=0, output=(4.0, 3.0)),
+            max_abs_error=0.0, tolerance=tolerance,
+        )
