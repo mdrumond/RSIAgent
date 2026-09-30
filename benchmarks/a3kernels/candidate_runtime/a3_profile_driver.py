@@ -118,21 +118,22 @@ def _report_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _raw_rows(root: Path, metric: str) -> tuple[list[str], list[list[object]], list[list[object]]]:
+def _raw_rows(
+    root: Path, metric: str
+) -> tuple[list[str], list[list[object]], list[list[object]], list[str]]:
     kernels: set[str] = set()
     values: list[list[object]] = []
     timeline: list[list[object]] = []
-    metric_key = "".join(character for character in metric.lower() if character.isalnum())
-    tables = sorted(
-        path for path in root.rglob("*.csv")
-        if metric_key in "".join(character for character in path.name.lower() if character.isalnum())
-    )
-    if not tables:
-        raise RuntimeError(f"msprof report contains no {metric} CSV table")
-    for path in tables:
+    selected_columns: set[str] = set()
+    for path in sorted(root.rglob("*.csv")):
         relative = path.relative_to(root).as_posix()
         with path.open(newline="", encoding="utf-8-sig") as stream:
-            for row_number, row in enumerate(csv.DictReader(stream)):
+            reader = csv.DictReader(stream)
+            columns = tuple(reader.fieldnames or ())
+            if not any(column.strip().lower() in _KERNEL_COLUMNS for column in columns):
+                continue
+            selected_columns.update(f"{relative}:{column}" for column in columns)
+            for row_number, row in enumerate(reader):
                 for column, raw in row.items():
                     if column.strip().lower() in _KERNEL_COLUMNS and raw:
                         kernels.add(raw.strip())
@@ -145,7 +146,11 @@ def _raw_rows(root: Path, metric: str) -> tuple[list[str], list[list[object]], l
                     item = [f"{relative}:{column}:{row_number}", number]
                     (timeline if any(word in column.lower() for word in _TIMELINE_WORDS)
                      else values).append(item)
-    return sorted(kernels), values, timeline
+    if not selected_columns:
+        raise RuntimeError(
+            f"msprof report contains no kernel-schema CSV table for {metric}"
+        )
+    return sorted(kernels), values, timeline, sorted(selected_columns)
 
 
 def _replay_argv(root: Path, input_name: str, args: argparse.Namespace) -> tuple[str, ...]:
@@ -204,11 +209,12 @@ def main(
     completed = process_runner(command, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "msprof failed").strip())
-    kernels, values, timeline = _raw_rows(report, args.metric)
+    kernels, values, timeline, selected_columns = _raw_rows(report, args.metric)
     if args.kernel not in kernels:
         raise RuntimeError("msprof raw table does not contain the expected kernel")
     compact = {
         "exported_kernels": kernels, "metric_values": values, "timeline": timeline,
+        "selected_columns": selected_columns,
         "report_sha256": _report_digest(report),
     }
     print("A3PROFILE_COMPACT=" + json.dumps(compact, sort_keys=True, separators=(",", ":")))
