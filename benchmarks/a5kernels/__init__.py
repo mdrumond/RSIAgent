@@ -57,6 +57,7 @@ from benchmarks.a5kernels.profiling import (
     ProfilingTreatmentController,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
 from benchmarks.a5kernels.trial import (
     ActorOutcome,
@@ -133,6 +134,7 @@ __all__ = [
     "ParallelismClass",
     "Phase1PerformanceStudy",
     "Phase1ProjectRuntime",
+    "Phase1PerformanceExecution",
     "Phase1StudyBackend",
     "Phase1StudyResult",
     "ProfileCommandExecutor",

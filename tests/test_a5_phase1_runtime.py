@@ -206,7 +206,7 @@ def test_repairing_either_runtime_fault_leaves_the_other_host_visible():
     ({"length": 401}, "length"),
     ({"padded_length": 63}, "padded_length"),
     ({"padded_length": 96}, "padded_length"),
-    ({"padded_length": 512}, "padded_length"),
+    ({"padded_length": 576}, "padded_length"),
     ({"block_count": 0}, "block_count"),
     ({"block_count": True}, "block_count"),
 ])
@@ -217,15 +217,15 @@ def test_candidate_backend_rejects_values_outside_host_contract(options, message
 
 def test_candidate_backend_accepts_maximum_executable_fixture_extent():
     execution = FakeExecution()
-    backend = CatlassCandidateBackend(execution, length=400, padded_length=448)
+    backend = CatlassCandidateBackend(execution, length=400, padded_length=512)
     request = backend._request()
-    assert request.length == 400 and request.padded_length == 448
+    assert request.length == 400 and request.padded_length == 512
     assert execution.plans == []
 
 
 @pytest.mark.parametrize("options", [
     {"length": 401, "padded_length": 448},
-    {"length": 400, "padded_length": 512},
+    {"length": 400, "padded_length": 576},
 ])
 def test_candidate_backend_rejects_unexecutable_extent_before_dispatch(options):
     execution = FakeExecution()

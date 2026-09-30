@@ -20,6 +20,9 @@ from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.profiling import (
     ProfileRequest,
     ProfilingTreatmentController,
+    StudyDimensions,
+    StudyVariant,
+    bind_study_dimensions,
 )
 from benchmarks.a5kernels.protocol import ExecutionPlan, ExecutionReceipt, RunRequest
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
@@ -158,6 +161,42 @@ class CatlassCandidateBackend:
             plan, verified, kernel_name, workload,
             hashlib.sha256(source.encode("utf-8")).hexdigest(),
         )
+
+    def run_study(
+        self,
+        workspace: Path,
+        language: str,
+        workload: Workload,
+        attempt_id: str,
+        ledger: EvidenceLedger,
+        dimensions: StudyDimensions,
+    ) -> StudyVariant:
+        """Execute correctness with study dimensions already bound to the plan."""
+
+        if workload is not Workload.SMOKE_VECTOR_ADD:
+            raise ValueError("Catlass candidate runtime supports only smoke-vector-add")
+        if not isinstance(dimensions, StudyDimensions):
+            raise TypeError("dimensions must be host-owned StudyDimensions")
+        source = self._source(workspace, language)
+        request = self._request()
+        capture = _CaptureExecution(self._execution_backend)
+        runner = A5KernelRunner(capture, evidence_ledger=ledger)
+        plan = self._prepare(
+            runner, request, source, attempt_id,
+            compile_only=False, device=self._device,
+        )
+        plan = bind_study_dimensions(plan, dimensions)
+        verified = runner.run_plan(request, plan)
+        if not verified.passed:
+            raise ValueError("candidate correctness must pass before a study variant")
+        kernel_name = _discovered_kernel(capture.receipt)
+        profile = ProfileRequest.from_execution_plan(
+            plan,
+            implementation=Language.CATLASS_DSL.value,
+            expected_kernel=kernel_name,
+            device=self._device,
+        )
+        return StudyVariant(profile, verified, dimensions)
 
     def _request(self) -> RunRequest:
         return RunRequest(

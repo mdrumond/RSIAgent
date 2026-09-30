@@ -9,7 +9,7 @@ from benchmarks.a5kernels.protocol import ExecutionEnvironment, SourceFile
 
 
 CATLASS_MAX_LENGTH = 400
-CATLASS_MAX_PADDED_LENGTH = 448
+CATLASS_MAX_PADDED_LENGTH = 512
 
 
 class Language(str, Enum):
@@ -86,9 +86,10 @@ def run(input_a, input_b):
     a = torch.tensor(input_a, dtype=torch.float32, device="npu")
     b = torch.tensor(input_b, dtype=torch.float32, device="npu")
     out = torch.empty_like(a)
-    block_num = int(os.environ.get("A5KERNEL_BLOCK_NUM", "1"))
-    if not 1 <= block_num <= 8:
-        raise ValueError("A5KERNEL_BLOCK_NUM must be in [1, 8]")
+    encoded_block_num = os.environ.get("A5KERNEL_BLOCK_NUM", "1")
+    if encoded_block_num not in {str(value) for value in range(1, 9)}:
+        raise ValueError("A5KERNEL_BLOCK_NUM must be a canonical integer in [1, 8]")
+    block_num = int(encoded_block_num)
 
     def as_tla(tensor):
         return from_dlpack(
@@ -525,7 +526,9 @@ def catlass_candidate_fixture(source: str) -> Fixture:
     runtime = runtime.replace("VECTOR_ELE", "_HOST_VECTOR_ELE").replace(
         "VL_ELE", "_HOST_VL_ELE"
     )
-    # Candidate plans already carry the complete padded verification extent.
+    # Candidate plans can carry the largest accepted physical study extent:
+    # logical N400 with align-256 padding is 512.
+    # Keep this capacity separate from the base hello fixture's logical N400 cap.
     # Poison every output slot so an unwritten zero-padding lane cannot pass.
     runtime = runtime.replace("torch.empty_like(a)", "torch.full_like(a, float('nan'))")
     runtime = runtime.replace("return out[:original_length].cpu().tolist()",

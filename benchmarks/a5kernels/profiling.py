@@ -20,8 +20,6 @@ from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult, canonic
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-
-
 class ProfileMetric(str, Enum):
     BASIC_INFO = "BasicInfo"
     PIPE_UTILIZATION = "PipeUtilization"
@@ -76,6 +74,29 @@ class ProfileRequest:
             raise ValueError(
                 "plan block binding must be a canonical integer from 1 through 8"
             )
+        parallelism_values = tuple(
+            value
+            for key, value in self.plan.runtime_provenance
+            if key == "phase1.parallelism"
+        )
+        if len(parallelism_values) == 1 and parallelism_values[0] in {
+            str(item.value) for item in ParallelismClass
+        }:
+            parallelism = ParallelismClass(int(parallelism_values[0]))
+            if encoded_block_count not in (None, str(parallelism.value)) or (
+                encoded_block_count is None
+                and parallelism is not ParallelismClass.ONE
+            ):
+                raise ValueError(
+                    "plan environment block binding does not match Phase 1 dimensions"
+                )
+        if self.block_count is not None:
+            if type(self.block_count) is not int or not 1 <= self.block_count <= 8:
+                raise ValueError("block_count must be an integer from 1 through 8")
+            if encoded_block_count != str(self.block_count):
+                raise ValueError(
+                    "plan block binding must match host-owned block metadata"
+                )
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -443,6 +464,7 @@ class ShapeClass(str, Enum):
     N64 = "n64"
     N128 = "n128"
     N256 = "n256"
+    N400 = "n400"
 
 
 class PaddingClass(str, Enum):
@@ -459,6 +481,13 @@ class AccessClass(str, Enum):
 
 class ParallelismClass(int, Enum):
     ONE = 1
+    TWO = 2
+    THREE = 3
+    FOUR = 4
+    FIVE = 5
+    SIX = 6
+    SEVEN = 7
+    EIGHT = 8
 
 
 class MetricDomain(str, Enum):

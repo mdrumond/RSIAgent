@@ -17,6 +17,7 @@ from benchmarks.a5kernels.profiling import (
     StudyVariant,
     bind_study_dimensions,
     bind_profile_device,
+    study_dimensions_from_plan,
 )
 from tests.test_a5kernels_profiling import (
     CORRECT,
@@ -325,11 +326,110 @@ def test_phase1_variant_rejects_block_count_mismatched_with_parallelism():
             "A5KERNEL_BLOCK_NUM", "2"
         ),
     )
-    request = replace(bound.request, plan=plan)
-    correctness = replace(bound.correctness, execution_id=request.execution_id)
+    with pytest.raises(ValueError, match="Phase 1 dimensions"):
+        replace(bound.request, plan=plan)
 
-    with pytest.raises(ValueError, match="typed parallelism"):
-        StudyVariant(request, correctness, bound.dimensions)
+
+@pytest.mark.parametrize("encoded", ["0", "9", "06"])
+def test_profile_request_rejects_noncanonical_block_bindings(encoded):
+    plan = replace(
+        REQUEST.plan,
+        environment=REQUEST.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", encoded
+        ),
+    )
+    with pytest.raises(ValueError, match="canonical integer"):
+        replace(REQUEST, plan=plan)
+
+
+def test_bind_n400_align64_dimensions_uses_physical_448_inputs():
+    dimensions = StudyDimensions(
+        ShapeClass.N400,
+        PaddingClass.ALIGN_64,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.ONE,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                input_a=(*([1.0] * 400), *([0.0] * 48)),
+                input_b=(*([2.0] * 400), *([0.0] * 48)),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    assert study_dimensions_from_plan(plan) == dimensions
+    assert len(plan.input_a) == 448
+
+
+def test_bind_block_count_six_sets_study_plan_environment():
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    assert study_dimensions_from_plan(plan) == dimensions
+    assert dict(plan.environment.bindings)["A5KERNEL_BLOCK_NUM"] == "6"
+
+
+def test_bind_study_dimensions_sets_matching_block_binding():
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    assert dict(plan.environment.bindings)["A5KERNEL_BLOCK_NUM"] == "6"
+    replace(REQUEST, plan=plan)
+
+
+def test_profile_request_treats_assignment_shaped_positional_argument_as_argv():
+    dimensions = StudyDimensions(
+        ShapeClass.N64,
+        PaddingClass.NONE,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    plan = bind_study_dimensions(
+        bind_profile_device(
+            replace(
+                REQUEST.plan,
+                argv=(*REQUEST.plan.argv, "A5KERNEL_BLOCK_NUM=6"),
+                input_a=tuple([1.0] * 64),
+                input_b=tuple([2.0] * 64),
+            ),
+            REQUEST.device,
+        ),
+        dimensions,
+    )
+    assert plan.argv[-1] == "A5KERNEL_BLOCK_NUM=6"
+    assert dict(plan.environment.bindings)["A5KERNEL_BLOCK_NUM"] == "6"
+    replace(REQUEST, plan=plan)
 
 
 def test_optimization_comparison_caps_variants_before_measurement():

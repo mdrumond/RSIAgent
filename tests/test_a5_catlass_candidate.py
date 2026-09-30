@@ -15,6 +15,13 @@ from benchmarks.a5kernels.candidate import (
 )
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.matrix import Workload
+from benchmarks.a5kernels.profiling import (
+    AccessClass,
+    PaddingClass,
+    ParallelismClass,
+    ShapeClass,
+    StudyDimensions,
+)
 from benchmarks.a5kernels.protocol import ExecutionReceipt, RunRequest
 from benchmarks.a5kernels.runner import A5KernelRunner
 from benchmarks.a5kernels.trial import TrialAction, TrialActionExecutor
@@ -151,7 +158,7 @@ def test_candidate_without_launch_constants_uses_host_owned_runtime(tmp_path):
     assert result["passed"]
     composed = next(item for item in execution.plans[0].files
                     if item.relative_path == "kernel.py").content
-    assert "_HOST_VECTOR_ELE = 448" in composed
+    assert "_HOST_VECTOR_ELE = 512" in composed
     assert "_HOST_VL_ELE = 64" in composed
 
 
@@ -214,6 +221,38 @@ def test_candidate_verifies_immutable_zero_padded_smoke_inputs(tmp_path):
     assert "torch.full_like(a, float('nan'))" in kernel
     assert "return out.cpu().tolist()" in kernel
     assert "return out[:original_length]" not in kernel
+
+
+def test_n400_align256_candidate_runs_and_forms_study_variant(tmp_path):
+    """The supported backend, verifier, and study model share the 512 extent."""
+
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    execution = FakeExecution()
+    dimensions = StudyDimensions(
+        ShapeClass.N400,
+        PaddingClass.ALIGN_256,
+        AccessClass.CONTIGUOUS,
+        ParallelismClass.SIX,
+    )
+    registered = CatlassCandidateBackend(
+        execution, length=400, padded_length=512, block_count=6, device=2
+    ).run_study(
+        tmp_path,
+        "catlass-dsl",
+        Workload.SMOKE_VECTOR_ADD,
+        "n400-align256",
+        EvidenceLedger(tmp_path / "evidence.jsonl"),
+        dimensions,
+    )
+
+    plan = registered.request.plan
+    assert execution.plans == [plan]
+    assert registered.correctness.passed
+    assert registered.correctness.execution_id == plan.execution_id
+    assert registered.correctness.source_fingerprint == plan.source_fingerprint
+    assert len(plan.input_a) == len(plan.input_b) == 512
+    assert plan.input_a[400:] == plan.input_b[400:] == (0.0,) * 112
+    assert registered.dimensions.padding is PaddingClass.ALIGN_256
 
 
 @pytest.mark.parametrize("padding", [(), (float("nan"),) * 32, (1.0,) * 32])

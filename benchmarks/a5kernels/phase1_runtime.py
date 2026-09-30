@@ -5,9 +5,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+from pathlib import Path
 
 from benchmarks.a5kernels.candidate import CatlassCandidateBackend
+from benchmarks.a5kernels.evidence import EvidenceLedger
+from benchmarks.a5kernels.fixtures import Language
+from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.phase1_registry import CurriculumProposal, ProjectFamily
+from benchmarks.a5kernels.profiling import (
+    AccessClass,
+    PaddingClass,
+    ParallelismClass,
+    ShapeClass,
+    StudyDimensions,
+    StudyVariant,
+)
 from benchmarks.a5kernels.runner import ExecutionBackend
 
 
@@ -88,6 +100,51 @@ class Phase1ProjectRuntime:
             execution_backend, length=self.logical_length,
             padded_length=self.padded_length, block_count=self.block_count,
             seed=seed, device=device,
+        )
+
+    @property
+    def study_dimensions(self) -> StudyDimensions:
+        """Derive the typed study point from this registered runtime."""
+
+        if self.proposal.family not in {
+            ProjectFamily.LENGTH_KNEE,
+            ProjectFamily.CROSS_LAYER_LAUNCH,
+            ProjectFamily.MSPROF_PIPE,
+        }:
+            raise ValueError("project family does not register a performance study")
+        padding = (
+            PaddingClass.NONE
+            if self.padded_length == self.logical_length
+            else PaddingClass.ALIGN_64
+        )
+        return StudyDimensions(
+            ShapeClass(f"n{self.logical_length}"),
+            padding,
+            AccessClass.CONTIGUOUS,
+            ParallelismClass(self.block_count),
+        )
+
+    def run_study(
+        self,
+        execution_backend: ExecutionBackend,
+        workspace: Path,
+        attempt_id: str,
+        ledger: EvidenceLedger,
+        *,
+        seed: int = 0,
+        device: int = 0,
+    ) -> StudyVariant:
+        """Run registered correctness and return its exact profiling variant."""
+
+        return self.backend(
+            execution_backend, seed=seed, device=device
+        ).run_study(
+            workspace,
+            Language.CATLASS_DSL.value,
+            Workload.SMOKE_VECTOR_ADD,
+            attempt_id,
+            ledger,
+            self.study_dimensions,
         )
 
     def as_dict(self) -> dict[str, object]:
