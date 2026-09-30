@@ -174,7 +174,7 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
             output = Path(next(item.split("=", 1)[1] for item in argv if item.startswith("--output=")))
             report = output / "PROF_1" / "mindstudio_profiler_output"
             report.mkdir(parents=True)
-            (report / f"{metric}.csv").write_text(
+            (report / "op_summary_0.csv").write_text(
                 "Op Name,Duration(us),Raw Counter\nvector_add,12.5,7\n"
             )
             return subprocess.CompletedProcess(argv, 0, "", "")
@@ -192,9 +192,12 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
     meta = json.loads(next(line.split("=", 1)[1] for line in output.splitlines()
                            if line.startswith("A3PROFILE_META=")))
     assert compact["exported_kernels"] == ["vector_add"]
-    table = f"PROF_1/mindstudio_profiler_output/{metric}.csv"
+    table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
     assert compact["metric_values"] == [[f"{table}:Raw Counter:0", 7.0]]
     assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
+    assert compact["selected_columns"] == [
+        f"{table}:Duration(us)", f"{table}:Op Name", f"{table}:Raw Counter"
+    ]
     assert len(compact["report_sha256"]) == 64
     assert Path(meta["remote_report"]).is_dir()
     profile = next(call for call in calls if call[0] == "msprof")
