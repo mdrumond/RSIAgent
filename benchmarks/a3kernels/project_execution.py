@@ -281,6 +281,8 @@ class ProjectDispatcher:
             request_id=request_id,
             attempt_id=attempt_id,
             length=policy.logical_length,
+            padded_length=policy.padded_length,
+            block_count=policy.block_count,
             seed=seed,
             project_id=proposal.project_id,
         )
