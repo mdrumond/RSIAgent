@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from benchmarks.a3kernels.candidate import profile_driver_asset
+from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config, Phase1Wave, foundation_cells, full_dry_run,
 )
@@ -61,6 +62,11 @@ def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
     records = wave.run()
     assert len(records) == len(seen) == 8
     assert {record["status"] for record in records} == {"passed"}
+    assert {record["profile_driver_sha256"] for record in records} == {
+        profile_driver_asset().sha256
+    }
+    assert len({record["plan_fingerprint"] for record in records}) == 1
+    assert len({record["host_fixture_sha256"] for record in records}) == 1
     report = wave.report()
     assert report["counts"] == {"passed": 8}
     assert len({str(paths.memory) for _, paths in seen}) == 8
@@ -93,6 +99,24 @@ def test_foreign_or_conflicting_terminal_record_is_rejected(tmp_path):
     paths = wave.paths(first); paths.root.mkdir(parents=True)
     paths.terminal.write_text(json.dumps({"cell_id": first.cell_id, "target": "a5", "language": "catlass-dsl", "status": "passed", "evidence_sha256": "a" * 64}))
     with pytest.raises(ValueError, match="foreign"):
+        wave.resume()
+
+
+@pytest.mark.parametrize(
+    "field", ["plan_fingerprint", "profile_driver_sha256", "host_fixture_sha256"]
+)
+def test_resume_rejects_terminal_from_stale_research_identity(tmp_path, field):
+    cfg = config(tmp_path)
+    wave = Phase1Wave(
+        cfg, lambda *_: {"status": "passed", "evidence_sha256": "a" * 64}
+    )
+    wave.run()
+    terminal = wave.paths(foundation_cells()[0]).terminal
+    record = json.loads(terminal.read_text())
+    record[field] = canonical_digest({"stale": field})
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
         wave.resume()
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib.resources import files
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Callable, Mapping
 
 from benchmarks.a3_experiments import A3ExperimentCell, ProgrammingLevel, build_a3_experiment_plan
 from benchmarks.a3kernels.candidate import profile_driver_asset
+from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_registry import dry_run_plan
 
 
@@ -29,6 +31,19 @@ def foundation_cells() -> tuple[A3ExperimentCell, ...]:
         cell for cell in build_a3_experiment_plan().cells
         if cell.programming_level is ProgrammingLevel.FOUNDATION
     )
+
+
+def _research_identity() -> dict[str, str]:
+    source = files("benchmarks.a3kernels.candidate_runtime")
+    fixture = {
+        name: hashlib.sha256(source.joinpath(name).read_bytes()).hexdigest()
+        for name in _HOST_ASSETS
+    }
+    return {
+        "plan_fingerprint": canonical_digest(full_dry_run()),
+        "profile_driver_sha256": profile_driver_asset().sha256,
+        "host_fixture_sha256": canonical_digest(fixture),
+    }
 
 
 @dataclass(frozen=True)
@@ -76,7 +91,7 @@ class Phase1Config:
         return {
             "ready": True,
             "checks": paths,
-            "profile_driver_sha256": driver.sha256,
+            **_research_identity(),
         }
 
 
@@ -145,13 +160,14 @@ class Phase1Wave:
         if type(outcome["evidence_sha256"]) is not str or _SHA.fullmatch(outcome["evidence_sha256"]) is None:
             raise ValueError("executor terminal evidence digest is invalid")
         return {
-            "schema": "a3-phase1-cell-terminal-v1",
+            "schema": "a3-phase1-cell-terminal-v2",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
             "model": cell.backend_model.value,
             "knowledge": cell.knowledge.value,
             "profiling": cell.profiling.value,
+            **_research_identity(),
             **outcome,
         }
 
