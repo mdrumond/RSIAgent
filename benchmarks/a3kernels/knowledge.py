@@ -15,6 +15,7 @@ from .corpus import CorpusDocument
 
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 20
+CHUNK_SCHEMA = "a3-lines-v1"
 RRF_K = 60
 
 
@@ -43,6 +44,9 @@ class CollectionManifest:
     embedding_model: str
     embedding_revision: str
     dimension: int
+    chunk_schema: str
+    chunk_lines: int
+    chunk_overlap: int
     sources: tuple[SourceFingerprint, ...]
     fingerprint: str
 
@@ -61,6 +65,9 @@ class CollectionManifest:
                 manifest.embedding_model,
                 manifest.embedding_revision,
                 manifest.dimension,
+                manifest.chunk_schema,
+                manifest.chunk_lines,
+                manifest.chunk_overlap,
                 manifest.sources,
             )
             if manifest.target != "a3" or manifest.fingerprint != expected:
@@ -94,6 +101,9 @@ def _manifest_fingerprint(
     model: str,
     revision: str,
     dimension: int,
+    chunk_schema: str,
+    chunk_lines: int,
+    chunk_overlap: int,
     sources: tuple[SourceFingerprint, ...],
 ) -> str:
     identity = {
@@ -101,6 +111,9 @@ def _manifest_fingerprint(
         "dimension": dimension,
         "embedding_model": model,
         "embedding_revision": revision,
+        "chunk_schema": chunk_schema,
+        "chunk_lines": chunk_lines,
+        "chunk_overlap": chunk_overlap,
         "sources": [asdict(source) for source in sources],
         "target": target,
     }
@@ -221,11 +234,12 @@ class KnowledgeDB:
         collection = next(iter(collections))
         fingerprint = _manifest_fingerprint(
             collection, "a3", self.embeddings.model, self.embeddings.revision,
-            self.embeddings.dimension, sources,
+            self.embeddings.dimension, CHUNK_SCHEMA, CHUNK_LINES, CHUNK_OVERLAP, sources,
         )
         manifest = CollectionManifest(
             collection, "a3", self.embeddings.model, self.embeddings.revision,
-            self.embeddings.dimension, sources, fingerprint,
+            self.embeddings.dimension, CHUNK_SCHEMA, CHUNK_LINES, CHUNK_OVERLAP,
+            sources, fingerprint,
         )
         existing = self.connection.execute(
             "SELECT manifest_json FROM collections WHERE name = ?", (collection,)
@@ -268,9 +282,15 @@ class KnowledgeDB:
         rows = self.connection.execute(
             "SELECT * FROM chunks WHERE collection = ?", (collection,)
         ).fetchall()
-        terms = tuple(dict.fromkeys(term.lower() for term in re.findall(r"\w+", query)))
+        terms = tuple(dict.fromkeys(term.casefold() for term in re.findall(r"\w+", query)))
+        token_counts = {
+            row["chunk_id"]: tuple(
+                token.casefold() for token in re.findall(r"\w+", row["text"])
+            )
+            for row in rows
+        }
         lexical = sorted(
-            ((sum(row["text"].lower().count(term) for term in terms), row) for row in rows),
+            ((sum(token_counts[row["chunk_id"]].count(term) for term in terms), row) for row in rows),
             key=lambda item: (-item[0], item[1]["chunk_id"]),
         )
         lexical_rank = {
