@@ -100,7 +100,7 @@ class GZA3ProfilingBackend:
         self._validate_replay(replay)
         retained = self._load_replay(replay, request_id, "timing")
         if retained is not None:
-            return self._timing_from_dict(retained["result"])
+            return self._timing_from_dict(retained["result"], binding, dimensions)
         argv = self._wrapper_argv(replay, self._driver_argv("timing", dimensions))
         completed = self._call(argv)
         meta, handle, status = self._validated_output(completed, mode="timing")
@@ -127,7 +127,7 @@ class GZA3ProfilingBackend:
         self._validate_replay(replay)
         retained = self._load_replay(replay, request.request_id, "profile")
         if retained is not None:
-            return self._profile_from_dict(retained["result"])
+            return self._profile_from_dict(retained["result"], request)
         extra = (
             "--metric", request.metric.value,
             "--kernel", request.expected_kernel,
@@ -322,19 +322,49 @@ class GZA3ProfilingBackend:
             raise ValueError("unsafe GZ-A3 replay id")
 
     @staticmethod
-    def _timing_from_dict(value: dict) -> TimingResult:
-        value = dict(value)
-        value["dimensions"] = StudyDimensions(**value["dimensions"])
-        value["samples_us"] = tuple(value["samples_us"])
-        return TimingResult(**value)
+    def _timing_from_dict(
+        value: dict, binding: CandidateBinding, dimensions: StudyDimensions
+    ) -> TimingResult:
+        try:
+            retained = dict(value)
+            retained["dimensions"] = StudyDimensions(**retained["dimensions"])
+            retained["samples_us"] = tuple(retained["samples_us"])
+            result = TimingResult(**retained)
+            expected = replace(
+                TimingResult.from_samples(binding, dimensions, result.samples_us),
+                dimensions=dimensions,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("retained timing result is corrupt") from exc
+        if result != expected:
+            raise RuntimeError("retained timing result does not match its request or digest")
+        return result
 
     @staticmethod
-    def _profile_from_dict(value: dict) -> CompactProfileResult:
-        value = dict(value)
-        value["metric"] = ProfileMetric(value["metric"])
-        for key in ("exported_kernels", "metric_values", "timeline"):
-            value[key] = tuple(tuple(item) if isinstance(item, list) else item for item in value[key])
-        return CompactProfileResult(**value)
+    def _profile_from_dict(
+        value: dict, request: ProfileRequest
+    ) -> CompactProfileResult:
+        try:
+            retained = dict(value)
+            retained["metric"] = ProfileMetric(retained["metric"])
+            for key in ("exported_kernels", "metric_values", "timeline"):
+                retained[key] = tuple(
+                    tuple(item) if isinstance(item, list) else item
+                    for item in retained[key]
+                )
+            result = CompactProfileResult(**retained)
+            expected = CompactProfileResult.create(
+                request,
+                exported_kernels=result.exported_kernels,
+                metric_values=result.metric_values,
+                timeline=result.timeline,
+                report_sha256=result.report_sha256,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("retained profile result is corrupt") from exc
+        if result != expected:
+            raise RuntimeError("retained profile result does not match its request or digest")
+        return result
 
 
 __all__ = ["GZA3ProfilingBackend", "GZA3RunEvidence"]

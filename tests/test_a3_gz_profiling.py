@@ -169,6 +169,34 @@ def test_replay_reuses_identical_evidence_and_rejects_conflict(tmp_path):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("candidate_execution_id", "f" * 64),
+        ("source_fingerprint", "f" * 64),
+        ("evidence_sha256", "f" * 64),
+    ],
+)
+def test_timing_replay_revalidates_binding_and_digest(tmp_path, field, value):
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, output(
+            "A3TIMING_US=7",
+            'A3PROFILE_META={"language":"ascend-c","logical_device":0,'
+            '"mode":"timing","remote_report":null,"runtime":"native-ascend-c",'
+            '"target":"Ascend910B4"}',
+        ), "")
+
+    concrete = backend(tmp_path, runner)
+    concrete.time(BINDING, DIMENSIONS, replay_id="corrupt-timing")
+    path = tmp_path / "evidence" / "corrupt-timing" / "record.json"
+    record = json.loads(path.read_text())
+    record["result"][field] = value
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        concrete.time(BINDING, DIMENSIONS, replay_id="corrupt-timing")
+
+
 def test_missing_or_conflicting_compact_output_fails_without_publication(tmp_path):
     request = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.BASIC)
 
