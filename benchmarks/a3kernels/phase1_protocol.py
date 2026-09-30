@@ -165,11 +165,22 @@ class VerifiedResult:
         max_abs_error: float | None,
         tolerance: float = 1e-5,
     ) -> "VerifiedResult":
+        if (
+            type(tolerance) not in (int, float)
+            or not math.isfinite(tolerance)
+            or tolerance < 0
+        ):
+            raise ValueError("tolerance must be a finite non-negative number")
+        if max_abs_error is not None and (
+            type(max_abs_error) not in (int, float)
+            or not math.isfinite(max_abs_error)
+            or max_abs_error < 0
+        ):
+            raise ValueError("max_abs_error must be a finite non-negative number")
         if receipt.exit_code != 0 and max_abs_error is not None:
             raise ValueError("a failed exit code cannot have a verification metric")
         metric_ok = (
             max_abs_error is not None
-            and math.isfinite(max_abs_error)
             and max_abs_error <= tolerance
         )
         body = {
@@ -178,7 +189,7 @@ class VerifiedResult:
             "attempt_id": plan.attempt_id,
             "project_id": plan.project_id,
             "passed": receipt.exit_code == 0 and metric_ok,
-            "max_abs_error": max_abs_error if max_abs_error is None or math.isfinite(max_abs_error) else None,
+            "max_abs_error": max_abs_error,
             "exit_code": receipt.exit_code,
             "output_sha256": canonical_digest(receipt.output),
             "source_fingerprint": plan.source_fingerprint,
