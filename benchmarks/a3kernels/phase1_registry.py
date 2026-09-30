@@ -115,7 +115,7 @@ PROJECT_REGISTRY = (
     RegisteredProject(
         ProjectFamily.LENGTH_KNEE,
         3,
-        (ParameterSpec("length", choices=(32, 64, 128, 256, 400)),),
+        (ParameterSpec("length", choices=(1, 8, 16, 32, 64, 128, 256, 400)),),
         frozenset({EvidencePreset.CORRECTNESS_TIMING}),
         frozenset({Coverage.PERFORMANCE_KNEE}),
     ),
@@ -264,7 +264,7 @@ DEFAULT_PROPOSALS = (
     _proposal("padded-multitile", {"length": 400}, "Expose tail and multi-tile mistakes at a padded extent.", "correctness"),
     _proposal("compile-recovery", {"faults": 1}, "Recover from one ordinary Ascend C compiler failure.", "ordinary-recovery"),
     _proposal("runtime-recovery", {"faults": 1}, "Diagnose and recover from one ordinary device failure.", "ordinary-recovery"),
-    _proposal("length-knee", {"length": 128}, "Sample the lower native execution performance knee.", "correctness-timing"),
+    _proposal("length-knee", {"length": 16}, "Sample the sub-32 native execution performance knee.", "correctness-timing"),
     _proposal("length-knee", {"length": 400}, "Sample the upper native execution performance knee.", "correctness-timing"),
     _proposal("cross-layer-launch", {"block_count": 1}, "Measure the host-to-kernel launch boundary.", "correctness-timing"),
     _proposal("msprof-pipe", {"metric": "PipeUtilization"}, "Use one bounded msprof observation to guide revision.", "msprof-guided"),

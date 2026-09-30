@@ -77,10 +77,22 @@ def _validate_a3_identity(payload: Mapping[str, Any]) -> None:
     for key, (expected, label) in checks.items():
         if key in payload and payload[key] != expected:
             raise ValueError(f"A3 evidence {label} must be {expected}")
-    if "runtime_provenance" in payload:
-        provenance = canonical_bytes(payload["runtime_provenance"]).lower()
-        if b"a5" in provenance or b"catlass" in provenance or b"bz-a5" in provenance:
-            raise ValueError("A3 evidence provenance cannot reference A5 or Catlass")
+    provenance = payload.get("runtime_provenance")
+    if isinstance(provenance, Mapping):
+        items = provenance.items()
+    elif isinstance(provenance, (list, tuple)):
+        items = (
+            item
+            for item in provenance
+            if isinstance(item, (list, tuple))
+            and len(item) == 2
+            and isinstance(item[0], str)
+        )
+    else:
+        items = ()
+    for key, value in items:
+        if key in checks and value != checks[key][0]:
+            raise ValueError(f"A3 evidence {checks[key][1]} must be {checks[key][0]}")
 
 
 @dataclass(frozen=True)

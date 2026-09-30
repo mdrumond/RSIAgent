@@ -4,6 +4,7 @@ import pytest
 
 from benchmarks.a3kernels.phase1_memory import (
     AgentInterpretation,
+    AuthoritativeEvidence,
     HostFact,
     Phase1LearningJournal,
     ProjectMemory,
@@ -14,7 +15,28 @@ from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 CELL = "a3-cell-0123456789abcdef"
 OTHER_CELL = "a3-cell-fedcba9876543210"
 LINEAGE = "pilot-lineage-1"
-EVIDENCE = "a" * 64
+EVIDENCE = f"{1:064x}"
+
+
+def evidence(ordinal):
+    return f"{ordinal:064x}"
+
+
+class Resolver:
+    def __init__(self, records=None):
+        self.records = records if records is not None else {
+            evidence(ordinal): AuthoritativeEvidence(
+                "host-verification",
+                evidence(ordinal),
+                proposal.project_id,
+                "b" * 64,
+                True,
+            )
+            for ordinal, proposal in enumerate(DEFAULT_PROPOSALS, 1)
+        }
+
+    def resolve(self, digest):
+        return self.records.get(digest)
 
 
 def memory(ordinal, *, cell_id=CELL, lineage_id=LINEAGE):
@@ -30,18 +52,24 @@ def memory(ordinal, *, cell_id=CELL, lineage_id=LINEAGE):
             HostFact(
                 "host-verification",
                 f"verified output for project {ordinal}",
-                EVIDENCE,
+                evidence(ordinal),
             ),
         ),
         interpretations=(
-            AgentInterpretation("The result suggests a reusable lesson.", (EVIDENCE,)),
+            AgentInterpretation(
+                "The result suggests a reusable lesson.", (evidence(ordinal),)
+            ),
         ),
     )
 
 
-def journal(path, *, cell_id=CELL, lineage_id=LINEAGE):
+def journal(path, *, cell_id=CELL, lineage_id=LINEAGE, resolver=None):
     return Phase1LearningJournal(
-        path, DEFAULT_PROPOSALS, cell_id=cell_id, lineage_id=lineage_id
+        path,
+        DEFAULT_PROPOSALS,
+        cell_id=cell_id,
+        lineage_id=lineage_id,
+        evidence_resolver=resolver or Resolver(),
     )
 
 
@@ -60,6 +88,43 @@ def test_append_reopen_and_context_keep_host_authority_explicit(tmp_path):
     assert context["lineage_id"] == LINEAGE
     assert context["projects"][0]["host_facts"][0]["authority"] == "host"
     assert context["projects"][0]["agent_interpretations"][0]["supports"] == [EVIDENCE]
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("kind", "profiling", "kind"),
+        ("evidence_sha256", "f" * 64, "digest"),
+        ("project_id", "f" * 64, "project"),
+        ("candidate_sha256", "f" * 64, "candidate"),
+        ("success", False, "success"),
+    ],
+)
+def test_append_requires_matching_authoritative_host_result(
+    tmp_path, field, value, message
+):
+    record = AuthoritativeEvidence(
+        "host-verification",
+        EVIDENCE,
+        DEFAULT_PROPOSALS[0].project_id,
+        "b" * 64,
+        True,
+    )
+    values = record.__dict__.copy()
+    values[field] = value
+    resolver = Resolver({EVIDENCE: AuthoritativeEvidence(**values)})
+
+    with pytest.raises(ValueError, match=message):
+        journal(tmp_path / "unverified.jsonl", resolver=resolver).append(memory(1))
+
+
+def test_append_rejects_unresolved_host_fact_without_writing(tmp_path):
+    active = journal(tmp_path / "missing.jsonl", resolver=Resolver({}))
+
+    with pytest.raises(ValueError, match="resolve"):
+        active.append(memory(1))
+
+    assert not active.path.exists()
 
 
 def test_context_is_byte_identical_after_checkpoint_and_resume(tmp_path):
