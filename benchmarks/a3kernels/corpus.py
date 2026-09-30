@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import subprocess
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import Mapping
+from typing import Callable, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -100,6 +103,65 @@ class CorpusSpec:
         spec.validate()
         return spec
 
+
+CorpusFetcher = Callable[[str, str, tuple[str, ...]], Mapping[str, bytes]]
+
+
+def fetch_pinned_git_files(
+    repository: str, revision: str, paths: tuple[str, ...]
+) -> Mapping[str, bytes]:
+    """Fetch exact blobs from one revision without publishing a checkout."""
+    with tempfile.TemporaryDirectory(prefix="a3-corpus-fetch-") as value:
+        root = Path(value)
+        _git(["init", "--quiet"], root)
+        _git(["remote", "add", "origin", repository], root)
+        _git(["fetch", "--quiet", "--depth=1", "origin", revision], root)
+        resolved = _git(["rev-parse", "FETCH_HEAD^{commit}"], root).decode().strip()
+        if resolved != revision:
+            raise ValueError(f"fetched revision mismatch: expected {revision}, got {resolved}")
+        return {path: _git(["show", f"{revision}:{path}"], root) for path in paths}
+
+
+def _git(arguments: Sequence[str], root: Path) -> bytes:
+    try:
+        return subprocess.run(
+            ["git", *arguments], cwd=root, check=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ).stdout
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {arguments[0]} failed: {detail or exc.returncode}") from exc
+
+
+def prepare_corpus(
+    spec: CorpusSpec,
+    artifacts: Path,
+    *,
+    fetcher: CorpusFetcher = fetch_pinned_git_files,
+) -> Path:
+    """Verify and atomically publish only the pinned allowlisted source blobs."""
+    destination = spec.source_root(artifacts)
+    if destination.exists():
+        load_documents(spec, artifacts)
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    paths = tuple(item.path for item in spec.files)
+    fetched = fetcher(spec.repository, spec.revision, paths)
+    if set(fetched) != set(paths) or any(type(value) is not bytes for value in fetched.values()):
+        raise ValueError("fetcher must return exactly the allowlisted corpus byte blobs")
+    for item in spec.files:
+        actual = hashlib.sha256(fetched[item.path]).hexdigest()
+        if actual != item.sha256:
+            raise ValueError(f"fetched hash mismatch for {item.path}")
+    with tempfile.TemporaryDirectory(prefix=f".{spec.name}-", dir=destination.parent) as value:
+        staging = Path(value) / "sources"
+        for item in spec.files:
+            target = staging / item.path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(fetched[item.path])
+        os.replace(staging, destination)
+    load_documents(spec, artifacts)
+    return destination
 
 def load_documents(spec: CorpusSpec, artifacts: Path) -> tuple[CorpusDocument, ...]:
     """Load an exact prepared allowlist, failing closed on missing or changed bytes."""
