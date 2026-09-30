@@ -9,7 +9,9 @@ from benchmarks.a3_experiments import (
 )
 from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
 from benchmarks.a3kernels.candidate import CandidateCompilation
-from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
+from benchmarks.a3kernels.knowledge_agent import (
+    Citation, KnowledgeQuery, KnowledgeResult,
+)
 from benchmarks.a3kernels.phase1_evidence import EvidenceLedger
 from benchmarks.a3kernels.phase1_memory import (
     AuthoritativeEvidence, Phase1LearningJournal,
@@ -105,7 +107,18 @@ class FakeKnowledge:
     def query(self, query):
         assert isinstance(query, KnowledgeQuery)
         self.queries.append(query.query)
-        return ()
+        if not self.enabled:
+            return ()
+        return (
+            KnowledgeResult(
+                Citation(
+                    "a3-reference", "docs/datacopy.md", 10, 14, "1" * 64,
+                    "2" * 64, "3" * 64,
+                ),
+                "Use DataCopyPad for a bounded tail." * 400,
+                0.9,
+            ),
+        )
 
 
 class FakeProfiler:
@@ -129,7 +142,7 @@ class FakeProfiler:
 
 def _run(
     tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
-    candidate=None, budgets=None,
+    candidate=None, budgets=None, completion_tokens=1,
 ):
     selected = cell or _cell()
     profile = load_a3_model_profile(selected.backend_model)
@@ -139,7 +152,10 @@ def _run(
     def actor(actual_profile, context):
         assert actual_profile == profile
         prompts.append(context)
-        return A3Completion(queue.pop(0), {"profile_sha256": profile.fingerprint})
+        return A3Completion(
+            queue.pop(0), completion_tokens,
+            {"profile_sha256": profile.fingerprint},
+        )
     journal = Phase1LearningJournal(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=selected.cell_id, lineage_id="isolated-lineage",
@@ -223,9 +239,23 @@ def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
         '{"action":"profile","metric":"PipeUtilization"}',
         json.dumps({"action": "submit", "interpretation": "profile supports result", "supports": []}),
     ]
-    result, _, _ = _run(tmp_path, actions, cell=cell, knowledge=knowledge, profiler=profiler)
+    result, prompts, _ = _run(
+        tmp_path, actions, cell=cell, knowledge=knowledge, profiler=profiler
+    )
     assert result.status == "passed"
     assert knowledge.queries == ["DataCopyPad"]
+    observation = json.loads(prompts[4])["observations"][-1]
+    assert observation["knowledge_results"][0]["text"].startswith("Use DataCopyPad")
+    assert len(observation["knowledge_results"][0]["text"]) <= 2048
+    assert observation["knowledge_results"][0]["citation"] == {
+        "chunk_id": "1" * 64,
+        "collection": "a3-reference",
+        "content_sha256": "3" * 64,
+        "end_line": 14,
+        "path": "docs/datacopy.md",
+        "source_revision": "2" * 64,
+        "start_line": 10,
+    }
     assert profiler.requests[0].treatment.value == cell.profiling.value
     assert result.profile_result.candidate_execution_id == result.verified.execution_id
 
@@ -250,7 +280,7 @@ def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
     assert journal.read() == ()
     token_result, _, token_journal = _run(
         tmp_path / "tokens", ['{"action": "compile"}'],
-        budgets=TrialBudgets(3, 1),
+        budgets=TrialBudgets(3, 1), completion_tokens=2,
     )
     assert token_result.status == "budget-exhausted" and token_result.turns == 1
     assert token_result.failures == ("token budget exhausted",)
@@ -273,7 +303,9 @@ def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
     )
     loop = A3TrialLoop(
         cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
-        actor=lambda *_: A3Completion('{"action":"compile"}', {"profile_sha256": "0" * 64}),
+        actor=lambda *_: A3Completion(
+            '{"action":"compile"}', 1, {"profile_sha256": "0" * 64}
+        ),
         candidate=FakeCandidate(), knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
         evidence=EvidenceLedger(tmp_path / "evidence.jsonl"), memory=journal,
         workdir=tmp_path / "work", budgets=TrialBudgets(1, 100),

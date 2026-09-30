@@ -194,25 +194,50 @@ def load_a3_model_profile(model: BackendModel) -> A3ModelProfile:
 @dataclass(frozen=True)
 class A3Completion:
     text: str
+    completion_tokens: int
     provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
+        if (
+            type(self.text) is not str
+            or type(self.completion_tokens) is not int
+            or self.completion_tokens < 1
+        ):
+            raise ValueError("completion requires text and positive provider token usage")
         object.__setattr__(self, "provenance", _deep_freeze(self.provenance))
 
     def as_dict(self) -> dict[str, Any]:
-        return {"text": self.text, "provenance": _json_value(self.provenance)}
+        return {
+            "text": self.text,
+            "completion_tokens": self.completion_tokens,
+            "provenance": _json_value(self.provenance),
+        }
 
 
-Transport = Callable[..., str]
+@dataclass(frozen=True)
+class A3TransportResult:
+    text: str
+    completion_tokens: int
 
 
-def _openai_transport(*, base_url: str, api_key: str, request: Mapping[str, Any]) -> str:
+Transport = Callable[..., A3TransportResult]
+
+
+def _openai_transport(
+    *, base_url: str, api_key: str, request: Mapping[str, Any]
+) -> A3TransportResult:
     from openai import OpenAI
 
     response = OpenAI(api_key=api_key, base_url=base_url).chat.completions.create(
         **dict(request)
     )
-    return response.choices[0].message.content or ""
+    try:
+        return A3TransportResult(
+            response.choices[0].message.content or "",
+            response.usage.completion_tokens,
+        )
+    except (AttributeError, IndexError, TypeError) as exc:
+        raise ValueError("provider response is missing completion token usage") from exc
 
 
 def complete_a3(
@@ -229,11 +254,14 @@ def complete_a3(
     if not api_key:
         raise ValueError(f"missing required credential {profile.credential_env}")
     request = profile.request(system, user)
-    text = (transport or _openai_transport)(
+    result = (transport or _openai_transport)(
         base_url=profile.base_url, api_key=api_key, request=request
     )
+    if not isinstance(result, A3TransportResult):
+        raise TypeError("transport must return A3TransportResult with provider token usage")
     return A3Completion(
-        text=text,
+        text=result.text,
+        completion_tokens=result.completion_tokens,
         provenance={
             "profile_id": profile.profile_id,
             "profile_sha256": profile.fingerprint,
@@ -248,6 +276,6 @@ def complete_a3(
 
 
 __all__ = [
-    "A3Completion", "A3Generation", "A3ModelProfile", "DEEPSEEK_BASE_URL",
+    "A3Completion", "A3Generation", "A3ModelProfile", "A3TransportResult", "DEEPSEEK_BASE_URL",
     "OPENROUTER_BASE_URL", "complete_a3", "load_a3_model_profile",
 ]
