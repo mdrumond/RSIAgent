@@ -162,14 +162,21 @@ def test_execute_failure_is_runtime_evidence_and_does_not_reupload(tmp_path):
 
 def test_compile_observer_loss_reopens_same_handle_without_reupload(tmp_path):
     calls = []
+    observations = 0
     def process(argv, **kwargs):
+        nonlocal observations
         calls.append(tuple(argv))
         if "upload" in argv: return _completed(argv, '{"id":"u1","status":"queued"}')
         if "status" in argv: return _completed(argv, '{"id":"u1","status":"succeeded"}')
         if "observe" in argv:
+            observations += 1
+            if observations == 1:
+                return _completed(argv, "", "listener temporarily unavailable", 2)
             return _completed(argv, "A3REMOTE_STAGE=compile\nA3CANDIDATE_COMPILED=" + "a" * 64 + "\nCATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_HANDLE=gz-a3:compile-pending\nCATLASS_VALIDATION_EXIT=0")
         return _completed(argv, "CATLASS_VALIDATION_PROFILE=gz-a3\nCATLASS_VALIDATION_STATE=observation-unavailable\nCATLASS_VALIDATION_HANDLE=gz-a3:compile-pending\nCATLASS_VALIDATION_EXIT=1", "observer lost", 1)
 
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
     with pytest.raises(RuntimeError, match="retry retained handle"):
         _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
     compilation = _backend(tmp_path, process).compile(_plan(), tmp_path / "local")

@@ -29,6 +29,10 @@ class CandidateBundle:
     execution_id: str
 
 
+class _PendingObservation(RuntimeError):
+    pass
+
+
 _COMPILE_SCRIPT = r'''set -eu
 archive=$1
 destination=$2
@@ -157,9 +161,9 @@ class GZA3RemoteCandidateBackend:
             argv = self._observe_argv(plan, "compile", pending["handle"])
         try:
             completed = self._run_operation(plan, "compile", argv, pending)
+        except _PendingObservation:
+            raise
         except RuntimeError as exc:
-            if "observation unavailable" in str(exc):
-                raise
             return FailedEvidence.create(
                 plan, stage="compile", error_type="RuntimeError", detail=str(exc)
             )
@@ -201,9 +205,9 @@ class GZA3RemoteCandidateBackend:
         )
         try:
             completed = self._run_operation(plan, "execute", argv, pending)
+        except _PendingObservation:
+            raise
         except RuntimeError as exc:
-            if "observation unavailable" in str(exc):
-                raise
             return FailedEvidence.create(
                 plan, stage="execute", error_type="RuntimeError", detail=str(exc)
             )
@@ -306,7 +310,14 @@ class GZA3RemoteCandidateBackend:
         self, plan: ExecutionPlan, operation: str, argv: tuple[str, ...],
         pending: dict[str, str] | None,
     ) -> subprocess.CompletedProcess[str]:
-        completed = self._call(argv)
+        try:
+            completed = self._call(argv)
+        except RuntimeError as exc:
+            if pending is not None:
+                raise _PendingObservation(
+                    f"remote candidate observation incomplete; retry retained handle {pending['handle']}"
+                ) from exc
+            raise
         handles = self._markers(completed.stdout, "CATLASS_VALIDATION_HANDLE=")
         states = self._markers(completed.stdout, "CATLASS_VALIDATION_STATE=")
         profiles = self._markers(completed.stdout, "CATLASS_VALIDATION_PROFILE=")
@@ -318,11 +329,15 @@ class GZA3RemoteCandidateBackend:
             if pending is not None and handles[0] != pending["handle"]:
                 raise RuntimeError("remote candidate observation returned a foreign handle")
             self._publish_pending(plan, operation, handles[0])
-            raise RuntimeError(
+            raise _PendingObservation(
                 f"remote candidate observation unavailable; retry retained handle {handles[0]}"
             )
         if completed.returncode == 0 and pending is not None and handles != [pending["handle"]]:
             raise RuntimeError("remote candidate observation returned a foreign handle")
+        if completed.returncode != 0 and pending is not None and states != ["failed"]:
+            raise _PendingObservation(
+                f"remote candidate observation incomplete; retry retained handle {pending['handle']}"
+            )
         if completed.returncode != 0 and states == ["failed"]:
             self._pending_path(plan, operation).unlink(missing_ok=True)
         return completed
