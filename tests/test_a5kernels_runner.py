@@ -22,7 +22,11 @@ from benchmarks.a5kernels.bz import (
     OUTPUT_MARKER,
     RuntimeUnavailableError,
 )
-from benchmarks.a5kernels.protocol import ExecutionReceipt, SourceFile
+from benchmarks.a5kernels.protocol import (
+    ExecutionEnvironment,
+    ExecutionReceipt,
+    SourceFile,
+)
 
 
 def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
@@ -336,6 +340,19 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
         "input_b": list(plan.input_b),
     }
     assert invocation.remote_directory == f".a5kernels/{plan.execution_id}/trial-1"
+    separator = invocation.argv.index("--")
+    rendered = invocation.argv[separator + 1 :]
+    assert rendered.count("env") == 1
+    assert rendered[:11] == (
+        "env",
+        "-u", "A5KERNEL_COMPILE_ONLY",
+        "-u", "A5KERNEL_EMIT_TIMING",
+        "-u", "A5KERNEL_LAUNCH_COUNT",
+        "-u", "A5KERNEL_WARM_UP",
+        "-u", "PYTHONPYCACHEPREFIX",
+    )
+    assert "A5KERNEL_BLOCK_NUM=1" in rendered
+    assert "BZ_A5_PROFILE_PHYSICAL_DEVICE=0" in rendered
     assert invocation.argv[-5:] == (
         "python",
         "-B",
@@ -438,15 +455,23 @@ def test_catlass_fixture_uses_current_imperative_runtime_api():
     sources = {item.relative_path: item.content for item in fixture.files}
 
     assert fixture.argv == (
-        "env",
-        "-u",
-        "PYTHONPYCACHEPREFIX",
         "python",
         "-B",
         "host_driver.py",
         "kernel.py",
         "input.json",
     )
+    assert dict(fixture.environment.bindings) == {
+        "A5KERNEL_BLOCK_NUM": "1",
+        "BZ_A5_PROFILE_PHYSICAL_DEVICE": "0",
+    }
+    assert set(fixture.environment.unset) == {
+        "A5KERNEL_COMPILE_ONLY",
+        "A5KERNEL_EMIT_TIMING",
+        "A5KERNEL_LAUNCH_COUNT",
+        "A5KERNEL_WARM_UP",
+        "PYTHONPYCACHEPREFIX",
+    }
     assert set(sources) == {"host_driver.py", "kernel.py"}
     assert "tla.allocate" in sources["kernel.py"]
     assert 'tla.vec.func(mode="simd")' in sources["kernel.py"]
@@ -1104,6 +1129,102 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
     assert receipt.exit_code == 9
     assert len(executor.invocations) == 1
     assert f"A5KERNEL_BLOCK_NUM={parallelism}" in executor.invocations[0].argv
+
+
+@pytest.mark.parametrize("binding", ["1", None])
+def test_adapter_accepts_matching_or_missing_typed_parallelism_binding(binding):
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(9, "expected dispatch failure"), runtime_provenance=runtime
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend(runtime_provenance=runtime)).prepare(
+        RunRequest(Language.CATLASS_DSL.value, padded_length=64), attempt_id="trial-1"
+    )
+    environment = ExecutionEnvironment() if binding is None else ExecutionEnvironment(
+        bindings=(("A5KERNEL_BLOCK_NUM", binding),)
+    )
+    plan = replace(
+        plan,
+        environment=environment,
+        runtime_provenance=(
+            *plan.runtime_provenance,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+
+    assert backend.execute(plan).exit_code == 9
+    assert "A5KERNEL_BLOCK_NUM=1" in executor.invocations[0].argv
+
+
+def test_runner_records_the_effective_adapter_environment(tmp_path):
+    from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(9, "expected dispatch failure"), runtime_provenance=runtime
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    runner = A5KernelRunner(backend, evidence_ledger=ledger)
+    request = RunRequest(Language.CATLASS_DSL.value, padded_length=64)
+    plan = replace(
+        runner.prepare(request, attempt_id="trial-1"),
+        environment=ExecutionEnvironment(),
+        runtime_provenance=(
+            *runtime,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+
+    result = runner.run_plan(request, plan)
+
+    action = next(
+        item for item in ledger.entries if item.kind == EvidenceKind.ACTION.value
+    )
+    assert action.payload["environment"]["bindings"] == [
+        ["A5KERNEL_BLOCK_NUM", "1"],
+    ]
+    assert result.execution_id == action.payload["execution_id"]
+    assert result.execution_id in executor.invocations[0].remote_directory
+
+
+def test_adapter_rejects_typed_parallelism_binding_mismatch_before_dispatch():
+    runtime = (("catlass_revision", "1" * 40),)
+    executor = FakeCommandExecutor(
+        CommandResult(0, "must not run"), runtime_provenance=runtime
+    )
+    backend = BZSessionAdapter(
+        executor, session_wrapper="execution-profiles/bz-a5/session.sh"
+    )
+    plan = A5KernelRunner(FakeBackend(runtime_provenance=runtime)).prepare(
+        RunRequest(Language.CATLASS_DSL.value, padded_length=64), attempt_id="trial-1"
+    )
+    plan = replace(
+        plan,
+        environment=ExecutionEnvironment(bindings=(("A5KERNEL_BLOCK_NUM", "4"),)),
+        runtime_provenance=(
+            *plan.runtime_provenance,
+            ("phase1.shape", "n32"),
+            ("phase1.padding", "align-64"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="does not match typed parallelism"):
+        backend.execute(plan)
+    assert executor.invocations == []
 
 
 @pytest.mark.parametrize(

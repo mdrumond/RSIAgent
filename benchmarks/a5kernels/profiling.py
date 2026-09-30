@@ -56,28 +56,19 @@ class ProfileRequest:
             raise ValueError("device must be non-negative")
         if not self.plan.argv:
             raise ValueError("workload_argv must not be empty")
-        device_environment = tuple(
-            argument
-            for argument in self.plan.argv
-            if argument.startswith("BZ_A5_PROFILE_PHYSICAL_DEVICE=")
-        )
-        if device_environment and device_environment != (
-            f"BZ_A5_PROFILE_PHYSICAL_DEVICE={self.device}",
-        ):
+        bindings = dict(self.plan.environment.bindings)
+        device_environment = bindings.get("BZ_A5_PROFILE_PHYSICAL_DEVICE")
+        if device_environment is not None and device_environment != str(self.device):
             raise ValueError(
-                "profile device must match the canonical device bound in plan argv"
+                "profile device must match the canonical device bound in the plan environment"
             )
-        reserved_timing = (
-            "A5KERNEL_EMIT_TIMING=",
-            "A5KERNEL_WARM_UP=",
-            "A5KERNEL_LAUNCH_COUNT=",
-            "A5KERNEL_BLOCK_NUM=",
-        )
-        if any(
-            argument.startswith(reserved_timing)
-            for argument in self.plan.argv
-        ):
-            raise ValueError("plan argv must not override host-owned timing policy")
+        reserved_timing = {
+            "A5KERNEL_EMIT_TIMING",
+            "A5KERNEL_WARM_UP",
+            "A5KERNEL_LAUNCH_COUNT",
+        }
+        if reserved_timing.intersection(bindings):
+            raise ValueError("plan environment must not override host-owned timing policy")
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -147,15 +138,11 @@ def bind_profile_device(plan: ExecutionPlan, device: int) -> ExecutionPlan:
         raise TypeError("plan must be an ExecutionPlan")
     if isinstance(device, bool) or not isinstance(device, int) or device < 0:
         raise ValueError("device must be a non-negative integer")
-    assert plan.argv is not None
-    if any(
-        argument.startswith("BZ_A5_PROFILE_PHYSICAL_DEVICE=")
-        for argument in plan.argv
-    ):
-        raise ValueError("execution plan already contains a device binding")
     return replace(
         plan,
-        argv=("env", f"BZ_A5_PROFILE_PHYSICAL_DEVICE={device}", *plan.argv),
+        environment=plan.environment.with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(device)
+        ),
     )
 
 
@@ -552,6 +539,9 @@ def bind_study_dimensions(
         raise ValueError("execution plan already contains Phase 1 dimensions")
     bound = replace(
         plan,
+        environment=plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", str(dimensions.parallelism.value)
+        ),
         runtime_provenance=(*plan.runtime_provenance, *dimensions.as_provenance()),
     )
     _validate_dimensions_against_plan(bound, dimensions)
@@ -594,14 +584,18 @@ class StudyVariant:
             raise TypeError("correctness must be a VerifiedResult")
         if not isinstance(self.dimensions, StudyDimensions):
             raise TypeError("dimensions must be StudyDimensions")
-        expected_device = f"BZ_A5_PROFILE_PHYSICAL_DEVICE={self.request.device}"
-        if tuple(
-            argument
-            for argument in self.request.plan.argv or ()
-            if argument.startswith("BZ_A5_PROFILE_PHYSICAL_DEVICE=")
-        ) != (expected_device,):
+        bindings = dict(self.request.plan.environment.bindings)
+        if bindings.get("BZ_A5_PROFILE_PHYSICAL_DEVICE") != str(
+            self.request.device
+        ):
             raise ValueError(
                 "Phase 1 variants require one canonical device-bound execution plan"
+            )
+        if bindings.get("A5KERNEL_BLOCK_NUM") != str(
+            self.dimensions.parallelism.value
+        ):
+            raise ValueError(
+                "Phase 1 variants require block count to match typed parallelism"
             )
         if study_dimensions_from_plan(self.request.plan) != self.dimensions:
             raise ValueError(

@@ -24,6 +24,8 @@ from benchmarks.a5kernels.protocol import (
 class ExecutionBackend(Protocol):
     """Boundary implemented by the checked-in BZ-A5 wrapper adapter."""
 
+    def prepare_execution(self, plan: ExecutionPlan) -> ExecutionPlan: ...
+
     def execute(self, plan: ExecutionPlan) -> ExecutionReceipt: ...
 
 
@@ -59,6 +61,7 @@ class A5KernelRunner:
             argv=fixture.argv,
             input_a=input_a,
             input_b=input_b,
+            environment=fixture.environment,
             runtime_provenance=getattr(self._backend, "runtime_provenance", ()),
         )
 
@@ -76,6 +79,9 @@ class A5KernelRunner:
         expected_a, expected_b = self._request_inputs(request)
         if plan.input_a != expected_a or plan.input_b != expected_b:
             raise ValueError("execution plan inputs do not match its run request")
+        prepare_execution = getattr(self._backend, "prepare_execution", None)
+        if prepare_execution is not None:
+            plan = prepare_execution(plan)
         self._record_plan(request, plan)
         try:
             receipt = self._backend.execute(plan)
@@ -171,6 +177,10 @@ class A5KernelRunner:
                 **identity,
                 "language": plan.language,
                 "argv": plan.argv,
+                "environment": {
+                    "bindings": plan.environment.bindings,
+                    "unset": plan.environment.unset,
+                },
                 "inputs_sha256": canonical_digest(
                     {"input_a": plan.input_a, "input_b": plan.input_b}
                 ),

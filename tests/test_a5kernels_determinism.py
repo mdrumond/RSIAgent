@@ -83,6 +83,7 @@ def write_ledger(
         argv=fixture.argv,
         input_a=input_a,
         input_b=input_b,
+        environment=fixture.environment,
     )
     identity = {
         "request_id": request.request_id,
@@ -98,6 +99,10 @@ def write_ledger(
                 **identity,
                 "language": request.language,
                 "argv": fixture_argv(request),
+                "environment": {
+                    "bindings": fixture.environment.bindings,
+                    "unset": fixture.environment.unset,
+                },
                 "inputs_sha256": input_digest(request),
             },
         )
@@ -289,6 +294,12 @@ def test_verified_ledger_converts_to_snapshot(tmp_path):
     assert replay.actions == ({
         "language": "catlass-dsl",
         "argv": fixture_argv(request),
+        "environment": {
+            "bindings": [
+                list(item) for item in fixture_for("catlass-dsl").environment.bindings
+            ],
+            "unset": list(fixture_for("catlass-dsl").environment.unset),
+        },
         "inputs_sha256": input_digest(request),
     },)
     fixture = fixture_for("catlass-dsl")
@@ -351,6 +362,29 @@ def test_snapshot_rejects_numeric_input_digest(tmp_path):
                 ledger.entries,
                 1,
                 {**action.payload, "inputs_sha256": int("1" * 64)},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {"bindings": [["B", "1"], ["A", "2"]], "unset": []},
+        {"bindings": [["BAD-NAME", "1"]], "unset": []},
+        {"bindings": [], "unset": ["X", "X"]},
+        {"bindings": []},
+    ],
+)
+def test_snapshot_rejects_noncanonical_or_invalid_action_environment(
+    tmp_path, environment
+):
+    ledger = write_ledger(tmp_path / "bad-environment.jsonl", "one")
+    action = ledger.entries[1]
+
+    with pytest.raises(ValueError, match="action evidence|action environment"):
+        snapshot_from_ledger(
+            replace_entry_payload(
+                ledger.entries, 1, {**action.payload, "environment": environment}
             )
         )
 

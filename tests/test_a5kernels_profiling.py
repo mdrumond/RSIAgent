@@ -21,7 +21,8 @@ from benchmarks.a5kernels.profiling import (
     TimingResult,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
-from benchmarks.a5kernels import A5KernelRunner, Language, RunRequest
+from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest
+from benchmarks.a5kernels.bz import CommandResult
 from benchmarks.a5kernels.protocol import (
     ExecutionPlan,
     ExecutionReceipt,
@@ -86,7 +87,13 @@ def test_profile_request_binds_to_host_prepared_attempt() -> None:
     plan = A5KernelRunner(PreparingBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value), attempt_id="host-attempt-7"
     )
-    plan = replace(plan, argv=("python", "driver.py"))
+    plan = replace(
+        plan,
+        argv=("python", "driver.py"),
+        environment=plan.environment.with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", "3"
+        ),
+    )
 
     request = ProfileRequest.from_execution_plan(
         plan,
@@ -542,6 +549,9 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     profiled_plan = replace(
         PLAN,
         argv=("python", "kernel.py", "input.json"),
+        environment=PLAN.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", "4"
+        ).with_binding("BZ_A5_PROFILE_PHYSICAL_DEVICE", "3"),
         runtime_provenance=(
             ("ascendnpu_ir_gitlink", "gitlink"),
             ("ascendnpu_ir_install_commit", "install"),
@@ -586,10 +596,13 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         if "--operation" in call and call[call.index("--operation") + 2] == "run"
     )
     separator = timing_call.index("--")
-    assert timing_call[separator + 1 : separator + 4] == (
+    assert timing_call[separator + 1 : separator + 7] == (
         "env",
-        f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
+        "A5KERNEL_BLOCK_NUM=4",
         "A5KERNEL_EMIT_TIMING=1",
+        "A5KERNEL_LAUNCH_COUNT=1",
+        "A5KERNEL_WARM_UP=0",
+        f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
     )
     assert "A5KERNEL_WARM_UP=0" in timing_call
     assert "A5KERNEL_LAUNCH_COUNT=1" in timing_call
@@ -598,7 +611,7 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         for call in calls
         if "--operation" in call and call[call.index("--operation") + 2] == "profile"
     ]
-    assert all("A5KERNEL_BLOCK_NUM=1" in call for call in profile_calls)
+    assert all("A5KERNEL_BLOCK_NUM=4" in call for call in profile_calls)
     assert [call[call.index("--metric") + 1] for call in profile_calls] == [
         "BasicInfo",
         "PipeUtilization",
@@ -618,6 +631,47 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     assert "--kernel-name" not in collection_calls[1]
     assert "--kernel-name" in collection_calls[2]
     assert "--kernel-name" not in collection_calls[3]
+
+    class RecordingExecutor:
+        runtime_provenance = profiled_plan.runtime_provenance
+
+        def __init__(self):
+            self.invocation = None
+
+        def run(self, invocation):
+            self.invocation = invocation
+            return CommandResult(9, "expected test dispatch failure")
+
+        def inspect(self, argv):  # pragma: no cover - failed dispatch is terminal
+            raise AssertionError(f"unexpected evidence inspection: {argv}")
+
+    executor = RecordingExecutor()
+    correctness = BZSessionAdapter(
+        executor, session_wrapper="/profiles/session.sh"
+    )
+    correctness.execute(profiled_plan)
+    assert executor.invocation is not None
+    correctness_argv = executor.invocation.argv
+    assert "A5KERNEL_BLOCK_NUM=4" in correctness_argv
+    assert "A5KERNEL_BLOCK_NUM=4" in timing_call
+    assert profiled_request.execution_id == profiled_plan.execution_id
+
+    mismatched_study_plan = replace(
+        profiled_plan,
+        input_a=tuple([1.0] * 64),
+        input_b=tuple([2.0] * 64),
+        runtime_provenance=(
+            *profiled_plan.runtime_provenance,
+            ("phase1.shape", "n64"),
+            ("phase1.padding", "none"),
+            ("phase1.access", "contiguous"),
+            ("phase1.parallelism", "1"),
+        ),
+    )
+    mismatched_request = replace(profiled_request, plan=mismatched_study_plan)
+    with pytest.raises(ValueError, match="block count must match"):
+        backend._adapter_argv("mismatched-study", "run", mismatched_request)
+
     wrapper_operations = {
         call[call.index("--operation") + 1]
         for call in calls

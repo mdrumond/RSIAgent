@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from benchmarks.a5kernels.protocol import SourceFile
+from benchmarks.a5kernels.protocol import ExecutionEnvironment, SourceFile
 
 
 class Language(str, Enum):
@@ -22,6 +22,7 @@ class Fixture:
     # A missing argv is an explicit, fail-closed support boundary.
     argv: tuple[str, ...] | None = None
     max_length: int | None = None
+    environment: ExecutionEnvironment = ExecutionEnvironment()
 
 
 _CATLASS_SOURCE = '''\
@@ -482,9 +483,6 @@ _FIXTURES = {
             SourceFile("host_driver.py", _CATLASS_DRIVER),
         ),
         (
-            "env",
-            "-u",
-            "PYTHONPYCACHEPREFIX",
             "python",
             "-B",
             "host_driver.py",
@@ -492,6 +490,19 @@ _FIXTURES = {
             "input.json",
         ),
         400,
+        ExecutionEnvironment(
+            bindings=(
+                ("A5KERNEL_BLOCK_NUM", "1"),
+                ("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0"),
+            ),
+            unset=(
+                "A5KERNEL_COMPILE_ONLY",
+                "A5KERNEL_EMIT_TIMING",
+                "A5KERNEL_LAUNCH_COUNT",
+                "A5KERNEL_WARM_UP",
+                "PYTHONPYCACHEPREFIX",
+            ),
+        ),
     ),
     Language.TRITON_ASCEND: Fixture(
         Language.TRITON_ASCEND,
@@ -526,7 +537,9 @@ def catlass_candidate_fixture(source: str) -> Fixture:
         if item.relative_path == "kernel.py" else item
         for item in fixture.files
     )
-    return Fixture(fixture.language, files, fixture.argv, fixture.max_length)
+    return Fixture(
+        fixture.language, files, fixture.argv, fixture.max_length, fixture.environment
+    )
 
 
 def fixture_for(language: Language | str) -> Fixture:

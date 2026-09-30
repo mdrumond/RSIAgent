@@ -8,7 +8,7 @@ shell syntax.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -290,10 +290,7 @@ class BZSessionAdapter:
             raise RuntimeUnavailableError(
                 f"no executable runtime is registered for {plan.language}"
             )
-        if not self._runtime_provenance_matches(plan):
-            raise RuntimeUnavailableError(
-                "execution plan runtime provenance does not match the configured backend"
-            )
+        plan = self.prepare_execution(plan)
         session_name = f"codex-a5hello-{plan.execution_id}-{plan.attempt_id}"
         remote_directory = f".a5kernels/{plan.execution_id}/{plan.attempt_id}"
         payload = json.dumps(
@@ -306,13 +303,7 @@ class BZSessionAdapter:
             f"{remote_directory}/{arg}" if arg in staged_paths else arg
             for arg in plan.argv
         )
-        dimensions = study_dimensions_from_plan(plan)
-        if dimensions is not None:
-            remote_argv = (
-                "env",
-                f"A5KERNEL_BLOCK_NUM={dimensions.parallelism.value}",
-                *remote_argv,
-            )
+        remote_argv = plan.environment.render(remote_argv)
         invocation = CommandInvocation(
             argv=(
                 self._wrapper,
@@ -358,6 +349,27 @@ class BZSessionAdapter:
                 or dispatch.session_handle
                 or f"bz-a5:{session_name}"
             ),
+        )
+
+    def prepare_execution(self, plan: ExecutionPlan) -> ExecutionPlan:
+        """Return the exact immutable plan that will cross the BZ boundary."""
+
+        if not self._runtime_provenance_matches(plan):
+            raise RuntimeUnavailableError(
+                "execution plan runtime provenance does not match the configured backend"
+            )
+        dimensions = study_dimensions_from_plan(plan)
+        if dimensions is None:
+            return plan
+        block_num = str(dimensions.parallelism.value)
+        existing = dict(plan.environment.bindings).get("A5KERNEL_BLOCK_NUM")
+        if existing is not None and existing != block_num:
+            raise ValueError(
+                "A5KERNEL_BLOCK_NUM binding does not match typed parallelism"
+            )
+        environment = plan.environment.with_binding("A5KERNEL_BLOCK_NUM", block_num)
+        return plan if environment == plan.environment else replace(
+            plan, environment=environment
         )
 
     def _runtime_provenance_matches(
