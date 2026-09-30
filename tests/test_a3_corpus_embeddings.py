@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from benchmarks.a3kernels import corpus
-from benchmarks.a3kernels.corpus import CorpusSpec, load_documents
+from benchmarks.a3kernels.corpus import CorpusSpec, load_documents, prepare_corpus
 from benchmarks.a3kernels.embeddings import (
     DEFAULT_EMBEDDING_REVISION,
     EmbeddingLoadError,
@@ -146,6 +146,44 @@ def test_load_documents_is_ordered_and_fails_closed_on_missing_or_drift(tmp_path
     (root / "a.md").write_bytes(b"changed\n")
     with pytest.raises(ValueError, match="hash mismatch"):
         load_documents(spec, tmp_path / "artifacts")
+
+
+def test_prepare_fetches_exact_allowlist_atomically_and_reuses_verified_tree(tmp_path):
+    values = {"a.md": b"first\n", "nested/z.cpp": b"second\n"}
+    base = CorpusSpec.load(CORPORA / "a3-ascendc-en.json")
+    spec = base.with_files(values)
+    calls = []
+
+    def fetch(repository, revision, paths):
+        calls.append((repository, revision, paths))
+        return dict(values)
+
+    root = prepare_corpus(spec, tmp_path, fetcher=fetch)
+    assert [(item.path, item.text) for item in load_documents(spec, tmp_path)] == [
+        ("a.md", "first\n"), ("nested/z.cpp", "second\n")
+    ]
+    assert prepare_corpus(
+        spec, tmp_path,
+        fetcher=lambda *_args: (_ for _ in ()).throw(AssertionError("must reuse")),
+    ) == root
+    assert calls == [(spec.repository, spec.revision, tuple(values))]
+
+
+@pytest.mark.parametrize("failure", ["missing", "extra", "hash"])
+def test_prepare_mismatch_never_publishes_partial_sources(tmp_path, failure):
+    values = {"a.md": b"first\n", "z.cpp": b"second\n"}
+    spec = CorpusSpec.load(CORPORA / "a3-ascendc-en.json").with_files(values)
+    fetched = dict(values)
+    if failure == "missing":
+        fetched.pop("z.cpp")
+    elif failure == "extra":
+        fetched["other.md"] = b"other\n"
+    else:
+        fetched["a.md"] = b"changed\n"
+
+    with pytest.raises(ValueError, match="allowlisted|hash mismatch"):
+        prepare_corpus(spec, tmp_path, fetcher=lambda *_args: fetched)
+    assert not spec.source_root(tmp_path).exists()
 
 
 def test_query_and_documents_use_separate_encoding_paths():

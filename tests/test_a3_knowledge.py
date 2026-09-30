@@ -5,6 +5,7 @@ import sqlite3
 
 import pytest
 
+import benchmarks.a3kernels.knowledge as knowledge
 from benchmarks.a3kernels.corpus import CorpusDocument
 from benchmarks.a3kernels.embeddings import (
     DEFAULT_EMBEDDING_MODEL,
@@ -155,3 +156,35 @@ def test_vector_ties_have_stable_digest_order(tmp_path):
         database.index([document("z.cpp", "one\n"), document("a.cpp", "two\n")])
         hits = database.query("a3-docs", "anything", limit=2)
     assert [hit.chunk_id for hit in hits] == sorted(hit.chunk_id for hit in hits)
+
+
+def test_manifest_identity_binds_chunk_schema_and_window(monkeypatch, tmp_path):
+    item = document("kernel.cpp", "vector kernel\n")
+    with KnowledgeDB.create(tmp_path / "first.sqlite", FakeEmbeddings()) as database:
+        first = database.index([item])
+    assert (first.chunk_schema, first.chunk_lines, first.chunk_overlap) == (
+        "a3-lines-v1", 80, 20,
+    )
+
+    monkeypatch.setattr(knowledge, "CHUNK_LINES", 64)
+    with KnowledgeDB.create(tmp_path / "second.sqlite", FakeEmbeddings()) as database:
+        changed = database.index([item])
+    assert changed.fingerprint != first.fingerprint
+
+
+def test_lexical_rank_matches_tokens_not_incidental_substrings(tmp_path):
+    class TiedEmbeddings(FakeEmbeddings):
+        def embed_documents(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        def embed_queries(self, texts):
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+    with KnowledgeDB.create(tmp_path / "db.sqlite", TiedEmbeddings()) as database:
+        database.index([
+            document("incidental.cpp", "concatenate allocation\n"),
+            document("token.cpp", "cat kernel\n"),
+        ])
+        hits = database.query("a3-docs", "cat", limit=2)
+    ranks = {hit.path: hit.lexical_rank for hit in hits}
+    assert ranks == {"token.cpp": 1, "incidental.cpp": None}
