@@ -284,10 +284,39 @@ class GZA3ProfilingBackend:
             return None
         try:
             value = json.loads(path.read_text())
-        except json.JSONDecodeError as exc:
+        except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError("retained GZ-A3 replay is corrupt") from exc
+        if (
+            type(value) is not dict
+            or set(value) != {"request_id", "mode", "result", "evidence"}
+            or type(value["result"]) is not dict
+            or type(value["evidence"]) is not dict
+        ):
+            raise RuntimeError("retained GZ-A3 replay is corrupt")
         if value.get("request_id") != request_id or value.get("mode") != mode:
             raise ValueError("conflicting replay request")
+        try:
+            evidence = GZA3RunEvidence(**value["evidence"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("retained GZ-A3 replay evidence is corrupt") from exc
+        digest_ok = all(
+            type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in (evidence.stdout_sha256, evidence.stderr_sha256)
+        )
+        if (
+            evidence.replay_id != replay
+            or evidence.request_id != request_id
+            or evidence.mode != mode
+            or evidence.status != "completed"
+            or type(evidence.handle) is not str
+            or not evidence.handle.startswith("gz-a3:")
+            or type(evidence.physical_device) is not int
+            or evidence.physical_device != self._device
+            or type(evidence.logical_device) is not int
+            or evidence.logical_device != 0
+            or not digest_ok
+        ):
+            raise RuntimeError("retained GZ-A3 replay evidence identity is invalid")
         return value
 
     def _publish(
