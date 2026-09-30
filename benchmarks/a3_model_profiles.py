@@ -27,6 +27,24 @@ def _exact_keys(value: Mapping[str, Any], expected: set[str]) -> None:
         raise ValueError("A3 model profile requires its exact schema")
 
 
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    return value
+
+
+def _json_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _json_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True)
 class A3Generation:
     max_tokens: int
@@ -179,7 +197,10 @@ class A3Completion:
     provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "provenance", MappingProxyType(dict(self.provenance)))
+        object.__setattr__(self, "provenance", _deep_freeze(self.provenance))
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"text": self.text, "provenance": _json_value(self.provenance)}
 
 
 Transport = Callable[..., str]

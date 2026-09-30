@@ -5,6 +5,7 @@ import pytest
 from benchmarks.a3_model_profiles import (
     DEEPSEEK_BASE_URL,
     OPENROUTER_BASE_URL,
+    A3Completion,
     A3ModelProfile,
     complete_a3,
     load_a3_model_profile,
@@ -118,3 +119,45 @@ def test_profile_json_rejects_extra_alias_field():
     payload["model_alias"] = "deepseek"
     with pytest.raises(ValueError, match="exact schema"):
         A3ModelProfile.from_mapping(payload)
+
+
+def test_completion_provenance_is_deeply_immutable_and_caller_isolated():
+    caller_owned = {
+        "generation": {"max_tokens": 32768, "tags": ["native", "a3"]},
+        "route": ["deepseek"],
+    }
+    completion = A3Completion("candidate", caller_owned)
+
+    caller_owned["generation"]["max_tokens"] = 1
+    caller_owned["generation"]["tags"].append("changed")
+    caller_owned["route"].append("fallback")
+    assert completion.as_dict()["provenance"] == {
+        "generation": {"max_tokens": 32768, "tags": ["native", "a3"]},
+        "route": ["deepseek"],
+    }
+    with pytest.raises(TypeError):
+        completion.provenance["generation"]["max_tokens"] = 1
+    with pytest.raises(AttributeError):
+        completion.provenance["generation"]["tags"].append("changed")
+    exported = completion.as_dict()
+    exported["provenance"]["generation"]["max_tokens"] = 2
+    assert completion.provenance["generation"]["max_tokens"] == 32768
+
+
+def test_transport_request_mutation_cannot_change_recorded_provenance():
+    def mutating_transport(*, request, **_kwargs):
+        request["reasoning_effort"] = "low"
+        request["extra_body"]["thinking"]["type"] = "disabled"
+        return "candidate"
+
+    result = complete_a3(
+        "system", "user", model=BackendModel.DEEPSEEK_FLASH,
+        environ={"DEEPSEEK_API_KEY": "secret"}, transport=mutating_transport,
+    )
+    assert result.as_dict()["provenance"]["generation"] == {
+        "max_tokens": 32768,
+        "top_p": 1.0,
+        "reasoning_effort": "high",
+        "temperature": None,
+        "thinking": True,
+    }
