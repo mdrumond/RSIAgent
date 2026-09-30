@@ -169,6 +169,106 @@ def test_replay_reuses_identical_evidence_and_rejects_conflict(tmp_path):
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("candidate_execution_id", "f" * 64),
+        ("source_fingerprint", "f" * 64),
+        ("evidence_sha256", "f" * 64),
+    ],
+)
+def test_timing_replay_revalidates_binding_and_digest(tmp_path, field, value):
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, output(
+            "A3TIMING_US=7",
+            'A3PROFILE_META={"language":"ascend-c","logical_device":0,'
+            '"mode":"timing","remote_report":null,"runtime":"native-ascend-c",'
+            '"target":"Ascend910B4"}',
+        ), "")
+
+    concrete = backend(tmp_path, runner)
+    concrete.time(BINDING, DIMENSIONS, replay_id="corrupt-timing")
+    path = tmp_path / "evidence" / "corrupt-timing" / "record.json"
+    record = json.loads(path.read_text())
+    record["result"][field] = value
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        concrete.time(BINDING, DIMENSIONS, replay_id="corrupt-timing")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("request_id", "f" * 64),
+        ("candidate_execution_id", "f" * 64),
+        ("source_fingerprint", "f" * 64),
+        ("report_sha256", "f" * 64),
+        ("evidence_sha256", "f" * 64),
+    ],
+)
+def test_profile_replay_revalidates_request_binding_and_digest(tmp_path, field, value):
+    request = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION)
+    compact = {
+        "exported_kernels": ["vector_add"],
+        "metric_values": [["vector_ratio", 0.75]],
+        "timeline": [["kernel_count", 5]],
+        "report_sha256": "e" * 64,
+    }
+    meta = {
+        "language": "ascend-c", "logical_device": 0, "mode": "profile",
+        "remote_report": "/data2/reports/a3-profile", "runtime": "native-ascend-c",
+        "target": "Ascend910B4",
+    }
+
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, output(
+            "A3PROFILE_COMPACT=" + json.dumps(compact, separators=(",", ":")),
+            "A3PROFILE_META=" + json.dumps(meta, separators=(",", ":")),
+        ), "")
+
+    concrete = backend(tmp_path, runner)
+    concrete.profile(request, replay_id="corrupt-profile")
+    path = tmp_path / "evidence" / "corrupt-profile" / "record.json"
+    record = json.loads(path.read_text())
+    record["result"][field] = value
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        concrete.profile(request, replay_id="corrupt-profile")
+
+
+def test_replay_revalidates_retained_evidence_identity(tmp_path):
+    def runner(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, output(
+            "A3TIMING_US=7",
+            'A3PROFILE_META={"language":"ascend-c","logical_device":0,'
+            '"mode":"timing","remote_report":null,"runtime":"native-ascend-c",'
+            '"target":"Ascend910B4"}',
+        ), "")
+
+    concrete = backend(tmp_path, runner)
+    concrete.time(BINDING, DIMENSIONS, replay_id="evidence-binding")
+    path = tmp_path / "evidence" / "evidence-binding" / "record.json"
+    record = json.loads(path.read_text())
+    record["evidence"]["request_id"] = "f" * 64
+    path.write_text(json.dumps(record))
+
+    with pytest.raises(RuntimeError, match="evidence identity"):
+        concrete.time(BINDING, DIMENSIONS, replay_id="evidence-binding")
+
+
+def test_non_object_replay_record_is_reported_as_corrupt(tmp_path):
+    path = tmp_path / "evidence" / "broken-record" / "record.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("[]")
+
+    with pytest.raises(RuntimeError, match="corrupt"):
+        backend(tmp_path, lambda *_a, **_k: None).time(
+            BINDING, DIMENSIONS, replay_id="broken-record"
+        )
+
+
 def test_missing_or_conflicting_compact_output_fails_without_publication(tmp_path):
     request = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.BASIC)
 

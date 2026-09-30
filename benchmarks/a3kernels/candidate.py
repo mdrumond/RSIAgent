@@ -24,7 +24,7 @@ from benchmarks.a3kernels.phase1_protocol import (
 
 
 _PACKAGE = "benchmarks.a3kernels.candidate_runtime"
-_HOST_FILES = ("build.json", "host_driver.py", "host_wrapper.inc")
+_HOST_FILES = ("a3_profile_driver.py", "build.json", "host_driver.py", "host_wrapper.inc")
 _COMPILE_ARGV = ("python", "host_driver.py", "--compile-only")
 _RUN_ARGV = ("python", "host_driver.py", "input.json")
 _COMPILE_MARKER = "A3CANDIDATE_COMPILED="
@@ -44,6 +44,12 @@ def _host_source_files() -> tuple[SourceFile, ...]:
         SourceFile(name, root.joinpath(name).read_text(encoding="utf-8"))
         for name in _HOST_FILES
     )
+
+
+def profile_driver_asset() -> SourceFile:
+    """Return the exact staged driver bytes and their ``SourceFile.sha256`` binding."""
+
+    return next(item for item in _host_source_files() if item.relative_path == "a3_profile_driver.py")
 
 
 def validate_candidate_source(source: str) -> None:
@@ -263,5 +269,5 @@ def _detail(completed: subprocess.CompletedProcess[str]) -> str:
 
 __all__ = [
     "A3CandidateBackend", "CandidateCompilation", "FailedEvidence",
-    "VerifiedResult", "validate_candidate_source",
+    "VerifiedResult", "profile_driver_asset", "validate_candidate_source",
 ]
