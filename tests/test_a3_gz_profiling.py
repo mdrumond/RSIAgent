@@ -169,6 +169,41 @@ def test_replay_reuses_identical_evidence_and_rejects_conflict(tmp_path):
     assert len(calls) == 1
 
 
+def test_observation_unavailable_reopens_same_handle_without_resubmission(tmp_path):
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(argv, 1, output(
+                "A3TIMING_US=7",
+                'A3PROFILE_META={"language":"ascend-c","logical_device":0,'
+                '"mode":"timing","remote_report":null,"runtime":"native-ascend-c",'
+                '"target":"Ascend910B4"}',
+            ).replace("CATLASS_VALIDATION_STATE=completed", "CATLASS_VALIDATION_STATE=observation-unavailable"), "observer lost")
+        return subprocess.CompletedProcess(argv, 0, output(
+            "A3TIMING_US=7",
+            'A3PROFILE_META={"language":"ascend-c","logical_device":0,'
+            '"mode":"timing","remote_report":null,"runtime":"native-ascend-c",'
+            '"target":"Ascend910B4"}',
+        ), "")
+
+    replay = "recover-timing"
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        backend(tmp_path, runner).time(BINDING, DIMENSIONS, replay_id=replay)
+    pending = json.loads((tmp_path / "evidence" / replay / "pending.json").read_text())
+    assert pending["handle"] == "gz-a3:job-123"
+
+    result = backend(tmp_path, runner).time(BINDING, DIMENSIONS, replay_id=replay)
+
+    assert result.samples_us == (7.0,)
+    assert len(calls) == 2
+    assert "timing" in calls[0] and "observe" not in calls[0]
+    assert calls[1][-3:] == ("observe", "--handle", "gz-a3:job-123")
+    assert not (tmp_path / "evidence" / replay / "pending.json").exists()
+    assert (tmp_path / "evidence" / replay / "record.json").is_file()
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
