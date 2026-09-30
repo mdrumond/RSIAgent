@@ -5,12 +5,17 @@ import pytest
 from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.phase1_registry import CurriculumProposal
 from benchmarks.a5kernels.profiling import (
+    AccessClass,
+    PaddingClass,
     ParallelismClass,
     Phase1StudyResult,
     ProfileCapture,
     ProfileMetric,
     StudyPreset,
+    StudyDimensions,
     StudyTimingSample,
+    StudyVariant,
+    ShapeClass,
     bind_study_dimensions,
 )
 from tests.test_a5_phase1_performance import SHA, variant
@@ -80,6 +85,43 @@ def block_variant(block_count):
         correctness=correctness,
         dimensions=dimensions,
     )
+
+
+def dimension_variant(dimensions):
+    candidate = variant()
+    logical_length = int(dimensions.shape.value.removeprefix("n"))
+    if dimensions.padding is PaddingClass.NONE:
+        physical_length = logical_length
+    else:
+        alignment = 64 if dimensions.padding is PaddingClass.ALIGN_64 else 256
+        physical_length = (
+            (logical_length + alignment - 1) // alignment
+        ) * alignment
+    plan = replace(
+        candidate.request.plan,
+        input_a=(
+            *([1.0] * logical_length),
+            *([0.0] * (physical_length - logical_length)),
+        ),
+        input_b=(
+            *([2.0] * logical_length),
+            *([0.0] * (physical_length - logical_length)),
+        ),
+        runtime_provenance=tuple(
+            item
+            for item in candidate.request.plan.runtime_provenance
+            if not item[0].startswith("phase1.")
+        ),
+    )
+    plan = bind_study_dimensions(plan, dimensions)
+    request = replace(candidate.request, plan=plan)
+    correctness = replace(
+        candidate.correctness,
+        request_id=request.request_id,
+        execution_id=request.execution_id,
+        source_fingerprint=request.source_fingerprint,
+    )
+    return StudyVariant(request, correctness, dimensions)
 
 @pytest.mark.parametrize("registered", [
     proposal("vector-add-baseline", {"length": 32}, "correctness"),
@@ -166,7 +208,7 @@ def test_dispatcher_preserves_study_correctness_gate():
 def test_length_knee_rejects_variant_for_different_length_before_dispatch():
     backend = RecordingBackend()
 
-    with pytest.raises(ValueError, match="shape does not match proposal length"):
+    with pytest.raises(ValueError, match="shape does not match the proposal runtime"):
         Phase1PerformanceExecution(backend).run(
             proposal("length-knee", {"length": 128}, "correctness-timing"),
             [variant()],
@@ -188,7 +230,9 @@ def test_unsupported_knee_length_is_rejected_before_backend_dispatch():
 def test_cross_layer_rejects_variant_for_different_block_count():
     backend = RecordingBackend()
 
-    with pytest.raises(ValueError, match="proposal block_count"):
+    with pytest.raises(
+        ValueError, match="parallelism does not match the proposal runtime"
+    ):
         Phase1PerformanceExecution(backend).run(
             proposal("cross-layer-launch", {"block_count": 6}, "correctness-timing"),
             [variant()],
@@ -214,3 +258,72 @@ def test_cross_layer_registered_block_count_dispatches_fixed_timing():
         ) == "6"
         for command in backend.commands
     )
+
+
+@pytest.mark.parametrize(
+    "registered,candidate,field",
+    [
+        pytest.param(
+            proposal("length-knee", {"length": 64}, "correctness-timing"),
+            dimension_variant(StudyDimensions(
+                ShapeClass.N64,
+                PaddingClass.ALIGN_256,
+                AccessClass.CONTIGUOUS,
+                ParallelismClass.ONE,
+            )),
+            "padding",
+            id="length-knee-padding",
+        ),
+        pytest.param(
+            proposal("cross-layer-launch", {"block_count": 6}, "correctness-timing"),
+            dimension_variant(StudyDimensions(
+                ShapeClass.N64,
+                PaddingClass.NONE,
+                AccessClass.CONTIGUOUS,
+                ParallelismClass.SIX,
+            )),
+            "shape",
+            id="cross-layer-shape",
+        ),
+        pytest.param(
+            proposal("msprof-pipe", {"metric": "PipeUtilization"}, "msprof-guided"),
+            block_variant(2),
+            "parallelism",
+            id="msprof-parallelism",
+        ),
+    ],
+)
+def test_dispatcher_rejects_each_family_runtime_mismatch_before_dispatch(
+    registered, candidate, field
+):
+    backend = RecordingBackend()
+
+    with pytest.raises(
+        ValueError, match=f"study {field} does not match the proposal runtime"
+    ):
+        Phase1PerformanceExecution(backend).run(registered, [candidate])
+
+    assert backend.commands == []
+
+
+def test_dispatcher_explicitly_checks_contiguous_runtime_access_before_dispatch():
+    backend = RecordingBackend()
+    candidate = variant()
+    # StudyVariant itself currently admits only contiguous plans. Corrupt a copy
+    # to prove the dispatcher independently enforces the project runtime contract.
+    candidate = replace(candidate)
+    object.__setattr__(
+        candidate,
+        "dimensions",
+        replace(candidate.dimensions, access=AccessClass.STRIDED_2),
+    )
+
+    with pytest.raises(
+        ValueError, match="study access does not match the proposal runtime"
+    ):
+        Phase1PerformanceExecution(backend).run(
+            proposal("msprof-pipe", {"metric": "PipeUtilization"}, "msprof-guided"),
+            [candidate],
+        )
+
+    assert backend.commands == []

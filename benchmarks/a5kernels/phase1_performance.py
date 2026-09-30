@@ -7,12 +7,16 @@ from collections.abc import Sequence
 from benchmarks.a5kernels.phase1_registry import (
     CurriculumProposal,
     EvidencePreset,
-    ProjectFamily,
 )
+from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.profiling import (
+    AccessClass,
+    PaddingClass,
+    ParallelismClass,
     Phase1PerformanceStudy,
     Phase1StudyBackend,
     Phase1StudyResult,
+    ShapeClass,
     StudyPreset,
     StudyVariant,
 )
@@ -63,21 +67,20 @@ class Phase1PerformanceExecution:
     def _validate_dimensions(
         proposal: CurriculumProposal, variants: Sequence[StudyVariant]
     ) -> None:
-        parameters = dict(proposal.parameters)
-        if proposal.family in {
-            ProjectFamily.VECTOR_ADD_BASELINE,
-            ProjectFamily.PADDED_MULTITILE,
-            ProjectFamily.LENGTH_KNEE,
-        }:
-            expected = parameters["length"]
-            if any(
-                int(item.dimensions.shape.value.removeprefix("n")) != expected
-                for item in variants
-            ):
-                raise ValueError("study shape does not match proposal length")
-        elif proposal.family is ProjectFamily.CROSS_LAYER_LAUNCH:
-            expected = parameters["block_count"]
-            if any(item.dimensions.parallelism.value != expected for item in variants):
+        runtime = Phase1ProjectRuntime.from_proposal(proposal)
+        expected_padding = (
+            PaddingClass.NONE
+            if runtime.padded_length == runtime.logical_length
+            else PaddingClass.ALIGN_64
+        )
+        expected = {
+            "shape": ShapeClass(f"n{runtime.logical_length}"),
+            "padding": expected_padding,
+            "access": AccessClass.CONTIGUOUS,
+            "parallelism": ParallelismClass(runtime.block_count),
+        }
+        for field, value in expected.items():
+            if any(getattr(item.dimensions, field) is not value for item in variants):
                 raise ValueError(
-                    "study parallelism does not match proposal block_count"
+                    f"study {field} does not match the proposal runtime"
                 )
