@@ -17,6 +17,7 @@ from benchmarks.a5kernels.profiling import (
     StudyVariant,
     bind_study_dimensions,
     bind_profile_device,
+    study_dimensions_from_plan,
 )
 from tests.test_a5kernels_profiling import (
     CORRECT,
@@ -341,7 +342,7 @@ def test_profile_request_rejects_noncanonical_block_bindings(encoded):
         replace(REQUEST, plan=plan)
 
 
-def test_registered_n400_align64_variant_uses_physical_448_inputs():
+def test_bind_n400_align64_dimensions_uses_physical_448_inputs():
     dimensions = StudyDimensions(
         ShapeClass.N400,
         PaddingClass.ALIGN_64,
@@ -359,20 +360,11 @@ def test_registered_n400_align64_variant_uses_physical_448_inputs():
         ),
         dimensions,
     )
-    request = replace(REQUEST, plan=plan)
-    correctness = replace(
-        CORRECT,
-        execution_id=request.execution_id,
-        source_fingerprint=request.source_fingerprint,
-    )
-
-    registered = StudyVariant(request, correctness, dimensions)
-
-    assert registered.dimensions.shape is ShapeClass.N400
-    assert len(registered.request.plan.input_a) == 448
+    assert study_dimensions_from_plan(plan) == dimensions
+    assert len(plan.input_a) == 448
 
 
-def test_registered_block_count_six_is_bound_to_variant_plan():
+def test_bind_block_count_six_sets_study_plan_environment():
     dimensions = StudyDimensions(
         ShapeClass.N64,
         PaddingClass.NONE,
@@ -390,19 +382,8 @@ def test_registered_block_count_six_is_bound_to_variant_plan():
         ),
         dimensions,
     )
-    request = replace(REQUEST, plan=plan)
-    correctness = replace(
-        CORRECT,
-        execution_id=request.execution_id,
-        source_fingerprint=request.source_fingerprint,
-    )
-
-    registered = StudyVariant(request, correctness, dimensions)
-
-    assert (
-        dict(registered.request.plan.environment.bindings)["A5KERNEL_BLOCK_NUM"]
-        == "6"
-    )
+    assert study_dimensions_from_plan(plan) == dimensions
+    assert dict(plan.environment.bindings)["A5KERNEL_BLOCK_NUM"] == "6"
 
 
 def test_bind_study_dimensions_sets_matching_block_binding():

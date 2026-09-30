@@ -19,11 +19,8 @@ from benchmarks.a5kernels.profiling import (
     AccessClass,
     PaddingClass,
     ParallelismClass,
-    ProfileRequest,
     ShapeClass,
     StudyDimensions,
-    StudyVariant,
-    bind_study_dimensions,
 )
 from benchmarks.a5kernels.protocol import ExecutionReceipt, RunRequest
 from benchmarks.a5kernels.runner import A5KernelRunner
@@ -230,38 +227,29 @@ def test_n400_align256_candidate_runs_and_forms_study_variant(tmp_path):
     """The supported backend, verifier, and study model share the 512 extent."""
 
     (tmp_path / "kernel.py").write_text(SOURCE)
-    run = CatlassCandidateBackend(
-        FakeExecution(), length=400, padded_length=512, block_count=6, device=2
-    ).run(
-        tmp_path,
-        "catlass-dsl",
-        Workload.SMOKE_VECTOR_ADD,
-        "n400-align256",
-        EvidenceLedger(tmp_path / "evidence.jsonl"),
-    )
+    execution = FakeExecution()
     dimensions = StudyDimensions(
         ShapeClass.N400,
         PaddingClass.ALIGN_256,
         AccessClass.CONTIGUOUS,
         ParallelismClass.SIX,
     )
-    plan = bind_study_dimensions(run.plan, dimensions)
-    request = ProfileRequest.from_execution_plan(
-        plan,
-        implementation="catlass-dsl",
-        expected_kernel=run.kernel_name,
-        device=2,
-        block_count=6,
-    )
-    correctness = replace(
-        run.verified,
-        execution_id=plan.execution_id,
-        source_fingerprint=plan.source_fingerprint,
+    registered = CatlassCandidateBackend(
+        execution, length=400, padded_length=512, block_count=6, device=2
+    ).run_study(
+        tmp_path,
+        "catlass-dsl",
+        Workload.SMOKE_VECTOR_ADD,
+        "n400-align256",
+        EvidenceLedger(tmp_path / "evidence.jsonl"),
+        dimensions,
     )
 
-    registered = StudyVariant(request, correctness, dimensions)
-
-    assert run.verified.passed
+    plan = registered.request.plan
+    assert execution.plans == [plan]
+    assert registered.correctness.passed
+    assert registered.correctness.execution_id == plan.execution_id
+    assert registered.correctness.source_fingerprint == plan.source_fingerprint
     assert len(plan.input_a) == len(plan.input_b) == 512
     assert plan.input_a[400:] == plan.input_b[400:] == (0.0,) * 112
     assert registered.dimensions.padding is PaddingClass.ALIGN_256

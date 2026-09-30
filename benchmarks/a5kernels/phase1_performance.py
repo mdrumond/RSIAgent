@@ -10,13 +10,9 @@ from benchmarks.a5kernels.phase1_registry import (
 )
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.profiling import (
-    AccessClass,
-    PaddingClass,
-    ParallelismClass,
     Phase1PerformanceStudy,
     Phase1StudyBackend,
     Phase1StudyResult,
-    ShapeClass,
     StudyPreset,
     StudyVariant,
 )
@@ -68,16 +64,12 @@ class Phase1PerformanceExecution:
         proposal: CurriculumProposal, variants: Sequence[StudyVariant]
     ) -> None:
         runtime = Phase1ProjectRuntime.from_proposal(proposal)
-        expected_padding = (
-            PaddingClass.NONE
-            if runtime.padded_length == runtime.logical_length
-            else PaddingClass.ALIGN_64
-        )
+        dimensions = runtime.study_dimensions
         expected = {
-            "shape": ShapeClass(f"n{runtime.logical_length}"),
-            "padding": expected_padding,
-            "access": AccessClass.CONTIGUOUS,
-            "parallelism": ParallelismClass(runtime.block_count),
+            "shape": dimensions.shape,
+            "padding": dimensions.padding,
+            "access": dimensions.access,
+            "parallelism": dimensions.parallelism,
         }
         for field, value in expected.items():
             if any(getattr(item.dimensions, field) is not value for item in variants):
