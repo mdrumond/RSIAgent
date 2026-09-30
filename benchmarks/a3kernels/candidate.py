@@ -38,6 +38,14 @@ _SIGNATURE = re.compile(
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
+def _host_source_files() -> tuple[SourceFile, ...]:
+    root = files(_PACKAGE)
+    return tuple(
+        SourceFile(name, root.joinpath(name).read_text(encoding="utf-8"))
+        for name in _HOST_FILES
+    )
+
+
 def validate_candidate_source(source: str) -> None:
     if type(source) is not str or not source.strip():
         raise ValueError("candidate must contain the exact exported vector_add signature")
@@ -88,7 +96,7 @@ class A3CandidateBackend:
             request_id=request_id,
             attempt_id=attempt_id,
             project_id=project_id,
-            files=(SourceFile("candidate.cpp", source),),
+            files=(SourceFile("candidate.cpp", source), *_host_source_files()),
             argv=_RUN_ARGV,
             input_a=tuple(rng.uniform(-1.0, 1.0) for _ in range(length)),
             input_b=tuple(rng.uniform(-1.0, 1.0) for _ in range(length)),
@@ -161,10 +169,10 @@ class A3CandidateBackend:
     @staticmethod
     def _stage(plan: ExecutionPlan, workdir: Path) -> None:
         workdir.mkdir(parents=True, exist_ok=True)
-        (workdir / "candidate.cpp").write_text(plan.files[0].content, encoding="utf-8")
-        root = files(_PACKAGE)
-        for name in _HOST_FILES:
-            (workdir / name).write_text(root.joinpath(name).read_text(encoding="utf-8"), encoding="utf-8")
+        for source in plan.files:
+            (workdir / source.relative_path).write_text(
+                source.content, encoding="utf-8"
+            )
         (workdir / "input.json").write_text(
             json.dumps({"input_a": plan.input_a, "input_b": plan.input_b}, separators=(",", ":")),
             encoding="utf-8",

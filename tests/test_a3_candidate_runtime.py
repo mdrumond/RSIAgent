@@ -6,6 +6,7 @@ import subprocess
 
 import pytest
 
+import benchmarks.a3kernels.candidate as candidate_module
 from benchmarks.a3kernels.candidate_runtime import host_driver
 from benchmarks.a3kernels.candidate import (
     A3CandidateBackend,
@@ -66,11 +67,42 @@ def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
     first = backend.plan(SOURCE, request_id="r1", attempt_id="a1", length=33, seed=7)
     second = backend.plan(SOURCE + "\n", request_id="r1", attempt_id="a1", length=33, seed=7)
 
-    assert [item.relative_path for item in first.files] == ["candidate.cpp"]
+    assert [item.relative_path for item in first.files] == [
+        "build.json", "candidate.cpp", "host_driver.py", "host_wrapper.inc"
+    ]
+    assert [item.relative_path for item in first.files if item.relative_path == "candidate.cpp"] == [
+        "candidate.cpp"
+    ]
     assert first.argv == ("python", "host_driver.py", "input.json")
     assert first.logical_device == 0
     assert first.source_fingerprint != second.source_fingerprint
     assert first.execution_id != second.execution_id
+
+
+@pytest.mark.parametrize("changed_path", ["build.json", "host_driver.py", "host_wrapper.inc"])
+def test_every_host_asset_is_identity_bound_and_staged_from_plan(monkeypatch, tmp_path, changed_path):
+    backend = A3CandidateBackend(command_runner=lambda *args, **kwargs: None)
+    original = backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0
+    )
+    original_host = tuple(item for item in original.files if item.relative_path != "candidate.cpp")
+    changed_host = tuple(
+        type(item)(item.relative_path, item.content + "\n// changed")
+        if item.relative_path == changed_path else item
+        for item in original_host
+    )
+    monkeypatch.setattr(candidate_module, "_host_source_files", lambda: changed_host)
+    changed = backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0
+    )
+
+    assert changed.source_fingerprint != original.source_fingerprint
+    assert changed.execution_id != original.execution_id
+    backend._stage(changed, tmp_path)
+    assert {
+        item.relative_path: (tmp_path / item.relative_path).read_text()
+        for item in changed.files
+    } == {item.relative_path: item.content for item in changed.files}
 
 
 @pytest.mark.parametrize(
