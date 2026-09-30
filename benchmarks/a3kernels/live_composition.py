@@ -199,6 +199,7 @@ def _policy_actor(actor, profile: A3ModelProfile, policy: ProjectRuntimePolicy):
             return actor(selected_profile, context)
         return A3Completion(
             json.dumps(action, sort_keys=True, separators=(",", ":")),
+            1,
             {"profile_sha256": profile.fingerprint},
         )
     return wrapped

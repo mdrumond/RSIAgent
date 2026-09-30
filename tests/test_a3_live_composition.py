@@ -4,7 +4,9 @@ from pathlib import PurePosixPath
 
 from benchmarks.a3_experiments import KnowledgeMode, ProfilingGuidance
 from benchmarks.a3_experiments import BackendModel
-from benchmarks.a3_model_profiles import A3Completion, DEEPSEEK_BASE_URL, load_a3_model_profile
+from benchmarks.a3_model_profiles import (
+    A3Completion, A3TransportResult, DEEPSEEK_BASE_URL, load_a3_model_profile,
+)
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
 from benchmarks.a3kernels.live_composition import (
     AuthoritativeResultStore,
@@ -110,7 +112,10 @@ def actor_factory(cell, proposal):
     actions.append({"action": "submit", "interpretation": "host facts only", "supports": []})
     iterator = iter(actions)
     def actor(profile, context):
-        return A3Completion(json.dumps(next(iterator)), {"profile_sha256": profile.fingerprint})
+        return A3Completion(
+            json.dumps(next(iterator)), 1,
+            {"profile_sha256": profile.fingerprint},
+        )
     return actor
 
 
@@ -175,7 +180,9 @@ def test_completion_provenance_and_no_secret_in_terminal_output(tmp_path):
 
 def test_deepseek_actor_uses_native_pinned_route_without_exposing_secret():
     seen = {}
-    def transport(**kwargs): seen.update(kwargs); return '{"action":"compile"}'
+    def transport(**kwargs):
+        seen.update(kwargs)
+        return A3TransportResult('{"action":"compile"}', 3)
     factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, transport)
     cell = next(cell for cell in __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells() if cell.backend_model is BackendModel.DEEPSEEK_FLASH)
     completion = factory(cell, DEFAULT_PROPOSALS[0])(
