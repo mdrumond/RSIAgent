@@ -20,7 +20,7 @@ def test_fixture_is_a3_specific_and_complete():
     descriptor = json.loads(sources["build.json"])
 
     assert tuple(sources) == ("build.json", "host_driver.py", "kernel.cpp")
-    assert descriptor["arch"] == "dav-c220"
+    assert descriptor["arch"] == "dav-2201"
     assert descriptor["target"] == "Ascend910B4"
     assert descriptor["logical_device"] == 0
     assert descriptor["runtime"] == "py311-torch"
@@ -106,7 +106,7 @@ def test_compile_uses_bisheng_and_fixed_a3_arch(monkeypatch, tmp_path):
     assert output == tmp_path / "a3_kernel.so"
     argv, cwd, check = calls[0]
     assert argv[:7] == [
-        "/cann/bin/bisheng", "-x", "asc", "--npu-arch=dav-c220",
+        "/cann/bin/bisheng", "-x", "asc", "--npu-arch=dav-2201",
         "-shared", "-fPIC", "-std=c++17",
     ]
     assert cwd == tmp_path and check is True

@@ -11,7 +11,7 @@ import sys
 
 OUTPUT_MARKER = "A3KERNEL_OUTPUT="
 _EXPECTED_BUILD = {
-    "arch": "dav-c220",
+    "arch": "dav-2201",
     "compiler": "bisheng",
     "logical_device": 0,
     "max_elements": 4096,
