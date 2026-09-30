@@ -11,7 +11,9 @@ from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
 from benchmarks.a3kernels.candidate import CandidateCompilation
 from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
 from benchmarks.a3kernels.phase1_evidence import EvidenceLedger
-from benchmarks.a3kernels.phase1_memory import Phase1LearningJournal
+from benchmarks.a3kernels.phase1_memory import (
+    AuthoritativeEvidence, Phase1LearningJournal,
+)
 from benchmarks.a3kernels.phase1_protocol import (
     ExecutionPlan, ExecutionReceipt, FailedEvidence, SourceFile, VerifiedResult, attest,
 )
@@ -53,7 +55,7 @@ def test_action_schema_has_one_fixed_source_slot_and_no_argv():
 
 
 class FakeCandidate:
-    def __init__(self): self.source = None
+    def __init__(self, resolver=None): self.source, self.resolver = None, resolver
     def _plan(
         self, source, request_id, attempt_id, length, project_id,
         padded_length=None, block_count=1,
@@ -68,13 +70,34 @@ class FakeCandidate:
         self.source = source
         plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1))
         body = {"plan": plan, "library_sha256": "c" * 64, "stdout": "ok", "stderr": ""}
-        return CandidateCompilation(plan, "c" * 64, "ok", "", attest(body))
+        result = CandidateCompilation(plan, "c" * 64, "ok", "", attest(body))
+        if self.resolver:
+            self.resolver.retain(
+                "compile", result.attestation_sha256, plan.project_id,
+                plan.source_fingerprint,
+            )
+        return result
     def run(self, source, _workdir, **kw):
         assert source == self.source
         plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1))
-        return VerifiedResult.from_receipt(
+        result = VerifiedResult.from_receipt(
             plan, ExecutionReceipt(0, (3.0,) * plan.padded_length), max_abs_error=0.0
         )
+        if self.resolver:
+            self.resolver.retain(
+                "host-verification", result.evidence_sha256, plan.project_id,
+                plan.source_fingerprint,
+            )
+        return result
+
+
+class Resolver:
+    def __init__(self): self.records = {}
+    def retain(self, kind, digest, project_id, candidate_sha256):
+        self.records[digest] = AuthoritativeEvidence(
+            kind, digest, project_id, candidate_sha256, True,
+        )
+    def resolve(self, digest): return self.records.get(digest)
 
 
 class FakeKnowledge:
@@ -86,16 +109,22 @@ class FakeKnowledge:
 
 
 class FakeProfiler:
-    def __init__(self): self.requests = []
+    def __init__(self, resolver=None): self.requests, self.resolver = [], resolver
     def profile(self, request):
         self.requests.append(request)
         if request.treatment.value.startswith("without"):
             return None
-        return CompactProfileResult.create(
+        result = CompactProfileResult.create(
             request, exported_kernels=("vector_add",),
             metric_values=(("vector_ratio", .75),), timeline=(("kernel_count", 20.0),),
             report_sha256="d" * 64,
         )
+        if self.resolver:
+            self.resolver.retain(
+                "profiling", result.evidence_sha256,
+                DEFAULT_PROPOSALS[0].project_id, request.binding.source_fingerprint,
+            )
+        return result
 
 
 def _run(
@@ -104,6 +133,7 @@ def _run(
 ):
     selected = cell or _cell()
     profile = load_a3_model_profile(selected.backend_model)
+    resolver = Resolver()
     queue = list(actions)
     prompts = []
     def actor(actual_profile, context):
@@ -113,11 +143,18 @@ def _run(
     journal = Phase1LearningJournal(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=selected.cell_id, lineage_id="isolated-lineage",
+        evidence_resolver=resolver,
     )
+    selected_candidate = candidate or FakeCandidate(resolver)
+    selected_profiler = profiler or FakeProfiler(resolver)
+    if hasattr(selected_candidate, "resolver"):
+        selected_candidate.resolver = resolver
+    if hasattr(selected_profiler, "resolver"):
+        selected_profiler.resolver = resolver
     loop = A3TrialLoop(
         cell=selected, proposal=DEFAULT_PROPOSALS[0], profile=profile, actor=actor,
-        candidate=candidate or FakeCandidate(), knowledge=knowledge or FakeKnowledge(False),
-        profiler=profiler or FakeProfiler(), evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
+        candidate=selected_candidate, knowledge=knowledge or FakeKnowledge(False),
+        profiler=selected_profiler, evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work", budgets=budgets or TrialBudgets(10, 2000),
     )
     return loop.run(), prompts, journal
@@ -232,6 +269,7 @@ def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
     journal = Phase1LearningJournal(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=cell.cell_id, lineage_id="isolated-lineage",
+        evidence_resolver=Resolver(),
     )
     loop = A3TrialLoop(
         cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,

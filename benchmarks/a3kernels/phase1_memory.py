@@ -8,7 +8,7 @@ import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_digest
 from benchmarks.a3kernels.phase1_registry import (
@@ -33,6 +33,7 @@ class HostFact:
     statement: str
     evidence_sha256: str
     authority: str = "host"
+    success: bool = True
 
     def __post_init__(self) -> None:
         if self.category not in {"compile", "runtime", "host-verification", "profiling"}:
@@ -45,13 +46,45 @@ class HostFact:
             raise ValueError("host fact evidence must be a lowercase SHA-256")
         if self.authority != "host":
             raise ValueError("measured facts require host authority")
+        if type(self.success) is not bool:
+            raise ValueError("host fact success must be a boolean")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "HostFact":
-        expected = {"category", "statement", "evidence_sha256", "authority"}
+        expected = {
+            "category", "statement", "evidence_sha256", "authority", "success"
+        }
         if not isinstance(value, Mapping) or set(value) != expected:
             raise ValueError("invalid host fact schema")
         return cls(**value)
+
+
+@dataclass(frozen=True)
+class AuthoritativeEvidence:
+    """One host result addressable by its retained evidence digest."""
+
+    kind: str
+    evidence_sha256: str
+    project_id: str
+    candidate_sha256: str
+    success: bool
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"compile", "runtime", "host-verification", "profiling"}:
+            raise ValueError("authoritative evidence kind is not recognized")
+        for value, label in (
+            (self.evidence_sha256, "evidence digest"),
+            (self.project_id, "project identity"),
+            (self.candidate_sha256, "candidate identity"),
+        ):
+            if type(value) is not str or not _SHA256.fullmatch(value):
+                raise ValueError(f"authoritative {label} must be a lowercase SHA-256")
+        if type(self.success) is not bool:
+            raise ValueError("authoritative success must be a boolean")
+
+
+class EvidenceResolver(Protocol):
+    def resolve(self, evidence_sha256: str) -> AuthoritativeEvidence | None: ...
 
 
 @dataclass(frozen=True)
@@ -182,6 +215,7 @@ class Phase1LearningJournal:
         *,
         cell_id: str,
         lineage_id: str,
+        evidence_resolver: EvidenceResolver,
     ) -> None:
         if type(cell_id) is not str or not _CELL_ID.fullmatch(cell_id):
             raise ValueError("journal requires a registered A3 cell identity")
@@ -191,6 +225,9 @@ class Phase1LearningJournal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.cell_id = cell_id
         self.lineage_id = lineage_id
+        if not callable(getattr(evidence_resolver, "resolve", None)):
+            raise TypeError("evidence_resolver must provide resolve(digest)")
+        self._evidence_resolver = evidence_resolver
         plan = dry_run_plan(proposals)
         self.proposals = tuple(
             CurriculumProposal.from_mapping(
@@ -211,6 +248,7 @@ class Phase1LearningJournal:
             raise TypeError("memory must be a ProjectMemory")
         if memory.cell_id != self.cell_id or memory.lineage_id != self.lineage_id:
             raise ValueError("memory cell and lineage must match the journal")
+        self._validate_host_facts(memory)
         with self.path.open("a+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             stream.seek(0)
@@ -307,6 +345,7 @@ class Phase1LearningJournal:
             if not valid:
                 raise ValueError("A3 learning journal failed resume validation")
             memory = ProjectMemory.from_mapping(entry["memory"])
+            self._validate_host_facts(memory)
             if (
                 sequence > len(self.proposals)
                 or memory.proposal != self.proposals[sequence - 1]
@@ -317,6 +356,24 @@ class Phase1LearningJournal:
             previous = digest
             entries.append(entry)
         return entries
+
+    def _validate_host_facts(self, memory: ProjectMemory) -> None:
+        for fact in memory.host_facts:
+            resolved = self._evidence_resolver.resolve(fact.evidence_sha256)
+            if not isinstance(resolved, AuthoritativeEvidence):
+                raise ValueError("host fact must resolve to authoritative evidence")
+            checks = (
+                ("kind", resolved.kind, fact.category),
+                ("digest", resolved.evidence_sha256, fact.evidence_sha256),
+                ("project", resolved.project_id, memory.project_id),
+                ("candidate", resolved.candidate_sha256, memory.source_revision),
+                ("success", resolved.success, fact.success),
+            )
+            for label, actual, expected in checks:
+                if actual != expected:
+                    raise ValueError(
+                        f"host fact {label} does not match authoritative evidence"
+                    )
 
     @staticmethod
     def _committed_content(value: bytes) -> tuple[bytes, bool]:
