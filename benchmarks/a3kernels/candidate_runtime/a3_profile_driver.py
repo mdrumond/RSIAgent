@@ -40,25 +40,36 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _validate(args: argparse.Namespace) -> Path:
+def _validate(args: argparse.Namespace) -> tuple[Path, str]:
     root = args.candidate_dir.resolve()
     if not args.candidate_dir.is_absolute() or args.logical_device != 0:
         raise ValueError("candidate-dir must be absolute and logical-device must be 0")
-    if not 1 <= args.length <= 4096 or args.block_count != 1:
-        raise ValueError("length must be in [1,4096] and block-count must be 1")
+    if not 1 <= args.length <= 4096 or not 1 <= args.block_count <= 32:
+        raise ValueError("length must be in [1,4096] and block-count in [1,32]")
     if args.warm_up < 0 or args.launch_count < 1:
         raise ValueError("warm-up must be non-negative and launch-count must be positive")
     for name in ("host_driver.py", "input.json", "a3_candidate.so"):
         if not (root / name).is_file():
             raise RuntimeError(f"staged candidate is missing {name}")
     payload = json.loads((root / "input.json").read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or len(payload.get("input_a", ())) != args.length:
-        raise ValueError("staged input length does not match --length")
-    return root
+    expected = {"input_a", "input_b", "logical_length", "padded_length", "block_count"}
+    if (
+        not isinstance(payload, dict) or set(payload) != expected
+        or payload["logical_length"] != args.length
+        or len(payload["input_a"]) != payload["padded_length"]
+        or len(payload["input_b"]) != payload["padded_length"]
+    ):
+        raise ValueError("staged input dimensions do not match --length")
+    payload["block_count"] = args.block_count
+    profile_input = ".a3-profile-input.json"
+    (root / profile_input).write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
+    )
+    return root, profile_input
 
 
-def _launch(root: Path, length: int, run: ProcessRunner) -> None:
-    argv = (sys.executable, "host_driver.py", "input.json")
+def _launch(root: Path, input_name: str, run: ProcessRunner) -> None:
+    argv = (sys.executable, "host_driver.py", input_name)
     completed = run(argv, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "candidate launch failed").strip())
@@ -70,12 +81,16 @@ def _launch(root: Path, length: int, run: ProcessRunner) -> None:
         values = json.loads(records[0])
     except json.JSONDecodeError as exc:
         raise RuntimeError("candidate output is not JSON") from exc
+    payload = json.loads((root / input_name).read_text(encoding="utf-8"))
+    expected = [a + b for a, b in zip(payload["input_a"], payload["input_b"])]
     if (
-        not isinstance(values, list) or len(values) != length
+        not isinstance(values, list) or len(values) != len(expected)
         or any(isinstance(value, bool) or not isinstance(value, (int, float))
                or not math.isfinite(value) for value in values)
     ):
         raise RuntimeError("candidate output must be a finite numeric array of the staged length")
+    if any(abs(float(value) - float(want)) > 1e-5 for value, want in zip(values, expected)):
+        raise RuntimeError("candidate output failed host verification")
 
 
 def _metadata(mode: str, report: Path | None) -> dict[str, object]:
@@ -131,7 +146,7 @@ def _replay_argv(root: Path, args: argparse.Namespace) -> tuple[str, ...]:
     return (
         sys.executable, str((root / "a3_profile_driver.py").resolve()), "replay",
         "--candidate-dir", str(root), "--logical-device", "0",
-        "--length", str(args.length), "--block-count", "1",
+        "--length", str(args.length), "--block-count", str(args.block_count),
         "--warm-up", "0", "--launch-count", str(args.launch_count),
     )
 
@@ -148,18 +163,18 @@ def main(
     report_directory_factory: ReportDirectoryFactory = _new_report_directory,
 ) -> int:
     args = _parser().parse_args(argv)
-    root = _validate(args)
+    root, input_name = _validate(args)
     if args.mode == "replay":
         for _ in range(args.launch_count):
-            _launch(root, args.length, process_runner)
+            _launch(root, input_name, process_runner)
         return 0
 
     for _ in range(args.warm_up):
-        _launch(root, args.length, process_runner)
+        _launch(root, input_name, process_runner)
     if args.mode == "timing":
         for _ in range(args.launch_count):
             start = clock_ns()
-            _launch(root, args.length, process_runner)
+            _launch(root, input_name, process_runner)
             elapsed = (clock_ns() - start) / 1000.0
             if elapsed <= 0:
                 raise RuntimeError("timing clock returned a non-positive sample")
@@ -168,7 +183,7 @@ def main(
         return 0
 
     # Verify once without instrumentation before the separately profiled replay.
-    _launch(root, args.length, process_runner)
+    _launch(root, input_name, process_runner)
     report = report_directory_factory(root, args.metric).resolve()
     application = shlex.join(_replay_argv(root, args))
     command = (
