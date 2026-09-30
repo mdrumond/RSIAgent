@@ -70,7 +70,7 @@ def test_proposals_enforce_registered_parameter_bounds(parameters):
         proposal(parameters=parameters)
 
 
-@pytest.mark.parametrize("length", [32, 64, 128, 256, 400])
+@pytest.mark.parametrize("length", [1, 8, 16, 32, 64, 128, 256, 400])
 def test_length_knee_accepts_only_registered_shapes(length):
     assert dict(proposal(parameters={"length": length}).parameters) == {
         "length": length
@@ -85,6 +85,17 @@ def test_padded_project_accepts_non_knee_extent():
         evidence_preset="correctness",
     )
     assert dict(padded.parameters) == {"length": 96}
+
+
+def test_default_knees_keep_one_sub32_and_one_distant_large_sample():
+    knees = [
+        dict(item.parameters)["length"]
+        for item in DEFAULT_PROPOSALS
+        if item.family.value == "length-knee"
+    ]
+    assert knees == [16, 400]
+    assert knees[0] < 32
+    assert knees[1] >= 256
 
 
 def test_default_plan_contains_exact_eight_project_curriculum():
