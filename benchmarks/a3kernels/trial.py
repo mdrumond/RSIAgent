@@ -142,6 +142,7 @@ class A3TrialLoop:
         memory: Phase1LearningJournal,
         workdir: Path,
         budgets: TrialBudgets = TrialBudgets(),
+        timing_dimensions: StudyDimensions | None = None,
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -157,12 +158,16 @@ class A3TrialLoop:
         self.cell, self.proposal, self.profile = cell, proposal, profile
         self.actor, self.candidate, self.knowledge, self.profiler = actor, candidate, knowledge, profiler
         self.evidence, self.memory, self.workdir, self.budgets = evidence, memory, Path(workdir), budgets
+        if timing_dimensions is not None and not isinstance(timing_dimensions, StudyDimensions):
+            raise TypeError("timing_dimensions must be StudyDimensions")
+        self.timing_dimensions = timing_dimensions
 
     def run(self) -> TrialResult:
         source = None
         compilation = None
         verified = None
         profile_result = None
+        timing_result = None
         failures: list[str] = []
         observations: list[object] = []
         actions: list[str] = []
@@ -248,12 +253,19 @@ class A3TrialLoop:
                     if failure:
                         raise ValueError(failure)
                     assert verified is not None
+                    if self.timing_dimensions is not None and timing_result is None:
+                        timing_result = self.profiler.time(
+                            CandidateBinding(verified.execution_id, verified.source_fingerprint),
+                            self.timing_dimensions,
+                        )
                     facts = [
                         HostFact("compile", "candidate compiled with the host-owned fixture", compilation.attestation_sha256),
                         HostFact("host-verification", "candidate output passed host verification", verified.evidence_sha256),
                     ]
                     if profile_result is not None:
                         facts.append(HostFact("profiling", "compact profile captured", profile_result.evidence_sha256))
+                    if timing_result is not None:
+                        facts.append(HostFact("profiling", "host timing samples captured", timing_result.evidence_sha256))
                     interpretation = AgentInterpretation(
                         action.interpretation, action.supports
                     )

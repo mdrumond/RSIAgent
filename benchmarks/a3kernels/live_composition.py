@@ -20,8 +20,10 @@ from benchmarks.a3kernels.phase1_memory import AuthoritativeEvidence, Phase1Lear
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
 from benchmarks.a3kernels.phase1_registry import CurriculumProposal, DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
-from benchmarks.a3kernels.profiling import CompactProfileResult
-from benchmarks.a3kernels.profiling import A3ProfilingSession
+from benchmarks.a3kernels.project_execution import (
+    PerformancePreset, ProjectRuntimePolicy, RecoveryEvidence,
+)
+from benchmarks.a3kernels.profiling import A3ProfilingSession, CompactProfileResult, TimingResult
 from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
 from benchmarks.a3kernels.trial import A3TrialLoop
@@ -130,6 +132,77 @@ class _RecordingProfiler:
             )
         return result
 
+    def time(self, binding, dimensions):
+        result = self.backend.time(binding, dimensions)
+        if not isinstance(result, TimingResult):
+            raise TypeError("timing backend returned an invalid result")
+        self.store.register(
+            "profiling", result.evidence_sha256, self.project_id,
+            result.source_fingerprint, True,
+        )
+        return result
+
+
+class _RecoveryCandidate:
+    """Require the registered starter failure before accepting a repair."""
+
+    def __init__(self, backend, policy: ProjectRuntimePolicy) -> None:
+        self.backend, self.policy = backend, policy
+        self.observed = False
+
+    def compile(self, source, workdir, **options):
+        recovery = self.policy.recovery
+        if recovery is not None and not self.observed:
+            if source != recovery.source:
+                raise ValueError("registered recovery starter must be attempted first")
+            result = self.backend.compile(source, workdir, **options)
+            if recovery.required_evidence is RecoveryEvidence.COMPILE_FAILURE:
+                if not isinstance(result, FailedEvidence) or result.stage != "compile":
+                    raise ValueError("compile recovery starter did not produce its registered failure")
+                self.observed = True
+            return result
+        return self.backend.compile(source, workdir, **options)
+
+    def run(self, source, workdir, **options):
+        recovery = self.policy.recovery
+        if (
+            recovery is not None
+            and recovery.required_evidence is RecoveryEvidence.HOST_VERIFICATION_FAILURE
+            and not self.observed
+        ):
+            if source != recovery.source:
+                raise ValueError("registered runtime recovery starter must run first")
+            result = self.backend.run(source, workdir, **options)
+            if not isinstance(result, FailedEvidence) or result.stage not in {"execute", "verify"}:
+                raise ValueError("runtime recovery starter did not produce its registered failure")
+            self.observed = True
+            return result
+        return self.backend.run(source, workdir, **options)
+
+
+def _policy_actor(actor, profile: A3ModelProfile, policy: ProjectRuntimePolicy):
+    recovery = policy.recovery
+    if recovery is None:
+        return actor
+    forced = [
+        {"action": "write_source", "source": recovery.source},
+        {"action": "compile"},
+    ]
+    if recovery.required_evidence is RecoveryEvidence.HOST_VERIFICATION_FAILURE:
+        forced.append({"action": "run"})
+    actions = iter(forced)
+
+    def wrapped(selected_profile, context):
+        try:
+            action = next(actions)
+        except StopIteration:
+            return actor(selected_profile, context)
+        return A3Completion(
+            json.dumps(action, sort_keys=True, separators=(",", ":")),
+            {"profile_sha256": profile.fingerprint},
+        )
+    return wrapped
+
 
 class LiveComposition:
     """Execute every registered project for one isolated experiment cell."""
@@ -150,8 +223,11 @@ class LiveComposition:
         digests = [entry["entry_sha256"] for entry in memory.read()]
         start = memory.resume_state().completed_projects
         for proposal in DEFAULT_PROPOSALS[start:]:
+            policy = ProjectRuntimePolicy.from_proposal(proposal)
             candidate = _RecordingCandidate(
-                self.dependencies.candidate_factory(cell, proposal, paths), store
+                _RecoveryCandidate(
+                    self.dependencies.candidate_factory(cell, proposal, paths), policy
+                ), store
             )
             profiler = _RecordingProfiler(
                 self.dependencies.profiler_factory(
@@ -161,10 +237,16 @@ class LiveComposition:
             )
             trial = A3TrialLoop(
                 cell=cell, proposal=proposal, profile=profile,
-                actor=self.dependencies.actor_factory(cell, proposal),
+                actor=_policy_actor(
+                    self.dependencies.actor_factory(cell, proposal), profile, policy
+                ),
                 candidate=candidate, knowledge=knowledge, profiler=profiler,
                 evidence=evidence, memory=memory,
                 workdir=paths.workspace / proposal.project_id,
+                timing_dimensions=(
+                    policy.study_dimensions
+                    if policy.performance_preset is PerformancePreset.TIMING else None
+                ),
             ).run()
             if trial.status != "passed" or trial.memory_entry_sha256 is None:
                 failure = canonical_digest(
@@ -246,6 +328,8 @@ class _LazyGZProfiler:
 
     def profile(self, request):
         remote = self.candidate.backend
+        if isinstance(remote, _RecoveryCandidate):
+            remote = remote.backend
         if not isinstance(remote, RemoteCandidateBundle):
             raise TypeError("GZ profiler requires the managed candidate backend")
         plan = remote.plans.get(request.binding.execution_id)
@@ -259,6 +343,24 @@ class _LazyGZProfiler:
             verified_results=self.candidate.verified,
         )
         return A3ProfilingSession(profiler=backend.profile).profile(request)
+
+    def time(self, binding, dimensions):
+        remote = self.candidate.backend
+        if isinstance(remote, _RecoveryCandidate):
+            remote = remote.backend
+        if not isinstance(remote, RemoteCandidateBundle):
+            raise TypeError("GZ timing requires the managed candidate backend")
+        plan = remote.plans.get(binding.execution_id)
+        if plan is None:
+            raise ValueError("timing candidate has no retained remote directory")
+        backend = GZA3ProfilingBackend(
+            validation_wrapper=str(self.config.validation_wrapper),
+            remote_candidate_directory=remote.backend.remote_candidate_directory(plan).as_posix(),
+            evidence_directory=self.paths.root / "profiles",
+            physical_device=self.physical_device,
+            verified_results=self.candidate.verified,
+        )
+        return A3ProfilingSession(timing=backend.time).time(binding, dimensions)
 
 
 def managed_live_dependencies(

@@ -14,12 +14,16 @@ from benchmarks.a3kernels.live_composition import (
     model_actor_factory,
 )
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
-from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt, VerifiedResult, attest
+from benchmarks.a3kernels.phase1_protocol import (
+    ExecutionReceipt, FailedEvidence, VerifiedResult, attest,
+)
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
+from benchmarks.a3kernels.project_execution import ProjectRuntimePolicy, RecoveryEvidence
 from benchmarks.a3kernels.phase1_wave import Phase1Config, Phase1Wave
 from benchmarks.a3kernels.profiling import (
     CandidateBinding, CompactProfileResult, ProfileMetric, ProfileRequest,
     StudyDimensions,
+    TimingResult,
 )
 
 
@@ -41,16 +45,33 @@ def config(tmp_path):
 
 
 class FakeCandidate:
-    def __init__(self):
+    def __init__(self, proposal=None):
         self.base = A3CandidateBackend(lambda *a, **k: None)
+        self.policy = ProjectRuntimePolicy.from_proposal(proposal) if proposal else None
 
     def compile(self, source, workdir, **options):
         plan = self.base.plan(source, **options)
+        if (
+            self.policy and self.policy.recovery
+            and self.policy.recovery.required_evidence is RecoveryEvidence.COMPILE_FAILURE
+            and source == self.policy.recovery.source
+        ):
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="CompileError", detail="registered fault"
+            )
         body = {"plan": plan, "library_sha256": "1" * 64, "stdout": "", "stderr": ""}
         return CandidateCompilation(plan, "1" * 64, "", "", attest(body))
 
     def run(self, source, workdir, **options):
         plan = self.base.plan(source, **options)
+        if (
+            self.policy and self.policy.recovery
+            and self.policy.recovery.required_evidence is RecoveryEvidence.HOST_VERIFICATION_FAILURE
+            and source == self.policy.recovery.source
+        ):
+            return FailedEvidence.create(
+                plan, stage="verify", error_type="Mismatch", detail="registered fault"
+            )
         output = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
         return VerifiedResult.from_receipt(
             plan, ExecutionReceipt(0, output, job_handle=f"gz-a3:{plan.project_id[:12]}"),
@@ -72,6 +93,9 @@ class FakeProfiler:
             request, exported_kernels=("vector_add",), metric_values=(("pipe", 1.0),),
             timeline=(("kernel", 1.0),), report_sha256="2" * 64,
         )
+    def time(self, binding, dimensions):
+        self.calls.append("timing")
+        return TimingResult.from_samples(binding, dimensions, (1.0, 2.0))
 
 
 def actor_factory(cell, proposal):
@@ -93,7 +117,7 @@ def actor_factory(cell, proposal):
 def dependencies(knowledge_calls, profile_calls):
     return LiveDependencies(
         actor_factory=actor_factory,
-        candidate_factory=lambda cell, proposal, paths: FakeCandidate(),
+        candidate_factory=lambda cell, proposal, paths: FakeCandidate(proposal),
         knowledge_factory=lambda cell, paths: FakeKnowledge(
             cell.knowledge is KnowledgeMode.WITH_KDB, knowledge_calls
         ),
@@ -110,8 +134,22 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
     records = wave.run()
     assert len(records) == 8 and {row["status"] for row in records} == {"passed"}
     assert len(knowledge_calls) == 4 * len(DEFAULT_PROPOSALS)
-    assert len(profile_calls) == 4 * len(DEFAULT_PROPOSALS)
-    assert all(len(json.loads(wave.paths(cell).memory.read_text().splitlines()[0])["entry_sha256"]) == 64 for cell in __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells())
+    assert profile_calls.count("timing") == 8 * 3
+    assert len([value for value in profile_calls if value != "timing"]) == 4 * len(DEFAULT_PROPOSALS)
+    cells = __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells()
+    assert all(len(json.loads(wave.paths(cell).memory.read_text().splitlines()[0])["entry_sha256"]) == 64 for cell in cells)
+    for cell in cells:
+        memories = [json.loads(line)["memory"] for line in wave.paths(cell).memory.read_text().splitlines()]
+        assert sum(
+            fact["category"] == "profiling" and fact["statement"] == "host timing samples captured"
+            for memory in memories for fact in memory["host_facts"]
+        ) == 3
+        failures = [
+            json.loads(line)["payload"].get("failed_evidence", {})
+            for line in wave.paths(cell).evidence.read_text().splitlines()
+            if json.loads(line)["kind"] == "failure"
+        ]
+        assert {item.get("stage") for item in failures} >= {"compile", "verify"}
     assert Phase1Wave(cfg, composition.execute).resume() == records
 
 
