@@ -38,7 +38,7 @@ def proposal(family, occurrence=0):
         ("padded-multitile", 0, 400, 448, 1, PerformancePreset.NONE),
         ("compile-recovery", 0, 32, 64, 1, PerformancePreset.NONE),
         ("runtime-recovery", 0, 32, 64, 1, PerformancePreset.NONE),
-        ("length-knee", 0, 128, 128, 1, PerformancePreset.TIMING),
+        ("length-knee", 0, 16, 64, 1, PerformancePreset.TIMING),
         ("length-knee", 1, 400, 448, 1, PerformancePreset.TIMING),
         ("cross-layer-launch", 0, 32, 64, 1, PerformancePreset.TIMING),
         ("msprof-pipe", 0, 32, 64, 1, PerformancePreset.PIPE),
