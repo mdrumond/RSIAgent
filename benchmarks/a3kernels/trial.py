@@ -14,7 +14,7 @@ from benchmarks.a3_experiments import (
 )
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile
 from benchmarks.a3kernels.candidate import CandidateCompilation
-from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
+from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery, KnowledgeResult
 from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a3kernels.phase1_memory import (
     AgentInterpretation,
@@ -54,6 +54,8 @@ _ACTION_FIELDS = {
     "profile": {"action", "metric"},
     "submit": {"action", "interpretation", "supports"},
 }
+_KNOWLEDGE_RESULT_LIMIT = 5
+_KNOWLEDGE_TEXT_LIMIT = 2048
 
 
 def parse_action(text: str) -> Action:
@@ -176,7 +178,7 @@ class A3TrialLoop:
             completion = self.actor(self.profile, self._context(observations, source))
             if not isinstance(completion, A3Completion):
                 raise TypeError("actor must return A3Completion")
-            tokens += len(completion.text.split())
+            tokens += completion.completion_tokens
             if tokens > self.budgets.max_tokens:
                 failures.append("token budget exhausted")
                 return TrialResult("budget-exhausted", turn, tokens, verified, profile_result, queries, tuple(failures))
@@ -229,10 +231,27 @@ class A3TrialLoop:
                 elif action.kind == "query":
                     queries += 1
                     results = self.knowledge.query(KnowledgeQuery(action.query, action.limit))
-                    observations.append(
-                        "knowledge disabled" if not self.knowledge.enabled
-                        else f"knowledge results: {len(results)}"
-                    )
+                    if not self.knowledge.enabled:
+                        observations.append("knowledge disabled")
+                    else:
+                        selected = results[:_KNOWLEDGE_RESULT_LIMIT]
+                        if any(not isinstance(item, KnowledgeResult) for item in selected):
+                            raise TypeError("Knowledge Agent returned an invalid result")
+                        observations.append({
+                            "knowledge_results": [
+                                {
+                                    "citation": asdict(item.citation),
+                                    "text": item.text[:_KNOWLEDGE_TEXT_LIMIT],
+                                }
+                                for item in selected
+                            ],
+                            "returned_count": len(results),
+                            "included_count": len(selected),
+                            "text_truncated": any(
+                                len(item.text) > _KNOWLEDGE_TEXT_LIMIT
+                                for item in selected
+                            ),
+                        })
                 elif action.kind == "profile":
                     if verified is None:
                         raise ValueError("verified candidate is required before profile")
