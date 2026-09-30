@@ -195,7 +195,6 @@ class CatlassCandidateBackend:
             implementation=Language.CATLASS_DSL.value,
             expected_kernel=kernel_name,
             device=self._device,
-            block_count=self._block_count,
         )
         return StudyVariant(profile, verified, dimensions)
 

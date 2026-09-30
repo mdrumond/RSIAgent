@@ -338,7 +338,7 @@ def test_profile_request_rejects_noncanonical_block_bindings(encoded):
             "A5KERNEL_BLOCK_NUM", encoded
         ),
     )
-    with pytest.raises(ValueError, match="invalid host-owned block binding"):
+    with pytest.raises(ValueError, match="canonical integer"):
         replace(REQUEST, plan=plan)
 
 
