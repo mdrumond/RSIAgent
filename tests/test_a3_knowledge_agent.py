@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import replace
 
 import pytest
@@ -117,6 +118,24 @@ def test_gate_rejects_other_collection_and_tampered_hit_before_journaling(tmp_pa
             )
         hit = readonly.query("a3-docs", "vector", limit=1)[0]
         monkeypatch.setattr(readonly, "query", lambda *_args, **_kwargs: [replace(hit, text="bad")])
+        agent = KnowledgeAgent(
+            enabled=True, database=readonly, collection="a3-docs", journal=journal
+        )
+        with pytest.raises(ValueError, match="validated indexed chunk"):
+            agent.query(KnowledgeQuery("vector"))
+    assert journal.read() == []
+
+
+@pytest.mark.parametrize("column", ["source_revision", "content_sha256"])
+def test_gate_rejects_stored_provenance_that_disagrees_with_manifest(tmp_path, column):
+    path, encoder = database(tmp_path)
+    connection = sqlite3.connect(path)
+    connection.execute(f"UPDATE chunks SET {column} = ?", ("f" * 64,))
+    connection.commit()
+    connection.close()
+    journal = QueryJournal(tmp_path / "journal.jsonl")
+
+    with KnowledgeDB.open_read_only(path, encoder) as readonly:
         agent = KnowledgeAgent(
             enabled=True, database=readonly, collection="a3-docs", journal=journal
         )

@@ -221,6 +221,7 @@ class KnowledgeAgent:
             hit.path, hit.start_line, hit.end_line, hit.text,
             hit.source_revision, hit.content_sha256,
         )
+        manifest_provenance = (source.source_revision, source.content_sha256)
         identity = {
             "collection": self.collection,
             "content_sha256": source.content_sha256,
@@ -233,7 +234,12 @@ class KnowledgeAgent:
         expected_chunk = _digest(
             f"{document_digest}\0{hit.start_line}\0{hit.end_line}\0{hit.text}".encode()
         )
-        if expected != actual or expected_chunk != hit.chunk_id:
+        if (
+            expected != actual
+            or expected[-2:] != manifest_provenance
+            or actual[-2:] != manifest_provenance
+            or expected_chunk != hit.chunk_id
+        ):
             raise ValueError("knowledge result is not a validated indexed chunk")
         citation = Citation(
             collection=self.collection, path=hit.path, start_line=hit.start_line,
