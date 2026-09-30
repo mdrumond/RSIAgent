@@ -8,6 +8,7 @@ import io
 import json
 import math
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import tarfile
 import time
@@ -40,7 +41,7 @@ if test ! -d "$destination"; then
   tar -xf "$archive" -C "$temporary"
   mv "$temporary" "$destination"
 fi
-python -c 'import json,sys; p=json.load(open(sys.argv[1])); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]' "$destination/manifest.json" "$execution_id" "$source_fingerprint"
+python -c 'import hashlib,json,os,sys; root=sys.argv[1]; p=json.load(open(os.path.join(root,"manifest.json"))); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]; assert all(hashlib.sha256(open(os.path.join(root,n),"rb").read()).hexdigest() == h for n,h in p["files"].items())' "$destination" "$execution_id" "$source_fingerprint"
 cd "$destination"
 printf 'A3REMOTE_STAGE=compile\n'
 python host_driver.py --compile-only
@@ -149,7 +150,7 @@ class GZA3RemoteCandidateBackend:
             handle = self._validate_wrapper(completed.stdout)
             output = self._parse_output(completed.stdout, plan.padded_length)
             libraries = self._markers(completed.stdout, "A3CANDIDATE_COMPILED=")
-            if len(libraries) != 1 or len(libraries[0]) != 64:
+            if len(libraries) != 1 or re.fullmatch(r"[0-9a-f]{64}", libraries[0]) is None:
                 raise ValueError("remote compile marker is invalid")
         except ValueError as exc:
             return FailedEvidence.create(
