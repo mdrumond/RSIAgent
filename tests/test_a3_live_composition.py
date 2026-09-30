@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 
 from benchmarks.a3_experiments import KnowledgeMode, ProfilingGuidance
 from benchmarks.a3_experiments import BackendModel
@@ -16,7 +17,10 @@ from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt, VerifiedResult, attest
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import Phase1Config, Phase1Wave
-from benchmarks.a3kernels.profiling import CompactProfileResult
+from benchmarks.a3kernels.profiling import (
+    CandidateBinding, CompactProfileResult, ProfileMetric, ProfileRequest,
+    StudyDimensions,
+)
 
 
 SOURCE = '''extern "C" __global__ __aicore__ void vector_add(
@@ -26,6 +30,7 @@ SOURCE = '''extern "C" __global__ __aicore__ void vector_add(
 
 
 def config(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     wrapper = tmp_path / "catlass-validation.sh"
     wrapper.write_text("#!/bin/sh\n"); wrapper.chmod(0o755)
     embedding = tmp_path / "embedding"; embedding.mkdir()
@@ -162,7 +167,56 @@ def test_remote_bundle_compile_then_run_reuses_one_managed_execution(tmp_path):
     verified = bundle.run(SOURCE, tmp_path, attempt_id="turn-3", **options)
     assert isinstance(compiled, CandidateCompilation)
     assert isinstance(verified, VerifiedResult) and verified.passed
+    assert verified.execution_id == compiled.plan.execution_id
+    assert verified.attempt_id == "turn-2"
     assert managed.calls == 1
+
+
+def test_profile_uses_exact_retained_compile_binding_and_directory(tmp_path, monkeypatch):
+    import benchmarks.a3kernels.live_composition as live
+    class Managed:
+        def __init__(self): self.library = {}
+        def run(self, plan, workdir):
+            self.library[plan.execution_id] = "4" * 64
+            output = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
+            return VerifiedResult.from_receipt(
+                plan, ExecutionReceipt(0, output, job_handle="gz-a3:exact"),
+                max_abs_error=0.0,
+            )
+        def library_sha256(self, plan): return self.library[plan.execution_id]
+        def remote_candidate_directory(self, plan):
+            return PurePosixPath("/remote/candidates") / plan.execution_id
+    managed = Managed()
+    store = AuthoritativeResultStore(tmp_path / "authority.jsonl")
+    candidate = live._RecordingCandidate(RemoteCandidateBundle(managed), store)
+    options = dict(request_id="cell", project_id="a" * 64, length=32,
+                   padded_length=64, block_count=1, seed=0)
+    candidate.compile(SOURCE, tmp_path, attempt_id="turn-2", **options)
+    verified = candidate.run(SOURCE, tmp_path, attempt_id="turn-3", **options)
+    request = ProfileRequest(
+        CandidateBinding(verified.execution_id, verified.source_fingerprint),
+        StudyDimensions(32, 1, 5, 20), ProfileMetric.PIPE_UTILIZATION,
+    )
+    seen = {}
+    class ProfileBackend:
+        def __init__(self, **kwargs): seen.update(kwargs)
+        def profile(self, selected):
+            return CompactProfileResult.create(
+                selected, exported_kernels=("vector_add",),
+                metric_values=(("pipe", 1.0),), timeline=(("kernel", 1.0),),
+                report_sha256="5" * 64,
+            )
+    monkeypatch.setattr(live, "GZA3ProfilingBackend", ProfileBackend)
+    cfg = config(tmp_path / "config")
+    paths = Phase1Wave(cfg, lambda *_: {}).paths(
+        __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells()[0]
+    )
+    result = live._LazyGZProfiler(
+        config=cfg, paths=paths, candidate=candidate, physical_device=0,
+    ).profile(request)
+    assert result.candidate_execution_id == verified.execution_id
+    assert seen["remote_candidate_directory"].endswith(verified.execution_id)
+    assert seen["verified_results"] == {verified.execution_id: verified}
 
 
 def test_cli_run_composes_all_eight_cells_with_injected_backends(
