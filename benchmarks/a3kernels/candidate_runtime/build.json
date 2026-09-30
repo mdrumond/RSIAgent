@@ -1,0 +1,9 @@
+{
+  "arch": "dav-2201",
+  "compiler": "bisheng",
+  "logical_device": 0,
+  "max_elements": 4096,
+  "output": "a3_candidate.so",
+  "source": "kernel.cpp",
+  "target": "Ascend910B4"
+}

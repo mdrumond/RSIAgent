@@ -1,0 +1,105 @@
+"""Fixed compiler and launcher for one staged A3 candidate source."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+_EXPECTED_BUILD = {
+    "arch": "dav-2201",
+    "compiler": "bisheng",
+    "logical_device": 0,
+    "max_elements": 4096,
+    "output": "a3_candidate.so",
+    "source": "kernel.cpp",
+    "target": "Ascend910B4",
+}
+
+
+def _toolchain_paths(torch, torch_npu):
+    torch_root = Path(torch.__file__).resolve().parent
+    npu_root = Path(torch_npu.__file__).resolve().parent
+    return (
+        torch_root / "include",
+        torch_root / "include" / "torch" / "csrc" / "api" / "include",
+        npu_root / "include",
+    ), (torch_root / "lib", npu_root / "lib")
+
+
+def _compile(root: Path, spec: dict, torch, torch_npu) -> Path:
+    compiler = shutil.which(spec["compiler"])
+    if compiler is None:
+        raise RuntimeError("bisheng compiler not found on PATH")
+    combined = (root / "candidate.cpp").read_text(encoding="utf-8") + "\n" + (
+        root / "host_wrapper.inc"
+    ).read_text(encoding="utf-8")
+    source = root / spec["source"]
+    source.write_text(combined, encoding="utf-8")
+    output = root / spec["output"]
+    includes, libraries = _toolchain_paths(torch, torch_npu)
+    abi = "1" if torch._C._GLIBCXX_USE_CXX11_ABI else "0"
+    argv = [
+        compiler, "-x", "asc", f"--npu-arch={spec['arch']}",
+        "-shared", "-fPIC", "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={abi}",
+        "-ltorch_npu", "-ltorch", "-lc10", str(source), "-o", str(output),
+        *(f"-I{path}" for path in includes), *(f"-L{path}" for path in libraries),
+    ]
+    subprocess.run(argv, cwd=root, check=True)
+    if not output.is_file():
+        raise RuntimeError("bisheng succeeded without producing a3_candidate.so")
+    return output
+
+
+def _read_input(path: Path, maximum: int) -> tuple[list[float], list[float]]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or set(value) != {"input_a", "input_b"}:
+        raise ValueError("input must contain only input_a and input_b")
+    a, b = value["input_a"], value["input_b"]
+    if (
+        not isinstance(a, list) or not isinstance(b, list) or not a
+        or len(a) != len(b) or len(a) > maximum
+        or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in a + b)
+    ):
+        raise ValueError("inputs must be equal bounded non-empty numeric arrays")
+    return [float(item) for item in a], [float(item) for item in b]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    root = Path(__file__).resolve().parent
+    spec = json.loads((root / "build.json").read_text(encoding="utf-8"))
+    if spec != _EXPECTED_BUILD:
+        raise RuntimeError("unrecognized A3 candidate build descriptor")
+    import torch
+    import torch_npu
+
+    if args == ["--compile-only"]:
+        library = _compile(root, spec, torch, torch_npu)
+        print("A3CANDIDATE_COMPILED=" + hashlib.sha256(library.read_bytes()).hexdigest())
+        return 0
+    if len(args) != 1:
+        raise SystemExit("usage: host_driver.py INPUT.json | --compile-only")
+    library = root / spec["output"]
+    if not library.is_file():
+        raise RuntimeError("candidate library has not been compiled")
+    input_path = Path(args[0])
+    if not input_path.is_absolute():
+        input_path = root / input_path
+    a_values, b_values = _read_input(input_path, spec["max_elements"])
+    torch.ops.load_library(str(library))
+    torch.npu.set_device(0)
+    a = torch.tensor(a_values, dtype=torch.float32, device="npu:0")
+    b = torch.tensor(b_values, dtype=torch.float32, device="npu:0")
+    output = torch.ops.rsi_a3candidates.vector_add(a, b)
+    torch.npu.synchronize()
+    print("A3KERNEL_OUTPUT=" + json.dumps(output.cpu().tolist(), separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
