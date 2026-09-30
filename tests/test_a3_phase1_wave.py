@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config, Phase1Wave, foundation_cells, full_dry_run,
 )
@@ -16,8 +17,9 @@ def config(tmp_path):
     corpus = tmp_path / "corpus"; corpus.mkdir()
     database = tmp_path / "kdb.sqlite"; database.write_bytes(b"db")
     manifest = tmp_path / "manifest.json"; manifest.write_text("{}")
-    profile_driver = tmp_path / "a3_profile_driver.py"; profile_driver.write_text("# fixed\n")
-    return Phase1Config(tmp_path / "state", wrapper, embedding, corpus, database, manifest, profile_driver)
+    return Phase1Config(
+        tmp_path / "state", wrapper, embedding, corpus, database, manifest
+    )
 
 
 def test_all_eight_project_dry_run_has_no_side_effects(tmp_path):
@@ -42,11 +44,9 @@ def test_preflight_checks_credentials_paths_and_fixed_adapter(tmp_path):
     cfg = config(tmp_path)
     report = cfg.preflight({"OPENROUTER_API_KEY": "gpt", "DEEPSEEK_API_KEY": "ds"})
     assert report["ready"] is True and all(report["checks"].values())
+    assert report["profile_driver_sha256"] == profile_driver_asset().sha256
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
         cfg.preflight({"OPENROUTER_API_KEY": "gpt"})
-    cfg.profile_driver.write_text("foreign catlass evidence")
-    with pytest.raises(ValueError, match="foreign"):
-        cfg.preflight({"OPENROUTER_API_KEY": "gpt", "DEEPSEEK_API_KEY": "ds"})
 
 
 def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
@@ -55,7 +55,7 @@ def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
     def execute(cell, paths):
         seen.append((cell.cell_id, paths))
         assert paths.workspace.parent == cfg.state_root / "cells" / cell.cell_id
-        assert paths.profile_driver.read_text() == "# fixed\n"
+        assert paths.profile_driver.read_text() == profile_driver_asset().content
         return {"status": "passed", "evidence_sha256": cell.cell_id.removeprefix("a3-cell-") * 4}
     wave = Phase1Wave(cfg, execute)
     records = wave.run()

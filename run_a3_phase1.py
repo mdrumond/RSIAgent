@@ -23,7 +23,6 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--corpus-artifacts", type=Path, required=True)
         command.add_argument("--knowledge-database", type=Path, required=True)
         command.add_argument("--knowledge-manifest", type=Path, required=True)
-        command.add_argument("--profile-driver", type=Path, required=True)
     return parser
 
 
@@ -31,7 +30,6 @@ def _config(args) -> Phase1Config:
     return Phase1Config(
         args.state_root, args.validation_wrapper, args.embedding_cache,
         args.corpus_artifacts, args.knowledge_database, args.knowledge_manifest,
-        args.profile_driver,
     )
 
 
@@ -40,7 +38,7 @@ def main(argv=None) -> int:
     if args.command == "dry-run":
         value = full_dry_run()
     elif args.command == "report":
-        cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(6)))
+        cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(5)))
         value = Phase1Wave(cfg, lambda *_: {}).report()
     elif args.command == "preflight":
         import os

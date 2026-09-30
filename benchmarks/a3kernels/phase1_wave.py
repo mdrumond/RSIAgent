@@ -12,6 +12,7 @@ import tempfile
 from typing import Callable, Mapping
 
 from benchmarks.a3_experiments import A3ExperimentCell, ProgrammingLevel, build_a3_experiment_plan
+from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_registry import dry_run_plan
 
 
@@ -48,9 +49,9 @@ class Phase1Config:
     corpus_artifacts: Path
     knowledge_database: Path
     knowledge_manifest: Path
-    profile_driver: Path
 
     def preflight(self, environ: Mapping[str, str]) -> dict[str, object]:
+        driver = profile_driver_asset()
         paths = {
             "validation_wrapper": self.validation_wrapper.is_file()
             and os.access(self.validation_wrapper, os.X_OK)
@@ -59,17 +60,24 @@ class Phase1Config:
             "corpus_artifacts": self.corpus_artifacts.is_dir(),
             "knowledge_database": self.knowledge_database.is_file(),
             "knowledge_manifest": self.knowledge_manifest.is_file(),
-            "profile_driver": self.profile_driver.is_file(),
+            "profile_driver": (
+                driver.relative_path == "a3_profile_driver.py"
+                and _SHA.fullmatch(driver.sha256) is not None
+            ),
             "OPENROUTER_API_KEY": bool(environ.get("OPENROUTER_API_KEY")),
             "DEEPSEEK_API_KEY": bool(environ.get("DEEPSEEK_API_KEY")),
         }
         missing = [name for name, present in paths.items() if not present]
         if missing:
             raise ValueError("preflight missing: " + ", ".join(missing))
-        profile_text = self.profile_driver.read_text(encoding="utf-8").lower()
+        profile_text = driver.content.lower()
         if any(token in profile_text for token in ("catlass", "bz-a5", "a5kernel")):
             raise ValueError("profile driver contains foreign A5/Catlass evidence")
-        return {"ready": True, "checks": paths}
+        return {
+            "ready": True,
+            "checks": paths,
+            "profile_driver_sha256": driver.sha256,
+        }
 
 
 Executor = Callable[[A3ExperimentCell, CellPaths], Mapping[str, object]]
@@ -125,7 +133,8 @@ class Phase1Wave:
             (paths.workspace / name).write_text(
                 source.joinpath(name).read_text(encoding="utf-8"), encoding="utf-8"
             )
-        paths.profile_driver.write_bytes(self.config.profile_driver.read_bytes())
+        driver = profile_driver_asset()
+        paths.profile_driver.write_text(driver.content, encoding="utf-8")
 
     @staticmethod
     def _terminal(cell: A3ExperimentCell, outcome: Mapping[str, object]) -> dict[str, object]:
