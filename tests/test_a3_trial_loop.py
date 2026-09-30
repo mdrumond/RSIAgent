@@ -12,7 +12,9 @@ from benchmarks.a3kernels.candidate import CandidateCompilation
 from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
 from benchmarks.a3kernels.phase1_evidence import EvidenceLedger
 from benchmarks.a3kernels.phase1_memory import Phase1LearningJournal
-from benchmarks.a3kernels.phase1_protocol import ExecutionPlan, ExecutionReceipt, SourceFile, VerifiedResult, attest
+from benchmarks.a3kernels.phase1_protocol import (
+    ExecutionPlan, ExecutionReceipt, FailedEvidence, SourceFile, VerifiedResult, attest,
+)
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.profiling import CompactProfileResult, ProfileMetric
 from benchmarks.a3kernels.trial import A3TrialLoop, Action, TrialBudgets, parse_action
@@ -52,19 +54,26 @@ def test_action_schema_has_one_fixed_source_slot_and_no_argv():
 
 class FakeCandidate:
     def __init__(self): self.source = None
-    def _plan(self, source, request_id, attempt_id, length, project_id):
+    def _plan(
+        self, source, request_id, attempt_id, length, project_id,
+        padded_length=None, block_count=1,
+    ):
+        padded_length = padded_length or length
         return ExecutionPlan(request_id, attempt_id, project_id, (SourceFile("candidate.cpp", source),),
-                             ("python", "host_driver.py", "input.json"), (1.0,) * length, (2.0,) * length)
+                             ("python", "host_driver.py", "input.json"),
+                             (1.0,) * padded_length, (2.0,) * padded_length,
+                             logical_length=length, padded_length=padded_length,
+                             block_count=block_count)
     def compile(self, source, _workdir, **kw):
         self.source = source
-        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"])
+        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1))
         body = {"plan": plan, "library_sha256": "c" * 64, "stdout": "ok", "stderr": ""}
         return CandidateCompilation(plan, "c" * 64, "ok", "", attest(body))
     def run(self, source, _workdir, **kw):
         assert source == self.source
-        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"])
+        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1))
         return VerifiedResult.from_receipt(
-            plan, ExecutionReceipt(0, (3.0,) * kw["length"]), max_abs_error=0.0
+            plan, ExecutionReceipt(0, (3.0,) * plan.padded_length), max_abs_error=0.0
         )
 
 
@@ -89,7 +98,10 @@ class FakeProfiler:
         )
 
 
-def _run(tmp_path, actions, *, cell=None, knowledge=None, profiler=None, budgets=None):
+def _run(
+    tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
+    candidate=None, budgets=None,
+):
     selected = cell or _cell()
     profile = load_a3_model_profile(selected.backend_model)
     queue = list(actions)
@@ -104,7 +116,7 @@ def _run(tmp_path, actions, *, cell=None, knowledge=None, profiler=None, budgets
     )
     loop = A3TrialLoop(
         cell=selected, proposal=DEFAULT_PROPOSALS[0], profile=profile, actor=actor,
-        candidate=FakeCandidate(), knowledge=knowledge or FakeKnowledge(False),
+        candidate=candidate or FakeCandidate(), knowledge=knowledge or FakeKnowledge(False),
         profiler=profiler or FakeProfiler(), evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work", budgets=budgets or TrialBudgets(10, 2000),
     )
@@ -124,6 +136,45 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
     assert result.knowledge_queries == 1 and result.profile_result is None
     assert len(journal.read()) == 1
     assert all(_cell().cell_id in prompt and "isolated-lineage" in prompt for prompt in prompts)
+    memory = journal.read()[0]["memory"]
+    assert memory["agent_interpretations"][0]["supports"] == []
+    first, after_write = map(json.loads, prompts[:2])
+    assert first["proposal"] == DEFAULT_PROPOSALS[0].as_dict()
+    assert first["policy"] == {
+        "block_count": 1, "logical_length": 32, "padded_length": 64,
+        "profiling_treatment": "without-profiling-guidance",
+    }
+    assert first["allowed_actions"]["write_source"] == ["action", "source"]
+    assert first["current_candidate_source"] is None
+    assert after_write["current_candidate_source"] == SOURCE
+
+
+def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):
+    class CompileFailure(FakeCandidate):
+        def compile(self, source, _workdir, **kw):
+            plan = self._plan(
+                source, kw["request_id"], kw["attempt_id"], kw["length"],
+                kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1),
+            )
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="CompileError", detail="fixture",
+            )
+
+    result, prompts, _ = _run(
+        tmp_path,
+        [json.dumps({"action": "write_source", "source": SOURCE}),
+         '{"action":"compile"}', '{"action":"compile"}'],
+        candidate=CompileFailure(), budgets=TrialBudgets(3, 2000),
+    )
+    observation = json.loads(prompts[2])["observations"][-1]["failed_evidence"]
+    assert observation["stage"] == "compile"
+    assert len(observation["attestation_sha256"]) == 64
+    failure_entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    assert observation["attestation_sha256"] in {
+        entry.payload["failed_evidence"]["attestation_sha256"]
+        for entry in failure_entries if "failed_evidence" in entry.payload
+    }
+    assert result.failures[-1] == "compile failed: fixture"
 
 
 def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):

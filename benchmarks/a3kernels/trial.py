@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
 from typing import Callable, Mapping
@@ -164,11 +164,11 @@ class A3TrialLoop:
         verified = None
         profile_result = None
         failures: list[str] = []
-        observations: list[str] = []
+        observations: list[object] = []
         actions: list[str] = []
         tokens = queries = 0
         for turn in range(1, self.budgets.max_turns + 1):
-            completion = self.actor(self.profile, self._context(observations))
+            completion = self.actor(self.profile, self._context(observations, source))
             if not isinstance(completion, A3Completion):
                 raise TypeError("actor must return A3Completion")
             tokens += len(completion.text.split())
@@ -190,10 +190,14 @@ class A3TrialLoop:
                     compilation = self.candidate.compile(
                         source, self.workdir, request_id=self.cell.cell_id,
                         attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
-                        length=self._length(), seed=0,
+                        length=self._length(), padded_length=self._padded_length(),
+                        block_count=self._block_count(), seed=0,
                     )
                     if isinstance(compilation, FailedEvidence):
-                        raise ValueError(f"compile failed: {compilation.detail}")
+                        self._retain_candidate_failure(
+                            turn, "compile", compilation, failures, observations
+                        )
+                        continue
                     if not isinstance(compilation, CandidateCompilation):
                         raise TypeError("candidate compiler returned an invalid result")
                     observations.append("host compile passed")
@@ -203,10 +207,14 @@ class A3TrialLoop:
                     result = self.candidate.run(
                         source, self.workdir, request_id=self.cell.cell_id,
                         attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
-                        length=self._length(), seed=0,
+                        length=self._length(), padded_length=self._padded_length(),
+                        block_count=self._block_count(), seed=0,
                     )
                     if isinstance(result, FailedEvidence):
-                        raise ValueError(f"run failed: {result.detail}")
+                        self._retain_candidate_failure(
+                            turn, "run", result, failures, observations
+                        )
+                        continue
                     if not isinstance(result, VerifiedResult) or not result.passed:
                         raise ValueError("host verification did not pass")
                     if result.source_fingerprint != compilation.plan.source_fingerprint:
@@ -246,9 +254,9 @@ class A3TrialLoop:
                     ]
                     if profile_result is not None:
                         facts.append(HostFact("profiling", "compact profile captured", profile_result.evidence_sha256))
-                    known = {fact.evidence_sha256 for fact in facts}
-                    supports = action.supports or tuple(sorted(known))
-                    interpretation = AgentInterpretation(action.interpretation, supports)
+                    interpretation = AgentInterpretation(
+                        action.interpretation, action.supports
+                    )
                     project_memory = ProjectMemory(
                         self.proposal, self.proposal.project_id, self.cell.cell_id,
                         self.memory.lineage_id, verified.source_fingerprint, tuple(actions),
@@ -281,6 +289,26 @@ class A3TrialLoop:
         value = dict(self.proposal.parameters).get("block_count", 1)
         return value if type(value) is int else 1
 
+    def _padded_length(self) -> int:
+        return ((self._length() + 63) // 64) * 64
+
+    def _retain_candidate_failure(
+        self,
+        turn: int,
+        operation: str,
+        failure: FailedEvidence,
+        failures: list[str],
+        observations: list[object],
+    ) -> None:
+        detail = f"{operation} failed: {failure.detail}"
+        failures.append(detail)
+        structured = asdict(failure)
+        observations.append({"failed_evidence": structured})
+        self.evidence.append(
+            EvidenceKind.FAILURE,
+            self._identity({"turn": turn, "failed_evidence": failure}),
+        )
+
     def _identity(self, payload: Mapping[str, object]) -> dict[str, object]:
         return {
             "target": "Ascend910B4", "language": "ascend-c",
@@ -295,13 +323,24 @@ class A3TrialLoop:
             self._identity({"turn": turn, "action": action.kind}),
         )
 
-    def _context(self, observations: list[str]) -> str:
+    def _context(self, observations: list[object], source: str | None) -> str:
         return json.dumps(
             {
+                "allowed_actions": {
+                    kind: sorted(fields) for kind, fields in sorted(_ACTION_FIELDS.items())
+                },
                 "cell": self.cell.as_dict(),
+                "current_candidate_source": source,
                 "lineage_id": self.memory.lineage_id,
                 "memory": json.loads(self.memory.project_context()),
                 "observations": observations,
+                "policy": {
+                    "logical_length": self._length(),
+                    "padded_length": self._padded_length(),
+                    "block_count": self._block_count(),
+                    "profiling_treatment": self.cell.profiling.value,
+                },
+                "proposal": self.proposal.as_dict(),
                 "source_slot": "candidate.cpp",
             },
             sort_keys=True,
