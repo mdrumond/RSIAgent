@@ -122,9 +122,10 @@ _RUNTIME_FAULTS = (
 )
 
 _TWO_RUNTIME_FAULTS = (
-    "        tla.copy(gm_c[0:32], gm_a[0:32])\n",
-    "        tla.copy(gm_c[32:64], gm_b[32:64])\n",
+    "        tla.copy(gm_c[0:16], gm_a[0:16])\n",
+    "        tla.copy(gm_c[16:32], gm_b[16:32])\n",
 )
+_RUNTIME_PADDING_WRITE = "        tla.copy(gm_c[32:64], gm_a[32:64])\n"
 
 
 def _recovery_starter(family: ProjectFamily, fault_count: int) -> str:
@@ -136,7 +137,9 @@ def _recovery_starter(family: ProjectFamily, fault_count: int) -> str:
         # Keep the public one-fault fixture stable, but make a two-fault starter
         # write disjoint halves. Repairing either half alone must therefore
         # remain observable as a host-verification failure.
-        faults = _RUNTIME_FAULTS if fault_count == 1 else _TWO_RUNTIME_FAULTS
+        if fault_count == 2:
+            return _SOURCE_HEAD + "".join(_TWO_RUNTIME_FAULTS) + _RUNTIME_PADDING_WRITE
+        faults = _RUNTIME_FAULTS
     else:  # pragma: no cover - internal call invariant
         raise ValueError("recovery starter requires a recovery family")
     return _SOURCE_HEAD + "".join(faults[:fault_count])

@@ -125,8 +125,6 @@ def test_recovery_contracts_supply_stable_abi_valid_starters(family, evidence):
 @pytest.mark.parametrize("family,one_prefix,two_prefix,second_fault", [
     ("compile-recovery", "tla.copy(gm_c, missing_input",
      "tla.copy(gm_c, missing_input", "missing_input_second"),
-    ("runtime-recovery", "tla.copy(gm_c, gm_a)",
-     "tla.copy(gm_c[", "gm_c[32:64]"),
 ])
 def test_recovery_source_encodes_requested_fault_count(
     family, one_prefix, two_prefix, second_fault
@@ -160,8 +158,10 @@ def test_two_runtime_faults_write_disjoint_output_regions():
     recovery = Phase1ProjectRuntime.from_proposal(proposal).recovery
 
     assert recovery is not None
-    assert "gm_c[0:32]" in recovery.source
-    assert "gm_c[32:64]" in recovery.source
+    assert recovery.fault_count == 2
+    assert "tla.copy(gm_c[0:16], gm_a[0:16])" in recovery.source
+    assert "tla.copy(gm_c[16:32], gm_b[16:32])" in recovery.source
+    assert "tla.copy(gm_c[32:64], gm_a[32:64])" in recovery.source
     assert "tla.copy(gm_c, " not in recovery.source
 
 
