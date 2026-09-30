@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 
 _EXPECTED_BUILD = {
@@ -80,7 +83,21 @@ def _read_input(
     return [float(item) for item in a], [float(item) for item in b], logical, padded, blocks
 
 
-def main(argv: list[str] | None = None) -> int:
+def _runtime_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run one staged A3 candidate")
+    parser.add_argument("--mode", choices=("run", "benchmark", "replay"), default="run")
+    parser.add_argument("--warm-up", type=int, default=0)
+    parser.add_argument("--launch-count", type=int, default=1)
+    parser.add_argument("input")
+    args = parser.parse_args(argv)
+    if args.warm_up < 0 or args.launch_count < 1:
+        parser.error("warm-up must be non-negative and launch-count must be positive")
+    if args.mode == "run" and (args.warm_up != 0 or args.launch_count != 1):
+        parser.error("run mode uses exactly one launch and no warm-up")
+    return args
+
+
+def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int:
     args = sys.argv[1:] if argv is None else argv
     root = Path(__file__).resolve().parent
     spec = json.loads((root / "build.json").read_text(encoding="utf-8"))
@@ -93,12 +110,11 @@ def main(argv: list[str] | None = None) -> int:
         library = _compile(root, spec, torch, torch_npu)
         print("A3CANDIDATE_COMPILED=" + hashlib.sha256(library.read_bytes()).hexdigest())
         return 0
-    if len(args) != 1:
-        raise SystemExit("usage: host_driver.py INPUT.json | --compile-only")
+    runtime = _runtime_args(args)
     library = root / spec["output"]
     if not library.is_file():
         raise RuntimeError("candidate library has not been compiled")
-    input_path = Path(args[0])
+    input_path = Path(runtime.input)
     if not input_path.is_absolute():
         input_path = root / input_path
     a_values, b_values, _logical, padded, blocks = _read_input(
@@ -108,9 +124,34 @@ def main(argv: list[str] | None = None) -> int:
     torch.npu.set_device(0)
     a = torch.tensor(a_values, dtype=torch.float32, device="npu:0")
     b = torch.tensor(b_values, dtype=torch.float32, device="npu:0")
-    output = torch.ops.rsi_a3candidates.vector_add(a, b, padded, blocks)
-    torch.npu.synchronize()
-    print("A3KERNEL_OUTPUT=" + json.dumps(output.cpu().tolist(), separators=(",", ":")))
+    def launch():
+        result = torch.ops.rsi_a3candidates.vector_add(a, b, padded, blocks)
+        torch.npu.synchronize()
+        return result
+
+    output = None
+    for _ in range(runtime.warm_up):
+        output = launch()
+    samples = []
+    for _ in range(runtime.launch_count):
+        start = clock_ns() if runtime.mode == "benchmark" else None
+        output = launch()
+        if start is not None:
+            elapsed = (clock_ns() - start) / 1000.0
+            if not math.isfinite(elapsed) or elapsed <= 0:
+                raise RuntimeError("timing clock returned a non-positive sample")
+            samples.append(elapsed)
+    values = output.cpu().tolist()
+    expected = [a + b for a, b in zip(a_values, b_values)]
+    if (
+        not isinstance(values, list) or len(values) != len(expected)
+        or any(not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
+               for value, want in zip(values, expected))
+    ):
+        raise RuntimeError("candidate output failed padded host verification")
+    for sample in samples:
+        print(f"A3INNER_TIMING_US={sample:.6f}")
+    print("A3KERNEL_OUTPUT=" + json.dumps(values, separators=(",", ":")))
     return 0
 
 

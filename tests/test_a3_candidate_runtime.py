@@ -7,7 +7,7 @@ import subprocess
 import pytest
 
 import benchmarks.a3kernels.candidate as candidate_module
-from benchmarks.a3kernels.candidate_runtime import host_driver
+from benchmarks.a3kernels.candidate_runtime import a3_profile_driver, host_driver
 from benchmarks.a3kernels.candidate import (
     A3CandidateBackend,
     CandidateCompilation,
@@ -68,7 +68,7 @@ def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
     second = backend.plan(SOURCE + "\n", request_id="r1", attempt_id="a1", length=33, seed=7)
 
     assert [item.relative_path for item in first.files] == [
-        "build.json", "candidate.cpp", "host_driver.py", "host_wrapper.inc"
+        "a3_profile_driver.py", "build.json", "candidate.cpp", "host_driver.py", "host_wrapper.inc"
     ]
     assert [item.relative_path for item in first.files if item.relative_path == "candidate.cpp"] == [
         "candidate.cpp"
@@ -99,7 +99,10 @@ def test_plan_identity_binds_logical_padded_and_block_dimensions():
     ).execution_id
 
 
-@pytest.mark.parametrize("changed_path", ["build.json", "host_driver.py", "host_wrapper.inc"])
+@pytest.mark.parametrize(
+    "changed_path",
+    ["a3_profile_driver.py", "build.json", "host_driver.py", "host_wrapper.inc"],
+)
 def test_every_host_asset_is_identity_bound_and_staged_from_plan(monkeypatch, tmp_path, changed_path):
     backend = A3CandidateBackend(command_runner=lambda *args, **kwargs: None)
     original = backend.plan(
@@ -123,6 +126,123 @@ def test_every_host_asset_is_identity_bound_and_staged_from_plan(monkeypatch, tm
         item.relative_path: (tmp_path / item.relative_path).read_text()
         for item in changed.files
     } == {item.relative_path: item.content for item in changed.files}
+
+
+def test_profile_driver_asset_has_explicit_bytes_and_digest_contract():
+    asset = candidate_module.profile_driver_asset()
+
+    assert asset.relative_path == "a3_profile_driver.py"
+    assert asset.content.startswith('"""Checked A3 timing')
+    assert len(asset.sha256) == 64
+
+
+def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, capsys):
+    _candidate_directory(tmp_path, length=4, block_count=1)
+    calls = []
+    def process(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        assert json.loads((tmp_path / argv[-1]).read_text())["block_count"] == 3
+        return subprocess.CompletedProcess(
+            argv, 0,
+            "A3INNER_TIMING_US=2.000000\nA3INNER_TIMING_US=4.000000\n"
+            "A3KERNEL_OUTPUT=[3,3,3,3]\n", "",
+        )
+
+    result = a3_profile_driver.main(
+        ["timing", *_driver_args(tmp_path, block_count=3), "--warm-up", "1", "--launch-count", "2"],
+        process_runner=process,
+    )
+
+    output = capsys.readouterr().out
+    assert result == 0 and len(calls) == 1
+    assert calls[0][0][-8:] == (
+        "host_driver.py", "--mode", "benchmark", "--warm-up", "1",
+        "--launch-count", "2", ".a3-profile-input.json",
+    )
+    assert "A3TIMING_US=2.000000" in output
+    assert "A3TIMING_US=4.000000" in output
+
+
+@pytest.mark.parametrize("metric", ["Basic", "PipeUtilization"])
+def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
+    _candidate_directory(tmp_path, length=4, block_count=1)
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(tuple(argv))
+        if argv[0] == "msprof":
+            output = Path(next(item.split("=", 1)[1] for item in argv if item.startswith("--output=")))
+            report = output / "PROF_1" / "mindstudio_profiler_output"
+            report.mkdir(parents=True)
+            (report / "op_summary_0.csv").write_text(
+                "Op Name,Duration(us),Raw Counter\nvector_add,12.5,7\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
+
+    assert a3_profile_driver.main(
+        ["profile", *_driver_args(tmp_path, block_count=4), "--metric", metric, "--kernel", "vector_add"],
+        process_runner=process,
+        report_directory_factory=lambda root, selected: root / f"report-{selected}",
+    ) == 0
+
+    output = capsys.readouterr().out
+    compact = json.loads(next(line.split("=", 1)[1] for line in output.splitlines()
+                              if line.startswith("A3PROFILE_COMPACT=")))
+    meta = json.loads(next(line.split("=", 1)[1] for line in output.splitlines()
+                           if line.startswith("A3PROFILE_META=")))
+    assert compact["exported_kernels"] == ["vector_add"]
+    table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
+    assert compact["metric_values"] == [[f"{table}:Raw Counter:0", 7.0]]
+    assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
+    assert compact["selected_columns"] == [
+        f"{table}:Duration(us)", f"{table}:Op Name", f"{table}:Raw Counter"
+    ]
+    assert len(compact["report_sha256"]) == 64
+    assert Path(meta["remote_report"]).is_dir()
+    profile = next(call for call in calls if call[0] == "msprof")
+    host_calls = [call for call in calls if call[0] != "msprof"]
+    assert len(host_calls) == 1
+    assert host_calls[0][-8:] == (
+        "host_driver.py", "--mode", "replay", "--warm-up", "0",
+        "--launch-count", "1", ".a3-profile-input.json",
+    )
+    assert f"--aic-metrics={metric}" in profile
+    application = next(item.split("=", 1)[1] for item in profile if item.startswith("--application="))
+    assert "host_driver.py --mode replay --warm-up 0 --launch-count 1 .a3-profile-input.json" in application
+    assert json.loads((tmp_path / ".a3-profile-input.json").read_text())["block_count"] == 4
+
+
+def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):
+    _candidate_directory(tmp_path, length=4, block_count=1)
+
+    def failed(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 2, "", "launch failed")
+
+    with pytest.raises(RuntimeError, match="launch failed"):
+        a3_profile_driver.main(["timing", *_driver_args(tmp_path)], process_runner=failed)
+    with pytest.raises(ValueError, match="block-count"):
+        a3_profile_driver.main(
+            ["timing", *_driver_args(tmp_path, block_count=33)],
+            process_runner=failed,
+        )
+
+
+def _candidate_directory(root: Path, *, length: int, block_count: int) -> None:
+    for name in ("host_driver.py", "input.json", "a3_candidate.so"):
+        (root / name).write_text("{}" if name == "input.json" else "staged")
+    (root / "input.json").write_text(json.dumps({
+        "input_a": [1] * length, "input_b": [2] * length,
+        "logical_length": length, "padded_length": length, "block_count": block_count,
+    }))
+
+
+def _driver_args(root: Path, *, block_count: int = 1) -> list[str]:
+    return [
+        "--candidate-dir", str(root.resolve()), "--logical-device", "0",
+        "--length", "4", "--block-count", str(block_count), "--warm-up", "0",
+        "--launch-count", "1",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -316,6 +436,52 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
         ("launch", 4, 3), "sync",
     ]
     assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0,0.0,0.0]\n"
+
+
+def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tmp_path):
+    class Tensor:
+        def __init__(self, values): self.values = values
+        def cpu(self): return self
+        def tolist(self): return self.values
+
+    events = []
+    torch = type("Torch", (), {})()
+    torch.float32 = object()
+    torch.tensor = lambda values, **kwargs: Tensor(values)
+    torch.npu = type("Npu", (), {
+        "set_device": lambda _self, value: events.append(("device", value)),
+        "synchronize": lambda _self: events.append("sync"),
+    })()
+    torch.ops = type("Ops", (), {
+        "load_library": lambda _self, path: events.append("load"),
+        "rsi_a3candidates": type("Candidate", (), {
+            "vector_add": lambda _self, a, b, padded, blocks: (
+                events.append(("launch", blocks)),
+                Tensor([x + y for x, y in zip(a.values, b.values)]),
+            )[1],
+        })(),
+    })()
+    monkeypatch.setitem(__import__("sys").modules, "torch", torch)
+    monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("N", (), {})())
+    monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
+    (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
+    (tmp_path / "a3_candidate.so").write_bytes(b"library")
+    _candidate_directory(tmp_path, length=4, block_count=3)
+    ticks = iter((0, 2000, 3000, 7000))
+
+    assert host_driver.main(
+        ["--mode", "benchmark", "--warm-up", "2", "--launch-count", "2", "input.json"],
+        clock_ns=lambda: next(ticks),
+    ) == 0
+
+    assert events.count(("launch", 3)) == 4
+    assert events.count("sync") == 4
+    assert events.count("load") == 1
+    output = capsys.readouterr().out
+    assert output.count("A3INNER_TIMING_US=") == 2
+    assert "A3INNER_TIMING_US=2.000000" in output
+    assert "A3INNER_TIMING_US=4.000000" in output
+    assert output.endswith("A3KERNEL_OUTPUT=[3.0,3.0,3.0,3.0]\n")
 
 
 def test_fixed_wrapper_launches_the_requested_block_count():
