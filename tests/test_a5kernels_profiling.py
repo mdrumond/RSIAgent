@@ -238,6 +238,33 @@ def _final_replay_ids(request: ProfileRequest) -> tuple[str, ...]:
     return tuple(command.replay_id for command in backend.commands)
 
 
+def test_default_profile_identity_preserves_legacy_golden_values() -> None:
+    assert REQUEST.block_count is None
+    assert REQUEST.configuration_id == (
+        "a995f98acd42f00fd1b3a51fb4bf645e12aa8f9723b338bb8f5da0c9a3b21997"
+    )
+    assert _final_replay_ids(REQUEST) == (
+        "profile-c7b74c5aa1941f9fde61200b11b3d9b2122f8db1292c44aa688997bc50756ae5",
+        "profile-a9a848aedbb429dbe44f5003dacc4f352657f4b124054154465e92aeffc6d3f5",
+        "profile-a3e5e34fbc4e930832c31df545a987ae308fca1f930e07655861ba116161f5a9",
+    )
+
+
+def test_plan_owned_nondefault_block_binding_changes_profile_identity() -> None:
+    plan = replace(
+        REQUEST.plan,
+        environment=REQUEST.plan.environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", "6"
+        ),
+    )
+    request = replace(REQUEST, plan=plan)
+
+    assert request.block_count == 6
+    assert request.execution_id != REQUEST.execution_id
+    assert request.configuration_id != REQUEST.configuration_id
+    assert _final_replay_ids(request) != _final_replay_ids(REQUEST)
+
+
 @pytest.mark.parametrize(
     "changed",
     [

@@ -254,5 +254,4 @@ class CandidateProfileEvaluation:
             implementation="catlass-dsl",
             expected_kernel=run.kernel_name,
             device=self._device,
-            block_count=int(encoded_block_count),
         )

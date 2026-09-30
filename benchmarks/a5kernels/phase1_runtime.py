@@ -105,7 +105,7 @@ class Phase1ProjectRuntime:
         }
 
 
-_SOURCE_HEAD = """\
+_COMPILE_SOURCE_HEAD = """\
 import catlass.tla as tla
 
 @tla.kernel
@@ -117,32 +117,75 @@ _COMPILE_FAULTS = (
     "        tla.copy(gm_c, missing_input)\n",
     "        tla.copy(gm_c, missing_input_second)\n",
 )
+_RUNTIME_SOURCE_HEAD = """\
+import catlass.tla as tla
+
+PADDED_VECTOR_ELE = 448
+VL_ELE = 64
+FAULT_ELE = 16
+
+@tla.kernel
+def vector_add(gm_a: tla.Tensor, gm_b: tla.Tensor, gm_c: tla.Tensor) -> None:
+    n_ele = gm_a.origin_shape[0]
+    ub_loaded = tla.flag("ub_loaded", tla.arch.MTE2, tla.arch.VECTOR)
+    vec_done = tla.flag("vec_done", tla.arch.VECTOR, tla.arch.MTE3)
+
+    ptr_a = tla.allocate(PADDED_VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
+    ptr_b = tla.allocate(PADDED_VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
+    ptr_c = tla.allocate(PADDED_VECTOR_ELE, tla.Float32, tla.AddressSpace.ub, 256)
+    ub_a = tla.make_tensor_like(ptr_a, gm_a, tla.arch.RowMajor)
+    ub_b = tla.make_tensor_like(ptr_b, gm_b, tla.arch.RowMajor)
+    ub_c = tla.make_tensor_like(ptr_c, gm_c, tla.arch.RowMajor)
+
+    with tla.vector():
+        tla.copy(ub_a, gm_a)
+        tla.copy(ub_b, gm_b)
+        tla.set_flag(ub_loaded)
+        tla.wait_flag(ub_loaded)
+        with tla.vec.func(mode="simd"):
+            for i in tla.range((n_ele + VL_ELE - 1) // VL_ELE):
+                tile_a = tla.tile_view(ub_a, tla.make_shape(VL_ELE), tla.make_coord(i))
+                tile_b = tla.tile_view(ub_b, tla.make_shape(VL_ELE), tla.make_coord(i))
+                tile_c = tla.tile_view(ub_c, tla.make_shape(VL_ELE), tla.make_coord(i))
+                tile_c.store(tla.add(tile_a.load(), tile_b.load()))
+"""
+
 _RUNTIME_FAULTS = (
-    "        tla.copy(gm_c, gm_a)\n",
+    """\
+            fault_a_0 = tla.tile_view(ub_a, tla.make_shape(FAULT_ELE), tla.make_coord(0))
+            fault_b_0 = tla.tile_view(ub_b, tla.make_shape(FAULT_ELE), tla.make_coord(0))
+            fault_c_0 = tla.tile_view(ub_c, tla.make_shape(FAULT_ELE), tla.make_coord(0))
+            fault_c_0.store(fault_a_0.load())
+""",
+    """\
+            fault_a_1 = tla.tile_view(ub_a, tla.make_shape(FAULT_ELE), tla.make_coord(1))
+            fault_b_1 = tla.tile_view(ub_b, tla.make_shape(FAULT_ELE), tla.make_coord(1))
+            fault_c_1 = tla.tile_view(ub_c, tla.make_shape(FAULT_ELE), tla.make_coord(1))
+            fault_c_1.store(fault_b_1.load())
+""",
 )
 
-_TWO_RUNTIME_FAULTS = (
-    "        tla.copy(gm_c[0:16], gm_a[0:16])\n",
-    "        tla.copy(gm_c[16:32], gm_b[16:32])\n",
-)
-_RUNTIME_PADDING_WRITE = "        tla.copy(gm_c[32:64], gm_a[32:64])\n"
+_RUNTIME_SOURCE_TAIL = """\
+        tla.set_flag(vec_done)
+        tla.wait_flag(vec_done)
+        tla.copy(gm_c, ub_c)
+        tla.pipe_barrier(tla.pipes.ALL)
+"""
 
 
 def _recovery_starter(family: ProjectFamily, fault_count: int) -> str:
     if fault_count not in (1, 2):  # pragma: no cover - registry invariant
         raise ValueError("recovery fault count must be 1 or 2")
     if family is ProjectFamily.COMPILE_RECOVERY:
-        faults = _COMPILE_FAULTS
+        return _COMPILE_SOURCE_HEAD + "".join(_COMPILE_FAULTS[:fault_count])
     elif family is ProjectFamily.RUNTIME_RECOVERY:
-        # Keep the public one-fault fixture stable, but make a two-fault starter
-        # write disjoint halves. Repairing either half alone must therefore
-        # remain observable as a host-verification failure.
-        if fault_count == 2:
-            return _SOURCE_HEAD + "".join(_TWO_RUNTIME_FAULTS) + _RUNTIME_PADDING_WRITE
-        faults = _RUNTIME_FAULTS
+        return (
+            _RUNTIME_SOURCE_HEAD
+            + "".join(_RUNTIME_FAULTS[:fault_count])
+            + _RUNTIME_SOURCE_TAIL
+        )
     else:  # pragma: no cover - internal call invariant
         raise ValueError("recovery starter requires a recovery family")
-    return _SOURCE_HEAD + "".join(faults[:fault_count])
 
 
 # Stable public one-fault fixtures retained for callers and default proposals.

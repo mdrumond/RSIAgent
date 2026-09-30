@@ -42,7 +42,6 @@ class ProfileRequest:
     device: int
     warm_up: int = 0
     launch_count: int = 1
-    block_count: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.plan, ExecutionPlan):
@@ -70,13 +69,13 @@ class ProfileRequest:
         }
         if reserved_timing.intersection(bindings):
             raise ValueError("plan environment must not override host-owned timing policy")
-        if self.block_count is not None:
-            if type(self.block_count) is not int or not 1 <= self.block_count <= 8:
-                raise ValueError("block_count must be an integer from 1 through 8")
-            if bindings.get("A5KERNEL_BLOCK_NUM") != str(self.block_count):
-                raise ValueError(
-                    "plan block binding must match host-owned block metadata"
-                )
+        encoded_block_count = bindings.get("A5KERNEL_BLOCK_NUM")
+        if encoded_block_count is not None and not (
+            len(encoded_block_count) == 1 and "1" <= encoded_block_count <= "8"
+        ):
+            raise ValueError(
+                "plan block binding must be a canonical integer from 1 through 8"
+            )
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -102,6 +101,13 @@ class ProfileRequest:
         return self.plan.source_fingerprint
 
     @property
+    def block_count(self) -> int | None:
+        """Return the block count owned by the immutable execution plan."""
+
+        encoded = dict(self.plan.environment.bindings).get("A5KERNEL_BLOCK_NUM")
+        return None if encoded is None else int(encoded)
+
+    @property
     def configuration_id(self) -> str:
         """Identity of the executable and every profiling launch setting."""
 
@@ -112,7 +118,6 @@ class ProfileRequest:
                 "expected_kernel": self.expected_kernel,
                 "implementation": self.implementation,
                 "launch_count": self.launch_count,
-                "block_count": self.block_count,
                 "warm_up": self.warm_up,
             }
         )
@@ -127,7 +132,6 @@ class ProfileRequest:
         device: int,
         warm_up: int = 0,
         launch_count: int = 1,
-        block_count: int | None = None,
     ) -> ProfileRequest:
         """Bind profiling to the exact host-prepared executable attempt."""
 
@@ -138,7 +142,6 @@ class ProfileRequest:
             device=device,
             warm_up=warm_up,
             launch_count=launch_count,
-            block_count=block_count,
         )
 
 

@@ -149,7 +149,7 @@ def test_recovery_source_encodes_requested_fault_count(
     validate_candidate_source(two.source)
 
 
-def test_two_runtime_faults_write_disjoint_output_regions():
+def test_runtime_faults_use_valid_movement_and_disjoint_logical_regions():
     proposal = CurriculumProposal.from_mapping({
         "family": "runtime-recovery", "parameters": {"faults": 2},
         "hypothesis": "Two disjoint faults exercise recovery.",
@@ -159,10 +159,45 @@ def test_two_runtime_faults_write_disjoint_output_regions():
 
     assert recovery is not None
     assert recovery.fault_count == 2
-    assert "tla.copy(gm_c[0:16], gm_a[0:16])" in recovery.source
-    assert "tla.copy(gm_c[16:32], gm_b[16:32])" in recovery.source
-    assert "tla.copy(gm_c[32:64], gm_a[32:64])" in recovery.source
-    assert "tla.copy(gm_c, " not in recovery.source
+    assert "tla.copy(ub_a, gm_a)" in recovery.source
+    assert "tla.copy(ub_b, gm_b)" in recovery.source
+    assert "tla.copy(gm_c, ub_c)" in recovery.source
+    assert "fault_c_0.store(fault_a_0.load())" in recovery.source
+    assert "fault_c_1.store(fault_b_1.load())" in recovery.source
+    assert "gm_c[" not in recovery.source
+    assert "tla.copy(gm_c, gm_" not in recovery.source
+
+
+def test_repairing_either_runtime_fault_leaves_the_other_host_visible():
+    proposal = CurriculumProposal.from_mapping({
+        "family": "runtime-recovery", "parameters": {"faults": 2},
+        "hypothesis": "Each independent fault requires its own repair.",
+        "evidence_preset": "ordinary-recovery",
+    })
+    source = Phase1ProjectRuntime.from_proposal(proposal).recovery.source
+    faults = (
+        "fault_c_0.store(fault_a_0.load())",
+        "fault_c_1.store(fault_b_1.load())",
+    )
+    repairs = (
+        "fault_c_0.store(tla.add(fault_a_0.load(), fault_b_0.load()))",
+        "fault_c_1.store(tla.add(fault_a_1.load(), fault_b_1.load()))",
+    )
+
+    for repaired_index in range(2):
+        repaired = source.replace(faults[repaired_index], repairs[repaired_index])
+        validate_candidate_source(repaired)
+        assert repairs[repaired_index] in repaired
+        assert faults[1 - repaired_index] in repaired
+
+        left = [float(index + 1) for index in range(64)]
+        right = [float(100 + index) for index in range(64)]
+        output = [a + b for a, b in zip(left, right)]
+        remaining = 1 - repaired_index
+        start = remaining * 16
+        source_values = left if remaining == 0 else right
+        output[start:start + 16] = source_values[start:start + 16]
+        assert output != [a + b for a, b in zip(left, right)]
 
 
 @pytest.mark.parametrize("options,message", [
@@ -226,4 +261,5 @@ def test_direct_recovery_construction_rejects_metadata_mismatch(recovery):
 def test_recovery_templates_are_distinct_and_deterministic():
     assert COMPILE_FAILURE_STARTER != HOST_FAILURE_STARTER
     assert "missing_input" in COMPILE_FAILURE_STARTER
-    assert "tla.copy(gm_c, gm_a)" in HOST_FAILURE_STARTER
+    assert "fault_c_0.store(fault_a_0.load())" in HOST_FAILURE_STARTER
+    assert "tla.copy(gm_c, ub_c)" in HOST_FAILURE_STARTER
