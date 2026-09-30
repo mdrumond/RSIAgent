@@ -10,9 +10,10 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from benchmarks.a3kernels import A3KernelRunner, RunRequest
+from benchmarks.a3kernels import A3KernelRunner, RunRequest, VerifiedResult
 from benchmarks.a3kernels.ascendc_runtime import host_driver
 from benchmarks.a3kernels.fixture import source_files
+import run_a3kernels as cli
 
 
 def test_fixture_is_a3_specific_and_complete():
@@ -59,6 +60,9 @@ def test_host_runner_scores_raw_output_and_attests_evidence(tmp_path):
 
     assert result.passed is True
     assert result.max_abs_error == 0
+    assert result.stdout.startswith("A3KERNEL_OUTPUT=")
+    assert result.stderr == ""
+    assert result.output_parse_error is None
     assert len(result.a3_evidence_sha256) == 64
     assert len(result.attestation_sha256) == 64
     assert (tmp_path / "kernel.cpp").is_file()
@@ -74,10 +78,60 @@ def test_host_runner_rejects_incorrect_output_even_on_zero_exit(tmp_path):
     assert result.max_abs_error > 1
 
 
+@pytest.mark.parametrize(
+    "stdout, message",
+    [
+        ("compiler banner\n", "exactly one"),
+        ("A3KERNEL_OUTPUT=[]\nA3KERNEL_OUTPUT=[]\n", "exactly one"),
+        ("A3KERNEL_OUTPUT=not-json\n", "Expecting value"),
+        ('A3KERNEL_OUTPUT=[1,"bad"]\n', "numeric array"),
+    ],
+)
+def test_malformed_success_output_becomes_attested_failure(tmp_path, stdout, message):
+    def command(argv, **unused):
+        return subprocess.CompletedProcess(argv, 0, stdout, "runtime warning")
+
+    result = A3KernelRunner(command).run(RunRequest(length=1), tmp_path)
+
+    assert result.passed is False
+    assert result.exit_code == 0
+    assert result.max_abs_error is None
+    assert message in result.output_parse_error
+    assert result.stdout == stdout
+    assert result.stderr == "runtime warning"
+    assert len(result.a3_evidence_sha256) == len(result.attestation_sha256) == 64
+
+
+def test_native_failure_diagnostics_are_retained_and_attested(tmp_path):
+    def command(argv, **unused):
+        return subprocess.CompletedProcess(
+            argv, 4, "bisheng: compiling kernel.cpp\n", "linker: missing library\n"
+        )
+
+    result = A3KernelRunner(command).run(RunRequest(length=7), tmp_path)
+
+    assert result.passed is False
+    assert result.exit_code == 4
+    assert result.stdout == "bisheng: compiling kernel.cpp\n"
+    assert result.stderr == "linker: missing library\n"
+    assert result.output_parse_error is None
+    changed = A3KernelRunner(
+        lambda argv, **unused: subprocess.CompletedProcess(argv, 4, "", "different")
+    ).run(RunRequest(length=7), tmp_path)
+    assert changed.a3_evidence_sha256 != result.a3_evidence_sha256
+    assert changed.attestation_sha256 != result.attestation_sha256
+
+
 @pytest.mark.parametrize("length", [0, 4097, True])
 def test_request_rejects_invalid_lengths(length):
     with pytest.raises(ValueError, match="length"):
         RunRequest(length=length)
+
+
+@pytest.mark.parametrize("seed", [True, False, 1.0, "1", None])
+def test_request_rejects_non_integer_seed_before_identity(seed):
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        RunRequest(seed=seed).request_id
 
 
 def test_compile_uses_bisheng_and_fixed_a3_arch(monkeypatch, tmp_path):
@@ -162,3 +216,40 @@ def test_input_parser_rejects_untrusted_fields_and_bad_shapes():
         )
     with pytest.raises(ValueError, match="equal lengths"):
         host_driver._read_vectors(StringIO('{"input_a":[1],"input_b":[2,3]}'), 4096)
+
+
+def test_public_cli_validation_suite_covers_native_boundary_lengths(
+    monkeypatch, capsys, tmp_path
+):
+    calls = []
+
+    class FakeRunner:
+        def run(self, request, workdir):
+            calls.append((request.length, request.seed, workdir))
+            return VerifiedResult(
+                request_id=request.request_id,
+                execution_id=f"execution-{request.length}",
+                passed=True,
+                max_abs_error=0.0,
+                exit_code=0,
+                source_fingerprint="source",
+                output_sha256="output",
+                a3_evidence_sha256="evidence",
+                stdout="A3KERNEL_OUTPUT=[]\n",
+                stderr="",
+                output_parse_error=None,
+                attestation_sha256="attestation",
+            )
+
+    monkeypatch.setattr(cli, "A3KernelRunner", FakeRunner)
+
+    assert cli.main(["--validation-suite", "--seed", "9", "--workdir", str(tmp_path)]) == 0
+
+    report = json.loads(capsys.readouterr().out)
+    assert report["validation_lengths"] == [1, 33, 4096]
+    assert [item[:2] for item in calls] == [(1, 9), (33, 9), (4096, 9)]
+    assert [item[2] for item in calls] == [
+        tmp_path / "length-1",
+        tmp_path / "length-33",
+        tmp_path / "length-4096",
+    ]

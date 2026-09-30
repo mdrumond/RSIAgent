@@ -56,7 +56,13 @@ class A3KernelRunner:
         completed = self._command_runner(
             plan.argv, cwd=workdir, text=True, capture_output=True, check=False
         )
-        output = _parse_output(completed.stdout) if completed.returncode == 0 else ()
+        output: tuple[float, ...] = ()
+        parse_error = None
+        if completed.returncode == 0:
+            try:
+                output = _parse_output(completed.stdout)
+            except (TypeError, ValueError) as exc:
+                parse_error = str(exc)
         expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
         valid = len(output) == len(expected) and all(math.isfinite(x) for x in output)
         max_error = (
@@ -79,6 +85,7 @@ class A3KernelRunner:
                 "stderr": completed.stderr,
                 "stdout": completed.stdout,
                 "output_sha256": output_sha,
+                "output_parse_error": parse_error,
             }
         )
         fields = {
@@ -90,6 +97,9 @@ class A3KernelRunner:
             "source_fingerprint": plan.source_fingerprint,
             "output_sha256": output_sha,
             "a3_evidence_sha256": evidence_sha,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "output_parse_error": parse_error,
         }
         return VerifiedResult(**fields, attestation_sha256=canonical_hash(fields))
 

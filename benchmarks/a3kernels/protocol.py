@@ -25,6 +25,8 @@ class RunRequest:
     def __post_init__(self) -> None:
         if type(self.length) is not int or not 1 <= self.length <= 4096:
             raise ValueError("length must be an integer in [1, 4096]")
+        if type(self.seed) is not int:
+            raise ValueError("seed must be an integer")
         if self.dtype != "float32":
             raise ValueError("the A3 hello kernel supports only float32")
         if self.target != "Ascend910B4":
@@ -84,4 +86,7 @@ class VerifiedResult:
     source_fingerprint: str
     output_sha256: str
     a3_evidence_sha256: str
+    stdout: str
+    stderr: str
+    output_parse_error: str | None
     attestation_sha256: str
