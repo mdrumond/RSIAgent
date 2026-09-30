@@ -11,6 +11,8 @@ from typing import Mapping
 
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.fixtures import (
+    CATLASS_MAX_LENGTH,
+    CATLASS_MAX_PADDED_LENGTH,
     Language,
     catlass_candidate_fixture,
 )
@@ -18,6 +20,9 @@ from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.profiling import (
     ProfileRequest,
     ProfilingTreatmentController,
+    StudyDimensions,
+    StudyVariant,
+    bind_study_dimensions,
 )
 from benchmarks.a5kernels.protocol import ExecutionPlan, ExecutionReceipt, RunRequest
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
@@ -90,11 +95,29 @@ class CatlassCandidateBackend:
     """Turn workspace source into an immutable plan and execute it on BZ-A5."""
 
     def __init__(self, execution_backend: ExecutionBackend, *, length: int = 32,
+                 padded_length: int | None = None, block_count: int = 1,
                  seed: int = 0, device: int = 0):
         if isinstance(device, bool) or not isinstance(device, int) or device < 0:
             raise ValueError("device must be a non-negative integer")
+        if type(length) is not int or not 1 <= length <= CATLASS_MAX_LENGTH:
+            raise ValueError(
+                f"length must be an integer in [1, {CATLASS_MAX_LENGTH}]"
+            )
+        if padded_length is None:
+            padded_length = ((length + 63) // 64) * 64
+        if (type(padded_length) is not int or padded_length < length
+                or padded_length > CATLASS_MAX_PADDED_LENGTH
+                or padded_length % 64):
+            raise ValueError(
+                "padded_length must be a 64-aligned integer in "
+                f"[length, {CATLASS_MAX_PADDED_LENGTH}]"
+            )
+        if type(block_count) is not int or not 1 <= block_count <= 8:
+            raise ValueError("block_count must be an integer in [1, 8]")
         self._execution_backend = execution_backend
         self._length = length
+        self._padded_length = padded_length
+        self._block_count = block_count
         self._seed = seed
         self._device = device
 
@@ -139,10 +162,46 @@ class CatlassCandidateBackend:
             hashlib.sha256(source.encode("utf-8")).hexdigest(),
         )
 
+    def run_study(
+        self,
+        workspace: Path,
+        language: str,
+        workload: Workload,
+        attempt_id: str,
+        ledger: EvidenceLedger,
+        dimensions: StudyDimensions,
+    ) -> StudyVariant:
+        """Execute correctness with study dimensions already bound to the plan."""
+
+        if workload is not Workload.SMOKE_VECTOR_ADD:
+            raise ValueError("Catlass candidate runtime supports only smoke-vector-add")
+        if not isinstance(dimensions, StudyDimensions):
+            raise TypeError("dimensions must be host-owned StudyDimensions")
+        source = self._source(workspace, language)
+        request = self._request()
+        capture = _CaptureExecution(self._execution_backend)
+        runner = A5KernelRunner(capture, evidence_ledger=ledger)
+        plan = self._prepare(
+            runner, request, source, attempt_id,
+            compile_only=False, device=self._device,
+        )
+        plan = bind_study_dimensions(plan, dimensions)
+        verified = runner.run_plan(request, plan)
+        if not verified.passed:
+            raise ValueError("candidate correctness must pass before a study variant")
+        kernel_name = _discovered_kernel(capture.receipt)
+        profile = ProfileRequest.from_execution_plan(
+            plan,
+            implementation=Language.CATLASS_DSL.value,
+            expected_kernel=kernel_name,
+            device=self._device,
+        )
+        return StudyVariant(profile, verified, dimensions)
+
     def _request(self) -> RunRequest:
         return RunRequest(
             Language.CATLASS_DSL.value, length=self._length, seed=self._seed,
-            padded_length=((self._length + 63) // 64) * 64,
+            padded_length=self._padded_length,
         )
 
     @staticmethod
@@ -153,13 +212,15 @@ class CatlassCandidateBackend:
         validate_candidate_source(source)
         return source
 
-    @staticmethod
-    def _prepare(runner: A5KernelRunner, request: RunRequest, source: str,
+    def _prepare(self, runner: A5KernelRunner, request: RunRequest, source: str,
                  attempt_id: str, *, compile_only: bool, device: int) -> ExecutionPlan:
         plan = runner.prepare(request, attempt_id=attempt_id)
         fixture = catlass_candidate_fixture(source)
         environment = fixture.environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(device)
+        )
+        environment = environment.with_binding(
+            "A5KERNEL_BLOCK_NUM", str(self._block_count)
         )
         if compile_only:
             environment = environment.with_binding("A5KERNEL_COMPILE_ONLY", "1")
@@ -218,6 +279,15 @@ class CandidateProfileEvaluation:
     def _request(self, run: CandidateRun) -> ProfileRequest:
         if run.kernel_name != EXACT_KERNEL_NAME:
             raise ValueError("candidate run did not report the host-discovered kernel")
+        bindings = dict(run.plan.environment.bindings)
+        encoded_block_count = bindings.get("A5KERNEL_BLOCK_NUM")
+        if encoded_block_count is None or not encoded_block_count.isascii() or not (
+            len(encoded_block_count) == 1 and "1" <= encoded_block_count <= "8"
+        ):
+            raise ValueError(
+                "candidate plan must bind A5KERNEL_BLOCK_NUM to a canonical "
+                "integer in [1, 8]"
+            )
         return ProfileRequest.from_execution_plan(
             run.plan,
             implementation="catlass-dsl",

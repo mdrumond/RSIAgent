@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -879,6 +880,49 @@ def test_catlass_source_pads_to_full_tiles_and_preserves_public_capacity():
     A5KernelRunner(FakeBackend()).prepare(RunRequest(Language.CATLASS_DSL.value, length=400))
 
 
+def test_catlass_fixture_compile_path_accepts_host_owned_block_six(monkeypatch):
+    source = {
+        item.relative_path: item.content
+        for item in fixture_for(Language.CATLASS_DSL).files
+    }["kernel.py"]
+    catlass = ModuleType("catlass")
+    catlass.__path__ = []
+    tla = ModuleType("catlass.tla")
+    tla.Tensor = object
+    tla.kernel = lambda function: function
+    tla.arch = SimpleNamespace(RowMajor=object())
+    artifact = lambda *args, **kwargs: None
+    tla.compile = lambda *args, **kwargs: artifact
+    runtime = ModuleType("catlass.tla.runtime")
+    catlass.tla = tla
+
+    class FakeTensor:
+        def contiguous(self):
+            return self
+
+    class FakeTLATensor:
+        def mark_compact_shape_dynamic(self, _axis):
+            return self
+
+    runtime.from_dlpack = lambda _tensor, layout_tag: FakeTLATensor()
+    torch = ModuleType("torch")
+    torch.float32 = object()
+    torch.npu = SimpleNamespace(set_device=lambda _device: None)
+    torch.tensor = lambda *args, **kwargs: FakeTensor()
+    torch.empty_like = lambda _tensor: FakeTensor()
+    monkeypatch.setitem(sys.modules, "catlass", catlass)
+    monkeypatch.setitem(sys.modules, "catlass.tla", tla)
+    monkeypatch.setitem(sys.modules, "catlass.tla.runtime", runtime)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
+    monkeypatch.setenv("A5KERNEL_BLOCK_NUM", "6")
+    monkeypatch.setenv("A5KERNEL_COMPILE_ONLY", "1")
+    namespace = {}
+    exec(compile(source, "kernel.py", "exec"), namespace)
+
+    assert namespace["run"]([1.0, 2.0], [3.0, 4.0]) == [4.0, 6.0]
+
+
 def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence():
     calls = []
     revision = "9a6ac627b5f4078060287844189730cf0d184800"
@@ -1100,8 +1144,10 @@ def test_adapter_rejects_plan_bound_to_different_runtime_provenance():
     assert executor.invocations == []
 
 
-def test_adapter_applies_complete_typed_phase1_study_provenance():
-    parallelism = "1"
+@pytest.mark.parametrize(("parallelism", "plan_bound"), [("1", False), ("6", True)])
+def test_adapter_applies_complete_typed_phase1_study_provenance(
+    parallelism, plan_bound
+):
     runtime = (("catlass_revision", "1" * 40),)
     executor = FakeCommandExecutor(
         CommandResult(9, "expected dispatch failure"),
@@ -1115,6 +1161,11 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
     )
     plan = replace(
         plan,
+        environment=(
+            plan.environment.with_binding("A5KERNEL_BLOCK_NUM", parallelism)
+            if plan_bound
+            else plan.environment
+        ),
         runtime_provenance=(
             *plan.runtime_provenance,
             ("phase1.shape", "n32"),
@@ -1128,7 +1179,9 @@ def test_adapter_applies_complete_typed_phase1_study_provenance():
 
     assert receipt.exit_code == 9
     assert len(executor.invocations) == 1
-    assert f"A5KERNEL_BLOCK_NUM={parallelism}" in executor.invocations[0].argv
+    assert executor.invocations[0].argv.count(
+        f"A5KERNEL_BLOCK_NUM={parallelism}"
+    ) == 1
 
 
 @pytest.mark.parametrize("binding", ["1", None])

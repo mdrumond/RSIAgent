@@ -16,7 +16,7 @@ import tempfile
 from typing import Callable, Protocol
 
 from benchmarks.a5kernels.protocol import ExecutionPlan, ExecutionReceipt, SourceFile
-from benchmarks.a5kernels.profiling import study_dimensions_from_plan
+from benchmarks.a5kernels.profiling import ParallelismClass, study_dimensions_from_plan
 
 
 OUTPUT_MARKER = "A5KERNEL_OUTPUT="
@@ -354,6 +354,7 @@ class BZSessionAdapter:
     def prepare_execution(self, plan: ExecutionPlan) -> ExecutionPlan:
         """Return the exact immutable plan that will cross the BZ boundary."""
 
+        plan = _bind_declared_parallelism(plan)
         if not self._runtime_provenance_matches(plan):
             raise RuntimeUnavailableError(
                 "execution plan runtime provenance does not match the configured backend"
@@ -388,6 +389,32 @@ class BZSessionAdapter:
         except (TypeError, ValueError):
             return False
         return True
+
+
+def _bind_declared_parallelism(plan: ExecutionPlan) -> ExecutionPlan:
+    """Materialize the block binding implied by one typed study manifest."""
+
+    declared = tuple(
+        value for key, value in plan.runtime_provenance
+        if key == "phase1.parallelism"
+    )
+    if len(declared) != 1:
+        return plan
+    try:
+        parallelism = ParallelismClass(int(declared[0]))
+    except (TypeError, ValueError):
+        return plan
+    if declared[0] != str(parallelism.value):
+        return plan
+    existing = dict(plan.environment.bindings).get("A5KERNEL_BLOCK_NUM")
+    if existing is not None and existing != declared[0]:
+        raise ValueError("A5KERNEL_BLOCK_NUM binding does not match typed parallelism")
+    if existing is not None:
+        return plan
+    return replace(
+        plan,
+        environment=plan.environment.with_binding("A5KERNEL_BLOCK_NUM", declared[0]),
+    )
 
 
 def _parse_output(stdout: str) -> tuple[float, ...]:

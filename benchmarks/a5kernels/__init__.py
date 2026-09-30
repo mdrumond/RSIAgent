@@ -57,6 +57,7 @@ from benchmarks.a5kernels.profiling import (
     ProfilingTreatmentController,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
 from benchmarks.a5kernels.trial import (
     ActorOutcome,
@@ -89,6 +90,11 @@ from benchmarks.a5kernels.phase1_memory import (
     Phase1LearningJournal,
     Phase1ProjectMemory,
     Phase1ResumeState,
+)
+from benchmarks.a5kernels.phase1_runtime import (
+    Phase1ProjectRuntime,
+    RecoveryEvidence,
+    RecoveryStarter,
 )
 
 __all__ = [
@@ -127,6 +133,8 @@ __all__ = [
     "PaddingClass",
     "ParallelismClass",
     "Phase1PerformanceStudy",
+    "Phase1ProjectRuntime",
+    "Phase1PerformanceExecution",
     "Phase1StudyBackend",
     "Phase1StudyResult",
     "ProfileCommandExecutor",
@@ -141,6 +149,8 @@ __all__ = [
     "Phase1ProjectMemory",
     "Phase1ResumeState",
     "ProgressiveMemoryJournal",
+    "RecoveryEvidence",
+    "RecoveryStarter",
     "RunRequest",
     "SearchHit",
     "ShapeClass",

@@ -20,8 +20,6 @@ from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult, canonic
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
-
-
 class ProfileMetric(str, Enum):
     BASIC_INFO = "BasicInfo"
     PIPE_UTILIZATION = "PipeUtilization"
@@ -69,6 +67,36 @@ class ProfileRequest:
         }
         if reserved_timing.intersection(bindings):
             raise ValueError("plan environment must not override host-owned timing policy")
+        encoded_block_count = bindings.get("A5KERNEL_BLOCK_NUM")
+        if encoded_block_count is not None and not (
+            len(encoded_block_count) == 1 and "1" <= encoded_block_count <= "8"
+        ):
+            raise ValueError(
+                "plan block binding must be a canonical integer from 1 through 8"
+            )
+        parallelism_values = tuple(
+            value
+            for key, value in self.plan.runtime_provenance
+            if key == "phase1.parallelism"
+        )
+        if len(parallelism_values) == 1 and parallelism_values[0] in {
+            str(item.value) for item in ParallelismClass
+        }:
+            parallelism = ParallelismClass(int(parallelism_values[0]))
+            if encoded_block_count not in (None, str(parallelism.value)) or (
+                encoded_block_count is None
+                and parallelism is not ParallelismClass.ONE
+            ):
+                raise ValueError(
+                    "plan environment block binding does not match Phase 1 dimensions"
+                )
+        if self.block_count is not None:
+            if type(self.block_count) is not int or not 1 <= self.block_count <= 8:
+                raise ValueError("block_count must be an integer from 1 through 8")
+            if encoded_block_count != str(self.block_count):
+                raise ValueError(
+                    "plan block binding must match host-owned block metadata"
+                )
         if self.warm_up < 0 or self.launch_count < 1:
             raise ValueError("invalid warm-up or launch count")
 
@@ -92,6 +120,13 @@ class ProfileRequest:
     @property
     def source_fingerprint(self) -> str:
         return self.plan.source_fingerprint
+
+    @property
+    def block_count(self) -> int | None:
+        """Return the block count owned by the immutable execution plan."""
+
+        encoded = dict(self.plan.environment.bindings).get("A5KERNEL_BLOCK_NUM")
+        return None if encoded is None else int(encoded)
 
     @property
     def configuration_id(self) -> str:
@@ -429,6 +464,7 @@ class ShapeClass(str, Enum):
     N64 = "n64"
     N128 = "n128"
     N256 = "n256"
+    N400 = "n400"
 
 
 class PaddingClass(str, Enum):
@@ -445,6 +481,13 @@ class AccessClass(str, Enum):
 
 class ParallelismClass(int, Enum):
     ONE = 1
+    TWO = 2
+    THREE = 3
+    FOUR = 4
+    FIVE = 5
+    SIX = 6
+    SEVEN = 7
+    EIGHT = 8
 
 
 class MetricDomain(str, Enum):
@@ -555,6 +598,14 @@ def _validate_dimensions_against_plan(
         raise ValueError("Phase 1 dimensions require a Catlass DSL execution plan")
     if dimensions.access is not AccessClass.CONTIGUOUS:
         raise ValueError("the current Catlass fixture supports only contiguous access")
+    block_environment = dict(plan.environment.bindings).get(
+        "A5KERNEL_BLOCK_NUM"
+    )
+    expected_block = str(dimensions.parallelism.value)
+    if block_environment != expected_block:
+        raise ValueError(
+            "execution plan block count must match the host-owned study block dimension"
+        )
     logical_length = int(dimensions.shape.value[1:])
     if dimensions.padding is PaddingClass.NONE:
         if logical_length % 64:
