@@ -83,23 +83,37 @@ class A3CandidateBackend:
         request_id: str,
         attempt_id: str,
         length: int,
+        padded_length: int | None = None,
+        block_count: int = 1,
         seed: int,
         project_id: str = "vector-add",
     ) -> ExecutionPlan:
         validate_candidate_source(source)
         if type(length) is not int or not 1 <= length <= 4096:
             raise ValueError("length must be an integer in [1, 4096]")
+        if padded_length is None:
+            padded_length = length
+        if type(padded_length) is not int or not length <= padded_length <= 4096:
+            raise ValueError("padded_length must be an integer in [length, 4096]")
+        if type(block_count) is not int or not 1 <= block_count <= 32:
+            raise ValueError("block_count must be an integer in [1, 32]")
         if type(seed) is not int:
             raise ValueError("seed must be an integer")
         rng = random.Random(seed)
+        input_a = tuple(rng.uniform(-1.0, 1.0) for _ in range(length))
+        input_b = tuple(rng.uniform(-1.0, 1.0) for _ in range(length))
+        padding = (0.0,) * (padded_length - length)
         return ExecutionPlan(
             request_id=request_id,
             attempt_id=attempt_id,
             project_id=project_id,
             files=(SourceFile("candidate.cpp", source), *_host_source_files()),
             argv=_RUN_ARGV,
-            input_a=tuple(rng.uniform(-1.0, 1.0) for _ in range(length)),
-            input_b=tuple(rng.uniform(-1.0, 1.0) for _ in range(length)),
+            input_a=input_a + padding,
+            input_b=input_b + padding,
+            logical_length=length,
+            padded_length=padded_length,
+            block_count=block_count,
         )
 
     def compile(
@@ -110,12 +124,15 @@ class A3CandidateBackend:
         request_id: str,
         attempt_id: str,
         length: int = 1,
+        padded_length: int | None = None,
+        block_count: int = 1,
         seed: int = 0,
         project_id: str = "vector-add",
     ) -> CandidateCompilation | FailedEvidence:
         plan = self.plan(
             source, request_id=request_id, attempt_id=attempt_id,
-            length=length, seed=seed, project_id=project_id,
+            length=length, padded_length=padded_length, block_count=block_count,
+            seed=seed, project_id=project_id,
         )
         self._stage(plan, workdir)
         return self._compile(plan, workdir)
@@ -128,12 +145,15 @@ class A3CandidateBackend:
         request_id: str,
         attempt_id: str,
         length: int,
+        padded_length: int | None = None,
+        block_count: int = 1,
         seed: int = 0,
         project_id: str = "vector-add",
     ) -> VerifiedResult | FailedEvidence:
         plan = self.plan(
             source, request_id=request_id, attempt_id=attempt_id,
-            length=length, seed=seed, project_id=project_id,
+            length=length, padded_length=padded_length, block_count=block_count,
+            seed=seed, project_id=project_id,
         )
         self._stage(plan, workdir)
         compilation = self._compile(plan, workdir)
@@ -174,7 +194,16 @@ class A3CandidateBackend:
                 source.content, encoding="utf-8"
             )
         (workdir / "input.json").write_text(
-            json.dumps({"input_a": plan.input_a, "input_b": plan.input_b}, separators=(",", ":")),
+            json.dumps(
+                {
+                    "input_a": plan.input_a,
+                    "input_b": plan.input_b,
+                    "logical_length": plan.logical_length,
+                    "padded_length": plan.padded_length,
+                    "block_count": plan.block_count,
+                },
+                separators=(",", ":"),
+            ),
             encoding="utf-8",
         )
 

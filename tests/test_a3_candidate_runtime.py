@@ -79,6 +79,26 @@ def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
     assert first.execution_id != second.execution_id
 
 
+def test_plan_identity_binds_logical_padded_and_block_dimensions():
+    backend = A3CandidateBackend(command_runner=lambda *a, **k: None)
+    base = backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=33,
+        padded_length=64, block_count=2, seed=7,
+    )
+
+    assert (base.logical_length, base.padded_length, base.block_count) == (33, 64, 2)
+    assert len(base.input_a) == len(base.input_b) == 64
+    assert base.input_a[33:] == base.input_b[33:] == (0.0,) * 31
+    assert base.execution_id != backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=33,
+        padded_length=65, block_count=2, seed=7,
+    ).execution_id
+    assert base.execution_id != backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=33,
+        padded_length=64, block_count=3, seed=7,
+    ).execution_id
+
+
 @pytest.mark.parametrize("changed_path", ["build.json", "host_driver.py", "host_wrapper.inc"])
 def test_every_host_asset_is_identity_bound_and_staged_from_plan(monkeypatch, tmp_path, changed_path):
     backend = A3CandidateBackend(command_runner=lambda *args, **kwargs: None)
@@ -140,8 +160,10 @@ def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
     assert result.plan.source_fingerprint
 
 
-@pytest.mark.parametrize("length", [32, 33])
-def test_run_compiles_then_executes_aligned_and_padded_shapes(tmp_path, length):
+@pytest.mark.parametrize("length,padded_length", [(32, 32), (33, 64)])
+def test_run_compiles_then_executes_aligned_and_padded_shapes(
+    tmp_path, length, padded_length
+):
     calls = []
 
     def command(argv, *, cwd, text, capture_output, check):
@@ -154,7 +176,8 @@ def test_run_compiles_then_executes_aligned_and_padded_shapes(tmp_path, length):
 
     result = A3CandidateBackend(command).run(
         SOURCE, tmp_path / str(length), request_id=f"r{length}",
-        attempt_id="a1", length=length, seed=9,
+        attempt_id="a1", length=length, padded_length=padded_length,
+        block_count=2, seed=9,
     )
 
     assert isinstance(result, VerifiedResult)
@@ -270,8 +293,8 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     torch.ops = type("Ops", (), {
         "load_library": lambda _self, path: events.append(("load", path)),
         "rsi_a3candidates": type("Candidate", (), {
-            "vector_add": lambda _self, a, b: (
-                events.append("launch"),
+            "vector_add": lambda _self, a, b, padded_length, block_count: (
+                events.append(("launch", padded_length, block_count)),
                 Tensor([x + y for x, y in zip(a.values, b.values)]),
             )[1],
         })(),
@@ -281,11 +304,24 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
     (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
     (tmp_path / "a3_candidate.so").write_bytes(b"library")
-    (tmp_path / "input.json").write_text('{"input_a":[1,2],"input_b":[3,4]}')
+    (tmp_path / "input.json").write_text(
+        '{"input_a":[1,2,0,0],"input_b":[3,4,0,0],'
+        '"logical_length":2,"padded_length":4,"block_count":3}'
+    )
 
     assert host_driver.main(["input.json"]) == 0
     assert events == [
         ("load", str(tmp_path / "a3_candidate.so")), ("device", 0),
-        ("allocate", "npu:0"), ("allocate", "npu:0"), "launch", "sync",
+        ("allocate", "npu:0"), ("allocate", "npu:0"),
+        ("launch", 4, 3), "sync",
     ]
-    assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0]\n"
+    assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0,0.0,0.0]\n"
+
+
+def test_fixed_wrapper_launches_the_requested_block_count():
+    wrapper = next(
+        item.content for item in candidate_module._host_source_files()
+        if item.relative_path == "host_wrapper.inc"
+    )
+    assert "::vector_add<<<block_count" in wrapper
+    assert 'int padded_length, int block_count' in wrapper
