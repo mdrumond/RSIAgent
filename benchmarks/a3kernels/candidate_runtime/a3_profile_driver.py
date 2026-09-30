@@ -12,7 +12,6 @@ import shlex
 import subprocess
 import sys
 import tempfile
-import time
 from typing import Callable
 
 
@@ -26,7 +25,7 @@ _TIMELINE_WORDS = ("duration", "start", "end", "timestamp")
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="mode", required=True)
-    for name in ("timing", "profile", "replay"):
+    for name in ("timing", "profile"):
         command = commands.add_parser(name)
         command.add_argument("--candidate-dir", required=True, type=Path)
         command.add_argument("--logical-device", required=True, type=int)
@@ -68,8 +67,14 @@ def _validate(args: argparse.Namespace) -> tuple[Path, str]:
     return root, profile_input
 
 
-def _launch(root: Path, input_name: str, run: ProcessRunner) -> None:
-    argv = (sys.executable, "host_driver.py", input_name)
+def _host_run(
+    root: Path, input_name: str, run: ProcessRunner, *, mode: str = "run",
+    warm_up: int = 0, launch_count: int = 1,
+) -> subprocess.CompletedProcess[str]:
+    argv = (
+        sys.executable, "host_driver.py", "--mode", mode,
+        "--warm-up", str(warm_up), "--launch-count", str(launch_count), input_name,
+    )
     completed = run(argv, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "candidate launch failed").strip())
@@ -91,6 +96,7 @@ def _launch(root: Path, input_name: str, run: ProcessRunner) -> None:
         raise RuntimeError("candidate output must be a finite numeric array of the staged length")
     if any(abs(float(value) - float(want)) > 1e-5 for value, want in zip(values, expected)):
         raise RuntimeError("candidate output failed host verification")
+    return completed
 
 
 def _metadata(mode: str, report: Path | None) -> dict[str, object]:
@@ -142,12 +148,11 @@ def _raw_rows(root: Path, metric: str) -> tuple[list[str], list[list[object]], l
     return sorted(kernels), values, timeline
 
 
-def _replay_argv(root: Path, args: argparse.Namespace) -> tuple[str, ...]:
+def _replay_argv(root: Path, input_name: str, args: argparse.Namespace) -> tuple[str, ...]:
     return (
-        sys.executable, str((root / "a3_profile_driver.py").resolve()), "replay",
-        "--candidate-dir", str(root), "--logical-device", "0",
-        "--length", str(args.length), "--block-count", str(args.block_count),
-        "--warm-up", "0", "--launch-count", str(args.launch_count),
+        sys.executable, str((root / "host_driver.py").resolve()),
+        "--mode", "replay", "--warm-up", "0",
+        "--launch-count", str(args.launch_count), input_name,
     )
 
 
@@ -159,33 +164,39 @@ def _new_report_directory(root: Path, metric: str) -> Path:
 
 def main(
     argv: list[str] | None = None, *, process_runner: ProcessRunner = subprocess.run,
-    clock_ns: Callable[[], int] = time.perf_counter_ns,
     report_directory_factory: ReportDirectoryFactory = _new_report_directory,
 ) -> int:
     args = _parser().parse_args(argv)
     root, input_name = _validate(args)
-    if args.mode == "replay":
-        for _ in range(args.launch_count):
-            _launch(root, input_name, process_runner)
-        return 0
-
-    for _ in range(args.warm_up):
-        _launch(root, input_name, process_runner)
     if args.mode == "timing":
-        for _ in range(args.launch_count):
-            start = clock_ns()
-            _launch(root, input_name, process_runner)
-            elapsed = (clock_ns() - start) / 1000.0
-            if elapsed <= 0:
-                raise RuntimeError("timing clock returned a non-positive sample")
-            print(f"A3TIMING_US={elapsed:.6f}")
+        completed = _host_run(
+            root, input_name, process_runner, mode="benchmark",
+            warm_up=args.warm_up, launch_count=args.launch_count,
+        )
+        raw_samples = [
+            line.removeprefix("A3INNER_TIMING_US=") for line in completed.stdout.splitlines()
+            if line.startswith("A3INNER_TIMING_US=")
+        ]
+        if len(raw_samples) != args.launch_count:
+            raise RuntimeError("benchmark host emitted the wrong timing sample count")
+        try:
+            samples = [float(sample) for sample in raw_samples]
+        except ValueError as exc:
+            raise RuntimeError("benchmark host emitted a non-numeric timing sample") from exc
+        if any(not math.isfinite(sample) or sample <= 0 for sample in samples):
+            raise RuntimeError("benchmark host emitted a non-positive timing sample")
+        for sample in samples:
+            print(f"A3TIMING_US={sample:.6f}")
         print("A3PROFILE_META=" + json.dumps(_metadata("timing", None), sort_keys=True))
         return 0
 
     # Verify once without instrumentation before the separately profiled replay.
-    _launch(root, input_name, process_runner)
+    _host_run(
+        root, input_name, process_runner, mode="replay",
+        warm_up=args.warm_up, launch_count=1,
+    )
     report = report_directory_factory(root, args.metric).resolve()
-    application = shlex.join(_replay_argv(root, args))
+    application = shlex.join(_replay_argv(root, input_name, args))
     command = (
         "msprof", f"--output={report}", f"--aic-metrics={args.metric}",
         f"--application={application}",

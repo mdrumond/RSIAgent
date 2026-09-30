@@ -139,22 +139,26 @@ def test_profile_driver_asset_has_explicit_bytes_and_digest_contract():
 def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, capsys):
     _candidate_directory(tmp_path, length=4, block_count=1)
     calls = []
-    ticks = iter((0, 2000, 3000, 7000))
-
     def process(argv, **kwargs):
         calls.append((tuple(argv), kwargs))
         assert json.loads((tmp_path / argv[-1]).read_text())["block_count"] == 3
-        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
+        return subprocess.CompletedProcess(
+            argv, 0,
+            "A3INNER_TIMING_US=2.000000\nA3INNER_TIMING_US=4.000000\n"
+            "A3KERNEL_OUTPUT=[3,3,3,3]\n", "",
+        )
 
     result = a3_profile_driver.main(
         ["timing", *_driver_args(tmp_path, block_count=3), "--warm-up", "1", "--launch-count", "2"],
         process_runner=process,
-        clock_ns=lambda: next(ticks),
     )
 
     output = capsys.readouterr().out
-    assert result == 0 and len(calls) == 3
-    assert all(call[0][-2:] == ("host_driver.py", ".a3-profile-input.json") for call in calls)
+    assert result == 0 and len(calls) == 1
+    assert calls[0][0][-8:] == (
+        "host_driver.py", "--mode", "benchmark", "--warm-up", "1",
+        "--launch-count", "2", ".a3-profile-input.json",
+    )
     assert "A3TIMING_US=2.000000" in output
     assert "A3TIMING_US=4.000000" in output
 
@@ -194,9 +198,15 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
     assert len(compact["report_sha256"]) == 64
     assert Path(meta["remote_report"]).is_dir()
     profile = next(call for call in calls if call[0] == "msprof")
+    host_calls = [call for call in calls if call[0] != "msprof"]
+    assert len(host_calls) == 1
+    assert host_calls[0][-8:] == (
+        "host_driver.py", "--mode", "replay", "--warm-up", "0",
+        "--launch-count", "1", ".a3-profile-input.json",
+    )
     assert f"--aic-metrics={metric}" in profile
     application = next(item.split("=", 1)[1] for item in profile if item.startswith("--application="))
-    assert "--block-count 4" in application
+    assert "host_driver.py --mode replay --warm-up 0 --launch-count 1 .a3-profile-input.json" in application
     assert json.loads((tmp_path / ".a3-profile-input.json").read_text())["block_count"] == 4
 
 
@@ -423,6 +433,52 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
         ("launch", 4, 3), "sync",
     ]
     assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0,0.0,0.0]\n"
+
+
+def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tmp_path):
+    class Tensor:
+        def __init__(self, values): self.values = values
+        def cpu(self): return self
+        def tolist(self): return self.values
+
+    events = []
+    torch = type("Torch", (), {})()
+    torch.float32 = object()
+    torch.tensor = lambda values, **kwargs: Tensor(values)
+    torch.npu = type("Npu", (), {
+        "set_device": lambda _self, value: events.append(("device", value)),
+        "synchronize": lambda _self: events.append("sync"),
+    })()
+    torch.ops = type("Ops", (), {
+        "load_library": lambda _self, path: events.append("load"),
+        "rsi_a3candidates": type("Candidate", (), {
+            "vector_add": lambda _self, a, b, padded, blocks: (
+                events.append(("launch", blocks)),
+                Tensor([x + y for x, y in zip(a.values, b.values)]),
+            )[1],
+        })(),
+    })()
+    monkeypatch.setitem(__import__("sys").modules, "torch", torch)
+    monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("N", (), {})())
+    monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
+    (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
+    (tmp_path / "a3_candidate.so").write_bytes(b"library")
+    _candidate_directory(tmp_path, length=4, block_count=3)
+    ticks = iter((0, 2000, 3000, 7000))
+
+    assert host_driver.main(
+        ["--mode", "benchmark", "--warm-up", "2", "--launch-count", "2", "input.json"],
+        clock_ns=lambda: next(ticks),
+    ) == 0
+
+    assert events.count(("launch", 3)) == 4
+    assert events.count("sync") == 4
+    assert events.count("load") == 1
+    output = capsys.readouterr().out
+    assert output.count("A3INNER_TIMING_US=") == 2
+    assert "A3INNER_TIMING_US=2.000000" in output
+    assert "A3INNER_TIMING_US=4.000000" in output
+    assert output.endswith("A3KERNEL_OUTPUT=[3.0,3.0,3.0,3.0]\n")
 
 
 def test_fixed_wrapper_launches_the_requested_block_count():
