@@ -79,6 +79,25 @@ def test_plan_ids_order_and_serialization_are_stable():
     assert payload["cells"][0]["backend_model"] == "openai/gpt-5.6-astra"
 
 
+def test_plan_canonicalizes_permuted_cells():
+    canonical = build_a3_experiment_plan()
+    permuted = replace(canonical, cells=tuple(reversed(canonical.cells)))
+
+    assert permuted.cells == canonical.cells
+    assert permuted.to_json() == canonical.to_json()
+
+
+def test_plan_canonicalizes_permuted_active_evidence():
+    first = A3EvidenceRef("api-reference", "a" * 64)
+    second = A3EvidenceRef("programming-guide", "b" * 64)
+
+    forward = build_a3_experiment_plan(active_knowledge=(first, second))
+    reverse = build_a3_experiment_plan(active_knowledge=(second, first))
+
+    assert reverse.active_knowledge == forward.active_knowledge == (first, second)
+    assert reverse.to_json() == forward.to_json()
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("target", "a5"), ("language", "catlass-dsl")],

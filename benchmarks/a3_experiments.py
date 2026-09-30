@@ -177,6 +177,8 @@ class A3ExperimentPlan:
             or self.language is not A3Language.ASCEND_C
         ):
             raise ValueError("active plan must be the A3 Ascend C schema")
+        if any(not isinstance(cell, A3ExperimentCell) for cell in self.cells):
+            raise ValueError("A3 plan cells must be A3ExperimentCell values")
         if len(self.cells) != 24 or len({cell.cell_id for cell in self.cells}) != 24:
             raise ValueError("A3 plan requires exactly 24 unique registered cells")
         if self.curriculum != CURRICULUM:
@@ -186,6 +188,17 @@ class A3ExperimentPlan:
         ids = [item.evidence_id for item in self.active_knowledge]
         if len(ids) != len(set(ids)):
             raise ValueError("active knowledge evidence IDs must be unique")
+        object.__setattr__(self, "cells", tuple(sorted(self.cells, key=_cell_order)))
+        object.__setattr__(
+            self,
+            "active_knowledge",
+            tuple(
+                sorted(
+                    self.active_knowledge,
+                    key=lambda item: (item.evidence_id, item.sha256),
+                )
+            ),
+        )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -199,6 +212,15 @@ class A3ExperimentPlan:
 
     def to_json(self) -> str:
         return _canonical_json(self.as_dict()) + "\n"
+
+
+def _cell_order(cell: A3ExperimentCell) -> tuple[int, int, int, int]:
+    return (
+        _BACKEND_MODELS.index(cell.backend_model),
+        _KNOWLEDGE_MODES.index(cell.knowledge),
+        _PROFILING_MODES.index(cell.profiling),
+        _PROGRAMMING_LEVELS.index(cell.programming_level),
+    )
 
 
 def build_a3_experiment_plan(
