@@ -1,0 +1,10 @@
+{
+  "arch": "dav-c220",
+  "compiler": "bisheng",
+  "logical_device": 0,
+  "max_elements": 4096,
+  "output": "a3_kernel.so",
+  "runtime": "py311-torch",
+  "source": "kernel.cpp",
+  "target": "Ascend910B4"
+}
