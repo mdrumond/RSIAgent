@@ -1,12 +1,16 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
+
+import benchmarks.a3_model_profiles as model_module
 
 from benchmarks.a3_model_profiles import (
     DEEPSEEK_BASE_URL,
     OPENROUTER_BASE_URL,
     A3Completion,
     A3ModelProfile,
+    A3TransportResult,
     complete_a3,
     load_a3_model_profile,
 )
@@ -47,7 +51,7 @@ def test_fake_transport_captures_exact_provider_specific_requests():
 
     def transport(*, base_url, api_key, request):
         calls.append({"base_url": base_url, "api_key": api_key, "request": request})
-        return "candidate"
+        return A3TransportResult("candidate", 17)
 
     environment = {"OPENROUTER_API_KEY": "gpt-secret", "DEEPSEEK_API_KEY": "ds-secret"}
     for model in (BackendModel.GPT_5_6_SOL, BackendModel.DEEPSEEK_FLASH):
@@ -55,6 +59,7 @@ def test_fake_transport_captures_exact_provider_specific_requests():
             "system", "user", model=model, environ=environment, transport=transport
         )
         assert result.text == "candidate"
+        assert result.completion_tokens == 17
         assert result.provenance["profile_sha256"] == load_a3_model_profile(model).fingerprint
         assert result.provenance["allow_fallbacks"] is False
 
@@ -97,7 +102,7 @@ def test_fake_transport_captures_exact_provider_specific_requests():
 
 
 def test_credentials_are_required_from_the_selected_provider_only():
-    transport = lambda **_kwargs: "ok"
+    transport = lambda **_kwargs: A3TransportResult("ok", 1)
     complete_a3(
         "s", "u", model=BackendModel.GPT_5_6_SOL,
         environ={"OPENROUTER_API_KEY": "gpt"}, transport=transport,
@@ -126,14 +131,18 @@ def test_completion_provenance_is_deeply_immutable_and_caller_isolated():
         "generation": {"max_tokens": 32768, "tags": ["native", "a3"]},
         "route": ["deepseek"],
     }
-    completion = A3Completion("candidate", caller_owned)
+    completion = A3Completion("candidate", 9, caller_owned)
 
     caller_owned["generation"]["max_tokens"] = 1
     caller_owned["generation"]["tags"].append("changed")
     caller_owned["route"].append("fallback")
-    assert completion.as_dict()["provenance"] == {
+    assert completion.as_dict() == {
+        "text": "candidate",
+        "completion_tokens": 9,
+        "provenance": {
         "generation": {"max_tokens": 32768, "tags": ["native", "a3"]},
         "route": ["deepseek"],
+        },
     }
     with pytest.raises(TypeError):
         completion.provenance["generation"]["max_tokens"] = 1
@@ -148,7 +157,7 @@ def test_transport_request_mutation_cannot_change_recorded_provenance():
     def mutating_transport(*, request, **_kwargs):
         request["reasoning_effort"] = "low"
         request["extra_body"]["thinking"]["type"] = "disabled"
-        return "candidate"
+        return A3TransportResult("candidate", 12)
 
     result = complete_a3(
         "system", "user", model=BackendModel.DEEPSEEK_FLASH,
@@ -161,3 +170,33 @@ def test_transport_request_mutation_cannot_change_recorded_provenance():
         "temperature": None,
         "thinking": True,
     }
+
+
+@pytest.mark.parametrize(
+    "transport_result",
+    ["candidate", None, A3TransportResult("candidate", 0), A3TransportResult("candidate", True)],
+)
+def test_live_completion_rejects_missing_or_invalid_provider_usage(transport_result):
+    with pytest.raises((TypeError, ValueError), match="token|transport"):
+        complete_a3(
+            "system", "user", model=BackendModel.DEEPSEEK_FLASH,
+            environ={"DEEPSEEK_API_KEY": "secret"},
+            transport=lambda **_kwargs: transport_result,
+        )
+
+
+def test_openai_compatible_response_parses_provider_completion_usage(monkeypatch):
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="candidate"))],
+        usage=SimpleNamespace(completion_tokens=23),
+    )
+    completions = SimpleNamespace(create=lambda **_request: response)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai",
+        SimpleNamespace(OpenAI=lambda **_route: client),
+    )
+
+    assert model_module._openai_transport(
+        base_url=DEEPSEEK_BASE_URL, api_key="secret", request={"model": "deepseek-flash"}
+    ) == A3TransportResult("candidate", 23)
