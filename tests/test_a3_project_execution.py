@@ -120,6 +120,23 @@ class FakeCandidateBackend:
         )
 
 
+@pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS)
+def test_every_project_executes_its_resolved_shape_and_launch_dimensions(
+    tmp_path, proposal
+):
+    backend = FakeCandidateBackend()
+    policy = ProjectRuntimePolicy.from_proposal(proposal)
+    ProjectDispatcher(backend, profiling_session([])).execute(
+        proposal, SOURCE, tmp_path / proposal.project_id,
+        request_id="request", attempt_id="attempt",
+    )
+
+    options = backend.calls[0][2]
+    assert options["length"] == policy.logical_length
+    assert options["padded_length"] == policy.padded_length
+    assert options["block_count"] == policy.block_count
+
+
 def profiling_session(calls):
     def timing(binding, dimensions):
         calls.append(("timing", binding, dimensions))
