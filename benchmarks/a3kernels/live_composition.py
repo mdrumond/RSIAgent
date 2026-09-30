@@ -1,0 +1,222 @@
+"""Concrete, dependency-injected composition for an A3 Phase 1 wave."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import json
+import os
+from pathlib import Path
+import re
+from typing import Callable, Mapping, Protocol
+
+from benchmarks.a3_experiments import A3ExperimentCell
+from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, complete_a3, load_a3_model_profile
+from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.embeddings import PinnedBGEEmbeddings
+from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
+from benchmarks.a3kernels.knowledge_agent import KnowledgeAgent, QueryJournal
+from benchmarks.a3kernels.phase1_evidence import EvidenceLedger, canonical_bytes, canonical_digest
+from benchmarks.a3kernels.phase1_memory import AuthoritativeEvidence, Phase1LearningJournal
+from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
+from benchmarks.a3kernels.phase1_registry import CurriculumProposal, DEFAULT_PROPOSALS
+from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
+from benchmarks.a3kernels.profiling import CompactProfileResult
+from benchmarks.a3kernels.trial import A3TrialLoop
+
+
+_SHA = re.compile(r"[0-9a-f]{64}")
+_SYSTEM = """You are running one bounded A3 Ascend C learning project. Reply with
+exactly one JSON action from the supplied schema. Treat host compile, verification,
+and profiling observations as authoritative. Never claim correctness yourself."""
+
+
+class CandidateFactory(Protocol):
+    def __call__(self, cell: A3ExperimentCell, proposal: CurriculumProposal, paths: CellPaths): ...
+
+
+class ProfilerFactory(Protocol):
+    def __call__(
+        self, cell: A3ExperimentCell, proposal: CurriculumProposal, paths: CellPaths,
+        verified: Mapping[str, VerifiedResult],
+    ): ...
+
+
+@dataclass(frozen=True)
+class LiveDependencies:
+    actor_factory: Callable[[A3ExperimentCell, CurriculumProposal], Callable[[A3ModelProfile, str], A3Completion]]
+    candidate_factory: CandidateFactory
+    knowledge_factory: Callable[[A3ExperimentCell, CellPaths], object]
+    profiler_factory: ProfilerFactory
+
+
+class AuthoritativeResultStore:
+    """Small durable resolver populated only from typed backend results."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._records: dict[str, AuthoritativeEvidence] = {}
+        if self.path.exists():
+            for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
+                try:
+                    record = AuthoritativeEvidence(**json.loads(line))
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"invalid authoritative evidence at line {number}") from exc
+                if record.evidence_sha256 in self._records:
+                    raise ValueError("duplicate authoritative evidence")
+                self._records[record.evidence_sha256] = record
+
+    def register(
+        self, kind: str, evidence_sha256: str, project_id: str,
+        candidate_sha256: str, success: bool,
+    ) -> AuthoritativeEvidence:
+        record = AuthoritativeEvidence(
+            kind, evidence_sha256, project_id, candidate_sha256, success
+        )
+        prior = self._records.get(evidence_sha256)
+        if prior is not None:
+            if prior != record:
+                raise ValueError("conflicting authoritative evidence")
+            return prior
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("ab") as stream:
+            stream.write(canonical_bytes(asdict(record)) + b"\n")
+            stream.flush(); os.fsync(stream.fileno())
+        self._records[evidence_sha256] = record
+        return record
+
+    def resolve(self, evidence_sha256: str) -> AuthoritativeEvidence | None:
+        return self._records.get(evidence_sha256)
+
+
+class _RecordingCandidate:
+    def __init__(self, backend, store: AuthoritativeResultStore) -> None:
+        self.backend, self.store = backend, store
+        self.verified: dict[str, VerifiedResult] = {}
+
+    def compile(self, source, workdir, **options):
+        result = self.backend.compile(source, workdir, **options)
+        if isinstance(result, CandidateCompilation):
+            self.store.register(
+                "compile", result.attestation_sha256, result.plan.project_id,
+                result.plan.source_fingerprint, True,
+            )
+        return result
+
+    def run(self, source, workdir, **options):
+        result = self.backend.run(source, workdir, **options)
+        if isinstance(result, VerifiedResult):
+            self.store.register(
+                "host-verification", result.evidence_sha256, result.project_id,
+                result.source_fingerprint, result.passed,
+            )
+            if result.passed:
+                self.verified[result.execution_id] = result
+        return result
+
+
+class _RecordingProfiler:
+    def __init__(self, backend, store: AuthoritativeResultStore, project_id: str) -> None:
+        self.backend, self.store, self.project_id = backend, store, project_id
+
+    def profile(self, request):
+        result = self.backend.profile(request)
+        if isinstance(result, CompactProfileResult):
+            self.store.register(
+                "profiling", result.evidence_sha256, self.project_id,
+                result.source_fingerprint, True,
+            )
+        return result
+
+
+class LiveComposition:
+    """Execute every registered project for one isolated experiment cell."""
+
+    def __init__(self, config: Phase1Config, dependencies: LiveDependencies) -> None:
+        self.config, self.dependencies = config, dependencies
+        self.cell_digests: dict[str, tuple[str, ...]] = {}
+
+    def execute(self, cell: A3ExperimentCell, paths: CellPaths) -> dict[str, object]:
+        store = AuthoritativeResultStore(paths.root / "authority.jsonl")
+        memory = Phase1LearningJournal(
+            paths.memory, DEFAULT_PROPOSALS, cell_id=cell.cell_id,
+            lineage_id=f"phase1-{cell.cell_id}", evidence_resolver=store,
+        )
+        knowledge = self.dependencies.knowledge_factory(cell, paths)
+        evidence = EvidenceLedger(paths.evidence)
+        profile = load_a3_model_profile(cell.backend_model)
+        digests = [entry["entry_sha256"] for entry in memory.read()]
+        start = memory.resume_state().completed_projects
+        for proposal in DEFAULT_PROPOSALS[start:]:
+            candidate = _RecordingCandidate(
+                self.dependencies.candidate_factory(cell, proposal, paths), store
+            )
+            profiler = _RecordingProfiler(
+                self.dependencies.profiler_factory(
+                    cell, proposal, paths, candidate.verified
+                ),
+                store, proposal.project_id,
+            )
+            trial = A3TrialLoop(
+                cell=cell, proposal=proposal, profile=profile,
+                actor=self.dependencies.actor_factory(cell, proposal),
+                candidate=candidate, knowledge=knowledge, profiler=profiler,
+                evidence=evidence, memory=memory,
+                workdir=paths.workspace / proposal.project_id,
+            ).run()
+            if trial.status != "passed" or trial.memory_entry_sha256 is None:
+                failure = canonical_digest(
+                    {"cell_id": cell.cell_id, "project_id": proposal.project_id,
+                     "status": trial.status, "failures": trial.failures}
+                )
+                self.cell_digests[cell.cell_id] = tuple((*digests, failure))
+                return {"status": "failed", "evidence_sha256": failure}
+            digests.append(trial.memory_entry_sha256)
+        self.cell_digests[cell.cell_id] = tuple(digests)
+        return {"status": "passed", "evidence_sha256": canonical_digest(tuple(digests))}
+
+
+def model_actor_factory(
+    environ: Mapping[str, str], transport=None,
+) -> Callable[[A3ExperimentCell, CurriculumProposal], Callable[[A3ModelProfile, str], A3Completion]]:
+    """Build the real model actor without retaining or returning credentials."""
+    environment = dict(environ)
+    def factory(cell: A3ExperimentCell, _proposal: CurriculumProposal):
+        def actor(_profile: A3ModelProfile, context: str) -> A3Completion:
+            return complete_a3(
+                _SYSTEM, context, model=cell.backend_model,
+                environ=environment, transport=transport,
+            )
+        return actor
+    return factory
+
+
+def local_knowledge_factory(
+    config: Phase1Config,
+) -> Callable[[A3ExperimentCell, CellPaths], KnowledgeAgent]:
+    """Open only the pinned local KDB and only for the enabled treatment."""
+    def factory(cell: A3ExperimentCell, paths: CellPaths) -> KnowledgeAgent:
+        from benchmarks.a3_experiments import KnowledgeMode
+
+        journal = QueryJournal(paths.root / "knowledge-queries.jsonl")
+        if cell.knowledge is KnowledgeMode.WITHOUT_KDB:
+            return KnowledgeAgent(enabled=False, journal=journal)
+        expected = CollectionManifest.from_json(
+            config.knowledge_manifest.read_text(encoding="utf-8")
+        )
+        embeddings = PinnedBGEEmbeddings(cache_dir=config.embedding_cache)
+        database = KnowledgeDB.open_read_only(config.knowledge_database, embeddings)
+        actual = database.manifest(expected.collection)
+        if actual != expected:
+            database.connection.close()
+            raise ValueError("local KDB does not match the pinned knowledge manifest")
+        return KnowledgeAgent(
+            enabled=True, journal=journal, database=database,
+            collection=expected.collection,
+        )
+    return factory
+
+
+__all__ = [
+    "AuthoritativeResultStore", "LiveComposition", "LiveDependencies",
+    "local_knowledge_factory", "model_actor_factory",
+]
