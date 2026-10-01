@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import os
 from pathlib import Path
 import subprocess
 from typing import Callable, Mapping
@@ -44,6 +45,7 @@ class BZA3ProfilingBackend(GZA3ProfilingBackend):
         self,
         *,
         validation_wrapper: str,
+        cpl_remote: str,
         profile: str,
         remote_candidate_directory: str,
         evidence_directory: Path,
@@ -54,6 +56,8 @@ class BZA3ProfilingBackend(GZA3ProfilingBackend):
     ) -> None:
         if profile not in _PROFILES:
             raise ValueError("profile must be bz-a3-1 or bz-a3-2")
+        if Path(cpl_remote).name != "cpl-remote":
+            raise ValueError("cpl_remote must identify the user-wide cpl-remote executable")
         super().__init__(
             validation_wrapper=validation_wrapper,
             remote_candidate_directory=remote_candidate_directory,
@@ -65,6 +69,20 @@ class BZA3ProfilingBackend(GZA3ProfilingBackend):
         )
         self._profile = profile
         self._label = "BZ-A3"
+        self._cpl_remote = cpl_remote
+
+    def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "CPL_REMOTE": self._cpl_remote,
+        }
+        try:
+            return self._run(
+                argv, text=True, capture_output=True, check=False,
+                timeout=self._timeout, env=environment,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("BZ-A3 profiling wrapper timed out") from exc
 
     def _evidence(
         self, replay: str, request_id: str, mode: str, handle: str, status: str,

@@ -18,6 +18,7 @@ from .profiling import (
     CompactProfileResult,
     ProfileMetric,
     ProfileRequest,
+    ProfilingTreatment,
     StudyDimensions,
     TimingResult,
     parse_timing_output,
@@ -126,7 +127,9 @@ class GZA3ProfilingBackend:
         request: ProfileRequest,
         *,
         replay_id: str | None = None,
-    ) -> CompactProfileResult:
+    ) -> CompactProfileResult | None:
+        if request.treatment is ProfilingTreatment.OFF:
+            return None
         self._require_verified(request.binding)
         if request.execution_profile != self._profile:
             raise ValueError(

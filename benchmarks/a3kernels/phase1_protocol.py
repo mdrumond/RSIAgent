@@ -14,6 +14,7 @@ from benchmarks.a3kernels.phase1_evidence import canonical_digest
 A3_TARGET = "Ascend910B4"
 A3_LANGUAGE = "ascend-c"
 A3_EXECUTION_PROFILE = "gz-a3"
+A3_EXECUTION_PROFILES = frozenset((A3_EXECUTION_PROFILE, "bz-a3-1", "bz-a3-2"))
 A3_RUNTIME = "native-ascend-c"
 
 
@@ -77,8 +78,8 @@ class ExecutionPlan:
             raise ValueError(f"A3 target must be {A3_TARGET}")
         if self.language != A3_LANGUAGE:
             raise ValueError(f"A3 language must be {A3_LANGUAGE}; Catlass is unsupported")
-        if self.execution_profile != A3_EXECUTION_PROFILE:
-            raise ValueError(f"A3 execution profile must be {A3_EXECUTION_PROFILE}")
+        if self.execution_profile not in A3_EXECUTION_PROFILES:
+            raise ValueError("A3 execution profile must be a registered A3 profile")
         if self.runtime != A3_RUNTIME:
             raise ValueError(f"A3 runtime must be {A3_RUNTIME}")
         if self.logical_device != 0:
