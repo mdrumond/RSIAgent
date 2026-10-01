@@ -1,4 +1,5 @@
 #include <ATen/Operators.h>
+#include <cstdint>
 #include <torch/all.h>
 #include <torch/library.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
@@ -6,7 +7,7 @@
 
 namespace rsi_a3candidate_host {
 torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
-                        int padded_length, int block_count) {
+                        int64_t padded_length, int64_t block_count) {
   TORCH_CHECK(a.device().type() == c10::DeviceType::PrivateUse1,
               "a must be an NPU tensor");
   TORCH_CHECK(b.device() == a.device() && a.sizes() == b.sizes(),

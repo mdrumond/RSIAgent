@@ -346,4 +346,5 @@ def test_fixed_wrapper_launches_the_requested_block_count():
         if item.relative_path == "host_wrapper.inc"
     )
     assert "::vector_add<<<block_count" in wrapper
-    assert 'int padded_length, int block_count' in wrapper
+    assert "int64_t padded_length, int64_t block_count" in wrapper
+    assert "const torch::Tensor &b,\n                        int padded_length" not in wrapper
