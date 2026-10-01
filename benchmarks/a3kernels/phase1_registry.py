@@ -299,8 +299,19 @@ def saturation_status(proposals: Sequence[CurriculumProposal]) -> str:
     if len(rows) not in CHECKPOINTS:
         return "IN_PROGRESS"
     coverage = {tag for row in rows for tag in row.registered.coverage}
-    knees = sum(Coverage.PERFORMANCE_KNEE in row.registered.coverage for row in rows)
-    if PHASE1_BRIEF.required_coverage <= coverage and knees >= 2:
+    knee_lengths = tuple(
+        dict(row.parameters)["length"]
+        for row in rows
+        if row.family is ProjectFamily.LENGTH_KNEE
+    )
+    has_near_knee = any(length < 32 for length in knee_lengths)
+    has_far_knee = any(length >= 256 for length in knee_lengths)
+    if (
+        PHASE1_BRIEF.required_coverage <= coverage
+        and len(knee_lengths) >= PHASE1_BRIEF.performance_knee_minimum
+        and has_near_knee
+        and has_far_knee
+    ):
         return "SATURATED"
     return "CONTINUE"
 
