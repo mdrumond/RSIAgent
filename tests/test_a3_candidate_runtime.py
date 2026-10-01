@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 
@@ -191,7 +192,9 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 3)
 
 
-@pytest.mark.parametrize("metric", ["Basic", "PipeUtilization"])
+@pytest.mark.parametrize(
+    "metric", ["Basic", "ArithmeticUtilization", "PipeUtilization"]
+)
 def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
     _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
@@ -236,8 +239,11 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
         "--launch-count", "1", ".a3-profile-input.json",
     )
     assert f"--aic-metrics={metric}" in profile
-    application = next(item.split("=", 1)[1] for item in profile if item.startswith("--application="))
-    assert "host_driver.py --mode replay --warm-up 0 --launch-count 1 .a3-profile-input.json" in application
+    assert profile[3:] == (
+        str(Path(sys.executable)), str((tmp_path / "host_driver.py").resolve()),
+        "--mode", "replay", "--warm-up", "0", "--launch-count", "1",
+        ".a3-profile-input.json",
+    )
     staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)
 

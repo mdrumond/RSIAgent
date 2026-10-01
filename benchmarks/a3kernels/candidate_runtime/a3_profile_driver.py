@@ -7,8 +7,8 @@ import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 import tempfile
@@ -34,7 +34,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--warm-up", type=int, default=0)
         command.add_argument("--launch-count", type=int, default=1)
         if name == "profile":
-            command.add_argument("--metric", choices=("Basic", "PipeUtilization"), required=True)
+            command.add_argument(
+                "--metric",
+                choices=("Basic", "ArithmeticUtilization", "PipeUtilization"),
+                required=True,
+            )
             command.add_argument("--kernel", choices=("vector_add",), required=True)
     return parser
 
@@ -156,8 +160,13 @@ def _raw_rows(
 
 
 def _replay_argv(root: Path, input_name: str, args: argparse.Namespace) -> tuple[str, ...]:
+    interpreter = Path(sys.executable)
+    if not interpreter.is_absolute():
+        raise RuntimeError("active Python interpreter path must be absolute")
+    if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+        raise RuntimeError("active Python interpreter must be an executable file")
     return (
-        sys.executable, str((root / "host_driver.py").resolve()),
+        str(interpreter), str((root / "host_driver.py").resolve()),
         "--mode", "replay", "--warm-up", "0",
         "--launch-count", str(args.launch_count), input_name,
     )
@@ -203,10 +212,9 @@ def main(
         warm_up=args.warm_up, launch_count=1,
     )
     report = report_directory_factory(root, args.metric).resolve()
-    application = shlex.join(_replay_argv(root, input_name, args))
     command = (
         "msprof", f"--output={report}", f"--aic-metrics={args.metric}",
-        f"--application={application}",
+        *_replay_argv(root, input_name, args),
     )
     completed = process_runner(command, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
