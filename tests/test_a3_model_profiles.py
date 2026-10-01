@@ -27,7 +27,7 @@ def test_registered_profiles_have_exact_routes_and_stable_fingerprints():
     assert (deepseek.model, deepseek.base_url, deepseek.credential_env) == (
         "deepseek-flash", DEEPSEEK_BASE_URL, "DEEPSEEK_API_KEY"
     )
-    assert gpt.fingerprint == "e443eb94240d22e6a5baa4f008141eb1dcc2c05dbd1b59a2c82a9ec5633c0cac"
+    assert gpt.fingerprint == "cf11c957483d93a0324cabf8cd43d9a4b3b776b8e7615d6aa15efbfcfe9b7f4f"
     assert deepseek.fingerprint == "e9b6c97cbaca17596ead9fc2ab470e3df41e6b89e845410cb2871f62b4a94b7b"
     assert not gpt.allow_fallbacks and not deepseek.allow_fallbacks
 
@@ -44,6 +44,31 @@ def test_profiles_reject_route_or_generation_mutation():
         replace(profile, base_url="https://proxy.invalid")
     with pytest.raises(ValueError, match="canonical A3 model profile"):
         replace(profile, generation={"max_tokens": 1})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_tokens", 32768.0),
+        ("top_p", True),
+        ("temperature", False),
+        ("thinking", 1),
+    ],
+)
+def test_profile_generation_rejects_python_equal_wrong_types(field, value):
+    payload = load_a3_model_profile(BackendModel.GPT_5_6_SOL).as_dict()
+    payload["generation"][field] = value
+
+    with pytest.raises(ValueError, match="generation field types"):
+        A3ModelProfile.from_mapping(payload)
+
+
+def test_profile_rejects_boolean_equivalent_fallback_control():
+    payload = load_a3_model_profile(BackendModel.GPT_5_6_SOL).as_dict()
+    payload["allow_fallbacks"] = 0
+
+    with pytest.raises(ValueError, match="profile field types"):
+        A3ModelProfile.from_mapping(payload)
 
 
 def test_fake_transport_captures_exact_provider_specific_requests():
@@ -74,7 +99,6 @@ def test_fake_transport_captures_exact_provider_specific_requests():
                     {"role": "user", "content": "user"},
                 ],
                 "max_tokens": 32768,
-                "temperature": 0.0,
                 "top_p": 1.0,
                 "reasoning_effort": "high",
                 "extra_body": {"provider": {
@@ -182,6 +206,36 @@ def test_live_completion_rejects_missing_or_invalid_provider_usage(transport_res
             "system", "user", model=BackendModel.DEEPSEEK_FLASH,
             environ={"DEEPSEEK_API_KEY": "secret"},
             transport=lambda **_kwargs: transport_result,
+        )
+
+
+@pytest.mark.parametrize("text", ["", " ", "\n\t"])
+def test_live_completion_rejects_empty_or_whitespace_provider_content(text):
+    with pytest.raises(ValueError, match="non-empty text"):
+        complete_a3(
+            "system", "user", model=BackendModel.DEEPSEEK_FLASH,
+            environ={"DEEPSEEK_API_KEY": "secret"},
+            transport=lambda **_kwargs: A3TransportResult(text, 7),
+        )
+
+
+def test_openai_compatible_response_rejects_missing_content(monkeypatch):
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=None))],
+        usage=SimpleNamespace(completion_tokens=23),
+    )
+    completions = SimpleNamespace(create=lambda **_request: response)
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    monkeypatch.setitem(
+        __import__("sys").modules, "openai",
+        SimpleNamespace(OpenAI=lambda **_route: client),
+    )
+
+    with pytest.raises(ValueError, match="non-empty text"):
+        model_module._openai_transport(
+            base_url=DEEPSEEK_BASE_URL,
+            api_key="secret",
+            request={"model": "deepseek-flash"},
         )
 
 

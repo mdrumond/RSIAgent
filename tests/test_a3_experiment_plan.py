@@ -73,7 +73,7 @@ def test_plan_ids_order_and_serialization_are_stable():
     ]
     assert first.to_json() == second.to_json()
     payload = json.loads(first.to_json())
-    assert payload["schema"] == "a3-ascendc-experiment-plan-v1"
+    assert payload["schema"] == "a3-ascendc-experiment-plan-v2"
     assert payload["target"] == "a3"
     assert payload["language"] == "ascend-c"
     assert [member.value for member in BackendModel] == [
@@ -81,6 +81,14 @@ def test_plan_ids_order_and_serialization_are_stable():
         "deepseek-flash",
     ]
     assert payload["cells"][0]["backend_model"] == "openai/gpt-5.6-sol"
+
+
+def test_deepseek_sol_model_dimensions_are_not_serialized_as_legacy_v1():
+    plan = build_a3_experiment_plan()
+
+    assert plan.schema == "a3-ascendc-experiment-plan-v2"
+    with pytest.raises(ValueError, match="A3 Ascend C schema"):
+        replace(plan, schema="a3-ascendc-experiment-plan-v1")
 
 
 def test_plan_canonicalizes_permuted_cells():

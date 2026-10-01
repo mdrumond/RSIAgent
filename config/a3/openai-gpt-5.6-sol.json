@@ -10,7 +10,7 @@
     "max_tokens": 32768,
     "top_p": 1.0,
     "reasoning_effort": "high",
-    "temperature": 0.0,
+    "temperature": null,
     "thinking": false
   }
 }
