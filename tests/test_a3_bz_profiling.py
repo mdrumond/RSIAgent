@@ -101,8 +101,16 @@ def test_timing_uses_exact_bz_profile_native_runtime_and_logical_zero(tmp_path):
     }
 
 
-@pytest.mark.parametrize("metric", [ProfileMetric.BASIC, ProfileMetric.PIPE_UTILIZATION])
-def test_profile_accepts_only_matching_bz_request_and_compact_raw_evidence(tmp_path, metric):
+@pytest.mark.parametrize(
+    ("metric", "remote_metric"),
+    [
+        (ProfileMetric.BASIC, "ArithmeticUtilization"),
+        (ProfileMetric.PIPE_UTILIZATION, "PipeUtilization"),
+    ],
+)
+def test_profile_accepts_only_matching_bz_request_and_compact_raw_evidence(
+    tmp_path, metric, remote_metric,
+):
     compact = {
         "exported_kernels": ["vector_add"],
         "metric_values": [["raw_value", 0.75]],
@@ -113,7 +121,10 @@ def test_profile_accepts_only_matching_bz_request_and_compact_raw_evidence(tmp_p
         BINDING, DIMENSIONS, metric, execution_profile="bz-a3-2"
     )
 
+    calls = []
+
     def runner(argv, **_kwargs):
+        calls.append(tuple(argv))
         return subprocess.CompletedProcess(argv, 0, output(
             "bz-a3-2",
             "A3PROFILE_COMPACT=" + json.dumps(compact, separators=(",", ":")),
@@ -125,6 +136,7 @@ def test_profile_accepts_only_matching_bz_request_and_compact_raw_evidence(tmp_p
     evidence = concrete.evidence(request.default_replay_id)
 
     assert result.metric is metric
+    assert calls[0][calls[0].index("--metric") + 1] == remote_metric
     assert result.metric_values == (("raw_value", 0.75),)
     assert result.report_sha256 == "e" * 64
     assert evidence == BZA3RunEvidence(

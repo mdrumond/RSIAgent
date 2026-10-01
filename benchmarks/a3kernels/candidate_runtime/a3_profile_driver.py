@@ -34,7 +34,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--warm-up", type=int, default=0)
         command.add_argument("--launch-count", type=int, default=1)
         if name == "profile":
-            command.add_argument("--metric", choices=("Basic", "PipeUtilization"), required=True)
+            command.add_argument(
+                "--metric",
+                choices=("Basic", "ArithmeticUtilization", "PipeUtilization"),
+                required=True,
+            )
             command.add_argument("--kernel", choices=("vector_add",), required=True)
     return parser
 

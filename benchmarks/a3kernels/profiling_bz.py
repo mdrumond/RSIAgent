@@ -10,6 +10,7 @@ import subprocess
 from typing import Callable, Mapping
 
 from .phase1_protocol import VerifiedResult
+from .profiling import ProfileMetric
 from .profiling_gz import GZA3ProfilingBackend
 
 
@@ -83,6 +84,12 @@ class BZA3ProfilingBackend(GZA3ProfilingBackend):
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("BZ-A3 profiling wrapper timed out") from exc
+
+    @staticmethod
+    def _remote_metric(metric: ProfileMetric) -> str:
+        if metric is ProfileMetric.BASIC:
+            return "ArithmeticUtilization"
+        return metric.value
 
     def _evidence(
         self, replay: str, request_id: str, mode: str, handle: str, status: str,
