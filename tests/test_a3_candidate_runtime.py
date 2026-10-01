@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 import subprocess
+import venv
 
 import pytest
 
@@ -201,14 +203,10 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
     "metric", ["Basic", "ArithmeticUtilization", "PipeUtilization"]
 )
 def test_checked_driver_profiles_one_raw_metric_and_retains_report(
-    tmp_path, capsys, monkeypatch, metric,
+    tmp_path, capsys, metric,
 ):
     _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
-    monkeypatch.setattr(
-        a3_profile_driver.sys, "executable",
-        "/opt/a3-py311-torch/bin/python3.11",
-    )
 
     def process(argv, **kwargs):
         calls.append(tuple(argv))
@@ -252,13 +250,28 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(
     assert f"--aic-metrics={metric}" in profile
     assert not any(item.startswith("--application=") for item in profile)
     assert profile[3:] == (
-        "/opt/a3-py311-torch/bin/python3.11",
+        a3_profile_driver.sys.executable,
         str((tmp_path / "host_driver.py").resolve()),
         "--mode", "replay", "--warm-up", "0",
         "--launch-count", "1", ".a3-profile-input.json",
     )
     staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)
+
+
+def test_replay_preserves_real_symlinked_venv_interpreter(tmp_path, monkeypatch):
+    environment = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
+    interpreter = environment / "bin" / "python"
+    assert interpreter.is_symlink()
+    assert interpreter.resolve() != interpreter
+    monkeypatch.setattr(a3_profile_driver.sys, "executable", str(interpreter))
+
+    argv = a3_profile_driver._replay_argv(
+        tmp_path, "input.json", argparse.Namespace(launch_count=1)
+    )
+
+    assert argv[0] == str(interpreter)
 
 
 def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):

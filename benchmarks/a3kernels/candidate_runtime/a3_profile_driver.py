@@ -7,6 +7,7 @@ import csv
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -157,8 +158,13 @@ def _raw_rows(
 
 
 def _replay_argv(root: Path, input_name: str, args: argparse.Namespace) -> tuple[str, ...]:
+    interpreter = Path(sys.executable)
+    if not interpreter.is_absolute():
+        raise RuntimeError("active Python interpreter path must be absolute")
+    if not interpreter.is_file() or not os.access(interpreter, os.X_OK):
+        raise RuntimeError("active Python interpreter must be an executable file")
     return (
-        str(Path(sys.executable).resolve()), str((root / "host_driver.py").resolve()),
+        str(interpreter), str((root / "host_driver.py").resolve()),
         "--mode", "replay", "--warm-up", "0",
         "--launch-count", str(args.launch_count), input_name,
     )
