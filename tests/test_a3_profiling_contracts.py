@@ -29,11 +29,39 @@ def test_study_dimensions_and_ids_are_exact_and_stable():
     }
     first = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION)
     second = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION)
-    assert first.request_id == second.request_id == "39908bd0e0c94f479e7806a5a47e10bbf308e0476ba30d519ac5f0eddbb222de"
-    assert first.default_replay_id == "a3-profile-39908bd0e0c94f47"
+    assert first.request_id == second.request_id == (
+        "0621eb7e4e99ad831eb4174b124df12f19beb8e4582849f9d109d76b703faf77"
+    )
+    assert first.default_replay_id == "a3-profile-0621eb7e4e99ad83"
     assert first.target == "Ascend910B4"
     assert first.language == "ascend-c"
-    assert first.execution_profile == "gz-a3"
+    assert first.execution_profile == "bz-a3-1"
+
+
+@pytest.mark.parametrize("profile", ["bz-a3-1", "bz-a3-2", "gz-a3"])
+def test_profile_request_supports_authoritative_and_compatibility_profiles(profile):
+    request = ProfileRequest(
+        BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION,
+        execution_profile=profile,
+    )
+    assert request.execution_profile == profile
+    assert request.as_dict()["execution_profile"] == profile
+
+
+def test_execution_profile_is_part_of_profile_and_timing_identity():
+    first = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.BASIC)
+    second = replace(first, execution_profile="bz-a3-2")
+    compatibility = replace(first, execution_profile="gz-a3")
+    assert len({first.request_id, second.request_id, compatibility.request_id}) == 3
+
+    session = A3ProfilingSession(
+        timing=lambda _binding, _dimensions: "A3TIMING_US=1\n"
+    )
+    bz1 = session.time(BINDING, DIMENSIONS, execution_profile="bz-a3-1")
+    bz2 = session.time(BINDING, DIMENSIONS, execution_profile="bz-a3-2")
+    assert bz1.execution_profile == "bz-a3-1"
+    assert bz2.execution_profile == "bz-a3-2"
+    assert bz1.request_id != bz2.request_id
 
 
 @pytest.mark.parametrize(
@@ -166,6 +194,7 @@ def test_fake_timing_backend_is_deterministic_and_bound_to_candidate():
     result = session.time(BINDING, DIMENSIONS, replay_id="timing-replay")
     assert result.median_us == 6
     assert result.candidate_execution_id == BINDING.execution_id
+    assert result.execution_profile == "bz-a3-1"
     assert session.time(BINDING, DIMENSIONS, replay_id="timing-replay") is result
     assert calls == [(BINDING, DIMENSIONS)]
     with pytest.raises(ValueError, match="conflicting timing replay"):
