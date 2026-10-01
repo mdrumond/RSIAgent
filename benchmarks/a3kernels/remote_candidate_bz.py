@@ -75,6 +75,18 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
             raise RuntimeError(
                 (completed.stderr or completed.stdout or "cpl-remote upload failed").strip()
             )
+        expected = {
+            "REMOTE_TARGET=": self._profile,
+            "REMOTE_BACKEND=": "ssh",
+            "REMOTE_OPERATION=": "upload",
+            "REMOTE_STATE=": "completed",
+            "REMOTE_EXIT=": "0",
+        }
+        if any(
+            self._markers(completed.stdout, prefix) != [value]
+            for prefix, value in expected.items()
+        ):
+            raise RuntimeError("cpl-remote upload returned invalid terminal markers")
         return "synchronous-bz-upload"
 
     def _poll_transfer(self, job_id: str) -> None:
