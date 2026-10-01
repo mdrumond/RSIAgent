@@ -101,14 +101,16 @@ def main(argv: list[str] | None = None) -> int:
     input_path = Path(args[0])
     if not input_path.is_absolute():
         input_path = root / input_path
-    a_values, b_values, _logical, padded, blocks = _read_input(
+    a_values, b_values, logical, padded, blocks = _read_input(
         input_path, spec["max_elements"]
     )
     torch.ops.load_library(str(library))
     torch.npu.set_device(0)
     a = torch.tensor(a_values, dtype=torch.float32, device="npu:0")
     b = torch.tensor(b_values, dtype=torch.float32, device="npu:0")
-    output = torch.ops.rsi_a3candidates.vector_add(a, b, padded, blocks)
+    output = torch.ops.rsi_a3candidates.vector_add(
+        a, b, logical, padded, blocks
+    )
     torch.npu.synchronize()
     print("A3KERNEL_OUTPUT=" + json.dumps(output.cpu().tolist(), separators=(",", ":")))
     return 0

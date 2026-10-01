@@ -59,7 +59,10 @@ extern "C" __global__ __aicore__ void vector_add(
 
 def _output(cwd: Path) -> list[float]:
     payload = json.loads((cwd / "input.json").read_text())
-    return [a + b for a, b in zip(payload["input_a"], payload["input_b"])]
+    return [
+        a + b
+        for a, b in zip(payload["input_a"], payload["input_b"])
+    ][:payload["logical_length"]]
 
 
 def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
@@ -100,6 +103,10 @@ def test_plan_identity_binds_logical_padded_and_block_dimensions():
     assert base.execution_id != backend.plan(
         SOURCE, request_id="r1", attempt_id="a1", length=33,
         padded_length=64, block_count=3, seed=7,
+    ).execution_id
+    assert base.execution_id != backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=32,
+        padded_length=64, block_count=2, seed=7,
     ).execution_id
 
 
@@ -240,7 +247,10 @@ def test_runtime_failure_is_structured(tmp_path):
     assert "ACL launch failed" in result.detail
 
 
-@pytest.mark.parametrize("stdout", ["", "A3KERNEL_OUTPUT=nope\n", "A3KERNEL_OUTPUT=[1]\n"])
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "A3KERNEL_OUTPUT=nope\n", "A3KERNEL_OUTPUT=[1]\n", "A3KERNEL_OUTPUT=[NaN,0,0,0]\n"],
+)
 def test_malformed_or_wrong_length_output_is_structured_verification_failure(tmp_path, stdout):
     def command(argv, **kwargs):
         if "--compile-only" in argv:
@@ -315,9 +325,9 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     torch.ops = type("Ops", (), {
         "load_library": lambda _self, path: events.append(("load", path)),
         "rsi_a3candidates": type("Candidate", (), {
-            "vector_add": lambda _self, a, b, padded_length, block_count: (
-                events.append(("launch", padded_length, block_count)),
-                Tensor([x + y for x, y in zip(a.values, b.values)]),
+            "vector_add": lambda _self, a, b, logical_length, padded_length, block_count: (
+                events.append(("launch", logical_length, padded_length, block_count)),
+                Tensor([x + y for x, y in zip(a.values, b.values)][:logical_length]),
             )[1],
         })(),
     })()
@@ -326,18 +336,22 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
     (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
     (tmp_path / "a3_candidate.so").write_bytes(b"library")
-    (tmp_path / "input.json").write_text(
-        '{"input_a":[1,2,0,0],"input_b":[3,4,0,0],'
-        '"logical_length":2,"padded_length":4,"block_count":3}'
-    )
+    (tmp_path / "input.json").write_text(json.dumps({
+        "input_a": [1.0] * 33 + [0.0] * 31,
+        "input_b": [3.0] * 33 + [0.0] * 31,
+        "logical_length": 33,
+        "padded_length": 64,
+        "block_count": 3,
+    }))
 
     assert host_driver.main(["input.json"]) == 0
     assert events == [
         ("load", str(tmp_path / "a3_candidate.so")), ("device", 0),
         ("allocate", "npu:0"), ("allocate", "npu:0"),
-        ("launch", 4, 3), "sync",
+        ("launch", 33, 64, 3), "sync",
     ]
-    assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0,0.0,0.0]\n"
+    output = capsys.readouterr().out.removeprefix("A3KERNEL_OUTPUT=")
+    assert json.loads(output) == [4.0] * 33
 
 
 def test_fixed_wrapper_launches_the_requested_block_count():
@@ -346,5 +360,7 @@ def test_fixed_wrapper_launches_the_requested_block_count():
         if item.relative_path == "host_wrapper.inc"
     )
     assert "::vector_add<<<block_count" in wrapper
-    assert "int64_t padded_length, int64_t block_count" in wrapper
+    assert "int64_t logical_length, int64_t padded_length," in wrapper
+    assert "const auto count = static_cast<uint32_t>(logical_length);" in wrapper
+    assert "output.narrow(0, 0, logical_length)" in wrapper
     assert "const torch::Tensor &b,\n                        int padded_length" not in wrapper

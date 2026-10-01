@@ -179,12 +179,18 @@ class A3CandidateBackend:
                 detail=_detail(completed),
             )
         try:
-            output = _parse_output(completed.stdout, len(plan.input_a))
+            output = _parse_output(completed.stdout, plan.logical_length)
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return FailedEvidence.create(
                 plan, stage="verify", error_type="OutputError", detail=str(exc)
             )
-        expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
+        expected = tuple(
+            a + b
+            for a, b in zip(
+                plan.input_a[:plan.logical_length],
+                plan.input_b[:plan.logical_length],
+            )
+        )
         max_error = max(abs(got - want) for got, want in zip(output, expected))
         receipt = ExecutionReceipt(
             exit_code=0,
