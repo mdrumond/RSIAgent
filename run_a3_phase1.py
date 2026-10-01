@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import subprocess
 
 from benchmarks.a3kernels.artifact_prepare import prepare_phase1_artifacts
 from benchmarks.a3kernels.phase1_wave import (
@@ -13,7 +15,7 @@ from benchmarks.a3kernels.phase1_wave import (
     full_dry_run,
     select_foundation_cells,
 )
-from benchmarks.a3kernels.live_composition import LiveComposition, managed_live_dependencies
+from benchmarks.a3kernels.live_composition import LiveComposition, bz_live_dependencies
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -35,10 +37,12 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--corpus-artifacts", type=Path, required=True)
         command.add_argument("--knowledge-database", type=Path, required=True)
         command.add_argument("--knowledge-manifest", type=Path, required=True)
+        if name in ("preflight", "run", "resume"):
+            command.add_argument(
+                "--profile", choices=("bz-a3-1", "bz-a3-2"), required=True,
+            )
+            command.add_argument("--cpl-remote", required=True)
         if name in ("run", "resume"):
-            command.add_argument("--remote-client", required=True)
-            command.add_argument("--server", required=True)
-            command.add_argument("--remote", required=True)
             command.add_argument("--remote-workspace", required=True)
             command.add_argument("--physical-device", type=int, required=True)
             command.add_argument(
@@ -57,6 +61,43 @@ def _config(args) -> Phase1Config:
     )
 
 
+def _marker(stdout: str, prefix: str) -> list[str]:
+    return [line[len(prefix):] for line in stdout.splitlines() if line.startswith(prefix)]
+
+
+def _bz_preflight(
+    validation_wrapper: Path, profile: str, cpl_remote: str,
+) -> dict[str, str]:
+    remote = Path(cpl_remote)
+    if not remote.is_file() or not os.access(remote, os.X_OK) or remote.name != "cpl-remote":
+        raise ValueError("cpl_remote must be the user-wide executable cpl-remote")
+    environment = {
+        key: value for key, value in os.environ.items()
+        if key not in {"OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"}
+    }
+    environment["CPL_REMOTE"] = str(remote)
+    argv = [str(validation_wrapper), "--profile", profile, "preflight"]
+    completed = subprocess.run(
+        argv, capture_output=True, text=True, check=False,
+        timeout=120, env=environment,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"BZ-A3 adapter preflight failed with exit {completed.returncode}"
+        )
+    expected = {
+        "CATLASS_VALIDATION_PROFILE=": profile,
+        "CATLASS_VALIDATION_OPERATION=": "-",
+        "CATLASS_VALIDATION_STATE=": "completed",
+        "CATLASS_VALIDATION_EXIT=": "0",
+    }
+    if any(_marker(completed.stdout, prefix) != [value] for prefix, value in expected.items()):
+        raise RuntimeError("BZ-A3 adapter preflight returned invalid terminal markers")
+    if _marker(completed.stdout, "CATLASS_VALIDATION_HANDLE="):
+        raise RuntimeError("BZ-A3 adapter preflight returned invalid terminal markers")
+    return {"profile": profile, "state": "completed"}
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "dry-run":
@@ -72,10 +113,14 @@ def main(argv=None) -> int:
         cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(5)))
         value = Phase1Wave(cfg, lambda *_: {}).report()
     elif args.command == "preflight":
-        import os
-        value = _config(args).preflight(os.environ)
+        cfg = _config(args)
+        value = {
+            **cfg.preflight(os.environ),
+            "remote_preflight": _bz_preflight(
+                cfg.validation_wrapper, args.profile, args.cpl_remote,
+            ),
+        }
     else:
-        import os
         cells = select_foundation_cells(
             cell_ids=args.cell_id,
             shard_count=args.shard_count,
@@ -83,9 +128,10 @@ def main(argv=None) -> int:
         )
         cfg = _config(args)
         cfg.preflight(os.environ)
-        dependencies = managed_live_dependencies(
-            cfg, client=args.remote_client, server=args.server,
-            remote=args.remote, remote_workspace=args.remote_workspace,
+        _bz_preflight(cfg.validation_wrapper, args.profile, args.cpl_remote)
+        dependencies = bz_live_dependencies(
+            cfg, cpl_remote=args.cpl_remote, profile=args.profile,
+            remote_workspace=args.remote_workspace,
             physical_device=args.physical_device, environ=os.environ,
         )
         wave = Phase1Wave(

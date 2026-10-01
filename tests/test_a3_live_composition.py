@@ -268,27 +268,50 @@ def test_profile_uses_exact_retained_compile_binding_and_directory(tmp_path, mon
     assert seen["verified_results"] == {verified.execution_id: verified}
 
 
-def test_cli_run_composes_all_eight_cells_with_injected_backends(
+def test_cli_run_and_resume_route_bz_and_compose_all_eight_cells(
     tmp_path, monkeypatch, capsys,
 ):
     import run_a3_phase1
     cfg = config(tmp_path)
     deps = dependencies([], [])
-    monkeypatch.setattr(run_a3_phase1, "managed_live_dependencies", lambda *a, **k: deps)
+    routed = {}
+    preflights = []
+    monkeypatch.setattr(
+        run_a3_phase1,
+        "bz_live_dependencies",
+        lambda *a, **k: routed.update(k) or deps,
+    )
+    monkeypatch.setattr(
+        run_a3_phase1, "_bz_preflight",
+        lambda *args: preflights.append(args) or {"state": "completed"},
+    )
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
-    argv = [
-        "run", "--state-root", str(cfg.state_root),
+    common = [
+        "--state-root", str(cfg.state_root),
         "--validation-wrapper", str(cfg.validation_wrapper),
         "--embedding-cache", str(cfg.embedding_cache),
         "--corpus-artifacts", str(cfg.corpus_artifacts),
         "--knowledge-database", str(cfg.knowledge_database),
         "--knowledge-manifest", str(cfg.knowledge_manifest),
-        "--remote-client", "/checked/remote_agent_client.sh",
-        "--server", "http://127.0.0.1:37787", "--remote", "a3-gz",
+        "--profile", "bz-a3-2", "--cpl-remote", "/checked/cpl-remote",
         "--remote-workspace", "/data2/research", "--physical-device", "0",
     ]
-    assert run_a3_phase1.main(argv) == 0
-    output = capsys.readouterr().out
-    assert len(json.loads(output)) == 8
-    assert "openrouter-secret" not in output and "deepseek-secret" not in output
+    for command in ("run", "resume"):
+        routed.clear()
+        assert run_a3_phase1.main([command, *common]) == 0
+        output = capsys.readouterr().out
+        assert len(json.loads(output)) == 8
+        assert "openrouter-secret" not in output and "deepseek-secret" not in output
+        environment = routed.pop("environ")
+        assert environment is __import__("os").environ
+        assert routed == {
+            "cpl_remote": "/checked/cpl-remote",
+            "profile": "bz-a3-2",
+            "remote_workspace": "/data2/research",
+            "physical_device": 0,
+        }
+    assert preflights == [
+        (cfg.validation_wrapper, "bz-a3-2", "/checked/cpl-remote"),
+        (cfg.validation_wrapper, "bz-a3-2", "/checked/cpl-remote"),
+    ]

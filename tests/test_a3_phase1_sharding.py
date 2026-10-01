@@ -1,4 +1,5 @@
 import json
+import subprocess
 
 import pytest
 
@@ -114,8 +115,11 @@ def test_cli_repeatable_cell_selection_and_shard_routing(tmp_path, monkeypatch, 
 
     monkeypatch.setattr(run_a3_phase1, "LiveComposition", FakeComposition)
     monkeypatch.setattr(
+        run_a3_phase1, "_bz_preflight", lambda *args: {"state": "completed"},
+    )
+    monkeypatch.setattr(
         run_a3_phase1,
-        "managed_live_dependencies",
+        "bz_live_dependencies",
         lambda *args, **kwargs: created.append("dependencies") or object(),
     )
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
@@ -128,9 +132,8 @@ def test_cli_repeatable_cell_selection_and_shard_routing(tmp_path, monkeypatch, 
         "--corpus-artifacts", str(cfg.corpus_artifacts),
         "--knowledge-database", str(cfg.knowledge_database),
         "--knowledge-manifest", str(cfg.knowledge_manifest),
-        "--remote-client", "/checked/remote_agent_client.sh",
-        "--server", "http://127.0.0.1:37787",
-        "--remote", "bz-a3-1",
+        "--profile", "bz-a3-1",
+        "--cpl-remote", "/checked/cpl-remote",
         "--remote-workspace", "/data2/research",
         "--physical-device", "0",
     ]
@@ -159,7 +162,7 @@ def test_cli_rejects_unknown_cell_before_remote_dependency_creation(
     created = []
     monkeypatch.setattr(
         run_a3_phase1,
-        "managed_live_dependencies",
+        "bz_live_dependencies",
         lambda *args, **kwargs: created.append("dependencies"),
     )
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
@@ -172,9 +175,8 @@ def test_cli_rejects_unknown_cell_before_remote_dependency_creation(
         "--corpus-artifacts", str(cfg.corpus_artifacts),
         "--knowledge-database", str(cfg.knowledge_database),
         "--knowledge-manifest", str(cfg.knowledge_manifest),
-        "--remote-client", "/checked/remote_agent_client.sh",
-        "--server", "http://127.0.0.1:37787",
-        "--remote", "bz-a3-1",
+        "--profile", "bz-a3-1",
+        "--cpl-remote", "/checked/cpl-remote",
         "--remote-workspace", "/data2/research",
         "--physical-device", "0",
         "--cell-id", "a3-cell-unknown",
@@ -182,3 +184,111 @@ def test_cli_rejects_unknown_cell_before_remote_dependency_creation(
     with pytest.raises(ValueError, match="unknown foundation cell ID"):
         run_a3_phase1.main(argv)
     assert created == []
+
+
+def test_cli_resume_requires_supported_bz_profile_and_has_no_gz_transport_flags():
+    import run_a3_phase1
+
+    parser = run_a3_phase1._parser()
+    common = [
+        "--state-root", "/state",
+        "--validation-wrapper", "/tools/catlass-validation.sh",
+        "--embedding-cache", "/artifacts/embedding",
+        "--corpus-artifacts", "/artifacts/corpus",
+        "--knowledge-database", "/artifacts/knowledge.sqlite3",
+        "--knowledge-manifest", "/artifacts/manifest.json",
+        "--cpl-remote", "/tools/cpl-remote",
+        "--remote-workspace", "/remote/rsi",
+        "--physical-device", "2",
+    ]
+    parsed = parser.parse_args(["resume", *common, "--profile", "bz-a3-2"])
+    assert parsed.profile == "bz-a3-2"
+    assert parsed.cpl_remote == "/tools/cpl-remote"
+    assert not hasattr(parsed, "remote_client")
+    assert not hasattr(parsed, "server")
+    assert not hasattr(parsed, "remote")
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["resume", *common, "--profile", "gz-a3"])
+
+
+def test_cli_preflight_checks_local_inputs_then_exact_bz_adapter_markers(
+    tmp_path, monkeypatch, capsys,
+):
+    import run_a3_phase1
+
+    cfg = config(tmp_path)
+    cpl_remote = tmp_path / "cpl-remote"
+    cpl_remote.write_text("#!/bin/sh\n")
+    cpl_remote.chmod(0o755)
+    seen = {}
+
+    def runner(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, "\n".join((
+            "BZ_A3_PREFLIGHT_STATE=passed profile=bz-a3-1",
+            "CATLASS_VALIDATION_PROFILE=bz-a3-1",
+            "CATLASS_VALIDATION_OPERATION=-",
+            "CATLASS_VALIDATION_STATE=completed",
+            "CATLASS_VALIDATION_EXIT=0",
+        )), "")
+
+    monkeypatch.setattr(run_a3_phase1.subprocess, "run", runner)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    argv = ["preflight"]
+    for field in (
+        "state_root", "validation_wrapper", "embedding_cache",
+        "corpus_artifacts", "knowledge_database", "knowledge_manifest",
+    ):
+        argv.extend(("--" + field.replace("_", "-"), str(getattr(cfg, field))))
+    argv.extend(("--profile", "bz-a3-1", "--cpl-remote", str(cpl_remote)))
+
+    assert run_a3_phase1.main(argv) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["remote_preflight"] == {
+        "profile": "bz-a3-1", "state": "completed",
+    }
+    assert seen["argv"] == [
+        str(cfg.validation_wrapper), "--profile", "bz-a3-1", "preflight",
+    ]
+    assert seen["env"]["CPL_REMOTE"] == str(cpl_remote)
+    assert "OPENROUTER_API_KEY" not in seen["env"]
+    assert "DEEPSEEK_API_KEY" not in seen["env"]
+    assert "secret" not in json.dumps(report)
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "CATLASS_VALIDATION_PROFILE=bz-a3-2\nCATLASS_VALIDATION_OPERATION=-\n"
+        "CATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_EXIT=0",
+        "CATLASS_VALIDATION_PROFILE=bz-a3-1\nCATLASS_VALIDATION_OPERATION=-\n"
+        "CATLASS_VALIDATION_STATE=completed\nCATLASS_VALIDATION_STATE=completed\n"
+        "CATLASS_VALIDATION_EXIT=0",
+    ],
+)
+def test_cli_preflight_rejects_foreign_or_duplicate_terminal_markers(
+    tmp_path, monkeypatch, stdout,
+):
+    import run_a3_phase1
+
+    cfg = config(tmp_path)
+    cpl_remote = tmp_path / "cpl-remote"
+    cpl_remote.write_text("#!/bin/sh\n")
+    cpl_remote.chmod(0o755)
+    monkeypatch.setattr(
+        run_a3_phase1.subprocess, "run",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout, ""),
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "key")
+    argv = ["preflight"]
+    for field in (
+        "state_root", "validation_wrapper", "embedding_cache",
+        "corpus_artifacts", "knowledge_database", "knowledge_manifest",
+    ):
+        argv.extend(("--" + field.replace("_", "-"), str(getattr(cfg, field))))
+    argv.extend(("--profile", "bz-a3-1", "--cpl-remote", str(cpl_remote)))
+    with pytest.raises(RuntimeError, match="markers"):
+        run_a3_phase1.main(argv)
