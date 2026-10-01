@@ -47,6 +47,8 @@ class CollectionManifest:
     chunk_schema: str
     chunk_lines: int
     chunk_overlap: int
+    chunk_count: int
+    chunk_set_sha256: str
     sources: tuple[SourceFingerprint, ...]
     fingerprint: str
 
@@ -68,9 +70,17 @@ class CollectionManifest:
                 manifest.chunk_schema,
                 manifest.chunk_lines,
                 manifest.chunk_overlap,
+                manifest.chunk_count,
+                manifest.chunk_set_sha256,
                 manifest.sources,
             )
-            if manifest.target != "a3" or manifest.fingerprint != expected:
+            if (
+                manifest.target != "a3"
+                or type(manifest.chunk_count) is not int
+                or manifest.chunk_count < 0
+                or re.fullmatch(r"[0-9a-f]{64}", manifest.chunk_set_sha256) is None
+                or manifest.fingerprint != expected
+            ):
                 raise ValueError
             return manifest
         except (KeyError, TypeError, json.JSONDecodeError, ValueError) as exc:
@@ -104,6 +114,8 @@ def _manifest_fingerprint(
     chunk_schema: str,
     chunk_lines: int,
     chunk_overlap: int,
+    chunk_count: int,
+    chunk_set_sha256: str,
     sources: tuple[SourceFingerprint, ...],
 ) -> str:
     identity = {
@@ -114,10 +126,37 @@ def _manifest_fingerprint(
         "chunk_schema": chunk_schema,
         "chunk_lines": chunk_lines,
         "chunk_overlap": chunk_overlap,
+        "chunk_count": chunk_count,
+        "chunk_set_sha256": chunk_set_sha256,
         "sources": [asdict(source) for source in sources],
         "target": target,
     }
     return _digest(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _chunk_set_digest(chunk_ids: Iterable[str]) -> str:
+    encoded = json.dumps(
+        sorted(chunk_ids), sort_keys=True, separators=(",", ":")
+    ).encode()
+    return _digest(encoded)
+
+
+def _source_digest(
+    collection: str, target: str, source: SourceFingerprint
+) -> str:
+    identity = {
+        "collection": collection,
+        "content_sha256": source.content_sha256,
+        "path": source.path,
+        "repository": source.repository,
+        "source_revision": source.source_revision,
+        "target": target,
+    }
+    return _digest(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _chunk_id(document_digest: str, start: int, end: int, text: str) -> str:
+    return _digest(f"{document_digest}\0{start}\0{end}\0{text}".encode())
 
 
 def _normalize(vector: Sequence[float], dimension: int) -> list[float]:
@@ -142,7 +181,7 @@ def _chunks(document: CorpusDocument) -> list[tuple[str, int, int, str]]:
         selected = lines[offset : offset + CHUNK_LINES]
         text = "".join(selected)
         start, end = offset + 1, offset + len(selected)
-        chunk_id = _digest(f"{document.digest}\0{start}\0{end}\0{text}".encode())
+        chunk_id = _chunk_id(document.digest, start, end, text)
         values.append((chunk_id, start, end, text))
         if end == len(lines):
             break
@@ -210,6 +249,55 @@ class KnowledgeDB:
             raise KeyError(collection)
         return CollectionManifest.from_json(row["manifest_json"])
 
+    def _validated_chunk_rows(
+        self, manifest: CollectionManifest
+    ) -> list[sqlite3.Row]:
+        rows = self.connection.execute(
+            "SELECT * FROM chunks WHERE collection = ?", (manifest.collection,)
+        ).fetchall()
+        sources = {source.path: source for source in manifest.sources}
+        try:
+            chunk_ids = []
+            for row in rows:
+                chunk_id = row["chunk_id"]
+                path = row["path"]
+                start = row["start_line"]
+                end = row["end_line"]
+                text = row["text"]
+                revision = row["source_revision"]
+                content_sha256 = row["content_sha256"]
+                source = sources.get(path)
+                if (
+                    type(chunk_id) is not str
+                    or type(path) is not str
+                    or type(start) is not int
+                    or type(end) is not int
+                    or type(text) is not str
+                    or type(revision) is not str
+                    or type(content_sha256) is not str
+                    or start < 1
+                    or end < start
+                    or source is None
+                    or revision != source.source_revision
+                    or content_sha256 != source.content_sha256
+                    or chunk_id != _chunk_id(
+                        _source_digest(manifest.collection, manifest.target, source),
+                        start,
+                        end,
+                        text,
+                    )
+                ):
+                    raise ValueError
+                chunk_ids.append(chunk_id)
+            if (
+                len(rows) != manifest.chunk_count
+                or _chunk_set_digest(chunk_ids) != manifest.chunk_set_sha256
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("stored chunk rows do not match collection manifest") from exc
+        return rows
+
     def index(self, documents: Iterable[CorpusDocument]) -> CollectionManifest:
         provided = list(documents)
         if not provided:
@@ -232,14 +320,18 @@ class KnowledgeDB:
             item.path, item.content_sha256, item.repository, item.source_revision
         ) for item in ordered)
         collection = next(iter(collections))
+        chunks = tuple((item, chunk) for item in ordered for chunk in _chunks(item))
+        chunk_count = len(chunks)
+        chunk_set_sha256 = _chunk_set_digest(chunk[0] for _item, chunk in chunks)
         fingerprint = _manifest_fingerprint(
             collection, "a3", self.embeddings.model, self.embeddings.revision,
-            self.embeddings.dimension, CHUNK_SCHEMA, CHUNK_LINES, CHUNK_OVERLAP, sources,
+            self.embeddings.dimension, CHUNK_SCHEMA, CHUNK_LINES, CHUNK_OVERLAP,
+            chunk_count, chunk_set_sha256, sources,
         )
         manifest = CollectionManifest(
             collection, "a3", self.embeddings.model, self.embeddings.revision,
             self.embeddings.dimension, CHUNK_SCHEMA, CHUNK_LINES, CHUNK_OVERLAP,
-            sources, fingerprint,
+            chunk_count, chunk_set_sha256, sources, fingerprint,
         )
         existing = self.connection.execute(
             "SELECT manifest_json FROM collections WHERE name = ?", (collection,)
@@ -248,8 +340,8 @@ class KnowledgeDB:
             current = CollectionManifest.from_json(existing["manifest_json"])
             if current != manifest:
                 raise ValueError(f"collection {collection!r} is immutable")
+            self._validated_chunk_rows(current)
             return current
-        chunks = [(item, chunk) for item in ordered for chunk in _chunks(item)]
         vectors = self.embeddings.embed_documents([chunk[3] for _, chunk in chunks])
         if len(vectors) != len(chunks):
             raise ValueError("embedding backend returned the wrong number of vectors")
@@ -275,13 +367,18 @@ class KnowledgeDB:
             manifest.embedding_model, manifest.embedding_revision, manifest.dimension
         ):
             raise ValueError("embedding backend does not match collection manifest")
+        rows = self._validated_chunk_rows(manifest)
+        try:
+            stored_vectors = {
+                row["chunk_id"]: _normalize(json.loads(row["vector_json"]), manifest.dimension)
+                for row in rows
+            }
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("stored embedding is corrupt or has an invalid dimension") from exc
         query_vectors = self.embeddings.embed_queries([query])
         if len(query_vectors) != 1:
             raise ValueError("embedding backend must return one query embedding")
         query_vector = _normalize(query_vectors[0], manifest.dimension)
-        rows = self.connection.execute(
-            "SELECT * FROM chunks WHERE collection = ?", (collection,)
-        ).fetchall()
         terms = tuple(dict.fromkeys(term.casefold() for term in re.findall(r"\w+", query)))
         token_counts = {
             row["chunk_id"]: tuple(
@@ -296,13 +393,6 @@ class KnowledgeDB:
         lexical_rank = {
             row["chunk_id"]: rank for rank, (score, row) in enumerate(lexical, 1) if score
         }
-        try:
-            stored_vectors = {
-                row["chunk_id"]: _normalize(json.loads(row["vector_json"]), manifest.dimension)
-                for row in rows
-            }
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ValueError("stored embedding is corrupt or has an invalid dimension") from exc
         vector = sorted(rows, key=lambda row: (
             -_cosine(query_vector, stored_vectors[row["chunk_id"]]), row["chunk_id"]
         ))

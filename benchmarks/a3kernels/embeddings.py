@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -10,7 +11,32 @@ DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_EMBEDDING_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 EXPECTED_EMBEDDING_DIMENSION = 384
 QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
-_REQUIRED_SNAPSHOT_FILES = ("config.json", "tokenizer.json", "model.safetensors")
+_SNAPSHOT_SHA256 = (
+    (
+        "config.json",
+        "094f8e891b932f2000c92cfc663bac4c62069f5d8af5b5278c4306aef3084750",
+    ),
+    (
+        "model.safetensors",
+        "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad",
+    ),
+    (
+        "special_tokens_map.json",
+        "b6d346be366a7d1d48332dbc9fdf3bf8960b5d879522b7799ddba59e76237ee3",
+    ),
+    (
+        "tokenizer.json",
+        "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66",
+    ),
+    (
+        "tokenizer_config.json",
+        "9261e7d79b44c8195c1cada2b453e55b00aeb81e907a6664974b4d7776172ab3",
+    ),
+    (
+        "vocab.txt",
+        "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+    ),
+)
 
 
 class EmbeddingLoadError(RuntimeError):
@@ -29,9 +55,19 @@ def validate_local_snapshot(cache_dir: Path) -> Path:
         raise EmbeddingLoadError(
             f"pinned embedding snapshot {DEFAULT_EMBEDDING_REVISION} is not present"
         )
-    missing = [name for name in _REQUIRED_SNAPSHOT_FILES if not (snapshot / name).is_file()]
+    missing = [
+        name for name, _digest in _SNAPSHOT_SHA256
+        if not (snapshot / name).is_file()
+    ]
     if missing:
         raise EmbeddingLoadError(f"pinned embedding snapshot is incomplete: {', '.join(missing)}")
+    for name, expected in _SNAPSHOT_SHA256:
+        digest = hashlib.sha256()
+        with (snapshot / name).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != expected:
+            raise EmbeddingLoadError(f"pinned snapshot content mismatch: {name}")
     return snapshot
 
 
@@ -66,6 +102,12 @@ class PinnedBGEEmbeddings:
     def _load(self) -> tuple[Any, Any, Any]:
         if self._loaded is not None:
             return self._loaded
+        if self.cache_dir is None and (
+            self._tokenizer_loader is None or self._model_loader is None
+        ):
+            raise EmbeddingLoadError(
+                "cache_dir is required to authenticate the pinned embedding snapshot"
+            )
         try:
             if self._torch is None:
                 import torch
@@ -114,9 +156,11 @@ class PinnedBGEEmbeddings:
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         return self._embed(texts)
 
-    # Keep the small conventional backend surface expected by later KDB work.
-    def embed_query(self, texts: Sequence[str]) -> list[list[float]]:
-        return self.embed_queries(texts)
+    # Keep the conventional singular-query backend surface expected by callers.
+    def embed_query(self, text: str) -> list[float]:
+        if not isinstance(text, str):
+            raise TypeError("embedding query must be a string")
+        return self.embed_queries([text])[0]
 
     def embed(self, texts: Sequence[str]) -> list[list[float]]:
         return self.embed_documents(texts)

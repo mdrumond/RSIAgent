@@ -59,6 +59,8 @@ def test_index_reopen_query_retains_a3_provenance_and_digests(tmp_path):
         assert [source.path for source in manifest.sources] == ["a.cpp", "z.cpp"]
         assert manifest.target == "a3"
         assert manifest.dimension == 3
+        assert manifest.chunk_count == 2
+        assert len(manifest.chunk_set_sha256) == 64
         assert len(manifest.fingerprint) == 64
 
     with KnowledgeDB.open_read_only(path, encoder) as database:
@@ -145,6 +147,59 @@ def test_query_detects_corrupt_vector_and_manifest(tmp_path, vector):
         database.connection.commit()
         with pytest.raises(ValueError, match="manifest"):
             database.manifest("a3-docs")
+
+
+@pytest.mark.parametrize(
+    "column,value",
+    [
+        ("text", "changed vector text\n"),
+        ("path", "changed.cpp"),
+        ("start_line", 2),
+        ("end_line", 2),
+        ("source_revision", "b" * 40),
+        ("content_sha256", "0" * 64),
+        ("chunk_id", "f" * 64),
+    ],
+)
+def test_query_rejects_modified_chunk_identity_fields(tmp_path, column, value):
+    with KnowledgeDB.create(tmp_path / "db.sqlite", FakeEmbeddings()) as database:
+        database.index([document("kernel.cpp", "vector kernel\n")])
+        database.connection.execute(f"UPDATE chunks SET {column} = ?", (value,))
+        database.connection.commit()
+
+        with pytest.raises(ValueError, match="stored chunk rows"):
+            database.query("a3-docs", "vector")
+
+
+@pytest.mark.parametrize("operation", ["delete", "inject"])
+def test_query_rejects_deleted_or_injected_chunk_rows(tmp_path, operation):
+    with KnowledgeDB.create(tmp_path / "db.sqlite", FakeEmbeddings()) as database:
+        database.index([document("kernel.cpp", "vector kernel\n")])
+        if operation == "delete":
+            database.connection.execute("DELETE FROM chunks")
+        else:
+            database.connection.execute(
+                """INSERT INTO chunks
+                   SELECT ?, collection, path, start_line, end_line, text,
+                          source_revision, content_sha256, vector_json
+                   FROM chunks""",
+                ("f" * 64,),
+            )
+        database.connection.commit()
+
+        with pytest.raises(ValueError, match="stored chunk rows"):
+            database.query("a3-docs", "vector")
+
+
+def test_reindex_rejects_corrupt_rows_before_reuse(tmp_path):
+    item = document("kernel.cpp", "vector kernel\n")
+    with KnowledgeDB.create(tmp_path / "db.sqlite", FakeEmbeddings()) as database:
+        database.index([item])
+        database.connection.execute("DELETE FROM chunks")
+        database.connection.commit()
+
+        with pytest.raises(ValueError, match="stored chunk rows"):
+            database.index([item])
 
 
 def test_vector_ties_have_stable_digest_order(tmp_path):

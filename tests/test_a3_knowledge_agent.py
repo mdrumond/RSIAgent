@@ -139,7 +139,7 @@ def test_gate_rejects_stored_provenance_that_disagrees_with_manifest(tmp_path, c
         agent = KnowledgeAgent(
             enabled=True, database=readonly, collection="a3-docs", journal=journal
         )
-        with pytest.raises(ValueError, match="validated indexed chunk"):
+        with pytest.raises(ValueError, match="stored chunk rows do not match collection manifest"):
             agent.query(KnowledgeQuery("vector"))
     assert journal.read() == []
 
