@@ -121,7 +121,9 @@ def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path, monkeypat
         assert ("--device", "2") == argv[argv.index("--device"):argv.index("--device") + 2]
         assert ("--runtime", "py311-torch") == argv[argv.index("--runtime"):argv.index("--runtime") + 2]
         assert kwargs["env"] == wrapper_env
+        assert kwargs["timeout"] == 1230
         assert not any("KEY" in name or "SECRET" in name for name in kwargs["env"])
+    assert calls[0][1]["timeout"] == 1200
     assert "torch.npu.set_device(0)" in plan.files[3].content
 
 
@@ -257,12 +259,89 @@ def test_pending_observation_rejects_foreign_handle_and_remains_recoverable(tmp_
     backend = _backend(tmp_path, process)
     with pytest.raises(RuntimeError, match="retry retained handle"):
         backend.compile(_plan(), tmp_path / "local")
-    failed = backend.compile(_plan(), tmp_path / "local")
-
-    assert isinstance(failed, FailedEvidence)
-    assert failed.stage == "compile" and "foreign handle" in failed.detail
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        backend.compile(_plan(), tmp_path / "local")
     pending = tmp_path / "state" / _plan().execution_id / "compile.json"
     assert json.loads(pending.read_text())["handle"] == "bz-a3-1:pending"
+
+
+@pytest.mark.parametrize(
+    "profile,handle",
+    [
+        (None, "bz-a3-1:pending"),
+        ("bz-a3-2", "bz-a3-1:pending"),
+        ("bz-a3-1", None),
+        ("bz-a3-1", "bz-a3-1:foreign"),
+    ],
+)
+def test_failed_pending_terminal_requires_exact_profile_and_handle(
+    tmp_path, profile, handle,
+):
+    def process(argv, **kwargs):
+        if argv[0].endswith("cpl-remote"):
+            return _completed(argv, _upload_terminal())
+        if "observe" not in argv:
+            return _terminal(
+                "bz-a3-1", "bz-a3-1:pending",
+                state="observation-unavailable", code=75,
+            )
+        markers = ["CATLASS_VALIDATION_STATE=failed", "CATLASS_VALIDATION_EXIT=2"]
+        if profile is not None:
+            markers.append(f"CATLASS_VALIDATION_PROFILE={profile}")
+        if handle is not None:
+            markers.append(f"CATLASS_VALIDATION_HANDLE={handle}")
+        return _completed(argv, "\n".join(markers), "compile failed", 2)
+
+    backend = _backend(tmp_path, process)
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        backend.compile(_plan(), tmp_path / "local")
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        backend.compile(_plan(), tmp_path / "local")
+
+    pending = tmp_path / "state" / _plan().execution_id / "compile.json"
+    assert json.loads(pending.read_text())["handle"] == "bz-a3-1:pending"
+
+
+def test_exact_failed_pending_terminal_clears_state_and_returns_evidence(tmp_path):
+    def process(argv, **kwargs):
+        if argv[0].endswith("cpl-remote"):
+            return _completed(argv, _upload_terminal())
+        if "observe" in argv:
+            return _terminal(
+                "bz-a3-1", "bz-a3-1:pending",
+                state="failed", code=2, stderr="compile failed",
+            )
+        return _terminal(
+            "bz-a3-1", "bz-a3-1:pending",
+            state="observation-unavailable", code=75,
+        )
+
+    backend = _backend(tmp_path, process)
+    with pytest.raises(RuntimeError, match="retry retained handle"):
+        backend.compile(_plan(), tmp_path / "local")
+    result = backend.compile(_plan(), tmp_path / "local")
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "compile" and "compile failed" in result.detail
+    pending = tmp_path / "state" / _plan().execution_id / "compile.json"
+    assert not pending.exists()
+
+
+def test_wrapper_timeout_after_inner_deadline_is_not_terminal_evidence(tmp_path):
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append((tuple(argv), kwargs))
+        if argv[0].endswith("cpl-remote"):
+            return _completed(argv, _upload_terminal())
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    backend = _backend(tmp_path, process)
+    with pytest.raises(RuntimeError, match="submission state is unknown"):
+        backend.compile(_plan(), tmp_path / "local")
+
+    assert calls[0][1]["timeout"] == 1200
+    assert calls[1][1]["timeout"] == 1230
 
 
 def test_corrupt_or_cross_profile_pending_state_fails_closed(tmp_path):

@@ -20,6 +20,7 @@ from .remote_candidate import (
 
 
 _PROFILES = frozenset(("bz-a3-1", "bz-a3-2"))
+_WRAPPER_TIMEOUT_GRACE_SECONDS = 30
 
 
 class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
@@ -105,13 +106,17 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
         return self._workspace / f".rsi-a3-candidate-{plan.execution_id}.tar"
 
     def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        wrapper_call = argv[0] == self._wrapper
         options = {
             "text": True,
             "capture_output": True,
             "check": False,
-            "timeout": self._timeout,
+            "timeout": (
+                self._timeout + _WRAPPER_TIMEOUT_GRACE_SECONDS
+                if wrapper_call else self._timeout
+            ),
         }
-        if argv[0] == self._wrapper:
+        if wrapper_call:
             options["env"] = {
                 "PATH": os.environ.get("PATH", os.defpath),
                 "CPL_REMOTE": self._cpl_remote,
@@ -119,6 +124,11 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
         try:
             return self._run(argv, **options)
         except subprocess.TimeoutExpired as exc:
+            if wrapper_call:
+                raise _PendingObservation(
+                    "neutral wrapper exceeded its retained-operation timeout grace; "
+                    "submission state is unknown"
+                ) from exc
             raise RuntimeError("managed A3 operation timed out") from exc
 
     def _compile_argv(
@@ -241,13 +251,20 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
             raise _PendingObservation(
                 f"remote candidate observation unavailable; retry retained handle {handles[0]}"
             )
-        if completed.returncode == 0 and pending is not None:
-            if profiles != [self._profile] or handles != [pending["handle"]]:
-                raise RuntimeError("remote candidate observation returned a foreign handle")
-        if completed.returncode != 0 and pending is not None and states != ["failed"]:
-            raise _PendingObservation(
-                f"remote candidate observation incomplete; retry retained handle {pending['handle']}"
+        if pending is not None:
+            terminal = states in (["completed"], ["failed"])
+            exact_identity = (
+                profiles == [self._profile] and handles == [pending["handle"]]
             )
+            coherent_exit = (
+                (states == ["completed"] and completed.returncode == 0)
+                or (states == ["failed"] and completed.returncode != 0)
+            )
+            if not terminal or not exact_identity or not coherent_exit:
+                raise _PendingObservation(
+                    f"remote candidate observation incomplete; retry retained handle "
+                    f"{pending['handle']}"
+                )
         if completed.returncode != 0 and states == ["failed"]:
             self._pending_path(plan, operation).unlink(missing_ok=True)
         return completed
