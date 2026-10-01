@@ -323,6 +323,29 @@ def test_compact_profile_filters_helper_kernel_rows(tmp_path, capsys):
     assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
 
 
+@pytest.mark.parametrize(
+    ("metric", "counter"),
+    [("ArithmeticUtilization", "aiv_vec_fp32_ratio"),
+     ("PipeUtilization", "aiv_mte2_ratio")],
+)
+def test_raw_metric_can_be_bound_by_generic_operator_summary_columns(
+    tmp_path, metric, counter,
+):
+    report = tmp_path / "PROF_1/mindstudio_profiler_output"
+    report.mkdir(parents=True)
+    (report / "op_summary_0.csv").write_text(
+        f"Op Name,Task Duration(us),{counter}\nvector_add,2.5,0.75\n"
+    )
+
+    kernels, values, timeline, _columns = a3_profile_driver._raw_rows(
+        tmp_path, metric, "vector_add"
+    )
+
+    assert kernels == ["vector_add"]
+    assert any(item[0].endswith(f":{counter}:0") and item[1] == 0.75 for item in values)
+    assert any(item[0].endswith(":Task Duration(us):0") for item in timeline)
+
+
 def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):
     _candidate_directory(tmp_path, length=4, block_count=1)
 

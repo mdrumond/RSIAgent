@@ -20,6 +20,10 @@ ReportDirectoryFactory = Callable[[Path, str], Path]
 _OUTPUT = "A3KERNEL_OUTPUT="
 _KERNEL_COLUMNS = {"op name", "op_name", "opname", "kernel name", "kernel_name"}
 _TIMELINE_WORDS = ("duration", "start", "end", "timestamp")
+_INLINE_METRIC_TOKENS = {
+    "ArithmeticUtilization": ("_mac_", "_fops", "_vec_fp", "_vec_int"),
+    "PipeUtilization": ("_mte", "_scalar_", "_vec_ratio", "cube_utilization"),
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -190,9 +194,14 @@ def _raw_rows(
                     character.lower() for character in relative if character.isalnum()
                 )
             )
+            is_inline_metric = bool(kernel_columns) and any(
+                token in column.lower()
+                for column in columns
+                for token in _INLINE_METRIC_TOKENS.get(metric, ())
+            )
             if not kernel_columns and not is_metric_table:
                 continue
-            if is_metric_table:
+            if is_metric_table or is_inline_metric:
                 metric_tables += 1
             for row_number, row in enumerate(reader):
                 row_kernels = {
