@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shlex
 import subprocess
 
 import pytest
@@ -200,9 +201,16 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
 @pytest.mark.parametrize(
     "metric", ["Basic", "ArithmeticUtilization", "PipeUtilization"]
 )
-def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
+def test_checked_driver_profiles_one_raw_metric_and_retains_report(
+    tmp_path, capsys, monkeypatch, metric,
+):
     _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
+    monkeypatch.setattr(a3_profile_driver.sys, "executable", "python")
+    monkeypatch.setattr(
+        a3_profile_driver.shutil, "which",
+        lambda executable: "/opt/a3-py311-torch/bin/python3.11",
+    )
 
     def process(argv, **kwargs):
         calls.append(tuple(argv))
@@ -245,6 +253,7 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
     )
     assert f"--aic-metrics={metric}" in profile
     application = next(item.split("=", 1)[1] for item in profile if item.startswith("--application="))
+    assert shlex.split(application)[0] == "/opt/a3-py311-torch/bin/python3.11"
     assert "host_driver.py --mode replay --warm-up 0 --launch-count 1 .a3-profile-input.json" in application
     staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)

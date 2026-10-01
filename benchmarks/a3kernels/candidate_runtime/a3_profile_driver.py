@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -158,8 +159,11 @@ def _raw_rows(
 
 
 def _replay_argv(root: Path, input_name: str, args: argparse.Namespace) -> tuple[str, ...]:
+    interpreter = shutil.which(sys.executable)
+    if interpreter is None:
+        raise RuntimeError("active Python interpreter is not executable")
     return (
-        sys.executable, str((root / "host_driver.py").resolve()),
+        str(Path(interpreter).resolve()), str((root / "host_driver.py").resolve()),
         "--mode", "replay", "--warm-up", "0",
         "--launch-count", str(args.launch_count), input_name,
     )
