@@ -305,7 +305,10 @@ def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
     def command(argv, *, cwd, text, capture_output, check):
         calls.append(tuple(argv))
         assert (cwd / "candidate.cpp").read_text() == SOURCE
-        assert "TORCH_LIBRARY(rsi_a3candidates" in (cwd / "host_wrapper.inc").read_text()
+        wrapper = (cwd / "host_wrapper.inc").read_text()
+        assert "TORCH_LIBRARY(rsi_a3candidates" in wrapper
+        assert "int64_t padded_length, int64_t block_count" in wrapper
+        assert "static_cast<uint32_t>(block_count)" in wrapper
         return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", "")
 
     result = A3CandidateBackend(command).compile(
@@ -528,5 +531,9 @@ def test_fixed_wrapper_launches_the_requested_block_count():
         item.content for item in candidate_module._host_source_files()
         if item.relative_path == "host_wrapper.inc"
     )
-    assert "::vector_add<<<block_count" in wrapper
-    assert 'int padded_length, int block_count' in wrapper
+    assert "int64_t padded_length, int64_t block_count" in wrapper
+    assert 'registry.def("vector_add(Tensor a, Tensor b, int padded_length, int block_count)' in wrapper
+    assert "block_count >= 1 && block_count <= 32" in wrapper
+    assert "const auto launch_blocks = static_cast<uint32_t>(block_count);" in wrapper
+    assert "::vector_add<<<launch_blocks" in wrapper
+    assert wrapper.index("block_count >= 1") < wrapper.index("static_cast<uint32_t>(block_count)")
