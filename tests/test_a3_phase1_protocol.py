@@ -21,6 +21,7 @@ def plan(**changes):
         "argv": ("python", "host_driver.py", "input.json"),
         "input_a": (1.0, -2.0),
         "input_b": (3.0, 5.0),
+        "execution_profile": "bz-a3-1",
     }
     values.update(changes)
     return ExecutionPlan(**values)
@@ -36,13 +37,25 @@ def test_plan_has_deterministic_a3_source_and_execution_identity():
     assert first.execution_id == reordered.execution_id
     assert first.target == "Ascend910B4"
     assert first.language == "ascend-c"
-    assert first.execution_profile == "gz-a3"
+    assert first.execution_profile == "bz-a3-1"
     assert first.logical_device == 0
     assert first.files == tuple(reversed(files))
     assert isinstance(first.argv, tuple)
     assert len(first.execution_id) == 64
     with pytest.raises(FrozenInstanceError):
         first.project_id = "changed"
+
+
+def test_execution_dimensions_are_validated_and_identity_bound():
+    execution = plan(logical_length=2, padded_length=2, block_count=1)
+    assert execution.execution_id != plan(
+        logical_length=1, padded_length=2, block_count=1
+    ).execution_id
+    assert execution.execution_id != plan(
+        logical_length=2, padded_length=2, block_count=2
+    ).execution_id
+    with pytest.raises(ValueError, match="padded_length"):
+        plan(logical_length=2, padded_length=3)
 
 
 @pytest.mark.parametrize(
@@ -60,6 +73,21 @@ def test_plan_rejects_non_a3_or_catlass_identity(changes, message):
         plan(**changes)
 
 
+@pytest.mark.parametrize("profile", ["bz-a3-1", "bz-a3-2"])
+def test_plan_accepts_authoritative_bz_a3_profiles(profile):
+    execution = plan(execution_profile=profile)
+
+    assert execution.execution_profile == profile
+    assert execution.as_dict()["execution_profile"] == profile
+
+
+def test_plan_preserves_explicit_gz_a3_compatibility_identity():
+    execution = plan(execution_profile="gz-a3")
+
+    assert execution.execution_profile == "gz-a3"
+    assert execution.execution_id != plan(execution_profile="bz-a3-1").execution_id
+
+
 @pytest.mark.parametrize("path", ["/kernel.cpp", "../kernel.cpp", "a/../../kernel.cpp"])
 def test_source_paths_are_relative_and_cannot_escape(path):
     with pytest.raises(ValueError, match="relative"):
@@ -75,6 +103,21 @@ def test_plan_rejects_duplicate_sources_and_identity_changes_with_content():
     ).execution_id
 
 
+def test_source_paths_are_normalized_before_identity_and_aliases_collide():
+    canonical = SourceFile("kernel.cpp", "source")
+    alias = SourceFile("./kernel.cpp", "source")
+
+    assert alias.relative_path == canonical.relative_path
+    assert alias.sha256 == canonical.sha256
+    with pytest.raises(ValueError, match="unique"):
+        plan(files=(canonical, alias))
+
+
+def test_plan_rejects_boolean_logical_device():
+    with pytest.raises(ValueError, match="logical device"):
+        plan(logical_device=False)
+
+
 def test_receipt_is_untrusted_and_attestation_is_host_derived():
     execution = plan()
     receipt = ExecutionReceipt(
@@ -88,8 +131,26 @@ def test_receipt_is_untrusted_and_attestation_is_host_derived():
     assert result.passed is True
     assert isinstance(receipt.output, tuple)
     assert result.output_sha256
+    assert result.tolerance == 1e-5
     assert result.attestation_sha256 == attest(result.attestation_payload())
     assert "agent_claim" not in str(result.attestation_payload())
+
+
+def test_verified_result_attests_nondefault_tolerance():
+    execution = plan()
+    receipt = ExecutionReceipt(exit_code=0, output=[4.0, 3.0])
+
+    narrow = VerifiedResult.from_receipt(
+        execution, receipt, max_abs_error=0.05, tolerance=0.05
+    )
+    wide = VerifiedResult.from_receipt(
+        execution, receipt, max_abs_error=0.05, tolerance=0.1
+    )
+
+    assert narrow.passed is True
+    assert narrow.tolerance == 0.05
+    assert wide.tolerance == 0.1
+    assert narrow.attestation_sha256 != wide.attestation_sha256
 
 
 def test_failed_evidence_is_structured_and_attested():
@@ -109,4 +170,22 @@ def test_verified_result_cannot_claim_pass_on_failed_process():
     with pytest.raises(ValueError, match="exit code"):
         VerifiedResult.from_receipt(
             plan(), ExecutionReceipt(exit_code=2), max_abs_error=0.0
+        )
+
+
+@pytest.mark.parametrize("metric", [-1.0, -0.000001, True])
+def test_verified_result_rejects_negative_or_boolean_error(metric):
+    with pytest.raises(ValueError, match="max_abs_error"):
+        VerifiedResult.from_receipt(
+            plan(), ExecutionReceipt(exit_code=0, output=(4.0, 3.0)),
+            max_abs_error=metric,
+        )
+
+
+@pytest.mark.parametrize("tolerance", [-1.0, float("inf"), True])
+def test_verified_result_rejects_invalid_tolerance(tolerance):
+    with pytest.raises(ValueError, match="tolerance"):
+        VerifiedResult.from_receipt(
+            plan(), ExecutionReceipt(exit_code=0, output=(4.0, 3.0)),
+            max_abs_error=0.0, tolerance=tolerance,
         )

@@ -8,12 +8,14 @@ import hashlib
 import math
 from typing import Any, Mapping
 
-from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_evidence import (
+    A3_EXECUTION_PROFILES,
+    canonical_digest,
+)
 
 
 A3_TARGET = "Ascend910B4"
 A3_LANGUAGE = "ascend-c"
-A3_EXECUTION_PROFILE = "gz-a3"
 A3_RUNTIME = "native-ascend-c"
 
 
@@ -29,16 +31,18 @@ class SourceFile:
     content: str
 
     def __post_init__(self) -> None:
+        if type(self.relative_path) is not str or not self.relative_path:
+            raise ValueError("source path must be a non-empty relative path")
         path = PurePosixPath(self.relative_path)
         if (
-            type(self.relative_path) is not str
-            or not self.relative_path
-            or path.is_absolute()
+            path.is_absolute()
             or ".." in path.parts
+            or path.as_posix() == "."
         ):
             raise ValueError("source path must be a non-empty relative path")
         if type(self.content) is not str:
             raise TypeError("source content must be a string")
+        object.__setattr__(self, "relative_path", path.as_posix())
 
     @property
     def sha256(self) -> str:
@@ -56,11 +60,14 @@ class ExecutionPlan:
     argv: tuple[str, ...]
     input_a: tuple[float, ...]
     input_b: tuple[float, ...]
+    execution_profile: str
     target: str = A3_TARGET
     language: str = A3_LANGUAGE
-    execution_profile: str = A3_EXECUTION_PROFILE
     runtime: str = A3_RUNTIME
     logical_device: int = 0
+    logical_length: int | None = None
+    padded_length: int | None = None
+    block_count: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "files", tuple(self.files))
@@ -74,11 +81,14 @@ class ExecutionPlan:
             raise ValueError(f"A3 target must be {A3_TARGET}")
         if self.language != A3_LANGUAGE:
             raise ValueError(f"A3 language must be {A3_LANGUAGE}; Catlass is unsupported")
-        if self.execution_profile != A3_EXECUTION_PROFILE:
-            raise ValueError(f"A3 execution profile must be {A3_EXECUTION_PROFILE}")
+        if self.execution_profile not in A3_EXECUTION_PROFILES:
+            raise ValueError(
+                "A3 execution profile must be bz-a3-1, bz-a3-2, or "
+                "the gz-a3 compatibility profile"
+            )
         if self.runtime != A3_RUNTIME:
             raise ValueError(f"A3 runtime must be {A3_RUNTIME}")
-        if self.logical_device != 0:
+        if type(self.logical_device) is not int or self.logical_device != 0:
             raise ValueError("A3 logical device must be 0")
         if not self.files or any(not isinstance(item, SourceFile) for item in self.files):
             raise ValueError("files must contain at least one SourceFile")
@@ -89,6 +99,21 @@ class ExecutionPlan:
             raise ValueError("argv must contain strings")
         if len(self.input_a) != len(self.input_b):
             raise ValueError("input vectors must have equal lengths")
+        if self.logical_length is None:
+            object.__setattr__(self, "logical_length", len(self.input_a))
+        if self.padded_length is None:
+            object.__setattr__(self, "padded_length", len(self.input_a))
+        if (
+            type(self.logical_length) is not int
+            or type(self.padded_length) is not int
+            or not 1 <= self.logical_length <= self.padded_length <= 4096
+            or len(self.input_a) != self.padded_length
+        ):
+            raise ValueError(
+                "logical_length and padded_length must describe the staged inputs"
+            )
+        if type(self.block_count) is not int or not 1 <= self.block_count <= 32:
+            raise ValueError("block_count must be an integer in [1, 32]")
         object.__setattr__(self, "files", tuple(sorted(self.files)))
 
     @property
@@ -107,7 +132,10 @@ class ExecutionPlan:
                 "input_a": self.input_a,
                 "input_b": self.input_b,
                 "language": self.language,
+                "logical_length": self.logical_length,
                 "logical_device": self.logical_device,
+                "padded_length": self.padded_length,
+                "block_count": self.block_count,
                 "project_id": self.project_id,
                 "request_id": self.request_id,
                 "runtime": self.runtime,
@@ -149,6 +177,7 @@ class VerifiedResult:
     project_id: str
     passed: bool
     max_abs_error: float | None
+    tolerance: float
     exit_code: int
     output_sha256: str
     source_fingerprint: str
@@ -165,11 +194,22 @@ class VerifiedResult:
         max_abs_error: float | None,
         tolerance: float = 1e-5,
     ) -> "VerifiedResult":
+        if (
+            type(tolerance) not in (int, float)
+            or not math.isfinite(tolerance)
+            or tolerance < 0
+        ):
+            raise ValueError("tolerance must be a finite non-negative number")
+        if max_abs_error is not None and (
+            type(max_abs_error) not in (int, float)
+            or not math.isfinite(max_abs_error)
+            or max_abs_error < 0
+        ):
+            raise ValueError("max_abs_error must be a finite non-negative number")
         if receipt.exit_code != 0 and max_abs_error is not None:
             raise ValueError("a failed exit code cannot have a verification metric")
         metric_ok = (
             max_abs_error is not None
-            and math.isfinite(max_abs_error)
             and max_abs_error <= tolerance
         )
         body = {
@@ -178,7 +218,8 @@ class VerifiedResult:
             "attempt_id": plan.attempt_id,
             "project_id": plan.project_id,
             "passed": receipt.exit_code == 0 and metric_ok,
-            "max_abs_error": max_abs_error if max_abs_error is None or math.isfinite(max_abs_error) else None,
+            "max_abs_error": max_abs_error,
+            "tolerance": float(tolerance),
             "exit_code": receipt.exit_code,
             "output_sha256": canonical_digest(receipt.output),
             "source_fingerprint": plan.source_fingerprint,

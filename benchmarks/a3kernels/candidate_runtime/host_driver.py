@@ -55,18 +55,29 @@ def _compile(root: Path, spec: dict, torch, torch_npu) -> Path:
     return output
 
 
-def _read_input(path: Path, maximum: int) -> tuple[list[float], list[float]]:
+def _read_input(
+    path: Path, maximum: int
+) -> tuple[list[float], list[float], int, int, int]:
     value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) != {"input_a", "input_b"}:
-        raise ValueError("input must contain only input_a and input_b")
+    expected = {
+        "input_a", "input_b", "logical_length", "padded_length", "block_count"
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("input does not match the fixed execution schema")
     a, b = value["input_a"], value["input_b"]
+    logical = value["logical_length"]
+    padded = value["padded_length"]
+    blocks = value["block_count"]
     if (
         not isinstance(a, list) or not isinstance(b, list) or not a
-        or len(a) != len(b) or len(a) > maximum
+        or type(logical) is not int or type(padded) is not int
+        or type(blocks) is not int or not 1 <= blocks <= 32
+        or len(a) != len(b) or len(a) != padded or len(a) > maximum
+        or not 1 <= logical <= padded
         or any(isinstance(item, bool) or not isinstance(item, (int, float)) for item in a + b)
     ):
-        raise ValueError("inputs must be equal bounded non-empty numeric arrays")
-    return [float(item) for item in a], [float(item) for item in b]
+        raise ValueError("input dimensions must describe bounded numeric arrays")
+    return [float(item) for item in a], [float(item) for item in b], logical, padded, blocks
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,12 +101,16 @@ def main(argv: list[str] | None = None) -> int:
     input_path = Path(args[0])
     if not input_path.is_absolute():
         input_path = root / input_path
-    a_values, b_values = _read_input(input_path, spec["max_elements"])
+    a_values, b_values, logical, padded, blocks = _read_input(
+        input_path, spec["max_elements"]
+    )
     torch.ops.load_library(str(library))
     torch.npu.set_device(0)
     a = torch.tensor(a_values, dtype=torch.float32, device="npu:0")
     b = torch.tensor(b_values, dtype=torch.float32, device="npu:0")
-    output = torch.ops.rsi_a3candidates.vector_add(a, b)
+    output = torch.ops.rsi_a3candidates.vector_add(
+        a, b, logical, padded, blocks
+    )
     torch.npu.synchronize()
     print("A3KERNEL_OUTPUT=" + json.dumps(output.cpu().tolist(), separators=(",", ":")))
     return 0
