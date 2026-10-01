@@ -247,6 +247,92 @@ def test_runtime_failure_is_structured(tmp_path):
     assert "ACL launch failed" in result.detail
 
 
+def test_compile_timeout_is_structured_and_stops_before_execute(tmp_path):
+    calls = []
+
+    def command(argv, **_kwargs):
+        calls.append(tuple(argv))
+        raise subprocess.TimeoutExpired(argv, timeout=999)
+
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
+        SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
+    )
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "compile" and result.error_type == "TimeoutExpired"
+    assert result.detail == "compile exceeded host timeout of 600 seconds"
+    assert calls == [("python", "host_driver.py", "--compile-only")]
+
+
+def test_execute_timeout_is_structured_after_successful_compile(tmp_path):
+    calls = []
+
+    def command(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "e" * 64 + "\n", ""
+            )
+        raise subprocess.TimeoutExpired(argv, timeout=999)
+
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
+        SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
+    )
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "execute" and result.error_type == "TimeoutExpired"
+    assert result.detail == "execute exceeded host timeout of 120 seconds"
+    assert calls == [
+        ("python", "host_driver.py", "--compile-only"),
+        ("python", "host_driver.py", "input.json"),
+    ]
+
+
+def test_default_runner_gets_host_timeouts_and_injected_runner_stays_compatible(
+    monkeypatch, tmp_path
+):
+    default_timeouts = []
+
+    def default_runner(
+        argv, *, cwd, text, capture_output, check, timeout
+    ):
+        default_timeouts.append(timeout)
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "f" * 64 + "\n", ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(_output(cwd)) + "\n", ""
+        )
+
+    monkeypatch.setattr(candidate_module.subprocess, "run", default_runner)
+    default_result = A3CandidateBackend(execution_profile="bz-a3-1").run(
+        SOURCE, tmp_path / "default", request_id="r1", attempt_id="a", length=4
+    )
+    assert isinstance(default_result, VerifiedResult) and default_result.passed
+    assert default_timeouts == [600, 120]
+
+    injected_calls = []
+
+    def injected_runner(argv, *, cwd, text, capture_output, check):
+        injected_calls.append(tuple(argv))
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(_output(cwd)) + "\n", ""
+        )
+
+    injected_result = A3CandidateBackend(
+        injected_runner, execution_profile="bz-a3-1"
+    ).run(
+        SOURCE, tmp_path / "injected", request_id="r2", attempt_id="a", length=4
+    )
+    assert isinstance(injected_result, VerifiedResult) and injected_result.passed
+    assert len(injected_calls) == 2
+
+
 @pytest.mark.parametrize(
     "stdout",
     ["", "A3KERNEL_OUTPUT=nope\n", "A3KERNEL_OUTPUT=[1]\n", "A3KERNEL_OUTPUT=[NaN,0,0,0]\n"],

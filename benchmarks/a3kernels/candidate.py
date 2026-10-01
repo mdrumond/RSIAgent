@@ -30,6 +30,8 @@ _COMPILE_ARGV = ("python", "host_driver.py", "--compile-only")
 _RUN_ARGV = ("python", "host_driver.py", "input.json")
 _COMPILE_MARKER = "A3CANDIDATE_COMPILED="
 _OUTPUT_MARKER = "A3KERNEL_OUTPUT="
+_COMPILE_TIMEOUT_SECONDS = 600
+_EXECUTE_TIMEOUT_SECONDS = 120
 _SIGNATURE = re.compile(
     r'extern\s+"C"\s+__global__\s+__aicore__\s+void\s+vector_add\s*\(\s*'
     r'GM_ADDR\s+input_a\s*,\s*GM_ADDR\s+input_b\s*,\s*GM_ADDR\s+output\s*,\s*'
@@ -75,14 +77,17 @@ class CandidateCompilation:
 class A3CandidateBackend:
     def __init__(
         self,
-        command_runner: CommandRunner = subprocess.run,
+        command_runner: CommandRunner | None = None,
         *,
         execution_profile: str,
         atol=1e-5,
     ):
         if execution_profile not in A3_EXECUTION_PROFILES:
             raise ValueError("candidate backend requires a registered A3 profile")
-        self._command_runner = command_runner
+        self._uses_default_runner = command_runner is None
+        self._command_runner = (
+            subprocess.run if command_runner is None else command_runner
+        )
         self._execution_profile = execution_profile
         self._atol = float(atol)
 
@@ -170,9 +175,20 @@ class A3CandidateBackend:
         compilation = self._compile(plan, workdir)
         if isinstance(compilation, FailedEvidence):
             return compilation
-        completed = self._command_runner(
-            _RUN_ARGV, cwd=workdir, text=True, capture_output=True, check=False
-        )
+        try:
+            completed = self._run_command(
+                _RUN_ARGV, workdir, timeout=_EXECUTE_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            return FailedEvidence.create(
+                plan,
+                stage="execute",
+                error_type="TimeoutExpired",
+                detail=(
+                    "execute exceeded host timeout of "
+                    f"{_EXECUTE_TIMEOUT_SECONDS} seconds"
+                ),
+            )
         if completed.returncode != 0:
             return FailedEvidence.create(
                 plan, stage="execute", error_type="RuntimeError",
@@ -227,9 +243,20 @@ class A3CandidateBackend:
     def _compile(
         self, plan: ExecutionPlan, workdir: Path
     ) -> CandidateCompilation | FailedEvidence:
-        completed = self._command_runner(
-            _COMPILE_ARGV, cwd=workdir, text=True, capture_output=True, check=False
-        )
+        try:
+            completed = self._run_command(
+                _COMPILE_ARGV, workdir, timeout=_COMPILE_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            return FailedEvidence.create(
+                plan,
+                stage="compile",
+                error_type="TimeoutExpired",
+                detail=(
+                    "compile exceeded host timeout of "
+                    f"{_COMPILE_TIMEOUT_SECONDS} seconds"
+                ),
+            )
         if completed.returncode != 0:
             return FailedEvidence.create(
                 plan, stage="compile", error_type="CompileError",
@@ -254,6 +281,19 @@ class A3CandidateBackend:
         return CandidateCompilation(
             plan, records[0], completed.stdout, completed.stderr, attest(body)
         )
+
+    def _run_command(
+        self, argv: tuple[str, ...], workdir: Path, *, timeout: int
+    ) -> subprocess.CompletedProcess[str]:
+        options = {
+            "cwd": workdir,
+            "text": True,
+            "capture_output": True,
+            "check": False,
+        }
+        if self._uses_default_runner:
+            options["timeout"] = timeout
+        return self._command_runner(argv, **options)
 
 
 def _parse_output(stdout: str, expected_length: int) -> tuple[float, ...]:
