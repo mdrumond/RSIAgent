@@ -86,6 +86,15 @@ def test_provenance_checks_only_explicit_route_fields(tmp_path):
     assert entry.payload["runtime_provenance"][0][1] == digest_with_a5
 
 
+@pytest.mark.parametrize("profile", ["gz-a3", "bz-a3-1", "bz-a3-2"])
+def test_ledger_accepts_registered_a3_execution_profiles(tmp_path, profile):
+    entry = EvidenceLedger(tmp_path / f"{profile}.jsonl").append(
+        EvidenceKind.ACTION, {"execution_profile": profile}
+    )
+
+    assert entry.payload["execution_profile"] == profile
+
+
 @pytest.mark.parametrize(
     "field,value,message",
     [

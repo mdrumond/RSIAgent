@@ -14,6 +14,7 @@ import subprocess
 from typing import Callable
 
 from benchmarks.a3kernels.phase1_protocol import (
+    A3_EXECUTION_PROFILE,
     ExecutionPlan,
     ExecutionReceipt,
     FailedEvidence,
@@ -93,6 +94,7 @@ class A3CandidateBackend:
         block_count: int = 1,
         seed: int,
         project_id: str = "vector-add",
+        execution_profile: str = A3_EXECUTION_PROFILE,
     ) -> ExecutionPlan:
         validate_candidate_source(source)
         if type(length) is not int or not 1 <= length <= 4096:
@@ -120,6 +122,7 @@ class A3CandidateBackend:
             logical_length=length,
             padded_length=padded_length,
             block_count=block_count,
+            execution_profile=execution_profile,
         )
 
     def compile(

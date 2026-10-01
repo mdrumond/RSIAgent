@@ -63,6 +63,14 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
     def profile(self) -> str:
         return self._profile
 
+    def _require_execution_profile(self, plan: ExecutionPlan) -> None:
+        if not isinstance(plan, ExecutionPlan):
+            raise TypeError("plan must be an A3 ExecutionPlan")
+        if plan.execution_profile != self._profile:
+            raise ValueError(
+                f"BZ-A3 backend requires a {self._profile} execution profile"
+            )
+
     def _require_listener(self) -> None:
         """BZ transfer readiness is checked by cpl-remote itself."""
 
@@ -92,6 +100,23 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
     def _poll_transfer(self, job_id: str) -> None:
         if job_id != "synchronous-bz-upload":
             raise RuntimeError("unexpected BZ transfer state")
+
+    def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        options = {
+            "text": True,
+            "capture_output": True,
+            "check": False,
+            "timeout": self._timeout,
+        }
+        if argv[0] == self._wrapper:
+            options["env"] = {
+                "PATH": os.environ.get("PATH", os.defpath),
+                "CPL_REMOTE": self._cpl_remote,
+            }
+        try:
+            return self._run(argv, **options)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("managed A3 operation timed out") from exc
 
     def _compile_argv(
         self, plan: ExecutionPlan, bundle: CandidateBundle,
