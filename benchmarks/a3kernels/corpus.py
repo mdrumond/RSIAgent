@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -85,7 +86,12 @@ class CorpusSpec:
             raise ValueError("corpus files must be unique and sorted by path")
         for item in self.files:
             pure = PurePosixPath(item.path)
-            if pure.is_absolute() or ".." in pure.parts or pure.as_posix() != item.path:
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or not pure.name
+                or pure.as_posix() != item.path
+            ):
                 raise ValueError(f"unsafe corpus path: {item.path!r}")
             if not re.fullmatch(r"[0-9a-f]{64}", item.sha256):
                 raise ValueError(f"invalid sha256 for {item.path!r}")
@@ -140,26 +146,42 @@ def prepare_corpus(
     fetcher: CorpusFetcher = fetch_pinned_git_files,
 ) -> Path:
     """Verify and atomically publish only the pinned allowlisted source blobs."""
+    spec.validate()
     destination = spec.source_root(artifacts)
     if destination.exists():
         load_documents(spec, artifacts)
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    paths = tuple(item.path for item in spec.files)
-    fetched = fetcher(spec.repository, spec.revision, paths)
-    if set(fetched) != set(paths) or any(type(value) is not bytes for value in fetched.values()):
-        raise ValueError("fetcher must return exactly the allowlisted corpus byte blobs")
-    for item in spec.files:
-        actual = hashlib.sha256(fetched[item.path]).hexdigest()
-        if actual != item.sha256:
-            raise ValueError(f"fetched hash mismatch for {item.path}")
-    with tempfile.TemporaryDirectory(prefix=f".{spec.name}-", dir=destination.parent) as value:
-        staging = Path(value) / "sources"
+    lock_path = destination.parent / ".prepare.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if destination.exists():
+            load_documents(spec, artifacts)
+            return destination
+        paths = tuple(item.path for item in spec.files)
+        fetched = fetcher(spec.repository, spec.revision, paths)
+        if set(fetched) != set(paths) or any(
+            type(value) is not bytes for value in fetched.values()
+        ):
+            raise ValueError("fetcher must return exactly the allowlisted corpus byte blobs")
         for item in spec.files:
-            target = staging / item.path
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(fetched[item.path])
-        os.replace(staging, destination)
+            data = fetched[item.path]
+            actual = hashlib.sha256(data).hexdigest()
+            if actual != item.sha256:
+                raise ValueError(f"fetched hash mismatch for {item.path}")
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"corpus file is not UTF-8: {item.path}") from exc
+        with tempfile.TemporaryDirectory(
+            prefix=f".{spec.name}-", dir=destination.parent
+        ) as value:
+            staging = Path(value) / "sources"
+            for item in spec.files:
+                target = staging / item.path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(fetched[item.path])
+            os.replace(staging, destination)
     load_documents(spec, artifacts)
     return destination
 

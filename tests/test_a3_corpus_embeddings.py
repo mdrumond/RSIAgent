@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import threading
 from contextlib import nullcontext
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -11,6 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from benchmarks.a3kernels import corpus
+from benchmarks.a3kernels import embeddings as embedding_module
 from benchmarks.a3kernels.corpus import CorpusSpec, load_documents, prepare_corpus
 from benchmarks.a3kernels.embeddings import (
     DEFAULT_EMBEDDING_REVISION,
@@ -115,6 +118,21 @@ def test_spec_rejects_wrong_target_unknown_fields_and_bad_order(tmp_path):
         CorpusSpec.load(path)
 
 
+@pytest.mark.parametrize("invalid_path", [".", "nested/"])
+def test_spec_rejects_paths_without_a_real_filename(tmp_path, invalid_path):
+    raw = {
+        "name": "a3-docs-en", "collection": "a3-docs-en-v1", "target": "a3",
+        "language": "en", "repository": "https://example.invalid/docs.git",
+        "revision": "a" * 40,
+        "files": [{"path": invalid_path, "sha256": "b" * 64}],
+    }
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ValueError, match="unsafe corpus path"):
+        CorpusSpec.load(path)
+
+
 def test_load_documents_is_ordered_and_fails_closed_on_missing_or_drift(tmp_path):
     data = {"a.md": b"first\n", "z.cpp": b"second\n"}
     raw = {
@@ -186,19 +204,59 @@ def test_prepare_mismatch_never_publishes_partial_sources(tmp_path, failure):
     assert not spec.source_root(tmp_path).exists()
 
 
+def test_prepare_rejects_invalid_utf8_before_publication(tmp_path):
+    values = {"guide.md": b"\xff\xfe"}
+    spec = CorpusSpec.load(CORPORA / "a3-ascendc-en.json").with_files(values)
+
+    with pytest.raises(ValueError, match="not UTF-8"):
+        prepare_corpus(spec, tmp_path, fetcher=lambda *_args: values)
+
+    assert not spec.source_root(tmp_path).exists()
+
+
+def test_concurrent_prepare_has_one_publisher_and_verified_reuse(tmp_path):
+    values = {"a.md": b"first\n", "nested/z.cpp": b"second\n"}
+    spec = CorpusSpec.load(CORPORA / "a3-ascendc-en.json").with_files(values)
+    start = threading.Barrier(2)
+    calls = []
+
+    def fetch(*_args):
+        calls.append(True)
+        return dict(values)
+
+    def prepare():
+        start.wait()
+        return prepare_corpus(spec, tmp_path, fetcher=fetch)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        roots = tuple(pool.map(lambda _index: prepare(), range(2)))
+
+    assert roots == (spec.source_root(tmp_path),) * 2
+    assert len(calls) == 1
+    assert [doc.text for doc in load_documents(spec, tmp_path)] == [
+        "first\n", "second\n",
+    ]
+
+
 def test_query_and_documents_use_separate_encoding_paths():
     tokenizer = RecordingTokenizer()
     backend = _backend(tokenizer)
 
     documents = backend.embed_documents(["DataCopy"])
     queries = backend.embed_queries(["vector add"])
+    query = backend.embed_query("vector add")
 
     assert tokenizer.batches == [
         ["DataCopy"],
         ["Represent this sentence for searching relevant passages: vector add"],
+        ["Represent this sentence for searching relevant passages: vector add"],
     ]
     assert documents == backend.embed_documents(["DataCopy"])
+    assert query == queries[0]
+    assert len(query) == 384
     assert all(math.isclose(sum(value * value for value in row), 1.0) for row in queries)
+    with pytest.raises(TypeError, match="query must be a string"):
+        backend.embed_query(["vector add"])
 
 
 def test_loader_rejects_unverified_revision_before_returning_vectors():
@@ -206,14 +264,38 @@ def test_loader_rejects_unverified_revision_before_returning_vectors():
         _backend(RecordingTokenizer(), revision="main").embed_documents(["kernel"])
 
 
-def test_snapshot_validation_is_offline_and_fails_closed(tmp_path):
+def test_default_loader_requires_an_authenticated_cache_path():
+    with pytest.raises(EmbeddingLoadError, match="cache_dir is required"):
+        PinnedBGEEmbeddings().embed_documents(["kernel"])
+
+
+def test_snapshot_validation_is_offline_and_authenticates_contents(
+    tmp_path, monkeypatch
+):
     cache = tmp_path / "hub"
     snapshot = cache / "models--BAAI--bge-small-en-v1.5" / "snapshots" / DEFAULT_EMBEDDING_REVISION
     snapshot.mkdir(parents=True)
-    for name in ("config.json", "tokenizer.json", "model.safetensors"):
-        (snapshot / name).write_text(name)
+    contents = {
+        "config.json": b"config",
+        "tokenizer.json": b"tokenizer",
+        "model.safetensors": b"weights",
+    }
+    monkeypatch.setattr(
+        embedding_module,
+        "_SNAPSHOT_SHA256",
+        tuple(
+            (name, hashlib.sha256(content).hexdigest())
+            for name, content in contents.items()
+        ),
+    )
+    for name, content in contents.items():
+        (snapshot / name).write_bytes(content)
 
     assert validate_local_snapshot(cache) == snapshot
+    (snapshot / "tokenizer.json").write_bytes(b"drifted")
+    with pytest.raises(EmbeddingLoadError, match="content mismatch: tokenizer.json"):
+        validate_local_snapshot(cache)
+    (snapshot / "tokenizer.json").write_bytes(contents["tokenizer.json"])
     (snapshot / "config.json").unlink()
     with pytest.raises(EmbeddingLoadError, match="incomplete"):
         validate_local_snapshot(cache)
