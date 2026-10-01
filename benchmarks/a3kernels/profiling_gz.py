@@ -86,6 +86,8 @@ class GZA3ProfilingBackend:
         self._verified = dict(verified_results)
         self._run = process_runner
         self._timeout = timeout
+        self._profile = "gz-a3"
+        self._label = "GZ-A3"
 
     def time(
         self,
@@ -95,7 +97,9 @@ class GZA3ProfilingBackend:
         replay_id: str | None = None,
     ) -> TimingResult:
         self._require_verified(binding)
-        request_id = timing_request_id(binding, dimensions)
+        request_id = timing_request_id(
+            binding, dimensions, execution_profile=self._profile
+        )
         replay = replay_id or f"a3-timing-{request_id[:16]}"
         self._validate_replay(replay)
         retained = self._load_replay(replay, request_id, "timing")
@@ -106,7 +110,8 @@ class GZA3ProfilingBackend:
         meta, handle, status = self._validated_output(completed, mode="timing")
         result = replace(
             TimingResult.from_samples(
-                binding, dimensions, parse_timing_output(completed.stdout)
+                binding, dimensions, parse_timing_output(completed.stdout),
+                execution_profile=self._profile,
             ),
             dimensions=dimensions,
         )
@@ -123,6 +128,10 @@ class GZA3ProfilingBackend:
         replay_id: str | None = None,
     ) -> CompactProfileResult:
         self._require_verified(request.binding)
+        if request.execution_profile != self._profile:
+            raise ValueError(
+                f"profiling request requires matching {self._label} execution profile"
+            )
         replay = replay_id or request.default_replay_id
         self._validate_replay(replay)
         retained = self._load_replay(replay, request.request_id, "profile")
@@ -159,7 +168,7 @@ class GZA3ProfilingBackend:
         if not path.is_file():
             raise KeyError(replay_id)
         try:
-            return GZA3RunEvidence(**json.loads(path.read_text())["evidence"])
+            return self._evidence_from_dict(json.loads(path.read_text())["evidence"])
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise RuntimeError("retained GZ-A3 evidence is corrupt") from exc
 
@@ -193,7 +202,7 @@ class GZA3ProfilingBackend:
 
     def _wrapper_argv(self, replay: str, command: tuple[str, ...]) -> tuple[str, ...]:
         return (
-            self._wrapper, "--profile", "gz-a3", "--operation", replay,
+            self._wrapper, "--profile", self._profile, "--operation", replay,
             "run", "--native", "--runtime", "py311-torch",
             "--device", str(self._device), "--timeout", str(self._timeout),
             "--", *command,
@@ -208,7 +217,7 @@ class GZA3ProfilingBackend:
                 timeout=self._timeout, env=environment,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("GZ-A3 profiling wrapper timed out") from exc
+            raise RuntimeError(f"{self._label} profiling wrapper timed out") from exc
         return completed
 
     def _run_or_observe(
@@ -216,7 +225,7 @@ class GZA3ProfilingBackend:
     ) -> subprocess.CompletedProcess[str]:
         pending = self._load_pending(replay, request_id, mode)
         argv = submit_argv if pending is None else (
-            self._wrapper, "--profile", "gz-a3", "--operation", replay,
+            self._wrapper, "--profile", self._profile, "--operation", replay,
             "observe", "--handle", pending["handle"],
         )
         completed = self._call(argv)
@@ -224,7 +233,7 @@ class GZA3ProfilingBackend:
             if pending is not None:
                 handle = self._one_marker(completed.stdout, _STATE_MARKERS["handle"], "handle")
                 if handle != pending["handle"]:
-                    raise RuntimeError("GZ-A3 observation returned a foreign handle")
+                    raise RuntimeError(f"{self._label} observation returned a foreign handle")
             return completed
         try:
             profile = self._one_marker(completed.stdout, _STATE_MARKERS["profile"], "profile")
@@ -232,13 +241,19 @@ class GZA3ProfilingBackend:
             handle = self._one_marker(completed.stdout, _STATE_MARKERS["handle"], "handle")
         except RuntimeError:
             profile = state = handle = ""
-        if profile == "gz-a3" and state == "observation-unavailable" and handle.startswith("gz-a3:"):
+        if (
+            profile == self._profile
+            and state == "observation-unavailable"
+            and handle.startswith(self._profile + ":")
+        ):
             if pending is not None and handle != pending["handle"]:
-                raise RuntimeError("GZ-A3 observation returned a foreign handle")
+                raise RuntimeError(f"{self._label} observation returned a foreign handle")
             self._publish_pending(replay, request_id, mode, handle)
-            raise RuntimeError(f"GZ-A3 observation unavailable; retry retained handle {handle}")
+            raise RuntimeError(
+                f"{self._label} observation unavailable; retry retained handle {handle}"
+            )
         raise RuntimeError(
-            "GZ-A3 profiling failed: "
+            f"{self._label} profiling failed: "
             + (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
         )
 
@@ -249,19 +264,19 @@ class GZA3ProfilingBackend:
             name: self._one_marker(completed.stdout, prefix, name)
             for name, prefix in _STATE_MARKERS.items()
         }
-        if values["profile"] != "gz-a3":
-            raise RuntimeError("GZ-A3 profiling provenance is foreign")
+        if values["profile"] != self._profile:
+            raise RuntimeError(f"{self._label} profiling provenance is foreign")
         if values["state"] != "completed" or values["exit"] != "0":
-            raise RuntimeError("GZ-A3 profiling returned a failed terminal state")
-        if not values["handle"].startswith("gz-a3:"):
-            raise RuntimeError("GZ-A3 profiling returned an invalid handle")
+            raise RuntimeError(f"{self._label} profiling returned a failed terminal state")
+        if not values["handle"].startswith(self._profile + ":"):
+            raise RuntimeError(f"{self._label} profiling returned an invalid handle")
         meta = self._one_json_marker(completed.stdout, _MARKER_META, "profile metadata")
         expected = {
             "language": "ascend-c", "logical_device": 0, "mode": mode,
             "runtime": "native-ascend-c", "target": "Ascend910B4",
         }
         if any(meta.get(key) != value for key, value in expected.items()):
-            raise RuntimeError("GZ-A3 profiling metadata has foreign provenance")
+            raise RuntimeError(f"{self._label} profiling metadata has foreign provenance")
         remote = meta.get("remote_report")
         if mode == "timing" and remote is not None:
             raise RuntimeError("timing evidence cannot claim an msprof report")
@@ -275,7 +290,7 @@ class GZA3ProfilingBackend:
     def _one_marker(stdout: str, prefix: str, label: str) -> str:
         values = [line.removeprefix(prefix) for line in stdout.splitlines() if line.startswith(prefix)]
         if len(values) != 1:
-            raise RuntimeError(f"GZ-A3 output requires one {label} marker")
+            raise RuntimeError(f"A3 output requires one {label} marker")
         return values[0]
 
     @classmethod
@@ -300,6 +315,10 @@ class GZA3ProfilingBackend:
             hashlib.sha256(completed.stderr.encode()).hexdigest(),
         )
 
+    @staticmethod
+    def _evidence_from_dict(value: dict[str, object]) -> GZA3RunEvidence:
+        return GZA3RunEvidence(**value)
+
     def _record_path(self, replay: str) -> Path:
         self._validate_replay(replay)
         return self._evidence_root / replay / "record.json"
@@ -317,14 +336,14 @@ class GZA3ProfilingBackend:
         try:
             value = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError("retained GZ-A3 pending replay is corrupt") from exc
+            raise RuntimeError(f"retained {self._label} pending replay is corrupt") from exc
         if (
             type(value) is not dict
             or set(value) != {"request_id", "mode", "handle"}
             or type(value.get("handle")) is not str
-            or not value["handle"].startswith("gz-a3:")
+            or not value["handle"].startswith(self._profile + ":")
         ):
-            raise RuntimeError("retained GZ-A3 pending replay is corrupt")
+            raise RuntimeError(f"retained {self._label} pending replay is corrupt")
         if value["request_id"] != request_id or value["mode"] != mode:
             raise ValueError("conflicting pending replay request")
         return value
@@ -362,18 +381,18 @@ class GZA3ProfilingBackend:
         try:
             value = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError("retained GZ-A3 replay is corrupt") from exc
+            raise RuntimeError(f"retained {self._label} replay is corrupt") from exc
         if (
             type(value) is not dict
             or set(value) != {"request_id", "mode", "result", "evidence"}
             or type(value["result"]) is not dict
             or type(value["evidence"]) is not dict
         ):
-            raise RuntimeError("retained GZ-A3 replay is corrupt")
+            raise RuntimeError(f"retained {self._label} replay is corrupt")
         if value.get("request_id") != request_id or value.get("mode") != mode:
             raise ValueError("conflicting replay request")
         try:
-            evidence = GZA3RunEvidence(**value["evidence"])
+            evidence = self._evidence_from_dict(value["evidence"])
         except (TypeError, ValueError) as exc:
             raise RuntimeError("retained GZ-A3 replay evidence is corrupt") from exc
         digest_ok = all(
@@ -386,14 +405,14 @@ class GZA3ProfilingBackend:
             or evidence.mode != mode
             or evidence.status != "completed"
             or type(evidence.handle) is not str
-            or not evidence.handle.startswith("gz-a3:")
+            or not evidence.handle.startswith(self._profile + ":")
             or type(evidence.physical_device) is not int
             or evidence.physical_device != self._device
             or type(evidence.logical_device) is not int
             or evidence.logical_device != 0
             or not digest_ok
         ):
-            raise RuntimeError("retained GZ-A3 replay evidence identity is invalid")
+            raise RuntimeError(f"retained {self._label} replay evidence identity is invalid")
         return value
 
     def _publish(
@@ -426,11 +445,10 @@ class GZA3ProfilingBackend:
     @staticmethod
     def _validate_replay(value: str) -> None:
         if type(value) is not str or _SAFE_REPLAY.fullmatch(value) is None:
-            raise ValueError("unsafe GZ-A3 replay id")
+            raise ValueError("unsafe A3 replay id")
 
-    @staticmethod
     def _timing_from_dict(
-        value: dict, binding: CandidateBinding, dimensions: StudyDimensions
+        self, value: dict, binding: CandidateBinding, dimensions: StudyDimensions
     ) -> TimingResult:
         try:
             retained = dict(value)
@@ -438,7 +456,10 @@ class GZA3ProfilingBackend:
             retained["samples_us"] = tuple(retained["samples_us"])
             result = TimingResult(**retained)
             expected = replace(
-                TimingResult.from_samples(binding, dimensions, result.samples_us),
+                TimingResult.from_samples(
+                    binding, dimensions, result.samples_us,
+                    execution_profile=self._profile,
+                ),
                 dimensions=dimensions,
             )
         except (KeyError, TypeError, ValueError) as exc:

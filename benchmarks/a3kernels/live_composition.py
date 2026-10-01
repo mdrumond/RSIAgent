@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -23,9 +23,11 @@ from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
 from benchmarks.a3kernels.project_execution import (
     PerformancePreset, ProjectRuntimePolicy, RecoveryEvidence,
 )
-from benchmarks.a3kernels.profiling import A3ProfilingSession, CompactProfileResult, TimingResult
+from benchmarks.a3kernels.profiling import CompactProfileResult, TimingResult
 from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
+from benchmarks.a3kernels.profiling_bz import BZA3ProfilingBackend
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
+from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
 from benchmarks.a3kernels.trial import A3TrialLoop
 
 
@@ -279,7 +281,9 @@ def model_actor_factory(
 class RemoteCandidateBundle:
     """Expose separate trial actions over one managed compile+verify operation."""
 
-    def __init__(self, backend: GZA3RemoteCandidateBackend) -> None:
+    def __init__(
+        self, backend: GZA3RemoteCandidateBackend | BZA3RemoteCandidateBackend
+    ) -> None:
         self.backend = backend
         self.planner = A3CandidateBackend(lambda *args, **kwargs: None)
         self.results: dict[str, VerifiedResult | FailedEvidence] = {}
@@ -338,7 +342,7 @@ class _LazyGZProfiler:
             physical_device=self.physical_device,
             verified_results=self.candidate.verified,
         )
-        return A3ProfilingSession(profiler=backend.profile).profile(request)
+        return backend.profile(request)
 
     def time(self, binding, dimensions):
         remote = self.candidate.backend
@@ -356,7 +360,48 @@ class _LazyGZProfiler:
             physical_device=self.physical_device,
             verified_results=self.candidate.verified,
         )
-        return A3ProfilingSession(timing=backend.time).time(binding, dimensions)
+        return backend.time(binding, dimensions)
+
+
+class _LazyBZProfiler:
+    """Bind profiling to the exact candidate directory and selected BZ profile."""
+
+    def __init__(
+        self, *, config: Phase1Config, paths: CellPaths,
+        candidate: _RecordingCandidate, profile: str, physical_device: int,
+    ) -> None:
+        self.config, self.paths = config, paths
+        self.candidate = candidate
+        self.profile_name, self.physical_device = profile, physical_device
+
+    def _backend(self, execution_id: str) -> BZA3ProfilingBackend:
+        remote = self.candidate.backend
+        if isinstance(remote, _RecoveryCandidate):
+            remote = remote.backend
+        if not isinstance(remote, RemoteCandidateBundle) or not isinstance(
+            remote.backend, BZA3RemoteCandidateBackend
+        ):
+            raise TypeError("BZ profiler requires the managed BZ candidate backend")
+        plan = remote.plans.get(execution_id)
+        if plan is None:
+            raise ValueError("profiling candidate has no retained remote directory")
+        return BZA3ProfilingBackend(
+            validation_wrapper=str(self.config.validation_wrapper),
+            profile=self.profile_name,
+            remote_candidate_directory=(
+                remote.backend.remote_candidate_directory(plan).as_posix()
+            ),
+            evidence_directory=self.paths.root / "profiles",
+            physical_device=self.physical_device,
+            verified_results=self.candidate.verified,
+        )
+
+    def profile(self, request):
+        selected = replace(request, execution_profile=self.profile_name)
+        return self._backend(selected.binding.execution_id).profile(selected)
+
+    def time(self, binding, dimensions):
+        return self._backend(binding.execution_id).time(binding, dimensions)
 
 
 def managed_live_dependencies(
@@ -384,6 +429,48 @@ def managed_live_dependencies(
         return _LazyGZProfiler(
             config=config, paths=paths, candidate=candidate,
             physical_device=physical_device,
+        )
+
+    return LiveDependencies(
+        actor_factory=model_actor_factory(environ, transport),
+        candidate_factory=candidate_factory,
+        knowledge_factory=local_knowledge_factory(config),
+        profiler_factory=profiler_factory,
+    )
+
+
+def bz_live_dependencies(
+    config: Phase1Config, *, cpl_remote: str, profile: str,
+    remote_workspace: str, physical_device: int,
+    environ: Mapping[str, str], transport=None,
+) -> LiveDependencies:
+    """Compose the user-wide transport, BZ candidate, and raw profiler."""
+    remote_path = Path(cpl_remote)
+    if (
+        not remote_path.is_file()
+        or not os.access(remote_path, os.X_OK)
+        or remote_path.name != "cpl-remote"
+    ):
+        raise ValueError("cpl_remote must be the user-wide executable cpl-remote")
+    if profile not in {"bz-a3-1", "bz-a3-2"}:
+        raise ValueError("profile must be bz-a3-1 or bz-a3-2")
+
+    def candidate_factory(_cell, proposal, paths):
+        return RemoteCandidateBundle(BZA3RemoteCandidateBackend(
+            cpl_remote=cpl_remote,
+            validation_wrapper=str(config.validation_wrapper),
+            profile=profile,
+            remote_workspace=remote_workspace,
+            physical_device=physical_device,
+            state_directory=(
+                paths.root / "remote-candidate-state" / proposal.project_id
+            ),
+        ))
+
+    def profiler_factory(_cell, _proposal, paths, candidate):
+        return _LazyBZProfiler(
+            config=config, paths=paths, candidate=candidate,
+            profile=profile, physical_device=physical_device,
         )
 
     return LiveDependencies(
@@ -422,5 +509,6 @@ def local_knowledge_factory(
 
 __all__ = [
     "AuthoritativeResultStore", "LiveComposition", "LiveDependencies", "RemoteCandidateBundle",
-    "local_knowledge_factory", "managed_live_dependencies", "model_actor_factory",
+    "bz_live_dependencies", "local_knowledge_factory", "managed_live_dependencies",
+    "model_actor_factory",
 ]

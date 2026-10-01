@@ -15,6 +15,7 @@ from benchmarks.a3kernels.phase1_evidence import canonical_digest
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REPLAY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _TIMING = re.compile(r"^A3TIMING_US=(.+)$")
+_EXECUTION_PROFILES = frozenset(("gz-a3", "bz-a3-1", "bz-a3-2"))
 
 
 def _digest(value: object, label: str) -> None:
@@ -103,10 +104,10 @@ class ProfileRequest:
         if (
             self.target != "Ascend910B4"
             or self.language != "ascend-c"
-            or self.execution_profile != "gz-a3"
+            or self.execution_profile not in _EXECUTION_PROFILES
             or self.runtime != "native-ascend-c"
         ):
-            raise ValueError("A3 profiling identity must use native Ascend C on gz-a3")
+            raise ValueError("A3 profiling identity must use a registered native Ascend C profile")
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -167,6 +168,8 @@ class TimingResult:
         binding: CandidateBinding,
         dimensions: StudyDimensions,
         samples: tuple[float, ...],
+        *,
+        execution_profile: str = "gz-a3",
     ) -> "TimingResult":
         if not samples or any(
             type(value) not in (int, float) or not math.isfinite(value) or value <= 0
@@ -175,7 +178,9 @@ class TimingResult:
             raise ValueError("timing samples must be finite and positive")
         values = tuple(float(value) for value in samples)
         body = {
-            "request_id": timing_request_id(binding, dimensions),
+            "request_id": timing_request_id(
+                binding, dimensions, execution_profile=execution_profile
+            ),
             "candidate_execution_id": binding.execution_id,
             "source_fingerprint": binding.source_fingerprint,
             "dimensions": dimensions.as_dict(),
@@ -189,8 +194,13 @@ class TimingResult:
 
 
 def timing_request_id(
-    binding: CandidateBinding, dimensions: StudyDimensions
+    binding: CandidateBinding,
+    dimensions: StudyDimensions,
+    *,
+    execution_profile: str = "gz-a3",
 ) -> str:
+    if execution_profile not in _EXECUTION_PROFILES:
+        raise ValueError("timing requires a registered A3 execution profile")
     return canonical_digest(
         {
             "kind": "a3-timing",
@@ -198,7 +208,7 @@ def timing_request_id(
             "dimensions": dimensions.as_dict(),
             "target": "Ascend910B4",
             "language": "ascend-c",
-            "execution_profile": "gz-a3",
+            "execution_profile": execution_profile,
             "runtime": "native-ascend-c",
         }
     )
