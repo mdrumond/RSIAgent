@@ -147,9 +147,7 @@ class GZA3RemoteCandidateBackend:
             try:
                 self._require_listener()
                 bundle = self.build_bundle(plan, local_directory / f"{plan.execution_id}.tar")
-                remote_archive = (
-                    self._workspace / ".rsi-a3" / "uploads" / f"{plan.execution_id}.tar"
-                )
+                remote_archive = self._remote_archive_destination(plan)
                 remote_directory = self.remote_candidate_directory(plan)
                 transfer_id = self._upload(bundle.path, remote_archive)
                 self._poll_transfer(transfer_id)
@@ -249,6 +247,9 @@ class GZA3RemoteCandidateBackend:
         if not isinstance(plan, ExecutionPlan):
             raise TypeError("plan must be an A3 ExecutionPlan")
         return self._workspace / ".rsi-a3" / "candidates" / plan.execution_id
+
+    def _remote_archive_destination(self, plan: ExecutionPlan) -> PurePosixPath:
+        return self._workspace / ".rsi-a3" / "uploads" / f"{plan.execution_id}.tar"
 
     @staticmethod
     def _require_execution_profile(plan: ExecutionPlan) -> None:

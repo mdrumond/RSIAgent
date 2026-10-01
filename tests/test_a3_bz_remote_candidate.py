@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 
 import pytest
@@ -98,7 +98,9 @@ def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path, monkeypat
     assert upload[:3] == (
         "/skills/remote-access/scripts/cpl-remote", "upload", "bz-a3-1",
     )
-    assert upload[-1].startswith("/home/research/.rsi-a3/uploads/")
+    remote_archive = PurePosixPath(upload[-1])
+    assert remote_archive.parent == PurePosixPath("/home/research")
+    assert remote_archive.name == f".rsi-a3-candidate-{plan.execution_id}.tar"
     compile_argv, execute_argv = calls[1][0], calls[2][0]
     wrapper_env = {
         "PATH": os.environ["PATH"],
