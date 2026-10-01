@@ -141,7 +141,7 @@ class GZA3ProfilingBackend:
         if retained is not None:
             return self._profile_from_dict(retained["result"], request)
         extra = (
-            "--metric", request.metric.value,
+            "--metric", self._remote_metric(request.metric),
             "--kernel", request.expected_kernel,
         )
         argv = self._wrapper_argv(
@@ -165,6 +165,10 @@ class GZA3ProfilingBackend:
         )
         self._publish(replay, request.request_id, "profile", asdict(result), evidence)
         return result
+
+    @staticmethod
+    def _remote_metric(metric: ProfileMetric) -> str:
+        return metric.value
 
     def evidence(self, replay_id: str) -> GZA3RunEvidence:
         path = self._record_path(replay_id)

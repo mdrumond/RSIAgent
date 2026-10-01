@@ -197,7 +197,9 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 3)
 
 
-@pytest.mark.parametrize("metric", ["Basic", "PipeUtilization"])
+@pytest.mark.parametrize(
+    "metric", ["Basic", "ArithmeticUtilization", "PipeUtilization"]
+)
 def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
     _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
