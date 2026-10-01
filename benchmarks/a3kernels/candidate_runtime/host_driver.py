@@ -131,29 +131,32 @@ def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int
         torch.npu.synchronize()
         return result
 
-    output = None
     for _ in range(runtime.warm_up):
-        output = launch()
+        launch()
     samples = []
+    outputs = []
     for _ in range(runtime.launch_count):
         start = clock_ns() if runtime.mode == "benchmark" else None
-        output = launch()
+        outputs.append(launch())
         if start is not None:
             elapsed = (clock_ns() - start) / 1000.0
             if not math.isfinite(elapsed) or elapsed <= 0:
                 raise RuntimeError("timing clock returned a non-positive sample")
             samples.append(elapsed)
-    values = output.cpu().tolist()
     expected = [a + b for a, b in zip(a_values, b_values)][:logical]
-    if (
-        not isinstance(values, list) or len(values) != len(expected)
-        or any(not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
-               for value, want in zip(values, expected))
-    ):
-        raise RuntimeError("candidate output failed padded host verification")
+    measured_values = []
+    for output in outputs:
+        values = output.cpu().tolist()
+        if (
+            not isinstance(values, list) or len(values) != len(expected)
+            or any(not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
+                   for value, want in zip(values, expected))
+        ):
+            raise RuntimeError("candidate output failed host verification")
+        measured_values.append(values)
     for sample in samples:
         print(f"A3INNER_TIMING_US={sample:.6f}")
-    print("A3KERNEL_OUTPUT=" + json.dumps(values, separators=(",", ":")))
+    print("A3KERNEL_OUTPUT=" + json.dumps(measured_values[-1], separators=(",", ":")))
     return 0
 
 

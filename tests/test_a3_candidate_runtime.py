@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
@@ -182,14 +183,35 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
 
     output = capsys.readouterr().out
     assert result == 0 and len(calls) == 1
-    assert calls[0][0][-8:] == (
+    input_name = calls[0][0][-1]
+    assert calls[0][0][-8:-1] == (
         "host_driver.py", "--mode", "benchmark", "--warm-up", "1",
-        "--launch-count", "2", ".a3-profile-input.json",
+        "--launch-count", "2",
     )
+    assert input_name.startswith(".a3-profile-input-") and input_name.endswith(".json")
     assert "A3TIMING_US=2.000000" in output
     assert "A3TIMING_US=4.000000" in output
-    staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
+    staged = json.loads((tmp_path / input_name).read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 3)
+
+
+def test_concurrent_profile_inputs_are_immutable_and_request_bound(tmp_path):
+    _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
+    requests = [
+        a3_profile_driver._parser().parse_args(
+            ["timing", *_driver_args(tmp_path, block_count=block_count)]
+        )
+        for block_count in (2, 3)
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        staged = list(pool.map(a3_profile_driver._validate, requests))
+
+    names = [name for _root, name in staged]
+    assert len(set(names)) == 2
+    assert [
+        json.loads((tmp_path / name).read_text())["block_count"] for name in names
+    ] == [2, 3]
 
 
 @pytest.mark.parametrize(
@@ -208,6 +230,10 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
             (report / "op_summary_0.csv").write_text(
                 "Op Name,Duration(us),Raw Counter\nvector_add,12.5,7\n"
             )
+            if metric != "Basic":
+                (report / f"{metric}.csv").write_text(
+                    "Block,Utilization\n0,0.5\n"
+                )
             return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
 
@@ -224,28 +250,74 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
                            if line.startswith("A3PROFILE_META=")))
     assert compact["exported_kernels"] == ["vector_add"]
     table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
-    assert compact["metric_values"] == [[f"{table}:Raw Counter:0", 7.0]]
+    assert [f"{table}:Raw Counter:0", 7.0] in compact["metric_values"]
+    if metric != "Basic":
+        metric_table = f"PROF_1/mindstudio_profiler_output/{metric}.csv"
+        assert [f"{metric_table}:Utilization:0", 0.5] in compact["metric_values"]
     assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
-    assert compact["selected_columns"] == [
+    assert {
         f"{table}:Duration(us)", f"{table}:Op Name", f"{table}:Raw Counter"
-    ]
+    }.issubset(compact["selected_columns"])
     assert len(compact["report_sha256"]) == 64
     assert Path(meta["remote_report"]).is_dir()
     profile = next(call for call in calls if call[0] == "msprof")
     host_calls = [call for call in calls if call[0] != "msprof"]
     assert len(host_calls) == 1
-    assert host_calls[0][-8:] == (
+    input_name = host_calls[0][-1]
+    assert host_calls[0][-8:-1] == (
         "host_driver.py", "--mode", "replay", "--warm-up", "0",
-        "--launch-count", "1", ".a3-profile-input.json",
+        "--launch-count", "1",
     )
     assert f"--aic-metrics={metric}" in profile
     assert profile[3:] == (
         str(Path(sys.executable)), str((tmp_path / "host_driver.py").resolve()),
         "--mode", "replay", "--warm-up", "0", "--launch-count", "1",
-        ".a3-profile-input.json",
+        input_name,
     )
-    staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
+    staged = json.loads((tmp_path / input_name).read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)
+
+
+def test_compact_profile_filters_helper_kernel_rows(tmp_path, capsys):
+    _candidate_directory(tmp_path, length=4, block_count=1)
+
+    def process(argv, **_kwargs):
+        if argv[0] == "msprof":
+            output = Path(next(item.split("=", 1)[1] for item in argv if item.startswith("--output=")))
+            report = output / "PROF_1" / "mindstudio_profiler_output"
+            report.mkdir(parents=True)
+            (report / "op_summary_0.csv").write_text(
+                "Op Name,Duration(us),Raw Counter\n"
+                "vector_add,12.5,7\n"
+                "helper_copy,999,888\n"
+            )
+            (report / "PipeUtilization.csv").write_text(
+                "Block,Vector Ratio\n0,0.75\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
+
+    assert a3_profile_driver.main(
+        [
+            "profile", *_driver_args(tmp_path), "--metric", "PipeUtilization",
+            "--kernel", "vector_add",
+        ],
+        process_runner=process,
+        report_directory_factory=lambda root, _metric: root / "mixed-report",
+    ) == 0
+
+    output = capsys.readouterr().out
+    compact = json.loads(next(
+        line.split("=", 1)[1] for line in output.splitlines()
+        if line.startswith("A3PROFILE_COMPACT=")
+    ))
+    table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
+    assert compact["exported_kernels"] == ["helper_copy", "vector_add"]
+    assert [f"{table}:Raw Counter:0", 7.0] in compact["metric_values"]
+    pipe = "PROF_1/mindstudio_profiler_output/PipeUtilization.csv"
+    assert [f"{pipe}:Vector Ratio:0", 0.75] in compact["metric_values"]
+    assert not any(item[1] == 888.0 for item in compact["metric_values"])
+    assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
 
 
 def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):
@@ -617,6 +689,43 @@ def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tm
     assert "A3INNER_TIMING_US=2.000000" in output
     assert "A3INNER_TIMING_US=4.000000" in output
     assert output.endswith("A3KERNEL_OUTPUT=[3.0,3.0,3.0,3.0]\n")
+
+
+def test_fixed_driver_verifies_every_measured_launch(monkeypatch, tmp_path):
+    class Tensor:
+        def __init__(self, values): self.values = values
+        def cpu(self): return self
+        def tolist(self): return self.values
+
+    measured = iter(([99.0] * 4, [3.0] * 4))
+    torch = type("Torch", (), {})()
+    torch.float32 = object()
+    torch.tensor = lambda values, **_kwargs: Tensor(values)
+    torch.npu = type("Npu", (), {
+        "set_device": lambda _self, _value: None,
+        "synchronize": lambda _self: None,
+    })()
+    torch.ops = type("Ops", (), {
+        "load_library": lambda _self, _path: None,
+        "rsi_a3candidates": type("Candidate", (), {
+            "vector_add": lambda _self, _a, _b, _logical, _padded, _blocks: Tensor(
+                next(measured)
+            ),
+        })(),
+    })()
+    monkeypatch.setitem(__import__("sys").modules, "torch", torch)
+    monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("N", (), {})())
+    monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
+    (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
+    (tmp_path / "a3_candidate.so").write_bytes(b"library")
+    _candidate_directory(tmp_path, length=4, block_count=1)
+    ticks = iter((0, 1000, 2000, 3000))
+
+    with pytest.raises(RuntimeError, match="host verification"):
+        host_driver.main(
+            ["--mode", "benchmark", "--launch-count", "2", "input.json"],
+            clock_ns=lambda: next(ticks),
+        )
 
 
 def test_fixed_wrapper_launches_the_requested_block_count():

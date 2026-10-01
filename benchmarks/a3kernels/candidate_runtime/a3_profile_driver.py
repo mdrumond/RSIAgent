@@ -64,10 +64,25 @@ def _validate(args: argparse.Namespace) -> tuple[Path, str]:
     ):
         raise ValueError("staged input dimensions do not match --length")
     payload["block_count"] = args.block_count
-    profile_input = ".a3-profile-input.json"
-    (root / profile_input).write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")), encoding="utf-8"
-    )
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    digest = hashlib.sha256(data.encode()).hexdigest()
+    profile_input = f".a3-profile-input-{digest}.json"
+    destination = root / profile_input
+    with tempfile.NamedTemporaryFile(
+        "w", dir=root, prefix=".a3-profile-input-", suffix=".tmp", delete=False,
+        encoding="utf-8",
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.link(temporary, destination)
+    except FileExistsError:
+        if destination.read_text(encoding="utf-8") != data:
+            raise RuntimeError("profile input digest conflicts with retained content") from None
+    finally:
+        temporary.unlink(missing_ok=True)
     return root, profile_input
 
 
@@ -125,24 +140,45 @@ def _report_digest(root: Path) -> str:
 
 
 def _raw_rows(
-    root: Path, metric: str
+    root: Path, metric: str, expected_kernel: str
 ) -> tuple[list[str], list[list[object]], list[list[object]], list[str]]:
     kernels: set[str] = set()
     values: list[list[object]] = []
     timeline: list[list[object]] = []
     selected_columns: set[str] = set()
+    metric_tables = 0
+    normalized_metric = "".join(character.lower() for character in metric if character.isalnum())
     for path in sorted(root.rglob("*.csv")):
         relative = path.relative_to(root).as_posix()
         with path.open(newline="", encoding="utf-8-sig") as stream:
             reader = csv.DictReader(stream)
             columns = tuple(reader.fieldnames or ())
-            if not any(column.strip().lower() in _KERNEL_COLUMNS for column in columns):
+            kernel_columns = tuple(
+                column for column in columns
+                if column.strip().lower() in _KERNEL_COLUMNS
+            )
+            is_metric_table = (
+                not kernel_columns
+                and normalized_metric in "".join(
+                    character.lower() for character in relative if character.isalnum()
+                )
+            )
+            if not kernel_columns and not is_metric_table:
                 continue
-            selected_columns.update(f"{relative}:{column}" for column in columns)
+            if is_metric_table:
+                metric_tables += 1
             for row_number, row in enumerate(reader):
+                row_kernels = {
+                    row[column].strip() for column in kernel_columns
+                    if row.get(column) and row[column].strip()
+                }
+                kernels.update(row_kernels)
+                if kernel_columns and expected_kernel not in row_kernels:
+                    continue
+                selected_columns.update(f"{relative}:{column}" for column in columns)
                 for column, raw in row.items():
-                    if column.strip().lower() in _KERNEL_COLUMNS and raw:
-                        kernels.add(raw.strip())
+                    if column in kernel_columns:
+                        continue
                     try:
                         number = float(raw)
                     except (TypeError, ValueError):
@@ -152,10 +188,12 @@ def _raw_rows(
                     item = [f"{relative}:{column}:{row_number}", number]
                     (timeline if any(word in column.lower() for word in _TIMELINE_WORDS)
                      else values).append(item)
-    if not selected_columns:
+    if expected_kernel not in kernels:
         raise RuntimeError(
-            f"msprof report contains no kernel-schema CSV table for {metric}"
+            "msprof report does not bind the expected kernel"
         )
+    if metric != "Basic" and metric_tables == 0:
+        raise RuntimeError(f"msprof report contains no {metric} metric table")
     return sorted(kernels), values, timeline, sorted(selected_columns)
 
 
@@ -219,9 +257,9 @@ def main(
     completed = process_runner(command, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "msprof failed").strip())
-    kernels, values, timeline, selected_columns = _raw_rows(report, args.metric)
-    if args.kernel not in kernels:
-        raise RuntimeError("msprof raw table does not contain the expected kernel")
+    kernels, values, timeline, selected_columns = _raw_rows(
+        report, args.metric, args.kernel
+    )
     compact = {
         "exported_kernels": kernels, "metric_values": values, "timeline": timeline,
         "selected_columns": selected_columns,
