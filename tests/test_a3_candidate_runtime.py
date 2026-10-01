@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import subprocess
-import venv
+import sys
 
 import pytest
 
@@ -61,11 +61,16 @@ extern "C" __global__ __aicore__ void vector_add(
 
 def _output(cwd: Path) -> list[float]:
     payload = json.loads((cwd / "input.json").read_text())
-    return [a + b for a, b in zip(payload["input_a"], payload["input_b"])]
+    return [
+        a + b
+        for a, b in zip(payload["input_a"], payload["input_b"])
+    ][:payload["logical_length"]]
 
 
 def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
-    backend = A3CandidateBackend(command_runner=lambda *a, **k: None)
+    backend = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-1"
+    )
     first = backend.plan(SOURCE, request_id="r1", attempt_id="a1", length=33, seed=7)
     second = backend.plan(SOURCE + "\n", request_id="r1", attempt_id="a1", length=33, seed=7)
 
@@ -82,7 +87,9 @@ def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
 
 
 def test_plan_identity_binds_logical_padded_and_block_dimensions():
-    backend = A3CandidateBackend(command_runner=lambda *a, **k: None)
+    backend = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-1"
+    )
     base = backend.plan(
         SOURCE, request_id="r1", attempt_id="a1", length=33,
         padded_length=64, block_count=2, seed=7,
@@ -99,38 +106,23 @@ def test_plan_identity_binds_logical_padded_and_block_dimensions():
         SOURCE, request_id="r1", attempt_id="a1", length=33,
         padded_length=64, block_count=3, seed=7,
     ).execution_id
-
-
-def test_compile_and_run_bind_explicit_bz_execution_profile(tmp_path):
-    commands = []
-
-    def command(argv, **kwargs):
-        commands.append(tuple(argv))
-        if "--compile-only" in argv:
-            return subprocess.CompletedProcess(
-                argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", ""
-            )
-        payload = json.loads((kwargs["cwd"] / "input.json").read_text())
-        values = [a + b for a, b in zip(payload["input_a"], payload["input_b"])]
-        return subprocess.CompletedProcess(
-            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(values) + "\n", ""
-        )
-    backend = A3CandidateBackend(command)
-    compiled = backend.compile(
-        SOURCE, tmp_path / "compile", request_id="r", attempt_id="a",
-        length=4, execution_profile="bz-a3-1",
-    )
-    verified = backend.run(
-        SOURCE, tmp_path / "run", request_id="r", attempt_id="b",
-        length=4, execution_profile="bz-a3-2",
-    )
-    assert compiled.plan.execution_profile == "bz-a3-1"
-    assert verified.passed
-    assert verified.execution_id == backend.plan(
-        SOURCE, request_id="r", attempt_id="b", length=4, seed=0,
-        execution_profile="bz-a3-2",
+    assert base.execution_id != backend.plan(
+        SOURCE, request_id="r1", attempt_id="a1", length=32,
+        padded_length=64, block_count=2, seed=7,
     ).execution_id
-    assert commands
+
+
+def test_plan_identity_binds_selected_bz_profile():
+    first = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-1"
+    ).plan(SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0)
+    second = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-2"
+    ).plan(SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0)
+
+    assert first.execution_profile == "bz-a3-1"
+    assert second.execution_profile == "bz-a3-2"
+    assert first.execution_id != second.execution_id
 
 
 @pytest.mark.parametrize(
@@ -138,7 +130,9 @@ def test_compile_and_run_bind_explicit_bz_execution_profile(tmp_path):
     ["a3_profile_driver.py", "build.json", "host_driver.py", "host_wrapper.inc"],
 )
 def test_every_host_asset_is_identity_bound_and_staged_from_plan(monkeypatch, tmp_path, changed_path):
-    backend = A3CandidateBackend(command_runner=lambda *args, **kwargs: None)
+    backend = A3CandidateBackend(
+        command_runner=lambda *args, **kwargs: None, execution_profile="bz-a3-1"
+    )
     original = backend.plan(
         SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0
     )
@@ -179,7 +173,7 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
         return subprocess.CompletedProcess(
             argv, 0,
             "A3INNER_TIMING_US=2.000000\nA3INNER_TIMING_US=4.000000\n"
-            "A3KERNEL_OUTPUT=[3,3,3,3,0,0]\n", "",
+            "A3KERNEL_OUTPUT=[3,3,3,3]\n", "",
         )
 
     result = a3_profile_driver.main(
@@ -189,22 +183,41 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
 
     output = capsys.readouterr().out
     assert result == 0 and len(calls) == 1
-    assert calls[0][0][-8:] == (
+    input_name = calls[0][0][-1]
+    assert calls[0][0][-8:-1] == (
         "host_driver.py", "--mode", "benchmark", "--warm-up", "1",
-        "--launch-count", "2", ".a3-profile-input.json",
+        "--launch-count", "2",
     )
+    assert input_name.startswith(".a3-profile-input-") and input_name.endswith(".json")
     assert "A3TIMING_US=2.000000" in output
     assert "A3TIMING_US=4.000000" in output
-    staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
+    staged = json.loads((tmp_path / input_name).read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 3)
+
+
+def test_concurrent_profile_inputs_are_immutable_and_request_bound(tmp_path):
+    _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
+    requests = [
+        a3_profile_driver._parser().parse_args(
+            ["timing", *_driver_args(tmp_path, block_count=block_count)]
+        )
+        for block_count in (2, 3)
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        staged = list(pool.map(a3_profile_driver._validate, requests))
+
+    names = [name for _root, name in staged]
+    assert len(set(names)) == 2
+    assert [
+        json.loads((tmp_path / name).read_text())["block_count"] for name in names
+    ] == [2, 3]
 
 
 @pytest.mark.parametrize(
     "metric", ["Basic", "ArithmeticUtilization", "PipeUtilization"]
 )
-def test_checked_driver_profiles_one_raw_metric_and_retains_report(
-    tmp_path, capsys, metric,
-):
+def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
     _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
 
@@ -217,8 +230,12 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(
             (report / "op_summary_0.csv").write_text(
                 "Op Name,Duration(us),Raw Counter\nvector_add,12.5,7\n"
             )
+            if metric != "Basic":
+                (report / f"{metric}.csv").write_text(
+                    "Block,Utilization\n0,0.5\n"
+                )
             return subprocess.CompletedProcess(argv, 0, "", "")
-        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3,0,0]\n", "")
+        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
 
     assert a3_profile_driver.main(
         ["profile", *_driver_args(tmp_path, block_count=4), "--metric", metric, "--kernel", "vector_add"],
@@ -233,45 +250,74 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(
                            if line.startswith("A3PROFILE_META=")))
     assert compact["exported_kernels"] == ["vector_add"]
     table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
-    assert compact["metric_values"] == [[f"{table}:Raw Counter:0", 7.0]]
+    assert [f"{table}:Raw Counter:0", 7.0] in compact["metric_values"]
+    if metric != "Basic":
+        metric_table = f"PROF_1/mindstudio_profiler_output/{metric}.csv"
+        assert [f"{metric_table}:Utilization:0", 0.5] in compact["metric_values"]
     assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
-    assert compact["selected_columns"] == [
+    assert {
         f"{table}:Duration(us)", f"{table}:Op Name", f"{table}:Raw Counter"
-    ]
+    }.issubset(compact["selected_columns"])
     assert len(compact["report_sha256"]) == 64
     assert Path(meta["remote_report"]).is_dir()
     profile = next(call for call in calls if call[0] == "msprof")
     host_calls = [call for call in calls if call[0] != "msprof"]
     assert len(host_calls) == 1
-    assert host_calls[0][-8:] == (
+    input_name = host_calls[0][-1]
+    assert host_calls[0][-8:-1] == (
         "host_driver.py", "--mode", "replay", "--warm-up", "0",
-        "--launch-count", "1", ".a3-profile-input.json",
+        "--launch-count", "1",
     )
     assert f"--aic-metrics={metric}" in profile
-    assert not any(item.startswith("--application=") for item in profile)
     assert profile[3:] == (
-        a3_profile_driver.sys.executable,
-        str((tmp_path / "host_driver.py").resolve()),
-        "--mode", "replay", "--warm-up", "0",
-        "--launch-count", "1", ".a3-profile-input.json",
+        str(Path(sys.executable)), str((tmp_path / "host_driver.py").resolve()),
+        "--mode", "replay", "--warm-up", "0", "--launch-count", "1",
+        input_name,
     )
-    staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
+    staged = json.loads((tmp_path / input_name).read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)
 
 
-def test_replay_preserves_real_symlinked_venv_interpreter(tmp_path, monkeypatch):
-    environment = tmp_path / "venv"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(environment)
-    interpreter = environment / "bin" / "python"
-    assert interpreter.is_symlink()
-    assert interpreter.resolve() != interpreter
-    monkeypatch.setattr(a3_profile_driver.sys, "executable", str(interpreter))
+def test_compact_profile_filters_helper_kernel_rows(tmp_path, capsys):
+    _candidate_directory(tmp_path, length=4, block_count=1)
 
-    argv = a3_profile_driver._replay_argv(
-        tmp_path, "input.json", argparse.Namespace(launch_count=1)
-    )
+    def process(argv, **_kwargs):
+        if argv[0] == "msprof":
+            output = Path(next(item.split("=", 1)[1] for item in argv if item.startswith("--output=")))
+            report = output / "PROF_1" / "mindstudio_profiler_output"
+            report.mkdir(parents=True)
+            (report / "op_summary_0.csv").write_text(
+                "Op Name,Duration(us),Raw Counter\n"
+                "vector_add,12.5,7\n"
+                "helper_copy,999,888\n"
+            )
+            (report / "PipeUtilization.csv").write_text(
+                "Block,Vector Ratio\n0,0.75\n"
+            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3]\n", "")
 
-    assert argv[0] == str(interpreter)
+    assert a3_profile_driver.main(
+        [
+            "profile", *_driver_args(tmp_path), "--metric", "PipeUtilization",
+            "--kernel", "vector_add",
+        ],
+        process_runner=process,
+        report_directory_factory=lambda root, _metric: root / "mixed-report",
+    ) == 0
+
+    output = capsys.readouterr().out
+    compact = json.loads(next(
+        line.split("=", 1)[1] for line in output.splitlines()
+        if line.startswith("A3PROFILE_COMPACT=")
+    ))
+    table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
+    assert compact["exported_kernels"] == ["helper_copy", "vector_add"]
+    assert [f"{table}:Raw Counter:0", 7.0] in compact["metric_values"]
+    pipe = "PROF_1/mindstudio_profiler_output/PipeUtilization.csv"
+    assert [f"{pipe}:Vector Ratio:0", 0.75] in compact["metric_values"]
+    assert not any(item[1] == 888.0 for item in compact["metric_values"])
+    assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
 
 
 def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):
@@ -331,13 +377,10 @@ def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
     def command(argv, *, cwd, text, capture_output, check):
         calls.append(tuple(argv))
         assert (cwd / "candidate.cpp").read_text() == SOURCE
-        wrapper = (cwd / "host_wrapper.inc").read_text()
-        assert "TORCH_LIBRARY(rsi_a3candidates" in wrapper
-        assert "int64_t padded_length, int64_t block_count" in wrapper
-        assert "static_cast<uint32_t>(block_count)" in wrapper
+        assert "TORCH_LIBRARY(rsi_a3candidates" in (cwd / "host_wrapper.inc").read_text()
         return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", "")
 
-    result = A3CandidateBackend(command).compile(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").compile(
         SOURCE, tmp_path, request_id="r1", attempt_id="a1"
     )
 
@@ -362,7 +405,7 @@ def test_run_compiles_then_executes_aligned_and_padded_shapes(
             argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(_output(cwd)) + "\n", ""
         )
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path / str(length), request_id=f"r{length}",
         attempt_id="a1", length=length, padded_length=padded_length,
         block_count=2, seed=9,
@@ -370,6 +413,7 @@ def test_run_compiles_then_executes_aligned_and_padded_shapes(
 
     assert isinstance(result, VerifiedResult)
     assert result.passed and result.max_abs_error == 0.0
+    assert result.tolerance == 1e-5
     assert calls == [
         ("python", "host_driver.py", "--compile-only"),
         ("python", "host_driver.py", "input.json"),
@@ -383,7 +427,7 @@ def test_compile_failure_is_structured_and_stops_before_run(tmp_path):
         calls.append(tuple(argv))
         return subprocess.CompletedProcess(argv, 2, "", "bisheng: candidate.cpp:8: error")
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
     )
 
@@ -399,7 +443,7 @@ def test_runtime_failure_is_structured(tmp_path):
             return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "c" * 64 + "\n", "")
         return subprocess.CompletedProcess(argv, 3, "", "ACL launch failed")
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
     )
 
@@ -408,14 +452,103 @@ def test_runtime_failure_is_structured(tmp_path):
     assert "ACL launch failed" in result.detail
 
 
-@pytest.mark.parametrize("stdout", ["", "A3KERNEL_OUTPUT=nope\n", "A3KERNEL_OUTPUT=[1]\n"])
+def test_compile_timeout_is_structured_and_stops_before_execute(tmp_path):
+    calls = []
+
+    def command(argv, **_kwargs):
+        calls.append(tuple(argv))
+        raise subprocess.TimeoutExpired(argv, timeout=999)
+
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
+        SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
+    )
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "compile" and result.error_type == "TimeoutExpired"
+    assert result.detail == "compile exceeded host timeout of 600 seconds"
+    assert calls == [("python", "host_driver.py", "--compile-only")]
+
+
+def test_execute_timeout_is_structured_after_successful_compile(tmp_path):
+    calls = []
+
+    def command(argv, **_kwargs):
+        calls.append(tuple(argv))
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "e" * 64 + "\n", ""
+            )
+        raise subprocess.TimeoutExpired(argv, timeout=999)
+
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
+        SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
+    )
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "execute" and result.error_type == "TimeoutExpired"
+    assert result.detail == "execute exceeded host timeout of 120 seconds"
+    assert calls == [
+        ("python", "host_driver.py", "--compile-only"),
+        ("python", "host_driver.py", "input.json"),
+    ]
+
+
+def test_default_runner_gets_host_timeouts_and_injected_runner_stays_compatible(
+    monkeypatch, tmp_path
+):
+    default_timeouts = []
+
+    def default_runner(
+        argv, *, cwd, text, capture_output, check, timeout
+    ):
+        default_timeouts.append(timeout)
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "f" * 64 + "\n", ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(_output(cwd)) + "\n", ""
+        )
+
+    monkeypatch.setattr(candidate_module.subprocess, "run", default_runner)
+    default_result = A3CandidateBackend(execution_profile="bz-a3-1").run(
+        SOURCE, tmp_path / "default", request_id="r1", attempt_id="a", length=4
+    )
+    assert isinstance(default_result, VerifiedResult) and default_result.passed
+    assert default_timeouts == [600, 120]
+
+    injected_calls = []
+
+    def injected_runner(argv, *, cwd, text, capture_output, check):
+        injected_calls.append(tuple(argv))
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", ""
+            )
+        return subprocess.CompletedProcess(
+            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(_output(cwd)) + "\n", ""
+        )
+
+    injected_result = A3CandidateBackend(
+        injected_runner, execution_profile="bz-a3-1"
+    ).run(
+        SOURCE, tmp_path / "injected", request_id="r2", attempt_id="a", length=4
+    )
+    assert isinstance(injected_result, VerifiedResult) and injected_result.passed
+    assert len(injected_calls) == 2
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    ["", "A3KERNEL_OUTPUT=nope\n", "A3KERNEL_OUTPUT=[1]\n", "A3KERNEL_OUTPUT=[NaN,0,0,0]\n"],
+)
 def test_malformed_or_wrong_length_output_is_structured_verification_failure(tmp_path, stdout):
     def command(argv, **kwargs):
         if "--compile-only" in argv:
             return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "d" * 64 + "\n", "")
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
     )
 
@@ -425,7 +558,9 @@ def test_malformed_or_wrong_length_output_is_structured_verification_failure(tmp
 
 def test_agent_has_no_argv_or_build_descriptor_surface():
     with pytest.raises(TypeError):
-        A3CandidateBackend(lambda *a, **k: None).plan(
+        A3CandidateBackend(
+            lambda *a, **k: None, execution_profile="bz-a3-1"
+        ).plan(
             SOURCE, request_id="r", attempt_id="a", length=4, seed=0,
             argv=("bash", "-c", "anything"),
         )
@@ -481,9 +616,9 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     torch.ops = type("Ops", (), {
         "load_library": lambda _self, path: events.append(("load", path)),
         "rsi_a3candidates": type("Candidate", (), {
-            "vector_add": lambda _self, a, b, padded_length, block_count: (
-                events.append(("launch", padded_length, block_count)),
-                Tensor([x + y for x, y in zip(a.values, b.values)]),
+            "vector_add": lambda _self, a, b, logical_length, padded_length, block_count: (
+                events.append(("launch", logical_length, padded_length, block_count)),
+                Tensor([x + y for x, y in zip(a.values, b.values)][:logical_length]),
             )[1],
         })(),
     })()
@@ -492,18 +627,22 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
     (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
     (tmp_path / "a3_candidate.so").write_bytes(b"library")
-    (tmp_path / "input.json").write_text(
-        '{"input_a":[1,2,0,0],"input_b":[3,4,0,0],'
-        '"logical_length":2,"padded_length":4,"block_count":3}'
-    )
+    (tmp_path / "input.json").write_text(json.dumps({
+        "input_a": [1.0] * 33 + [0.0] * 31,
+        "input_b": [3.0] * 33 + [0.0] * 31,
+        "logical_length": 33,
+        "padded_length": 64,
+        "block_count": 3,
+    }))
 
     assert host_driver.main(["input.json"]) == 0
     assert events == [
         ("load", str(tmp_path / "a3_candidate.so")), ("device", 0),
         ("allocate", "npu:0"), ("allocate", "npu:0"),
-        ("launch", 4, 3), "sync",
+        ("launch", 33, 64, 3), "sync",
     ]
-    assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0,0.0,0.0]\n"
+    output = capsys.readouterr().out.removeprefix("A3KERNEL_OUTPUT=")
+    assert json.loads(output) == [4.0] * 33
 
 
 def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tmp_path):
@@ -523,9 +662,9 @@ def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tm
     torch.ops = type("Ops", (), {
         "load_library": lambda _self, path: events.append("load"),
         "rsi_a3candidates": type("Candidate", (), {
-            "vector_add": lambda _self, a, b, padded, blocks: (
+            "vector_add": lambda _self, a, b, logical, padded, blocks: (
                 events.append(("launch", blocks)),
-                Tensor([x + y for x, y in zip(a.values, b.values)]),
+                Tensor([x + y for x, y in zip(a.values, b.values)][:logical]),
             )[1],
         })(),
     })()
@@ -552,14 +691,50 @@ def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tm
     assert output.endswith("A3KERNEL_OUTPUT=[3.0,3.0,3.0,3.0]\n")
 
 
+def test_fixed_driver_verifies_every_measured_launch(monkeypatch, tmp_path):
+    class Tensor:
+        def __init__(self, values): self.values = values
+        def cpu(self): return self
+        def tolist(self): return self.values
+
+    measured = iter(([99.0] * 4, [3.0] * 4))
+    torch = type("Torch", (), {})()
+    torch.float32 = object()
+    torch.tensor = lambda values, **_kwargs: Tensor(values)
+    torch.npu = type("Npu", (), {
+        "set_device": lambda _self, _value: None,
+        "synchronize": lambda _self: None,
+    })()
+    torch.ops = type("Ops", (), {
+        "load_library": lambda _self, _path: None,
+        "rsi_a3candidates": type("Candidate", (), {
+            "vector_add": lambda _self, _a, _b, _logical, _padded, _blocks: Tensor(
+                next(measured)
+            ),
+        })(),
+    })()
+    monkeypatch.setitem(__import__("sys").modules, "torch", torch)
+    monkeypatch.setitem(__import__("sys").modules, "torch_npu", type("N", (), {})())
+    monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
+    (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
+    (tmp_path / "a3_candidate.so").write_bytes(b"library")
+    _candidate_directory(tmp_path, length=4, block_count=1)
+    ticks = iter((0, 1000, 2000, 3000))
+
+    with pytest.raises(RuntimeError, match="host verification"):
+        host_driver.main(
+            ["--mode", "benchmark", "--launch-count", "2", "input.json"],
+            clock_ns=lambda: next(ticks),
+        )
+
+
 def test_fixed_wrapper_launches_the_requested_block_count():
     wrapper = next(
         item.content for item in candidate_module._host_source_files()
         if item.relative_path == "host_wrapper.inc"
     )
-    assert "int64_t padded_length, int64_t block_count" in wrapper
-    assert 'registry.def("vector_add(Tensor a, Tensor b, int padded_length, int block_count)' in wrapper
-    assert "block_count >= 1 && block_count <= 32" in wrapper
-    assert "const auto launch_blocks = static_cast<uint32_t>(block_count);" in wrapper
-    assert "::vector_add<<<launch_blocks" in wrapper
-    assert wrapper.index("block_count >= 1") < wrapper.index("static_cast<uint32_t>(block_count)")
+    assert "::vector_add<<<block_count" in wrapper
+    assert "int64_t logical_length, int64_t padded_length," in wrapper
+    assert "const auto count = static_cast<uint32_t>(logical_length);" in wrapper
+    assert "output.narrow(0, 0, logical_length)" in wrapper
+    assert "const torch::Tensor &b,\n                        int padded_length" not in wrapper

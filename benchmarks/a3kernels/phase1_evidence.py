@@ -15,6 +15,12 @@ from typing import Any, Iterable, Mapping
 
 
 GENESIS_HASH = "0" * 64
+A3_AUTHORITATIVE_EXECUTION_PROFILES = ("bz-a3-1", "bz-a3-2")
+A3_GZ_COMPATIBILITY_EXECUTION_PROFILE = "gz-a3"
+A3_EXECUTION_PROFILES = (
+    *A3_AUTHORITATIVE_EXECUTION_PROFILES,
+    A3_GZ_COMPATIBILITY_EXECUTION_PROFILE,
+)
 
 
 class EvidenceKind(str, Enum):
@@ -76,12 +82,12 @@ def _validate_a3_identity(payload: Mapping[str, Any]) -> None:
     for key, (expected, label) in checks.items():
         if key in payload and payload[key] != expected:
             raise ValueError(f"A3 evidence {label} must be {expected}")
-    profiles = frozenset(("gz-a3", "bz-a3-1", "bz-a3-2"))
-    if (
-        "execution_profile" in payload
-        and payload["execution_profile"] not in profiles
-    ):
-        raise ValueError("A3 evidence profile must be gz-a3, bz-a3-1, or bz-a3-2")
+    profile = payload.get("execution_profile")
+    if profile is not None and profile not in A3_EXECUTION_PROFILES:
+        raise ValueError(
+            "A3 evidence profile must be bz-a3-1, bz-a3-2, or "
+            "the gz-a3 compatibility profile"
+        )
     provenance = payload.get("runtime_provenance")
     if isinstance(provenance, Mapping):
         items = provenance.items()
@@ -96,9 +102,10 @@ def _validate_a3_identity(payload: Mapping[str, Any]) -> None:
     else:
         items = ()
     for key, value in items:
-        if key == "execution_profile" and value not in profiles:
+        if key == "execution_profile" and value not in A3_EXECUTION_PROFILES:
             raise ValueError(
-                "A3 evidence profile must be gz-a3, bz-a3-1, or bz-a3-2"
+                "A3 evidence profile must be bz-a3-1, bz-a3-2, or "
+                "the gz-a3 compatibility profile"
             )
         if key in checks and value != checks[key][0]:
             raise ValueError(f"A3 evidence {checks[key][1]} must be {checks[key][0]}")
@@ -185,6 +192,8 @@ class EvidenceLedger:
 
     @staticmethod
     def _decode(data: bytes) -> Iterable[EvidenceEntry]:
+        if data and not data.endswith(b"\n"):
+            raise ValueError("unterminated A3 evidence at final line")
         entries = []
         for line_number, line in enumerate(data.splitlines(), 1):
             try:

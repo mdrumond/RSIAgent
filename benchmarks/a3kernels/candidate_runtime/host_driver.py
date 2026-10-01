@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int
     input_path = Path(runtime.input)
     if not input_path.is_absolute():
         input_path = root / input_path
-    a_values, b_values, _logical, padded, blocks = _read_input(
+    a_values, b_values, logical, padded, blocks = _read_input(
         input_path, spec["max_elements"]
     )
     torch.ops.load_library(str(library))
@@ -125,33 +125,38 @@ def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int
     a = torch.tensor(a_values, dtype=torch.float32, device="npu:0")
     b = torch.tensor(b_values, dtype=torch.float32, device="npu:0")
     def launch():
-        result = torch.ops.rsi_a3candidates.vector_add(a, b, padded, blocks)
+        result = torch.ops.rsi_a3candidates.vector_add(
+            a, b, logical, padded, blocks
+        )
         torch.npu.synchronize()
         return result
 
-    output = None
     for _ in range(runtime.warm_up):
-        output = launch()
+        launch()
     samples = []
+    outputs = []
     for _ in range(runtime.launch_count):
         start = clock_ns() if runtime.mode == "benchmark" else None
-        output = launch()
+        outputs.append(launch())
         if start is not None:
             elapsed = (clock_ns() - start) / 1000.0
             if not math.isfinite(elapsed) or elapsed <= 0:
                 raise RuntimeError("timing clock returned a non-positive sample")
             samples.append(elapsed)
-    values = output.cpu().tolist()
-    expected = [a + b for a, b in zip(a_values, b_values)]
-    if (
-        not isinstance(values, list) or len(values) != len(expected)
-        or any(not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
-               for value, want in zip(values, expected))
-    ):
-        raise RuntimeError("candidate output failed padded host verification")
+    expected = [a + b for a, b in zip(a_values, b_values)][:logical]
+    measured_values = []
+    for output in outputs:
+        values = output.cpu().tolist()
+        if (
+            not isinstance(values, list) or len(values) != len(expected)
+            or any(not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
+                   for value, want in zip(values, expected))
+        ):
+            raise RuntimeError("candidate output failed host verification")
+        measured_values.append(values)
     for sample in samples:
         print(f"A3INNER_TIMING_US={sample:.6f}")
-    print("A3KERNEL_OUTPUT=" + json.dumps(values, separators=(",", ":")))
+    print("A3KERNEL_OUTPUT=" + json.dumps(measured_values[-1], separators=(",", ":")))
     return 0
 
 

@@ -39,6 +39,7 @@ destination=$2
 expected_archive=$3
 execution_id=$4
 source_fingerprint=$5
+expected_manifest=$6
 actual_archive=$(sha256sum "$archive" | cut -d ' ' -f 1)
 test "$actual_archive" = "$expected_archive"
 if test ! -d "$destination"; then
@@ -48,7 +49,7 @@ if test ! -d "$destination"; then
   tar -xf "$archive" -C "$temporary"
   mv "$temporary" "$destination"
 fi
-python -c 'import hashlib,json,os,sys; root=sys.argv[1]; p=json.load(open(os.path.join(root,"manifest.json"))); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]; assert all(hashlib.sha256(open(os.path.join(root,n),"rb").read()).hexdigest() == h for n,h in p["files"].items())' "$destination" "$execution_id" "$source_fingerprint"
+python -c 'import hashlib,json,os,sys; root=sys.argv[1]; raw=open(os.path.join(root,"manifest.json"),"rb").read(); assert hashlib.sha256(raw).hexdigest() == sys.argv[4]; p=json.loads(raw); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]; assert all(hashlib.sha256(open(os.path.join(root,n),"rb").read()).hexdigest() == h for n,h in p["files"].items())' "$destination" "$execution_id" "$source_fingerprint" "$expected_manifest"
 cd "$destination"
 printf 'A3REMOTE_STAGE=compile\n'
 python host_driver.py --compile-only
@@ -59,7 +60,8 @@ destination=$1
 execution_id=$2
 source_fingerprint=$3
 library_sha256=$4
-python -c 'import hashlib,json,os,sys; root=sys.argv[1]; p=json.load(open(os.path.join(root,"manifest.json"))); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]; assert all(hashlib.sha256(open(os.path.join(root,n),"rb").read()).hexdigest() == h for n,h in p["files"].items()); assert hashlib.sha256(open(os.path.join(root,"a3_candidate.so"),"rb").read()).hexdigest() == sys.argv[4]' "$destination" "$execution_id" "$source_fingerprint" "$library_sha256"
+expected_manifest=$5
+python -c 'import hashlib,json,os,sys; root=sys.argv[1]; raw=open(os.path.join(root,"manifest.json"),"rb").read(); assert hashlib.sha256(raw).hexdigest() == sys.argv[5]; p=json.loads(raw); assert p["execution_id"] == sys.argv[2]; assert p["source_fingerprint"] == sys.argv[3]; assert all(hashlib.sha256(open(os.path.join(root,n),"rb").read()).hexdigest() == h for n,h in p["files"].items()); assert hashlib.sha256(open(os.path.join(root,"a3_candidate.so"),"rb").read()).hexdigest() == sys.argv[4]' "$destination" "$execution_id" "$source_fingerprint" "$library_sha256" "$expected_manifest"
 cd "$destination"
 printf 'A3REMOTE_STAGE=execute\n'
 python host_driver.py input.json
@@ -103,8 +105,24 @@ class GZA3RemoteCandidateBackend:
         self._state_root = state_directory.resolve() if state_directory is not None else None
 
     def build_bundle(self, plan: ExecutionPlan, destination: Path) -> CandidateBundle:
-        if not isinstance(plan, ExecutionPlan):
-            raise TypeError("plan must be an A3 ExecutionPlan")
+        self._require_gz_plan(plan)
+        members = self._bundle_members(plan)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as stream, tarfile.open(fileobj=stream, mode="w") as archive:
+            for name, data in sorted(members.items()):
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mtime = info.uid = info.gid = 0
+                info.mode = 0o644
+                info.uname = info.gname = ""
+                archive.addfile(info, io.BytesIO(data))
+        return CandidateBundle(
+            destination, hashlib.sha256(destination.read_bytes()).hexdigest(),
+            plan.execution_id,
+        )
+
+    @staticmethod
+    def _bundle_members(plan: ExecutionPlan) -> dict[str, bytes]:
         input_value = {
             "input_a": plan.input_a, "input_b": plan.input_b,
             "logical_length": plan.logical_length, "padded_length": plan.padded_length,
@@ -124,23 +142,15 @@ class GZA3RemoteCandidateBackend:
         members["manifest.json"] = json.dumps(
             manifest, sort_keys=True, separators=(",", ":")
         ).encode()
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with destination.open("wb") as stream, tarfile.open(fileobj=stream, mode="w") as archive:
-            for name, data in sorted(members.items()):
-                info = tarfile.TarInfo(name)
-                info.size = len(data)
-                info.mtime = info.uid = info.gid = 0
-                info.mode = 0o644
-                info.uname = info.gname = ""
-                archive.addfile(info, io.BytesIO(data))
-        return CandidateBundle(
-            destination, hashlib.sha256(destination.read_bytes()).hexdigest(), plan.execution_id
-        )
+        return members
+
+    def _manifest_sha256(self, plan: ExecutionPlan) -> str:
+        return hashlib.sha256(self._bundle_members(plan)["manifest.json"]).hexdigest()
 
     def compile(
         self, plan: ExecutionPlan, local_directory: Path
     ) -> CandidateCompilation | FailedEvidence:
-        self._require_execution_profile(plan)
+        self._require_gz_plan(plan)
         self._bind_state_root(local_directory)
         pending = self._load_pending(plan, "compile")
         if pending is None:
@@ -196,7 +206,7 @@ class GZA3RemoteCandidateBackend:
         if not isinstance(compilation, CandidateCompilation):
             raise TypeError("execute requires a CandidateCompilation")
         plan = compilation.plan
-        self._require_execution_profile(plan)
+        self._require_gz_plan(plan)
         directory = self.remote_candidate_directory(plan)
         pending = self._load_pending(plan, "execute")
         argv = (
@@ -218,12 +228,18 @@ class GZA3RemoteCandidateBackend:
             )
         try:
             handle = self._validate_wrapper(completed.stdout)
-            output = self._parse_output(completed.stdout, plan.padded_length)
+            output = self._parse_output(completed.stdout, plan.logical_length)
         except ValueError as exc:
             return FailedEvidence.create(
                 plan, stage="verify", error_type="OutputError", detail=str(exc)
             )
-        expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
+        expected = tuple(
+            a + b
+            for a, b in zip(
+                plan.input_a[:plan.logical_length],
+                plan.input_b[:plan.logical_length],
+            )
+        )
         maximum = max(abs(got - want) for got, want in zip(output, expected))
         receipt = ExecutionReceipt(
             exit_code=0, output=output, stdout=completed.stdout,
@@ -244,19 +260,18 @@ class GZA3RemoteCandidateBackend:
     def remote_candidate_directory(self, plan: ExecutionPlan) -> PurePosixPath:
         """Return the retained directory consumed by the A3 profiling backend."""
 
-        if not isinstance(plan, ExecutionPlan):
-            raise TypeError("plan must be an A3 ExecutionPlan")
+        self._require_gz_plan(plan)
         return self._workspace / ".rsi-a3" / "candidates" / plan.execution_id
 
     def _remote_archive_destination(self, plan: ExecutionPlan) -> PurePosixPath:
         return self._workspace / ".rsi-a3" / "uploads" / f"{plan.execution_id}.tar"
 
     @staticmethod
-    def _require_execution_profile(plan: ExecutionPlan) -> None:
+    def _require_gz_plan(plan: ExecutionPlan) -> None:
         if not isinstance(plan, ExecutionPlan):
             raise TypeError("plan must be an A3 ExecutionPlan")
         if plan.execution_profile != "gz-a3":
-            raise ValueError("GZ-A3 backend requires a gz-a3 execution profile")
+            raise ValueError("GZ-A3 remote candidate requires a gz-a3 execution plan")
 
     def _bind_state_root(self, local_directory: Path) -> None:
         selected = (local_directory / ".a3-remote-state").resolve()
@@ -332,6 +347,15 @@ class GZA3RemoteCandidateBackend:
         states = self._markers(completed.stdout, "CATLASS_VALIDATION_STATE=")
         profiles = self._markers(completed.stdout, "CATLASS_VALIDATION_PROFILE=")
         if (
+            pending is not None
+            and states in (["completed"], ["failed"])
+            and handles != [pending["handle"]]
+        ):
+            raise _PendingObservation(
+                "remote candidate terminal result did not match retained handle; "
+                f"retry retained handle {pending['handle']}"
+            )
+        if (
             completed.returncode != 0 and profiles == ["gz-a3"]
             and states == ["observation-unavailable"] and len(handles) == 1
             and handles[0].startswith("gz-a3:")
@@ -342,8 +366,6 @@ class GZA3RemoteCandidateBackend:
             raise _PendingObservation(
                 f"remote candidate observation unavailable; retry retained handle {handles[0]}"
             )
-        if completed.returncode == 0 and pending is not None and handles != [pending["handle"]]:
-            raise RuntimeError("remote candidate observation returned a foreign handle")
         if completed.returncode != 0 and pending is not None and states != ["failed"]:
             raise _PendingObservation(
                 f"remote candidate observation incomplete; retry retained handle {pending['handle']}"
@@ -408,7 +430,7 @@ class GZA3RemoteCandidateBackend:
             "--runtime", "py311-torch", "--device", str(self._device),
             "--timeout", str(self._timeout), "--", "bash", "-c", _COMPILE_SCRIPT,
             "rsi-a3-candidate", archive.as_posix(), directory.as_posix(), bundle.sha256,
-            plan.execution_id, plan.source_fingerprint,
+            plan.execution_id, plan.source_fingerprint, self._manifest_sha256(plan),
         )
 
     def _execute_argv(
@@ -421,6 +443,7 @@ class GZA3RemoteCandidateBackend:
             "--timeout", str(self._timeout), "--", "bash", "-c", _EXECUTE_SCRIPT,
             "rsi-a3-candidate", directory.as_posix(), plan.execution_id,
             plan.source_fingerprint, library_sha256,
+            self._manifest_sha256(plan),
         )
 
     def _observe_argv(
@@ -469,7 +492,7 @@ class GZA3RemoteCandidateBackend:
             or any(isinstance(item, bool) or not isinstance(item, (int, float))
                    or not math.isfinite(item) for item in value)
         ):
-            raise ValueError("remote output must be a finite padded numeric array")
+            raise ValueError("remote output must be a finite logical numeric array")
         return tuple(float(item) for item in value)
 
 __all__ = ["CandidateBundle", "GZA3RemoteCandidateBackend"]
