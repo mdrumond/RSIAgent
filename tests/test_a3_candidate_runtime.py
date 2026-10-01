@@ -200,9 +200,15 @@ def test_checked_driver_emits_unprofiled_multiblock_timing_samples(tmp_path, cap
 @pytest.mark.parametrize(
     "metric", ["Basic", "ArithmeticUtilization", "PipeUtilization"]
 )
-def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, capsys, metric):
+def test_checked_driver_profiles_one_raw_metric_and_retains_report(
+    tmp_path, capsys, monkeypatch, metric,
+):
     _candidate_directory(tmp_path, length=4, padded_length=6, block_count=1)
     calls = []
+    monkeypatch.setattr(
+        a3_profile_driver.sys, "executable",
+        "/opt/a3-py311-torch/bin/python3.11",
+    )
 
     def process(argv, **kwargs):
         calls.append(tuple(argv))
@@ -244,8 +250,13 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(tmp_path, cap
         "--launch-count", "1", ".a3-profile-input.json",
     )
     assert f"--aic-metrics={metric}" in profile
-    application = next(item.split("=", 1)[1] for item in profile if item.startswith("--application="))
-    assert "host_driver.py --mode replay --warm-up 0 --launch-count 1 .a3-profile-input.json" in application
+    assert not any(item.startswith("--application=") for item in profile)
+    assert profile[3:] == (
+        "/opt/a3-py311-torch/bin/python3.11",
+        str((tmp_path / "host_driver.py").resolve()),
+        "--mode", "replay", "--warm-up", "0",
+        "--launch-count", "1", ".a3-profile-input.json",
+    )
     staged = json.loads((tmp_path / ".a3-profile-input.json").read_text())
     assert (staged["logical_length"], staged["padded_length"], staged["block_count"]) == (4, 6, 4)
 
