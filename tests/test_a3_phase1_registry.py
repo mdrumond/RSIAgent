@@ -165,6 +165,35 @@ def test_saturation_requires_all_coverage_and_two_knees():
     assert saturation_status((*short, replacement)) == "CONTINUE"
 
 
+@pytest.mark.parametrize(
+    ("removed_length", "replacement_length"),
+    [
+        (16, 256),  # 256 and 400 leave no sub-32 knee.
+        (400, 8),  # 16 and 8 leave no knee at or above 256.
+    ],
+)
+def test_saturation_requires_near_and_far_knee_ranges(
+    removed_length, replacement_length
+):
+    custom = tuple(
+        item
+        for item in DEFAULT_PROPOSALS
+        if not (
+            item.family.value == "length-knee"
+            and dict(item.parameters)["length"] == removed_length
+        )
+    ) + (
+        proposal(
+            parameters={"length": replacement_length},
+            hypothesis="A same-range knee must not satisfy both range requirements.",
+        ),
+    )
+
+    assert len(custom) == MAX_PROJECTS
+    assert saturation_status(custom) == "CONTINUE"
+    assert dry_run_plan(custom)["terminal_status"] == "CONTINUE"
+
+
 def test_dry_plan_has_no_execution_side_effect_surface():
     encoded = json.dumps(dry_run_plan(), sort_keys=True)
     assert "argv" not in encoded
