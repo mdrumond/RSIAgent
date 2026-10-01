@@ -22,7 +22,9 @@ extern "C" __global__ __aicore__ void vector_add(
 
 
 def _plan():
-    return A3CandidateBackend(lambda *a, **k: None).plan(
+    return A3CandidateBackend(
+        lambda *a, **k: None, execution_profile="gz-a3"
+    ).plan(
         SOURCE, request_id="request", attempt_id="attempt", length=3,
         padded_length=4, block_count=2, seed=4,
     )
