@@ -154,9 +154,39 @@ def test_disabled_treatment_makes_zero_backend_calls_and_leaks_no_content(tmp_pa
     before = FakeEmbeddings().calls
     assert agent.query(KnowledgeQuery("vector secret", 3)) == ()
     assert FakeEmbeddings().calls == before
-    assert "secret" in journal.read()[0]["query"]
+    entry = journal.read()[0]
+    assert "secret" in entry["query"]
+    assert entry["collection"] is None
+    assert entry["collection_fingerprint"] is None
+    assert entry["embedding"] is None
     with pytest.raises(ValueError, match="must not receive"):
         KnowledgeAgent(enabled=False, journal=journal, database=ForbiddenDatabase())
+
+
+@pytest.mark.parametrize(
+    "collection,include_manifest",
+    [
+        pytest.param(None, True, id="manifest-only"),
+        pytest.param("a3-docs", False, id="collection-only"),
+        pytest.param("a3-docs", True, id="both"),
+    ],
+)
+def test_disabled_journal_rejects_collection_metadata(
+    tmp_path, collection, include_manifest
+):
+    path, encoder = database(tmp_path)
+    journal = QueryJournal(tmp_path / "journal.jsonl")
+    with KnowledgeDB.open_read_only(path, encoder) as readonly:
+        manifest = readonly.manifest("a3-docs") if include_manifest else None
+        with pytest.raises(ValueError, match="cannot contain collection metadata"):
+            journal.append(
+                enabled=False,
+                query=KnowledgeQuery("vector"),
+                collection=collection,
+                manifest=manifest,
+                citations=(),
+            )
+    assert journal.read() == []
 
 
 def test_journal_is_append_only_hash_chained_and_reopens(tmp_path):

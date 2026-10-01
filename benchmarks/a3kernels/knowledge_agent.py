@@ -70,8 +70,10 @@ class QueryJournal:
         manifest: CollectionManifest | None,
         citations: tuple[Citation, ...],
     ) -> dict[str, Any]:
-        if enabled != (manifest is not None and collection is not None):
+        if enabled and (manifest is None or collection is None):
             raise ValueError("enabled query provenance requires a collection manifest")
+        if not enabled and (manifest is not None or collection is not None):
+            raise ValueError("disabled query provenance cannot contain collection metadata")
         if not enabled and citations:
             raise ValueError("disabled query provenance cannot contain citations")
         with self.path.open("a+", encoding="utf-8") as stream:
