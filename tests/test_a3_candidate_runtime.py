@@ -99,6 +99,38 @@ def test_plan_identity_binds_logical_padded_and_block_dimensions():
     ).execution_id
 
 
+def test_compile_and_run_bind_explicit_bz_execution_profile(tmp_path):
+    commands = []
+
+    def command(argv, **kwargs):
+        commands.append(tuple(argv))
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", ""
+            )
+        payload = json.loads((kwargs["cwd"] / "input.json").read_text())
+        values = [a + b for a, b in zip(payload["input_a"], payload["input_b"])]
+        return subprocess.CompletedProcess(
+            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(values) + "\n", ""
+        )
+    backend = A3CandidateBackend(command)
+    compiled = backend.compile(
+        SOURCE, tmp_path / "compile", request_id="r", attempt_id="a",
+        length=4, execution_profile="bz-a3-1",
+    )
+    verified = backend.run(
+        SOURCE, tmp_path / "run", request_id="r", attempt_id="b",
+        length=4, execution_profile="bz-a3-2",
+    )
+    assert compiled.plan.execution_profile == "bz-a3-1"
+    assert verified.passed
+    assert verified.execution_id == backend.plan(
+        SOURCE, request_id="r", attempt_id="b", length=4, seed=0,
+        execution_profile="bz-a3-2",
+    ).execution_id
+    assert commands
+
+
 @pytest.mark.parametrize(
     "changed_path",
     ["a3_profile_driver.py", "build.json", "host_driver.py", "host_wrapper.inc"],

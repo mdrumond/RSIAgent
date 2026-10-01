@@ -137,11 +137,13 @@ class A3CandidateBackend:
         block_count: int = 1,
         seed: int = 0,
         project_id: str = "vector-add",
+        execution_profile: str = A3_EXECUTION_PROFILE,
     ) -> CandidateCompilation | FailedEvidence:
         plan = self.plan(
             source, request_id=request_id, attempt_id=attempt_id,
             length=length, padded_length=padded_length, block_count=block_count,
             seed=seed, project_id=project_id,
+            execution_profile=execution_profile,
         )
         self._stage(plan, workdir)
         return self._compile(plan, workdir)
@@ -158,11 +160,13 @@ class A3CandidateBackend:
         block_count: int = 1,
         seed: int = 0,
         project_id: str = "vector-add",
+        execution_profile: str = A3_EXECUTION_PROFILE,
     ) -> VerifiedResult | FailedEvidence:
         plan = self.plan(
             source, request_id=request_id, attempt_id=attempt_id,
             length=length, padded_length=padded_length, block_count=block_count,
             seed=seed, project_id=project_id,
+            execution_profile=execution_profile,
         )
         self._stage(plan, workdir)
         compilation = self._compile(plan, workdir)

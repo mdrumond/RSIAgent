@@ -273,6 +273,7 @@ def test_lazy_bz_live_profile_and_timing_bind_exact_verified_candidate(
         uint32_t count, uint32_t buffer_bytes) {}''',
         request_id="cell", attempt_id="turn-1", project_id="project",
         length=33, padded_length=64, block_count=2, seed=0,
+        execution_profile="bz-a3-1",
     )
     bundle.plans[plan.execution_id] = plan
     store = live.AuthoritativeResultStore(tmp_path / "authority.jsonl")
@@ -311,7 +312,7 @@ def test_lazy_bz_live_profile_and_timing_bind_exact_verified_candidate(
     monkeypatch.setattr(live, "BZA3ProfilingBackend", InjectedProfiler)
     lazy = live._LazyBZProfiler(
         config=config, paths=paths, candidate=candidate,
-        profile="bz-a3-1", physical_device=2,
+        profile="bz-a3-1", physical_device=2, cpl_remote="/tools/cpl-remote",
     )
     request = ProfileRequest(
         CandidateBinding(plan.execution_id, plan.source_fingerprint),
