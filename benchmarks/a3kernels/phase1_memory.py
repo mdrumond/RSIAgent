@@ -14,6 +14,8 @@ from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_dige
 from benchmarks.a3kernels.phase1_registry import (
     CHECKPOINTS,
     CurriculumProposal,
+    EvidencePreset,
+    ProjectFamily,
     dry_run_plan,
     saturation_status,
 )
@@ -67,6 +69,7 @@ class AuthoritativeEvidence:
     evidence_sha256: str
     project_id: str
     candidate_sha256: str
+    statement: str
     success: bool
 
     def __post_init__(self) -> None:
@@ -79,6 +82,8 @@ class AuthoritativeEvidence:
         ):
             if type(value) is not str or not _SHA256.fullmatch(value):
                 raise ValueError(f"authoritative {label} must be a lowercase SHA-256")
+        if type(self.statement) is not str or not self.statement.strip():
+            raise ValueError("authoritative statement must be non-empty")
         if type(self.success) is not bool:
             raise ValueError("authoritative success must be a boolean")
 
@@ -254,14 +259,15 @@ class Phase1LearningJournal:
             stream.seek(0)
             committed, torn = self._committed_content(stream.read())
             entries = self._decode(committed)
-            ordinal = len(entries) + 1
-            if ordinal > len(self.proposals):
+            completed = self._completed_count(entries)
+            sequence = len(entries) + 1
+            if completed >= len(self.proposals):
                 raise ValueError("the Phase 1 plan is already complete")
-            if memory.proposal != self.proposals[ordinal - 1]:
+            if memory.proposal != self.proposals[completed]:
                 raise ValueError("memory does not match the next registered project")
             body = {
                 "schema": _ENTRY_SCHEMA,
-                "sequence": ordinal,
+                "sequence": sequence,
                 "plan_fingerprint": self.plan_fingerprint,
                 "cell_id": self.cell_id,
                 "lineage_id": self.lineage_id,
@@ -288,7 +294,7 @@ class Phase1LearningJournal:
 
     def resume_state(self) -> ResumeState:
         entries = self.read()
-        completed = len(entries)
+        completed = self._completed_count(entries)
         checkpoint = max(point for point in CHECKPOINTS if point <= completed)
         return ResumeState(
             completed,
@@ -303,6 +309,7 @@ class Phase1LearningJournal:
 
     def project_context(self) -> str:
         entries = self.read()
+        completed = self._completed_count(entries)
         return canonical_bytes(
             {
                 "schema": _CONTEXT_SCHEMA,
@@ -311,7 +318,7 @@ class Phase1LearningJournal:
                 "plan_fingerprint": self.plan_fingerprint,
                 "cell_id": self.cell_id,
                 "lineage_id": self.lineage_id,
-                "completed_projects": len(entries),
+                "completed_projects": completed,
                 "projects": [entry["memory"] for entry in entries],
             }
         ).decode("utf-8")
@@ -320,6 +327,7 @@ class Phase1LearningJournal:
         committed, _ = self._committed_content(value)
         entries = []
         previous = _GENESIS
+        completed = 0
         for sequence, raw in enumerate(committed.splitlines(), 1):
             try:
                 entry = json.loads(raw)
@@ -347,12 +355,14 @@ class Phase1LearningJournal:
             memory = ProjectMemory.from_mapping(entry["memory"])
             self._validate_host_facts(memory)
             if (
-                sequence > len(self.proposals)
-                or memory.proposal != self.proposals[sequence - 1]
+                completed >= len(self.proposals)
+                or memory.proposal != self.proposals[completed]
                 or memory.cell_id != self.cell_id
                 or memory.lineage_id != self.lineage_id
             ):
                 raise ValueError("A3 journal does not match the configured plan")
+            if self._completes_project(memory):
+                completed += 1
             previous = digest
             entries.append(entry)
         return entries
@@ -367,6 +377,7 @@ class Phase1LearningJournal:
                 ("digest", resolved.evidence_sha256, fact.evidence_sha256),
                 ("project", resolved.project_id, memory.project_id),
                 ("candidate", resolved.candidate_sha256, memory.source_revision),
+                ("statement", resolved.statement, fact.statement),
                 ("success", resolved.success, fact.success),
             )
             for label, actual, expected in checks:
@@ -374,6 +385,34 @@ class Phase1LearningJournal:
                     raise ValueError(
                         f"host fact {label} does not match authoritative evidence"
                     )
+
+    @staticmethod
+    def _completion_kinds(proposal: CurriculumProposal) -> frozenset[str]:
+        kinds = {"host-verification"}
+        if proposal.evidence_preset is EvidencePreset.CORRECTNESS_TIMING:
+            kinds.add("runtime")
+        elif proposal.evidence_preset is EvidencePreset.RECOVERY:
+            if proposal.family is ProjectFamily.COMPILE_RECOVERY:
+                kinds.add("compile")
+            elif proposal.family is ProjectFamily.RUNTIME_RECOVERY:
+                kinds.add("runtime")
+        elif proposal.evidence_preset is EvidencePreset.MSPROF:
+            kinds.add("profiling")
+        return frozenset(kinds)
+
+    @classmethod
+    def _completes_project(cls, memory: ProjectMemory) -> bool:
+        successful = {
+            fact.category for fact in memory.host_facts if fact.success
+        }
+        return cls._completion_kinds(memory.proposal) <= successful
+
+    @classmethod
+    def _completed_count(cls, entries: Sequence[Mapping[str, object]]) -> int:
+        return sum(
+            cls._completes_project(ProjectMemory.from_mapping(entry["memory"]))
+            for entry in entries
+        )
 
     @staticmethod
     def _committed_content(value: bytes) -> tuple[bytes, bool]:

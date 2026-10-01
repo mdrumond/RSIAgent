@@ -9,30 +9,64 @@ from benchmarks.a3kernels.phase1_memory import (
     Phase1LearningJournal,
     ProjectMemory,
 )
-from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
+from benchmarks.a3kernels.phase1_registry import (
+    DEFAULT_PROPOSALS,
+    EvidencePreset,
+    ProjectFamily,
+)
 
 
 CELL = "a3-cell-0123456789abcdef"
 OTHER_CELL = "a3-cell-fedcba9876543210"
 LINEAGE = "pilot-lineage-1"
-EVIDENCE = f"{1:064x}"
+EVIDENCE = f"{10:064x}"
 
 
-def evidence(ordinal):
-    return f"{ordinal:064x}"
+KIND_OFFSET = {
+    "host-verification": 0,
+    "compile": 1,
+    "runtime": 2,
+    "profiling": 3,
+}
+
+
+def evidence(ordinal, kind="host-verification", *, failed=False):
+    value = ordinal * 10 + KIND_OFFSET[kind] + (1000 if failed else 0)
+    return f"{value:064x}"
+
+
+def fact_statement(ordinal, kind):
+    return f"{kind} result for project {ordinal}"
+
+
+def completion_kinds(proposal):
+    kinds = ["host-verification"]
+    if proposal.evidence_preset is EvidencePreset.CORRECTNESS_TIMING:
+        kinds.append("runtime")
+    elif proposal.evidence_preset is EvidencePreset.RECOVERY:
+        kinds.append(
+            "compile"
+            if proposal.family is ProjectFamily.COMPILE_RECOVERY
+            else "runtime"
+        )
+    elif proposal.evidence_preset is EvidencePreset.MSPROF:
+        kinds.append("profiling")
+    return tuple(kinds)
 
 
 class Resolver:
     def __init__(self, records=None):
         self.records = records if records is not None else {
-            evidence(ordinal): AuthoritativeEvidence(
-                "host-verification",
-                evidence(ordinal),
+            evidence(ordinal, kind): AuthoritativeEvidence(
+                kind,
+                evidence(ordinal, kind),
                 proposal.project_id,
                 "b" * 64,
+                fact_statement(ordinal, kind),
                 True,
             )
             for ordinal, proposal in enumerate(DEFAULT_PROPOSALS, 1)
+            for kind in completion_kinds(proposal)
         }
 
     def resolve(self, digest):
@@ -48,12 +82,9 @@ def memory(ordinal, *, cell_id=CELL, lineage_id=LINEAGE):
         lineage_id=lineage_id,
         source_revision="b" * 64,
         actions=("compile candidate", "run host verifier"),
-        host_facts=(
-            HostFact(
-                "host-verification",
-                f"verified output for project {ordinal}",
-                evidence(ordinal),
-            ),
+        host_facts=tuple(
+            HostFact(kind, fact_statement(ordinal, kind), evidence(ordinal, kind))
+            for kind in completion_kinds(proposal)
         ),
         interpretations=(
             AgentInterpretation(
@@ -108,6 +139,7 @@ def test_append_requires_matching_authoritative_host_result(
         EVIDENCE,
         DEFAULT_PROPOSALS[0].project_id,
         "b" * 64,
+        fact_statement(1, "host-verification"),
         True,
     )
     values = record.__dict__.copy()
@@ -116,6 +148,182 @@ def test_append_requires_matching_authoritative_host_result(
 
     with pytest.raises(ValueError, match=message):
         journal(tmp_path / "unverified.jsonl", resolver=resolver).append(memory(1))
+
+
+def test_append_rejects_fabricated_statement_with_real_evidence(tmp_path):
+    legitimate = memory(1)
+    fabricated = ProjectMemory(
+        **{
+            **legitimate.__dict__,
+            "host_facts": (
+                HostFact("host-verification", "fabricated timing: 1 ns", EVIDENCE),
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="statement"):
+        journal(tmp_path / "fabricated.jsonl").append(fabricated)
+
+
+@pytest.mark.parametrize("ordinal", [1, 3, 4, 5, 8])
+def test_completion_accepts_successful_preset_evidence(tmp_path, ordinal):
+    proposal = DEFAULT_PROPOSALS[ordinal - 1]
+    active = Phase1LearningJournal(
+        tmp_path / f"preset-{ordinal}.jsonl",
+        (proposal,),
+        cell_id=CELL,
+        lineage_id=LINEAGE,
+        evidence_resolver=Resolver(),
+    )
+
+    active.append(memory(ordinal))
+
+    state = active.resume_state()
+    assert state.completed_projects == 1
+    assert state.next_ordinal is None
+
+
+@pytest.mark.parametrize(
+    ("ordinal", "missing_kind"),
+    [
+        (3, "compile"),
+        (4, "runtime"),
+        (5, "runtime"),
+        (8, "profiling"),
+    ],
+)
+def test_supplementary_facts_do_not_advance_without_preset_evidence(
+    tmp_path, ordinal, missing_kind
+):
+    proposal = DEFAULT_PROPOSALS[ordinal - 1]
+    complete = memory(ordinal)
+    supplementary = ProjectMemory(
+        **{
+            **complete.__dict__,
+            "host_facts": tuple(
+                fact for fact in complete.host_facts if fact.category != missing_kind
+            ),
+        }
+    )
+    active = Phase1LearningJournal(
+        tmp_path / f"supplementary-{ordinal}.jsonl",
+        (proposal,),
+        cell_id=CELL,
+        lineage_id=LINEAGE,
+        evidence_resolver=Resolver(),
+    )
+
+    active.append(supplementary)
+    pending = active.resume_state()
+    assert pending.completed_projects == 0
+    assert pending.next_ordinal == 1
+    assert len(active.read()) == 1
+
+    active.append(complete)
+    assert active.resume_state().completed_projects == 1
+    assert len(active.read()) == 2
+
+
+def test_failed_verification_is_retained_but_does_not_complete_project(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    failed_digest = evidence(1, failed=True)
+    failed_statement = "host verification failed for project 1"
+    records = dict(Resolver().records)
+    records[failed_digest] = AuthoritativeEvidence(
+        "host-verification",
+        failed_digest,
+        proposal.project_id,
+        "b" * 64,
+        failed_statement,
+        False,
+    )
+    failed = ProjectMemory(
+        **{
+            **memory(1).__dict__,
+            "host_facts": (
+                HostFact(
+                    "host-verification", failed_statement, failed_digest, success=False
+                ),
+            ),
+            "interpretations": (),
+        }
+    )
+    active = Phase1LearningJournal(
+        tmp_path / "failed.jsonl",
+        (proposal,),
+        cell_id=CELL,
+        lineage_id=LINEAGE,
+        evidence_resolver=Resolver(records),
+    )
+
+    active.append(failed)
+    assert active.resume_state().completed_projects == 0
+    assert len(active.read()) == 1
+
+    active.append(memory(1))
+    assert active.resume_state().completed_projects == 1
+    assert len(active.read()) == 2
+
+
+def test_compile_fact_is_supplementary_for_correctness_project(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    compile_digest = evidence(1, "compile")
+    records = dict(Resolver().records)
+    records[compile_digest] = AuthoritativeEvidence(
+        "compile",
+        compile_digest,
+        proposal.project_id,
+        "b" * 64,
+        fact_statement(1, "compile"),
+        True,
+    )
+    compile_only = ProjectMemory(
+        **{
+            **memory(1).__dict__,
+            "host_facts": (
+                HostFact("compile", fact_statement(1, "compile"), compile_digest),
+            ),
+            "interpretations": (),
+        }
+    )
+    active = Phase1LearningJournal(
+        tmp_path / "compile-only.jsonl",
+        (proposal,),
+        cell_id=CELL,
+        lineage_id=LINEAGE,
+        evidence_resolver=Resolver(records),
+    )
+
+    active.append(compile_only)
+    assert active.resume_state().completed_projects == 0
+
+    active.append(memory(1))
+    assert active.resume_state().completed_projects == 1
+
+
+def test_supplementary_entry_does_not_advance_checkpoint_or_saturation(tmp_path):
+    active = journal(tmp_path / "checkpoint.jsonl")
+    for ordinal in range(1, 5):
+        active.append(memory(ordinal))
+    fifth = memory(5)
+    active.append(
+        ProjectMemory(
+            **{
+                **fifth.__dict__,
+                "host_facts": tuple(
+                    fact
+                    for fact in fifth.host_facts
+                    if fact.category == "host-verification"
+                ),
+            }
+        )
+    )
+
+    state = active.resume_state()
+    assert state.completed_projects == 4
+    assert state.next_ordinal == 5
+    assert state.latest_checkpoint == 4
+    assert state.checkpoint_status == "CONTINUE"
 
 
 def test_append_rejects_unresolved_host_fact_without_writing(tmp_path):
