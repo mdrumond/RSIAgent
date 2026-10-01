@@ -63,7 +63,7 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
     def profile(self) -> str:
         return self._profile
 
-    def _require_execution_profile(self, plan: ExecutionPlan) -> None:
+    def _require_gz_plan(self, plan: ExecutionPlan) -> None:
         if not isinstance(plan, ExecutionPlan):
             raise TypeError("plan must be an A3 ExecutionPlan")
         if plan.execution_profile != self._profile:
@@ -132,7 +132,7 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
             "--runtime", "py311-torch", "--device", str(self._device),
             "--timeout", str(self._timeout), "--", "bash", "-c", _COMPILE_SCRIPT,
             "rsi-a3-candidate", archive.as_posix(), directory.as_posix(), bundle.sha256,
-            plan.execution_id, plan.source_fingerprint,
+            plan.execution_id, plan.source_fingerprint, self._manifest_sha256(plan),
         )
 
     def _execute_argv(
@@ -145,7 +145,7 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
             "--runtime", "py311-torch", "--device", str(self._device),
             "--timeout", str(self._timeout), "--", "bash", "-c", _EXECUTE_SCRIPT,
             "rsi-a3-candidate", directory.as_posix(), plan.execution_id,
-            plan.source_fingerprint, library_sha256,
+            plan.source_fingerprint, library_sha256, self._manifest_sha256(plan),
         )
 
     def _observe_argv(

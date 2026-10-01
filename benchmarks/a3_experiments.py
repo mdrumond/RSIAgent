@@ -24,8 +24,8 @@ class A3Language(str, Enum):
 
 
 class BackendModel(str, Enum):
+    GPT_5_6_ASTRA = "openai/gpt-5.6-astra"
     GPT_5_6_SOL = "openai/gpt-5.6-sol"
-    DEEPSEEK_FLASH = "deepseek-flash"
 
 
 class KnowledgeMode(str, Enum):

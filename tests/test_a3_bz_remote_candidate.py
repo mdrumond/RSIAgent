@@ -20,9 +20,11 @@ extern "C" __global__ __aicore__ void vector_add(
 
 
 def _plan(profile="bz-a3-1"):
-    return A3CandidateBackend(lambda *a, **k: None).plan(
+    return A3CandidateBackend(
+        lambda *a, **k: None, execution_profile=profile,
+    ).plan(
         SOURCE, request_id="request", attempt_id="attempt", length=3,
-        padded_length=4, block_count=2, seed=4, execution_profile=profile,
+        padded_length=4, block_count=2, seed=4,
     )
 
 
@@ -65,7 +67,13 @@ def _backend(tmp_path: Path, process, *, profile="bz-a3-1", device=2):
 def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path, monkeypatch):
     calls = []
     plan = _plan()
-    expected = [a + b for a, b in zip(plan.input_a, plan.input_b)]
+    expected = [
+        a + b
+        for a, b in zip(
+            plan.input_a[:plan.logical_length],
+            plan.input_b[:plan.logical_length],
+        )
+    ]
     monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")

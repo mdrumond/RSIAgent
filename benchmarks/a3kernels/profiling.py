@@ -9,12 +9,16 @@ import re
 import statistics
 from typing import Callable
 
-from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_evidence import (
+    A3_EXECUTION_PROFILES,
+    canonical_digest,
+)
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REPLAY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _TIMING = re.compile(r"^A3TIMING_US=(.+)$")
+_DEFAULT_EXECUTION_PROFILE = "bz-a3-1"
 
 
 def _digest(value: object, label: str) -> None:
@@ -78,6 +82,46 @@ class StudyDimensions:
 
 
 @dataclass(frozen=True)
+class TimingRequest:
+    binding: CandidateBinding
+    dimensions: StudyDimensions
+    execution_profile: str = _DEFAULT_EXECUTION_PROFILE
+    target: str = "Ascend910B4"
+    language: str = "ascend-c"
+    runtime: str = "native-ascend-c"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, CandidateBinding):
+            raise TypeError("binding must be CandidateBinding")
+        if not isinstance(self.dimensions, StudyDimensions):
+            raise TypeError("dimensions must be StudyDimensions")
+        if (
+            self.target != "Ascend910B4"
+            or self.language != "ascend-c"
+            or self.execution_profile not in A3_EXECUTION_PROFILES
+            or self.runtime != "native-ascend-c"
+        ):
+            raise ValueError(
+                "A3 timing identity must use native Ascend C on bz-a3-1, "
+                "bz-a3-2, or the gz-a3 compatibility profile"
+            )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "binding": self.binding.as_dict(),
+            "dimensions": self.dimensions.as_dict(),
+            "target": self.target,
+            "language": self.language,
+            "execution_profile": self.execution_profile,
+            "runtime": self.runtime,
+        }
+
+    @property
+    def request_id(self) -> str:
+        return canonical_digest({"kind": "a3-timing", **self.as_dict()})
+
+
+@dataclass(frozen=True)
 class ProfileRequest:
     binding: CandidateBinding
     dimensions: StudyDimensions
@@ -86,7 +130,7 @@ class ProfileRequest:
     expected_kernel: str = "vector_add"
     target: str = "Ascend910B4"
     language: str = "ascend-c"
-    execution_profile: str = "gz-a3"
+    execution_profile: str = _DEFAULT_EXECUTION_PROFILE
     runtime: str = "native-ascend-c"
 
     def __post_init__(self) -> None:
@@ -103,10 +147,13 @@ class ProfileRequest:
         if (
             self.target != "Ascend910B4"
             or self.language != "ascend-c"
-            or self.execution_profile != "gz-a3"
+            or self.execution_profile not in A3_EXECUTION_PROFILES
             or self.runtime != "native-ascend-c"
         ):
-            raise ValueError("A3 profiling identity must use native Ascend C on gz-a3")
+            raise ValueError(
+                "A3 profiling identity must use native Ascend C on bz-a3-1, "
+                "bz-a3-2, or the gz-a3 compatibility profile"
+            )
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -153,6 +200,7 @@ class TimingResult:
     request_id: str
     candidate_execution_id: str
     source_fingerprint: str
+    execution_profile: str
     dimensions: StudyDimensions
     samples_us: tuple[float, ...]
     minimum_us: float
@@ -164,10 +212,11 @@ class TimingResult:
     @classmethod
     def from_samples(
         cls,
-        binding: CandidateBinding,
-        dimensions: StudyDimensions,
+        request: TimingRequest,
         samples: tuple[float, ...],
     ) -> "TimingResult":
+        if not isinstance(request, TimingRequest):
+            raise TypeError("request must be TimingRequest")
         if not samples or any(
             type(value) not in (int, float) or not math.isfinite(value) or value <= 0
             for value in samples
@@ -175,10 +224,11 @@ class TimingResult:
             raise ValueError("timing samples must be finite and positive")
         values = tuple(float(value) for value in samples)
         body = {
-            "request_id": timing_request_id(binding, dimensions),
-            "candidate_execution_id": binding.execution_id,
-            "source_fingerprint": binding.source_fingerprint,
-            "dimensions": dimensions.as_dict(),
+            "request_id": request.request_id,
+            "candidate_execution_id": request.binding.execution_id,
+            "source_fingerprint": request.binding.source_fingerprint,
+            "execution_profile": request.execution_profile,
+            "dimensions": request.dimensions,
             "samples_us": values,
             "minimum_us": min(values),
             "maximum_us": max(values),
@@ -189,19 +239,14 @@ class TimingResult:
 
 
 def timing_request_id(
-    binding: CandidateBinding, dimensions: StudyDimensions
+    binding: CandidateBinding,
+    dimensions: StudyDimensions,
+    *,
+    execution_profile: str = _DEFAULT_EXECUTION_PROFILE,
 ) -> str:
-    return canonical_digest(
-        {
-            "kind": "a3-timing",
-            "binding": binding.as_dict(),
-            "dimensions": dimensions.as_dict(),
-            "target": "Ascend910B4",
-            "language": "ascend-c",
-            "execution_profile": "gz-a3",
-            "runtime": "native-ascend-c",
-        }
-    )
+    return TimingRequest(
+        binding, dimensions, execution_profile=execution_profile
+    ).request_id
 
 
 @dataclass(frozen=True)
@@ -256,7 +301,7 @@ def _pairs(values: tuple[tuple[str, float], ...], label: str) -> tuple[tuple[str
     return tuple(sorted(result))
 
 
-TimingBackend = Callable[[CandidateBinding, StudyDimensions], str]
+TimingBackend = Callable[[TimingRequest], str]
 ProfilerBackend = Callable[[ProfileRequest], CompactProfileResult]
 
 
@@ -278,8 +323,12 @@ class A3ProfilingSession:
         dimensions: StudyDimensions,
         *,
         replay_id: str | None = None,
+        execution_profile: str = _DEFAULT_EXECUTION_PROFILE,
     ) -> TimingResult:
-        request_id = timing_request_id(binding, dimensions)
+        request = TimingRequest(
+            binding, dimensions, execution_profile=execution_profile
+        )
+        request_id = request.request_id
         selected_replay = f"a3-timing-{request_id[:16]}" if replay_id is None else replay_id
         if _REPLAY_ID.fullmatch(selected_replay) is None:
             raise ValueError("timing replay_id is unsafe")
@@ -291,7 +340,8 @@ class A3ProfilingSession:
         if self._timing is None:
             raise RuntimeError("A3 timing backend is unavailable")
         result = TimingResult.from_samples(
-            binding, dimensions, parse_timing_output(self._timing(binding, dimensions))
+            request,
+            parse_timing_output(self._timing(request)),
         )
         self._timing_replays[selected_replay] = (request_id, result)
         return result
@@ -312,12 +362,19 @@ class A3ProfilingSession:
         if self._profiler is None:
             raise RuntimeError("A3 profiler backend is unavailable")
         result = self._profiler(request)
-        if (
-            not isinstance(result, CompactProfileResult)
-            or result.request_id != request.request_id
-            or result.candidate_execution_id != request.binding.execution_id
-            or result.source_fingerprint != request.binding.source_fingerprint
-        ):
+        if not isinstance(result, CompactProfileResult):
+            raise ValueError("profiler result does not match the A3 request")
+        try:
+            reconstructed = CompactProfileResult.create(
+                request,
+                exported_kernels=result.exported_kernels,
+                metric_values=result.metric_values,
+                timeline=result.timeline,
+                report_sha256=result.report_sha256,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("profiler result does not match the A3 request") from exc
+        if result != reconstructed:
             raise ValueError("profiler result does not match the A3 request")
         self._replays[selected_replay] = (request.request_id, result)
         return result
@@ -326,5 +383,5 @@ class A3ProfilingSession:
 __all__ = [
     "A3ProfilingSession", "CandidateBinding", "CompactProfileResult",
     "ProfileMetric", "ProfileRequest", "ProfilingTreatment", "StudyDimensions",
-    "TimingResult", "parse_timing_output", "timing_request_id",
+    "TimingRequest", "TimingResult", "parse_timing_output", "timing_request_id",
 ]
