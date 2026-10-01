@@ -8,8 +8,6 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -159,11 +157,8 @@ def _raw_rows(
 
 
 def _replay_argv(root: Path, input_name: str, args: argparse.Namespace) -> tuple[str, ...]:
-    interpreter = shutil.which(sys.executable)
-    if interpreter is None:
-        raise RuntimeError("active Python interpreter is not executable")
     return (
-        str(Path(interpreter).resolve()), str((root / "host_driver.py").resolve()),
+        str(Path(sys.executable).resolve()), str((root / "host_driver.py").resolve()),
         "--mode", "replay", "--warm-up", "0",
         "--launch-count", str(args.launch_count), input_name,
     )
@@ -209,10 +204,9 @@ def main(
         warm_up=args.warm_up, launch_count=1,
     )
     report = report_directory_factory(root, args.metric).resolve()
-    application = shlex.join(_replay_argv(root, input_name, args))
     command = (
         "msprof", f"--output={report}", f"--aic-metrics={args.metric}",
-        f"--application={application}",
+        *_replay_argv(root, input_name, args),
     )
     completed = process_runner(command, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
