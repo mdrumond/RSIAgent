@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 from benchmarks.a3_experiments import A3ExperimentCell, ProgrammingLevel, build_a3_experiment_plan
 from benchmarks.a3kernels.candidate import profile_driver_asset
@@ -30,6 +30,39 @@ def foundation_cells() -> tuple[A3ExperimentCell, ...]:
     return tuple(
         cell for cell in build_a3_experiment_plan().cells
         if cell.programming_level is ProgrammingLevel.FOUNDATION
+    )
+
+
+def select_foundation_cells(
+    *,
+    cell_ids: Sequence[str] = (),
+    shard_count: int | None = None,
+    shard_index: int | None = None,
+) -> tuple[A3ExperimentCell, ...]:
+    """Select a canonical, optionally sharded subset of foundation cells."""
+    cells = foundation_cells()
+    available = {cell.cell_id: cell for cell in cells}
+    requested = tuple(cell_ids)
+    if len(requested) != len(set(requested)):
+        raise ValueError("duplicate cell ID")
+    unknown = [cell_id for cell_id in requested if cell_id not in available]
+    if unknown:
+        raise ValueError("unknown foundation cell ID: " + ", ".join(map(str, unknown)))
+    if requested:
+        requested_ids = set(requested)
+        cells = tuple(cell for cell in cells if cell.cell_id in requested_ids)
+
+    if (shard_count is None) != (shard_index is None):
+        raise ValueError("shard count and index must be provided together")
+    if shard_count is None:
+        return cells
+    if type(shard_count) is not int or shard_count < 1:
+        raise ValueError("shard count must be a positive integer")
+    if type(shard_index) is not int or not 0 <= shard_index < shard_count:
+        raise ValueError("shard index must be an integer in the shard range")
+    return tuple(
+        cell for ordinal, cell in enumerate(cells)
+        if ordinal % shard_count == shard_index
     )
 
 
@@ -99,9 +132,20 @@ Executor = Callable[[A3ExperimentCell, CellPaths], Mapping[str, object]]
 
 
 class Phase1Wave:
-    def __init__(self, config: Phase1Config, executor: Executor) -> None:
+    def __init__(
+        self,
+        config: Phase1Config,
+        executor: Executor,
+        *,
+        cells: Sequence[A3ExperimentCell] | None = None,
+    ) -> None:
         self.config = config
         self.executor = executor
+        self.cells = (
+            foundation_cells()
+            if cells is None
+            else select_foundation_cells(cell_ids=tuple(cell.cell_id for cell in cells))
+        )
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
         root = self.config.state_root / "cells" / cell.cell_id
@@ -113,7 +157,7 @@ class Phase1Wave:
 
     def run(self) -> tuple[dict[str, object], ...]:
         records = []
-        for cell in foundation_cells():
+        for cell in self.cells:
             paths = self.paths(cell)
             retained = self._read_terminal(cell, paths.terminal)
             if retained is not None:
@@ -202,4 +246,11 @@ class Phase1Wave:
         return value
 
 
-__all__ = ["CellPaths", "Phase1Config", "Phase1Wave", "foundation_cells", "full_dry_run"]
+__all__ = [
+    "CellPaths",
+    "Phase1Config",
+    "Phase1Wave",
+    "foundation_cells",
+    "full_dry_run",
+    "select_foundation_cells",
+]
