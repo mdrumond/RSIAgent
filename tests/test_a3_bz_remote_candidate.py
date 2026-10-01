@@ -39,6 +39,16 @@ def _terminal(profile, handle, *body, state="completed", code=0, stderr=""):
     return _completed((), stdout, stderr, code)
 
 
+def _upload_terminal(profile="bz-a3-1"):
+    return "\n".join((
+        f"REMOTE_TARGET={profile}",
+        "REMOTE_BACKEND=ssh",
+        "REMOTE_OPERATION=upload",
+        "REMOTE_STATE=completed",
+        "REMOTE_EXIT=0",
+    ))
+
+
 def _backend(tmp_path: Path, process, *, profile="bz-a3-1", device=2):
     return BZA3RemoteCandidateBackend(
         cpl_remote="/skills/remote-access/scripts/cpl-remote",
@@ -59,7 +69,7 @@ def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path):
     def process(argv, **kwargs):
         calls.append((tuple(argv), kwargs))
         if argv[0].endswith("cpl-remote"):
-            return _completed(argv, "REMOTE_STATE=completed")
+            return _completed(argv, _upload_terminal())
         if "a3-candidate-" in " ".join(argv):
             result = _terminal(
                 "bz-a3-1", "bz-a3-1:compile-9",
@@ -120,7 +130,7 @@ def test_upload_and_compile_failures_are_structured(tmp_path):
 
     def compile_failure(argv, **kwargs):
         if argv[0].endswith("cpl-remote"):
-            return _completed(argv, "REMOTE_STATE=completed")
+            return _completed(argv, _upload_terminal())
         result = _terminal(
             "bz-a3-1", "bz-a3-1:compile-failed",
             "A3REMOTE_STAGE=compile", state="failed", code=2, stderr="bisheng failed",
@@ -140,7 +150,7 @@ def test_runtime_failure_is_structured_and_does_not_reupload(tmp_path):
     def process(argv, **kwargs):
         calls.append(tuple(argv))
         if argv[0].endswith("cpl-remote"):
-            return _completed(argv, "REMOTE_STATE=completed")
+            return _completed(argv, _upload_terminal())
         if "a3-candidate-" in " ".join(argv):
             result = _terminal(
                 "bz-a3-1", "bz-a3-1:compile", "A3REMOTE_STAGE=compile",
@@ -168,7 +178,7 @@ def test_observation_unavailable_recovers_exact_compile_handle_without_upload(tm
     def process(argv, **kwargs):
         calls.append(tuple(argv))
         if argv[0].endswith("cpl-remote"):
-            return _completed(argv, "REMOTE_STATE=completed")
+            return _completed(argv, _upload_terminal())
         if "observe" in argv:
             result = _terminal(
                 "bz-a3-1", "bz-a3-1:compile-pending", "A3REMOTE_STAGE=compile",
@@ -196,7 +206,7 @@ def test_pending_observation_rejects_foreign_handle_and_remains_recoverable(tmp_
     def process(argv, **kwargs):
         calls.append(tuple(argv))
         if argv[0].endswith("cpl-remote"):
-            return _completed(argv, "REMOTE_STATE=completed")
+            return _completed(argv, _upload_terminal())
         handle = "bz-a3-2:foreign" if "observe" in argv else "bz-a3-1:pending"
         state = "completed" if "observe" in argv else "observation-unavailable"
         code = 0 if "observe" in argv else 75
@@ -230,3 +240,22 @@ def test_corrupt_or_cross_profile_pending_state_fails_closed(tmp_path):
 
     with pytest.raises(RuntimeError, match="corrupt"):
         _backend(tmp_path, lambda *a, **k: None).compile(plan, tmp_path / "local")
+
+
+@pytest.mark.parametrize("stdout", [
+    "",
+    "REMOTE_STATE=completed",
+    _upload_terminal("bz-a3-2"),
+    _upload_terminal() + "\nREMOTE_TARGET=bz-a3-1",
+    _upload_terminal().replace("REMOTE_STATE=completed", "REMOTE_STATE=running"),
+])
+def test_zero_exit_upload_rejects_missing_duplicate_foreign_or_nonterminal_markers(
+    tmp_path, stdout,
+):
+    result = _backend(
+        tmp_path, lambda argv, **kwargs: _completed(argv, stdout)
+    ).compile(_plan(), tmp_path / "local")
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "prepare"
+    assert "terminal markers" in result.detail
