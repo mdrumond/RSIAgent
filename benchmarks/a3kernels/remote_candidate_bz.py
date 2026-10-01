@@ -101,6 +101,9 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
         if job_id != "synchronous-bz-upload":
             raise RuntimeError("unexpected BZ transfer state")
 
+    def _remote_archive_destination(self, plan: ExecutionPlan) -> PurePosixPath:
+        return self._workspace / f".rsi-a3-candidate-{plan.execution_id}.tar"
+
     def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
         options = {
             "text": True,
