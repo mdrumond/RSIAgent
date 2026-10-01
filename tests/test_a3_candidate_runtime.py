@@ -63,7 +63,9 @@ def _output(cwd: Path) -> list[float]:
 
 
 def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
-    backend = A3CandidateBackend(command_runner=lambda *a, **k: None)
+    backend = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-1"
+    )
     first = backend.plan(SOURCE, request_id="r1", attempt_id="a1", length=33, seed=7)
     second = backend.plan(SOURCE + "\n", request_id="r1", attempt_id="a1", length=33, seed=7)
 
@@ -80,7 +82,9 @@ def test_candidate_owns_one_exact_source_and_identity_changes_with_it():
 
 
 def test_plan_identity_binds_logical_padded_and_block_dimensions():
-    backend = A3CandidateBackend(command_runner=lambda *a, **k: None)
+    backend = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-1"
+    )
     base = backend.plan(
         SOURCE, request_id="r1", attempt_id="a1", length=33,
         padded_length=64, block_count=2, seed=7,
@@ -99,9 +103,24 @@ def test_plan_identity_binds_logical_padded_and_block_dimensions():
     ).execution_id
 
 
+def test_plan_identity_binds_selected_bz_profile():
+    first = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-1"
+    ).plan(SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0)
+    second = A3CandidateBackend(
+        command_runner=lambda *a, **k: None, execution_profile="bz-a3-2"
+    ).plan(SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0)
+
+    assert first.execution_profile == "bz-a3-1"
+    assert second.execution_profile == "bz-a3-2"
+    assert first.execution_id != second.execution_id
+
+
 @pytest.mark.parametrize("changed_path", ["build.json", "host_driver.py", "host_wrapper.inc"])
 def test_every_host_asset_is_identity_bound_and_staged_from_plan(monkeypatch, tmp_path, changed_path):
-    backend = A3CandidateBackend(command_runner=lambda *args, **kwargs: None)
+    backend = A3CandidateBackend(
+        command_runner=lambda *args, **kwargs: None, execution_profile="bz-a3-1"
+    )
     original = backend.plan(
         SOURCE, request_id="r1", attempt_id="a1", length=4, seed=0
     )
@@ -149,7 +168,7 @@ def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
         assert "TORCH_LIBRARY(rsi_a3candidates" in (cwd / "host_wrapper.inc").read_text()
         return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", "")
 
-    result = A3CandidateBackend(command).compile(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").compile(
         SOURCE, tmp_path, request_id="r1", attempt_id="a1"
     )
 
@@ -174,7 +193,7 @@ def test_run_compiles_then_executes_aligned_and_padded_shapes(
             argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(_output(cwd)) + "\n", ""
         )
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path / str(length), request_id=f"r{length}",
         attempt_id="a1", length=length, padded_length=padded_length,
         block_count=2, seed=9,
@@ -182,6 +201,7 @@ def test_run_compiles_then_executes_aligned_and_padded_shapes(
 
     assert isinstance(result, VerifiedResult)
     assert result.passed and result.max_abs_error == 0.0
+    assert result.tolerance == 1e-5
     assert calls == [
         ("python", "host_driver.py", "--compile-only"),
         ("python", "host_driver.py", "input.json"),
@@ -195,7 +215,7 @@ def test_compile_failure_is_structured_and_stops_before_run(tmp_path):
         calls.append(tuple(argv))
         return subprocess.CompletedProcess(argv, 2, "", "bisheng: candidate.cpp:8: error")
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
     )
 
@@ -211,7 +231,7 @@ def test_runtime_failure_is_structured(tmp_path):
             return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "c" * 64 + "\n", "")
         return subprocess.CompletedProcess(argv, 3, "", "ACL launch failed")
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
     )
 
@@ -227,7 +247,7 @@ def test_malformed_or_wrong_length_output_is_structured_verification_failure(tmp
             return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "d" * 64 + "\n", "")
         return subprocess.CompletedProcess(argv, 0, stdout, "")
 
-    result = A3CandidateBackend(command).run(
+    result = A3CandidateBackend(command, execution_profile="bz-a3-1").run(
         SOURCE, tmp_path, request_id="r", attempt_id="a", length=4
     )
 
@@ -237,7 +257,9 @@ def test_malformed_or_wrong_length_output_is_structured_verification_failure(tmp
 
 def test_agent_has_no_argv_or_build_descriptor_surface():
     with pytest.raises(TypeError):
-        A3CandidateBackend(lambda *a, **k: None).plan(
+        A3CandidateBackend(
+            lambda *a, **k: None, execution_profile="bz-a3-1"
+        ).plan(
             SOURCE, request_id="r", attempt_id="a", length=4, seed=0,
             argv=("bash", "-c", "anything"),
         )

@@ -13,6 +13,7 @@ import re
 import subprocess
 from typing import Callable
 
+from benchmarks.a3kernels.phase1_evidence import A3_EXECUTION_PROFILES
 from benchmarks.a3kernels.phase1_protocol import (
     ExecutionPlan,
     ExecutionReceipt,
@@ -72,8 +73,17 @@ class CandidateCompilation:
 
 
 class A3CandidateBackend:
-    def __init__(self, command_runner: CommandRunner = subprocess.run, *, atol=1e-5):
+    def __init__(
+        self,
+        command_runner: CommandRunner = subprocess.run,
+        *,
+        execution_profile: str,
+        atol=1e-5,
+    ):
+        if execution_profile not in A3_EXECUTION_PROFILES:
+            raise ValueError("candidate backend requires a registered A3 profile")
         self._command_runner = command_runner
+        self._execution_profile = execution_profile
         self._atol = float(atol)
 
     def plan(
@@ -111,6 +121,7 @@ class A3CandidateBackend:
             argv=_RUN_ARGV,
             input_a=input_a + padding,
             input_b=input_b + padding,
+            execution_profile=self._execution_profile,
             logical_length=length,
             padded_length=padded_length,
             block_count=block_count,
