@@ -54,18 +54,65 @@ def test_ledger_detects_tampering(tmp_path):
         EvidenceLedger(path)
 
 
+def test_ledger_rejects_unterminated_entry_before_append(tmp_path):
+    path = tmp_path / "a3.evidence.jsonl"
+    ledger = EvidenceLedger(path)
+    ledger.append(EvidenceKind.PLAN, {"request_id": "r1"})
+    path.write_bytes(path.read_bytes().removesuffix(b"\n"))
+
+    with pytest.raises(ValueError, match="unterminated"):
+        ledger.append(EvidenceKind.RESULT, {"passed": True})
+    with pytest.raises(ValueError, match="unterminated"):
+        EvidenceLedger(path)
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [
         ({"target": "Ascend950"}, "target"),
         ({"language": "catlass-dsl"}, "language"),
         ({"execution_profile": "bz-a5"}, "profile"),
-        ({"runtime_provenance": [["target", "a5"]]}, "provenance"),
+        ({"runtime_provenance": [["target", "a5"]]}, "target"),
     ],
 )
 def test_ledger_rejects_a5_catlass_or_foreign_provenance(tmp_path, payload, message):
     with pytest.raises(ValueError, match=message):
         EvidenceLedger(tmp_path / "bad.jsonl").append(EvidenceKind.ACTION, payload)
+
+
+def test_provenance_checks_only_explicit_route_fields(tmp_path):
+    digest_with_a5 = "0" * 20 + "a5" + "1" * 42
+    payload = {
+        "runtime_provenance": [
+            ["artifact_sha256", digest_with_a5],
+            ["note", "compare catlass history without routing to it"],
+            ["execution_profile", "gz-a3"],
+            ["language", "ascend-c"],
+        ]
+    }
+
+    entry = EvidenceLedger(tmp_path / "explicit.jsonl").append(
+        EvidenceKind.ARTIFACT, payload
+    )
+
+    assert entry.payload["runtime_provenance"][0][1] == digest_with_a5
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("target", "a5", "target"),
+        ("language", "catlass-dsl", "language"),
+        ("execution_profile", "bz-a5", "profile"),
+        ("runtime", "catlass", "runtime"),
+    ],
+)
+def test_nested_provenance_rejects_explicit_foreign_route(field, value, message, tmp_path):
+    with pytest.raises(ValueError, match=message):
+        EvidenceLedger(tmp_path / "foreign.jsonl").append(
+            EvidenceKind.ACTION,
+            {"runtime_provenance": [["artifact_sha256", "a5" * 32], [field, value]]},
+        )
 
 
 def test_deterministic_local_round_trip_records_source_identity(tmp_path):
@@ -77,6 +124,7 @@ def test_deterministic_local_round_trip_records_source_identity(tmp_path):
         argv=("python", "host_driver.py"),
         input_a=(1.0, 2.0),
         input_b=(3.0, 5.0),
+        execution_profile="bz-a3-1",
     )
     expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
     ledger = EvidenceLedger(tmp_path / "proof.jsonl")
@@ -90,3 +138,13 @@ def test_deterministic_local_round_trip_records_source_identity(tmp_path):
     assert reopened.entries[0].payload["source_fingerprint"] == plan.source_fingerprint
     assert reopened.entries[-1].payload["passed"] is True
     assert reopened.head_sha256 == ledger.head_sha256
+
+
+@pytest.mark.parametrize("profile", ["bz-a3-1", "bz-a3-2", "gz-a3"])
+def test_ledger_accepts_authoritative_and_compatibility_a3_profiles(tmp_path, profile):
+    entry = EvidenceLedger(tmp_path / f"{profile}.jsonl").append(
+        EvidenceKind.ACTION,
+        {"execution_profile": profile},
+    )
+
+    assert entry.payload["execution_profile"] == profile

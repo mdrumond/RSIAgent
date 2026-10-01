@@ -15,6 +15,12 @@ from typing import Any, Iterable, Mapping
 
 
 GENESIS_HASH = "0" * 64
+A3_AUTHORITATIVE_EXECUTION_PROFILES = ("bz-a3-1", "bz-a3-2")
+A3_GZ_COMPATIBILITY_EXECUTION_PROFILE = "gz-a3"
+A3_EXECUTION_PROFILES = (
+    *A3_AUTHORITATIVE_EXECUTION_PROFILES,
+    A3_GZ_COMPATIBILITY_EXECUTION_PROFILE,
+)
 
 
 class EvidenceKind(str, Enum):
@@ -71,16 +77,38 @@ def _validate_a3_identity(payload: Mapping[str, Any]) -> None:
     checks = {
         "target": ("Ascend910B4", "target"),
         "language": ("ascend-c", "language"),
-        "execution_profile": ("gz-a3", "profile"),
         "runtime": ("native-ascend-c", "runtime"),
     }
     for key, (expected, label) in checks.items():
         if key in payload and payload[key] != expected:
             raise ValueError(f"A3 evidence {label} must be {expected}")
-    if "runtime_provenance" in payload:
-        provenance = canonical_bytes(payload["runtime_provenance"]).lower()
-        if b"a5" in provenance or b"catlass" in provenance or b"bz-a5" in provenance:
-            raise ValueError("A3 evidence provenance cannot reference A5 or Catlass")
+    profile = payload.get("execution_profile")
+    if profile is not None and profile not in A3_EXECUTION_PROFILES:
+        raise ValueError(
+            "A3 evidence profile must be bz-a3-1, bz-a3-2, or "
+            "the gz-a3 compatibility profile"
+        )
+    provenance = payload.get("runtime_provenance")
+    if isinstance(provenance, Mapping):
+        items = provenance.items()
+    elif isinstance(provenance, (list, tuple)):
+        items = (
+            item
+            for item in provenance
+            if isinstance(item, (list, tuple))
+            and len(item) == 2
+            and isinstance(item[0], str)
+        )
+    else:
+        items = ()
+    for key, value in items:
+        if key == "execution_profile" and value not in A3_EXECUTION_PROFILES:
+            raise ValueError(
+                "A3 evidence profile must be bz-a3-1, bz-a3-2, or "
+                "the gz-a3 compatibility profile"
+            )
+        if key in checks and value != checks[key][0]:
+            raise ValueError(f"A3 evidence {checks[key][1]} must be {checks[key][0]}")
 
 
 @dataclass(frozen=True)
@@ -164,6 +192,8 @@ class EvidenceLedger:
 
     @staticmethod
     def _decode(data: bytes) -> Iterable[EvidenceEntry]:
+        if data and not data.endswith(b"\n"):
+            raise ValueError("unterminated A3 evidence at final line")
         entries = []
         for line_number, line in enumerate(data.splitlines(), 1):
             try:
