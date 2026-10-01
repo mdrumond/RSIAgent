@@ -87,7 +87,9 @@ def _host_run(
     except json.JSONDecodeError as exc:
         raise RuntimeError("candidate output is not JSON") from exc
     payload = json.loads((root / input_name).read_text(encoding="utf-8"))
-    expected = [a + b for a, b in zip(payload["input_a"], payload["input_b"])]
+    expected = [
+        a + b for a, b in zip(payload["input_a"], payload["input_b"])
+    ][:payload["logical_length"]]
     if (
         not isinstance(values, list) or len(values) != len(expected)
         or any(isinstance(value, bool) or not isinstance(value, (int, float))

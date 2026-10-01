@@ -28,6 +28,7 @@ def verified(binding=BINDING):
         "project_id": "vector-add",
         "passed": True,
         "max_abs_error": 0.0,
+        "tolerance": 1e-5,
         "exit_code": 0,
         "output_sha256": "c" * 64,
         "source_fingerprint": binding.source_fingerprint,
@@ -87,7 +88,10 @@ def test_timing_uses_exact_neutral_wrapper_device_and_logical_zero(tmp_path):
 
 
 def test_profile_parses_compact_raw_metrics_and_retained_report(tmp_path):
-    request = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION)
+    request = ProfileRequest(
+        BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION,
+        execution_profile="gz-a3",
+    )
     compact = {
         "exported_kernels": ["vector_add"],
         "metric_values": [["raw_vector_ratio", 0.75]],
@@ -208,7 +212,10 @@ def test_timing_replay_revalidates_binding_and_digest(tmp_path, field, value):
     ],
 )
 def test_profile_replay_revalidates_request_binding_and_digest(tmp_path, field, value):
-    request = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION)
+    request = ProfileRequest(
+        BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION,
+        execution_profile="gz-a3",
+    )
     compact = {
         "exported_kernels": ["vector_add"],
         "metric_values": [["vector_ratio", 0.75]],
@@ -270,7 +277,9 @@ def test_non_object_replay_record_is_reported_as_corrupt(tmp_path):
 
 
 def test_missing_or_conflicting_compact_output_fails_without_publication(tmp_path):
-    request = ProfileRequest(BINDING, DIMENSIONS, ProfileMetric.BASIC)
+    request = ProfileRequest(
+        BINDING, DIMENSIONS, ProfileMetric.BASIC, execution_profile="gz-a3"
+    )
 
     def runner(argv, **_kwargs):
         return subprocess.CompletedProcess(argv, 0, output(

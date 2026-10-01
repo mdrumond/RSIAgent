@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
@@ -18,10 +18,11 @@ from .profiling import (
     CompactProfileResult,
     ProfileMetric,
     ProfileRequest,
+    ProfilingTreatment,
     StudyDimensions,
+    TimingRequest,
     TimingResult,
     parse_timing_output,
-    timing_request_id,
 )
 
 
@@ -95,20 +96,18 @@ class GZA3ProfilingBackend:
         replay_id: str | None = None,
     ) -> TimingResult:
         self._require_verified(binding)
-        request_id = timing_request_id(binding, dimensions)
+        request = TimingRequest(binding, dimensions, execution_profile="gz-a3")
+        request_id = request.request_id
         replay = replay_id or f"a3-timing-{request_id[:16]}"
         self._validate_replay(replay)
         retained = self._load_replay(replay, request_id, "timing")
         if retained is not None:
-            return self._timing_from_dict(retained["result"], binding, dimensions)
+            return self._timing_from_dict(retained["result"], request)
         argv = self._wrapper_argv(replay, self._driver_argv("timing", dimensions))
         completed = self._call(argv)
         meta, handle, status = self._validated_output(completed, mode="timing")
-        result = replace(
-            TimingResult.from_samples(
-                binding, dimensions, parse_timing_output(completed.stdout)
-            ),
-            dimensions=dimensions,
+        result = TimingResult.from_samples(
+            request, parse_timing_output(completed.stdout)
         )
         evidence = self._evidence(
             replay, request_id, "timing", handle, status, meta, completed
@@ -121,8 +120,14 @@ class GZA3ProfilingBackend:
         request: ProfileRequest,
         *,
         replay_id: str | None = None,
-    ) -> CompactProfileResult:
+    ) -> CompactProfileResult | None:
+        if request.treatment is ProfilingTreatment.OFF:
+            return None
         self._require_verified(request.binding)
+        if request.execution_profile != "gz-a3":
+            raise ValueError(
+                "profiling request requires the gz-a3 execution profile"
+            )
         replay = replay_id or request.default_replay_id
         self._validate_replay(replay)
         retained = self._load_replay(replay, request.request_id, "profile")
@@ -352,17 +357,14 @@ class GZA3ProfilingBackend:
 
     @staticmethod
     def _timing_from_dict(
-        value: dict, binding: CandidateBinding, dimensions: StudyDimensions
+        value: dict, request: TimingRequest
     ) -> TimingResult:
         try:
             retained = dict(value)
             retained["dimensions"] = StudyDimensions(**retained["dimensions"])
             retained["samples_us"] = tuple(retained["samples_us"])
             result = TimingResult(**retained)
-            expected = replace(
-                TimingResult.from_samples(binding, dimensions, result.samples_us),
-                dimensions=dimensions,
-            )
+            expected = TimingResult.from_samples(request, result.samples_us)
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("retained timing result is corrupt") from exc
         if result != expected:
