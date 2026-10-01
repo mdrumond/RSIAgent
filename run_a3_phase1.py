@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 
 from benchmarks.a3kernels.artifact_prepare import prepare_phase1_artifacts
-from benchmarks.a3kernels.phase1_wave import Phase1Config, Phase1Wave, full_dry_run
+from benchmarks.a3kernels.phase1_wave import (
+    Phase1Config,
+    Phase1Wave,
+    full_dry_run,
+    select_foundation_cells,
+)
 from benchmarks.a3kernels.live_composition import LiveComposition, managed_live_dependencies
 
 
@@ -36,6 +41,12 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--remote", required=True)
             command.add_argument("--remote-workspace", required=True)
             command.add_argument("--physical-device", type=int, required=True)
+            command.add_argument(
+                "--cell-id", action="append", default=[],
+                help="run only this foundation cell; repeat to select more",
+            )
+            command.add_argument("--shard-count", type=int)
+            command.add_argument("--shard-index", type=int)
     return parser
 
 
@@ -65,6 +76,11 @@ def main(argv=None) -> int:
         value = _config(args).preflight(os.environ)
     else:
         import os
+        cells = select_foundation_cells(
+            cell_ids=args.cell_id,
+            shard_count=args.shard_count,
+            shard_index=args.shard_index,
+        )
         cfg = _config(args)
         cfg.preflight(os.environ)
         dependencies = managed_live_dependencies(
@@ -72,7 +88,11 @@ def main(argv=None) -> int:
             remote=args.remote, remote_workspace=args.remote_workspace,
             physical_device=args.physical_device, environ=os.environ,
         )
-        wave = Phase1Wave(cfg, LiveComposition(cfg, dependencies).execute)
+        wave = Phase1Wave(
+            cfg,
+            LiveComposition(cfg, dependencies).execute,
+            cells=cells,
+        )
         value = wave.run() if args.command == "run" else wave.resume()
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     return 0
