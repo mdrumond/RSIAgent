@@ -315,3 +315,74 @@ def test_cli_run_and_resume_route_bz_and_compose_all_eight_cells(
         (cfg.validation_wrapper, "bz-a3-2", "/checked/cpl-remote"),
         (cfg.validation_wrapper, "bz-a3-2", "/checked/cpl-remote"),
     ]
+
+
+def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
+    tmp_path, monkeypatch, capsys,
+):
+    import run_a3_phase1
+
+    cfg = config(tmp_path)
+    cpl_remote = tmp_path / "cpl-remote"
+    cpl_remote.write_text("#!/bin/sh\n")
+    cpl_remote.chmod(0o755)
+    selected = {}
+
+    class InspectingComposition:
+        def __init__(self, _config, dependencies):
+            self.dependencies = dependencies
+
+        def execute(self, cell, paths):
+            proposal = DEFAULT_PROPOSALS[0]
+            candidate = self.dependencies.candidate_factory(cell, proposal, paths)
+            profiler = self.dependencies.profiler_factory(
+                cell, proposal, paths, object(),
+            )
+            selected.update(
+                dependency_profile=self.dependencies.execution_profile,
+                candidate_profile=candidate.backend.profile,
+                candidate_cpl_remote=candidate.backend._cpl_remote,
+                candidate_workspace=candidate.backend._workspace.as_posix(),
+                candidate_device=candidate.backend._device,
+                profiler_profile=profiler.profile_name,
+                profiler_cpl_remote=profiler.cpl_remote,
+                profiler_device=profiler.physical_device,
+            )
+            return {
+                "status": "passed",
+                "evidence_sha256": canonical_digest(selected),
+            }
+
+    monkeypatch.setattr(run_a3_phase1, "LiveComposition", InspectingComposition)
+    monkeypatch.setattr(
+        run_a3_phase1, "_bz_preflight", lambda *args: {"state": "completed"},
+    )
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    cell = __import__(
+        "benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]
+    ).foundation_cells()[0]
+    argv = [
+        "run", "--state-root", str(cfg.state_root),
+        "--validation-wrapper", str(cfg.validation_wrapper),
+        "--embedding-cache", str(cfg.embedding_cache),
+        "--corpus-artifacts", str(cfg.corpus_artifacts),
+        "--knowledge-database", str(cfg.knowledge_database),
+        "--knowledge-manifest", str(cfg.knowledge_manifest),
+        "--profile", "bz-a3-2", "--cpl-remote", str(cpl_remote),
+        "--remote-workspace", "/remote/rsi", "--physical-device", "4",
+        "--cell-id", cell.cell_id,
+    ]
+
+    assert run_a3_phase1.main(argv) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 1
+    assert selected == {
+        "dependency_profile": "bz-a3-2",
+        "candidate_profile": "bz-a3-2",
+        "candidate_cpl_remote": str(cpl_remote),
+        "candidate_workspace": "/remote/rsi",
+        "candidate_device": 4,
+        "profiler_profile": "bz-a3-2",
+        "profiler_cpl_remote": str(cpl_remote),
+        "profiler_device": 4,
+    }
