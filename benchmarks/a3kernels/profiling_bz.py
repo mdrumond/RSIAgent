@@ -20,6 +20,7 @@ from .profiling import (
 )
 
 _PROFILES = frozenset(("bz-a3-1", "bz-a3-2"))
+_WRAPPER_TIMEOUT_GRACE_SECONDS = 30
 _SAFE_REPLAY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _STATE = {
     "profile": "CATLASS_VALIDATION_PROFILE=",
@@ -94,7 +95,8 @@ class BZA3ProfilingBackend:
                 raise RuntimeError("retained timing result does not match its request")
             return result
         completed, evidence = self._execute(
-            replay, request.request_id, "timing", self._command(replay, "timing", dimensions)
+            replay, request.request_id, "timing",
+            self._command(replay, "timing", binding, dimensions),
         )
         result = TimingResult.from_samples(request, parse_timing_output(completed.stdout))
         self._publish(replay, request.request_id, "timing", asdict(result), evidence)
@@ -130,7 +132,7 @@ class BZA3ProfilingBackend:
                 raise RuntimeError("retained profile result does not match its request")
             return result
         command = self._command(
-            replay, "profile", request.dimensions,
+            replay, "profile", request.binding, request.dimensions,
             ("--metric", self._remote_metric(request.metric),
              "--kernel", request.expected_kernel),
         )
@@ -169,17 +171,25 @@ class BZA3ProfilingBackend:
             not isinstance(result, VerifiedResult) or not result.passed
             or result.execution_id != binding.execution_id
             or result.source_fingerprint != binding.source_fingerprint
+            or not isinstance(result.job_handle, str)
+            or not result.job_handle.startswith(self._profile + ":")
             or result.attestation_sha256 != attest(result.attestation_payload())
         ):
-            raise ValueError("profiling requires a host-verified passing candidate")
+            raise ValueError(
+                "profiling requires a host-verified passing candidate from the "
+                "selected BZ-A3 profile"
+            )
 
     def _command(
-        self, replay: str, mode: str, dimensions: StudyDimensions,
+        self, replay: str, mode: str, binding: CandidateBinding,
+        dimensions: StudyDimensions,
         extra: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         driver = (
             "python", f"{self._remote}/a3_profile_driver.py", mode,
             "--candidate-dir", self._remote, "--logical-device", "0",
+            "--execution-id", binding.execution_id,
+            "--source-fingerprint", binding.source_fingerprint,
             "--length", str(dimensions.length), "--block-count", str(dimensions.block_count),
             "--warm-up", str(dimensions.warm_up), "--launch-count", str(dimensions.launch_count),
             *extra,
@@ -200,11 +210,25 @@ class BZA3ProfilingBackend:
         )
         try:
             completed = self._run(
-                argv, text=True, capture_output=True, check=False, timeout=self._timeout,
+                argv, text=True, capture_output=True, check=False,
+                timeout=self._timeout + _WRAPPER_TIMEOUT_GRACE_SECONDS,
                 env={"PATH": os.environ.get("PATH", ""), "CPL_REMOTE": self._cpl_remote},
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("BZ-A3 profiling wrapper timed out") from exc
+            if pending is not None:
+                raise RuntimeError(
+                    "BZ-A3 observation timed out; retry retained handle "
+                    + pending["handle"]
+                ) from exc
+            self._write_once(
+                self._path(replay, "unknown.json"),
+                {"request_id": request_id, "mode": mode,
+                 "status": "submission-timeout"},
+            )
+            raise RuntimeError(
+                "BZ-A3 wrapper deadline expired; submission state is unknown and "
+                "this replay is locked"
+            ) from exc
         markers = self._markers(completed.stdout, required=completed.returncode == 0)
         if completed.returncode:
             if (
@@ -222,6 +246,20 @@ class BZA3ProfilingBackend:
                     f"BZ-A3 observation unavailable; retry retained handle {markers['handle']}"
                 )
             detail = (completed.stderr or completed.stdout or f"exit {completed.returncode}").strip()
+            if (
+                markers.get("profile") == self._profile
+                and markers.get("state") == "failed"
+                and markers.get("handle", "").startswith(self._profile + ":")
+            ):
+                self._write_once(
+                    self._path(replay, "failed.json"),
+                    {"request_id": request_id, "mode": mode, "status": "failed",
+                     "profile": self._profile, "handle": markers["handle"],
+                     "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+                     "stderr_sha256": hashlib.sha256(completed.stderr.encode()).hexdigest(),
+                     "detail": detail},
+                )
+                self._path(replay, "pending.json").unlink(missing_ok=True)
             raise RuntimeError(f"BZ-A3 profiling failed: {detail}")
         if pending is not None and markers["handle"] != pending["handle"]:
             raise RuntimeError("BZ-A3 observation returned a foreign handle")
@@ -272,6 +310,7 @@ class BZA3ProfilingBackend:
         return value
 
     def _load(self, replay: str, request_id: str, mode: str) -> dict[str, object] | None:
+        self._raise_if_blocked(replay, request_id, mode)
         path = self._path(replay, "record.json")
         if not path.exists():
             return None
@@ -284,6 +323,26 @@ class BZA3ProfilingBackend:
             raise ValueError("conflicting replay request")
         self._validate_evidence(evidence, replay, request_id, mode)
         return value
+
+    def _raise_if_blocked(self, replay: str, request_id: str, mode: str) -> None:
+        for name, label in (("unknown.json", "locked after an unknown submission"),
+                            ("failed.json", "previously failed")):
+            path = self._path(replay, name)
+            if not path.exists():
+                continue
+            try:
+                value = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError("retained BZ-A3 replay state is corrupt") from exc
+            if (
+                type(value) is not dict
+                or value.get("request_id") != request_id
+                or value.get("mode") != mode
+            ):
+                raise ValueError("conflicting replay request")
+            detail = value.get("detail")
+            suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+            raise RuntimeError(f"BZ-A3 replay {label}; use a new replay id{suffix}")
 
     def _validate_evidence(
         self, evidence: BZA3RunEvidence, replay: str,

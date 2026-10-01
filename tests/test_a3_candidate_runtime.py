@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -57,6 +58,8 @@ extern "C" __global__ __aicore__ void vector_add(
   AscendC::DataCopyPad(c, output_local, copy);
 }
 '''
+DRIVER_EXECUTION_ID = "d" * 64
+DRIVER_SOURCE_FINGERPRINT = "e" * 64
 
 
 def _output(cwd: Path) -> list[float]:
@@ -346,11 +349,23 @@ def _candidate_directory(
         "input_a": [1] * length + padding, "input_b": [2] * length + padding,
         "logical_length": length, "padded_length": padded, "block_count": block_count,
     }))
+    files = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in ("host_driver.py", "input.json", "a3_candidate.so")
+    }
+    (root / "manifest.json").write_text(json.dumps({
+        "archive_schema": "rsi-a3-candidate-v1",
+        "execution_id": DRIVER_EXECUTION_ID,
+        "source_fingerprint": DRIVER_SOURCE_FINGERPRINT,
+        "files": files,
+    }, sort_keys=True, separators=(",", ":")))
 
 
 def _driver_args(root: Path, *, block_count: int = 1) -> list[str]:
     return [
         "--candidate-dir", str(root.resolve()), "--logical-device", "0",
+        "--execution-id", DRIVER_EXECUTION_ID,
+        "--source-fingerprint", DRIVER_SOURCE_FINGERPRINT,
         "--length", "4", "--block-count", str(block_count), "--warm-up", "0",
         "--launch-count", "1",
     ]

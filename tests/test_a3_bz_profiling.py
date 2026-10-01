@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -19,13 +20,13 @@ BINDING = CandidateBinding("a" * 64, "b" * 64)
 DIMENSIONS = StudyDimensions(33, 2, 3, 5)
 
 
-def verified() -> VerifiedResult:
+def verified(profile: str = "bz-a3-1") -> VerifiedResult:
     body = {
         "request_id": "candidate-request", "execution_id": BINDING.execution_id,
         "attempt_id": "attempt-1", "project_id": "vector-add", "passed": True,
         "max_abs_error": 0.0, "tolerance": 1e-5, "exit_code": 0,
         "output_sha256": "c" * 64, "source_fingerprint": BINDING.source_fingerprint,
-        "evidence_sha256": "d" * 64, "job_handle": "bz-a3-1:verified-job",
+        "evidence_sha256": "d" * 64, "job_handle": f"{profile}:verified-job",
     }
     return VerifiedResult(**body, attestation_sha256=attest(body))
 
@@ -52,7 +53,7 @@ def backend(tmp_path: Path, runner, *, profile="bz-a3-1", result=None):
         cpl_remote="/tools/cpl-remote", profile=profile,
         remote_candidate_directory="/home/user/work/candidate",
         evidence_directory=tmp_path / "evidence", physical_device=4,
-        verified_results={BINDING.execution_id: result or verified()},
+        verified_results={BINDING.execution_id: result or verified(profile)},
         process_runner=runner, timeout=321,
     )
 
@@ -77,8 +78,9 @@ def test_timing_uses_exact_profile_transport_and_logical_zero(tmp_path):
         "--runtime", "py311-torch", "--device", "4", "--timeout",
     )
     assert argv[12:15] == ("321", "--", "python")
-    assert argv[-13:] == (
-        "timing", "--candidate-dir", "/home/user/work/candidate", "--logical-device", "0",
+    assert argv[argv.index("--execution-id") + 1] == BINDING.execution_id
+    assert argv[argv.index("--source-fingerprint") + 1] == BINDING.source_fingerprint
+    assert argv[-8:] == (
         "--length", "33", "--block-count", "2", "--warm-up", "3", "--launch-count", "5",
     )
     assert kwargs["env"]["CPL_REMOTE"] == "/tools/cpl-remote"
@@ -136,6 +138,18 @@ def test_requires_verified_candidate_and_matching_request_without_dispatch(tmp_p
     assert calls == []
 
 
+@pytest.mark.parametrize("handle", [None, "bz-a3-2:verified-job", "gz-a3:verified-job"])
+def test_verified_candidate_handle_must_match_selected_profile(tmp_path, handle):
+    calls = []
+    proof = replace(verified(), job_handle=handle)
+    proof = replace(proof, attestation_sha256=attest(proof.attestation_payload()))
+    with pytest.raises(ValueError, match="selected BZ-A3 profile"):
+        backend(tmp_path, lambda *a, **k: calls.append(a), result=proof).time(
+            BINDING, DIMENSIONS
+        )
+    assert calls == []
+
+
 def test_off_treatment_does_not_validate_or_dispatch(tmp_path):
     calls = []
     request = ProfileRequest(
@@ -168,6 +182,53 @@ def test_observation_reuses_retained_handle_and_never_resubmits(tmp_path):
     assert "run" in calls[0] and "observe" not in calls[0]
     assert calls[1][-3:] == ("observe", "--handle", "bz-a3-1:job-123")
     assert not (tmp_path / "evidence/recover/pending.json").exists()
+
+
+def test_outer_timeout_locks_new_submission_and_pending_observation_is_reused(tmp_path):
+    calls = []
+
+    def timeout(argv, **kwargs):
+        calls.append((tuple(argv), kwargs["timeout"]))
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    concrete = backend(tmp_path, timeout)
+    with pytest.raises(RuntimeError, match="submission state is unknown"):
+        concrete.time(BINDING, DIMENSIONS, replay_id="outer-timeout")
+    with pytest.raises(RuntimeError, match="locked"):
+        concrete.time(BINDING, DIMENSIONS, replay_id="outer-timeout")
+    assert len(calls) == 1
+    assert calls[0][1] == 351
+
+    pending = tmp_path / "evidence/pending-timeout/pending.json"
+    pending.parent.mkdir(parents=True)
+    pending.write_text(json.dumps({
+        "handle": "bz-a3-1:retained", "mode": "timing",
+        "request_id": __import__(
+            "benchmarks.a3kernels.profiling", fromlist=["TimingRequest"]
+        ).TimingRequest(BINDING, DIMENSIONS).request_id,
+    }))
+    with pytest.raises(RuntimeError, match="retry retained handle bz-a3-1:retained"):
+        concrete.time(BINDING, DIMENSIONS, replay_id="pending-timeout")
+    assert calls[-1][0][-3:] == ("observe", "--handle", "bz-a3-1:retained")
+
+
+def test_terminal_failure_is_retained_and_requires_new_replay_id(tmp_path):
+    calls = []
+
+    def runner(argv, **_kwargs):
+        calls.append(tuple(argv))
+        return subprocess.CompletedProcess(
+            argv, 1, output("bz-a3-1", metadata("timing"), state="failed"), "boom"
+        )
+
+    concrete = backend(tmp_path, runner)
+    with pytest.raises(RuntimeError, match="profiling failed") as first:
+        concrete.time(BINDING, DIMENSIONS, replay_id="terminal-failure")
+    with pytest.raises(RuntimeError, match="previously failed") as second:
+        concrete.time(BINDING, DIMENSIONS, replay_id="terminal-failure")
+    assert "boom" in str(first.value) and "boom" in str(second.value)
+    assert len(calls) == 1
+    assert (tmp_path / "evidence/terminal-failure/failed.json").is_file()
 
 
 def test_completed_replay_is_content_addressed_and_does_not_dispatch(tmp_path):
@@ -210,3 +271,30 @@ def test_unsafe_replay_and_corrupt_retained_evidence_are_rejected(tmp_path):
     path.write_text("{}")
     with pytest.raises(RuntimeError, match="corrupt"):
         concrete.time(BINDING, DIMENSIONS, replay_id="corrupt")
+
+
+def test_checked_driver_rejects_stale_manifest_binding_and_staged_hash(tmp_path):
+    from benchmarks.a3kernels.candidate_runtime.a3_profile_driver import (
+        _validate_candidate_identity,
+    )
+
+    staged = tmp_path / "candidate"
+    staged.mkdir()
+    source = staged / "kernel.cpp"
+    source.write_text("kernel")
+    manifest = {
+        "archive_schema": "rsi-a3-candidate-v1",
+        "execution_id": BINDING.execution_id,
+        "source_fingerprint": BINDING.source_fingerprint,
+        "files": {"kernel.cpp": hashlib.sha256(source.read_bytes()).hexdigest()},
+    }
+    (staged / "manifest.json").write_text(json.dumps(manifest, separators=(",", ":")))
+    _validate_candidate_identity(staged, BINDING.execution_id, BINDING.source_fingerprint)
+
+    with pytest.raises(ValueError, match="execution identity"):
+        _validate_candidate_identity(staged, "c" * 64, BINDING.source_fingerprint)
+    with pytest.raises(ValueError, match="source identity"):
+        _validate_candidate_identity(staged, BINDING.execution_id, "c" * 64)
+    source.write_text("stale")
+    with pytest.raises(ValueError, match="staged file digest"):
+        _validate_candidate_identity(staged, BINDING.execution_id, BINDING.source_fingerprint)

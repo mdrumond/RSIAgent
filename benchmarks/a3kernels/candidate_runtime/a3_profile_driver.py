@@ -28,6 +28,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("timing", "profile"):
         command = commands.add_parser(name)
         command.add_argument("--candidate-dir", required=True, type=Path)
+        command.add_argument("--execution-id", required=True)
+        command.add_argument("--source-fingerprint", required=True)
         command.add_argument("--logical-device", required=True, type=int)
         command.add_argument("--length", required=True, type=int)
         command.add_argument("--block-count", required=True, type=int)
@@ -43,6 +45,30 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _validate_candidate_identity(
+    root: Path, execution_id: str, source_fingerprint: str
+) -> None:
+    try:
+        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("staged candidate manifest is invalid") from exc
+    if not isinstance(manifest, dict) or manifest.get("execution_id") != execution_id:
+        raise ValueError("staged candidate has a different execution identity")
+    if manifest.get("source_fingerprint") != source_fingerprint:
+        raise ValueError("staged candidate has a different source identity")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files:
+        raise ValueError("staged candidate manifest has no file digests")
+    for name, expected in files.items():
+        path = root / name if isinstance(name, str) else root
+        if (
+            not isinstance(expected, str) or len(expected) != 64
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+        ):
+            raise ValueError("staged file digest does not match candidate manifest")
+
+
 def _validate(args: argparse.Namespace) -> tuple[Path, str]:
     root = args.candidate_dir.resolve()
     if not args.candidate_dir.is_absolute() or args.logical_device != 0:
@@ -54,6 +80,7 @@ def _validate(args: argparse.Namespace) -> tuple[Path, str]:
     for name in ("host_driver.py", "input.json", "a3_candidate.so"):
         if not (root / name).is_file():
             raise RuntimeError(f"staged candidate is missing {name}")
+    _validate_candidate_identity(root, args.execution_id, args.source_fingerprint)
     payload = json.loads((root / "input.json").read_text(encoding="utf-8"))
     expected = {"input_a", "input_b", "logical_length", "padded_length", "block_count"}
     if (
