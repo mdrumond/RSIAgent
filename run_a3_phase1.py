@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+from benchmarks.a3kernels.artifact_prepare import prepare_phase1_artifacts
 from benchmarks.a3kernels.phase1_wave import Phase1Config, Phase1Wave, full_dry_run
 from benchmarks.a3kernels.live_composition import LiveComposition, managed_live_dependencies
 
@@ -14,6 +15,11 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("dry-run")
+    prepare = sub.add_parser("prepare")
+    prepare.add_argument("--embedding-cache", type=Path, required=True)
+    prepare.add_argument("--corpus-artifacts", type=Path, required=True)
+    prepare.add_argument("--knowledge-database", type=Path, required=True)
+    prepare.add_argument("--knowledge-manifest", type=Path, required=True)
     report = sub.add_parser("report")
     report.add_argument("--state-root", type=Path, required=True)
     for name in ("preflight", "run", "resume"):
@@ -44,6 +50,13 @@ def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "dry-run":
         value = full_dry_run()
+    elif args.command == "prepare":
+        value = prepare_phase1_artifacts(
+            embedding_cache=args.embedding_cache,
+            corpus_artifacts=args.corpus_artifacts,
+            knowledge_database=args.knowledge_database,
+            knowledge_manifest=args.knowledge_manifest,
+        )
     elif args.command == "report":
         cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(5)))
         value = Phase1Wave(cfg, lambda *_: {}).report()
