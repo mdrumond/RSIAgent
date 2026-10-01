@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -18,10 +19,10 @@ extern "C" __global__ __aicore__ void vector_add(
 '''
 
 
-def _plan():
+def _plan(profile="bz-a3-1"):
     return A3CandidateBackend(lambda *a, **k: None).plan(
         SOURCE, request_id="request", attempt_id="attempt", length=3,
-        padded_length=4, block_count=2, seed=4,
+        padded_length=4, block_count=2, seed=4, execution_profile=profile,
     )
 
 
@@ -61,10 +62,13 @@ def _backend(tmp_path: Path, process, *, profile="bz-a3-1", device=2):
     )
 
 
-def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path):
+def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path, monkeypatch):
     calls = []
     plan = _plan()
     expected = [a + b for a, b in zip(plan.input_a, plan.input_b)]
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "aws-secret")
 
     def process(argv, **kwargs):
         calls.append((tuple(argv), kwargs))
@@ -96,18 +100,33 @@ def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path):
     )
     assert upload[-1].startswith("/home/research/.rsi-a3/uploads/")
     compile_argv, execute_argv = calls[1][0], calls[2][0]
-    for argv in (compile_argv, execute_argv):
+    wrapper_env = {
+        "PATH": os.environ["PATH"],
+        "CPL_REMOTE": "/skills/remote-access/scripts/cpl-remote",
+    }
+    for (argv, kwargs) in calls[1:]:
         assert argv[:4] == (
             "/checked/catlass-validation.sh", "--profile", "bz-a3-1", "--operation",
         )
         assert ("--device", "2") == argv[argv.index("--device"):argv.index("--device") + 2]
         assert ("--runtime", "py311-torch") == argv[argv.index("--runtime"):argv.index("--runtime") + 2]
+        assert kwargs["env"] == wrapper_env
+        assert not any("KEY" in name or "SECRET" in name for name in kwargs["env"])
     assert "torch.npu.set_device(0)" in plan.files[3].content
 
 
 @pytest.mark.parametrize("profile", ["bz-a3-1", "bz-a3-2"])
 def test_only_declared_bz_profiles_are_accepted(tmp_path, profile):
     assert _backend(tmp_path, lambda *a, **k: None, profile=profile).profile == profile
+
+
+def test_bz_backend_rejects_plan_for_another_registered_profile(tmp_path):
+    backend = _backend(tmp_path, lambda *a, **k: None)
+
+    with pytest.raises(ValueError, match="execution profile"):
+        backend.compile(_plan("bz-a3-2"), tmp_path / "local")
+    with pytest.raises(ValueError, match="execution profile"):
+        backend.compile(_plan("gz-a3"), tmp_path / "local")
 
 
 @pytest.mark.parametrize("profile", ["gz-a3", "bz-a5", "bz-a3-3"])
@@ -172,11 +191,15 @@ def test_runtime_failure_is_structured_and_does_not_reupload(tmp_path):
     assert sum(call[0].endswith("cpl-remote") for call in calls) == 1
 
 
-def test_observation_unavailable_recovers_exact_compile_handle_without_upload(tmp_path):
+def test_observation_unavailable_recovers_exact_compile_handle_without_upload(
+    tmp_path, monkeypatch,
+):
     calls = []
+    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
 
     def process(argv, **kwargs):
-        calls.append(tuple(argv))
+        calls.append((tuple(argv), kwargs))
         if argv[0].endswith("cpl-remote"):
             return _completed(argv, _upload_terminal())
         if "observe" in argv:
@@ -196,8 +219,13 @@ def test_observation_unavailable_recovers_exact_compile_handle_without_upload(tm
     compilation = _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
 
     assert isinstance(compilation, CandidateCompilation)
-    assert sum(call[0].endswith("cpl-remote") for call in calls) == 1
-    assert calls[-1][-3:] == ("observe", "--handle", "bz-a3-1:compile-pending")
+    assert sum(call[0][0].endswith("cpl-remote") for call in calls) == 1
+    observe_argv, observe_kwargs = calls[-1]
+    assert observe_argv[-3:] == ("observe", "--handle", "bz-a3-1:compile-pending")
+    assert observe_kwargs["env"] == {
+        "PATH": os.environ["PATH"],
+        "CPL_REMOTE": "/skills/remote-access/scripts/cpl-remote",
+    }
 
 
 def test_pending_observation_rejects_foreign_handle_and_remains_recoverable(tmp_path):

@@ -140,6 +140,7 @@ class GZA3RemoteCandidateBackend:
     def compile(
         self, plan: ExecutionPlan, local_directory: Path
     ) -> CandidateCompilation | FailedEvidence:
+        self._require_execution_profile(plan)
         self._bind_state_root(local_directory)
         pending = self._load_pending(plan, "compile")
         if pending is None:
@@ -197,6 +198,7 @@ class GZA3RemoteCandidateBackend:
         if not isinstance(compilation, CandidateCompilation):
             raise TypeError("execute requires a CandidateCompilation")
         plan = compilation.plan
+        self._require_execution_profile(plan)
         directory = self.remote_candidate_directory(plan)
         pending = self._load_pending(plan, "execute")
         argv = (
@@ -247,6 +249,13 @@ class GZA3RemoteCandidateBackend:
         if not isinstance(plan, ExecutionPlan):
             raise TypeError("plan must be an A3 ExecutionPlan")
         return self._workspace / ".rsi-a3" / "candidates" / plan.execution_id
+
+    @staticmethod
+    def _require_execution_profile(plan: ExecutionPlan) -> None:
+        if not isinstance(plan, ExecutionPlan):
+            raise TypeError("plan must be an A3 ExecutionPlan")
+        if plan.execution_profile != "gz-a3":
+            raise ValueError("GZ-A3 backend requires a gz-a3 execution profile")
 
     def _bind_state_root(self, local_directory: Path) -> None:
         selected = (local_directory / ".a3-remote-state").resolve()

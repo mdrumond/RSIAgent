@@ -116,6 +116,16 @@ def test_listener_gate_fails_closed_before_upload(tmp_path):
     assert calls == []
 
 
+def test_gz_backend_rejects_bz_plan_before_transfer(tmp_path):
+    plan = A3CandidateBackend(lambda *a, **k: None).plan(
+        SOURCE, request_id="request", attempt_id="attempt", length=3,
+        padded_length=4, block_count=2, seed=4, execution_profile="bz-a3-1",
+    )
+
+    with pytest.raises(ValueError, match="execution profile"):
+        _backend(tmp_path, lambda *a, **k: None).compile(plan, tmp_path / "local")
+
+
 def test_failed_transfer_and_remote_compile_are_structured(tmp_path):
     def transfer_failure(argv, **kwargs):
         return _completed(argv, "", "upload unavailable", 2)

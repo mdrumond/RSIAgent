@@ -12,6 +12,7 @@ from benchmarks.a3kernels.profiling import (
     CandidateBinding,
     ProfileMetric,
     ProfileRequest,
+    ProfilingTreatment,
     StudyDimensions,
     TimingResult,
 )
@@ -51,6 +52,7 @@ def output(profile: str, *lines: str, state: str = "completed") -> str:
 def backend(tmp_path: Path, runner, *, profile: str = "bz-a3-1", result=None):
     return BZA3ProfilingBackend(
         validation_wrapper="/repo/execution-profiles/catlass-validation.sh",
+        cpl_remote="/tools/cpl-remote",
         profile=profile,
         remote_candidate_directory="/home/user/work/candidate",
         evidence_directory=tmp_path / "evidence",
@@ -94,7 +96,9 @@ def test_timing_uses_exact_bz_profile_native_runtime_and_logical_zero(tmp_path):
         "--logical-device", "0", "--length", "33", "--block-count", "2",
         "--warm-up", "3", "--launch-count", "5",
     )
-    assert kwargs["env"] == {"PATH": kwargs["env"]["PATH"]}
+    assert kwargs["env"] == {
+        "PATH": kwargs["env"]["PATH"], "CPL_REMOTE": "/tools/cpl-remote"
+    }
 
 
 @pytest.mark.parametrize("metric", [ProfileMetric.BASIC, ProfileMetric.PIPE_UTILIZATION])
@@ -148,6 +152,16 @@ def test_host_verified_pass_is_required_before_dispatch(tmp_path):
     concrete = backend(tmp_path, lambda *a, **k: calls.append(a), result=failed)
     with pytest.raises(ValueError, match="verified passing candidate"):
         concrete.time(BINDING, DIMENSIONS)
+    assert calls == []
+
+
+def test_off_treatment_returns_none_without_dispatch(tmp_path):
+    calls = []
+    request = ProfileRequest(
+        BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION,
+        treatment=ProfilingTreatment.OFF, execution_profile="bz-a3-1",
+    )
+    assert backend(tmp_path, lambda *a, **k: calls.append(a)).profile(request) is None
     assert calls == []
 
 
@@ -259,6 +273,7 @@ def test_lazy_bz_live_profile_and_timing_bind_exact_verified_candidate(
         uint32_t count, uint32_t buffer_bytes) {}''',
         request_id="cell", attempt_id="turn-1", project_id="project",
         length=33, padded_length=64, block_count=2, seed=0,
+        execution_profile="bz-a3-1",
     )
     bundle.plans[plan.execution_id] = plan
     store = live.AuthoritativeResultStore(tmp_path / "authority.jsonl")
@@ -297,7 +312,7 @@ def test_lazy_bz_live_profile_and_timing_bind_exact_verified_candidate(
     monkeypatch.setattr(live, "BZA3ProfilingBackend", InjectedProfiler)
     lazy = live._LazyBZProfiler(
         config=config, paths=paths, candidate=candidate,
-        profile="bz-a3-1", physical_device=2,
+        profile="bz-a3-1", physical_device=2, cpl_remote="/tools/cpl-remote",
     )
     request = ProfileRequest(
         CandidateBinding(plan.execution_id, plan.source_fingerprint),
@@ -311,3 +326,71 @@ def test_lazy_bz_live_profile_and_timing_bind_exact_verified_candidate(
     assert timed.samples_us == (2.0, 3.0)
     assert seen[0]["remote_candidate_directory"].endswith(plan.execution_id)
     assert seen[0]["verified_results"] == {plan.execution_id: proof}
+
+
+def test_lazy_profilers_do_not_construct_backend_for_off_treatment(tmp_path, monkeypatch):
+    import benchmarks.a3kernels.live_composition as live
+
+    constructed = []
+    monkeypatch.setattr(
+        live, "BZA3ProfilingBackend",
+        lambda **kwargs: constructed.append(kwargs),
+    )
+    request = ProfileRequest(
+        BINDING, DIMENSIONS, ProfileMetric.PIPE_UTILIZATION,
+        treatment=ProfilingTreatment.OFF,
+    )
+    lazy = object.__new__(live._LazyBZProfiler)
+    lazy.profile_name = "bz-a3-1"
+    assert lazy.profile(request) is None
+    assert constructed == []
+    lazy_gz = object.__new__(live._LazyGZProfiler)
+    assert lazy_gz.profile(request) is None
+
+
+def test_live_factory_passes_exact_cpl_remote_to_profiler(tmp_path, monkeypatch):
+    import benchmarks.a3kernels.live_composition as live
+    from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
+
+    config = phase1_config(tmp_path)
+    managed = BZA3RemoteCandidateBackend(
+        cpl_remote="/selected/cpl-remote",
+        validation_wrapper=str(config.validation_wrapper), profile="bz-a3-1",
+        remote_workspace="/home/user/rsi", physical_device=2,
+    )
+    bundle = live.RemoteCandidateBundle(managed)
+    plan = bundle.planner.plan(
+        '''extern "C" __global__ __aicore__ void vector_add(
+        GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output,
+        uint32_t count, uint32_t buffer_bytes) {}''',
+        request_id="cell", attempt_id="turn-1", project_id="project",
+        length=33, padded_length=64, block_count=2, seed=0,
+        execution_profile="bz-a3-1",
+    )
+    bundle.plans[plan.execution_id] = plan
+    candidate = live._RecordingCandidate(
+        bundle, live.AuthoritativeResultStore(tmp_path / "authority.jsonl")
+    )
+    proof = replace(
+        verified(), execution_id=plan.execution_id,
+        source_fingerprint=plan.source_fingerprint,
+    )
+    proof = replace(proof, attestation_sha256=attest(proof.attestation_payload()))
+    candidate.verified[plan.execution_id] = proof
+    seen = {}
+    class Injected:
+        def __init__(self, **kwargs): seen.update(kwargs)
+        def profile(self, request): return None
+    monkeypatch.setattr(live, "BZA3ProfilingBackend", Injected)
+    lazy = live._LazyBZProfiler(
+        config=config,
+        paths=CellPaths(tmp_path / "cell", tmp_path / "workspace", tmp_path / "memory",
+                        tmp_path / "evidence", tmp_path / "terminal", tmp_path / "driver"),
+        candidate=candidate, profile="bz-a3-1", physical_device=2,
+        cpl_remote="/selected/cpl-remote",
+    )
+    lazy.profile(ProfileRequest(
+        CandidateBinding(plan.execution_id, plan.source_fingerprint),
+        DIMENSIONS, ProfileMetric.PIPE_UTILIZATION,
+    ))
+    assert seen["cpl_remote"] == "/selected/cpl-remote"

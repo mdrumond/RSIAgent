@@ -23,7 +23,9 @@ from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
 from benchmarks.a3kernels.project_execution import (
     PerformancePreset, ProjectRuntimePolicy, RecoveryEvidence,
 )
-from benchmarks.a3kernels.profiling import CompactProfileResult, TimingResult
+from benchmarks.a3kernels.profiling import (
+    CompactProfileResult, ProfilingTreatment, TimingResult,
+)
 from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
 from benchmarks.a3kernels.profiling_bz import BZA3ProfilingBackend
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
@@ -54,6 +56,7 @@ class LiveDependencies:
     candidate_factory: CandidateFactory
     knowledge_factory: Callable[[A3ExperimentCell, CellPaths], object]
     profiler_factory: ProfilerFactory
+    execution_profile: str = "gz-a3"
 
 
 class AuthoritativeResultStore:
@@ -250,6 +253,7 @@ class LiveComposition:
                     policy.study_dimensions
                     if policy.performance_preset is PerformancePreset.TIMING else None
                 ),
+                execution_profile=self.dependencies.execution_profile,
             ).run()
             if trial.status != "passed" or trial.memory_entry_sha256 is None:
                 failure = canonical_digest(
@@ -291,7 +295,14 @@ class RemoteCandidateBundle:
         self.compilations: dict[str, CandidateCompilation] = {}
 
     def _plan(self, source, options):
-        return self.planner.plan(source, **options)
+        selected = dict(options)
+        requested_profile = selected.pop("execution_profile", None)
+        execution_profile = getattr(self.backend, "profile", "gz-a3")
+        if requested_profile is not None and requested_profile != execution_profile:
+            raise ValueError("candidate execution profile does not match its backend")
+        return self.planner.plan(
+            source, execution_profile=execution_profile, **selected
+        )
 
     def compile(self, source, workdir, **options):
         plan = self._plan(source, options)
@@ -327,6 +338,8 @@ class _LazyGZProfiler:
         self.candidate, self.physical_device = candidate, physical_device
 
     def profile(self, request):
+        if request.treatment is ProfilingTreatment.OFF:
+            return None
         remote = self.candidate.backend
         if isinstance(remote, _RecoveryCandidate):
             remote = remote.backend
@@ -369,10 +382,12 @@ class _LazyBZProfiler:
     def __init__(
         self, *, config: Phase1Config, paths: CellPaths,
         candidate: _RecordingCandidate, profile: str, physical_device: int,
+        cpl_remote: str,
     ) -> None:
         self.config, self.paths = config, paths
         self.candidate = candidate
         self.profile_name, self.physical_device = profile, physical_device
+        self.cpl_remote = cpl_remote
 
     def _backend(self, execution_id: str) -> BZA3ProfilingBackend:
         remote = self.candidate.backend
@@ -387,6 +402,7 @@ class _LazyBZProfiler:
             raise ValueError("profiling candidate has no retained remote directory")
         return BZA3ProfilingBackend(
             validation_wrapper=str(self.config.validation_wrapper),
+            cpl_remote=self.cpl_remote,
             profile=self.profile_name,
             remote_candidate_directory=(
                 remote.backend.remote_candidate_directory(plan).as_posix()
@@ -397,6 +413,8 @@ class _LazyBZProfiler:
         )
 
     def profile(self, request):
+        if request.treatment is ProfilingTreatment.OFF:
+            return None
         selected = replace(request, execution_profile=self.profile_name)
         return self._backend(selected.binding.execution_id).profile(selected)
 
@@ -436,6 +454,7 @@ def managed_live_dependencies(
         candidate_factory=candidate_factory,
         knowledge_factory=local_knowledge_factory(config),
         profiler_factory=profiler_factory,
+        execution_profile="gz-a3",
     )
 
 
@@ -471,6 +490,7 @@ def bz_live_dependencies(
         return _LazyBZProfiler(
             config=config, paths=paths, candidate=candidate,
             profile=profile, physical_device=physical_device,
+            cpl_remote=cpl_remote,
         )
 
     return LiveDependencies(
@@ -478,6 +498,7 @@ def bz_live_dependencies(
         candidate_factory=candidate_factory,
         knowledge_factory=local_knowledge_factory(config),
         profiler_factory=profiler_factory,
+        execution_profile=profile,
     )
 
 
