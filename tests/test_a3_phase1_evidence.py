@@ -87,7 +87,7 @@ def test_provenance_checks_only_explicit_route_fields(tmp_path):
 
 
 @pytest.mark.parametrize("profile", ["gz-a3", "bz-a3-1", "bz-a3-2"])
-def test_ledger_accepts_registered_a3_profiles(tmp_path, profile):
+def test_ledger_accepts_registered_a3_execution_profiles(tmp_path, profile):
     entry = EvidenceLedger(tmp_path / f"{profile}.jsonl").append(
         EvidenceKind.ACTION, {"execution_profile": profile}
     )

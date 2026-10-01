@@ -79,7 +79,9 @@ class ExecutionPlan:
         if self.language != A3_LANGUAGE:
             raise ValueError(f"A3 language must be {A3_LANGUAGE}; Catlass is unsupported")
         if self.execution_profile not in A3_EXECUTION_PROFILES:
-            raise ValueError("A3 execution profile must be a registered A3 profile")
+            raise ValueError(
+                "A3 execution profile must be gz-a3, bz-a3-1, or bz-a3-2"
+            )
         if self.runtime != A3_RUNTIME:
             raise ValueError(f"A3 runtime must be {A3_RUNTIME}")
         if self.logical_device != 0:
