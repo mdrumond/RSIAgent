@@ -1,0 +1,220 @@
+"""Tamper-evident, append-only evidence owned by A3 Phase 1."""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, is_dataclass
+from enum import Enum
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping
+
+
+GENESIS_HASH = "0" * 64
+A3_AUTHORITATIVE_EXECUTION_PROFILES = ("bz-a3-1", "bz-a3-2")
+A3_GZ_COMPATIBILITY_EXECUTION_PROFILE = "gz-a3"
+A3_EXECUTION_PROFILES = (
+    *A3_AUTHORITATIVE_EXECUTION_PROFILES,
+    A3_GZ_COMPATIBILITY_EXECUTION_PROFILE,
+)
+
+
+class EvidenceKind(str, Enum):
+    PLAN = "plan"
+    ACTION = "action"
+    ARTIFACT = "artifact"
+    RESULT = "result"
+    FAILURE = "failure"
+
+
+def _normalize(value: Any) -> Any:
+    if is_dataclass(value) and not isinstance(value, type):
+        return _normalize(asdict(value))
+    if isinstance(value, Enum):
+        return value.value
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("canonical evidence cannot contain non-finite numbers")
+        return value
+    if isinstance(value, Mapping):
+        if any(type(key) is not str for key in value):
+            raise TypeError("canonical evidence mappings require string keys")
+        return {key: _normalize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize(item) for item in value]
+    raise TypeError(f"unsupported canonical evidence type: {type(value).__name__}")
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def canonical_bytes(value: Any) -> bytes:
+    return json.dumps(
+        _normalize(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def canonical_digest(value: Any) -> str:
+    return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def _validate_a3_identity(payload: Mapping[str, Any]) -> None:
+    checks = {
+        "target": ("Ascend910B4", "target"),
+        "language": ("ascend-c", "language"),
+        "runtime": ("native-ascend-c", "runtime"),
+    }
+    for key, (expected, label) in checks.items():
+        if key in payload and payload[key] != expected:
+            raise ValueError(f"A3 evidence {label} must be {expected}")
+    profile = payload.get("execution_profile")
+    if profile is not None and profile not in A3_EXECUTION_PROFILES:
+        raise ValueError(
+            "A3 evidence profile must be bz-a3-1, bz-a3-2, or "
+            "the gz-a3 compatibility profile"
+        )
+    provenance = payload.get("runtime_provenance")
+    if isinstance(provenance, Mapping):
+        items = provenance.items()
+    elif isinstance(provenance, (list, tuple)):
+        items = (
+            item
+            for item in provenance
+            if isinstance(item, (list, tuple))
+            and len(item) == 2
+            and isinstance(item[0], str)
+        )
+    else:
+        items = ()
+    for key, value in items:
+        if key == "execution_profile" and value not in A3_EXECUTION_PROFILES:
+            raise ValueError(
+                "A3 evidence profile must be bz-a3-1, bz-a3-2, or "
+                "the gz-a3 compatibility profile"
+            )
+        if key in checks and value != checks[key][0]:
+            raise ValueError(f"A3 evidence {checks[key][1]} must be {checks[key][0]}")
+
+
+@dataclass(frozen=True)
+class EvidenceEntry:
+    sequence: int
+    kind: str
+    payload: Mapping[str, Any]
+    previous_sha256: str
+    entry_sha256: str
+
+    @classmethod
+    def create(
+        cls,
+        sequence: int,
+        kind: EvidenceKind | str,
+        payload: Mapping[str, Any],
+        previous_sha256: str,
+    ) -> "EvidenceEntry":
+        normalized = _normalize(payload)
+        _validate_a3_identity(normalized)
+        body = {
+            "sequence": sequence,
+            "kind": EvidenceKind(kind).value,
+            "payload": normalized,
+            "previous_sha256": previous_sha256,
+        }
+        return cls(
+            sequence=sequence,
+            kind=body["kind"],
+            payload=_freeze(normalized),
+            previous_sha256=previous_sha256,
+            entry_sha256=canonical_digest(body),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "sequence": self.sequence,
+            "kind": self.kind,
+            "payload": self.payload,
+            "previous_sha256": self.previous_sha256,
+            "entry_sha256": self.entry_sha256,
+        }
+
+
+class EvidenceLedger:
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._entries = tuple(self._read())
+        self.verify(self._entries)
+
+    @property
+    def entries(self) -> tuple[EvidenceEntry, ...]:
+        return self._entries
+
+    @property
+    def head_sha256(self) -> str:
+        return self._entries[-1].entry_sha256 if self._entries else GENESIS_HASH
+
+    def append(
+        self, kind: EvidenceKind | str, payload: Mapping[str, Any]
+    ) -> EvidenceEntry:
+        normalized = _normalize(payload)
+        _validate_a3_identity(normalized)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            stream.seek(0)
+            current = tuple(self._decode(stream.read()))
+            self.verify(current)
+            previous = current[-1].entry_sha256 if current else GENESIS_HASH
+            entry = EvidenceEntry.create(len(current), kind, normalized, previous)
+            stream.seek(0, os.SEEK_END)
+            stream.write(canonical_bytes(entry.as_dict()) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._entries = current + (entry,)
+        return entry
+
+    def _read(self) -> Iterable[EvidenceEntry]:
+        return self._decode(self.path.read_bytes()) if self.path.exists() else ()
+
+    @staticmethod
+    def _decode(data: bytes) -> Iterable[EvidenceEntry]:
+        if data and not data.endswith(b"\n"):
+            raise ValueError("unterminated A3 evidence at final line")
+        entries = []
+        for line_number, line in enumerate(data.splitlines(), 1):
+            try:
+                value = json.loads(line)
+                value["payload"] = _freeze(value["payload"])
+                entries.append(EvidenceEntry(**value))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"invalid A3 evidence at line {line_number}") from exc
+        return entries
+
+    @staticmethod
+    def verify(entries: Iterable[EvidenceEntry]) -> None:
+        previous = GENESIS_HASH
+        for expected_sequence, entry in enumerate(entries):
+            if type(entry.sequence) is not int:
+                raise ValueError(f"invalid evidence sequence at {expected_sequence}")
+            if entry.sequence != expected_sequence or entry.previous_sha256 != previous:
+                raise ValueError(f"broken evidence chain at sequence {expected_sequence}")
+            expected = EvidenceEntry.create(
+                entry.sequence, entry.kind, entry.payload, entry.previous_sha256
+            )
+            if entry.entry_sha256 != expected.entry_sha256:
+                raise ValueError(f"invalid evidence digest at sequence {expected_sequence}")
+            previous = entry.entry_sha256
