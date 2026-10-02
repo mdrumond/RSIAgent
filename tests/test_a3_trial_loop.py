@@ -407,6 +407,54 @@ def test_submit_gates_source_identity_verification_and_required_profile(tmp_path
     assert journal.read() == ()
 
 
+def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):
+    class FailSecondCompile(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_calls = 0
+
+        def compile(self, source, workdir, **options):
+            self.compile_calls += 1
+            if self.compile_calls == 2:
+                plan = self._plan(
+                    source, options["request_id"], options["attempt_id"],
+                    options["length"], options["project_id"],
+                    options.get("padded_length"), options.get("block_count", 1),
+                    options.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="compile", error_type="CompileError",
+                    detail="ordinary recompile failure",
+                )
+            return super().compile(source, workdir, **options)
+
+    result, _, journal = _run(
+        tmp_path,
+        [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            '{"action":"compile"}',
+            json.dumps({
+                "action": "submit", "interpretation": "stale result",
+                "supports": [],
+            }),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            json.dumps({
+                "action": "submit", "interpretation": "fresh host result",
+                "supports": [],
+            }),
+        ],
+        candidate=FailSecondCompile(),
+    )
+
+    assert result.status == "passed"
+    assert any("ordinary recompile failure" in failure for failure in result.failures)
+    assert any("host verification" in failure for failure in result.failures)
+    assert len(journal.read()) == 1
+
+
 def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
     result, _, journal = _run(
         tmp_path, ['{"action":"compile"}'] * 3, budgets=TrialBudgets(2, 30)

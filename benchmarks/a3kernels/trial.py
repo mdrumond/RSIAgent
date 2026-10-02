@@ -217,21 +217,23 @@ class A3TrialLoop:
                         raise ValueError("write_source is required before compile")
                     if compile_attempt_id is None:
                         compile_attempt_id = f"turn-{turn}"
-                    compilation = self.candidate.compile(
+                    verified = profile_result = timing_result = None
+                    compile_result = self.candidate.compile(
                         source, self.workdir, request_id=self.cell.cell_id,
                         attempt_id=compile_attempt_id, project_id=self.proposal.project_id,
                         length=self._length(), padded_length=self._padded_length(),
                         block_count=self._block_count(), seed=0,
                         execution_profile=self.execution_profile,
                     )
-                    if isinstance(compilation, FailedEvidence):
+                    if isinstance(compile_result, FailedEvidence):
                         compile_attempt_id = None
                         self._retain_candidate_failure(
-                            turn, "compile", compilation, failures, observations
+                            turn, "compile", compile_result, failures, observations
                         )
                         continue
-                    if not isinstance(compilation, CandidateCompilation):
+                    if not isinstance(compile_result, CandidateCompilation):
                         raise TypeError("candidate compiler returned an invalid result")
+                    compilation = compile_result
                     compile_attempt_id = None
                     observations.append(self._authoritative_observation(
                         kind="compile",
@@ -242,6 +244,7 @@ class A3TrialLoop:
                 elif action.kind == "run":
                     if source is None or compilation is None:
                         raise ValueError("successful compile is required before run")
+                    verified = profile_result = timing_result = None
                     result = self.candidate.run(
                         source, self.workdir, request_id=self.cell.cell_id,
                         attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
@@ -348,7 +351,11 @@ class A3TrialLoop:
         return TrialResult("budget-exhausted", self.budgets.max_turns, tokens, verified, profile_result, queries, tuple(failures))
 
     def _submit_gate(self, source, compilation, verified, profile_result) -> str | None:
-        if source is None or compilation is None or verified is None:
+        if (
+            source is None
+            or not isinstance(compilation, CandidateCompilation)
+            or verified is None
+        ):
             return "source, compile, and host verification are required before submit"
         if verified.source_fingerprint != compilation.plan.source_fingerprint:
             return "candidate source identity changed before submit"

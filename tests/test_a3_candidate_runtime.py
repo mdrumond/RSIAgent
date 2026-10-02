@@ -215,7 +215,9 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(
             report = output / "PROF_1" / "mindstudio_profiler_output"
             report.mkdir(parents=True)
             (report / "op_summary_0.csv").write_text(
-                "Op Name,Duration(us),Raw Counter\nvector_add,12.5,7\n"
+                "Op Name,Duration(us),Raw Counter\n"
+                "helper_kernel,99.0,1234\n"
+                "vector_add,12.5,7\n"
             )
             return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 0, "A3KERNEL_OUTPUT=[3,3,3,3,0,0]\n", "")
@@ -233,8 +235,8 @@ def test_checked_driver_profiles_one_raw_metric_and_retains_report(
                            if line.startswith("A3PROFILE_META=")))
     assert compact["exported_kernels"] == ["vector_add"]
     table = "PROF_1/mindstudio_profiler_output/op_summary_0.csv"
-    assert compact["metric_values"] == [[f"{table}:Raw Counter:0", 7.0]]
-    assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
+    assert compact["metric_values"] == [[f"{table}:Raw Counter:1", 7.0]]
+    assert compact["timeline"] == [[f"{table}:Duration(us):1", 12.5]]
     assert compact["selected_columns"] == [
         f"{table}:Duration(us)", f"{table}:Op Name", f"{table}:Raw Counter"
     ]

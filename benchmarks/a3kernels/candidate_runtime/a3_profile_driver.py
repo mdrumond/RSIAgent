@@ -123,7 +123,7 @@ def _report_digest(root: Path) -> str:
 
 
 def _raw_rows(
-    root: Path, metric: str
+    root: Path, metric: str, requested_kernel: str
 ) -> tuple[list[str], list[list[object]], list[list[object]], list[str]]:
     kernels: set[str] = set()
     values: list[list[object]] = []
@@ -134,13 +134,24 @@ def _raw_rows(
         with path.open(newline="", encoding="utf-8-sig") as stream:
             reader = csv.DictReader(stream)
             columns = tuple(reader.fieldnames or ())
-            if not any(column.strip().lower() in _KERNEL_COLUMNS for column in columns):
+            kernel_columns = tuple(
+                column for column in columns
+                if column.strip().lower() in _KERNEL_COLUMNS
+            )
+            if not kernel_columns:
                 continue
-            selected_columns.update(f"{relative}:{column}" for column in columns)
             for row_number, row in enumerate(reader):
+                row_kernels = {
+                    raw.strip() for column in kernel_columns
+                    if (raw := row.get(column))
+                }
+                if requested_kernel not in row_kernels:
+                    continue
+                kernels.add(requested_kernel)
+                selected_columns.update(
+                    f"{relative}:{column}" for column in columns
+                )
                 for column, raw in row.items():
-                    if column.strip().lower() in _KERNEL_COLUMNS and raw:
-                        kernels.add(raw.strip())
                     try:
                         number = float(raw)
                     except (TypeError, ValueError):
@@ -217,7 +228,9 @@ def main(
     completed = process_runner(command, cwd=root, text=True, capture_output=True, check=False)
     if completed.returncode:
         raise RuntimeError((completed.stderr or completed.stdout or "msprof failed").strip())
-    kernels, values, timeline, selected_columns = _raw_rows(report, args.metric)
+    kernels, values, timeline, selected_columns = _raw_rows(
+        report, args.metric, args.kernel
+    )
     if args.kernel not in kernels:
         raise RuntimeError("msprof raw table does not contain the expected kernel")
     compact = {
