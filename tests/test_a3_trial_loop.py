@@ -18,7 +18,7 @@ from benchmarks.a3kernels.candidate import (
 from benchmarks.a3kernels.knowledge_agent import (
     Citation, KnowledgeQuery, KnowledgeResult,
 )
-from benchmarks.a3kernels.phase1_evidence import EvidenceLedger
+from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a3kernels.phase1_memory import (
     AuthoritativeEvidence, Phase1LearningJournal,
 )
@@ -155,7 +155,7 @@ class FakeProfiler:
 def _run(
     tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
     candidate=None, budgets=None, completion_tokens=1,
-    execution_profile="gz-a3",
+    execution_profile="gz-a3", evidence=None,
 ):
     selected = cell or _cell()
     profile = load_a3_model_profile(selected.backend_model)
@@ -188,7 +188,8 @@ def _run(
     loop = A3TrialLoop(
         cell=selected, proposal=DEFAULT_PROPOSALS[0], profile=profile, actor=actor,
         candidate=selected_candidate, knowledge=knowledge or FakeKnowledge(False),
-        profiler=selected_profiler, evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
+        profiler=selected_profiler,
+        evidence=evidence or EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work", budgets=budgets or TrialBudgets(10, 2000),
         execution_profile=execution_profile,
     )
@@ -490,13 +491,129 @@ def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_pa
     )
 
     assert result.status == "passed" and result.turns == 5
+    assert result.tokens == 4
     assert result.failures == ("provider response failure: invalid-content-or-usage",)
     assert len(prompts) == 5 and journal.resume_state().completed_projects == 1
     failure = EvidenceLedger(tmp_path / "evidence.jsonl").entries[0]
     assert failure.kind == "failure"
     assert failure.payload["provider_response_failure"] == {
         "code": "invalid-content-or-usage",
+        "completion_tokens": None,
     }
+
+
+def test_provider_failure_usage_is_debited_before_budget_continuation(tmp_path):
+    calls = []
+
+    def malformed(_context):
+        calls.append("provider")
+        raise A3ProviderResponseError(
+            "invalid-content-or-usage", completion_tokens=7,
+        )
+
+    result, _, journal = _run(
+        tmp_path, [malformed, malformed, malformed],
+        budgets=TrialBudgets(3, 10),
+    )
+
+    assert result.status == "budget-exhausted"
+    assert result.turns == 2 and result.tokens == 14
+    assert result.failures == (
+        "provider response failure: invalid-content-or-usage",
+        "provider response failure: invalid-content-or-usage",
+        "token budget exhausted",
+    )
+    assert calls == ["provider", "provider"]
+    assert journal.read() == ()
+    failures = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    assert [
+        entry.payload["provider_response_failure"]["completion_tokens"]
+        for entry in failures
+    ] == [7, 7]
+
+
+def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(
+    tmp_path,
+):
+    class InjectedCrash(RuntimeError):
+        pass
+
+    class CrashAfterFirstProviderFailure(EvidenceLedger):
+        def append(self, kind, payload):
+            entry = super().append(kind, payload)
+            if "provider_response_failure" in payload:
+                raise InjectedCrash("after retained provider failure")
+            return entry
+
+    calls = []
+
+    def malformed(_context):
+        calls.append("provider")
+        raise A3ProviderResponseError(
+            "invalid-content-or-usage", completion_tokens=3,
+        )
+
+    path = tmp_path / "evidence.jsonl"
+    with pytest.raises(InjectedCrash, match="after retained"):
+        _run(
+            tmp_path, [malformed], budgets=TrialBudgets(2, 100),
+            evidence=CrashAfterFirstProviderFailure(path),
+        )
+
+    result, prompts, journal = _run(
+        tmp_path, [malformed], budgets=TrialBudgets(2, 100),
+    )
+
+    assert result.status == "budget-exhausted"
+    assert result.turns == 2 and result.tokens == 6
+    assert calls == ["provider", "provider"]
+    assert len(prompts) == 1 and journal.read() == ()
+    recovered = json.loads(prompts[0])["observations"]
+    assert recovered == [{
+        "provider_response_failure": {
+            "code": "invalid-content-or-usage",
+            "completion_tokens": 3,
+        }
+    }]
+    entries = EvidenceLedger(path).entries
+    assert [entry.payload["turn"] for entry in entries] == [1, 2]
+    assert all(entry.kind == "failure" for entry in entries)
+
+    reference_calls = []
+
+    def reference_malformed(_context):
+        reference_calls.append("provider")
+        raise A3ProviderResponseError(
+            "invalid-content-or-usage", completion_tokens=3,
+        )
+
+    reference, _, _ = _run(
+        tmp_path / "reference", [reference_malformed, reference_malformed],
+        budgets=TrialBudgets(2, 100),
+    )
+    assert reference_calls == ["provider", "provider"]
+    assert result == reference
+    assert path.read_bytes() == (
+        tmp_path / "reference" / "evidence.jsonl"
+    ).read_bytes()
+
+
+def test_provider_failure_recovery_does_not_hide_mixed_partial_state(tmp_path):
+    _run(
+        tmp_path, [A3ProviderResponseError("invalid-content-or-usage")],
+        budgets=TrialBudgets(1, 100),
+    )
+    cell = _cell()
+    EvidenceLedger(tmp_path / "evidence.jsonl").append(EvidenceKind.ACTION, {
+        "target": "Ascend910B4", "language": "ascend-c",
+        "execution_profile": "gz-a3", "runtime": "native-ascend-c",
+        "cell_id": cell.cell_id,
+        "project_id": DEFAULT_PROPOSALS[0].project_id,
+        "turn": 2, "action": "compile",
+    })
+
+    with pytest.raises(ValueError, match="only leading retained failures"):
+        _run(tmp_path, [])
 
 
 @pytest.mark.parametrize("error", [ValueError("actor bug"), RuntimeError("actor bug")])

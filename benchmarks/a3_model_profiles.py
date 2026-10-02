@@ -37,10 +37,17 @@ _PROVIDER_RESPONSE_MESSAGES = {
 class A3ProviderResponseError(ValueError):
     """Sanitized, deterministic failure of the provider response contract."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(
+        self, code: str, *, completion_tokens: int | None = None,
+    ) -> None:
         if code not in _PROVIDER_RESPONSE_MESSAGES:
             raise ValueError("provider response failure code is not registered")
+        if completion_tokens is not None and (
+            type(completion_tokens) is not int or completion_tokens < 1
+        ):
+            raise ValueError("provider response token usage must be positive")
         self.code = code
+        self.completion_tokens = completion_tokens
         super().__init__(_PROVIDER_RESPONSE_MESSAGES[code])
 
 
@@ -274,7 +281,14 @@ def _validated_transport_result(text: Any, completion_tokens: Any) -> A3Transpor
     try:
         _validate_completion_values(text, completion_tokens, label="transport result")
     except ValueError:
-        raise A3ProviderResponseError("invalid-content-or-usage") from None
+        usage = (
+            completion_tokens
+            if type(completion_tokens) is int and completion_tokens > 0
+            else None
+        )
+        raise A3ProviderResponseError(
+            "invalid-content-or-usage", completion_tokens=usage,
+        ) from None
     return A3TransportResult(text, completion_tokens)
 
 
@@ -333,7 +347,15 @@ def complete_a3(
             },
         )
     except ValueError:
-        raise A3ProviderResponseError("invalid-content-or-usage") from None
+        usage = (
+            result.completion_tokens
+            if type(result.completion_tokens) is int
+            and result.completion_tokens > 0
+            else None
+        )
+        raise A3ProviderResponseError(
+            "invalid-content-or-usage", completion_tokens=usage,
+        ) from None
 
 
 __all__ = [

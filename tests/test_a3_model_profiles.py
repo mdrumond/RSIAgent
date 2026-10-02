@@ -226,6 +226,18 @@ def test_live_completion_rejects_empty_or_whitespace_provider_content(text):
             transport=lambda **_kwargs: A3TransportResult(text, 7),
         )
     assert raised.value.code == "invalid-content-or-usage"
+    assert raised.value.completion_tokens == 7
+
+
+@pytest.mark.parametrize("usage", [0, -1, True, None])
+def test_invalid_provider_usage_is_not_reported_as_consumed_tokens(usage):
+    with pytest.raises(A3ProviderResponseError) as raised:
+        complete_a3(
+            "system", "user", model=BackendModel.DEEPSEEK_FLASH,
+            environ={"DEEPSEEK_API_KEY": "secret"},
+            transport=lambda **_kwargs: A3TransportResult("candidate", usage),
+        )
+    assert raised.value.completion_tokens is None
 
 
 def test_openai_compatible_response_rejects_missing_content(monkeypatch):
