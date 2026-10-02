@@ -57,6 +57,14 @@ def test_execution_dimensions_are_validated_and_identity_bound():
         plan(logical_length=2, padded_length=3)
 
 
+@pytest.mark.parametrize("profile", ["gz-a3", "bz-a3-1", "bz-a3-2"])
+def test_plan_accepts_registered_a3_execution_profiles(profile):
+    execution = plan(execution_profile=profile)
+    assert execution.execution_profile == profile
+    if profile != "gz-a3":
+        assert execution.execution_id != plan().execution_id
+
+
 @pytest.mark.parametrize(
     "changes, message",
     [

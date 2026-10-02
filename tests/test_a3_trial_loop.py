@@ -148,6 +148,7 @@ class FakeProfiler:
 def _run(
     tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
     candidate=None, budgets=None, completion_tokens=1,
+    execution_profile="gz-a3",
 ):
     selected = cell or _cell()
     profile = load_a3_model_profile(selected.backend_model)
@@ -177,6 +178,7 @@ def _run(
         candidate=selected_candidate, knowledge=knowledge or FakeKnowledge(False),
         profiler=selected_profiler, evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work", budgets=budgets or TrialBudgets(10, 2000),
+        execution_profile=execution_profile,
     )
     return loop.run(), prompts, journal
 
@@ -263,6 +265,34 @@ def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
     }
     assert profiler.requests[0].treatment.value == cell.profiling.value
     assert result.profile_result.candidate_execution_id == result.verified.execution_id
+    profile_observation = json.loads(prompts[5])["observations"][-1]
+    assert profile_observation == {
+        "profile_evidence": {
+            "evidence_sha256": result.profile_result.evidence_sha256,
+            "metric": "PipeUtilization",
+            "metric_values": [["vector_ratio", 0.75]],
+            "timeline": [["kernel_count", 20.0]],
+        }
+    }
+    profile_fact = next(
+        fact for fact in json.loads((tmp_path / "memory.jsonl").read_text())["memory"]["host_facts"]
+        if fact["category"] == "profiling"
+    )
+    assert "vector_ratio=0.75" in profile_fact["statement"]
+    assert "kernel_count=20" in profile_fact["statement"]
+
+
+def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):
+    result, _, _ = _run(
+        tmp_path,
+        [json.dumps({"action": "write_source", "source": SOURCE}),
+         '{"action":"compile"}', '{"action":"run"}',
+         json.dumps({"action": "submit", "interpretation": "host facts", "supports": []})],
+        execution_profile="bz-a3-2",
+    )
+    assert result.status == "passed"
+    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    assert {entry.payload["execution_profile"] for entry in entries} == {"bz-a3-2"}
 
 
 def test_submit_gates_source_identity_verification_and_required_profile(tmp_path):

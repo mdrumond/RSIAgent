@@ -24,6 +24,7 @@ from benchmarks.a3kernels.phase1_memory import (
     ProjectMemory,
 )
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
+from benchmarks.a3kernels.phase1_protocol import A3_EXECUTION_PROFILES
 from benchmarks.a3kernels.phase1_registry import CurriculumProposal
 from benchmarks.a3kernels.profiling import (
     A3ProfilingSession,
@@ -57,6 +58,8 @@ _ACTION_FIELDS = {
 }
 _KNOWLEDGE_RESULT_LIMIT = 5
 _KNOWLEDGE_TEXT_LIMIT = 2048
+_PROFILE_PAIR_LIMIT = 16
+_PROFILE_NAME_LIMIT = 128
 
 
 def parse_action(text: str) -> Action:
@@ -152,6 +155,8 @@ class A3TrialLoop:
         memory: Phase1LearningJournal,
         workdir: Path,
         budgets: TrialBudgets | None = None,
+        timing_dimensions: StudyDimensions | None = None,
+        execution_profile: str = "gz-a3",
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -168,12 +173,19 @@ class A3TrialLoop:
         self.actor, self.candidate, self.knowledge, self.profiler = actor, candidate, knowledge, profiler
         self.evidence, self.memory, self.workdir = evidence, memory, Path(workdir)
         self.budgets = budgets if budgets is not None else TrialBudgets.for_model(cell.backend_model)
+        if execution_profile not in A3_EXECUTION_PROFILES:
+            raise ValueError("trial execution_profile must be a registered A3 profile")
+        self.execution_profile = execution_profile
+        if timing_dimensions is not None and not isinstance(timing_dimensions, StudyDimensions):
+            raise TypeError("timing_dimensions must be StudyDimensions")
+        self.timing_dimensions = timing_dimensions
 
     def run(self) -> TrialResult:
         source = None
         compilation = None
         verified = None
         profile_result = None
+        timing_result = None
         failures: list[str] = []
         observations: list[object] = []
         actions: list[str] = []
@@ -203,6 +215,7 @@ class A3TrialLoop:
                         attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
                         length=self._length(), padded_length=self._padded_length(),
                         block_count=self._block_count(), seed=0,
+                        execution_profile=self.execution_profile,
                     )
                     if isinstance(compilation, FailedEvidence):
                         self._retain_candidate_failure(
@@ -220,6 +233,7 @@ class A3TrialLoop:
                         attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
                         length=self._length(), padded_length=self._padded_length(),
                         block_count=self._block_count(), seed=0,
+                        execution_profile=self.execution_profile,
                     )
                     if isinstance(result, FailedEvidence):
                         self._retain_candidate_failure(
@@ -268,20 +282,34 @@ class A3TrialLoop:
                             if self.cell.profiling is ProfilingGuidance.WITH_GUIDANCE
                             else ProfilingTreatment.OFF
                         ),
+                        execution_profile=self.execution_profile,
                     )
                     profile_result = self.profiler.profile(request)
-                    observations.append("profiling disabled" if profile_result is None else "profile captured")
+                    observations.append(
+                        "profiling disabled" if profile_result is None
+                        else self._profile_observation(profile_result)
+                    )
                 elif action.kind == "submit":
                     failure = self._submit_gate(source, compilation, verified, profile_result)
                     if failure:
                         raise ValueError(failure)
                     assert verified is not None
+                    if self.timing_dimensions is not None and timing_result is None:
+                        timing_result = self.profiler.time(
+                            CandidateBinding(verified.execution_id, verified.source_fingerprint),
+                            self.timing_dimensions,
+                        )
                     facts = [
                         HostFact("compile", "candidate compiled with the host-owned fixture", compilation.attestation_sha256),
                         HostFact("host-verification", "candidate output passed host verification", verified.evidence_sha256),
                     ]
                     if profile_result is not None:
-                        facts.append(HostFact("profiling", "compact profile captured", profile_result.evidence_sha256))
+                        facts.append(HostFact(
+                            "profiling", self._profile_statement(profile_result),
+                            profile_result.evidence_sha256,
+                        ))
+                    if timing_result is not None:
+                        facts.append(HostFact("profiling", "host timing samples captured", timing_result.evidence_sha256))
                     interpretation = AgentInterpretation(
                         action.interpretation, action.supports
                     )
@@ -340,7 +368,8 @@ class A3TrialLoop:
     def _identity(self, payload: Mapping[str, object]) -> dict[str, object]:
         return {
             "target": "Ascend910B4", "language": "ascend-c",
-            "execution_profile": "gz-a3", "runtime": "native-ascend-c",
+            "execution_profile": self.execution_profile,
+            "runtime": "native-ascend-c",
             "cell_id": self.cell.cell_id, "project_id": self.proposal.project_id,
             **payload,
         }
@@ -350,6 +379,30 @@ class A3TrialLoop:
             EvidenceKind.ACTION,
             self._identity({"turn": turn, "action": action.kind}),
         )
+
+    @staticmethod
+    def _profile_pairs(values) -> list[list[object]]:
+        return [
+            [str(name)[:_PROFILE_NAME_LIMIT], float(value)]
+            for name, value in values[:_PROFILE_PAIR_LIMIT]
+        ]
+
+    @classmethod
+    def _profile_observation(cls, result: CompactProfileResult) -> dict[str, object]:
+        return {"profile_evidence": {
+            "metric": result.metric.value,
+            "metric_values": cls._profile_pairs(result.metric_values),
+            "timeline": cls._profile_pairs(result.timeline),
+            "evidence_sha256": result.evidence_sha256,
+        }}
+
+    @classmethod
+    def _profile_statement(cls, result: CompactProfileResult) -> str:
+        def render(values) -> str:
+            return ",".join(f"{name}={value:.12g}" for name, value in values)
+        metrics = render(cls._profile_pairs(result.metric_values))
+        timeline = render(cls._profile_pairs(result.timeline))
+        return f"raw {result.metric.value}: metrics[{metrics}] timeline[{timeline}]"
 
     def _context(self, observations: list[object], source: str | None) -> str:
         return json.dumps(

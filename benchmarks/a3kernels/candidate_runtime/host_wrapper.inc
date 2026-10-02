@@ -1,4 +1,5 @@
 #include <ATen/Operators.h>
+#include <cstdint>
 #include <torch/all.h>
 #include <torch/library.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
@@ -6,7 +7,7 @@
 
 namespace rsi_a3candidate_host {
 torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
-                        int padded_length, int block_count) {
+                        int64_t padded_length, int64_t block_count) {
   TORCH_CHECK(a.device().type() == c10::DeviceType::PrivateUse1,
               "a must be an NPU tensor");
   TORCH_CHECK(b.device() == a.device() && a.sizes() == b.sizes(),
@@ -25,9 +26,10 @@ torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
   auto output = torch::empty_like(a);
   auto stream = c10_npu::getCurrentNPUStream().stream(false);
   const auto count = static_cast<uint32_t>(a.numel());
+  const auto launch_blocks = static_cast<uint32_t>(block_count);
   const uint32_t buffer_bytes = (count * sizeof(float) + 31U) & ~31U;
   auto launch = [=]() -> int {
-    ::vector_add<<<block_count, nullptr, stream>>>(
+    ::vector_add<<<launch_blocks, nullptr, stream>>>(
         (GM_ADDR)a.data_ptr(), (GM_ADDR)b.data_ptr(),
         (GM_ADDR)output.data_ptr(), count, buffer_bytes);
     return 0;

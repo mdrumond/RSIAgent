@@ -14,6 +14,7 @@ import subprocess
 from typing import Callable
 
 from benchmarks.a3kernels.phase1_protocol import (
+    A3_EXECUTION_PROFILE,
     ExecutionPlan,
     ExecutionReceipt,
     FailedEvidence,
@@ -24,7 +25,7 @@ from benchmarks.a3kernels.phase1_protocol import (
 
 
 _PACKAGE = "benchmarks.a3kernels.candidate_runtime"
-_HOST_FILES = ("build.json", "host_driver.py", "host_wrapper.inc")
+_HOST_FILES = ("a3_profile_driver.py", "build.json", "host_driver.py", "host_wrapper.inc")
 _COMPILE_ARGV = ("python", "host_driver.py", "--compile-only")
 _RUN_ARGV = ("python", "host_driver.py", "input.json")
 _COMPILE_MARKER = "A3CANDIDATE_COMPILED="
@@ -44,6 +45,12 @@ def _host_source_files() -> tuple[SourceFile, ...]:
         SourceFile(name, root.joinpath(name).read_text(encoding="utf-8"))
         for name in _HOST_FILES
     )
+
+
+def profile_driver_asset() -> SourceFile:
+    """Return the exact staged driver bytes and their ``SourceFile.sha256`` binding."""
+
+    return next(item for item in _host_source_files() if item.relative_path == "a3_profile_driver.py")
 
 
 def validate_candidate_source(source: str) -> None:
@@ -87,6 +94,7 @@ class A3CandidateBackend:
         block_count: int = 1,
         seed: int,
         project_id: str = "vector-add",
+        execution_profile: str = A3_EXECUTION_PROFILE,
     ) -> ExecutionPlan:
         validate_candidate_source(source)
         if type(length) is not int or not 1 <= length <= 4096:
@@ -114,6 +122,7 @@ class A3CandidateBackend:
             logical_length=length,
             padded_length=padded_length,
             block_count=block_count,
+            execution_profile=execution_profile,
         )
 
     def compile(
@@ -128,11 +137,13 @@ class A3CandidateBackend:
         block_count: int = 1,
         seed: int = 0,
         project_id: str = "vector-add",
+        execution_profile: str = A3_EXECUTION_PROFILE,
     ) -> CandidateCompilation | FailedEvidence:
         plan = self.plan(
             source, request_id=request_id, attempt_id=attempt_id,
             length=length, padded_length=padded_length, block_count=block_count,
             seed=seed, project_id=project_id,
+            execution_profile=execution_profile,
         )
         self._stage(plan, workdir)
         return self._compile(plan, workdir)
@@ -149,11 +160,13 @@ class A3CandidateBackend:
         block_count: int = 1,
         seed: int = 0,
         project_id: str = "vector-add",
+        execution_profile: str = A3_EXECUTION_PROFILE,
     ) -> VerifiedResult | FailedEvidence:
         plan = self.plan(
             source, request_id=request_id, attempt_id=attempt_id,
             length=length, padded_length=padded_length, block_count=block_count,
             seed=seed, project_id=project_id,
+            execution_profile=execution_profile,
         )
         self._stage(plan, workdir)
         compilation = self._compile(plan, workdir)
@@ -263,5 +276,5 @@ def _detail(completed: subprocess.CompletedProcess[str]) -> str:
 
 __all__ = [
     "A3CandidateBackend", "CandidateCompilation", "FailedEvidence",
-    "VerifiedResult", "validate_candidate_source",
+    "VerifiedResult", "profile_driver_asset", "validate_candidate_source",
 ]
