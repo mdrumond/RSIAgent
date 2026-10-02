@@ -162,8 +162,11 @@ def _run(
     def actor(actual_profile, context):
         assert actual_profile == profile
         prompts.append(context)
+        action = queue.pop(0)
+        if callable(action):
+            action = action(context)
         return A3Completion(
-            queue.pop(0), completion_tokens,
+            action, completion_tokens,
             {"profile_sha256": profile.fingerprint},
         )
     journal = Phase1LearningJournal(
@@ -219,6 +222,42 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
         json.loads(prompt)["candidate_source_contract"] == contract
         for prompt in prompts
     )
+
+
+def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
+    submitted_supports = []
+
+    def submit_from_context(context):
+        observations = json.loads(context)["observations"]
+        authoritative = [
+            item["authoritative_evidence"]
+            for item in observations
+            if isinstance(item, dict) and "authoritative_evidence" in item
+        ]
+        assert [item["kind"] for item in authoritative] == [
+            "compile", "host-verification",
+        ]
+        assert all(item["status"] == "passed" for item in authoritative)
+        assert len({item["source_fingerprint"] for item in authoritative}) == 1
+        submitted_supports.extend(item["evidence_sha256"] for item in authoritative)
+        assert all(len(digest) == 64 for digest in submitted_supports)
+        return json.dumps({
+            "action": "submit",
+            "interpretation": "host compilation and verification passed",
+            "supports": submitted_supports,
+        })
+
+    result, _, journal = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        '{"action":"run"}',
+        submit_from_context,
+    ])
+
+    assert result.status == "passed"
+    assert journal.read()[0]["memory"]["agent_interpretations"][0][
+        "supports"
+    ] == submitted_supports
 
 
 def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):

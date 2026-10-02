@@ -227,7 +227,12 @@ class A3TrialLoop:
                         continue
                     if not isinstance(compilation, CandidateCompilation):
                         raise TypeError("candidate compiler returned an invalid result")
-                    observations.append("host compile passed")
+                    observations.append(self._authoritative_observation(
+                        kind="compile",
+                        evidence_sha256=compilation.attestation_sha256,
+                        source_fingerprint=compilation.plan.source_fingerprint,
+                        execution_id=compilation.plan.execution_id,
+                    ))
                 elif action.kind == "run":
                     if source is None or compilation is None:
                         raise ValueError("successful compile is required before run")
@@ -248,7 +253,12 @@ class A3TrialLoop:
                     if result.source_fingerprint != compilation.plan.source_fingerprint:
                         raise ValueError("candidate source identity changed after compile")
                     verified = result
-                    observations.append("host verification passed")
+                    observations.append(self._authoritative_observation(
+                        kind="host-verification",
+                        evidence_sha256=result.evidence_sha256,
+                        source_fingerprint=result.source_fingerprint,
+                        execution_id=result.execution_id,
+                    ))
                 elif action.kind == "query":
                     queries += 1
                     results = self.knowledge.query(KnowledgeQuery(action.query, action.limit))
@@ -367,6 +377,19 @@ class A3TrialLoop:
             EvidenceKind.FAILURE,
             self._identity({"turn": turn, "failed_evidence": failure}),
         )
+
+    @staticmethod
+    def _authoritative_observation(
+        *, kind: str, evidence_sha256: str, source_fingerprint: str,
+        execution_id: str,
+    ) -> dict[str, object]:
+        return {"authoritative_evidence": {
+            "kind": kind,
+            "status": "passed",
+            "evidence_sha256": evidence_sha256,
+            "source_fingerprint": source_fingerprint,
+            "execution_id": execution_id,
+        }}
 
     def _identity(self, payload: Mapping[str, object]) -> dict[str, object]:
         return {
