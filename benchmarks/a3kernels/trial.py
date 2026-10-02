@@ -13,7 +13,9 @@ from benchmarks.a3_experiments import (
     KnowledgeMode,
     ProfilingGuidance,
 )
-from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile
+from benchmarks.a3_model_profiles import (
+    A3Completion, A3ModelProfile, A3ProviderResponseError,
+)
 from benchmarks.a3kernels.candidate import (
     CANDIDATE_SOURCE_CONTRACT,
     CandidateCompilation,
@@ -195,7 +197,15 @@ class A3TrialLoop:
         compile_attempt_id: str | None = None
         tokens = queries = 0
         for turn in range(1, self.budgets.max_turns + 1):
-            completion = self.actor(self.profile, self._context(observations, source))
+            try:
+                completion = self.actor(
+                    self.profile, self._context(observations, source)
+                )
+            except A3ProviderResponseError as exc:
+                self._retain_provider_response_failure(
+                    turn, exc, failures, observations
+                )
+                continue
             if not isinstance(completion, A3Completion):
                 raise TypeError("actor must return A3Completion")
             tokens += completion.completion_tokens
@@ -349,6 +359,25 @@ class A3TrialLoop:
                 observations.append("failure: " + failure)
                 self.evidence.append(EvidenceKind.FAILURE, self._identity({"turn": turn, "detail": failure}))
         return TrialResult("budget-exhausted", self.budgets.max_turns, tokens, verified, profile_result, queries, tuple(failures))
+
+    def _retain_provider_response_failure(
+        self,
+        turn: int,
+        failure: A3ProviderResponseError,
+        failures: list[str],
+        observations: list[object],
+    ) -> None:
+        detail = f"provider response failure: {failure.code}"
+        structured = {"code": failure.code}
+        failures.append(detail)
+        observations.append({"provider_response_failure": structured})
+        self.evidence.append(
+            EvidenceKind.FAILURE,
+            self._identity({
+                "turn": turn,
+                "provider_response_failure": structured,
+            }),
+        )
 
     def _submit_gate(self, source, compilation, verified, profile_result) -> str | None:
         if (

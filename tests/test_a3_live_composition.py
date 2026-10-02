@@ -23,7 +23,7 @@ from benchmarks.a3kernels.knowledge_agent import (
     KnowledgeQuery,
     QueryJournal,
 )
-from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_evidence import EvidenceLedger, canonical_digest
 from benchmarks.a3kernels.phase1_protocol import (
     ExecutionReceipt, FailedEvidence, VerifiedResult, attest,
 )
@@ -31,7 +31,7 @@ from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.project_execution import ProjectRuntimePolicy, RecoveryEvidence
 from benchmarks.a3kernels.phase1_wave import (
     SMOKE_PROPOSALS, Phase1Config,
-    Phase1Wave,
+    Phase1Wave, SmokeWave,
     foundation_cells,
 )
 from benchmarks.a3kernels.profiling import (
@@ -187,6 +187,62 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
     assert len(entries) == 1
     assert entries[0]["memory"]["proposal"]["family"] == "vector-add-baseline"
     assert entries[0]["memory"]["lineage_id"].startswith("smoke-")
+
+
+def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path):
+    cfg = config(tmp_path)
+    first, later = foundation_cells()[4:6]
+    invalid_calls = []
+
+    def invalid_transport(**_kwargs):
+        invalid_calls.append(first.cell_id)
+        return A3TransportResult("", 0)
+
+    def resilient_actor_factory(cell, proposal):
+        if cell == first:
+            return model_actor_factory(
+                {"DEEPSEEK_API_KEY": "fixture-secret"}, invalid_transport,
+            )(cell, proposal)
+        return actor_factory(cell, proposal)
+
+    deps = LiveDependencies(
+        actor_factory=resilient_actor_factory,
+        candidate_factory=lambda cell, proposal, paths: FakeCandidate(proposal),
+        knowledge_factory=lambda cell, paths: FakeKnowledge(False, []),
+        profiler_factory=lambda cell, proposal, paths, verified: FakeProfiler(
+            cell.profiling is ProfilingGuidance.WITH_GUIDANCE, []
+        ),
+        execution_profile="bz-a3-1",
+    )
+    composition = LiveComposition(
+        cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
+    )
+    wave = SmokeWave(
+        cfg, composition.execute, cells=(first, later),
+        execution_profile="bz-a3-1",
+    )
+
+    records = wave.run()
+    first_paths = wave.paths(first)
+    retained = (
+        first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
+    )
+
+    assert [record["status"] for record in records] == ["failed", "passed"]
+    assert len(invalid_calls) == 12
+    failures = EvidenceLedger(first_paths.evidence).entries
+    assert len(failures) == 12
+    assert all(
+        entry.payload["provider_response_failure"]["code"]
+        == "invalid-content-or-usage"
+        for entry in failures
+    )
+    assert wave.paths(later).terminal.is_file()
+    assert wave.resume() == records
+    assert len(invalid_calls) == 12
+    assert retained == (
+        first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
+    )
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):

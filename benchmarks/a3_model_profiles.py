@@ -21,6 +21,28 @@ _PROFILE_FILES = {
     BackendModel.DEEPSEEK_FLASH: "deepseek-flash.json",
 }
 
+_PROVIDER_RESPONSE_MESSAGES = {
+    "invalid-content-or-usage": (
+        "provider result requires non-empty text and positive token usage"
+    ),
+    "missing-response-fields": (
+        "provider response is missing content or completion token usage"
+    ),
+    "invalid-transport-result": (
+        "provider transport returned an invalid result contract"
+    ),
+}
+
+
+class A3ProviderResponseError(ValueError):
+    """Sanitized, deterministic failure of the provider response contract."""
+
+    def __init__(self, code: str) -> None:
+        if code not in _PROVIDER_RESPONSE_MESSAGES:
+            raise ValueError("provider response failure code is not registered")
+        self.code = code
+        super().__init__(_PROVIDER_RESPONSE_MESSAGES[code])
+
 
 def _exact_keys(value: Mapping[str, Any], expected: set[str]) -> None:
     if not isinstance(value, Mapping) or set(value) != expected:
@@ -249,7 +271,10 @@ def _validate_completion_values(
 
 
 def _validated_transport_result(text: Any, completion_tokens: Any) -> A3TransportResult:
-    _validate_completion_values(text, completion_tokens, label="transport result")
+    try:
+        _validate_completion_values(text, completion_tokens, label="transport result")
+    except ValueError:
+        raise A3ProviderResponseError("invalid-content-or-usage") from None
     return A3TransportResult(text, completion_tokens)
 
 
@@ -269,8 +294,8 @@ def _openai_transport(
             response.choices[0].message.content or "",
             response.usage.completion_tokens,
         )
-    except (AttributeError, IndexError, TypeError) as exc:
-        raise ValueError("provider response is missing completion token usage") from exc
+    except (AttributeError, IndexError, TypeError):
+        raise A3ProviderResponseError("missing-response-fields") from None
 
 
 def complete_a3(
@@ -291,24 +316,28 @@ def complete_a3(
         base_url=profile.base_url, api_key=api_key, request=request
     )
     if not isinstance(result, A3TransportResult):
-        raise TypeError("transport must return A3TransportResult with provider token usage")
-    return A3Completion(
-        text=result.text,
-        completion_tokens=result.completion_tokens,
-        provenance={
-            "profile_id": profile.profile_id,
-            "profile_sha256": profile.fingerprint,
-            "model": profile.model,
-            "provider": profile.provider,
-            "base_url": profile.base_url,
-            "credential_env": profile.credential_env,
-            "allow_fallbacks": profile.allow_fallbacks,
-            "generation": asdict(profile.generation),
-        },
-    )
+        raise A3ProviderResponseError("invalid-transport-result")
+    try:
+        return A3Completion(
+            text=result.text,
+            completion_tokens=result.completion_tokens,
+            provenance={
+                "profile_id": profile.profile_id,
+                "profile_sha256": profile.fingerprint,
+                "model": profile.model,
+                "provider": profile.provider,
+                "base_url": profile.base_url,
+                "credential_env": profile.credential_env,
+                "allow_fallbacks": profile.allow_fallbacks,
+                "generation": asdict(profile.generation),
+            },
+        )
+    except ValueError:
+        raise A3ProviderResponseError("invalid-content-or-usage") from None
 
 
 __all__ = [
-    "A3Completion", "A3Generation", "A3ModelProfile", "A3TransportResult", "DEEPSEEK_BASE_URL",
+    "A3Completion", "A3Generation", "A3ModelProfile", "A3ProviderResponseError",
+    "A3TransportResult", "DEEPSEEK_BASE_URL",
     "OPENAI_BASE_URL", "complete_a3", "load_a3_model_profile",
 ]

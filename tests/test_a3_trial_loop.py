@@ -7,7 +7,9 @@ from benchmarks.a3_experiments import (
     BackendModel, KnowledgeMode, ProfilingGuidance, ProgrammingLevel,
     build_a3_experiment_plan,
 )
-from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
+from benchmarks.a3_model_profiles import (
+    A3Completion, A3ProviderResponseError, load_a3_model_profile,
+)
 from benchmarks.a3kernels.candidate import (
     CANDIDATE_SOURCE_CONTRACT,
     CandidateCompilation,
@@ -164,6 +166,8 @@ def _run(
         assert actual_profile == profile
         prompts.append(context)
         action = queue.pop(0)
+        if isinstance(action, BaseException):
+            raise action
         if callable(action):
             action = action(context)
         return A3Completion(
@@ -468,6 +472,37 @@ def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
     assert token_result.status == "budget-exhausted" and token_result.turns == 1
     assert token_result.failures == ("token budget exhausted",)
     assert token_journal.read() == ()
+
+
+def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_path):
+    result, prompts, journal = _run(
+        tmp_path,
+        [
+            A3ProviderResponseError("invalid-content-or-usage"),
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            json.dumps({
+                "action": "submit", "interpretation": "host facts",
+                "supports": [],
+            }),
+        ],
+    )
+
+    assert result.status == "passed" and result.turns == 5
+    assert result.failures == ("provider response failure: invalid-content-or-usage",)
+    assert len(prompts) == 5 and journal.resume_state().completed_projects == 1
+    failure = EvidenceLedger(tmp_path / "evidence.jsonl").entries[0]
+    assert failure.kind == "failure"
+    assert failure.payload["provider_response_failure"] == {
+        "code": "invalid-content-or-usage",
+    }
+
+
+@pytest.mark.parametrize("error", [ValueError("actor bug"), RuntimeError("actor bug")])
+def test_unclassified_actor_errors_still_surface(tmp_path, error):
+    with pytest.raises(type(error), match="actor bug"):
+        _run(tmp_path, [error])
 
 
 def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
