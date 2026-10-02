@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -69,6 +70,20 @@ def validate_local_snapshot(cache_dir: Path) -> Path:
         if digest.hexdigest() != expected:
             raise EmbeddingLoadError(f"pinned snapshot content mismatch: {name}")
     return snapshot
+
+
+def authenticated_snapshot_identity(cache_dir: Path) -> str:
+    """Return a stable identity only after authenticating every pinned file."""
+    validate_local_snapshot(cache_dir)
+    payload = {
+        "model": DEFAULT_EMBEDDING_MODEL,
+        "revision": DEFAULT_EMBEDDING_REVISION,
+        "dimension": EXPECTED_EMBEDDING_DIMENSION,
+        "files": list(_SNAPSHOT_SHA256),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 class PinnedBGEEmbeddings:

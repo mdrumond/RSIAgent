@@ -12,6 +12,8 @@ from benchmarks.a3kernels.artifact_prepare import prepare_phase1_artifacts
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config,
     Phase1Wave,
+    SMOKE_PROPOSALS,
+    SmokeWave,
     full_dry_run,
     registered_credential_envs,
     select_foundation_cells,
@@ -37,7 +39,9 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--knowledge-manifest", type=Path, required=True)
     report = sub.add_parser("report")
     report.add_argument("--state-root", type=Path, required=True)
-    for name in ("preflight", "run", "resume"):
+    for name in (
+        "preflight", "run", "resume", "smoke-preflight", "smoke", "smoke-resume",
+    ):
         command = sub.add_parser(name)
         command.add_argument("--state-root", type=Path, required=True)
         command.add_argument("--validation-wrapper", type=Path, required=True)
@@ -45,12 +49,14 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--corpus-artifacts", type=Path, default=Path("/unconfigured"))
         command.add_argument("--knowledge-database", type=Path, default=Path("/unconfigured"))
         command.add_argument("--knowledge-manifest", type=Path, default=Path("/unconfigured"))
-        if name in ("preflight", "run", "resume"):
+        if name in (
+            "preflight", "run", "resume", "smoke-preflight", "smoke", "smoke-resume",
+        ):
             command.add_argument(
                 "--profile", choices=("bz-a3-1", "bz-a3-2"), required=True,
             )
             command.add_argument("--cpl-remote", required=True)
-        if name in ("run", "resume"):
+        if name in ("run", "resume", "smoke", "smoke-resume"):
             command.add_argument("--remote-workspace", required=True)
             command.add_argument("--physical-device", type=int, required=True)
             command.add_argument(
@@ -59,6 +65,8 @@ def _parser() -> argparse.ArgumentParser:
             )
             command.add_argument("--shard-count", type=int)
             command.add_argument("--shard-index", type=int)
+    smoke_report = sub.add_parser("smoke-report")
+    smoke_report.add_argument("--state-root", type=Path, required=True)
     return parser
 
 
@@ -123,10 +131,20 @@ def main(argv=None) -> int:
     elif args.command == "report":
         cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(5)))
         value = Phase1Wave(cfg, lambda *_: {}).report()
-    elif args.command == "preflight":
+    elif args.command == "smoke-report":
+        cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(5)))
+        value = SmokeWave(
+            cfg, lambda *_: {}, execution_profile="bz-a3-1"
+        ).report()
+    elif args.command in ("preflight", "smoke-preflight"):
         cfg = _config(args)
+        local = (
+            cfg.smoke_preflight(os.environ)
+            if args.command == "smoke-preflight"
+            else cfg.preflight(os.environ)
+        )
         value = {
-            **cfg.preflight(os.environ),
+            **local,
             "remote_preflight": _bz_preflight(
                 cfg.validation_wrapper, args.profile, args.cpl_remote,
             ),
@@ -138,20 +156,36 @@ def main(argv=None) -> int:
             shard_index=args.shard_index,
         )
         cfg = _config(args)
-        cfg.preflight(os.environ, cells=cells)
+        smoke = args.command in ("smoke", "smoke-resume")
+        local_preflight = (
+            cfg.smoke_preflight(os.environ, cells=cells)
+            if smoke else cfg.preflight(os.environ, cells=cells)
+        )
         _bz_preflight(cfg.validation_wrapper, args.profile, args.cpl_remote)
         dependencies = bz_live_dependencies(
             cfg, cpl_remote=args.cpl_remote, profile=args.profile,
             remote_workspace=args.remote_workspace,
             physical_device=args.physical_device, environ=os.environ,
         )
-        wave = Phase1Wave(
-            cfg,
-            LiveComposition(cfg, dependencies).execute,
-            cells=cells,
-            execution_profile=args.profile,
-        )
-        value = wave.run() if args.command == "run" else wave.resume()
+        if smoke:
+            wave = SmokeWave(
+                cfg,
+                LiveComposition(
+                    cfg, dependencies, proposals=SMOKE_PROPOSALS,
+                    lineage_prefix="smoke",
+                ).execute,
+                cells=cells,
+                execution_profile=args.profile,
+                knowledge_identity=local_preflight["knowledge_identity"],
+            )
+        else:
+            wave = Phase1Wave(
+                cfg,
+                LiveComposition(cfg, dependencies).execute,
+                cells=cells,
+                execution_profile=args.profile,
+            )
+        value = wave.run() if args.command in ("run", "smoke") else wave.resume()
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
     return 0
 

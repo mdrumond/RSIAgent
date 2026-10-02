@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 
 from benchmarks.a3_experiments import A3ExperimentCell
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, complete_a3, load_a3_model_profile
@@ -242,15 +242,30 @@ def _policy_actor(actor, profile: A3ModelProfile, policy: ProjectRuntimePolicy):
 class LiveComposition:
     """Execute every registered project for one isolated experiment cell."""
 
-    def __init__(self, config: Phase1Config, dependencies: LiveDependencies) -> None:
+    def __init__(
+        self,
+        config: Phase1Config,
+        dependencies: LiveDependencies,
+        *,
+        proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
+        lineage_prefix: str = "phase1",
+    ) -> None:
         self.config, self.dependencies = config, dependencies
+        self.proposals = tuple(proposals)
+        if not self.proposals or any(
+            not isinstance(item, CurriculumProposal) for item in self.proposals
+        ):
+            raise ValueError("composition requires registered curriculum proposals")
+        if not re.fullmatch(r"[a-z0-9-]+", lineage_prefix):
+            raise ValueError("composition lineage prefix is invalid")
+        self.lineage_prefix = lineage_prefix
         self.cell_digests: dict[str, tuple[str, ...]] = {}
 
     def execute(self, cell: A3ExperimentCell, paths: CellPaths) -> dict[str, object]:
         store = AuthoritativeResultStore(paths.root / "authority.jsonl")
         memory = Phase1LearningJournal(
-            paths.memory, DEFAULT_PROPOSALS, cell_id=cell.cell_id,
-            lineage_id=f"phase1-{cell.cell_id}", evidence_resolver=store,
+            paths.memory, self.proposals, cell_id=cell.cell_id,
+            lineage_id=f"{self.lineage_prefix}-{cell.cell_id}", evidence_resolver=store,
         )
         knowledge = self.dependencies.knowledge_factory(cell, paths)
         EvidenceLedger.recover_incomplete_tail(paths.evidence)
@@ -258,7 +273,7 @@ class LiveComposition:
         profile = load_a3_model_profile(cell.backend_model)
         digests = [entry["entry_sha256"] for entry in memory.read()]
         start = memory.resume_state().completed_projects
-        for proposal in DEFAULT_PROPOSALS[start:]:
+        for proposal in self.proposals[start:]:
             policy = ProjectRuntimePolicy.from_proposal(proposal)
             candidate = _RecordingCandidate(
                 _RecoveryCandidate(

@@ -24,7 +24,12 @@ from benchmarks.a3kernels.phase1_evidence import (
     A3_EXECUTION_PROFILES,
     canonical_digest,
 )
-from benchmarks.a3kernels.phase1_registry import dry_run_plan
+from benchmarks.a3kernels.embeddings import (
+    PinnedBGEEmbeddings,
+    authenticated_snapshot_identity,
+)
+from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
+from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS, CurriculumProposal, dry_run_plan
 
 
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -33,6 +38,22 @@ _HOST_ASSETS = ("build.json", "host_driver.py", "host_wrapper.inc")
 
 def full_dry_run() -> dict[str, object]:
     return dry_run_plan()
+
+
+SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[0],)
+_SMOKE_QUERY = "A3 Ascend C vector addition tensor movement"
+
+
+def smoke_dry_run() -> dict[str, object]:
+    project = SMOKE_PROPOSALS[0]
+    body = {
+        "schema": "a3-ascendc-foundation-smoke-plan-v1",
+        "mode": "smoke",
+        "target": "Ascend910B4",
+        "language": "ascend-c",
+        "projects": [project.as_dict()],
+    }
+    return {**body, "plan_id": canonical_digest(body)}
 
 
 def foundation_cells() -> tuple[A3ExperimentCell, ...]:
@@ -99,6 +120,41 @@ def _research_identity() -> dict[str, str]:
     }
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def authenticate_smoke_knowledge(config: "Phase1Config") -> dict[str, str]:
+    """Authenticate and query the exact local KDB before provider inference."""
+    snapshot_sha256 = authenticated_snapshot_identity(config.embedding_cache)
+    manifest_bytes = config.knowledge_manifest.read_bytes()
+    manifest = CollectionManifest.from_json(manifest_bytes.decode("utf-8"))
+    embeddings = PinnedBGEEmbeddings(cache_dir=config.embedding_cache)
+    with KnowledgeDB.open_read_only(config.knowledge_database, embeddings) as database:
+        if database.manifest(manifest.collection) != manifest:
+            raise ValueError("local KDB does not match the pinned knowledge manifest")
+        hits = database.query(manifest.collection, _SMOKE_QUERY, limit=1)
+    if len(hits) != 1:
+        raise ValueError("smoke KDB probe returned no authenticated result")
+    probe = {
+        "query": _SMOKE_QUERY,
+        "collection": manifest.collection,
+        "chunk_id": hits[0].chunk_id,
+        "content_sha256": hits[0].content_sha256,
+    }
+    return {
+        "embedding_snapshot_sha256": snapshot_sha256,
+        "knowledge_database_sha256": _sha256_file(config.knowledge_database),
+        "knowledge_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "knowledge_collection_sha256": manifest.fingerprint,
+        "knowledge_probe_sha256": canonical_digest(probe),
+    }
+
+
 @dataclass(frozen=True)
 class CellPaths:
     root: Path
@@ -156,6 +212,23 @@ class Phase1Config:
             "ready": True,
             "checks": paths,
             **_research_identity(),
+        }
+
+    def smoke_preflight(
+        self,
+        environ: Mapping[str, str],
+        *,
+        cells: Sequence[A3ExperimentCell] | None = None,
+    ) -> dict[str, object]:
+        selected = foundation_cells() if cells is None else tuple(cells)
+        report = self.preflight(environ, cells=selected)
+        knowledge_identity = None
+        if any(cell.knowledge is KnowledgeMode.WITH_KDB for cell in selected):
+            knowledge_identity = authenticate_smoke_knowledge(self)
+        return {
+            **report,
+            "smoke_plan_fingerprint": canonical_digest(smoke_dry_run()),
+            "knowledge_identity": knowledge_identity,
         }
 
 
@@ -301,11 +374,201 @@ class Phase1Wave:
         return value
 
 
+class SmokeWave(Phase1Wave):
+    """One-project, state-isolated gate for all selected foundation cells."""
+
+    def __init__(
+        self,
+        config: Phase1Config,
+        executor: Executor,
+        *,
+        cells: Sequence[A3ExperimentCell] | None = None,
+        execution_profile: str,
+        knowledge_identity: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(
+            config, executor, cells=cells, execution_profile=execution_profile
+        )
+        self._knowledge_identity = (
+            dict(knowledge_identity) if knowledge_identity is not None else None
+        )
+
+    def paths(self, cell: A3ExperimentCell) -> CellPaths:
+        root = self.config.state_root / "smoke-cells" / cell.cell_id
+        workspace = root / "workspace"
+        return CellPaths(
+            root, workspace, root / "memory.jsonl", root / "evidence.jsonl",
+            root / "terminal.json", workspace / "a3_profile_driver.py",
+        )
+
+    def _identity(self, cell: A3ExperimentCell) -> dict[str, object]:
+        knowledge = None
+        if cell.knowledge is KnowledgeMode.WITH_KDB:
+            if self._knowledge_identity is None:
+                self._knowledge_identity = authenticate_smoke_knowledge(self.config)
+            knowledge = self._knowledge_identity
+        profile = load_a3_model_profile(cell.backend_model)
+        return {
+            "plan_fingerprint": canonical_digest(smoke_dry_run()),
+            "proposal_set_sha256": canonical_digest(
+                [proposal.as_dict() for proposal in SMOKE_PROPOSALS]
+            ),
+            "model_profile_sha256": profile.fingerprint,
+            "profile_driver_sha256": _research_identity()["profile_driver_sha256"],
+            "host_fixture_sha256": _research_identity()["host_fixture_sha256"],
+            "knowledge_identity": knowledge,
+        }
+
+    def run(self) -> tuple[dict[str, object], ...]:
+        records = []
+        for cell in self.cells:
+            identity = self._identity(cell)
+            paths = self.paths(cell)
+            retained = self._read_smoke_terminal(cell, paths.terminal, identity)
+            if retained is not None:
+                records.append(retained)
+                continue
+            self._stage(paths)
+            outcome = dict(self.executor(cell, paths))
+            record = self._smoke_terminal(cell, outcome, identity)
+            self._publish(paths.terminal, record)
+            records.append(record)
+        return tuple(records)
+
+    def resume(self) -> tuple[dict[str, object], ...]:
+        return self.run()
+
+    def report(self) -> dict[str, object]:
+        records = []
+        for cell in foundation_cells():
+            path = self.paths(cell).terminal
+            if path.exists():
+                records.append(self._read_smoke_report_terminal(cell, path))
+        counts: dict[str, int] = {}
+        for record in records:
+            status = str(record["status"])
+            counts[status] = counts.get(status, 0) + 1
+        return {
+            "schema": "a3-phase1-foundation-smoke-report-v1",
+            "counts": counts,
+            "records": records,
+        }
+
+    def _read_smoke_report_terminal(
+        self, cell: A3ExperimentCell, path: Path,
+    ) -> dict[str, object]:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("smoke terminal cell record is corrupt") from exc
+        knowledge = value.get("knowledge_identity")
+        if cell.knowledge is KnowledgeMode.WITHOUT_KDB:
+            valid_knowledge = knowledge is None
+        else:
+            keys = {
+                "embedding_snapshot_sha256", "knowledge_database_sha256",
+                "knowledge_manifest_sha256", "knowledge_collection_sha256",
+                "knowledge_probe_sha256",
+            }
+            valid_knowledge = (
+                isinstance(knowledge, dict)
+                and set(knowledge) == keys
+                and all(
+                    isinstance(item, str) and _SHA.fullmatch(item)
+                    for item in knowledge.values()
+                )
+            )
+        static = _research_identity()
+        profile = load_a3_model_profile(cell.backend_model)
+        expected = {
+            "schema": "a3-phase1-smoke-cell-terminal-v1",
+            "cell_id": cell.cell_id,
+            "target": "a3",
+            "language": "ascend-c",
+            "model": cell.backend_model.value,
+            "knowledge": cell.knowledge.value,
+            "profiling": cell.profiling.value,
+            "execution_profile": value.get("execution_profile"),
+            "plan_fingerprint": canonical_digest(smoke_dry_run()),
+            "proposal_set_sha256": canonical_digest(
+                [proposal.as_dict() for proposal in SMOKE_PROPOSALS]
+            ),
+            "model_profile_sha256": profile.fingerprint,
+            "profile_driver_sha256": static["profile_driver_sha256"],
+            "host_fixture_sha256": static["host_fixture_sha256"],
+            "knowledge_identity": knowledge,
+            "status": value.get("status"),
+            "evidence_sha256": value.get("evidence_sha256"),
+        }
+        try:
+            Phase1Wave._terminal(
+                cell,
+                {
+                    "status": value.get("status"),
+                    "evidence_sha256": value.get("evidence_sha256"),
+                },
+                str(value.get("execution_profile")),
+            )
+        except ValueError as exc:
+            raise ValueError("smoke terminal cell record is corrupt") from exc
+        if not valid_knowledge or value != expected:
+            raise ValueError("smoke terminal cell record has foreign or conflicting evidence")
+        return value
+
+    def _smoke_terminal(
+        self,
+        cell: A3ExperimentCell,
+        outcome: Mapping[str, object],
+        identity: Mapping[str, object],
+    ) -> dict[str, object]:
+        Phase1Wave._terminal(cell, outcome, self.execution_profile)
+        return {
+            "schema": "a3-phase1-smoke-cell-terminal-v1",
+            "cell_id": cell.cell_id,
+            "target": "a3",
+            "language": "ascend-c",
+            "model": cell.backend_model.value,
+            "knowledge": cell.knowledge.value,
+            "profiling": cell.profiling.value,
+            "execution_profile": self.execution_profile,
+            **identity,
+            **outcome,
+        }
+
+    def _read_smoke_terminal(
+        self,
+        cell: A3ExperimentCell,
+        path: Path,
+        identity: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError("smoke terminal cell record is corrupt") from exc
+        expected = self._smoke_terminal(
+            cell,
+            {
+                "status": value.get("status"),
+                "evidence_sha256": value.get("evidence_sha256"),
+            },
+            identity,
+        )
+        if value != expected:
+            raise ValueError("smoke terminal cell record has foreign or conflicting evidence")
+        return value
+
+
 __all__ = [
     "CellPaths",
     "Phase1Config",
     "Phase1Wave",
+    "SMOKE_PROPOSALS",
+    "SmokeWave",
+    "authenticate_smoke_knowledge",
     "foundation_cells",
     "full_dry_run",
+    "smoke_dry_run",
     "select_foundation_cells",
 ]
