@@ -285,7 +285,7 @@ def test_cli_run_and_resume_route_bz_and_compose_all_eight_cells(
         run_a3_phase1, "_bz_preflight",
         lambda *args: preflights.append(args) or {"state": "completed"},
     )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
     common = [
         "--state-root", str(cfg.state_root),
@@ -357,7 +357,7 @@ def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
     monkeypatch.setattr(
         run_a3_phase1, "_bz_preflight", lambda *args: {"state": "completed"},
     )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
     cell = __import__(
         "benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]

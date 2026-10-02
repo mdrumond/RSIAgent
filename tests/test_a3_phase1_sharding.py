@@ -124,7 +124,7 @@ def test_cli_repeatable_cell_selection_and_shard_routing(tmp_path, monkeypatch, 
         "bz_live_dependencies",
         lambda *args, **kwargs: created.append("dependencies") or object(),
     )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
 
     common = [
@@ -167,7 +167,7 @@ def test_cli_rejects_unknown_cell_before_remote_dependency_creation(
         "bz_live_dependencies",
         lambda *args, **kwargs: created.append("dependencies"),
     )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
     argv = [
         "run",
@@ -236,7 +236,7 @@ def test_cli_preflight_checks_local_inputs_then_exact_bz_adapter_markers(
         )), "")
 
     monkeypatch.setattr(run_a3_phase1.subprocess, "run", runner)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "openrouter-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
     argv = ["preflight"]
     for field in (
@@ -341,7 +341,7 @@ def test_cli_preflight_rejects_foreign_or_duplicate_terminal_markers(
         run_a3_phase1.subprocess, "run",
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout, ""),
     )
-    monkeypatch.setenv("OPENROUTER_API_KEY", "key")
+    monkeypatch.setenv("OPENAI_API_KEY", "key")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "key")
     argv = ["preflight"]
     for field in (

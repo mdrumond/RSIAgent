@@ -69,17 +69,18 @@ class FakeCandidate:
     def __init__(self, resolver=None): self.source, self.resolver = None, resolver
     def _plan(
         self, source, request_id, attempt_id, length, project_id,
-        padded_length=None, block_count=1,
+        padded_length=None, block_count=1, execution_profile="gz-a3",
     ):
         padded_length = padded_length or length
         return ExecutionPlan(request_id, attempt_id, project_id, (SourceFile("candidate.cpp", source),),
                              ("python", "host_driver.py", "input.json"),
                              (1.0,) * padded_length, (2.0,) * padded_length,
+                             execution_profile=execution_profile,
                              logical_length=length, padded_length=padded_length,
                              block_count=block_count)
     def compile(self, source, _workdir, **kw):
         self.source = source
-        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1))
+        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"))
         body = {"plan": plan, "library_sha256": "c" * 64, "stdout": "ok", "stderr": ""}
         result = CandidateCompilation(plan, "c" * 64, "ok", "", attest(body))
         if self.resolver:
@@ -90,7 +91,7 @@ class FakeCandidate:
         return result
     def run(self, source, _workdir, **kw):
         assert source == self.source
-        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1))
+        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"))
         result = VerifiedResult.from_receipt(
             plan, ExecutionReceipt(0, (3.0,) * plan.padded_length), max_abs_error=0.0
         )
@@ -265,7 +266,8 @@ def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(
         def compile(self, source, _workdir, **kw):
             plan = self._plan(
                 source, kw["request_id"], kw["attempt_id"], kw["length"],
-                kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1),
+                kw["project_id"], kw.get("padded_length"),
+                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
             )
             return FailedEvidence.create(
                 plan, stage="compile", error_type="CompileError", detail="fixture",

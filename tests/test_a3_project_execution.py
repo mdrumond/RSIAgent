@@ -111,6 +111,7 @@ class FakeCandidateBackend:
             plan.project_id,
             True,
             0.0,
+            1e-5,
             0,
             "c" * 64,
             plan.source_fingerprint,
@@ -227,8 +228,9 @@ def test_same_replay_id_rejects_different_candidate_binding(tmp_path):
         result = original(*args, **kwargs)
         return VerifiedResult(
             result.request_id, "1" * 64, result.attempt_id, result.project_id,
-            result.passed, result.max_abs_error, result.exit_code, result.output_sha256,
-            "2" * 64, result.evidence_sha256, result.job_handle, result.attestation_sha256,
+            result.passed, result.max_abs_error, result.tolerance, result.exit_code,
+            result.output_sha256, "2" * 64, result.evidence_sha256,
+            result.job_handle, result.attestation_sha256,
         )
 
     backend.run = changed

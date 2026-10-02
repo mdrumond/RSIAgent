@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping
 from benchmarks.a3_experiments import BackendModel
 
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _PROFILE_DIR = Path(__file__).resolve().parents[1] / "config" / "a3"
 _PROFILE_FILES = {
@@ -53,6 +53,19 @@ class A3Generation:
     temperature: float | None
     thinking: bool
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.max_tokens) is not int
+            or type(self.top_p) is not float
+            or type(self.reasoning_effort) is not str
+            or (
+                self.temperature is not None
+                and type(self.temperature) is not float
+            )
+            or type(self.thinking) is not bool
+        ):
+            raise ValueError("A3 generation field types must be exact")
+
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "A3Generation":
         _exact_keys(
@@ -74,6 +87,17 @@ class A3ModelProfile:
     generation: A3Generation
 
     def __post_init__(self) -> None:
+        if (
+            type(self.profile_id) is not str
+            or type(self.backend_model) is not BackendModel
+            or type(self.model) is not str
+            or type(self.provider) is not str
+            or type(self.base_url) is not str
+            or type(self.credential_env) is not str
+            or type(self.allow_fallbacks) is not bool
+            or type(self.generation) is not A3Generation
+        ):
+            raise ValueError("canonical A3 model profile field types must be exact")
         if not isinstance(self.backend_model, BackendModel) or not isinstance(
             self.generation, A3Generation
         ):
@@ -132,20 +156,13 @@ class A3ModelProfile:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": self.generation.max_tokens,
-            "top_p": self.generation.top_p,
             "reasoning_effort": self.generation.reasoning_effort,
         }
         if self.backend_model is BackendModel.GPT_5_6_SOL:
-            request["temperature"] = self.generation.temperature
-            request["extra_body"] = {
-                "provider": {
-                    "order": [self.provider],
-                    "allow_fallbacks": False,
-                    "require_parameters": True,
-                }
-            }
+            request["max_completion_tokens"] = self.generation.max_tokens
         else:
+            request["max_tokens"] = self.generation.max_tokens
+            request["top_p"] = self.generation.top_p
             request["extra_body"] = {"thinking": {"type": "enabled"}}
         return request
 
@@ -154,14 +171,14 @@ _CANONICAL_VALUES: dict[BackendModel, dict[str, Any]] = {
     BackendModel.GPT_5_6_SOL: {
         "profile_id": "openai-gpt-5.6-sol-v1",
         "backend_model": "openai/gpt-5.6-sol",
-        "model": "openai/gpt-5.6-sol",
+        "model": "gpt-5.6-sol",
         "provider": "OpenAI",
-        "base_url": OPENROUTER_BASE_URL,
-        "credential_env": "OPENROUTER_API_KEY",
+        "base_url": OPENAI_BASE_URL,
+        "credential_env": "OPENAI_API_KEY",
         "allow_fallbacks": False,
         "generation": {
             "max_tokens": 32768, "top_p": 1.0, "reasoning_effort": "high",
-            "temperature": 0.0, "thinking": False,
+            "temperature": None, "thinking": False,
         },
     },
     BackendModel.DEEPSEEK_FLASH: {
@@ -198,12 +215,9 @@ class A3Completion:
     provenance: Mapping[str, Any]
 
     def __post_init__(self) -> None:
-        if (
-            type(self.text) is not str
-            or type(self.completion_tokens) is not int
-            or self.completion_tokens < 1
-        ):
-            raise ValueError("completion requires text and positive provider token usage")
+        _validate_completion_values(
+            self.text, self.completion_tokens, label="completion"
+        )
         object.__setattr__(self, "provenance", _deep_freeze(self.provenance))
 
     def as_dict(self) -> dict[str, Any]:
@@ -220,6 +234,25 @@ class A3TransportResult:
     completion_tokens: int
 
 
+def _validate_completion_values(
+    text: Any, completion_tokens: Any, *, label: str
+) -> None:
+    if (
+        type(text) is not str
+        or not text.strip()
+        or type(completion_tokens) is not int
+        or completion_tokens < 1
+    ):
+        raise ValueError(
+            f"{label} requires non-empty text and positive provider token usage"
+        )
+
+
+def _validated_transport_result(text: Any, completion_tokens: Any) -> A3TransportResult:
+    _validate_completion_values(text, completion_tokens, label="transport result")
+    return A3TransportResult(text, completion_tokens)
+
+
 Transport = Callable[..., A3TransportResult]
 
 
@@ -232,7 +265,7 @@ def _openai_transport(
         **dict(request)
     )
     try:
-        return A3TransportResult(
+        return _validated_transport_result(
             response.choices[0].message.content or "",
             response.usage.completion_tokens,
         )
@@ -277,5 +310,5 @@ def complete_a3(
 
 __all__ = [
     "A3Completion", "A3Generation", "A3ModelProfile", "A3TransportResult", "DEEPSEEK_BASE_URL",
-    "OPENROUTER_BASE_URL", "complete_a3", "load_a3_model_profile",
+    "OPENAI_BASE_URL", "complete_a3", "load_a3_model_profile",
 ]

@@ -45,11 +45,11 @@ def test_foundation_selection_is_exact_two_by_two_by_two():
 
 def test_preflight_checks_credentials_paths_and_fixed_adapter(tmp_path):
     cfg = config(tmp_path)
-    report = cfg.preflight({"OPENROUTER_API_KEY": "gpt", "DEEPSEEK_API_KEY": "ds"})
+    report = cfg.preflight({"OPENAI_API_KEY": "gpt", "DEEPSEEK_API_KEY": "ds"})
     assert report["ready"] is True and all(report["checks"].values())
     assert report["profile_driver_sha256"] == profile_driver_asset().sha256
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
-        cfg.preflight({"OPENROUTER_API_KEY": "gpt"})
+        cfg.preflight({"OPENAI_API_KEY": "gpt"})
 
 
 def test_preflight_uses_registered_profile_credential_names(monkeypatch, tmp_path):

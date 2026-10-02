@@ -8,13 +8,17 @@ import hashlib
 import math
 from typing import Any, Mapping
 
-from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_evidence import (
+    A3_EXECUTION_PROFILES,
+    canonical_digest,
+)
 
 
 A3_TARGET = "Ascend910B4"
 A3_LANGUAGE = "ascend-c"
+# Compatibility default for aggregate candidate helpers. ExecutionPlan keeps
+# execution_profile required so every persisted identity names its route.
 A3_EXECUTION_PROFILE = "gz-a3"
-A3_EXECUTION_PROFILES = frozenset((A3_EXECUTION_PROFILE, "bz-a3-1", "bz-a3-2"))
 A3_RUNTIME = "native-ascend-c"
 
 
@@ -30,16 +34,18 @@ class SourceFile:
     content: str
 
     def __post_init__(self) -> None:
+        if type(self.relative_path) is not str or not self.relative_path:
+            raise ValueError("source path must be a non-empty relative path")
         path = PurePosixPath(self.relative_path)
         if (
-            type(self.relative_path) is not str
-            or not self.relative_path
-            or path.is_absolute()
+            path.is_absolute()
             or ".." in path.parts
+            or path.as_posix() == "."
         ):
             raise ValueError("source path must be a non-empty relative path")
         if type(self.content) is not str:
             raise TypeError("source content must be a string")
+        object.__setattr__(self, "relative_path", path.as_posix())
 
     @property
     def sha256(self) -> str:
@@ -57,9 +63,9 @@ class ExecutionPlan:
     argv: tuple[str, ...]
     input_a: tuple[float, ...]
     input_b: tuple[float, ...]
+    execution_profile: str
     target: str = A3_TARGET
     language: str = A3_LANGUAGE
-    execution_profile: str = A3_EXECUTION_PROFILE
     runtime: str = A3_RUNTIME
     logical_device: int = 0
     logical_length: int | None = None
@@ -80,11 +86,12 @@ class ExecutionPlan:
             raise ValueError(f"A3 language must be {A3_LANGUAGE}; Catlass is unsupported")
         if self.execution_profile not in A3_EXECUTION_PROFILES:
             raise ValueError(
-                "A3 execution profile must be gz-a3, bz-a3-1, or bz-a3-2"
+                "A3 execution profile must be bz-a3-1, bz-a3-2, or "
+                "the gz-a3 compatibility profile"
             )
         if self.runtime != A3_RUNTIME:
             raise ValueError(f"A3 runtime must be {A3_RUNTIME}")
-        if self.logical_device != 0:
+        if type(self.logical_device) is not int or self.logical_device != 0:
             raise ValueError("A3 logical device must be 0")
         if not self.files or any(not isinstance(item, SourceFile) for item in self.files):
             raise ValueError("files must contain at least one SourceFile")
@@ -173,6 +180,7 @@ class VerifiedResult:
     project_id: str
     passed: bool
     max_abs_error: float | None
+    tolerance: float
     exit_code: int
     output_sha256: str
     source_fingerprint: str
@@ -214,6 +222,7 @@ class VerifiedResult:
             "project_id": plan.project_id,
             "passed": receipt.exit_code == 0 and metric_ok,
             "max_abs_error": max_abs_error,
+            "tolerance": float(tolerance),
             "exit_code": receipt.exit_code,
             "output_sha256": canonical_digest(receipt.output),
             "source_fingerprint": plan.source_fingerprint,

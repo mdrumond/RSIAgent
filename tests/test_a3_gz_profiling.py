@@ -28,6 +28,7 @@ def verified(binding=BINDING):
         "project_id": "vector-add",
         "passed": True,
         "max_abs_error": 0.0,
+        "tolerance": 1e-5,
         "exit_code": 0,
         "output_sha256": "c" * 64,
         "source_fingerprint": binding.source_fingerprint,
