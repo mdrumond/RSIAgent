@@ -46,18 +46,6 @@ def test_plan_ids_order_and_serialization_are_stable():
 
     assert first == second
     assert [cell.cell_id for cell in first.cells] == [
-        "a3-cell-06be7e628e1a742d",
-        "a3-cell-22af0dc10707c849",
-        "a3-cell-9cef0a3ff2d1fc9a",
-        "a3-cell-f186780727548109",
-        "a3-cell-92797aff4839cf83",
-        "a3-cell-f58cec0d66ac9591",
-        "a3-cell-929a8bddac922ca2",
-        "a3-cell-eabbb9ad8d80fbbc",
-        "a3-cell-260034c431efdac7",
-        "a3-cell-e04ac278abd81c08",
-        "a3-cell-586ce83ede94d45f",
-        "a3-cell-6ea07bd1567ca84b",
         "a3-cell-302a6e353e8f47f4",
         "a3-cell-f2fcc4337279ad92",
         "a3-cell-a9ef7dc1581bed73",
@@ -70,13 +58,37 @@ def test_plan_ids_order_and_serialization_are_stable():
         "a3-cell-9805db9eab68abcb",
         "a3-cell-3af73f3eb5a55777",
         "a3-cell-a1a26ccb06a4c92d",
+        "a3-cell-53ccb56d61ffd3a8",
+        "a3-cell-62424f98912b57df",
+        "a3-cell-57cd46f1e0de1e05",
+        "a3-cell-aa0ba7092e2031fc",
+        "a3-cell-0584e94d43e87b73",
+        "a3-cell-69c9d566362641df",
+        "a3-cell-7c8bdc347303a7ea",
+        "a3-cell-c1505226de6f498b",
+        "a3-cell-f63531c6caade085",
+        "a3-cell-a8a9a74bf9c6f4e2",
+        "a3-cell-792de8f286ed96d7",
+        "a3-cell-6a8c8b26c46b42f8",
     ]
     assert first.to_json() == second.to_json()
     payload = json.loads(first.to_json())
-    assert payload["schema"] == "a3-ascendc-experiment-plan-v1"
+    assert payload["schema"] == "a3-ascendc-experiment-plan-v2"
     assert payload["target"] == "a3"
     assert payload["language"] == "ascend-c"
-    assert payload["cells"][0]["backend_model"] == "openai/gpt-5.6-astra"
+    assert [member.value for member in BackendModel] == [
+        "openai/gpt-5.6-sol",
+        "deepseek-flash",
+    ]
+    assert payload["cells"][0]["backend_model"] == "openai/gpt-5.6-sol"
+
+
+def test_deepseek_sol_model_dimensions_are_not_serialized_as_legacy_v1():
+    plan = build_a3_experiment_plan()
+
+    assert plan.schema == "a3-ascendc-experiment-plan-v2"
+    with pytest.raises(ValueError, match="A3 Ascend C schema"):
+        replace(plan, schema="a3-ascendc-experiment-plan-v1")
 
 
 def test_plan_canonicalizes_permuted_cells():
@@ -164,7 +176,7 @@ def test_capability_scheduler_reports_every_missing_dimension():
         A3RuntimeCapabilities(
             target=A3Target.A3,
             language=A3Language.ASCEND_C,
-            backend_models=frozenset({BackendModel.GPT_5_6_ASTRA}),
+            backend_models=frozenset({BackendModel.GPT_5_6_SOL}),
             programming_levels=frozenset({ProgrammingLevel.FOUNDATION}),
             kdb=False,
             profiling_guidance=False,
@@ -175,7 +187,7 @@ def test_capability_scheduler_reports_every_missing_dimension():
         scheduler.schedule(cell)
 
     message = str(failure.value)
-    assert "backend-model:openai/gpt-5.6-sol" in message
+    assert "backend-model:deepseek-flash" in message
     assert "programming-level:optimized" in message
     assert "kdb" in message
     assert "profiling-guidance" in message

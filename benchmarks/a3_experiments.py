@@ -10,7 +10,7 @@ import re
 from typing import Mapping, Sequence
 
 
-PLAN_SCHEMA = "a3-ascendc-experiment-plan-v1"
+PLAN_SCHEMA = "a3-ascendc-experiment-plan-v2"
 _SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -24,8 +24,8 @@ class A3Language(str, Enum):
 
 
 class BackendModel(str, Enum):
-    GPT_5_6_ASTRA = "openai/gpt-5.6-astra"
     GPT_5_6_SOL = "openai/gpt-5.6-sol"
+    DEEPSEEK_FLASH = "deepseek-flash"
 
 
 class KnowledgeMode(str, Enum):
