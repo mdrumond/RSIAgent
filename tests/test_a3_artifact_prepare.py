@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
-from benchmarks.a3kernels.artifact_prepare import prepare_phase1_artifacts
+from benchmarks.a3kernels.artifact_prepare import (
+    prepare_phase1_artifacts,
+    validate_manifest_contract,
+)
 from benchmarks.a3kernels.corpus import CorpusSpec
 from benchmarks.a3kernels.embeddings import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_EMBEDDING_REVISION,
 )
-from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
+from benchmarks.a3kernels.knowledge import (
+    CollectionManifest, KnowledgeDB, SourceFingerprint,
+)
 
 
 class FakeEmbeddings:
@@ -124,6 +130,27 @@ def test_verified_reuse_does_not_fetch_or_rebuild(tmp_path):
         name: config[name].read_bytes()
         for name in ("knowledge_database", "knowledge_manifest")
     }
+
+
+def test_manifest_contract_rejects_self_consistent_but_unregistered_sources(tmp_path):
+    spec_path, values = fixture_spec(tmp_path)
+    config = paths(tmp_path)
+    config["embedding_cache"].mkdir()
+    prepare_phase1_artifacts(
+        **config, corpus_spec_path=spec_path,
+        fetcher=lambda *_: values, embedding_factory=lambda _cache: FakeEmbeddings(),
+    )
+    manifest = CollectionManifest.from_json(
+        config["knowledge_manifest"].read_text(encoding="utf-8")
+    )
+    foreign = replace(
+        manifest,
+        sources=(
+            SourceFingerprint("foreign.cpp", "f" * 64, "https://other.invalid/x", "b" * 40),
+        ),
+    )
+    with pytest.raises(ValueError, match="pinned inputs"):
+        validate_manifest_contract(CorpusSpec.load(spec_path), foreign, FakeEmbeddings())
 
 
 @pytest.mark.parametrize("remaining", ["database", "manifest"])

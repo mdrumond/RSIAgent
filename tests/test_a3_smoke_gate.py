@@ -154,6 +154,12 @@ def test_smoke_kdb_authentication_opens_read_only_and_runs_fixed_query(
     )
     monkeypatch.setattr(wave_module, "PinnedBGEEmbeddings", lambda **_kw: object())
     monkeypatch.setattr(
+        wave_module, "validate_manifest_contract",
+        lambda _spec, selected, _embeddings: events.append(
+            ("contract", selected.collection)
+        ),
+    )
+    monkeypatch.setattr(
         wave_module.KnowledgeDB, "open_read_only",
         lambda path, embeddings: events.append(("open", path, embeddings)) or Database(),
     )
@@ -161,12 +167,13 @@ def test_smoke_kdb_authentication_opens_read_only_and_runs_fixed_query(
     identity = wave_module.authenticate_smoke_knowledge(cfg)
 
     assert identity["embedding_snapshot_sha256"] == "a" * 64
-    assert events[0][0] == "open"
-    assert events[1] == ("manifest", "a3")
-    assert events[2] == (
+    assert events[0] == ("contract", "a3")
+    assert events[1][0] == "open"
+    assert events[2] == ("manifest", "a3")
+    assert events[3] == (
         "query", "a3", "A3 Ascend C vector addition tensor movement", 1,
     )
-    assert events[3] == "closed"
+    assert events[4] == "closed"
 
 
 def test_smoke_kdb_probe_fails_closed_when_query_has_no_result(tmp_path, monkeypatch):
@@ -189,9 +196,38 @@ def test_smoke_kdb_probe_fails_closed_when_query_has_no_result(tmp_path, monkeyp
     )
     monkeypatch.setattr(wave_module, "PinnedBGEEmbeddings", lambda **_kw: object())
     monkeypatch.setattr(
+        wave_module, "validate_manifest_contract", lambda *_args: None
+    )
+    monkeypatch.setattr(
         wave_module.KnowledgeDB, "open_read_only", lambda *_args: Database()
     )
     with pytest.raises(ValueError, match="no authenticated result"):
+        wave_module.authenticate_smoke_knowledge(cfg)
+
+
+def test_smoke_kdb_fails_before_open_when_manifest_is_not_pinned(
+    tmp_path, monkeypatch,
+):
+    import benchmarks.a3kernels.phase1_wave as wave_module
+
+    cfg = config(tmp_path)
+    manifest = SimpleNamespace(collection="other", fingerprint="f" * 64)
+    monkeypatch.setattr(
+        wave_module, "authenticated_snapshot_identity", lambda _path: "a" * 64
+    )
+    monkeypatch.setattr(
+        wave_module.CollectionManifest, "from_json", lambda _value: manifest
+    )
+    monkeypatch.setattr(wave_module, "PinnedBGEEmbeddings", lambda **_kw: object())
+    monkeypatch.setattr(
+        wave_module, "validate_manifest_contract",
+        lambda *_args: (_ for _ in ()).throw(ValueError("not pinned")),
+    )
+    monkeypatch.setattr(
+        wave_module.KnowledgeDB, "open_read_only",
+        lambda *_args: pytest.fail("untrusted database was opened"),
+    )
+    with pytest.raises(ValueError, match="not pinned"):
         wave_module.authenticate_smoke_knowledge(cfg)
 
 

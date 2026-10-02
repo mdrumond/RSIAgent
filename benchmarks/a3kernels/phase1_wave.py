@@ -20,6 +20,11 @@ from benchmarks.a3_experiments import (
 )
 from benchmarks.a3_model_profiles import load_a3_model_profile
 from benchmarks.a3kernels.candidate import profile_driver_asset
+from benchmarks.a3kernels.artifact_prepare import (
+    DEFAULT_CORPUS_SPEC,
+    validate_manifest_contract,
+)
+from benchmarks.a3kernels.corpus import CorpusSpec
 from benchmarks.a3kernels.phase1_evidence import (
     A3_EXECUTION_PROFILES,
     canonical_digest,
@@ -140,6 +145,9 @@ def authenticate_smoke_knowledge(config: "Phase1Config") -> dict[str, str]:
     manifest_bytes = config.knowledge_manifest.read_bytes()
     manifest = CollectionManifest.from_json(manifest_bytes.decode("utf-8"))
     embeddings = PinnedBGEEmbeddings(cache_dir=config.embedding_cache)
+    validate_manifest_contract(
+        CorpusSpec.load(DEFAULT_CORPUS_SPEC), manifest, embeddings
+    )
     with KnowledgeDB.open_read_only(config.knowledge_database, embeddings) as database:
         if database.manifest(manifest.collection) != manifest:
             raise ValueError("local KDB does not match the pinned knowledge manifest")

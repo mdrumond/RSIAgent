@@ -13,13 +13,20 @@ from typing import Callable, Mapping, Protocol, Sequence
 from benchmarks.a3_experiments import A3ExperimentCell
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, complete_a3, load_a3_model_profile
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
+from benchmarks.a3kernels.artifact_prepare import (
+    DEFAULT_CORPUS_SPEC,
+    validate_manifest_contract,
+)
+from benchmarks.a3kernels.corpus import CorpusSpec
 from benchmarks.a3kernels.embeddings import PinnedBGEEmbeddings
 from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
 from benchmarks.a3kernels.knowledge_agent import KnowledgeAgent, QueryJournal
 from benchmarks.a3kernels.phase1_evidence import EvidenceLedger, canonical_bytes, canonical_digest
 from benchmarks.a3kernels.phase1_memory import AuthoritativeEvidence, Phase1LearningJournal
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
-from benchmarks.a3kernels.phase1_registry import CurriculumProposal, DEFAULT_PROPOSALS
+from benchmarks.a3kernels.phase1_registry import (
+    CurriculumProposal, DEFAULT_PROPOSALS, canonical_proposals,
+)
 from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
 from benchmarks.a3kernels.project_execution import (
     PerformancePreset, ProjectRuntimePolicy, RecoveryEvidence,
@@ -251,11 +258,12 @@ class LiveComposition:
         lineage_prefix: str = "phase1",
     ) -> None:
         self.config, self.dependencies = config, dependencies
-        self.proposals = tuple(proposals)
-        if not self.proposals or any(
-            not isinstance(item, CurriculumProposal) for item in self.proposals
+        supplied = tuple(proposals)
+        if not supplied or any(
+            not isinstance(item, CurriculumProposal) for item in supplied
         ):
             raise ValueError("composition requires registered curriculum proposals")
+        self.proposals = canonical_proposals(supplied)
         if not re.fullmatch(r"[a-z0-9-]+", lineage_prefix):
             raise ValueError("composition lineage prefix is invalid")
         self.lineage_prefix = lineage_prefix
@@ -567,6 +575,9 @@ def local_knowledge_factory(
             config.knowledge_manifest.read_text(encoding="utf-8")
         )
         embeddings = PinnedBGEEmbeddings(cache_dir=config.embedding_cache)
+        validate_manifest_contract(
+            CorpusSpec.load(DEFAULT_CORPUS_SPEC), expected, embeddings
+        )
         database = KnowledgeDB.open_read_only(config.knowledge_database, embeddings)
         actual = database.manifest(expected.collection)
         if actual != expected:

@@ -43,6 +43,22 @@ def _expected_sources(spec: CorpusSpec) -> tuple[SourceFingerprint, ...]:
     )
 
 
+def validate_manifest_contract(
+    spec: CorpusSpec,
+    manifest: CollectionManifest,
+    embeddings: EmbeddingBackend,
+) -> None:
+    """Bind a manifest to the exact registered corpus and embedding backend."""
+    if (
+        manifest.collection != spec.collection
+        or manifest.target != "a3"
+        or manifest.sources != _expected_sources(spec)
+        or (manifest.embedding_model, manifest.embedding_revision, manifest.dimension)
+        != (embeddings.model, embeddings.revision, embeddings.dimension)
+    ):
+        raise ValueError("published A3 manifest does not match pinned inputs")
+
+
 def _verify(
     spec: CorpusSpec,
     corpus_artifacts: Path,
@@ -52,14 +68,7 @@ def _verify(
 ) -> CollectionManifest:
     documents = load_documents(spec, corpus_artifacts)
     manifest = CollectionManifest.from_json(manifest_path.read_text(encoding="utf-8"))
-    if (
-        manifest.collection != spec.collection
-        or manifest.target != "a3"
-        or manifest.sources != _expected_sources(spec)
-        or (manifest.embedding_model, manifest.embedding_revision, manifest.dimension)
-        != (embeddings.model, embeddings.revision, embeddings.dimension)
-    ):
-        raise ValueError("published A3 manifest does not match pinned inputs")
+    validate_manifest_contract(spec, manifest, embeddings)
     with KnowledgeDB.open_read_only(database_path, embeddings) as database:
         check = database.connection.execute("PRAGMA integrity_check").fetchone()
         if check is None or check[0] != "ok":
@@ -165,4 +174,6 @@ def prepare_phase1_artifacts(
     }
 
 
-__all__ = ["DEFAULT_CORPUS_SPEC", "prepare_phase1_artifacts"]
+__all__ = [
+    "DEFAULT_CORPUS_SPEC", "prepare_phase1_artifacts", "validate_manifest_contract",
+]

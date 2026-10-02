@@ -189,6 +189,14 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
     assert entries[0]["memory"]["lineage_id"].startswith("smoke-")
 
 
+def test_composition_canonicalizes_custom_proposals_before_execution(tmp_path):
+    composition = LiveComposition(
+        config(tmp_path), dependencies([], []),
+        proposals=tuple(reversed(DEFAULT_PROPOSALS[:2])),
+    )
+    assert composition.proposals == DEFAULT_PROPOSALS[:2]
+
+
 def test_smoke_guidance_cell_requires_one_candidate_bound_pipe_profile(tmp_path):
     cfg = config(tmp_path)
     profile_calls = []
