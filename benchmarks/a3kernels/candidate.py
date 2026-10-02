@@ -61,9 +61,19 @@ CANDIDATE_SOURCE_CONTRACT = CandidateSourceContract(
     ),
 )
 _SIGNATURE_TOKEN = re.compile(r'"[^"]*"|[A-Za-z_]\w*|::|[(),]')
+_IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_]\w*")
+
+
+def _signature_token_pattern(token: str) -> str:
+    escaped = re.escape(token)
+    if _IDENTIFIER_TOKEN.fullmatch(token):
+        return rf"(?<!\w){escaped}(?!\w)"
+    return escaped
+
+
 _SIGNATURE = re.compile(
     r"\s*".join(
-        re.escape(token)
+        _signature_token_pattern(token)
         for token in _SIGNATURE_TOKEN.findall(CANDIDATE_EXPORTED_SIGNATURE)
     ),
     re.MULTILINE,

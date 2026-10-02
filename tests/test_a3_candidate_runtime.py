@@ -316,6 +316,8 @@ def _driver_args(root: Path, *, block_count: int = 1) -> list[str]:
         "void vector_add() {}",
         SOURCE.replace("extern \"C\" ", ""),
         SOURCE.replace("uint32_t buffer_bytes", "uint64_t buffer_bytes"),
+        SOURCE.replace("GM_ADDR input_a", "GM_ADDRinput_a"),
+        SOURCE.replace("__global__ __aicore__", "__global____aicore__"),
         SOURCE + "\nextern \"C\" void vector_add();",
         SOURCE + "\n// catlass fallback",
     ],
@@ -323,6 +325,12 @@ def _driver_args(root: Path, *, block_count: int = 1) -> list[str]:
 def test_candidate_requires_exact_exported_signature(source):
     with pytest.raises(ValueError, match="candidate"):
         validate_candidate_source(source)
+
+
+def test_candidate_signature_allows_compact_punctuation():
+    source = candidate_module.CANDIDATE_EXPORTED_SIGNATURE.replace(", ", ",") + "{}"
+
+    validate_candidate_source(source)
 
 
 def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
