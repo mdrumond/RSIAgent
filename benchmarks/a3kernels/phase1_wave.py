@@ -34,6 +34,11 @@ from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS, CurriculumPr
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _HOST_ASSETS = ("build.json", "host_driver.py", "host_wrapper.inc")
+_KNOWLEDGE_IDENTITY_FIELDS = {
+    "embedding_snapshot_sha256", "knowledge_database_sha256",
+    "knowledge_manifest_sha256", "knowledge_collection_sha256",
+    "knowledge_probe_sha256",
+}
 
 
 def full_dry_run() -> dict[str, object]:
@@ -153,6 +158,19 @@ def authenticate_smoke_knowledge(config: "Phase1Config") -> dict[str, str]:
         "knowledge_collection_sha256": manifest.fingerprint,
         "knowledge_probe_sha256": canonical_digest(probe),
     }
+
+
+def _validated_knowledge_identity(
+    value: Mapping[str, str] | None,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if set(value) != _KNOWLEDGE_IDENTITY_FIELDS or any(
+        type(item) is not str or _SHA.fullmatch(item) is None
+        for item in value.values()
+    ):
+        raise ValueError("smoke knowledge identity is invalid")
+    return dict(value)
 
 
 @dataclass(frozen=True)
@@ -389,9 +407,7 @@ class SmokeWave(Phase1Wave):
         super().__init__(
             config, executor, cells=cells, execution_profile=execution_profile
         )
-        self._knowledge_identity = (
-            dict(knowledge_identity) if knowledge_identity is not None else None
-        )
+        self._knowledge_identity = _validated_knowledge_identity(knowledge_identity)
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
         root = self.config.state_root / "smoke-cells" / cell.cell_id
@@ -465,14 +481,9 @@ class SmokeWave(Phase1Wave):
         if cell.knowledge is KnowledgeMode.WITHOUT_KDB:
             valid_knowledge = knowledge is None
         else:
-            keys = {
-                "embedding_snapshot_sha256", "knowledge_database_sha256",
-                "knowledge_manifest_sha256", "knowledge_collection_sha256",
-                "knowledge_probe_sha256",
-            }
             valid_knowledge = (
                 isinstance(knowledge, dict)
-                and set(knowledge) == keys
+                and set(knowledge) == _KNOWLEDGE_IDENTITY_FIELDS
                 and all(
                     isinstance(item, str) and _SHA.fullmatch(item)
                     for item in knowledge.values()

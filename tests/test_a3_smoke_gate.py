@@ -109,6 +109,15 @@ def test_kdb_authentication_happens_before_executor(tmp_path, monkeypatch):
     assert events == ["authenticated-query", "provider-executor"]
 
 
+def test_injected_smoke_knowledge_identity_must_have_exact_digests(tmp_path):
+    cell = next(c for c in foundation_cells() if c.knowledge is KnowledgeMode.WITH_KDB)
+    with pytest.raises(ValueError, match="knowledge identity"):
+        SmokeWave(
+            config(tmp_path), outcome, cells=(cell,), execution_profile="bz-a3-1",
+            knowledge_identity={"knowledge_database_sha256": "not-a-digest"},
+        )
+
+
 def test_smoke_kdb_authentication_opens_read_only_and_runs_fixed_query(
     tmp_path, monkeypatch,
 ):
