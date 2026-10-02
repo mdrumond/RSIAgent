@@ -30,10 +30,54 @@ _COMPILE_ARGV = ("python", "host_driver.py", "--compile-only")
 _RUN_ARGV = ("python", "host_driver.py", "input.json")
 _COMPILE_MARKER = "A3CANDIDATE_COMPILED="
 _OUTPUT_MARKER = "A3KERNEL_OUTPUT="
+CANDIDATE_EXPORTED_SIGNATURE = (
+    'extern "C" __global__ __aicore__ void vector_add('
+    "GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output, "
+    "uint32_t count, uint32_t buffer_bytes)"
+)
+
+
+@dataclass(frozen=True)
+class CandidateSourceContract:
+    source_slot: str
+    exported_signature: str
+    constraints: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "source_slot": self.source_slot,
+            "exported_signature": self.exported_signature,
+            "constraints": list(self.constraints),
+        }
+
+
+CANDIDATE_SOURCE_CONTRACT = CandidateSourceContract(
+    source_slot="candidate.cpp",
+    exported_signature=CANDIDATE_EXPORTED_SIGNATURE,
+    constraints=(
+        "Define the exported signature exactly once.",
+        "Write only the complete Ascend C device implementation in the source slot.",
+        "Do not include Catlass, TLA annotations, or Torch registration code.",
+    ),
+)
+_SIGNATURE_TOKEN = re.compile(r'"[^"]*"|[A-Za-z_]\w*|::|[(),]')
+_IDENTIFIER_TOKEN = re.compile(r"[A-Za-z_]\w*")
+
+
+def _signature_token_pattern(token: str) -> str:
+    escaped = re.escape(token)
+    if _IDENTIFIER_TOKEN.fullmatch(token):
+        return rf"(?<!\w){escaped}(?!\w)"
+    if token.startswith('"'):
+        return rf"{escaped}(?!\w)"
+    return escaped
+
+
 _SIGNATURE = re.compile(
-    r'extern\s+"C"\s+__global__\s+__aicore__\s+void\s+vector_add\s*\(\s*'
-    r'GM_ADDR\s+input_a\s*,\s*GM_ADDR\s+input_b\s*,\s*GM_ADDR\s+output\s*,\s*'
-    r'uint32_t\s+count\s*,\s*uint32_t\s+buffer_bytes\s*\)',
+    r"\s*".join(
+        _signature_token_pattern(token)
+        for token in _SIGNATURE_TOKEN.findall(CANDIDATE_EXPORTED_SIGNATURE)
+    ),
     re.MULTILINE,
 )
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -275,6 +319,8 @@ def _detail(completed: subprocess.CompletedProcess[str]) -> str:
 
 
 __all__ = [
-    "A3CandidateBackend", "CandidateCompilation", "FailedEvidence",
-    "VerifiedResult", "profile_driver_asset", "validate_candidate_source",
+    "A3CandidateBackend", "CANDIDATE_EXPORTED_SIGNATURE",
+    "CANDIDATE_SOURCE_CONTRACT", "CandidateCompilation", "CandidateSourceContract",
+    "FailedEvidence", "VerifiedResult", "profile_driver_asset",
+    "validate_candidate_source",
 ]

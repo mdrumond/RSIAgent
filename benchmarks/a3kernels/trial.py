@@ -9,11 +9,15 @@ from typing import Callable, Mapping
 
 from benchmarks.a3_experiments import (
     A3ExperimentCell,
+    BackendModel,
     KnowledgeMode,
     ProfilingGuidance,
 )
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile
-from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.candidate import (
+    CANDIDATE_SOURCE_CONTRACT,
+    CandidateCompilation,
+)
 from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery, KnowledgeResult
 from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a3kernels.phase1_memory import (
@@ -116,6 +120,13 @@ class TrialBudgets:
         ):
             raise ValueError("trial budgets are outside registered bounds")
 
+    @classmethod
+    def for_model(cls, model: BackendModel) -> "TrialBudgets":
+        if not isinstance(model, BackendModel):
+            raise TypeError("default trial budgets require a registered backend model")
+        max_tokens = 65536 if model is BackendModel.DEEPSEEK_FLASH else 32768
+        return cls(max_tokens=max_tokens)
+
 
 @dataclass(frozen=True)
 class TrialResult:
@@ -146,7 +157,7 @@ class A3TrialLoop:
         evidence: EvidenceLedger,
         memory: Phase1LearningJournal,
         workdir: Path,
-        budgets: TrialBudgets = TrialBudgets(),
+        budgets: TrialBudgets | None = None,
         timing_dimensions: StudyDimensions | None = None,
         execution_profile: str = "gz-a3",
     ) -> None:
@@ -163,7 +174,8 @@ class A3TrialLoop:
             raise ValueError("memory must be isolated to the experiment cell")
         self.cell, self.proposal, self.profile = cell, proposal, profile
         self.actor, self.candidate, self.knowledge, self.profiler = actor, candidate, knowledge, profiler
-        self.evidence, self.memory, self.workdir, self.budgets = evidence, memory, Path(workdir), budgets
+        self.evidence, self.memory, self.workdir = evidence, memory, Path(workdir)
+        self.budgets = budgets if budgets is not None else TrialBudgets.for_model(cell.backend_model)
         if execution_profile not in A3_EXECUTION_PROFILES:
             raise ValueError("trial execution_profile must be a registered A3 profile")
         self.execution_profile = execution_profile
@@ -215,7 +227,12 @@ class A3TrialLoop:
                         continue
                     if not isinstance(compilation, CandidateCompilation):
                         raise TypeError("candidate compiler returned an invalid result")
-                    observations.append("host compile passed")
+                    observations.append(self._authoritative_observation(
+                        kind="compile",
+                        evidence_sha256=compilation.attestation_sha256,
+                        source_fingerprint=compilation.plan.source_fingerprint,
+                        execution_id=compilation.plan.execution_id,
+                    ))
                 elif action.kind == "run":
                     if source is None or compilation is None:
                         raise ValueError("successful compile is required before run")
@@ -236,7 +253,12 @@ class A3TrialLoop:
                     if result.source_fingerprint != compilation.plan.source_fingerprint:
                         raise ValueError("candidate source identity changed after compile")
                     verified = result
-                    observations.append("host verification passed")
+                    observations.append(self._authoritative_observation(
+                        kind="host-verification",
+                        evidence_sha256=result.evidence_sha256,
+                        source_fingerprint=result.source_fingerprint,
+                        execution_id=result.execution_id,
+                    ))
                 elif action.kind == "query":
                     queries += 1
                     results = self.knowledge.query(KnowledgeQuery(action.query, action.limit))
@@ -356,6 +378,19 @@ class A3TrialLoop:
             self._identity({"turn": turn, "failed_evidence": failure}),
         )
 
+    @staticmethod
+    def _authoritative_observation(
+        *, kind: str, evidence_sha256: str, source_fingerprint: str,
+        execution_id: str,
+    ) -> dict[str, object]:
+        return {"authoritative_evidence": {
+            "kind": kind,
+            "status": "passed",
+            "evidence_sha256": evidence_sha256,
+            "source_fingerprint": source_fingerprint,
+            "execution_id": execution_id,
+        }}
+
     def _identity(self, payload: Mapping[str, object]) -> dict[str, object]:
         return {
             "target": "Ascend910B4", "language": "ascend-c",
@@ -402,6 +437,7 @@ class A3TrialLoop:
                     kind: sorted(fields) for kind, fields in sorted(_ACTION_FIELDS.items())
                 },
                 "cell": self.cell.as_dict(),
+                "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
                 "current_candidate_source": source,
                 "lineage_id": self.memory.lineage_id,
                 "memory": json.loads(self.memory.project_context()),
@@ -413,7 +449,7 @@ class A3TrialLoop:
                     "profiling_treatment": self.cell.profiling.value,
                 },
                 "proposal": self.proposal.as_dict(),
-                "source_slot": "candidate.cpp",
+                "source_slot": CANDIDATE_SOURCE_CONTRACT.source_slot,
             },
             sort_keys=True,
             separators=(",", ":"),

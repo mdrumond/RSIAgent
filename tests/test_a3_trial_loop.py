@@ -8,7 +8,11 @@ from benchmarks.a3_experiments import (
     build_a3_experiment_plan,
 )
 from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
-from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.candidate import (
+    CANDIDATE_SOURCE_CONTRACT,
+    CandidateCompilation,
+    validate_candidate_source,
+)
 from benchmarks.a3kernels.knowledge_agent import (
     Citation, KnowledgeQuery, KnowledgeResult,
 )
@@ -27,10 +31,15 @@ from benchmarks.a3kernels.trial import A3TrialLoop, Action, TrialBudgets, parse_
 SOURCE = 'extern "C" __global__ __aicore__ void vector_add(GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output, uint32_t count, uint32_t buffer_bytes) {}'
 
 
-def _cell(*, knowledge=KnowledgeMode.WITHOUT_KDB, profiling=ProfilingGuidance.WITHOUT_GUIDANCE):
+def _cell(
+    *,
+    model=BackendModel.GPT_5_6_SOL,
+    knowledge=KnowledgeMode.WITHOUT_KDB,
+    profiling=ProfilingGuidance.WITHOUT_GUIDANCE,
+):
     return next(
         cell for cell in build_a3_experiment_plan().cells
-        if cell.backend_model is BackendModel.GPT_5_6_SOL
+        if cell.backend_model is model
         and cell.knowledge is knowledge and cell.profiling is profiling
         and cell.programming_level is ProgrammingLevel.FOUNDATION
     )
@@ -153,8 +162,11 @@ def _run(
     def actor(actual_profile, context):
         assert actual_profile == profile
         prompts.append(context)
+        action = queue.pop(0)
+        if callable(action):
+            action = action(context)
         return A3Completion(
-            queue.pop(0), completion_tokens,
+            action, completion_tokens,
             {"profile_sha256": profile.fingerprint},
         )
     journal = Phase1LearningJournal(
@@ -202,6 +214,50 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
     assert first["allowed_actions"]["write_source"] == ["action", "source"]
     assert first["current_candidate_source"] is None
     assert after_write["current_candidate_source"] == SOURCE
+    contract = first["candidate_source_contract"]
+    assert contract == CANDIDATE_SOURCE_CONTRACT.as_dict()
+    assert contract["source_slot"] == first["source_slot"] == "candidate.cpp"
+    validate_candidate_source(contract["exported_signature"] + " {}")
+    assert all(
+        json.loads(prompt)["candidate_source_contract"] == contract
+        for prompt in prompts
+    )
+
+
+def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
+    submitted_supports = []
+
+    def submit_from_context(context):
+        observations = json.loads(context)["observations"]
+        authoritative = [
+            item["authoritative_evidence"]
+            for item in observations
+            if isinstance(item, dict) and "authoritative_evidence" in item
+        ]
+        assert [item["kind"] for item in authoritative] == [
+            "compile", "host-verification",
+        ]
+        assert all(item["status"] == "passed" for item in authoritative)
+        assert len({item["source_fingerprint"] for item in authoritative}) == 1
+        submitted_supports.extend(item["evidence_sha256"] for item in authoritative)
+        assert all(len(digest) == 64 for digest in submitted_supports)
+        return json.dumps({
+            "action": "submit",
+            "interpretation": "host compilation and verification passed",
+            "supports": submitted_supports,
+        })
+
+    result, _, journal = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        '{"action":"run"}',
+        submit_from_context,
+    ])
+
+    assert result.status == "passed"
+    assert journal.read()[0]["memory"]["agent_interpretations"][0][
+        "supports"
+    ] == submitted_supports
 
 
 def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):
@@ -315,6 +371,32 @@ def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
     assert token_result.status == "budget-exhausted" and token_result.turns == 1
     assert token_result.failures == ("token budget exhausted",)
     assert token_journal.read() == ()
+
+
+def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
+    def build_loop(model, *, budgets=None):
+        cell = _cell(model=model)
+        profile = load_a3_model_profile(model)
+        journal = Phase1LearningJournal(
+            tmp_path / model.name / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
+            cell_id=cell.cell_id, lineage_id="isolated-lineage",
+            evidence_resolver=Resolver(),
+        )
+        kwargs = {}
+        if budgets is not None:
+            kwargs["budgets"] = budgets
+        return A3TrialLoop(
+            cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
+            actor=lambda *_: None, candidate=FakeCandidate(),
+            knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
+            evidence=EvidenceLedger(tmp_path / model.name / "evidence.jsonl"),
+            memory=journal, workdir=tmp_path / model.name / "work", **kwargs,
+        )
+
+    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(12, 32768)
+    assert build_loop(BackendModel.DEEPSEEK_FLASH).budgets == TrialBudgets(12, 65536)
+    override = TrialBudgets(2, 17)
+    assert build_loop(BackendModel.DEEPSEEK_FLASH, budgets=override).budgets is override
 
 
 def test_model_and_treatment_authorities_must_match_cell(tmp_path):
