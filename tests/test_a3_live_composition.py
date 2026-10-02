@@ -30,7 +30,7 @@ from benchmarks.a3kernels.phase1_protocol import (
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.project_execution import ProjectRuntimePolicy, RecoveryEvidence
 from benchmarks.a3kernels.phase1_wave import (
-    Phase1Config,
+    SMOKE_PROPOSALS, Phase1Config,
     Phase1Wave,
     foundation_cells,
 )
@@ -168,6 +168,62 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
         ]
         assert {item.get("stage") for item in failures} >= {"compile", "verify"}
     assert Phase1Wave(cfg, composition.execute).resume() == records
+
+
+def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    composition = LiveComposition(
+        cfg, dependencies([], []), proposals=SMOKE_PROPOSALS,
+        lineage_prefix="smoke",
+    )
+    paths = Phase1Wave(cfg, composition.execute, cells=(cell,)).paths(cell)
+    assert composition.execute(cell, paths)["status"] == "passed"
+    entries = [json.loads(line) for line in paths.memory.read_text().splitlines()]
+    assert len(entries) == 1
+    assert entries[0]["memory"]["proposal"]["family"] == "vector-add-baseline"
+    assert entries[0]["memory"]["lineage_id"].startswith("smoke-")
+
+
+def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):
+    calls = []
+    deps = LiveDependencies(
+        actor_factory=lambda *args: calls.append(("actor", args)),
+        candidate_factory=lambda *args: calls.append(("candidate", args)),
+        knowledge_factory=lambda *args: calls.append(("knowledge", args)),
+        profiler_factory=lambda *args: calls.append(("profiler", args)),
+    )
+    with pytest.raises(ValueError, match="canonical registry order"):
+        LiveComposition(
+            config(tmp_path), deps,
+            proposals=tuple(reversed(DEFAULT_PROPOSALS[:2])),
+        )
+    assert calls == []
+
+
+def test_smoke_guidance_cell_requires_one_candidate_bound_pipe_profile(tmp_path):
+    cfg = config(tmp_path)
+    profile_calls = []
+    cell = next(
+        item for item in foundation_cells()
+        if item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITH_GUIDANCE
+    )
+    composition = LiveComposition(
+        cfg, dependencies([], profile_calls), proposals=SMOKE_PROPOSALS,
+        lineage_prefix="smoke",
+    )
+    paths = Phase1Wave(cfg, composition.execute, cells=(cell,)).paths(cell)
+    assert composition.execute(cell, paths)["status"] == "passed"
+    assert len(profile_calls) == 1
+    memory = json.loads(paths.memory.read_text().splitlines()[0])["memory"]
+    facts = [fact for fact in memory["host_facts"] if fact["category"] == "profiling"]
+    assert len(facts) == 1
+    assert facts[0]["statement"].startswith("raw PipeUtilization:")
 
 
 def test_live_composition_recovers_torn_evidence_before_resume(tmp_path):

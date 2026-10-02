@@ -294,8 +294,15 @@ def _validated(
     )
 
 
+def canonical_proposals(
+    proposals: Sequence[CurriculumProposal],
+) -> tuple[CurriculumProposal, ...]:
+    """Validate and return proposals in the registry's execution order."""
+    return _validated(proposals)
+
+
 def saturation_status(proposals: Sequence[CurriculumProposal]) -> str:
-    rows = _validated(proposals)
+    rows = canonical_proposals(proposals)
     if len(rows) not in CHECKPOINTS:
         return "IN_PROGRESS"
     coverage = {tag for row in rows for tag in row.registered.coverage}
@@ -310,7 +317,7 @@ def dry_run_plan(
 ) -> dict[str, object]:
     """Build the complete plan without model, profiler, or device side effects."""
 
-    rows = _validated(proposals)
+    rows = canonical_proposals(proposals)
     projects = [
         {
             "ordinal": ordinal,

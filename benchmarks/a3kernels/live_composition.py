@@ -8,18 +8,25 @@ import json
 import os
 from pathlib import Path
 import re
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Mapping, Protocol, Sequence
 
 from benchmarks.a3_experiments import A3ExperimentCell
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, complete_a3, load_a3_model_profile
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
+from benchmarks.a3kernels.artifact_prepare import (
+    DEFAULT_CORPUS_SPEC,
+    validate_manifest_contract,
+)
+from benchmarks.a3kernels.corpus import CorpusSpec
 from benchmarks.a3kernels.embeddings import PinnedBGEEmbeddings
 from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
 from benchmarks.a3kernels.knowledge_agent import KnowledgeAgent, QueryJournal
 from benchmarks.a3kernels.phase1_evidence import EvidenceLedger, canonical_bytes, canonical_digest
 from benchmarks.a3kernels.phase1_memory import AuthoritativeEvidence, Phase1LearningJournal
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
-from benchmarks.a3kernels.phase1_registry import CurriculumProposal, DEFAULT_PROPOSALS
+from benchmarks.a3kernels.phase1_registry import (
+    CurriculumProposal, DEFAULT_PROPOSALS, canonical_proposals,
+)
 from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
 from benchmarks.a3kernels.project_execution import (
     PerformancePreset, ProjectRuntimePolicy, RecoveryEvidence,
@@ -242,15 +249,34 @@ def _policy_actor(actor, profile: A3ModelProfile, policy: ProjectRuntimePolicy):
 class LiveComposition:
     """Execute every registered project for one isolated experiment cell."""
 
-    def __init__(self, config: Phase1Config, dependencies: LiveDependencies) -> None:
+    def __init__(
+        self,
+        config: Phase1Config,
+        dependencies: LiveDependencies,
+        *,
+        proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
+        lineage_prefix: str = "phase1",
+    ) -> None:
         self.config, self.dependencies = config, dependencies
+        supplied = tuple(proposals)
+        if not supplied or any(
+            not isinstance(item, CurriculumProposal) for item in supplied
+        ):
+            raise ValueError("composition requires registered curriculum proposals")
+        canonical = canonical_proposals(supplied)
+        if supplied != canonical:
+            raise ValueError("composition proposals must use canonical registry order")
+        self.proposals = canonical
+        if not re.fullmatch(r"[a-z0-9-]+", lineage_prefix):
+            raise ValueError("composition lineage prefix is invalid")
+        self.lineage_prefix = lineage_prefix
         self.cell_digests: dict[str, tuple[str, ...]] = {}
 
     def execute(self, cell: A3ExperimentCell, paths: CellPaths) -> dict[str, object]:
         store = AuthoritativeResultStore(paths.root / "authority.jsonl")
         memory = Phase1LearningJournal(
-            paths.memory, DEFAULT_PROPOSALS, cell_id=cell.cell_id,
-            lineage_id=f"phase1-{cell.cell_id}", evidence_resolver=store,
+            paths.memory, self.proposals, cell_id=cell.cell_id,
+            lineage_id=f"{self.lineage_prefix}-{cell.cell_id}", evidence_resolver=store,
         )
         knowledge = self.dependencies.knowledge_factory(cell, paths)
         EvidenceLedger.recover_incomplete_tail(paths.evidence)
@@ -258,7 +284,7 @@ class LiveComposition:
         profile = load_a3_model_profile(cell.backend_model)
         digests = [entry["entry_sha256"] for entry in memory.read()]
         start = memory.resume_state().completed_projects
-        for proposal in DEFAULT_PROPOSALS[start:]:
+        for proposal in self.proposals[start:]:
             policy = ProjectRuntimePolicy.from_proposal(proposal)
             candidate = _RecordingCandidate(
                 _RecoveryCandidate(
@@ -552,6 +578,9 @@ def local_knowledge_factory(
             config.knowledge_manifest.read_text(encoding="utf-8")
         )
         embeddings = PinnedBGEEmbeddings(cache_dir=config.embedding_cache)
+        validate_manifest_contract(
+            CorpusSpec.load(DEFAULT_CORPUS_SPEC), expected, embeddings
+        )
         database = KnowledgeDB.open_read_only(config.knowledge_database, embeddings)
         actual = database.manifest(expected.collection)
         if actual != expected:
