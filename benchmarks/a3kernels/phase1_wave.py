@@ -13,6 +13,7 @@ import tempfile
 from typing import Callable, Mapping, Sequence
 
 from benchmarks.a3_experiments import A3ExperimentCell, ProgrammingLevel, build_a3_experiment_plan
+from benchmarks.a3_model_profiles import load_a3_model_profile
 from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_registry import dry_run_plan
@@ -31,6 +32,14 @@ def foundation_cells() -> tuple[A3ExperimentCell, ...]:
         cell for cell in build_a3_experiment_plan().cells
         if cell.programming_level is ProgrammingLevel.FOUNDATION
     )
+
+
+def registered_credential_envs() -> tuple[str, ...]:
+    """Return the deterministic credential boundary for the Phase 1 matrix."""
+    return tuple(sorted({
+        load_a3_model_profile(cell.backend_model).credential_env
+        for cell in foundation_cells()
+    }))
 
 
 def select_foundation_cells(
@@ -112,8 +121,10 @@ class Phase1Config:
                 driver.relative_path == "a3_profile_driver.py"
                 and _SHA.fullmatch(driver.sha256) is not None
             ),
-            "OPENROUTER_API_KEY": bool(environ.get("OPENROUTER_API_KEY")),
-            "DEEPSEEK_API_KEY": bool(environ.get("DEEPSEEK_API_KEY")),
+            **{
+                credential_name: bool(environ.get(credential_name))
+                for credential_name in registered_credential_envs()
+            },
         }
         missing = [name for name, present in paths.items() if not present]
         if missing:
