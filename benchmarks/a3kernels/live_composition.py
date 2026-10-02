@@ -346,7 +346,12 @@ class RemoteCandidateBundle:
         plan = self._plan(source, options)
         # Attempt ids intentionally differ between compile/run actions, while
         # source and host policy remain identical. Match the retained source.
-        for execution_id, retained_plan in self.plans.items():
+        # Multiple successful compile actions may have identical source and
+        # inputs but distinct attempt/execution identities. Execute the most
+        # recent matching artifact so the trial's latest compile observation
+        # and subsequent verification/profile evidence stay bound together.
+        for execution_id in reversed(self.plans):
+            retained_plan = self.plans[execution_id]
             if (
                 retained_plan.source_fingerprint == plan.source_fingerprint
                 and retained_plan.project_id == plan.project_id

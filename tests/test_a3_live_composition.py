@@ -310,6 +310,59 @@ def test_remote_bundle_compile_then_run_reuses_one_managed_execution(tmp_path):
     assert (managed.compile_calls, managed.execute_calls) == (1, 1)
 
 
+def test_remote_bundle_run_uses_latest_matching_successful_compile(tmp_path):
+    class Managed:
+        def __init__(self):
+            self.compile_calls = 0
+            self.executed = []
+
+        def compile(self, plan, workdir):
+            self.compile_calls += 1
+            library = f"{self.compile_calls}" * 64
+            body = {
+                "plan": plan, "library_sha256": library,
+                "stdout": "", "stderr": "",
+            }
+            return CandidateCompilation(plan, library, "", "", attest(body))
+
+        def execute(self, compilation):
+            self.executed.append(compilation)
+            plan = compilation.plan
+            output = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
+            return VerifiedResult.from_receipt(
+                plan,
+                ExecutionReceipt(
+                    0, output, job_handle="gz-a3:latest",
+                    metadata=(("library_sha256", compilation.library_sha256),),
+                ),
+                max_abs_error=0.0,
+            )
+
+    managed = Managed()
+    bundle = RemoteCandidateBundle(managed)
+    options = dict(
+        request_id="cell", project_id="project", length=32,
+        padded_length=64, block_count=1, seed=0,
+    )
+    first = bundle.compile(SOURCE, tmp_path, attempt_id="turn-2", **options)
+    latest = bundle.compile(SOURCE, tmp_path, attempt_id="turn-3", **options)
+    verified = bundle.run(SOURCE, tmp_path, attempt_id="turn-4", **options)
+
+    assert first.plan.execution_id != latest.plan.execution_id
+    assert managed.executed == [latest]
+    assert verified.execution_id == latest.plan.execution_id
+    expected = VerifiedResult.from_receipt(
+        latest.plan,
+        ExecutionReceipt(
+            0, tuple(a + b for a, b in zip(latest.plan.input_a, latest.plan.input_b)),
+            job_handle="gz-a3:latest",
+            metadata=(("library_sha256", latest.library_sha256),),
+        ),
+        max_abs_error=0.0,
+    )
+    assert verified.evidence_sha256 == expected.evidence_sha256
+
+
 def test_profile_uses_exact_retained_compile_binding_and_directory(tmp_path, monkeypatch):
     import benchmarks.a3kernels.live_composition as live
     class Managed:
