@@ -15,7 +15,13 @@ from benchmarks.a3kernels.live_composition import (
     LiveComposition,
     LiveDependencies,
     RemoteCandidateBundle,
+    local_knowledge_factory,
     model_actor_factory,
+)
+from benchmarks.a3kernels.knowledge_agent import (
+    KnowledgeAgent,
+    KnowledgeQuery,
+    QueryJournal,
 )
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_protocol import (
@@ -23,7 +29,11 @@ from benchmarks.a3kernels.phase1_protocol import (
 )
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.project_execution import ProjectRuntimePolicy, RecoveryEvidence
-from benchmarks.a3kernels.phase1_wave import Phase1Config, Phase1Wave
+from benchmarks.a3kernels.phase1_wave import (
+    Phase1Config,
+    Phase1Wave,
+    foundation_cells,
+)
 from benchmarks.a3kernels.profiling import (
     CandidateBinding, CompactProfileResult, ProfileMetric, ProfileRequest,
     StudyDimensions,
@@ -158,6 +168,47 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
         ]
         assert {item.get("stage") for item in failures} >= {"compile", "verify"}
     assert Phase1Wave(cfg, composition.execute).resume() == records
+
+
+def test_live_composition_recovers_torn_evidence_before_resume(tmp_path):
+    cfg = config(tmp_path)
+    composition = LiveComposition(cfg, dependencies([], []))
+    cell = foundation_cells()[0]
+    paths = Phase1Wave(cfg, composition.execute).paths(cell)
+    first = composition.execute(cell, paths)
+    committed = paths.evidence.read_bytes()
+    with paths.evidence.open("ab") as stream:
+        stream.write(b'{"sequence":999')
+
+    resumed = composition.execute(cell, paths)
+
+    assert resumed == first
+    assert paths.evidence.read_bytes() == committed
+
+
+def test_local_knowledge_factory_recovers_torn_query_before_continuation(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.knowledge is KnowledgeMode.WITHOUT_KDB
+    )
+    paths = Phase1Wave(cfg, lambda *_: {}).paths(cell)
+    journal_path = paths.root / "knowledge-queries.jsonl"
+    reference_path = tmp_path / "reference-queries.jsonl"
+    for target in (journal_path, reference_path):
+        KnowledgeAgent(enabled=False, journal=QueryJournal(target)).query(
+            KnowledgeQuery("first")
+        )
+    with journal_path.open("ab") as stream:
+        stream.write(b'{"sequence":2')
+
+    resumed = local_knowledge_factory(cfg)(cell, paths)
+    resumed.query(KnowledgeQuery("second"))
+    KnowledgeAgent(enabled=False, journal=QueryJournal(reference_path)).query(
+        KnowledgeQuery("second")
+    )
+
+    assert journal_path.read_bytes() == reference_path.read_bytes()
 
 
 def test_authority_store_is_durable_exact_and_conflict_rejecting(tmp_path):

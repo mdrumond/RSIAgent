@@ -118,8 +118,9 @@ class QueryJournal:
         with self.path.open("r+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
             value = stream.read()
-            if value.endswith(b"\n"):
-                raise ValueError("recovery permits only an incomplete final journal entry")
+            if not value or value.endswith(b"\n"):
+                self._decode(value.decode("utf-8"))
+                return 0
             boundary = value.rfind(b"\n") + 1
             prefix = value[:boundary].decode("utf-8")
             self._decode(prefix)

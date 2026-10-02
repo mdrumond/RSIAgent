@@ -188,5 +188,26 @@ def test_journal_rejects_middle_corruption_and_recovers_incomplete_tail(tmp_path
     path.write_text(json.dumps(entry) + "\n")
     with pytest.raises(ValueError, match="digest"):
         journal.read()
-    with pytest.raises(ValueError, match="only an incomplete"):
+    with pytest.raises(ValueError, match="digest"):
         journal.recover_incomplete_tail()
+
+
+def test_journal_recovery_continues_the_hash_chain_deterministically(tmp_path):
+    path = tmp_path / "interrupted.jsonl"
+    reference_path = tmp_path / "reference.jsonl"
+    for target in (path, reference_path):
+        KnowledgeAgent(enabled=False, journal=QueryJournal(target)).query(
+            KnowledgeQuery("first")
+        )
+    with path.open("ab") as stream:
+        stream.write(b'{"sequence":2')
+
+    journal = QueryJournal(path)
+    assert journal.recover_incomplete_tail() == 1
+    KnowledgeAgent(enabled=False, journal=journal).query(KnowledgeQuery("second"))
+    KnowledgeAgent(enabled=False, journal=QueryJournal(reference_path)).query(
+        KnowledgeQuery("second")
+    )
+
+    assert path.read_bytes() == reference_path.read_bytes()
+    assert journal.recover_incomplete_tail() == 0

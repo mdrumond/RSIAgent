@@ -238,6 +238,7 @@ class LiveComposition:
             lineage_id=f"phase1-{cell.cell_id}", evidence_resolver=store,
         )
         knowledge = self.dependencies.knowledge_factory(cell, paths)
+        EvidenceLedger.recover_incomplete_tail(paths.evidence)
         evidence = EvidenceLedger(paths.evidence)
         profile = load_a3_model_profile(cell.backend_model)
         digests = [entry["entry_sha256"] for entry in memory.read()]
@@ -524,6 +525,7 @@ def local_knowledge_factory(
         from benchmarks.a3_experiments import KnowledgeMode
 
         journal = QueryJournal(paths.root / "knowledge-queries.jsonl")
+        journal.recover_incomplete_tail()
         if cell.knowledge is KnowledgeMode.WITHOUT_KDB:
             return KnowledgeAgent(enabled=False, journal=journal)
         expected = CollectionManifest.from_json(
