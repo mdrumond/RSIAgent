@@ -19,6 +19,13 @@ from benchmarks.a3kernels.phase1_wave import (
 from benchmarks.a3kernels.live_composition import LiveComposition, bz_live_dependencies
 
 
+_SUPPORTED_PROVIDER_CREDENTIAL_ENVS = frozenset({
+    "DEEPSEEK_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+})
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -72,9 +79,12 @@ def _bz_preflight(
     remote = Path(cpl_remote)
     if not remote.is_file() or not os.access(remote, os.X_OK) or remote.name != "cpl-remote":
         raise ValueError("cpl_remote must be the user-wide executable cpl-remote")
+    credential_envs = (
+        _SUPPORTED_PROVIDER_CREDENTIAL_ENVS | set(registered_credential_envs())
+    )
     environment = {
         key: value for key, value in os.environ.items()
-        if key not in registered_credential_envs()
+        if key not in credential_envs
     }
     environment["CPL_REMOTE"] = str(remote)
     argv = [str(validation_wrapper), "--profile", profile, "preflight"]

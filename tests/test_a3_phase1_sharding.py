@@ -313,7 +313,9 @@ def test_cli_preflight_scrubs_direct_openai_profile_credential(
     assert "OPENROUTER_API_KEY" not in report["checks"]
     assert "OPENAI_API_KEY" not in seen["env"]
     assert "DEEPSEEK_API_KEY" not in seen["env"]
+    assert "OPENROUTER_API_KEY" not in seen["env"]
     assert "direct-openai-secret" not in json.dumps(report)
+    assert "stale-openrouter-secret" not in json.dumps(report)
 
 
 @pytest.mark.parametrize(
