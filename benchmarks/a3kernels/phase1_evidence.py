@@ -203,9 +203,17 @@ class EvidenceLedger:
                 cls.verify(tuple(cls._decode(data)))
                 return 0
             boundary = data.rfind(b"\n") + 1
-            cls.verify(tuple(cls._decode(data[:boundary])))
-            stream.seek(boundary)
-            stream.truncate()
+            tail = data[boundary:]
+            try:
+                json.loads(tail)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                cls.verify(tuple(cls._decode(data[:boundary])))
+                stream.seek(boundary)
+                stream.truncate()
+            else:
+                cls.verify(tuple(cls._decode(data + b"\n")))
+                stream.seek(0, os.SEEK_END)
+                stream.write(b"\n")
             stream.flush()
             os.fsync(stream.fileno())
             return 1

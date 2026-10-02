@@ -12,10 +12,18 @@ import re
 import tempfile
 from typing import Callable, Mapping, Sequence
 
-from benchmarks.a3_experiments import A3ExperimentCell, ProgrammingLevel, build_a3_experiment_plan
+from benchmarks.a3_experiments import (
+    A3ExperimentCell,
+    KnowledgeMode,
+    ProgrammingLevel,
+    build_a3_experiment_plan,
+)
 from benchmarks.a3_model_profiles import load_a3_model_profile
 from benchmarks.a3kernels.candidate import profile_driver_asset
-from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_evidence import (
+    A3_EXECUTION_PROFILES,
+    canonical_digest,
+)
 from benchmarks.a3kernels.phase1_registry import dry_run_plan
 
 
@@ -117,14 +125,11 @@ class Phase1Config:
         cells: Sequence[A3ExperimentCell] | None = None,
     ) -> dict[str, object]:
         driver = profile_driver_asset()
+        selected = foundation_cells() if cells is None else tuple(cells)
         paths = {
             "validation_wrapper": self.validation_wrapper.is_file()
             and os.access(self.validation_wrapper, os.X_OK)
             and self.validation_wrapper.name == "catlass-validation.sh",
-            "embedding_cache": self.embedding_cache.is_dir(),
-            "corpus_artifacts": self.corpus_artifacts.is_dir(),
-            "knowledge_database": self.knowledge_database.is_file(),
-            "knowledge_manifest": self.knowledge_manifest.is_file(),
             "profile_driver": (
                 driver.relative_path == "a3_profile_driver.py"
                 and _SHA.fullmatch(driver.sha256) is not None
@@ -134,6 +139,13 @@ class Phase1Config:
                 for credential_name in registered_credential_envs(cells)
             },
         }
+        if any(cell.knowledge is KnowledgeMode.WITH_KDB for cell in selected):
+            paths.update({
+                "embedding_cache": self.embedding_cache.is_dir(),
+                "corpus_artifacts": self.corpus_artifacts.is_dir(),
+                "knowledge_database": self.knowledge_database.is_file(),
+                "knowledge_manifest": self.knowledge_manifest.is_file(),
+            })
         missing = [name for name, present in paths.items() if not present]
         if missing:
             raise ValueError("preflight missing: " + ", ".join(missing))
@@ -157,6 +169,7 @@ class Phase1Wave:
         executor: Executor,
         *,
         cells: Sequence[A3ExperimentCell] | None = None,
+        execution_profile: str = "gz-a3",
     ) -> None:
         self.config = config
         self.executor = executor
@@ -165,6 +178,9 @@ class Phase1Wave:
             if cells is None
             else select_foundation_cells(cell_ids=tuple(cell.cell_id for cell in cells))
         )
+        if execution_profile not in A3_EXECUTION_PROFILES:
+            raise ValueError("Phase 1 wave execution profile is invalid")
+        self.execution_profile = execution_profile
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
         root = self.config.state_root / "cells" / cell.cell_id
@@ -178,13 +194,15 @@ class Phase1Wave:
         records = []
         for cell in self.cells:
             paths = self.paths(cell)
-            retained = self._read_terminal(cell, paths.terminal)
+            retained = self._read_terminal(
+                cell, paths.terminal, execution_profile=self.execution_profile
+            )
             if retained is not None:
                 records.append(retained)
                 continue
             self._stage(paths)
             outcome = dict(self.executor(cell, paths))
-            record = self._terminal(cell, outcome)
+            record = self._terminal(cell, outcome, self.execution_profile)
             self._publish(paths.terminal, record)
             records.append(record)
         return tuple(records)
@@ -215,7 +233,11 @@ class Phase1Wave:
         paths.profile_driver.write_text(driver.content, encoding="utf-8")
 
     @staticmethod
-    def _terminal(cell: A3ExperimentCell, outcome: Mapping[str, object]) -> dict[str, object]:
+    def _terminal(
+        cell: A3ExperimentCell,
+        outcome: Mapping[str, object],
+        execution_profile: str,
+    ) -> dict[str, object]:
         if set(outcome) != {"status", "evidence_sha256"}:
             raise ValueError("executor terminal outcome has an invalid schema")
         if outcome["status"] not in {"passed", "failed"}:
@@ -223,13 +245,14 @@ class Phase1Wave:
         if type(outcome["evidence_sha256"]) is not str or _SHA.fullmatch(outcome["evidence_sha256"]) is None:
             raise ValueError("executor terminal evidence digest is invalid")
         return {
-            "schema": "a3-phase1-cell-terminal-v2",
+            "schema": "a3-phase1-cell-terminal-v3",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
             "model": cell.backend_model.value,
             "knowledge": cell.knowledge.value,
             "profiling": cell.profiling.value,
+            "execution_profile": execution_profile,
             **_research_identity(),
             **outcome,
         }
@@ -250,15 +273,28 @@ class Phase1Wave:
             temporary.unlink(missing_ok=True)
 
     @classmethod
-    def _read_terminal(cls, cell: A3ExperimentCell, path: Path) -> dict[str, object] | None:
+    def _read_terminal(
+        cls,
+        cell: A3ExperimentCell,
+        path: Path,
+        *,
+        execution_profile: str | None = None,
+    ) -> dict[str, object] | None:
         if not path.exists():
             return None
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise ValueError("terminal cell record is corrupt") from exc
+        retained_profile = value.get("execution_profile")
+        if execution_profile is None:
+            if retained_profile not in A3_EXECUTION_PROFILES:
+                raise ValueError("terminal cell record has an invalid execution profile")
+            execution_profile = retained_profile
         expected = cls._terminal(
-            cell, {"status": value.get("status"), "evidence_sha256": value.get("evidence_sha256")}
+            cell,
+            {"status": value.get("status"), "evidence_sha256": value.get("evidence_sha256")},
+            execution_profile,
         )
         if value != expected:
             raise ValueError("terminal cell record has foreign or conflicting evidence")

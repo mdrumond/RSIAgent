@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a3_experiments import BackendModel
+from benchmarks.a3_experiments import BackendModel, KnowledgeMode
 from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_wave import (
@@ -104,6 +104,37 @@ def test_preflight_requires_only_selected_cell_credentials(tmp_path, model, cred
     assert other.isdisjoint(report["checks"])
 
 
+def test_preflight_requires_kdb_artifacts_only_for_selected_kdb_treatment(tmp_path):
+    cfg = config(tmp_path)
+    cfg.embedding_cache.rmdir()
+    cfg.corpus_artifacts.rmdir()
+    cfg.knowledge_database.unlink()
+    cfg.knowledge_manifest.unlink()
+    without_kdb = next(
+        cell for cell in foundation_cells()
+        if cell.knowledge is KnowledgeMode.WITHOUT_KDB
+    )
+    with_kdb = next(
+        cell for cell in foundation_cells()
+        if cell.backend_model is without_kdb.backend_model
+        and cell.knowledge is KnowledgeMode.WITH_KDB
+    )
+    credential = (
+        "OPENAI_API_KEY"
+        if without_kdb.backend_model is BackendModel.GPT_5_6_SOL
+        else "DEEPSEEK_API_KEY"
+    )
+
+    report = cfg.preflight({credential: "secret"}, cells=(without_kdb,))
+
+    assert {
+        "embedding_cache", "corpus_artifacts", "knowledge_database",
+        "knowledge_manifest",
+    }.isdisjoint(report["checks"])
+    with pytest.raises(ValueError, match="embedding_cache"):
+        cfg.preflight({credential: "secret"}, cells=(with_kdb,))
+
+
 def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
     cfg = config(tmp_path)
     seen = []
@@ -144,6 +175,17 @@ def test_interruption_resume_does_not_duplicate_terminal_cells(tmp_path):
     ).resume()
     assert len(records) == 8 and len(resumed_calls) == 5
     assert not set(calls[:3]) & set(resumed_calls)
+
+
+def test_resume_rejects_terminal_from_other_execution_profile(tmp_path):
+    cfg = config(tmp_path)
+    execute = lambda *_: {"status": "passed", "evidence_sha256": "a" * 64}
+    Phase1Wave(cfg, execute, execution_profile="bz-a3-1").run()
+    terminal = Phase1Wave(cfg, execute).paths(foundation_cells()[0]).terminal
+    assert json.loads(terminal.read_text())["execution_profile"] == "bz-a3-1"
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        Phase1Wave(cfg, execute, execution_profile="bz-a3-2").resume()
 
 
 def test_foreign_or_conflicting_terminal_record_is_rejected(tmp_path):

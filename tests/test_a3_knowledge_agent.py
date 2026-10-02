@@ -211,3 +211,16 @@ def test_journal_recovery_continues_the_hash_chain_deterministically(tmp_path):
 
     assert path.read_bytes() == reference_path.read_bytes()
     assert journal.recover_incomplete_tail() == 0
+
+
+def test_journal_recovery_restores_delimiter_for_complete_valid_tail(tmp_path):
+    path = tmp_path / "complete-tail.jsonl"
+    journal = QueryJournal(path)
+    KnowledgeAgent(enabled=False, journal=journal).query(KnowledgeQuery("first"))
+    committed = path.read_bytes()
+    final = journal.read()[-1]
+    path.write_bytes(committed.removesuffix(b"\n"))
+
+    assert journal.recover_incomplete_tail() == 1
+    assert path.read_bytes() == committed
+    assert journal.read()[-1] == final

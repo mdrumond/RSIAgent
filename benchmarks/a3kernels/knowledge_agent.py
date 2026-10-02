@@ -123,9 +123,17 @@ class QueryJournal:
                 return 0
             boundary = value.rfind(b"\n") + 1
             prefix = value[:boundary].decode("utf-8")
-            self._decode(prefix)
-            stream.seek(boundary)
-            stream.truncate()
+            tail = value[boundary:]
+            try:
+                json.loads(tail)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._decode(prefix)
+                stream.seek(boundary)
+                stream.truncate()
+            else:
+                self._decode((value + b"\n").decode("utf-8"))
+                stream.seek(0, os.SEEK_END)
+                stream.write(b"\n")
             stream.flush()
             os.fsync(stream.fileno())
             return 1

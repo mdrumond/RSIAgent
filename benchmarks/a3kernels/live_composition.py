@@ -72,22 +72,37 @@ class AuthoritativeResultStore:
                 data = stream.read()
                 if data and not data.endswith(b"\n"):
                     boundary = data.rfind(b"\n") + 1
-                    data = data[:boundary]
-                    os.ftruncate(stream.fileno(), boundary)
+                    try:
+                        json.loads(data[boundary:])
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        self._load(data[:boundary])
+                        data = data[:boundary]
+                        os.ftruncate(stream.fileno(), boundary)
+                    else:
+                        self._load(data + b"\n")
+                        stream.seek(0, os.SEEK_END)
+                        stream.write(b"\n")
+                        data += b"\n"
                     stream.flush()
                     os.fsync(stream.fileno())
+            if not self._records:
+                self._load(data)
+
+    def _load(self, data: bytes) -> None:
+        try:
+            lines = data.decode("utf-8").splitlines()
+        except UnicodeDecodeError as exc:
+            raise ValueError("invalid authoritative evidence encoding") from exc
+        records: dict[str, AuthoritativeEvidence] = {}
+        for number, line in enumerate(lines, 1):
             try:
-                lines = data.decode("utf-8").splitlines()
-            except UnicodeDecodeError as exc:
-                raise ValueError("invalid authoritative evidence encoding") from exc
-            for number, line in enumerate(lines, 1):
-                try:
-                    record = AuthoritativeEvidence(**json.loads(line))
-                except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                    raise ValueError(f"invalid authoritative evidence at line {number}") from exc
-                if record.evidence_sha256 in self._records:
-                    raise ValueError("duplicate authoritative evidence")
-                self._records[record.evidence_sha256] = record
+                record = AuthoritativeEvidence(**json.loads(line))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"invalid authoritative evidence at line {number}") from exc
+            if record.evidence_sha256 in records:
+                raise ValueError("duplicate authoritative evidence")
+            records[record.evidence_sha256] = record
+        self._records = records
 
     def register(
         self, kind: str, evidence_sha256: str, project_id: str,

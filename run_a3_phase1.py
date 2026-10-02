@@ -41,10 +41,10 @@ def _parser() -> argparse.ArgumentParser:
         command = sub.add_parser(name)
         command.add_argument("--state-root", type=Path, required=True)
         command.add_argument("--validation-wrapper", type=Path, required=True)
-        command.add_argument("--embedding-cache", type=Path, required=True)
-        command.add_argument("--corpus-artifacts", type=Path, required=True)
-        command.add_argument("--knowledge-database", type=Path, required=True)
-        command.add_argument("--knowledge-manifest", type=Path, required=True)
+        command.add_argument("--embedding-cache", type=Path, default=Path("/unconfigured"))
+        command.add_argument("--corpus-artifacts", type=Path, default=Path("/unconfigured"))
+        command.add_argument("--knowledge-database", type=Path, default=Path("/unconfigured"))
+        command.add_argument("--knowledge-manifest", type=Path, default=Path("/unconfigured"))
         if name in ("preflight", "run", "resume"):
             command.add_argument(
                 "--profile", choices=("bz-a3-1", "bz-a3-2"), required=True,
@@ -149,6 +149,7 @@ def main(argv=None) -> int:
             cfg,
             LiveComposition(cfg, dependencies).execute,
             cells=cells,
+            execution_profile=args.profile,
         )
         value = wave.run() if args.command == "run" else wave.resume()
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))

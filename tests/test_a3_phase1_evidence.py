@@ -88,6 +88,19 @@ def test_ledger_recovers_only_torn_tail_and_continues_chain_deterministically(tm
     assert path.read_bytes() == reference_path.read_bytes()
 
 
+def test_ledger_recovery_restores_delimiter_for_complete_valid_tail(tmp_path):
+    path = tmp_path / "complete-tail.jsonl"
+    ledger = EvidenceLedger(path)
+    ledger.append(EvidenceKind.PLAN, {"request_id": "r1"})
+    final = ledger.append(EvidenceKind.RESULT, {"passed": True})
+    committed = path.read_bytes()
+    path.write_bytes(committed.removesuffix(b"\n"))
+
+    assert EvidenceLedger.recover_incomplete_tail(path) == 1
+    assert path.read_bytes() == committed
+    assert EvidenceLedger(path).entries[-1] == final
+
+
 def test_ledger_recovery_rejects_newline_terminated_malformed_record(tmp_path):
     path = tmp_path / "committed-malformed.jsonl"
     EvidenceLedger(path).append(EvidenceKind.PLAN, {"request_id": "r1"})

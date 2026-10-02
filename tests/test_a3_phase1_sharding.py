@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a3_experiments import BackendModel
+from benchmarks.a3_experiments import BackendModel, KnowledgeMode
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config,
     Phase1Wave,
@@ -152,6 +152,54 @@ def test_cli_repeatable_cell_selection_and_shard_routing(tmp_path, monkeypatch, 
     )
     assert [record["cell_id"] for record in records] == [cell.cell_id for cell in expected]
     assert created == ["dependencies"]
+
+
+def test_cli_no_kdb_selection_omits_kdb_artifact_arguments(
+    tmp_path, monkeypatch, capsys,
+):
+    import run_a3_phase1
+
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.knowledge is KnowledgeMode.WITHOUT_KDB
+    )
+
+    class FakeComposition:
+        def __init__(self, _config, _dependencies):
+            pass
+
+        def execute(self, selected, paths):
+            return outcome(selected, paths)
+
+    monkeypatch.setattr(run_a3_phase1, "LiveComposition", FakeComposition)
+    monkeypatch.setattr(
+        run_a3_phase1, "_bz_preflight", lambda *args: {"state": "completed"}
+    )
+    monkeypatch.setattr(
+        run_a3_phase1, "bz_live_dependencies", lambda *args, **kwargs: object()
+    )
+    credential = (
+        "OPENAI_API_KEY"
+        if cell.backend_model is BackendModel.GPT_5_6_SOL
+        else "DEEPSEEK_API_KEY"
+    )
+    monkeypatch.setenv(credential, "secret")
+
+    assert run_a3_phase1.main([
+        "run",
+        "--state-root", str(cfg.state_root),
+        "--validation-wrapper", str(cfg.validation_wrapper),
+        "--profile", "bz-a3-1",
+        "--cpl-remote", "/checked/cpl-remote",
+        "--remote-workspace", "/data2/research",
+        "--physical-device", "0",
+        "--cell-id", cell.cell_id,
+    ]) == 0
+
+    record = json.loads(capsys.readouterr().out)[0]
+    assert record["cell_id"] == cell.cell_id
+    assert record["execution_profile"] == "bz-a3-1"
 
 
 def test_cli_rejects_unknown_cell_before_remote_dependency_creation(
