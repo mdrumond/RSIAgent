@@ -7,7 +7,7 @@ import benchmarks.a3_model_profiles as model_module
 
 from benchmarks.a3_model_profiles import (
     DEEPSEEK_BASE_URL,
-    OPENROUTER_BASE_URL,
+    OPENAI_BASE_URL,
     A3Completion,
     A3ModelProfile,
     A3TransportResult,
@@ -22,12 +22,12 @@ def test_registered_profiles_have_exact_routes_and_stable_fingerprints():
     deepseek = load_a3_model_profile(BackendModel.DEEPSEEK_FLASH)
 
     assert (gpt.model, gpt.base_url, gpt.credential_env) == (
-        "openai/gpt-5.6-sol", OPENROUTER_BASE_URL, "OPENROUTER_API_KEY"
+        "gpt-5.6-sol", OPENAI_BASE_URL, "OPENAI_API_KEY"
     )
     assert (deepseek.model, deepseek.base_url, deepseek.credential_env) == (
         "deepseek-flash", DEEPSEEK_BASE_URL, "DEEPSEEK_API_KEY"
     )
-    assert gpt.fingerprint == "cf11c957483d93a0324cabf8cd43d9a4b3b776b8e7615d6aa15efbfcfe9b7f4f"
+    assert gpt.fingerprint == "e58ce9883286271c419262dd66d88d8d8c1bcab3b5da683eadc43891bf6b4ce8"
     assert deepseek.fingerprint == "e9b6c97cbaca17596ead9fc2ab470e3df41e6b89e845410cb2871f62b4a94b7b"
     assert not gpt.allow_fallbacks and not deepseek.allow_fallbacks
 
@@ -78,7 +78,7 @@ def test_fake_transport_captures_exact_provider_specific_requests():
         calls.append({"base_url": base_url, "api_key": api_key, "request": request})
         return A3TransportResult("candidate", 17)
 
-    environment = {"OPENROUTER_API_KEY": "gpt-secret", "DEEPSEEK_API_KEY": "ds-secret"}
+    environment = {"OPENAI_API_KEY": "gpt-secret", "DEEPSEEK_API_KEY": "ds-secret"}
     for model in (BackendModel.GPT_5_6_SOL, BackendModel.DEEPSEEK_FLASH):
         result = complete_a3(
             "system", "user", model=model, environ=environment, transport=transport
@@ -90,21 +90,16 @@ def test_fake_transport_captures_exact_provider_specific_requests():
 
     assert calls == [
         {
-            "base_url": OPENROUTER_BASE_URL,
+            "base_url": OPENAI_BASE_URL,
             "api_key": "gpt-secret",
             "request": {
-                "model": "openai/gpt-5.6-sol",
+                "model": "gpt-5.6-sol",
                 "messages": [
                     {"role": "system", "content": "system"},
                     {"role": "user", "content": "user"},
                 ],
-                "max_tokens": 32768,
-                "top_p": 1.0,
+                "max_completion_tokens": 32768,
                 "reasoning_effort": "high",
-                "extra_body": {"provider": {
-                    "order": ["OpenAI"], "allow_fallbacks": False,
-                    "require_parameters": True,
-                }},
             },
         },
         {
@@ -129,7 +124,7 @@ def test_credentials_are_required_from_the_selected_provider_only():
     transport = lambda **_kwargs: A3TransportResult("ok", 1)
     complete_a3(
         "s", "u", model=BackendModel.GPT_5_6_SOL,
-        environ={"OPENROUTER_API_KEY": "gpt"}, transport=transport,
+        environ={"OPENAI_API_KEY": "gpt"}, transport=transport,
     )
     complete_a3(
         "s", "u", model=BackendModel.DEEPSEEK_FLASH,
@@ -138,7 +133,16 @@ def test_credentials_are_required_from_the_selected_provider_only():
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
         complete_a3(
             "s", "u", model=BackendModel.DEEPSEEK_FLASH,
-            environ={"OPENROUTER_API_KEY": "wrong-provider"}, transport=transport,
+            environ={"OPENAI_API_KEY": "wrong-provider"}, transport=transport,
+        )
+
+
+def test_direct_openai_ignores_openrouter_credentials():
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        complete_a3(
+            "s", "u", model=BackendModel.GPT_5_6_SOL,
+            environ={"OPENROUTER_API_KEY": "must-not-be-used"},
+            transport=lambda **_kwargs: A3TransportResult("ok", 1),
         )
 
 

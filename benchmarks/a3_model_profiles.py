@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping
 from benchmarks.a3_experiments import BackendModel
 
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 _PROFILE_DIR = Path(__file__).resolve().parents[1] / "config" / "a3"
 _PROFILE_FILES = {
@@ -156,19 +156,13 @@ class A3ModelProfile:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            "max_tokens": self.generation.max_tokens,
-            "top_p": self.generation.top_p,
             "reasoning_effort": self.generation.reasoning_effort,
         }
         if self.backend_model is BackendModel.GPT_5_6_SOL:
-            request["extra_body"] = {
-                "provider": {
-                    "order": [self.provider],
-                    "allow_fallbacks": False,
-                    "require_parameters": True,
-                }
-            }
+            request["max_completion_tokens"] = self.generation.max_tokens
         else:
+            request["max_tokens"] = self.generation.max_tokens
+            request["top_p"] = self.generation.top_p
             request["extra_body"] = {"thinking": {"type": "enabled"}}
         return request
 
@@ -177,10 +171,10 @@ _CANONICAL_VALUES: dict[BackendModel, dict[str, Any]] = {
     BackendModel.GPT_5_6_SOL: {
         "profile_id": "openai-gpt-5.6-sol-v1",
         "backend_model": "openai/gpt-5.6-sol",
-        "model": "openai/gpt-5.6-sol",
+        "model": "gpt-5.6-sol",
         "provider": "OpenAI",
-        "base_url": OPENROUTER_BASE_URL,
-        "credential_env": "OPENROUTER_API_KEY",
+        "base_url": OPENAI_BASE_URL,
+        "credential_env": "OPENAI_API_KEY",
         "allow_fallbacks": False,
         "generation": {
             "max_tokens": 32768, "top_p": 1.0, "reasoning_effort": "high",
@@ -316,5 +310,5 @@ def complete_a3(
 
 __all__ = [
     "A3Completion", "A3Generation", "A3ModelProfile", "A3TransportResult", "DEEPSEEK_BASE_URL",
-    "OPENROUTER_BASE_URL", "complete_a3", "load_a3_model_profile",
+    "OPENAI_BASE_URL", "complete_a3", "load_a3_model_profile",
 ]
