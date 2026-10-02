@@ -8,7 +8,11 @@ from benchmarks.a3_experiments import (
     build_a3_experiment_plan,
 )
 from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
-from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.candidate import (
+    CANDIDATE_SOURCE_CONTRACT,
+    CandidateCompilation,
+    validate_candidate_source,
+)
 from benchmarks.a3kernels.knowledge_agent import (
     Citation, KnowledgeQuery, KnowledgeResult,
 )
@@ -207,6 +211,14 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
     assert first["allowed_actions"]["write_source"] == ["action", "source"]
     assert first["current_candidate_source"] is None
     assert after_write["current_candidate_source"] == SOURCE
+    contract = first["candidate_source_contract"]
+    assert contract == CANDIDATE_SOURCE_CONTRACT.as_dict()
+    assert contract["source_slot"] == first["source_slot"] == "candidate.cpp"
+    validate_candidate_source(contract["exported_signature"] + " {}")
+    assert all(
+        json.loads(prompt)["candidate_source_contract"] == contract
+        for prompt in prompts
+    )
 
 
 def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):

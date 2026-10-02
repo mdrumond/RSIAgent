@@ -14,7 +14,10 @@ from benchmarks.a3_experiments import (
     ProfilingGuidance,
 )
 from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile
-from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.candidate import (
+    CANDIDATE_SOURCE_CONTRACT,
+    CandidateCompilation,
+)
 from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery, KnowledgeResult
 from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a3kernels.phase1_memory import (
@@ -411,6 +414,7 @@ class A3TrialLoop:
                     kind: sorted(fields) for kind, fields in sorted(_ACTION_FIELDS.items())
                 },
                 "cell": self.cell.as_dict(),
+                "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
                 "current_candidate_source": source,
                 "lineage_id": self.memory.lineage_id,
                 "memory": json.loads(self.memory.project_context()),
@@ -422,7 +426,7 @@ class A3TrialLoop:
                     "profiling_treatment": self.cell.profiling.value,
                 },
                 "proposal": self.proposal.as_dict(),
-                "source_slot": "candidate.cpp",
+                "source_slot": CANDIDATE_SOURCE_CONTRACT.source_slot,
             },
             sort_keys=True,
             separators=(",", ":"),
