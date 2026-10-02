@@ -27,10 +27,15 @@ from benchmarks.a3kernels.trial import A3TrialLoop, Action, TrialBudgets, parse_
 SOURCE = 'extern "C" __global__ __aicore__ void vector_add(GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output, uint32_t count, uint32_t buffer_bytes) {}'
 
 
-def _cell(*, knowledge=KnowledgeMode.WITHOUT_KDB, profiling=ProfilingGuidance.WITHOUT_GUIDANCE):
+def _cell(
+    *,
+    model=BackendModel.GPT_5_6_SOL,
+    knowledge=KnowledgeMode.WITHOUT_KDB,
+    profiling=ProfilingGuidance.WITHOUT_GUIDANCE,
+):
     return next(
         cell for cell in build_a3_experiment_plan().cells
-        if cell.backend_model is BackendModel.GPT_5_6_SOL
+        if cell.backend_model is model
         and cell.knowledge is knowledge and cell.profiling is profiling
         and cell.programming_level is ProgrammingLevel.FOUNDATION
     )
@@ -285,6 +290,32 @@ def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
     assert token_result.status == "budget-exhausted" and token_result.turns == 1
     assert token_result.failures == ("token budget exhausted",)
     assert token_journal.read() == ()
+
+
+def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
+    def build_loop(model, *, budgets=None):
+        cell = _cell(model=model)
+        profile = load_a3_model_profile(model)
+        journal = Phase1LearningJournal(
+            tmp_path / model.name / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
+            cell_id=cell.cell_id, lineage_id="isolated-lineage",
+            evidence_resolver=Resolver(),
+        )
+        kwargs = {}
+        if budgets is not None:
+            kwargs["budgets"] = budgets
+        return A3TrialLoop(
+            cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
+            actor=lambda *_: None, candidate=FakeCandidate(),
+            knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
+            evidence=EvidenceLedger(tmp_path / model.name / "evidence.jsonl"),
+            memory=journal, workdir=tmp_path / model.name / "work", **kwargs,
+        )
+
+    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(12, 32768)
+    assert build_loop(BackendModel.DEEPSEEK_FLASH).budgets == TrialBudgets(12, 65536)
+    override = TrialBudgets(2, 17)
+    assert build_loop(BackendModel.DEEPSEEK_FLASH, budgets=override).budgets is override
 
 
 def test_model_and_treatment_authorities_must_match_cell(tmp_path):

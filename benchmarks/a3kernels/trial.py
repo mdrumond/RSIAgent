@@ -9,6 +9,7 @@ from typing import Callable, Mapping
 
 from benchmarks.a3_experiments import (
     A3ExperimentCell,
+    BackendModel,
     KnowledgeMode,
     ProfilingGuidance,
 )
@@ -113,6 +114,13 @@ class TrialBudgets:
         ):
             raise ValueError("trial budgets are outside registered bounds")
 
+    @classmethod
+    def for_model(cls, model: BackendModel) -> "TrialBudgets":
+        if not isinstance(model, BackendModel):
+            raise TypeError("default trial budgets require a registered backend model")
+        max_tokens = 65536 if model is BackendModel.DEEPSEEK_FLASH else 32768
+        return cls(max_tokens=max_tokens)
+
 
 @dataclass(frozen=True)
 class TrialResult:
@@ -143,7 +151,7 @@ class A3TrialLoop:
         evidence: EvidenceLedger,
         memory: Phase1LearningJournal,
         workdir: Path,
-        budgets: TrialBudgets = TrialBudgets(),
+        budgets: TrialBudgets | None = None,
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -158,7 +166,8 @@ class A3TrialLoop:
             raise ValueError("memory must be isolated to the experiment cell")
         self.cell, self.proposal, self.profile = cell, proposal, profile
         self.actor, self.candidate, self.knowledge, self.profiler = actor, candidate, knowledge, profiler
-        self.evidence, self.memory, self.workdir, self.budgets = evidence, memory, Path(workdir), budgets
+        self.evidence, self.memory, self.workdir = evidence, memory, Path(workdir)
+        self.budgets = budgets if budgets is not None else TrialBudgets.for_model(cell.backend_model)
 
     def run(self) -> TrialResult:
         source = None
