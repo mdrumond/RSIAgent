@@ -34,6 +34,14 @@ def foundation_cells() -> tuple[A3ExperimentCell, ...]:
     )
 
 
+def registered_credential_envs() -> tuple[str, ...]:
+    """Return the deterministic credential boundary for the Phase 1 matrix."""
+    return tuple(sorted({
+        load_a3_model_profile(cell.backend_model).credential_env
+        for cell in foundation_cells()
+    }))
+
+
 def select_foundation_cells(
     *,
     cell_ids: Sequence[str] = (),
@@ -101,10 +109,6 @@ class Phase1Config:
 
     def preflight(self, environ: Mapping[str, str]) -> dict[str, object]:
         driver = profile_driver_asset()
-        credential_names = {
-            load_a3_model_profile(cell.backend_model).credential_env
-            for cell in foundation_cells()
-        }
         paths = {
             "validation_wrapper": self.validation_wrapper.is_file()
             and os.access(self.validation_wrapper, os.X_OK)
@@ -119,7 +123,7 @@ class Phase1Config:
             ),
             **{
                 credential_name: bool(environ.get(credential_name))
-                for credential_name in sorted(credential_names)
+                for credential_name in registered_credential_envs()
             },
         }
         missing = [name for name, present in paths.items() if not present]

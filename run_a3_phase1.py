@@ -13,6 +13,7 @@ from benchmarks.a3kernels.phase1_wave import (
     Phase1Config,
     Phase1Wave,
     full_dry_run,
+    registered_credential_envs,
     select_foundation_cells,
 )
 from benchmarks.a3kernels.live_composition import LiveComposition, bz_live_dependencies
@@ -73,7 +74,7 @@ def _bz_preflight(
         raise ValueError("cpl_remote must be the user-wide executable cpl-remote")
     environment = {
         key: value for key, value in os.environ.items()
-        if key not in {"OPENROUTER_API_KEY", "DEEPSEEK_API_KEY"}
+        if key not in registered_credential_envs()
     }
     environment["CPL_REMOTE"] = str(remote)
     argv = [str(validation_wrapper), "--profile", profile, "preflight"]

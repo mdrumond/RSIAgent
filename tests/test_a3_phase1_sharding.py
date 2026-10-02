@@ -1,8 +1,10 @@
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
+from benchmarks.a3_experiments import BackendModel
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config,
     Phase1Wave,
@@ -256,6 +258,62 @@ def test_cli_preflight_checks_local_inputs_then_exact_bz_adapter_markers(
     assert "OPENROUTER_API_KEY" not in seen["env"]
     assert "DEEPSEEK_API_KEY" not in seen["env"]
     assert "secret" not in json.dumps(report)
+
+
+def test_cli_preflight_scrubs_direct_openai_profile_credential(
+    tmp_path, monkeypatch, capsys,
+):
+    import benchmarks.a3kernels.phase1_wave as phase1_wave
+    import run_a3_phase1
+
+    credential_names = {
+        BackendModel.GPT_5_6_SOL: "OPENAI_API_KEY",
+        BackendModel.DEEPSEEK_FLASH: "DEEPSEEK_API_KEY",
+    }
+    monkeypatch.setattr(
+        phase1_wave,
+        "load_a3_model_profile",
+        lambda model: SimpleNamespace(credential_env=credential_names[model]),
+    )
+    cfg = config(tmp_path)
+    cpl_remote = tmp_path / "cpl-remote"
+    cpl_remote.write_text("#!/bin/sh\n")
+    cpl_remote.chmod(0o755)
+    seen = {}
+
+    def runner(argv, **kwargs):
+        seen.update(argv=argv, **kwargs)
+        return subprocess.CompletedProcess(argv, 0, "\n".join((
+            "BZ_A3_PREFLIGHT_STATE=passed profile=bz-a3-1",
+            "CATLASS_VALIDATION_PROFILE=bz-a3-1",
+            "CATLASS_VALIDATION_OPERATION=-",
+            "CATLASS_VALIDATION_STATE=completed",
+            "CATLASS_VALIDATION_EXIT=0",
+        )), "")
+
+    monkeypatch.setattr(run_a3_phase1.subprocess, "run", runner)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "stale-openrouter-secret")
+    argv = ["preflight"]
+    for field in (
+        "state_root", "validation_wrapper", "embedding_cache",
+        "corpus_artifacts", "knowledge_database", "knowledge_manifest",
+    ):
+        argv.extend(("--" + field.replace("_", "-"), str(getattr(cfg, field))))
+    argv.extend(("--profile", "bz-a3-1", "--cpl-remote", str(cpl_remote)))
+
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        run_a3_phase1.main(argv)
+    assert seen == {}
+
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-secret")
+    assert run_a3_phase1.main(argv) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["checks"]["OPENAI_API_KEY"] is True
+    assert "OPENROUTER_API_KEY" not in report["checks"]
+    assert "OPENAI_API_KEY" not in seen["env"]
+    assert "DEEPSEEK_API_KEY" not in seen["env"]
+    assert "direct-openai-secret" not in json.dumps(report)
 
 
 @pytest.mark.parametrize(
