@@ -318,6 +318,7 @@ def _driver_args(root: Path, *, block_count: int = 1) -> list[str]:
         SOURCE.replace("uint32_t buffer_bytes", "uint64_t buffer_bytes"),
         SOURCE.replace("GM_ADDR input_a", "GM_ADDRinput_a"),
         SOURCE.replace("__global__ __aicore__", "__global____aicore__"),
+        SOURCE.replace('"C" __global__', '"C"__global__'),
         SOURCE + "\nextern \"C\" void vector_add();",
         SOURCE + "\n// catlass fallback",
     ],

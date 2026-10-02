@@ -68,6 +68,8 @@ def _signature_token_pattern(token: str) -> str:
     escaped = re.escape(token)
     if _IDENTIFIER_TOKEN.fullmatch(token):
         return rf"(?<!\w){escaped}(?!\w)"
+    if token.startswith('"'):
+        return rf"{escaped}(?!\w)"
     return escaped
 
 
