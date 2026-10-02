@@ -192,6 +192,7 @@ class A3TrialLoop:
         failures: list[str] = []
         observations: list[object] = []
         actions: list[str] = []
+        compile_attempt_id: str | None = None
         tokens = queries = 0
         for turn in range(1, self.budgets.max_turns + 1):
             completion = self.actor(self.profile, self._context(observations, source))
@@ -209,24 +210,29 @@ class A3TrialLoop:
                 self._record_action(turn, action)
                 if action.kind == "write_source":
                     source, compilation, verified, profile_result = action.source, None, None, None
+                    compile_attempt_id = None
                     observations.append("candidate source updated")
                 elif action.kind == "compile":
                     if source is None:
                         raise ValueError("write_source is required before compile")
+                    if compile_attempt_id is None:
+                        compile_attempt_id = f"turn-{turn}"
                     compilation = self.candidate.compile(
                         source, self.workdir, request_id=self.cell.cell_id,
-                        attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
+                        attempt_id=compile_attempt_id, project_id=self.proposal.project_id,
                         length=self._length(), padded_length=self._padded_length(),
                         block_count=self._block_count(), seed=0,
                         execution_profile=self.execution_profile,
                     )
                     if isinstance(compilation, FailedEvidence):
+                        compile_attempt_id = None
                         self._retain_candidate_failure(
                             turn, "compile", compilation, failures, observations
                         )
                         continue
                     if not isinstance(compilation, CandidateCompilation):
                         raise TypeError("candidate compiler returned an invalid result")
+                    compile_attempt_id = None
                     observations.append(self._authoritative_observation(
                         kind="compile",
                         evidence_sha256=compilation.attestation_sha256,
@@ -430,9 +436,30 @@ class A3TrialLoop:
         timeline = render(cls._profile_pairs(result.timeline))
         return f"raw {result.metric.value}: metrics[{metrics}] timeline[{timeline}]"
 
+    @staticmethod
+    def _eligible_submit_supports(observations: list[object]) -> list[str]:
+        supports = []
+        for observation in observations:
+            if not isinstance(observation, Mapping):
+                continue
+            for key in ("authoritative_evidence", "profile_evidence"):
+                evidence = observation.get(key)
+                if not isinstance(evidence, Mapping):
+                    continue
+                digest = evidence.get("evidence_sha256")
+                if isinstance(digest, str) and digest not in supports:
+                    supports.append(digest)
+        return supports
+
     def _context(self, observations: list[object], source: str | None) -> str:
         return json.dumps(
             {
+                "action_contract": {
+                    "profile_metric": ProfileMetric.PIPE_UTILIZATION.value,
+                    "eligible_submit_supports": self._eligible_submit_supports(
+                        observations
+                    ),
+                },
                 "allowed_actions": {
                     kind: sorted(fields) for kind, fields in sorted(_ACTION_FIELDS.items())
                 },

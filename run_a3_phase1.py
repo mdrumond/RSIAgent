@@ -138,7 +138,7 @@ def main(argv=None) -> int:
             shard_index=args.shard_index,
         )
         cfg = _config(args)
-        cfg.preflight(os.environ)
+        cfg.preflight(os.environ, cells=cells)
         _bz_preflight(cfg.validation_wrapper, args.profile, args.cpl_remote)
         dependencies = bz_live_dependencies(
             cfg, cpl_remote=args.cpl_remote, profile=args.profile,

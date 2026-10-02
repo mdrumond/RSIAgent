@@ -2,6 +2,8 @@ import json
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
+import pytest
+
 from benchmarks.a3_experiments import KnowledgeMode, ProfilingGuidance
 from benchmarks.a3_experiments import BackendModel
 from benchmarks.a3_model_profiles import (
@@ -167,6 +169,29 @@ def test_authority_store_is_durable_exact_and_conflict_rejecting(tmp_path):
     except ValueError as exc:
         assert "conflicting" in str(exc)
     else: raise AssertionError("conflicting evidence was accepted")
+
+
+def test_authority_store_recovers_only_an_unterminated_final_record(tmp_path):
+    path = tmp_path / "authority.jsonl"
+    record = AuthoritativeResultStore(path).register(
+        "compile", "a" * 64, "b" * 64, "c" * 64, True
+    )
+    committed = path.read_bytes()
+    with path.open("ab") as stream:
+        stream.write(b'{"kind":"host-verification"')
+
+    recovered = AuthoritativeResultStore(path)
+
+    assert recovered.resolve("a" * 64) == record
+    assert path.read_bytes() == committed
+
+
+def test_authority_store_rejects_malformed_committed_record(tmp_path):
+    path = tmp_path / "authority.jsonl"
+    path.write_bytes(b"not-json\n")
+
+    with pytest.raises(ValueError, match="line 1"):
+        AuthoritativeResultStore(path)
 
 
 def test_completion_provenance_and_no_secret_in_terminal_output(tmp_path):

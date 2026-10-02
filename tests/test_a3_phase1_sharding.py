@@ -124,7 +124,6 @@ def test_cli_repeatable_cell_selection_and_shard_routing(tmp_path, monkeypatch, 
         "bz_live_dependencies",
         lambda *args, **kwargs: created.append("dependencies") or object(),
     )
-    monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-secret")
 
     common = [

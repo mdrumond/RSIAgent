@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.a3kernels.candidate import validate_candidate_source
 from benchmarks.a3kernels.phase1_memory import HostFact
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
 from benchmarks.a3kernels.phase1_registry import (
@@ -71,6 +72,24 @@ def test_recovery_starters_are_deterministic_ascend_c(family, evidence):
     assert "catlass" not in first.recovery.source.lower()
     assert first.as_dict()["recovery"]["starter_sha256"] == first.recovery.source_sha256
     assert first.recovery.source not in str(first.as_dict())
+
+
+def test_recovery_starters_have_self_contained_compile_and_runtime_faults():
+    compile_source = ProjectRuntimePolicy.from_proposal(
+        proposal("compile-recovery")
+    ).recovery.source
+    runtime_source = ProjectRuntimePolicy.from_proposal(
+        proposal("runtime-recovery")
+    ).recovery.source
+
+    assert compile_source.startswith('#include "kernel_operator.h"\n')
+    assert "missing_compile_symbol_0" in compile_source
+    assert runtime_source.startswith('#include "kernel_operator.h"\n')
+    validate_candidate_source(runtime_source)
+    assert "AscendC::DataCopyPad(input_local, input_global" in runtime_source
+    assert "AscendC::Add(output_local, input_local, input_local" in runtime_source
+    assert "AscendC::DataCopyPad(output_global, output_local" in runtime_source
+    assert "missing_compile_symbol" not in runtime_source
 
 
 def test_direct_policy_cannot_override_registry_derived_values():

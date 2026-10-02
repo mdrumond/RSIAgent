@@ -213,6 +213,10 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
         "profiling_treatment": "without-profiling-guidance",
     }
     assert first["allowed_actions"]["write_source"] == ["action", "source"]
+    assert first["action_contract"] == {
+        "profile_metric": "PipeUtilization",
+        "eligible_submit_supports": [],
+    }
     assert first["current_candidate_source"] is None
     assert after_write["current_candidate_source"] == SOURCE
     contract = first["candidate_source_contract"]
@@ -229,7 +233,8 @@ def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
     submitted_supports = []
 
     def submit_from_context(context):
-        observations = json.loads(context)["observations"]
+        context_value = json.loads(context)
+        observations = context_value["observations"]
         authoritative = [
             item["authoritative_evidence"]
             for item in observations
@@ -240,7 +245,12 @@ def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
         ]
         assert all(item["status"] == "passed" for item in authoritative)
         assert len({item["source_fingerprint"] for item in authoritative}) == 1
-        submitted_supports.extend(item["evidence_sha256"] for item in authoritative)
+        submitted_supports.extend(
+            context_value["action_contract"]["eligible_submit_supports"]
+        )
+        assert submitted_supports == [
+            item["evidence_sha256"] for item in authoritative
+        ]
         assert all(len(digest) == 64 for digest in submitted_supports)
         return json.dumps({
             "action": "submit",
@@ -290,6 +300,38 @@ def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(
     assert result.failures[-1] == "compile failed: fixture"
 
 
+def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path):
+    class PendingOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
+        def compile(self, source, workdir, **kw):
+            self.attempts.append(kw["attempt_id"])
+            if len(self.attempts) == 1:
+                raise RuntimeError("observation unavailable; retry retained handle")
+            return super().compile(source, workdir, **kw)
+
+    candidate = PendingOnce()
+    result, _, _ = _run(
+        tmp_path,
+        [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            json.dumps({
+                "action": "submit", "interpretation": "host facts",
+                "supports": [],
+            }),
+        ],
+        candidate=candidate,
+    )
+
+    assert result.status == "passed"
+    assert candidate.attempts == ["turn-2", "turn-2"]
+
+
 def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
     cell = _cell(knowledge=KnowledgeMode.WITH_KDB, profiling=ProfilingGuidance.WITH_GUIDANCE)
     knowledge, profiler = FakeKnowledge(True), FakeProfiler()
@@ -333,6 +375,11 @@ def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
     )
     assert "vector_ratio=0.75" in profile_fact["statement"]
     assert "kernel_count=20" in profile_fact["statement"]
+    support_contract = json.loads(prompts[5])["action_contract"]
+    assert support_contract["profile_metric"] == "PipeUtilization"
+    assert support_contract["eligible_submit_supports"][-1] == (
+        result.profile_result.evidence_sha256
+    )
 
 
 def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):

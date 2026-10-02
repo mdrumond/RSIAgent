@@ -84,6 +84,26 @@ def test_preflight_uses_registered_profile_credential_names(monkeypatch, tmp_pat
         )
 
 
+@pytest.mark.parametrize(
+    ("model", "credential"),
+    [
+        (BackendModel.GPT_5_6_SOL, "OPENAI_API_KEY"),
+        (BackendModel.DEEPSEEK_FLASH, "DEEPSEEK_API_KEY"),
+    ],
+)
+def test_preflight_requires_only_selected_cell_credentials(tmp_path, model, credential):
+    cell = next(
+        cell for cell in foundation_cells()
+        if cell.backend_model is model
+    )
+
+    report = config(tmp_path).preflight({credential: "secret"}, cells=(cell,))
+
+    assert report["checks"][credential] is True
+    other = {"OPENAI_API_KEY", "DEEPSEEK_API_KEY"} - {credential}
+    assert other.isdisjoint(report["checks"])
+
+
 def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
     cfg = config(tmp_path)
     seen = []

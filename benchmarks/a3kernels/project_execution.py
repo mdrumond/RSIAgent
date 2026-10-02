@@ -53,6 +53,7 @@ class RecoveryStarter:
 
 
 _SIGNATURE = """\
+#include "kernel_operator.h"
 extern "C" __global__ __aicore__ void vector_add(
     GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output,
     uint32_t count, uint32_t buffer_bytes) {
@@ -62,8 +63,62 @@ _COMPILE_FAULTS = (
     "    missing_compile_symbol_1(input_b);\n",
 )
 _RUNTIME_FAULTS = (
-    "    // fault-0: retain input_a instead of the sum for the first tile\n",
-    "    // fault-1: retain input_b instead of the sum for the second tile\n",
+    """\
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::QuePosition::VECIN> input_buffer;
+    AscendC::TBuf<AscendC::QuePosition::VECOUT> output_buffer;
+    pipe.InitBuffer(input_buffer, buffer_bytes);
+    pipe.InitBuffer(output_buffer, buffer_bytes);
+    AscendC::GlobalTensor<float> input_global;
+    AscendC::GlobalTensor<float> output_global;
+    input_global.SetGlobalBuffer(
+        reinterpret_cast<__gm__ float *>(input_a), count);
+    output_global.SetGlobalBuffer(
+        reinterpret_cast<__gm__ float *>(output), count);
+    auto input_local = input_buffer.Get<float>();
+    auto output_local = output_buffer.Get<float>();
+    AscendC::DataCopyExtParams copy{};
+    copy.blockCount = 1;
+    copy.blockLen = count * sizeof(float);
+    AscendC::DataCopyPadExtParams<float> padding{false, 0, 0, 0};
+    AscendC::DataCopyPad(input_local, input_global, copy, padding);
+    auto loaded = pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(loaded);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(loaded);
+    AscendC::Add(output_local, input_local, input_local, count);
+    auto computed = pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(computed);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(computed);
+    AscendC::DataCopyPad(output_global, output_local, copy);
+""",
+    """\
+    AscendC::TPipe pipe;
+    AscendC::TBuf<AscendC::QuePosition::VECIN> input_buffer;
+    AscendC::TBuf<AscendC::QuePosition::VECOUT> output_buffer;
+    pipe.InitBuffer(input_buffer, buffer_bytes);
+    pipe.InitBuffer(output_buffer, buffer_bytes);
+    AscendC::GlobalTensor<float> input_global;
+    AscendC::GlobalTensor<float> output_global;
+    input_global.SetGlobalBuffer(
+        reinterpret_cast<__gm__ float *>(input_b), count);
+    output_global.SetGlobalBuffer(
+        reinterpret_cast<__gm__ float *>(output), count);
+    auto input_local = input_buffer.Get<float>();
+    auto output_local = output_buffer.Get<float>();
+    AscendC::DataCopyExtParams copy{};
+    copy.blockCount = 1;
+    copy.blockLen = count * sizeof(float);
+    AscendC::DataCopyPadExtParams<float> padding{false, 0, 0, 0};
+    AscendC::DataCopyPad(input_local, input_global, copy, padding);
+    auto loaded = pipe.FetchEventID<AscendC::HardEvent::MTE2_V>();
+    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(loaded);
+    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(loaded);
+    AscendC::Add(output_local, input_local, input_local, count);
+    auto computed = pipe.FetchEventID<AscendC::HardEvent::V_MTE3>();
+    AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(computed);
+    AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(computed);
+    AscendC::DataCopyPad(output_global, output_local, copy);
+""",
 )
 
 
@@ -77,7 +132,7 @@ def _recovery_starter(family: ProjectFamily, faults: int) -> RecoveryStarter:
         source = (
             _SIGNATURE
             + "    // Valid Ascend C starter with deliberately incorrect output semantics.\n"
-            + "".join(_RUNTIME_FAULTS[:faults])
+            + _RUNTIME_FAULTS[faults - 1]
             + "}\n"
         )
         evidence = RecoveryEvidence.HOST_VERIFICATION_FAILURE

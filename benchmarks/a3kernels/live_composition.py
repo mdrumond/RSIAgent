@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -66,7 +67,20 @@ class AuthoritativeResultStore:
         self.path = Path(path)
         self._records: dict[str, AuthoritativeEvidence] = {}
         if self.path.exists():
-            for number, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), 1):
+            with self.path.open("r+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                data = stream.read()
+                if data and not data.endswith(b"\n"):
+                    boundary = data.rfind(b"\n") + 1
+                    data = data[:boundary]
+                    os.ftruncate(stream.fileno(), boundary)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            try:
+                lines = data.decode("utf-8").splitlines()
+            except UnicodeDecodeError as exc:
+                raise ValueError("invalid authoritative evidence encoding") from exc
+            for number, line in enumerate(lines, 1):
                 try:
                     record = AuthoritativeEvidence(**json.loads(line))
                 except (TypeError, ValueError, json.JSONDecodeError) as exc:
