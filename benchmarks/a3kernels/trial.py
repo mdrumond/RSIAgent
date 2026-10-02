@@ -13,7 +13,9 @@ from benchmarks.a3_experiments import (
     KnowledgeMode,
     ProfilingGuidance,
 )
-from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile
+from benchmarks.a3_model_profiles import (
+    A3Completion, A3ModelProfile, A3ProviderResponseError,
+)
 from benchmarks.a3kernels.candidate import (
     CANDIDATE_SOURCE_CONTRACT,
     CandidateCompilation,
@@ -189,13 +191,35 @@ class A3TrialLoop:
         verified = None
         profile_result = None
         timing_result = None
-        failures: list[str] = []
-        observations: list[object] = []
+        consumed_turns, tokens, failures, observations = (
+            self._recover_provider_response_failures()
+        )
         actions: list[str] = []
         compile_attempt_id: str | None = None
-        tokens = queries = 0
-        for turn in range(1, self.budgets.max_turns + 1):
-            completion = self.actor(self.profile, self._context(observations, source))
+        queries = 0
+        if tokens > self.budgets.max_tokens:
+            failures.append("token budget exhausted")
+            return TrialResult(
+                "budget-exhausted", consumed_turns, tokens, verified,
+                profile_result, queries, tuple(failures),
+            )
+        for turn in range(consumed_turns + 1, self.budgets.max_turns + 1):
+            try:
+                completion = self.actor(
+                    self.profile, self._context(observations, source)
+                )
+            except A3ProviderResponseError as exc:
+                tokens += exc.completion_tokens or 0
+                self._retain_provider_response_failure(
+                    turn, exc, failures, observations
+                )
+                if tokens > self.budgets.max_tokens:
+                    failures.append("token budget exhausted")
+                    return TrialResult(
+                        "budget-exhausted", turn, tokens, verified,
+                        profile_result, queries, tuple(failures),
+                    )
+                continue
             if not isinstance(completion, A3Completion):
                 raise TypeError("actor must return A3Completion")
             tokens += completion.completion_tokens
@@ -349,6 +373,74 @@ class A3TrialLoop:
                 observations.append("failure: " + failure)
                 self.evidence.append(EvidenceKind.FAILURE, self._identity({"turn": turn, "detail": failure}))
         return TrialResult("budget-exhausted", self.budgets.max_turns, tokens, verified, profile_result, queries, tuple(failures))
+
+    def _recover_provider_response_failures(
+        self,
+    ) -> tuple[int, int, list[str], list[object]]:
+        retained = [
+            entry for entry in self.evidence.entries
+            if entry.payload.get("cell_id") == self.cell.cell_id
+            and entry.payload.get("project_id") == self.proposal.project_id
+            and entry.payload.get("execution_profile") == self.execution_profile
+        ]
+        if not retained:
+            return 0, 0, [], []
+        if any(
+            entry.kind != EvidenceKind.FAILURE.value
+            or "provider_response_failure" not in entry.payload
+            for entry in retained
+        ):
+            raise ValueError(
+                "provider failure recovery requires only leading retained failures"
+            )
+        tokens = 0
+        failures: list[str] = []
+        observations: list[object] = []
+        for expected_turn, entry in enumerate(retained, 1):
+            if entry.payload.get("turn") != expected_turn:
+                raise ValueError(
+                    "provider failure recovery turns are not consecutive"
+                )
+            structured = entry.payload["provider_response_failure"]
+            if not isinstance(structured, Mapping) or set(structured) != {
+                "code", "completion_tokens",
+            }:
+                raise ValueError("provider failure recovery evidence is invalid")
+            failure = A3ProviderResponseError(
+                structured["code"],
+                completion_tokens=structured["completion_tokens"],
+            )
+            tokens += failure.completion_tokens or 0
+            failures.append(f"provider response failure: {failure.code}")
+            observations.append({
+                "provider_response_failure": {
+                    "code": failure.code,
+                    "completion_tokens": failure.completion_tokens,
+                }
+            })
+        return len(retained), tokens, failures, observations
+
+    def _retain_provider_response_failure(
+        self,
+        turn: int,
+        failure: A3ProviderResponseError,
+        failures: list[str],
+        observations: list[object],
+    ) -> None:
+        detail = f"provider response failure: {failure.code}"
+        structured = {
+            "code": failure.code,
+            "completion_tokens": failure.completion_tokens,
+        }
+        failures.append(detail)
+        observations.append({"provider_response_failure": structured})
+        self.evidence.append(
+            EvidenceKind.FAILURE,
+            self._identity({
+                "turn": turn,
+                "provider_response_failure": structured,
+            }),
+        )
 
     def _submit_gate(self, source, compilation, verified, profile_result) -> str | None:
         if (

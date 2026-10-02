@@ -10,6 +10,7 @@ from benchmarks.a3_model_profiles import (
     OPENAI_BASE_URL,
     A3Completion,
     A3ModelProfile,
+    A3ProviderResponseError,
     A3TransportResult,
     complete_a3,
     load_a3_model_profile,
@@ -205,22 +206,38 @@ def test_transport_request_mutation_cannot_change_recorded_provenance():
     ["candidate", None, A3TransportResult("candidate", 0), A3TransportResult("candidate", True)],
 )
 def test_live_completion_rejects_missing_or_invalid_provider_usage(transport_result):
-    with pytest.raises((TypeError, ValueError), match="token|transport"):
+    with pytest.raises(A3ProviderResponseError) as raised:
         complete_a3(
             "system", "user", model=BackendModel.DEEPSEEK_FLASH,
             environ={"DEEPSEEK_API_KEY": "secret"},
             transport=lambda **_kwargs: transport_result,
         )
+    assert raised.value.code in {
+        "invalid-content-or-usage", "invalid-transport-result",
+    }
 
 
 @pytest.mark.parametrize("text", ["", " ", "\n\t"])
 def test_live_completion_rejects_empty_or_whitespace_provider_content(text):
-    with pytest.raises(ValueError, match="non-empty text"):
+    with pytest.raises(A3ProviderResponseError) as raised:
         complete_a3(
             "system", "user", model=BackendModel.DEEPSEEK_FLASH,
             environ={"DEEPSEEK_API_KEY": "secret"},
             transport=lambda **_kwargs: A3TransportResult(text, 7),
         )
+    assert raised.value.code == "invalid-content-or-usage"
+    assert raised.value.completion_tokens == 7
+
+
+@pytest.mark.parametrize("usage", [0, -1, True, None])
+def test_invalid_provider_usage_is_not_reported_as_consumed_tokens(usage):
+    with pytest.raises(A3ProviderResponseError) as raised:
+        complete_a3(
+            "system", "user", model=BackendModel.DEEPSEEK_FLASH,
+            environ={"DEEPSEEK_API_KEY": "secret"},
+            transport=lambda **_kwargs: A3TransportResult("candidate", usage),
+        )
+    assert raised.value.completion_tokens is None
 
 
 def test_openai_compatible_response_rejects_missing_content(monkeypatch):
@@ -235,12 +252,13 @@ def test_openai_compatible_response_rejects_missing_content(monkeypatch):
         SimpleNamespace(OpenAI=lambda **_route: client),
     )
 
-    with pytest.raises(ValueError, match="non-empty text"):
+    with pytest.raises(A3ProviderResponseError) as raised:
         model_module._openai_transport(
             base_url=DEEPSEEK_BASE_URL,
             api_key="secret",
             request={"model": "deepseek-flash"},
         )
+    assert raised.value.code == "invalid-content-or-usage"
 
 
 def test_openai_compatible_response_parses_provider_completion_usage(monkeypatch):
