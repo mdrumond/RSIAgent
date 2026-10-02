@@ -342,7 +342,8 @@ def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
         assert (cwd / "candidate.cpp").read_text() == SOURCE
         wrapper = (cwd / "host_wrapper.inc").read_text()
         assert "TORCH_LIBRARY(rsi_a3candidates" in wrapper
-        assert "int64_t padded_length, int64_t block_count" in wrapper
+        assert "int64_t logical_length, int64_t padded_length" in wrapper
+        assert "int64_t block_count" in wrapper
         assert "static_cast<uint32_t>(block_count)" in wrapper
         return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", "")
 
@@ -471,7 +472,10 @@ def test_fixed_driver_compiles_dav_2201_without_a_shell(monkeypatch, tmp_path):
     assert not any(value in {"bash", "sh", "-c"} for value in calls[0])
 
 
-def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, capsys, tmp_path):
+@pytest.mark.parametrize("logical,padded", [(16, 64), (400, 448)])
+def test_fixed_driver_allocates_padding_but_launches_logical_count(
+    monkeypatch, capsys, tmp_path, logical, padded
+):
     class Tensor:
         def __init__(self, values): self.values = values
         def cpu(self): return self
@@ -481,7 +485,7 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     torch = type("Torch", (), {})()
     torch.float32 = object()
     torch.tensor = lambda values, **kwargs: (
-        events.append(("allocate", kwargs["device"])), Tensor(values)
+        events.append(("allocate", kwargs["device"], len(values))), Tensor(values)
     )[1]
     torch.npu = type("Npu", (), {
         "set_device": lambda _self, value: events.append(("device", value)),
@@ -490,9 +494,12 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     torch.ops = type("Ops", (), {
         "load_library": lambda _self, path: events.append(("load", path)),
         "rsi_a3candidates": type("Candidate", (), {
-            "vector_add": lambda _self, a, b, padded_length, block_count: (
-                events.append(("launch", padded_length, block_count)),
-                Tensor([x + y for x, y in zip(a.values, b.values)]),
+            "vector_add": lambda _self, a, b, count, padded_length, block_count: (
+                events.append(("launch", count, padded_length, block_count)),
+                Tensor(
+                    [x + y for x, y in zip(a.values[:count], b.values[:count])]
+                    + [99.0] * (padded_length - count)
+                ),
             )[1],
         })(),
     })()
@@ -501,18 +508,23 @@ def test_fixed_driver_owns_device_zero_allocation_launch_and_sync(monkeypatch, c
     monkeypatch.setattr(host_driver, "__file__", str(tmp_path / "host_driver.py"))
     (tmp_path / "build.json").write_text(json.dumps(host_driver._EXPECTED_BUILD))
     (tmp_path / "a3_candidate.so").write_bytes(b"library")
-    (tmp_path / "input.json").write_text(
-        '{"input_a":[1,2,0,0],"input_b":[3,4,0,0],'
-        '"logical_length":2,"padded_length":4,"block_count":3}'
-    )
+    (tmp_path / "input.json").write_text(json.dumps({
+        "input_a": [1.0] * logical + [0.0] * (padded - logical),
+        "input_b": [2.0] * logical + [0.0] * (padded - logical),
+        "logical_length": logical,
+        "padded_length": padded,
+        "block_count": 3,
+    }))
 
     assert host_driver.main(["input.json"]) == 0
     assert events == [
         ("load", str(tmp_path / "a3_candidate.so")), ("device", 0),
-        ("allocate", "npu:0"), ("allocate", "npu:0"),
-        ("launch", 4, 3), "sync",
+        ("allocate", "npu:0", padded), ("allocate", "npu:0", padded),
+        ("launch", logical, padded, 3), "sync",
     ]
-    assert capsys.readouterr().out == "A3KERNEL_OUTPUT=[4.0,6.0,0.0,0.0]\n"
+    values = json.loads(capsys.readouterr().out.removeprefix("A3KERNEL_OUTPUT="))
+    assert values[:logical] == [3.0] * logical
+    assert values[logical:] == [0.0] * (padded - logical)
 
 
 def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tmp_path):
@@ -532,7 +544,7 @@ def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tm
     torch.ops = type("Ops", (), {
         "load_library": lambda _self, path: events.append("load"),
         "rsi_a3candidates": type("Candidate", (), {
-            "vector_add": lambda _self, a, b, padded, blocks: (
+            "vector_add": lambda _self, a, b, logical, padded, blocks: (
                 events.append(("launch", blocks)),
                 Tensor([x + y for x, y in zip(a.values, b.values)]),
             )[1],
@@ -566,8 +578,12 @@ def test_fixed_wrapper_launches_the_requested_block_count():
         item.content for item in candidate_module._host_source_files()
         if item.relative_path == "host_wrapper.inc"
     )
-    assert "int64_t padded_length, int64_t block_count" in wrapper
-    assert 'registry.def("vector_add(Tensor a, Tensor b, int padded_length, int block_count)' in wrapper
+    assert "int64_t logical_length, int64_t padded_length" in wrapper
+    assert "int64_t block_count" in wrapper
+    assert 'registry.def("vector_add(Tensor a, Tensor b, int logical_length, int padded_length, int block_count)' in wrapper
+    assert "logical_length >= 1 && logical_length <= padded_length" in wrapper
+    assert "const auto count = static_cast<uint32_t>(logical_length);" in wrapper
+    assert "torch::empty_like(a)" in wrapper
     assert "block_count >= 1 && block_count <= 32" in wrapper
     assert "const auto launch_blocks = static_cast<uint32_t>(block_count);" in wrapper
     assert "::vector_add<<<launch_blocks" in wrapper

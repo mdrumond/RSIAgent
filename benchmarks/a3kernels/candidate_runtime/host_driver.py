@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int
     input_path = Path(runtime.input)
     if not input_path.is_absolute():
         input_path = root / input_path
-    a_values, b_values, _logical, padded, blocks = _read_input(
+    a_values, b_values, logical, padded, blocks = _read_input(
         input_path, spec["max_elements"]
     )
     torch.ops.load_library(str(library))
@@ -125,7 +125,9 @@ def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int
     a = torch.tensor(a_values, dtype=torch.float32, device="npu:0")
     b = torch.tensor(b_values, dtype=torch.float32, device="npu:0")
     def launch():
-        result = torch.ops.rsi_a3candidates.vector_add(a, b, padded, blocks)
+        result = torch.ops.rsi_a3candidates.vector_add(
+            a, b, logical, padded, blocks
+        )
         torch.npu.synchronize()
         return result
 
@@ -142,13 +144,22 @@ def main(argv: list[str] | None = None, *, clock_ns=time.perf_counter_ns) -> int
                 raise RuntimeError("timing clock returned a non-positive sample")
             samples.append(elapsed)
     values = output.cpu().tolist()
-    expected = [a + b for a, b in zip(a_values, b_values)]
+    expected = [
+        a_values[index] + b_values[index] for index in range(logical)
+    ]
     if (
-        not isinstance(values, list) or len(values) != len(expected)
-        or any(not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
-               for value, want in zip(values, expected))
+        not isinstance(values, list) or len(values) != padded
+        or any(
+            not math.isfinite(float(value)) or abs(float(value) - want) > 1e-5
+            for value, want in zip(values[:logical], expected)
+        )
     ):
-        raise RuntimeError("candidate output failed padded host verification")
+        raise RuntimeError("candidate output failed logical host verification")
+    # Device padding is allocation-only and deliberately excluded from candidate
+    # correctness. Canonicalize it before emitting auditable padded output.
+    values = [float(value) for value in values[:logical]] + [0.0] * (
+        padded - logical
+    )
     for sample in samples:
         print(f"A3INNER_TIMING_US={sample:.6f}")
     print("A3KERNEL_OUTPUT=" + json.dumps(values, separators=(",", ":")))

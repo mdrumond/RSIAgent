@@ -7,7 +7,8 @@
 
 namespace rsi_a3candidate_host {
 torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
-                        int64_t padded_length, int64_t block_count) {
+                        int64_t logical_length, int64_t padded_length,
+                        int64_t block_count) {
   TORCH_CHECK(a.device().type() == c10::DeviceType::PrivateUse1,
               "a must be an NPU tensor");
   TORCH_CHECK(b.device() == a.device() && a.sizes() == b.sizes(),
@@ -21,11 +22,15 @@ torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
               "vector length must be in [1, 4096]");
   TORCH_CHECK(padded_length == a.numel(),
               "padded length must equal the allocated tensor length");
+  TORCH_CHECK(logical_length >= 1 && logical_length <= padded_length,
+              "logical length must be in [1, padded length]");
   TORCH_CHECK(block_count >= 1 && block_count <= 32,
               "block count must be in [1, 32]");
+  // Preserve the registered padded allocation while the candidate kernel owns
+  // and measures only the registered logical extent.
   auto output = torch::empty_like(a);
   auto stream = c10_npu::getCurrentNPUStream().stream(false);
-  const auto count = static_cast<uint32_t>(a.numel());
+  const auto count = static_cast<uint32_t>(logical_length);
   const auto launch_blocks = static_cast<uint32_t>(block_count);
   const uint32_t buffer_bytes = (count * sizeof(float) + 31U) & ~31U;
   auto launch = [=]() -> int {
@@ -38,7 +43,7 @@ torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
   return output;
 }
 TORCH_LIBRARY(rsi_a3candidates, registry) {
-  registry.def("vector_add(Tensor a, Tensor b, int padded_length, int block_count) -> Tensor");
+  registry.def("vector_add(Tensor a, Tensor b, int logical_length, int padded_length, int block_count) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(rsi_a3candidates, PrivateUse1, registry) {
   registry.impl("vector_add", VectorAdd);
