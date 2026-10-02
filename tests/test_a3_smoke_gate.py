@@ -118,6 +118,11 @@ def test_injected_smoke_knowledge_identity_must_have_exact_digests(tmp_path):
         )
 
 
+def test_smoke_rejects_non_bz_compatibility_profile(tmp_path):
+    with pytest.raises(ValueError, match="BZ-A3"):
+        SmokeWave(config(tmp_path), outcome, execution_profile="gz-a3")
+
+
 def test_smoke_kdb_authentication_opens_read_only_and_runs_fixed_query(
     tmp_path, monkeypatch,
 ):
@@ -217,6 +222,49 @@ def test_smoke_resume_rejects_changed_bound_identity(tmp_path, monkeypatch, fiel
     terminal.write_text(json.dumps(record))
     with pytest.raises(ValueError, match="foreign|conflicting"):
         wave.resume()
+
+
+def test_interrupted_smoke_state_rejects_changed_identity_before_executor(
+    tmp_path, monkeypatch,
+):
+    cfg = config(tmp_path)
+    cell = next(c for c in foundation_cells() if c.knowledge is KnowledgeMode.WITH_KDB)
+    first = knowledge_identity()
+    monkeypatch.setattr(
+        "benchmarks.a3kernels.phase1_wave.authenticate_smoke_knowledge",
+        lambda *_: first,
+    )
+    calls = []
+    wave = SmokeWave(
+        cfg,
+        lambda *_: calls.append("first") or (_ for _ in ()).throw(KeyboardInterrupt()),
+        cells=(cell,), execution_profile="bz-a3-1",
+    )
+    with pytest.raises(KeyboardInterrupt):
+        wave.run()
+    assert calls == ["first"]
+    assert wave.paths(cell).terminal.exists() is False
+    assert (wave.paths(cell).root / "identity.json").is_file()
+
+    with pytest.raises(ValueError, match="conflicting"):
+        SmokeWave(
+            cfg, lambda *_: calls.append("second") or outcome(), cells=(cell,),
+            execution_profile="bz-a3-1", knowledge_identity=knowledge_identity("f"),
+        ).resume()
+    assert calls == ["first"]
+
+
+def test_smoke_report_rejects_non_bz_terminal_profile(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(c for c in foundation_cells() if c.knowledge is KnowledgeMode.WITHOUT_KDB)
+    wave = SmokeWave(cfg, outcome, cells=(cell,), execution_profile="bz-a3-1")
+    wave.run()
+    terminal = wave.paths(cell).terminal
+    record = json.loads(terminal.read_text())
+    record["execution_profile"] = "gz-a3"
+    terminal.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        wave.report()
 
 
 def test_smoke_shards_are_deterministic_disjoint_and_use_unique_paths(tmp_path):

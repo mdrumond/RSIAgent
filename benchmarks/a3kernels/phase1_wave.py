@@ -39,6 +39,7 @@ _KNOWLEDGE_IDENTITY_FIELDS = {
     "knowledge_manifest_sha256", "knowledge_collection_sha256",
     "knowledge_probe_sha256",
 }
+_BZ_A3_EXECUTION_PROFILES = frozenset({"bz-a3-1", "bz-a3-2"})
 
 
 def full_dry_run() -> dict[str, object]:
@@ -407,6 +408,8 @@ class SmokeWave(Phase1Wave):
         super().__init__(
             config, executor, cells=cells, execution_profile=execution_profile
         )
+        if execution_profile not in _BZ_A3_EXECUTION_PROFILES:
+            raise ValueError("smoke gate requires a BZ-A3 execution profile")
         self._knowledge_identity = _validated_knowledge_identity(knowledge_identity)
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
@@ -440,6 +443,15 @@ class SmokeWave(Phase1Wave):
         for cell in self.cells:
             identity = self._identity(cell)
             paths = self.paths(cell)
+            self._publish(
+                paths.root / "identity.json",
+                {
+                    "schema": "a3-phase1-smoke-cell-identity-v1",
+                    "cell_id": cell.cell_id,
+                    "execution_profile": self.execution_profile,
+                    **identity,
+                },
+            )
             retained = self._read_smoke_terminal(cell, paths.terminal, identity)
             if retained is not None:
                 records.append(retained)
@@ -522,7 +534,11 @@ class SmokeWave(Phase1Wave):
             )
         except ValueError as exc:
             raise ValueError("smoke terminal cell record is corrupt") from exc
-        if not valid_knowledge or value != expected:
+        if (
+            value.get("execution_profile") not in _BZ_A3_EXECUTION_PROFILES
+            or not valid_knowledge
+            or value != expected
+        ):
             raise ValueError("smoke terminal cell record has foreign or conflicting evidence")
         return value
 
