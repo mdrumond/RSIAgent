@@ -66,6 +66,51 @@ def test_ledger_rejects_unterminated_entry_before_append(tmp_path):
         EvidenceLedger(path)
 
 
+def test_ledger_recovers_only_torn_tail_and_continues_chain_deterministically(tmp_path):
+    path = tmp_path / "interrupted.jsonl"
+    reference_path = tmp_path / "reference.jsonl"
+    for target in (path, reference_path):
+        ledger = EvidenceLedger(target)
+        ledger.append(EvidenceKind.PLAN, {"request_id": "r1"})
+        ledger.append(EvidenceKind.ACTION, {"action": "compile"})
+    committed = path.read_bytes()
+    with path.open("ab") as stream:
+        stream.write(b'{"sequence":2,"kind":"result"')
+
+    assert EvidenceLedger.recover_incomplete_tail(path) == 1
+    assert path.read_bytes() == committed
+    resumed = EvidenceLedger(path)
+    reference = EvidenceLedger(reference_path)
+    resumed_entry = resumed.append(EvidenceKind.RESULT, {"passed": True})
+    reference_entry = reference.append(EvidenceKind.RESULT, {"passed": True})
+
+    assert resumed_entry == reference_entry
+    assert path.read_bytes() == reference_path.read_bytes()
+
+
+def test_ledger_recovery_restores_delimiter_for_complete_valid_tail(tmp_path):
+    path = tmp_path / "complete-tail.jsonl"
+    ledger = EvidenceLedger(path)
+    ledger.append(EvidenceKind.PLAN, {"request_id": "r1"})
+    final = ledger.append(EvidenceKind.RESULT, {"passed": True})
+    committed = path.read_bytes()
+    path.write_bytes(committed.removesuffix(b"\n"))
+
+    assert EvidenceLedger.recover_incomplete_tail(path) == 1
+    assert path.read_bytes() == committed
+    assert EvidenceLedger(path).entries[-1] == final
+
+
+def test_ledger_recovery_rejects_newline_terminated_malformed_record(tmp_path):
+    path = tmp_path / "committed-malformed.jsonl"
+    EvidenceLedger(path).append(EvidenceKind.PLAN, {"request_id": "r1"})
+    with path.open("ab") as stream:
+        stream.write(b"not-json\n")
+
+    with pytest.raises(ValueError, match="line 2"):
+        EvidenceLedger.recover_incomplete_tail(path)
+
+
 @pytest.mark.parametrize(
     "payload, message",
     [

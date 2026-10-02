@@ -1,0 +1,524 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from benchmarks.a3_experiments import (
+    BackendModel, KnowledgeMode, ProfilingGuidance, ProgrammingLevel,
+    build_a3_experiment_plan,
+)
+from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
+from benchmarks.a3kernels.candidate import (
+    CANDIDATE_SOURCE_CONTRACT,
+    CandidateCompilation,
+    validate_candidate_source,
+)
+from benchmarks.a3kernels.knowledge_agent import (
+    Citation, KnowledgeQuery, KnowledgeResult,
+)
+from benchmarks.a3kernels.phase1_evidence import EvidenceLedger
+from benchmarks.a3kernels.phase1_memory import (
+    AuthoritativeEvidence, Phase1LearningJournal,
+)
+from benchmarks.a3kernels.phase1_protocol import (
+    ExecutionPlan, ExecutionReceipt, FailedEvidence, SourceFile, VerifiedResult, attest,
+)
+from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
+from benchmarks.a3kernels.profiling import CompactProfileResult, ProfileMetric
+from benchmarks.a3kernels.trial import A3TrialLoop, Action, TrialBudgets, parse_action
+
+
+SOURCE = 'extern "C" __global__ __aicore__ void vector_add(GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output, uint32_t count, uint32_t buffer_bytes) {}'
+
+
+def _cell(
+    *,
+    model=BackendModel.GPT_5_6_SOL,
+    knowledge=KnowledgeMode.WITHOUT_KDB,
+    profiling=ProfilingGuidance.WITHOUT_GUIDANCE,
+):
+    return next(
+        cell for cell in build_a3_experiment_plan().cells
+        if cell.backend_model is model
+        and cell.knowledge is knowledge and cell.profiling is profiling
+        and cell.programming_level is ProgrammingLevel.FOUNDATION
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {}, {"action": "write_source"}, {"action": "compile", "argv": ["sh"]},
+        {"action": "query", "query": ""}, {"action": "profile", "metric": "Basic"},
+        {"action": "submit", "interpretation": "", "supports": []},
+    ],
+)
+def test_action_schema_rejects_missing_extra_or_invalid_fields(payload):
+    with pytest.raises(ValueError, match="action"):
+        parse_action(json.dumps(payload))
+
+
+def test_action_schema_has_one_fixed_source_slot_and_no_argv():
+    action = parse_action(json.dumps({"action": "write_source", "source": SOURCE}))
+    assert action == Action("write_source", source=SOURCE)
+    with pytest.raises(ValueError):
+        parse_action(json.dumps({"action": "write_source", "path": "other.cpp", "source": SOURCE}))
+
+
+class FakeCandidate:
+    def __init__(self, resolver=None): self.source, self.resolver = None, resolver
+    def _plan(
+        self, source, request_id, attempt_id, length, project_id,
+        padded_length=None, block_count=1, execution_profile="gz-a3",
+    ):
+        padded_length = padded_length or length
+        return ExecutionPlan(request_id, attempt_id, project_id, (SourceFile("candidate.cpp", source),),
+                             ("python", "host_driver.py", "input.json"),
+                             (1.0,) * padded_length, (2.0,) * padded_length,
+                             execution_profile=execution_profile,
+                             logical_length=length, padded_length=padded_length,
+                             block_count=block_count)
+    def compile(self, source, _workdir, **kw):
+        self.source = source
+        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"))
+        body = {"plan": plan, "library_sha256": "c" * 64, "stdout": "ok", "stderr": ""}
+        result = CandidateCompilation(plan, "c" * 64, "ok", "", attest(body))
+        if self.resolver:
+            self.resolver.retain(
+                "compile", result.attestation_sha256, plan.project_id,
+                plan.source_fingerprint,
+            )
+        return result
+    def run(self, source, _workdir, **kw):
+        assert source == self.source
+        plan = self._plan(source, kw["request_id"], kw["attempt_id"], kw["length"], kw["project_id"], kw.get("padded_length"), kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"))
+        result = VerifiedResult.from_receipt(
+            plan, ExecutionReceipt(0, (3.0,) * plan.padded_length), max_abs_error=0.0
+        )
+        if self.resolver:
+            self.resolver.retain(
+                "host-verification", result.evidence_sha256, plan.project_id,
+                plan.source_fingerprint,
+            )
+        return result
+
+
+class Resolver:
+    def __init__(self): self.records = {}
+    def retain(self, kind, digest, project_id, candidate_sha256):
+        self.records[digest] = AuthoritativeEvidence(
+            kind, digest, project_id, candidate_sha256, True,
+        )
+    def resolve(self, digest): return self.records.get(digest)
+
+
+class FakeKnowledge:
+    def __init__(self, enabled): self.enabled, self.queries = enabled, []
+    def query(self, query):
+        assert isinstance(query, KnowledgeQuery)
+        self.queries.append(query.query)
+        if not self.enabled:
+            return ()
+        return (
+            KnowledgeResult(
+                Citation(
+                    "a3-reference", "docs/datacopy.md", 10, 14, "1" * 64,
+                    "2" * 64, "3" * 64,
+                ),
+                "Use DataCopyPad for a bounded tail." * 400,
+                0.9,
+            ),
+        )
+
+
+class FakeProfiler:
+    def __init__(self, resolver=None): self.requests, self.resolver = [], resolver
+    def profile(self, request):
+        self.requests.append(request)
+        if request.treatment.value.startswith("without"):
+            return None
+        result = CompactProfileResult.create(
+            request, exported_kernels=("vector_add",),
+            metric_values=(("vector_ratio", .75),), timeline=(("kernel_count", 20.0),),
+            report_sha256="d" * 64,
+        )
+        if self.resolver:
+            self.resolver.retain(
+                "profiling", result.evidence_sha256,
+                DEFAULT_PROPOSALS[0].project_id, request.binding.source_fingerprint,
+            )
+        return result
+
+
+def _run(
+    tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
+    candidate=None, budgets=None, completion_tokens=1,
+    execution_profile="gz-a3",
+):
+    selected = cell or _cell()
+    profile = load_a3_model_profile(selected.backend_model)
+    resolver = Resolver()
+    queue = list(actions)
+    prompts = []
+    def actor(actual_profile, context):
+        assert actual_profile == profile
+        prompts.append(context)
+        action = queue.pop(0)
+        if callable(action):
+            action = action(context)
+        return A3Completion(
+            action, completion_tokens,
+            {"profile_sha256": profile.fingerprint},
+        )
+    journal = Phase1LearningJournal(
+        tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
+        cell_id=selected.cell_id, lineage_id="isolated-lineage",
+        evidence_resolver=resolver,
+    )
+    selected_candidate = candidate or FakeCandidate(resolver)
+    selected_profiler = profiler or FakeProfiler(resolver)
+    if hasattr(selected_candidate, "resolver"):
+        selected_candidate.resolver = resolver
+    if hasattr(selected_profiler, "resolver"):
+        selected_profiler.resolver = resolver
+    loop = A3TrialLoop(
+        cell=selected, proposal=DEFAULT_PROPOSALS[0], profile=profile, actor=actor,
+        candidate=selected_candidate, knowledge=knowledge or FakeKnowledge(False),
+        profiler=selected_profiler, evidence=EvidenceLedger(tmp_path / "evidence.jsonl"),
+        memory=journal, workdir=tmp_path / "work", budgets=budgets or TrialBudgets(10, 2000),
+        execution_profile=execution_profile,
+    )
+    return loop.run(), prompts, journal
+
+
+def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
+    actions = [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        '{"action":"query","query":"padding","limit":3}',
+        '{"action":"profile","metric":"PipeUtilization"}',
+        json.dumps({"action": "submit", "interpretation": "host result passed", "supports": []}),
+    ]
+    result, prompts, journal = _run(tmp_path, actions)
+    assert result.status == "passed" and result.verified.passed
+    assert result.knowledge_queries == 1 and result.profile_result is None
+    assert len(journal.read()) == 1
+    assert all(_cell().cell_id in prompt and "isolated-lineage" in prompt for prompt in prompts)
+    memory = journal.read()[0]["memory"]
+    assert memory["agent_interpretations"][0]["supports"] == []
+    first, after_write = map(json.loads, prompts[:2])
+    assert first["proposal"] == DEFAULT_PROPOSALS[0].as_dict()
+    assert first["policy"] == {
+        "block_count": 1, "logical_length": 32, "padded_length": 64,
+        "profiling_treatment": "without-profiling-guidance",
+    }
+    assert first["allowed_actions"]["write_source"] == ["action", "source"]
+    assert first["action_contract"] == {
+        "profile_metric": "PipeUtilization",
+        "eligible_submit_supports": [],
+    }
+    assert first["current_candidate_source"] is None
+    assert after_write["current_candidate_source"] == SOURCE
+    contract = first["candidate_source_contract"]
+    assert contract == CANDIDATE_SOURCE_CONTRACT.as_dict()
+    assert contract["source_slot"] == first["source_slot"] == "candidate.cpp"
+    validate_candidate_source(contract["exported_signature"] + " {}")
+    assert all(
+        json.loads(prompt)["candidate_source_contract"] == contract
+        for prompt in prompts
+    )
+
+
+def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
+    submitted_supports = []
+
+    def submit_from_context(context):
+        context_value = json.loads(context)
+        observations = context_value["observations"]
+        authoritative = [
+            item["authoritative_evidence"]
+            for item in observations
+            if isinstance(item, dict) and "authoritative_evidence" in item
+        ]
+        assert [item["kind"] for item in authoritative] == [
+            "compile", "host-verification",
+        ]
+        assert all(item["status"] == "passed" for item in authoritative)
+        assert len({item["source_fingerprint"] for item in authoritative}) == 1
+        submitted_supports.extend(
+            context_value["action_contract"]["eligible_submit_supports"]
+        )
+        assert submitted_supports == [
+            item["evidence_sha256"] for item in authoritative
+        ]
+        assert all(len(digest) == 64 for digest in submitted_supports)
+        return json.dumps({
+            "action": "submit",
+            "interpretation": "host compilation and verification passed",
+            "supports": submitted_supports,
+        })
+
+    result, _, journal = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        '{"action":"run"}',
+        submit_from_context,
+    ])
+
+    assert result.status == "passed"
+    assert journal.read()[0]["memory"]["agent_interpretations"][0][
+        "supports"
+    ] == submitted_supports
+
+
+def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(tmp_path):
+    class CompileFailure(FakeCandidate):
+        def compile(self, source, _workdir, **kw):
+            plan = self._plan(
+                source, kw["request_id"], kw["attempt_id"], kw["length"],
+                kw["project_id"], kw.get("padded_length"),
+                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+            )
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="CompileError", detail="fixture",
+            )
+
+    result, prompts, _ = _run(
+        tmp_path,
+        [json.dumps({"action": "write_source", "source": SOURCE}),
+         '{"action":"compile"}', '{"action":"compile"}'],
+        candidate=CompileFailure(), budgets=TrialBudgets(3, 2000),
+    )
+    observation = json.loads(prompts[2])["observations"][-1]["failed_evidence"]
+    assert observation["stage"] == "compile"
+    assert len(observation["attestation_sha256"]) == 64
+    failure_entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    assert observation["attestation_sha256"] in {
+        entry.payload["failed_evidence"]["attestation_sha256"]
+        for entry in failure_entries if "failed_evidence" in entry.payload
+    }
+    assert result.failures[-1] == "compile failed: fixture"
+
+
+def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path):
+    class PendingOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
+        def compile(self, source, workdir, **kw):
+            self.attempts.append(kw["attempt_id"])
+            if len(self.attempts) == 1:
+                raise RuntimeError("observation unavailable; retry retained handle")
+            return super().compile(source, workdir, **kw)
+
+    candidate = PendingOnce()
+    result, _, _ = _run(
+        tmp_path,
+        [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            json.dumps({
+                "action": "submit", "interpretation": "host facts",
+                "supports": [],
+            }),
+        ],
+        candidate=candidate,
+    )
+
+    assert result.status == "passed"
+    assert candidate.attempts == ["turn-2", "turn-2"]
+
+
+def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
+    cell = _cell(knowledge=KnowledgeMode.WITH_KDB, profiling=ProfilingGuidance.WITH_GUIDANCE)
+    knowledge, profiler = FakeKnowledge(True), FakeProfiler()
+    actions = [
+        json.dumps({"action": "write_source", "source": SOURCE}), '{"action":"compile"}',
+        '{"action":"run"}', '{"action":"query","query":"DataCopyPad","limit":2}',
+        '{"action":"profile","metric":"PipeUtilization"}',
+        json.dumps({"action": "submit", "interpretation": "profile supports result", "supports": []}),
+    ]
+    result, prompts, _ = _run(
+        tmp_path, actions, cell=cell, knowledge=knowledge, profiler=profiler
+    )
+    assert result.status == "passed"
+    assert knowledge.queries == ["DataCopyPad"]
+    observation = json.loads(prompts[4])["observations"][-1]
+    assert observation["knowledge_results"][0]["text"].startswith("Use DataCopyPad")
+    assert len(observation["knowledge_results"][0]["text"]) <= 2048
+    assert observation["knowledge_results"][0]["citation"] == {
+        "chunk_id": "1" * 64,
+        "collection": "a3-reference",
+        "content_sha256": "3" * 64,
+        "end_line": 14,
+        "path": "docs/datacopy.md",
+        "source_revision": "2" * 64,
+        "start_line": 10,
+    }
+    assert profiler.requests[0].treatment.value == cell.profiling.value
+    assert result.profile_result.candidate_execution_id == result.verified.execution_id
+    profile_observation = json.loads(prompts[5])["observations"][-1]
+    assert profile_observation == {
+        "profile_evidence": {
+            "evidence_sha256": result.profile_result.evidence_sha256,
+            "metric": "PipeUtilization",
+            "metric_values": [["vector_ratio", 0.75]],
+            "timeline": [["kernel_count", 20.0]],
+        }
+    }
+    profile_fact = next(
+        fact for fact in json.loads((tmp_path / "memory.jsonl").read_text())["memory"]["host_facts"]
+        if fact["category"] == "profiling"
+    )
+    assert "vector_ratio=0.75" in profile_fact["statement"]
+    assert "kernel_count=20" in profile_fact["statement"]
+    support_contract = json.loads(prompts[5])["action_contract"]
+    assert support_contract["profile_metric"] == "PipeUtilization"
+    assert support_contract["eligible_submit_supports"][-1] == (
+        result.profile_result.evidence_sha256
+    )
+
+
+def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):
+    result, _, _ = _run(
+        tmp_path,
+        [json.dumps({"action": "write_source", "source": SOURCE}),
+         '{"action":"compile"}', '{"action":"run"}',
+         json.dumps({"action": "submit", "interpretation": "host facts", "supports": []})],
+        execution_profile="bz-a3-2",
+    )
+    assert result.status == "passed"
+    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    assert {entry.payload["execution_profile"] for entry in entries} == {"bz-a3-2"}
+
+
+def test_submit_gates_source_identity_verification_and_required_profile(tmp_path):
+    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
+    result, _, journal = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "submit", "interpretation": "too early", "supports": []}),
+    ], cell=cell, budgets=TrialBudgets(4, 2000))
+    assert result.status == "budget-exhausted"
+    assert "profile" in result.failures[-1]
+    assert journal.read() == ()
+
+
+def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):
+    class FailSecondCompile(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_calls = 0
+
+        def compile(self, source, workdir, **options):
+            self.compile_calls += 1
+            if self.compile_calls == 2:
+                plan = self._plan(
+                    source, options["request_id"], options["attempt_id"],
+                    options["length"], options["project_id"],
+                    options.get("padded_length"), options.get("block_count", 1),
+                    options.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="compile", error_type="CompileError",
+                    detail="ordinary recompile failure",
+                )
+            return super().compile(source, workdir, **options)
+
+    result, _, journal = _run(
+        tmp_path,
+        [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            '{"action":"compile"}',
+            json.dumps({
+                "action": "submit", "interpretation": "stale result",
+                "supports": [],
+            }),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+            json.dumps({
+                "action": "submit", "interpretation": "fresh host result",
+                "supports": [],
+            }),
+        ],
+        candidate=FailSecondCompile(),
+    )
+
+    assert result.status == "passed"
+    assert any("ordinary recompile failure" in failure for failure in result.failures)
+    assert any("host verification" in failure for failure in result.failures)
+    assert len(journal.read()) == 1
+
+
+def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
+    result, _, journal = _run(
+        tmp_path, ['{"action":"compile"}'] * 3, budgets=TrialBudgets(2, 30)
+    )
+    assert result.status == "budget-exhausted" and result.turns <= 2
+    assert journal.read() == ()
+    token_result, _, token_journal = _run(
+        tmp_path / "tokens", ['{"action": "compile"}'],
+        budgets=TrialBudgets(3, 1), completion_tokens=2,
+    )
+    assert token_result.status == "budget-exhausted" and token_result.turns == 1
+    assert token_result.failures == ("token budget exhausted",)
+    assert token_journal.read() == ()
+
+
+def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
+    def build_loop(model, *, budgets=None):
+        cell = _cell(model=model)
+        profile = load_a3_model_profile(model)
+        journal = Phase1LearningJournal(
+            tmp_path / model.name / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
+            cell_id=cell.cell_id, lineage_id="isolated-lineage",
+            evidence_resolver=Resolver(),
+        )
+        kwargs = {}
+        if budgets is not None:
+            kwargs["budgets"] = budgets
+        return A3TrialLoop(
+            cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
+            actor=lambda *_: None, candidate=FakeCandidate(),
+            knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
+            evidence=EvidenceLedger(tmp_path / model.name / "evidence.jsonl"),
+            memory=journal, workdir=tmp_path / model.name / "work", **kwargs,
+        )
+
+    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(12, 32768)
+    assert build_loop(BackendModel.DEEPSEEK_FLASH).budgets == TrialBudgets(12, 65536)
+    override = TrialBudgets(2, 17)
+    assert build_loop(BackendModel.DEEPSEEK_FLASH, budgets=override).budgets is override
+
+
+def test_model_and_treatment_authorities_must_match_cell(tmp_path):
+    cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
+    with pytest.raises(ValueError, match="Knowledge Agent"):
+        _run(tmp_path, [], cell=cell, knowledge=FakeKnowledge(False))
+
+
+def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
+    cell = _cell()
+    profile = load_a3_model_profile(cell.backend_model)
+    journal = Phase1LearningJournal(
+        tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
+        cell_id=cell.cell_id, lineage_id="isolated-lineage",
+        evidence_resolver=Resolver(),
+    )
+    loop = A3TrialLoop(
+        cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
+        actor=lambda *_: A3Completion(
+            '{"action":"compile"}', 1, {"profile_sha256": "0" * 64}
+        ),
+        candidate=FakeCandidate(), knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
+        evidence=EvidenceLedger(tmp_path / "evidence.jsonl"), memory=journal,
+        workdir=tmp_path / "work", budgets=TrialBudgets(1, 100),
+    )
+    result = loop.run()
+    assert result.status == "budget-exhausted"
+    assert result.failures == ("completion provenance does not match the cell model",)

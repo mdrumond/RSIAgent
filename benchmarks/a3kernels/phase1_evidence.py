@@ -190,6 +190,34 @@ class EvidenceLedger:
     def _read(self) -> Iterable[EvidenceEntry]:
         return self._decode(self.path.read_bytes()) if self.path.exists() else ()
 
+    @classmethod
+    def recover_incomplete_tail(cls, path: str | Path) -> int:
+        """Discard only an interrupted final append after validating its prefix."""
+        ledger_path = Path(path)
+        if not ledger_path.exists():
+            return 0
+        with ledger_path.open("r+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            data = stream.read()
+            if not data or data.endswith(b"\n"):
+                cls.verify(tuple(cls._decode(data)))
+                return 0
+            boundary = data.rfind(b"\n") + 1
+            tail = data[boundary:]
+            try:
+                json.loads(tail)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                cls.verify(tuple(cls._decode(data[:boundary])))
+                stream.seek(boundary)
+                stream.truncate()
+            else:
+                cls.verify(tuple(cls._decode(data + b"\n")))
+                stream.seek(0, os.SEEK_END)
+                stream.write(b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+            return 1
+
     @staticmethod
     def _decode(data: bytes) -> Iterable[EvidenceEntry]:
         if data and not data.endswith(b"\n"):

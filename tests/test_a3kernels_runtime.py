@@ -10,10 +10,16 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import benchmarks.a3kernels as a3kernels
 from benchmarks.a3kernels import A3KernelRunner, RunRequest, VerifiedResult
 from benchmarks.a3kernels.ascendc_runtime import host_driver
 from benchmarks.a3kernels.fixture import source_files
 import run_a3kernels as cli
+
+
+def test_root_exports_only_the_compatible_hello_runtime_contract():
+    assert a3kernels.__all__ == ["A3KernelRunner", "RunRequest", "VerifiedResult"]
+    assert "BZA3ProfilingBackend" not in a3kernels.__all__
 
 
 def test_fixture_is_a3_specific_and_complete():

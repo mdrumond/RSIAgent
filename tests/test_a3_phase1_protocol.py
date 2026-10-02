@@ -46,6 +46,26 @@ def test_plan_has_deterministic_a3_source_and_execution_identity():
         first.project_id = "changed"
 
 
+def test_execution_dimensions_are_validated_and_identity_bound():
+    execution = plan(logical_length=2, padded_length=2, block_count=1)
+    assert execution.execution_id != plan(
+        logical_length=1, padded_length=2, block_count=1
+    ).execution_id
+    assert execution.execution_id != plan(
+        logical_length=2, padded_length=2, block_count=2
+    ).execution_id
+    with pytest.raises(ValueError, match="padded_length"):
+        plan(logical_length=2, padded_length=3)
+
+
+@pytest.mark.parametrize("profile", ["gz-a3", "bz-a3-1", "bz-a3-2"])
+def test_plan_accepts_registered_a3_execution_profiles(profile):
+    execution = plan(execution_profile=profile)
+    assert execution.execution_profile == profile
+    if profile != "bz-a3-1":
+        assert execution.execution_id != plan().execution_id
+
+
 @pytest.mark.parametrize(
     "changes, message",
     [

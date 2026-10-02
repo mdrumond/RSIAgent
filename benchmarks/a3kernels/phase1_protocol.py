@@ -16,6 +16,9 @@ from benchmarks.a3kernels.phase1_evidence import (
 
 A3_TARGET = "Ascend910B4"
 A3_LANGUAGE = "ascend-c"
+# Compatibility default for aggregate candidate helpers. ExecutionPlan keeps
+# execution_profile required so every persisted identity names its route.
+A3_EXECUTION_PROFILE = "gz-a3"
 A3_RUNTIME = "native-ascend-c"
 
 
@@ -65,6 +68,9 @@ class ExecutionPlan:
     language: str = A3_LANGUAGE
     runtime: str = A3_RUNTIME
     logical_device: int = 0
+    logical_length: int | None = None
+    padded_length: int | None = None
+    block_count: int = 1
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "files", tuple(self.files))
@@ -96,6 +102,21 @@ class ExecutionPlan:
             raise ValueError("argv must contain strings")
         if len(self.input_a) != len(self.input_b):
             raise ValueError("input vectors must have equal lengths")
+        if self.logical_length is None:
+            object.__setattr__(self, "logical_length", len(self.input_a))
+        if self.padded_length is None:
+            object.__setattr__(self, "padded_length", len(self.input_a))
+        if (
+            type(self.logical_length) is not int
+            or type(self.padded_length) is not int
+            or not 1 <= self.logical_length <= self.padded_length <= 4096
+            or len(self.input_a) != self.padded_length
+        ):
+            raise ValueError(
+                "logical_length and padded_length must describe the staged inputs"
+            )
+        if type(self.block_count) is not int or not 1 <= self.block_count <= 32:
+            raise ValueError("block_count must be an integer in [1, 32]")
         object.__setattr__(self, "files", tuple(sorted(self.files)))
 
     @property
@@ -114,7 +135,10 @@ class ExecutionPlan:
                 "input_a": self.input_a,
                 "input_b": self.input_b,
                 "language": self.language,
+                "logical_length": self.logical_length,
                 "logical_device": self.logical_device,
+                "padded_length": self.padded_length,
+                "block_count": self.block_count,
                 "project_id": self.project_id,
                 "request_id": self.request_id,
                 "runtime": self.runtime,
