@@ -263,7 +263,10 @@ class LiveComposition:
             not isinstance(item, CurriculumProposal) for item in supplied
         ):
             raise ValueError("composition requires registered curriculum proposals")
-        self.proposals = canonical_proposals(supplied)
+        canonical = canonical_proposals(supplied)
+        if supplied != canonical:
+            raise ValueError("composition proposals must use canonical registry order")
+        self.proposals = canonical
         if not re.fullmatch(r"[a-z0-9-]+", lineage_prefix):
             raise ValueError("composition lineage prefix is invalid")
         self.lineage_prefix = lineage_prefix

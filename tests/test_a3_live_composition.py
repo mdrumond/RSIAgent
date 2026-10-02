@@ -189,12 +189,20 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
     assert entries[0]["memory"]["lineage_id"].startswith("smoke-")
 
 
-def test_composition_canonicalizes_custom_proposals_before_execution(tmp_path):
-    composition = LiveComposition(
-        config(tmp_path), dependencies([], []),
-        proposals=tuple(reversed(DEFAULT_PROPOSALS[:2])),
+def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):
+    calls = []
+    deps = LiveDependencies(
+        actor_factory=lambda *args: calls.append(("actor", args)),
+        candidate_factory=lambda *args: calls.append(("candidate", args)),
+        knowledge_factory=lambda *args: calls.append(("knowledge", args)),
+        profiler_factory=lambda *args: calls.append(("profiler", args)),
     )
-    assert composition.proposals == DEFAULT_PROPOSALS[:2]
+    with pytest.raises(ValueError, match="canonical registry order"):
+        LiveComposition(
+            config(tmp_path), deps,
+            proposals=tuple(reversed(DEFAULT_PROPOSALS[:2])),
+        )
+    assert calls == []
 
 
 def test_smoke_guidance_cell_requires_one_candidate_bound_pipe_profile(tmp_path):
