@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -57,6 +58,8 @@ extern "C" __global__ __aicore__ void vector_add(
   AscendC::DataCopyPad(c, output_local, copy);
 }
 '''
+DRIVER_EXECUTION_ID = "d" * 64
+DRIVER_SOURCE_FINGERPRINT = "e" * 64
 
 
 def _output(cwd: Path) -> list[float]:
@@ -320,6 +323,29 @@ def test_compact_profile_filters_helper_kernel_rows(tmp_path, capsys):
     assert compact["timeline"] == [[f"{table}:Duration(us):0", 12.5]]
 
 
+@pytest.mark.parametrize(
+    ("metric", "counter"),
+    [("ArithmeticUtilization", "aiv_vec_fp32_ratio"),
+     ("PipeUtilization", "aiv_mte2_ratio")],
+)
+def test_raw_metric_can_be_bound_by_generic_operator_summary_columns(
+    tmp_path, metric, counter,
+):
+    report = tmp_path / "PROF_1/mindstudio_profiler_output"
+    report.mkdir(parents=True)
+    (report / "op_summary_0.csv").write_text(
+        f"Op Name,Task Duration(us),{counter}\nvector_add,2.5,0.75\n"
+    )
+
+    kernels, values, timeline, _columns = a3_profile_driver._raw_rows(
+        tmp_path, metric, "vector_add"
+    )
+
+    assert kernels == ["vector_add"]
+    assert any(item[0].endswith(f":{counter}:0") and item[1] == 0.75 for item in values)
+    assert any(item[0].endswith(":Task Duration(us):0") for item in timeline)
+
+
 def test_checked_driver_rejects_failed_verification_and_out_of_range_blocks(tmp_path):
     _candidate_directory(tmp_path, length=4, block_count=1)
 
@@ -346,11 +372,23 @@ def _candidate_directory(
         "input_a": [1] * length + padding, "input_b": [2] * length + padding,
         "logical_length": length, "padded_length": padded, "block_count": block_count,
     }))
+    files = {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in ("host_driver.py", "input.json", "a3_candidate.so")
+    }
+    (root / "manifest.json").write_text(json.dumps({
+        "archive_schema": "rsi-a3-candidate-v1",
+        "execution_id": DRIVER_EXECUTION_ID,
+        "source_fingerprint": DRIVER_SOURCE_FINGERPRINT,
+        "files": files,
+    }, sort_keys=True, separators=(",", ":")))
 
 
 def _driver_args(root: Path, *, block_count: int = 1) -> list[str]:
     return [
         "--candidate-dir", str(root.resolve()), "--logical-device", "0",
+        "--execution-id", DRIVER_EXECUTION_ID,
+        "--source-fingerprint", DRIVER_SOURCE_FINGERPRINT,
         "--length", "4", "--block-count", str(block_count), "--warm-up", "0",
         "--launch-count", "1",
     ]
