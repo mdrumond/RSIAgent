@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from benchmarks.a3_experiments import BackendModel
 from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_wave import (
@@ -48,6 +50,38 @@ def test_preflight_checks_credentials_paths_and_fixed_adapter(tmp_path):
     assert report["profile_driver_sha256"] == profile_driver_asset().sha256
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
         cfg.preflight({"OPENROUTER_API_KEY": "gpt"})
+
+
+def test_preflight_uses_registered_profile_credential_names(monkeypatch, tmp_path):
+    import benchmarks.a3kernels.phase1_wave as phase1_wave
+
+    credential_names = {
+        BackendModel.GPT_5_6_SOL: "OPENAI_API_KEY",
+        BackendModel.DEEPSEEK_FLASH: "DEEPSEEK_API_KEY",
+    }
+    monkeypatch.setattr(
+        phase1_wave,
+        "load_a3_model_profile",
+        lambda model: SimpleNamespace(credential_env=credential_names[model]),
+    )
+
+    cfg = config(tmp_path)
+    report = cfg.preflight(
+        {
+            "OPENAI_API_KEY": "direct-openai-secret",
+            "DEEPSEEK_API_KEY": "deepseek-secret",
+        }
+    )
+
+    assert report["checks"]["OPENAI_API_KEY"] is True
+    assert "OPENROUTER_API_KEY" not in report["checks"]
+    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+        cfg.preflight(
+            {
+                "OPENROUTER_API_KEY": "stale-openrouter-secret",
+                "DEEPSEEK_API_KEY": "deepseek-secret",
+            }
+        )
 
 
 def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
