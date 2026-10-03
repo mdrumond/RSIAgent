@@ -38,7 +38,18 @@ def _toolchain_paths(torch, torch_npu):
 def _assemble_source(candidate: str, wrapper: str) -> str:
     if wrapper.count(_CANDIDATE_SOURCE_SLOT) != 1:
         raise RuntimeError("host wrapper must contain exactly one candidate source slot")
-    return wrapper.replace(_CANDIDATE_SOURCE_SLOT, candidate)
+    slot = wrapper.index(_CANDIDATE_SOURCE_SLOT)
+    prefix = wrapper[:slot]
+    suffix = wrapper[slot + len(_CANDIDATE_SOURCE_SLOT):]
+    next_wrapper_line = prefix.count("\n") + 2
+    candidate_newline = "" if candidate.endswith("\n") else "\n"
+    mapped_candidate = (
+        '#line 1 "candidate.cpp"\n'
+        + candidate
+        + candidate_newline
+        + f'#line {next_wrapper_line} "host_wrapper.inc"'
+    )
+    return prefix + mapped_candidate + suffix
 
 
 def _compile(root: Path, spec: dict, torch, torch_npu) -> Path:

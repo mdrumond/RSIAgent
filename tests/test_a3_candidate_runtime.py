@@ -488,11 +488,40 @@ def test_host_source_orders_headers_before_namespace_candidate_before_registrati
     source = host_driver._assemble_source(NAMESPACE_SOURCE, wrapper)
 
     assert source.count(NAMESPACE_SOURCE) == 1
+    assert source.count('#line 1 "candidate.cpp"') == 1
+    assert '#line 1 "candidate.cpp"\n' + NAMESPACE_SOURCE in source
     assert "RSI_A3_CANDIDATE_SOURCE_SLOT" not in source
     assert source.index("#include <torch/all.h>") < source.index("using namespace AscendC")
     assert source.index("using namespace AscendC") < source.index(
         "TORCH_LIBRARY(rsi_a3candidates"
     )
+
+
+@pytest.mark.parametrize("prefix", ["", "// preamble\n", "// first\n\n// third\n"])
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "CANDIDATE_LINE_1\nCANDIDATE_LINE_2",
+        "CANDIDATE_LINE_1\nCANDIDATE_LINE_2\n",
+    ],
+)
+def test_host_source_resets_wrapper_mapping_after_movable_slot(prefix, candidate):
+    wrapper = (
+        prefix
+        + "// RSI_A3_CANDIDATE_SOURCE_SLOT\n"
+        + "HOST_BODY\n"
+    )
+    next_wrapper_line = prefix.count("\n") + 2
+
+    source = host_driver._assemble_source(candidate, wrapper)
+
+    mapped = (
+        '#line 1 "candidate.cpp"\n'
+        + candidate
+        + ("" if candidate.endswith("\n") else "\n")
+        + f'#line {next_wrapper_line} "host_wrapper.inc"\nHOST_BODY\n'
+    )
+    assert mapped in source
 
 
 @pytest.mark.parametrize(
