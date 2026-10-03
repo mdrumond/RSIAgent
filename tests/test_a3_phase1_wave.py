@@ -7,6 +7,7 @@ import pytest
 from benchmarks.a3_experiments import BackendModel, KnowledgeMode
 from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config, Phase1Wave, foundation_cells, full_dry_run,
 )
@@ -23,6 +24,14 @@ def config(tmp_path):
     return Phase1Config(
         tmp_path / "state", wrapper, embedding, corpus, database, manifest
     )
+
+
+def terminal_outcome(digest="a" * 64):
+    return {
+        "status": "passed", "terminal_reason": "completed",
+        "completed_projects": 8, "failed_project_id": None,
+        "evidence_sha256": digest,
+    }
 
 
 def test_all_eight_project_dry_run_has_no_side_effects(tmp_path):
@@ -142,10 +151,14 @@ def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
         seen.append((cell.cell_id, paths))
         assert paths.workspace.parent == cfg.state_root / "cells" / cell.cell_id
         assert paths.profile_driver.read_text() == profile_driver_asset().content
-        return {"status": "passed", "evidence_sha256": cell.cell_id.removeprefix("a3-cell-") * 4}
+        return terminal_outcome(cell.cell_id.removeprefix("a3-cell-") * 4)
     wave = Phase1Wave(cfg, execute)
     records = wave.run()
     assert len(records) == len(seen) == 8
+    assert {record["schema"] for record in records} == {
+        "a3-phase1-cell-terminal-v4"
+    }
+    assert all(record["completed_projects"] == 8 for record in records)
     assert {record["status"] for record in records} == {"passed"}
     assert {record["profile_driver_sha256"] for record in records} == {
         profile_driver_asset().sha256
@@ -163,14 +176,14 @@ def test_interruption_resume_does_not_duplicate_terminal_cells(tmp_path):
     def interrupted(cell, paths):
         calls.append(cell.cell_id)
         if len(calls) == 4: raise KeyboardInterrupt()
-        return {"status": "passed", "evidence_sha256": "a" * 64}
+        return terminal_outcome()
     wave = Phase1Wave(cfg, interrupted)
     with pytest.raises(KeyboardInterrupt): wave.run()
     assert len(wave.report()["records"]) == 3
     resumed_calls = []
     records = Phase1Wave(
         cfg, lambda cell, paths: (
-            resumed_calls.append(cell.cell_id) or {"status": "passed", "evidence_sha256": "b" * 64}
+            resumed_calls.append(cell.cell_id) or terminal_outcome("b" * 64)
         ),
     ).resume()
     assert len(records) == 8 and len(resumed_calls) == 5
@@ -179,7 +192,7 @@ def test_interruption_resume_does_not_duplicate_terminal_cells(tmp_path):
 
 def test_resume_rejects_terminal_from_other_execution_profile(tmp_path):
     cfg = config(tmp_path)
-    execute = lambda *_: {"status": "passed", "evidence_sha256": "a" * 64}
+    execute = lambda *_: terminal_outcome()
     Phase1Wave(cfg, execute, execution_profile="bz-a3-1").run()
     terminal = Phase1Wave(cfg, execute).paths(foundation_cells()[0]).terminal
     assert json.loads(terminal.read_text())["execution_profile"] == "bz-a3-1"
@@ -190,11 +203,43 @@ def test_resume_rejects_terminal_from_other_execution_profile(tmp_path):
 
 def test_foreign_or_conflicting_terminal_record_is_rejected(tmp_path):
     cfg = config(tmp_path)
-    wave = Phase1Wave(cfg, lambda *_: {"status": "passed", "evidence_sha256": "a" * 64})
+    wave = Phase1Wave(cfg, lambda *_: terminal_outcome())
     first = foundation_cells()[0]
     paths = wave.paths(first); paths.root.mkdir(parents=True)
     paths.terminal.write_text(json.dumps({"cell_id": first.cell_id, "target": "a5", "language": "catlass-dsl", "status": "passed", "evidence_sha256": "a" * 64}))
     with pytest.raises(ValueError, match="foreign"):
+        wave.resume()
+
+
+def test_full_terminal_rejects_contradictory_project_progress(tmp_path):
+    cfg = config(tmp_path)
+    wave = Phase1Wave(cfg, lambda *_: terminal_outcome())
+    wave.run()
+    terminal = wave.paths(foundation_cells()[0]).terminal
+    record = json.loads(terminal.read_text())
+    record["completed_projects"] = 7
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        wave.report()
+
+
+def test_full_terminal_rejects_failed_project_out_of_sequence(tmp_path):
+    cfg = config(tmp_path)
+    failure = {
+        "status": "failed", "terminal_reason": "turn-budget-exhausted",
+        "completed_projects": 2,
+        "failed_project_id": DEFAULT_PROPOSALS[2].project_id,
+        "evidence_sha256": "a" * 64,
+    }
+    wave = Phase1Wave(cfg, lambda *_: failure)
+    wave.run()
+    terminal = wave.paths(foundation_cells()[0]).terminal
+    record = json.loads(terminal.read_text())
+    record["failed_project_id"] = DEFAULT_PROPOSALS[3].project_id
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
         wave.resume()
 
 
@@ -204,7 +249,7 @@ def test_foreign_or_conflicting_terminal_record_is_rejected(tmp_path):
 def test_resume_rejects_terminal_from_stale_research_identity(tmp_path, field):
     cfg = config(tmp_path)
     wave = Phase1Wave(
-        cfg, lambda *_: {"status": "passed", "evidence_sha256": "a" * 64}
+        cfg, lambda *_: terminal_outcome()
     )
     wave.run()
     terminal = wave.paths(foundation_cells()[0]).terminal

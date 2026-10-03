@@ -214,7 +214,14 @@ class _RecoveryCandidate:
             if source != recovery.source:
                 raise ValueError("registered runtime recovery starter must run first")
             result = self.backend.run(source, workdir, **options)
-            if not isinstance(result, FailedEvidence) or result.stage not in {"execute", "verify"}:
+            failed_evidence = (
+                isinstance(result, FailedEvidence)
+                and result.stage in {"execute", "verify"}
+            )
+            failed_verification = (
+                isinstance(result, VerifiedResult) and not result.passed
+            )
+            if not (failed_evidence or failed_verification):
                 raise ValueError("runtime recovery starter did not produce its registered failure")
             self.observed = True
             return result
@@ -317,10 +324,26 @@ class LiveComposition:
                      "status": trial.status, "failures": trial.failures}
                 )
                 self.cell_digests[cell.cell_id] = tuple((*digests, failure))
-                return {"status": "failed", "evidence_sha256": failure}
+                return {
+                    "status": "failed",
+                    "terminal_reason": (
+                        "token-budget-exhausted"
+                        if "token budget exhausted" in trial.failures
+                        else "turn-budget-exhausted"
+                    ),
+                    "completed_projects": len(digests),
+                    "failed_project_id": proposal.project_id,
+                    "evidence_sha256": failure,
+                }
             digests.append(trial.memory_entry_sha256)
         self.cell_digests[cell.cell_id] = tuple(digests)
-        return {"status": "passed", "evidence_sha256": canonical_digest(tuple(digests))}
+        return {
+            "status": "passed",
+            "terminal_reason": "completed",
+            "completed_projects": len(digests),
+            "failed_project_id": None,
+            "evidence_sha256": canonical_digest(tuple(digests)),
+        }
 
 
 def model_actor_factory(

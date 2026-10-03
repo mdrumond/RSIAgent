@@ -65,6 +65,7 @@ _KNOWLEDGE_RESULT_LIMIT = 5
 _KNOWLEDGE_TEXT_LIMIT = 2048
 _PROFILE_PAIR_LIMIT = 16
 _PROFILE_NAME_LIMIT = 128
+_MODEL_DIAGNOSTIC_LIMIT = 2048
 
 
 def parse_action(text: str) -> Action:
@@ -196,6 +197,8 @@ class A3TrialLoop:
         )
         actions: list[str] = []
         compile_attempt_id: str | None = None
+        run_attempt_id: str | None = None
+        rewrite_source: str | None = None
         queries = 0
         if tokens > self.budgets.max_tokens:
             failures.append("token budget exhausted")
@@ -206,7 +209,12 @@ class A3TrialLoop:
         for turn in range(consumed_turns + 1, self.budgets.max_turns + 1):
             try:
                 completion = self.actor(
-                    self.profile, self._context(observations, source)
+                    self.profile,
+                    self._context(
+                        observations, source, compilation, verified,
+                        profile_result, rewrite_source, compile_attempt_id,
+                        run_attempt_id,
+                    ),
                 )
             except A3ProviderResponseError as exc:
                 tokens += exc.completion_tokens or 0
@@ -230,11 +238,28 @@ class A3TrialLoop:
                 if completion.provenance.get("profile_sha256") != self.profile.fingerprint:
                     raise ValueError("completion provenance does not match the cell model")
                 action = parse_action(completion.text)
+                state = self._trial_state(
+                    source, compilation, verified, profile_result, rewrite_source,
+                    compile_attempt_id, run_attempt_id,
+                )
+                if action.kind not in self._allowed_action_kinds(state):
+                    raise ValueError(f"{action.kind} is not valid in {state}")
+                if (
+                    action.kind == "write_source"
+                    and rewrite_source is not None
+                    and action.source == rewrite_source
+                ):
+                    raise ValueError(
+                        "candidate source must change after deterministic failure"
+                    )
                 actions.append(action.kind)
                 self._record_action(turn, action)
                 if action.kind == "write_source":
                     source, compilation, verified, profile_result = action.source, None, None, None
                     compile_attempt_id = None
+                    run_attempt_id = None
+                    rewrite_source = None
+                    timing_result = None
                     observations.append("candidate source updated")
                 elif action.kind == "compile":
                     if source is None:
@@ -250,7 +275,9 @@ class A3TrialLoop:
                         execution_profile=self.execution_profile,
                     )
                     if isinstance(compile_result, FailedEvidence):
-                        compile_attempt_id = None
+                        if not self._retryable_failure("compile", compile_result):
+                            compile_attempt_id = None
+                            rewrite_source = source
                         self._retain_candidate_failure(
                             turn, "compile", compile_result, failures, observations
                         )
@@ -259,6 +286,7 @@ class A3TrialLoop:
                         raise TypeError("candidate compiler returned an invalid result")
                     compilation = compile_result
                     compile_attempt_id = None
+                    rewrite_source = None
                     observations.append(self._authoritative_observation(
                         kind="compile",
                         evidence_sha256=compilation.attestation_sha256,
@@ -269,23 +297,36 @@ class A3TrialLoop:
                     if source is None or compilation is None:
                         raise ValueError("successful compile is required before run")
                     verified = profile_result = timing_result = None
+                    if run_attempt_id is None:
+                        run_attempt_id = f"turn-{turn}"
                     result = self.candidate.run(
                         source, self.workdir, request_id=self.cell.cell_id,
-                        attempt_id=f"turn-{turn}", project_id=self.proposal.project_id,
+                        attempt_id=run_attempt_id, project_id=self.proposal.project_id,
                         length=self._length(), padded_length=self._padded_length(),
                         block_count=self._block_count(), seed=0,
                         execution_profile=self.execution_profile,
                     )
                     if isinstance(result, FailedEvidence):
+                        if not self._retryable_failure("run", result):
+                            run_attempt_id = None
+                            rewrite_source = source
                         self._retain_candidate_failure(
                             turn, "run", result, failures, observations
                         )
                         continue
-                    if not isinstance(result, VerifiedResult) or not result.passed:
-                        raise ValueError("host verification did not pass")
+                    if not isinstance(result, VerifiedResult):
+                        raise TypeError("candidate runner returned an invalid result")
+                    run_attempt_id = None
                     if result.source_fingerprint != compilation.plan.source_fingerprint:
                         raise ValueError("candidate source identity changed after compile")
+                    if not result.passed:
+                        rewrite_source = source
+                        self._retain_verification_failure(
+                            turn, result, failures, observations
+                        )
+                        continue
                     verified = result
+                    rewrite_source = None
                     observations.append(self._authoritative_observation(
                         kind="host-verification",
                         evidence_sha256=result.evidence_sha256,
@@ -476,12 +517,92 @@ class A3TrialLoop:
     ) -> None:
         detail = f"{operation} failed: {failure.detail}"
         failures.append(detail)
-        structured = asdict(failure)
-        observations.append({"failed_evidence": structured})
+        observations.append({
+            "candidate_failure": self._compact_failure(
+                stage=failure.stage,
+                error_type=failure.error_type,
+                detail=failure.detail,
+                source_fingerprint=failure.source_fingerprint,
+                execution_id=failure.execution_id,
+                attestation_sha256=failure.attestation_sha256,
+                next_action=(
+                    "retry"
+                    if self._retryable_failure(operation, failure)
+                    else "write_source"
+                ),
+            )
+        })
         self.evidence.append(
             EvidenceKind.FAILURE,
             self._identity({"turn": turn, "failed_evidence": failure}),
         )
+
+    def _retain_verification_failure(
+        self,
+        turn: int,
+        result: VerifiedResult,
+        failures: list[str],
+        observations: list[object],
+    ) -> None:
+        detail = (
+            "host verification failed: "
+            f"exit_code={result.exit_code}, max_abs_error={result.max_abs_error}, "
+            f"tolerance={result.tolerance}"
+        )
+        failures.append(detail)
+        observations.append({
+            "failed_verification": {
+                "diagnostic": detail,
+                "max_abs_error": result.max_abs_error,
+                "tolerance": result.tolerance,
+                "source_fingerprint": result.source_fingerprint,
+                "execution_id": result.execution_id,
+                "evidence_sha256": result.evidence_sha256,
+                "attestation_sha256": result.attestation_sha256,
+                "next_action": "write_source",
+            }
+        })
+        self.evidence.append(
+            EvidenceKind.FAILURE,
+            self._identity({"turn": turn, "failed_verification": result}),
+        )
+
+    @staticmethod
+    def _retryable_failure(operation: str, failure: FailedEvidence) -> bool:
+        return failure.stage == "prepare" or (
+            failure.error_type == "RuntimeError"
+            and (
+                (operation == "compile" and failure.stage == "compile")
+                or (operation == "run" and failure.stage == "execute")
+            )
+        )
+
+    @staticmethod
+    def _compact_failure(
+        *, stage: str, error_type: str, detail: str,
+        source_fingerprint: str, execution_id: str,
+        attestation_sha256: str, next_action: str,
+    ) -> dict[str, object]:
+        lines = [" ".join(line.split()) for line in detail.splitlines()]
+        lines = [line for line in lines if line]
+        preferred = [
+            line for line in lines
+            if "error:" in line.lower() or "fatal:" in line.lower()
+        ]
+        selected = preferred or lines
+        unique = list(dict.fromkeys(selected))
+        normalized = "\n".join(lines)
+        diagnostic = "\n".join(unique)[:_MODEL_DIAGNOSTIC_LIMIT]
+        return {
+            "stage": stage,
+            "error_type": error_type,
+            "diagnostic": diagnostic,
+            "detail_truncated": diagnostic != normalized,
+            "source_fingerprint": source_fingerprint,
+            "execution_id": execution_id,
+            "attestation_sha256": attestation_sha256,
+            "next_action": next_action,
+        }
 
     @staticmethod
     def _authoritative_observation(
@@ -525,6 +646,7 @@ class A3TrialLoop:
             "metric_values": cls._profile_pairs(result.metric_values),
             "timeline": cls._profile_pairs(result.timeline),
             "evidence_sha256": result.evidence_sha256,
+            "source_fingerprint": result.source_fingerprint,
         }}
 
     @classmethod
@@ -536,7 +658,9 @@ class A3TrialLoop:
         return f"raw {result.metric.value}: metrics[{metrics}] timeline[{timeline}]"
 
     @staticmethod
-    def _eligible_submit_supports(observations: list[object]) -> list[str]:
+    def _eligible_submit_supports(
+        observations: list[object], source_fingerprint: str | None,
+    ) -> list[str]:
         supports = []
         for observation in observations:
             if not isinstance(observation, Mapping):
@@ -545,22 +669,78 @@ class A3TrialLoop:
                 evidence = observation.get(key)
                 if not isinstance(evidence, Mapping):
                     continue
+                if evidence.get("source_fingerprint") != source_fingerprint:
+                    continue
                 digest = evidence.get("evidence_sha256")
                 if isinstance(digest, str) and digest not in supports:
                     supports.append(digest)
         return supports
 
-    def _context(self, observations: list[object], source: str | None) -> str:
+    def _trial_state(
+        self, source, compilation, verified, profile_result, rewrite_source,
+        compile_attempt_id=None, run_attempt_id=None,
+    ) -> str:
+        if source is None:
+            return "source-required"
+        if rewrite_source is not None:
+            return "rewrite-required"
+        if not isinstance(compilation, CandidateCompilation):
+            return (
+                "compile-retry" if compile_attempt_id is not None
+                else "compile-required"
+            )
+        if verified is None:
+            return "run-retry" if run_attempt_id is not None else "run-required"
+        if (
+            self.cell.profiling is ProfilingGuidance.WITH_GUIDANCE
+            and profile_result is None
+        ):
+            return "profile-required"
+        return "submit-ready"
+
+    def _allowed_action_kinds(self, state: str) -> tuple[str, ...]:
+        core = {
+            "source-required": ("write_source",),
+            "rewrite-required": ("write_source",),
+            "compile-required": ("compile", "write_source"),
+            "compile-retry": ("compile",),
+            "run-required": ("run", "write_source"),
+            "run-retry": ("run",),
+            "profile-required": ("profile", "write_source"),
+            "submit-ready": ("submit", "write_source"),
+        }[state]
+        if self.cell.knowledge is KnowledgeMode.WITH_KDB:
+            return (*core, "query")
+        return core
+
+    def _context(
+        self, observations: list[object], source: str | None,
+        compilation=None, verified=None, profile_result=None,
+        rewrite_source=None, compile_attempt_id=None, run_attempt_id=None,
+    ) -> str:
+        state = self._trial_state(
+            source, compilation, verified, profile_result, rewrite_source,
+            compile_attempt_id, run_attempt_id,
+        )
+        source_fingerprint = (
+            compilation.plan.source_fingerprint
+            if isinstance(compilation, CandidateCompilation) else None
+        )
+        allowed = self._allowed_action_kinds(state)
         return json.dumps(
             {
                 "action_contract": {
                     "profile_metric": ProfileMetric.PIPE_UTILIZATION.value,
                     "eligible_submit_supports": self._eligible_submit_supports(
-                        observations
+                        observations, source_fingerprint
+                    ),
+                    "trial_state": state,
+                    "required_next_action": (
+                        "write_source" if state == "rewrite-required" else None
                     ),
                 },
                 "allowed_actions": {
-                    kind: sorted(fields) for kind, fields in sorted(_ACTION_FIELDS.items())
+                    kind: sorted(_ACTION_FIELDS[kind]) for kind in sorted(allowed)
                 },
                 "cell": self.cell.as_dict(),
                 "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),

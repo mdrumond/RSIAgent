@@ -33,6 +33,9 @@ def config(tmp_path):
 def outcome(cell, _paths):
     return {
         "status": "passed",
+        "terminal_reason": "completed",
+        "completed_projects": 8,
+        "failed_project_id": None,
         "evidence_sha256": cell.cell_id.removeprefix("a3-cell-") * 4,
     }
 

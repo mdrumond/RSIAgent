@@ -7,6 +7,7 @@ from benchmarks.a3_experiments import KnowledgeMode
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_wave import (
     SMOKE_PROPOSALS,
+    TRIAL_RELIABILITY_SMOKE_PROPOSALS,
     Phase1Config,
     SmokeWave,
     foundation_cells,
@@ -30,7 +31,11 @@ def config(tmp_path):
 
 
 def outcome(*_args):
-    return {"status": "passed", "evidence_sha256": "a" * 64}
+    return {
+        "status": "passed", "terminal_reason": "completed",
+        "completed_projects": 1, "failed_project_id": None,
+        "evidence_sha256": "a" * 64,
+    }
 
 
 def knowledge_identity(seed="a"):
@@ -59,13 +64,50 @@ def test_smoke_paths_and_terminals_are_isolated_from_full_phase1(tmp_path):
     )
     record = wave.run()[0]
     assert wave.paths(cell).root.parent == cfg.state_root / "smoke-cells"
-    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v1"
+    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v2"
+    assert record["terminal_reason"] == "completed"
+    assert record["completed_projects"] == 1
+    assert record["failed_project_id"] is None
     assert record["knowledge_identity"] is None
     assert record["plan_fingerprint"] == canonical_digest(smoke_dry_run())
     assert record["proposal_set_sha256"] == canonical_digest(
         [proposal.as_dict() for proposal in SMOKE_PROPOSALS]
     )
     assert not (cfg.state_root / "cells" / cell.cell_id).exists()
+
+
+def test_runtime_recovery_preflight_and_terminal_share_proposal_identity(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(c for c in foundation_cells() if c.knowledge is KnowledgeMode.WITHOUT_KDB)
+    preflight = cfg.smoke_preflight(
+        {"OPENAI_API_KEY": "secret"}, cells=(cell,),
+        proposals=TRIAL_RELIABILITY_SMOKE_PROPOSALS,
+    )
+    wave = SmokeWave(
+        cfg, outcome, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=TRIAL_RELIABILITY_SMOKE_PROPOSALS,
+    )
+    record = wave.run()[0]
+
+    assert preflight["smoke_plan_fingerprint"] == record["plan_fingerprint"]
+    assert record["plan_fingerprint"] == canonical_digest(
+        smoke_dry_run(TRIAL_RELIABILITY_SMOKE_PROPOSALS)
+    )
+    assert wave.report()["records"] == [record]
+
+
+def test_smoke_terminal_rejects_contradictory_project_progress(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(c for c in foundation_cells() if c.knowledge is KnowledgeMode.WITHOUT_KDB)
+    wave = SmokeWave(cfg, outcome, cells=(cell,), execution_profile="bz-a3-1")
+    wave.run()
+    terminal = wave.paths(cell).terminal
+    record = json.loads(terminal.read_text())
+    record["completed_projects"] = 0
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting|corrupt"):
+        wave.report()
 
 
 def test_no_kdb_smoke_never_authenticates_or_opens_artifacts(tmp_path, monkeypatch):
@@ -320,14 +362,26 @@ def test_smoke_shards_are_deterministic_disjoint_and_use_unique_paths(tmp_path):
     assert first_paths.isdisjoint(second_paths)
 
 
+@pytest.mark.parametrize(
+    ("smoke_project", "proposals"),
+    [
+        ("baseline", SMOKE_PROPOSALS),
+        ("runtime-recovery", TRIAL_RELIABILITY_SMOKE_PROPOSALS),
+    ],
+)
 def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
-    tmp_path, monkeypatch, capsys,
+    tmp_path, monkeypatch, capsys, smoke_project, proposals,
 ):
     import run_a3_phase1
 
     cfg = config(tmp_path)
     cell = next(c for c in foundation_cells() if c.knowledge is KnowledgeMode.WITHOUT_KDB)
     selected = {}
+    original_preflight = Phase1Config.smoke_preflight
+
+    def capture_preflight(self, environ, **kwargs):
+        selected["preflight_proposals"] = tuple(kwargs["proposals"])
+        return original_preflight(self, environ, **kwargs)
 
     class Composition:
         def __init__(self, _cfg, _deps, *, proposals, lineage_prefix):
@@ -337,11 +391,16 @@ def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
             return outcome()
 
     monkeypatch.setattr(run_a3_phase1, "LiveComposition", Composition)
+    monkeypatch.setattr(Phase1Config, "smoke_preflight", capture_preflight)
     monkeypatch.setattr(
         run_a3_phase1, "bz_live_dependencies", lambda *_args, **_kwargs: object()
     )
     monkeypatch.setattr(
         run_a3_phase1, "_bz_preflight", lambda *_args: {"state": "completed"}
+    )
+    monkeypatch.setattr(
+        "benchmarks.a3kernels.phase1_wave.authenticate_smoke_knowledge",
+        lambda *_args: knowledge_identity(),
     )
     credential = (
         "OPENAI_API_KEY" if "openai" in cell.backend_model.value
@@ -354,11 +413,46 @@ def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
         "--profile", "bz-a3-1", "--cpl-remote", "/checked/cpl-remote",
         "--remote-workspace", "/remote/rsi", "--physical-device", "0",
         "--cell-id", cell.cell_id,
+        "--smoke-project", smoke_project,
     ]
     assert run_a3_phase1.main(argv) == 0
     record = json.loads(capsys.readouterr().out)[0]
-    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v1"
+    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v2"
     assert selected == {
-        "proposals": SMOKE_PROPOSALS,
+        "proposals": proposals,
+        "preflight_proposals": proposals,
         "lineage_prefix": "smoke",
     }
+
+
+def test_cli_smoke_preflight_selects_runtime_recovery_identity(
+    tmp_path, monkeypatch, capsys,
+):
+    import run_a3_phase1
+
+    cfg = config(tmp_path)
+    monkeypatch.setattr(
+        run_a3_phase1, "_bz_preflight", lambda *_args: {"state": "completed"}
+    )
+    monkeypatch.setattr(
+        "benchmarks.a3kernels.phase1_wave.authenticate_smoke_knowledge",
+        lambda *_args: knowledge_identity(),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    argv = [
+        "smoke-preflight", "--state-root", str(cfg.state_root),
+        "--validation-wrapper", str(cfg.validation_wrapper),
+        "--embedding-cache", str(cfg.embedding_cache),
+        "--corpus-artifacts", str(cfg.corpus_artifacts),
+        "--knowledge-database", str(cfg.knowledge_database),
+        "--knowledge-manifest", str(cfg.knowledge_manifest),
+        "--profile", "bz-a3-1", "--cpl-remote", "/checked/cpl-remote",
+        "--smoke-project", "runtime-recovery",
+    ]
+
+    assert run_a3_phase1.main(argv) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["smoke_plan_fingerprint"] == canonical_digest(
+        smoke_dry_run(TRIAL_RELIABILITY_SMOKE_PROPOSALS)
+    )

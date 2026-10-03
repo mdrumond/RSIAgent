@@ -200,13 +200,11 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
     actions = [
         json.dumps({"action": "write_source", "source": SOURCE}),
         '{"action":"compile"}', '{"action":"run"}',
-        '{"action":"query","query":"padding","limit":3}',
-        '{"action":"profile","metric":"PipeUtilization"}',
         json.dumps({"action": "submit", "interpretation": "host result passed", "supports": []}),
     ]
     result, prompts, journal = _run(tmp_path, actions)
     assert result.status == "passed" and result.verified.passed
-    assert result.knowledge_queries == 1 and result.profile_result is None
+    assert result.knowledge_queries == 0 and result.profile_result is None
     assert len(journal.read()) == 1
     assert all(_cell().cell_id in prompt and "isolated-lineage" in prompt for prompt in prompts)
     memory = journal.read()[0]["memory"]
@@ -217,10 +215,19 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
         "block_count": 1, "logical_length": 32, "padded_length": 64,
         "profiling_treatment": "without-profiling-guidance",
     }
-    assert first["allowed_actions"]["write_source"] == ["action", "source"]
+    assert first["action_contract"]["trial_state"] == "source-required"
+    assert first["action_contract"]["required_next_action"] is None
+    assert first["allowed_actions"] == {
+        "write_source": ["action", "source"],
+    }
+    assert after_write["action_contract"]["trial_state"] == "compile-required"
+    assert after_write["action_contract"]["required_next_action"] is None
+    assert set(after_write["allowed_actions"]) == {"compile", "write_source"}
     assert first["action_contract"] == {
         "profile_metric": "PipeUtilization",
         "eligible_submit_supports": [],
+        "trial_state": "source-required",
+        "required_next_action": None,
     }
     assert first["current_candidate_source"] is None
     assert after_write["current_candidate_source"] == SOURCE
@@ -294,18 +301,177 @@ def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(
          '{"action":"compile"}', '{"action":"compile"}'],
         candidate=CompileFailure(), budgets=TrialBudgets(3, 2000),
     )
-    observation = json.loads(prompts[2])["observations"][-1]["failed_evidence"]
-    assert observation["stage"] == "compile"
-    assert len(observation["attestation_sha256"]) == 64
+    context = json.loads(prompts[2])
+    observation = context["observations"][-1]["candidate_failure"]
+    assert observation == {
+        "stage": "compile",
+        "error_type": "CompileError",
+        "diagnostic": "fixture",
+        "detail_truncated": False,
+        "source_fingerprint": observation["source_fingerprint"],
+        "execution_id": observation["execution_id"],
+        "attestation_sha256": observation["attestation_sha256"],
+        "next_action": "write_source",
+    }
+    assert all(len(observation[key]) == 64 for key in (
+        "source_fingerprint", "execution_id", "attestation_sha256",
+    ))
+    assert context["action_contract"]["trial_state"] == "rewrite-required"
+    assert context["action_contract"]["required_next_action"] == "write_source"
+    assert set(context["allowed_actions"]) == {"write_source"}
+    assert len(json.dumps(context["observations"][-1])) <= 2048
     failure_entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
     assert observation["attestation_sha256"] in {
         entry.payload["failed_evidence"]["attestation_sha256"]
         for entry in failure_entries if "failed_evidence" in entry.payload
     }
-    assert result.failures[-1] == "compile failed: fixture"
+    assert result.failures == (
+        "compile failed: fixture",
+        "compile is not valid in rewrite-required",
+    )
 
 
-def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path):
+def test_deterministic_failure_requires_changed_source_without_backend_reentry(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class FailOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_calls = []
+
+        def compile(self, source, workdir, **kw):
+            self.compile_calls.append(source)
+            if len(self.compile_calls) == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="compile", error_type="CompileError",
+                    detail=(
+                        "noise one\nERROR: primary failure\n\n"
+                        " error:   primary   failure \nFatal: secondary\n"
+                        + '"\\\n' * 10000
+                    ),
+                )
+            return super().compile(source, workdir, **kw)
+
+    candidate = FailOnce()
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        '{"action":"compile"}',
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=candidate)
+
+    assert result.status == "passed"
+    assert candidate.compile_calls == [SOURCE, replacement]
+    assert "not valid in rewrite-required" in result.failures[1]
+    assert "source must change" in result.failures[2]
+    failed = json.loads(prompts[2])["observations"][-1]["candidate_failure"]
+    assert failed["diagnostic"] == (
+        "ERROR: primary failure\nerror: primary failure\nFatal: secondary"
+    )
+    assert failed["detail_truncated"] is True
+    assert len(failed["diagnostic"]) <= 2048
+    assert json.loads(prompts[2])["action_contract"] == {
+        "eligible_submit_supports": [],
+        "profile_metric": "PipeUtilization",
+        "required_next_action": "write_source",
+        "trial_state": "rewrite-required",
+    }
+
+
+def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class MismatchOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **kw):
+            self.runs += 1
+            if self.runs == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return VerifiedResult.from_receipt(
+                    plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
+                    max_abs_error=3.0,
+                )
+            return super().run(source, workdir, **kw)
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=MismatchOnce())
+
+    assert result.status == "passed"
+    assert "host verification failed" in result.failures[0]
+    context = json.loads(prompts[3])
+    assert context["action_contract"]["trial_state"] == "rewrite-required"
+    failure = context["observations"][-1]["failed_verification"]
+    assert failure["max_abs_error"] == 3.0
+    assert failure["tolerance"] == 1e-5
+    assert failure["next_action"] == "write_source"
+    assert all(len(failure[key]) == 64 for key in (
+        "source_fingerprint", "execution_id", "evidence_sha256",
+        "attestation_sha256",
+    ))
+    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    assert any("failed_verification" in entry.payload for entry in entries)
+
+
+def test_submit_supports_are_only_for_current_source_revision(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    def rewrite_from_context(context):
+        value = json.loads(context)
+        old = value["action_contract"]["eligible_submit_supports"]
+        assert len(old) == 2
+        return json.dumps({"action": "write_source", "source": replacement})
+
+    def submit_current(context):
+        value = json.loads(context)
+        supports = value["action_contract"]["eligible_submit_supports"]
+        assert len(supports) == 2
+        observations = value["observations"]
+        old = next(
+            item["authoritative_evidence"]["evidence_sha256"]
+            for item in observations
+            if isinstance(item, dict) and "authoritative_evidence" in item
+        )
+        assert old not in supports
+        return json.dumps({
+            "action": "submit", "interpretation": "current source only",
+            "supports": supports,
+        })
+
+    result, _, journal = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}', rewrite_from_context,
+        '{"action":"compile"}', '{"action":"run"}', submit_current,
+    ])
+    assert result.status == "passed"
+    assert len(journal.read()[0]["memory"]["agent_interpretations"][0]["supports"]) == 2
+
+
+@pytest.mark.parametrize("pending", ["observation", "prepare", "runtime-evidence"])
+def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pending):
     class PendingOnce(FakeCandidate):
         def __init__(self):
             super().__init__()
@@ -314,15 +480,33 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path):
         def compile(self, source, workdir, **kw):
             self.attempts.append(kw["attempt_id"])
             if len(self.attempts) == 1:
-                raise RuntimeError("observation unavailable; retry retained handle")
+                if pending == "observation":
+                    raise RuntimeError("observation unavailable; retry retained handle")
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan,
+                    stage="prepare" if pending == "prepare" else "compile",
+                    error_type=(
+                        "TransferPending" if pending == "prepare" else "RuntimeError"
+                    ),
+                    detail="retry retained handle",
+                )
             return super().compile(source, workdir, **kw)
 
     candidate = PendingOnce()
-    result, _, _ = _run(
+    result, prompts, _ = _run(
         tmp_path,
         [
             json.dumps({"action": "write_source", "source": SOURCE}),
             '{"action":"compile"}',
+            json.dumps({
+                "action": "write_source",
+                "source": SOURCE.replace(" {}", " { return; }"),
+            }),
             '{"action":"compile"}',
             '{"action":"run"}',
             json.dumps({
@@ -335,6 +519,92 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path):
 
     assert result.status == "passed"
     assert candidate.attempts == ["turn-2", "turn-2"]
+    context = json.loads(prompts[2])
+    assert context["action_contract"]["trial_state"] == "compile-retry"
+    assert context["action_contract"]["required_next_action"] is None
+    assert set(context["allowed_actions"]) == {"compile"}
+    assert result.failures[-1] == "write_source is not valid in compile-retry"
+    if pending != "observation":
+        assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
+
+
+def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
+    class PendingRun(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
+        def run(self, source, workdir, **kw):
+            self.attempts.append(kw["attempt_id"])
+            if len(self.attempts) == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="execute", error_type="RuntimeError",
+                    detail="retained operation observation unavailable",
+                )
+            return super().run(source, workdir, **kw)
+
+    candidate = PendingRun()
+    replacement = SOURCE.replace(" {}", " { return; }")
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=candidate)
+
+    context = json.loads(prompts[3])
+    assert context["action_contract"]["trial_state"] == "run-retry"
+    assert set(context["allowed_actions"]) == {"run"}
+    assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
+    assert candidate.attempts == ["turn-3", "turn-3"]
+    assert result.status == "passed"
+    assert result.failures[-1] == "write_source is not valid in run-retry"
+
+
+def test_verify_runtime_failure_is_deterministic_and_requires_rewrite(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class VerifyFailure(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **kw):
+            self.runs += 1
+            if self.runs == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="verify", error_type="RuntimeError",
+                    detail="terminal verification failure",
+                )
+            return super().run(source, workdir, **kw)
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=VerifyFailure())
+
+    context = json.loads(prompts[3])
+    assert context["action_contract"]["trial_state"] == "rewrite-required"
+    assert context["observations"][-1]["candidate_failure"]["next_action"] == "write_source"
+    assert result.status == "passed"
 
 
 def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
@@ -371,6 +641,7 @@ def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
             "evidence_sha256": result.profile_result.evidence_sha256,
             "metric": "PipeUtilization",
             "metric_values": [["vector_ratio", 0.75]],
+            "source_fingerprint": result.profile_result.source_fingerprint,
             "timeline": [["kernel_count", 20.0]],
         }
     }
@@ -413,6 +684,8 @@ def test_submit_gates_source_identity_verification_and_required_profile(tmp_path
 
 
 def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):
+    second_source = SOURCE.replace(" {}", " { return; }")
+    third_source = SOURCE.replace(" {}", " { uint32_t unused = count; }")
     class FailSecondCompile(FakeCandidate):
         def __init__(self):
             super().__init__()
@@ -439,11 +712,13 @@ def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_pat
             json.dumps({"action": "write_source", "source": SOURCE}),
             '{"action":"compile"}',
             '{"action":"run"}',
+            json.dumps({"action": "write_source", "source": second_source}),
             '{"action":"compile"}',
             json.dumps({
                 "action": "submit", "interpretation": "stale result",
                 "supports": [],
             }),
+            json.dumps({"action": "write_source", "source": third_source}),
             '{"action":"compile"}',
             '{"action":"run"}',
             json.dumps({
@@ -456,7 +731,7 @@ def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_pat
 
     assert result.status == "passed"
     assert any("ordinary recompile failure" in failure for failure in result.failures)
-    assert any("host verification" in failure for failure in result.failures)
+    assert any("submit is not valid in rewrite-required" == failure for failure in result.failures)
     assert len(journal.read()) == 1
 
 
