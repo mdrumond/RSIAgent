@@ -22,6 +22,7 @@ _EXPECTED_BUILD = {
     "source": "kernel.cpp",
     "target": "Ascend910B4",
 }
+_CANDIDATE_SOURCE_SLOT = "// RSI_A3_CANDIDATE_SOURCE_SLOT"
 
 
 def _toolchain_paths(torch, torch_npu):
@@ -34,13 +35,20 @@ def _toolchain_paths(torch, torch_npu):
     ), (torch_root / "lib", npu_root / "lib")
 
 
+def _assemble_source(candidate: str, wrapper: str) -> str:
+    if wrapper.count(_CANDIDATE_SOURCE_SLOT) != 1:
+        raise RuntimeError("host wrapper must contain exactly one candidate source slot")
+    return wrapper.replace(_CANDIDATE_SOURCE_SLOT, candidate)
+
+
 def _compile(root: Path, spec: dict, torch, torch_npu) -> Path:
     compiler = shutil.which(spec["compiler"])
     if compiler is None:
         raise RuntimeError("bisheng compiler not found on PATH")
-    combined = (root / "candidate.cpp").read_text(encoding="utf-8") + "\n" + (
-        root / "host_wrapper.inc"
-    ).read_text(encoding="utf-8")
+    combined = _assemble_source(
+        (root / "candidate.cpp").read_text(encoding="utf-8"),
+        (root / "host_wrapper.inc").read_text(encoding="utf-8"),
+    )
     source = root / spec["source"]
     source.write_text(combined, encoding="utf-8")
     output = root / spec["output"]

@@ -5,6 +5,8 @@
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 
+// RSI_A3_CANDIDATE_SOURCE_SLOT
+
 namespace rsi_a3candidate_host {
 torch::Tensor VectorAdd(const torch::Tensor &a, const torch::Tensor &b,
                         int64_t logical_length, int64_t padded_length,
