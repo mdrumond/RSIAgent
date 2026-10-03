@@ -7,6 +7,7 @@ import pytest
 from benchmarks.a3_experiments import BackendModel, KnowledgeMode
 from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config, Phase1Wave, foundation_cells, full_dry_run,
 )
@@ -207,6 +208,38 @@ def test_foreign_or_conflicting_terminal_record_is_rejected(tmp_path):
     paths = wave.paths(first); paths.root.mkdir(parents=True)
     paths.terminal.write_text(json.dumps({"cell_id": first.cell_id, "target": "a5", "language": "catlass-dsl", "status": "passed", "evidence_sha256": "a" * 64}))
     with pytest.raises(ValueError, match="foreign"):
+        wave.resume()
+
+
+def test_full_terminal_rejects_contradictory_project_progress(tmp_path):
+    cfg = config(tmp_path)
+    wave = Phase1Wave(cfg, lambda *_: terminal_outcome())
+    wave.run()
+    terminal = wave.paths(foundation_cells()[0]).terminal
+    record = json.loads(terminal.read_text())
+    record["completed_projects"] = 7
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        wave.report()
+
+
+def test_full_terminal_rejects_failed_project_out_of_sequence(tmp_path):
+    cfg = config(tmp_path)
+    failure = {
+        "status": "failed", "terminal_reason": "turn-budget-exhausted",
+        "completed_projects": 2,
+        "failed_project_id": DEFAULT_PROPOSALS[2].project_id,
+        "evidence_sha256": "a" * 64,
+    }
+    wave = Phase1Wave(cfg, lambda *_: failure)
+    wave.run()
+    terminal = wave.paths(foundation_cells()[0]).terminal
+    record = json.loads(terminal.read_text())
+    record["failed_project_id"] = DEFAULT_PROPOSALS[3].project_id
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
         wave.resume()
 
 

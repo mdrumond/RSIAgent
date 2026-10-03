@@ -56,11 +56,23 @@ TRIAL_RELIABILITY_SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[3],)
 _SMOKE_QUERY = "A3 Ascend C vector addition tensor movement"
 
 
+def _validated_proposals(
+    proposals: Sequence[CurriculumProposal],
+) -> tuple[CurriculumProposal, ...]:
+    selected = tuple(proposals)
+    if not selected or any(item not in DEFAULT_PROPOSALS for item in selected):
+        raise ValueError("wave proposals must be registered Phase 1 projects")
+    canonical = tuple(item for item in DEFAULT_PROPOSALS if item in selected)
+    if selected != canonical:
+        raise ValueError("wave proposals must use canonical registry order")
+    return selected
+
+
 def smoke_dry_run(
     proposals: Sequence[CurriculumProposal] = SMOKE_PROPOSALS,
 ) -> dict[str, object]:
-    selected = tuple(proposals)
-    if len(selected) != 1 or selected[0] not in DEFAULT_PROPOSALS:
+    selected = _validated_proposals(proposals)
+    if len(selected) != 1:
         raise ValueError("smoke requires one registered Phase 1 project")
     body = {
         "schema": "a3-ascendc-foundation-smoke-plan-v1",
@@ -251,15 +263,19 @@ class Phase1Config:
         environ: Mapping[str, str],
         *,
         cells: Sequence[A3ExperimentCell] | None = None,
+        proposals: Sequence[CurriculumProposal] = SMOKE_PROPOSALS,
     ) -> dict[str, object]:
         selected = foundation_cells() if cells is None else tuple(cells)
+        selected_proposals = _validated_proposals(proposals)
         report = self.preflight(environ, cells=selected)
         knowledge_identity = None
         if any(cell.knowledge is KnowledgeMode.WITH_KDB for cell in selected):
             knowledge_identity = authenticate_smoke_knowledge(self)
         return {
             **report,
-            "smoke_plan_fingerprint": canonical_digest(smoke_dry_run()),
+            "smoke_plan_fingerprint": canonical_digest(
+                smoke_dry_run(selected_proposals)
+            ),
             "knowledge_identity": knowledge_identity,
         }
 
@@ -275,6 +291,7 @@ class Phase1Wave:
         *,
         cells: Sequence[A3ExperimentCell] | None = None,
         execution_profile: str = "gz-a3",
+        proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
     ) -> None:
         self.config = config
         self.executor = executor
@@ -286,6 +303,7 @@ class Phase1Wave:
         if execution_profile not in A3_EXECUTION_PROFILES:
             raise ValueError("Phase 1 wave execution profile is invalid")
         self.execution_profile = execution_profile
+        self.proposals = _validated_proposals(proposals)
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
         root = self.config.state_root / "cells" / cell.cell_id
@@ -300,14 +318,17 @@ class Phase1Wave:
         for cell in self.cells:
             paths = self.paths(cell)
             retained = self._read_terminal(
-                cell, paths.terminal, execution_profile=self.execution_profile
+                cell, paths.terminal, execution_profile=self.execution_profile,
+                proposals=self.proposals,
             )
             if retained is not None:
                 records.append(retained)
                 continue
             self._stage(paths)
             outcome = dict(self.executor(cell, paths))
-            record = self._terminal(cell, outcome, self.execution_profile)
+            record = self._terminal(
+                cell, outcome, self.execution_profile, self.proposals
+            )
             self._publish(paths.terminal, record)
             records.append(record)
         return tuple(records)
@@ -318,7 +339,9 @@ class Phase1Wave:
     def report(self) -> dict[str, object]:
         records = []
         for cell in foundation_cells():
-            record = self._read_terminal(cell, self.paths(cell).terminal)
+            record = self._read_terminal(
+                cell, self.paths(cell).terminal, proposals=self.proposals
+            )
             if record is not None:
                 records.append(record)
         counts: dict[str, int] = {}
@@ -342,7 +365,9 @@ class Phase1Wave:
         cell: A3ExperimentCell,
         outcome: Mapping[str, object],
         execution_profile: str,
+        proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
     ) -> dict[str, object]:
+        selected_proposals = _validated_proposals(proposals)
         if set(outcome) != {
             "status", "terminal_reason", "completed_projects", "failed_project_id",
             "evidence_sha256",
@@ -362,13 +387,20 @@ class Phase1Wave:
         ):
             raise ValueError("executor terminal progress is invalid")
         failed_project_id = outcome["failed_project_id"]
+        completed_projects = outcome["completed_projects"]
         if outcome["status"] == "passed":
-            if outcome["terminal_reason"] != "completed" or failed_project_id is not None:
+            if (
+                outcome["terminal_reason"] != "completed"
+                or failed_project_id is not None
+                or completed_projects != len(selected_proposals)
+            ):
                 raise ValueError("passed executor terminal is inconsistent")
         elif (
             outcome["terminal_reason"] == "completed"
             or type(failed_project_id) is not str
             or _SHA.fullmatch(failed_project_id) is None
+            or completed_projects >= len(selected_proposals)
+            or failed_project_id != selected_proposals[completed_projects].project_id
         ):
             raise ValueError("failed executor terminal is inconsistent")
         return {
@@ -406,6 +438,7 @@ class Phase1Wave:
         path: Path,
         *,
         execution_profile: str | None = None,
+        proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
     ) -> dict[str, object] | None:
         if not path.exists():
             return None
@@ -428,6 +461,7 @@ class Phase1Wave:
                     )
                 },
                 execution_profile,
+                proposals,
             )
         except ValueError as exc:
             raise ValueError(
@@ -452,12 +486,12 @@ class SmokeWave(Phase1Wave):
         proposals: Sequence[CurriculumProposal] = SMOKE_PROPOSALS,
     ) -> None:
         super().__init__(
-            config, executor, cells=cells, execution_profile=execution_profile
+            config, executor, cells=cells, execution_profile=execution_profile,
+            proposals=proposals,
         )
         if execution_profile not in _BZ_A3_EXECUTION_PROFILES:
             raise ValueError("smoke gate requires a BZ-A3 execution profile")
         self._knowledge_identity = _validated_knowledge_identity(knowledge_identity)
-        self.proposals = tuple(proposals)
         smoke_dry_run(self.proposals)
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
@@ -584,6 +618,7 @@ class SmokeWave(Phase1Wave):
                     )
                 },
                 str(value.get("execution_profile")),
+                self.proposals,
             )
         except ValueError as exc:
             raise ValueError("smoke terminal cell record is corrupt") from exc
@@ -601,7 +636,9 @@ class SmokeWave(Phase1Wave):
         outcome: Mapping[str, object],
         identity: Mapping[str, object],
     ) -> dict[str, object]:
-        Phase1Wave._terminal(cell, outcome, self.execution_profile)
+        Phase1Wave._terminal(
+            cell, outcome, self.execution_profile, self.proposals
+        )
         return {
             "schema": "a3-phase1-smoke-cell-terminal-v2",
             "cell_id": cell.cell_id,

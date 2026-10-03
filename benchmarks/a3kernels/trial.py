@@ -275,7 +275,7 @@ class A3TrialLoop:
                         execution_profile=self.execution_profile,
                     )
                     if isinstance(compile_result, FailedEvidence):
-                        if compile_result.stage != "prepare":
+                        if not self._retryable_failure("compile", compile_result):
                             compile_attempt_id = None
                             rewrite_source = source
                         self._retain_candidate_failure(
@@ -307,7 +307,7 @@ class A3TrialLoop:
                         execution_profile=self.execution_profile,
                     )
                     if isinstance(result, FailedEvidence):
-                        if result.stage != "prepare":
+                        if not self._retryable_failure("run", result):
                             run_attempt_id = None
                             rewrite_source = source
                         self._retain_candidate_failure(
@@ -526,7 +526,9 @@ class A3TrialLoop:
                 execution_id=failure.execution_id,
                 attestation_sha256=failure.attestation_sha256,
                 next_action=(
-                    "retry" if failure.stage == "prepare" else "write_source"
+                    "retry"
+                    if self._retryable_failure(operation, failure)
+                    else "write_source"
                 ),
             )
         })
@@ -563,6 +565,16 @@ class A3TrialLoop:
         self.evidence.append(
             EvidenceKind.FAILURE,
             self._identity({"turn": turn, "failed_verification": result}),
+        )
+
+    @staticmethod
+    def _retryable_failure(operation: str, failure: FailedEvidence) -> bool:
+        return failure.stage == "prepare" or (
+            failure.error_type == "RuntimeError"
+            and (
+                (operation == "compile" and failure.stage == "compile")
+                or (operation == "run" and failure.stage == "execute")
+            )
         )
 
     @staticmethod
@@ -691,9 +703,9 @@ class A3TrialLoop:
             "source-required": ("write_source",),
             "rewrite-required": ("write_source",),
             "compile-required": ("compile", "write_source"),
-            "compile-retry": ("compile", "write_source"),
+            "compile-retry": ("compile",),
             "run-required": ("run", "write_source"),
-            "run-retry": ("run", "write_source"),
+            "run-retry": ("run",),
             "profile-required": ("profile", "write_source"),
             "submit-ready": ("submit", "write_source"),
         }[state]

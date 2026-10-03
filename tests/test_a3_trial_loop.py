@@ -470,7 +470,7 @@ def test_submit_supports_are_only_for_current_source_revision(tmp_path):
     assert len(journal.read()[0]["memory"]["agent_interpretations"][0]["supports"]) == 2
 
 
-@pytest.mark.parametrize("pending", ["observation", "prepare"])
+@pytest.mark.parametrize("pending", ["observation", "prepare", "runtime-evidence"])
 def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pending):
     class PendingOnce(FakeCandidate):
         def __init__(self):
@@ -488,7 +488,11 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
                     kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
                 )
                 return FailedEvidence.create(
-                    plan, stage="prepare", error_type="TransferPending",
+                    plan,
+                    stage="prepare" if pending == "prepare" else "compile",
+                    error_type=(
+                        "TransferPending" if pending == "prepare" else "RuntimeError"
+                    ),
                     detail="retry retained handle",
                 )
             return super().compile(source, workdir, **kw)
@@ -499,6 +503,10 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
         [
             json.dumps({"action": "write_source", "source": SOURCE}),
             '{"action":"compile"}',
+            json.dumps({
+                "action": "write_source",
+                "source": SOURCE.replace(" {}", " { return; }"),
+            }),
             '{"action":"compile"}',
             '{"action":"run"}',
             json.dumps({
@@ -514,6 +522,89 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
     context = json.loads(prompts[2])
     assert context["action_contract"]["trial_state"] == "compile-retry"
     assert context["action_contract"]["required_next_action"] is None
+    assert set(context["allowed_actions"]) == {"compile"}
+    assert result.failures[-1] == "write_source is not valid in compile-retry"
+    if pending != "observation":
+        assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
+
+
+def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
+    class PendingRun(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
+        def run(self, source, workdir, **kw):
+            self.attempts.append(kw["attempt_id"])
+            if len(self.attempts) == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="execute", error_type="RuntimeError",
+                    detail="retained operation observation unavailable",
+                )
+            return super().run(source, workdir, **kw)
+
+    candidate = PendingRun()
+    replacement = SOURCE.replace(" {}", " { return; }")
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=candidate)
+
+    context = json.loads(prompts[3])
+    assert context["action_contract"]["trial_state"] == "run-retry"
+    assert set(context["allowed_actions"]) == {"run"}
+    assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
+    assert candidate.attempts == ["turn-3", "turn-3"]
+    assert result.status == "passed"
+    assert result.failures[-1] == "write_source is not valid in run-retry"
+
+
+def test_verify_runtime_failure_is_deterministic_and_requires_rewrite(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class VerifyFailure(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **kw):
+            self.runs += 1
+            if self.runs == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="verify", error_type="RuntimeError",
+                    detail="terminal verification failure",
+                )
+            return super().run(source, workdir, **kw)
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=VerifyFailure())
+
+    context = json.loads(prompts[3])
+    assert context["action_contract"]["trial_state"] == "rewrite-required"
+    assert context["observations"][-1]["candidate_failure"]["next_action"] == "write_source"
+    assert result.status == "passed"
 
 
 def test_enabled_kdb_and_profile_are_exactly_cell_bound(tmp_path):
