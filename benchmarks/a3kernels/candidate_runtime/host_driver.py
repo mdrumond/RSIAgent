@@ -123,9 +123,11 @@ def _canonical_output(values, *, logical: int, padded: int) -> list[float]:
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not math.isfinite(value)
-        for value in values
+        for value in values[:logical]
     ):
-        raise RuntimeError("candidate output must contain finite numeric values")
+        raise RuntimeError(
+            "candidate logical output must contain finite numeric values"
+        )
     # Padding is allocation-only. Numerical verification owns the logical
     # values, while the emitted padded region has one canonical representation.
     return [float(value) for value in values[:logical]] + [0.0] * (

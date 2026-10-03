@@ -607,14 +607,24 @@ def test_fixed_driver_preserves_finite_wrong_logical_output_for_host_scoring():
     [
         ([1.0], "padded shape"),
         ([1.0, 2.0, 3.0], "padded shape"),
-        ([1.0, float("nan")], "finite numeric"),
-        ([1.0, float("inf")], "finite numeric"),
-        ([1.0, "bad"], "finite numeric"),
+        ([float("nan"), 2.0], "finite numeric"),
+        ([float("inf"), 2.0], "finite numeric"),
+        (["bad", 2.0], "finite numeric"),
     ],
 )
-def test_fixed_driver_rejects_wrong_shape_or_nonfinite_output(values, message):
+def test_fixed_driver_rejects_wrong_shape_or_invalid_logical_output(values, message):
     with pytest.raises(RuntimeError, match=message):
         host_driver._canonical_output(values, logical=1, padded=2)
+
+
+def test_fixed_driver_ignores_and_zeroes_arbitrary_padding():
+    values = host_driver._canonical_output(
+        [1.25, float("nan"), float("inf"), "not-a-number"],
+        logical=1,
+        padded=4,
+    )
+
+    assert values == [1.25, 0.0, 0.0, 0.0]
 
 
 def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tmp_path):
