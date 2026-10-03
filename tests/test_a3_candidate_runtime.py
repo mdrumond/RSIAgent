@@ -58,6 +58,11 @@ extern "C" __global__ __aicore__ void vector_add(
 }
 '''
 
+NAMESPACE_SOURCE = SOURCE.replace(
+    '#include "kernel_operator.h"\n',
+    '#include "kernel_operator.h"\nusing namespace AscendC;\n',
+)
+
 
 def _output(cwd: Path) -> list[float]:
     payload = json.loads((cwd / "input.json").read_text())
@@ -453,7 +458,9 @@ def test_fixed_driver_compiles_dav_2201_without_a_shell(monkeypatch, tmp_path):
     })
     fake_npu = type("Npu", (), {"__file__": str(npu_root / "__init__.py")})
     (tmp_path / "candidate.cpp").write_text(SOURCE)
-    (tmp_path / "host_wrapper.inc").write_text("// fixed wrapper")
+    (tmp_path / "host_wrapper.inc").write_text(
+        "// RSI_A3_CANDIDATE_SOURCE_SLOT\n// fixed wrapper"
+    )
     calls = []
     monkeypatch.setattr(host_driver.shutil, "which", lambda _name: "/cann/bin/bisheng")
 
@@ -472,6 +479,64 @@ def test_fixed_driver_compiles_dav_2201_without_a_shell(monkeypatch, tmp_path):
         "-shared", "-fPIC", "-std=c++17",
     )
     assert not any(value in {"bash", "sh", "-c"} for value in calls[0])
+
+
+def test_host_source_orders_headers_before_namespace_candidate_before_registration():
+    validate_candidate_source(NAMESPACE_SOURCE)
+    wrapper = Path(host_driver.__file__).with_name("host_wrapper.inc").read_text()
+
+    source = host_driver._assemble_source(NAMESPACE_SOURCE, wrapper)
+
+    assert source.count(NAMESPACE_SOURCE) == 1
+    assert source.count('#line 1 "candidate.cpp"') == 1
+    assert '#line 1 "candidate.cpp"\n' + NAMESPACE_SOURCE in source
+    assert "RSI_A3_CANDIDATE_SOURCE_SLOT" not in source
+    assert source.index("#include <torch/all.h>") < source.index("using namespace AscendC")
+    assert source.index("using namespace AscendC") < source.index(
+        "TORCH_LIBRARY(rsi_a3candidates"
+    )
+
+
+@pytest.mark.parametrize("prefix", ["", "// preamble\n", "// first\n\n// third\n"])
+@pytest.mark.parametrize(
+    "candidate",
+    [
+        "CANDIDATE_LINE_1\nCANDIDATE_LINE_2",
+        "CANDIDATE_LINE_1\nCANDIDATE_LINE_2\n",
+    ],
+)
+def test_host_source_resets_wrapper_mapping_after_movable_slot(prefix, candidate):
+    wrapper = (
+        prefix
+        + "// RSI_A3_CANDIDATE_SOURCE_SLOT\n"
+        + "HOST_BODY\n"
+    )
+    next_wrapper_line = prefix.count("\n") + 2
+
+    source = host_driver._assemble_source(candidate, wrapper)
+
+    mapped = (
+        '#line 1 "candidate.cpp"\n'
+        + candidate
+        + ("" if candidate.endswith("\n") else "\n")
+        + f'#line {next_wrapper_line} "host_wrapper.inc"\nHOST_BODY\n'
+    )
+    assert mapped in source
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    [
+        "#include <torch/all.h>\n",
+        (
+            "// RSI_A3_CANDIDATE_SOURCE_SLOT\n"
+            "// RSI_A3_CANDIDATE_SOURCE_SLOT\n"
+        ),
+    ],
+)
+def test_host_source_requires_exactly_one_candidate_slot(wrapper):
+    with pytest.raises(RuntimeError, match="exactly one candidate source slot"):
+        host_driver._assemble_source(SOURCE, wrapper)
 
 
 @pytest.mark.parametrize("logical,padded", [(16, 64), (400, 448)])
