@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a3_experiments import KnowledgeMode
+from benchmarks.a3_experiments import BackendModel, KnowledgeMode
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import (
@@ -48,6 +48,20 @@ def knowledge_identity(seed="a"):
         "knowledge_collection_sha256": "d" * 64,
         "knowledge_probe_sha256": "e" * 64,
     }
+
+
+def trial_protocol_sha256(openai_turns=24):
+    return canonical_digest({
+        "schema": "a3-trial-protocol-v1",
+        "model_budgets": {
+            BackendModel.GPT_5_6_SOL.value: {
+                "max_turns": openai_turns, "max_tokens": 32768,
+            },
+            BackendModel.DEEPSEEK_FLASH.value: {
+                "max_turns": 24, "max_tokens": 65536,
+            },
+        },
+    })
 
 
 def test_smoke_plan_is_one_registered_baseline_and_not_phase1_plan():
@@ -100,6 +114,8 @@ def test_runtime_recovery_preflight_and_terminal_share_proposal_identity(tmp_pat
     record = wave.run()[0]
 
     assert preflight["smoke_plan_fingerprint"] == record["plan_fingerprint"]
+    assert preflight["trial_protocol_sha256"] == record["trial_protocol_sha256"]
+    assert record["trial_protocol_sha256"] == trial_protocol_sha256()
     assert record["plan_fingerprint"] == canonical_digest(
         smoke_dry_run(TRIAL_RELIABILITY_SMOKE_PROPOSALS)
     )
@@ -308,6 +324,25 @@ def test_smoke_resume_rejects_changed_bound_identity(tmp_path, monkeypatch, fiel
         knowledge_identity("f") if field == "knowledge_identity" else "f" * 64
     )
     terminal.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        wave.resume()
+
+
+def test_smoke_resume_rejects_retained_twelve_turn_trial_protocol(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        c for c in foundation_cells()
+        if c.knowledge is KnowledgeMode.WITHOUT_KDB
+    )
+    wave = SmokeWave(
+        cfg, outcome, cells=(cell,), execution_profile="bz-a3-1"
+    )
+    wave.run()
+    terminal = wave.paths(cell).terminal
+    record = json.loads(terminal.read_text())
+    record["trial_protocol_sha256"] = trial_protocol_sha256(12)
+    terminal.write_text(json.dumps(record))
+
     with pytest.raises(ValueError, match="foreign|conflicting"):
         wave.resume()
 

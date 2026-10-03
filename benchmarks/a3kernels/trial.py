@@ -111,7 +111,7 @@ def parse_action(text: str) -> Action:
 
 @dataclass(frozen=True)
 class TrialBudgets:
-    max_turns: int = 12
+    max_turns: int = 24
     max_tokens: int = 32768
 
     def __post_init__(self) -> None:

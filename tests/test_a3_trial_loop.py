@@ -1097,6 +1097,11 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
         assert build_loop(model, budgets=override).budgets is override
 
 
+def test_public_no_arg_trial_budget_matches_the_openai_registered_default():
+    assert TrialBudgets() == TrialBudgets.for_model(BackendModel.GPT_5_6_SOL)
+    assert TrialBudgets() == TrialBudgets(24, 32768)
+
+
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
     cell = _cell(model=BackendModel.DEEPSEEK_FLASH)
 
