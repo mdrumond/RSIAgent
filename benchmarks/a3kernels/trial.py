@@ -708,11 +708,7 @@ class A3TrialLoop:
             "run-required": ("run",),
             "run-retry": ("run",),
             "profile-required": ("profile",),
-            "submit-ready": (
-                ("submit", "write_source")
-                if self.cell.profiling is ProfilingGuidance.WITH_GUIDANCE
-                else ("submit",)
-            ),
+            "submit-ready": ("submit", "write_source"),
         }[state]
         if self.cell.knowledge is KnowledgeMode.WITH_KDB:
             return (*core, "query")
@@ -765,18 +761,12 @@ class A3TrialLoop:
         )
 
     def _required_next_action(self, state: str) -> str | None:
-        required = {
+        return {
             "rewrite-required": "write_source",
             "compile-required": "compile",
             "run-required": "run",
             "profile-required": "profile",
         }.get(state)
-        if (
-            state == "submit-ready"
-            and self.cell.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
-        ):
-            return "submit"
-        return required
 
 
 __all__ = ["A3TrialLoop", "Action", "TrialBudgets", "TrialResult", "parse_action"]

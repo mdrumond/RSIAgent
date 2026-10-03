@@ -515,29 +515,42 @@ def test_guided_candidate_requires_profile_then_allows_optimization_rewrite(tmp_
     assert result.failures == ("write_source is not valid in profile-required",)
 
 
-def test_unguided_verified_candidate_requires_submit(tmp_path):
+@pytest.mark.parametrize(
+    "guidance",
+    [ProfilingGuidance.WITHOUT_GUIDANCE, ProfilingGuidance.WITH_GUIDANCE],
+)
+def test_submit_ready_allows_equal_revision_opportunity(tmp_path, guidance):
     replacement = SOURCE.replace(" {}", " { return; }")
     candidate = FakeCandidate()
-
-    result, prompts, _ = _run(tmp_path, [
+    cell = _cell(profiling=guidance)
+    actions = [
         json.dumps({"action": "write_source", "source": SOURCE}),
         '{"action":"compile"}', '{"action":"run"}',
+    ]
+    if guidance is ProfilingGuidance.WITH_GUIDANCE:
+        actions.append('{"action":"profile","metric":"PipeUtilization"}')
+    post_evidence_turn = len(actions)
+    actions.extend([
         json.dumps({"action": "write_source", "source": replacement}),
-        json.dumps({
-            "action": "submit", "interpretation": "host facts", "supports": [],
-        }),
         '{"action":"compile"}', '{"action":"run"}',
+    ])
+    if guidance is ProfilingGuidance.WITH_GUIDANCE:
+        actions.append('{"action":"profile","metric":"PipeUtilization"}')
+    actions.append(
         json.dumps({
-            "action": "submit", "interpretation": "fallback", "supports": [],
-        }),
-    ], candidate=candidate)
+            "action": "submit", "interpretation": "revised", "supports": [],
+        })
+    )
+    result, prompts, _ = _run(
+        tmp_path, actions, cell=cell, candidate=candidate,
+    )
 
-    assert result.status == "passed" and result.turns == 5
-    assert candidate.source == SOURCE
-    submit_ready = json.loads(prompts[3])
-    assert submit_ready["action_contract"]["required_next_action"] == "submit"
-    assert set(submit_ready["allowed_actions"]) == {"submit"}
-    assert result.failures == ("write_source is not valid in submit-ready",)
+    assert result.status == "passed"
+    assert candidate.source == replacement
+    submit_ready = json.loads(prompts[post_evidence_turn])
+    assert submit_ready["action_contract"]["required_next_action"] is None
+    assert set(submit_ready["allowed_actions"]) == {"submit", "write_source"}
+    assert result.failures == ()
 
 
 def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
