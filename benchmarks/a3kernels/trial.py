@@ -127,8 +127,9 @@ class TrialBudgets:
     def for_model(cls, model: BackendModel) -> "TrialBudgets":
         if not isinstance(model, BackendModel):
             raise TypeError("default trial budgets require a registered backend model")
-        max_tokens = 65536 if model is BackendModel.DEEPSEEK_FLASH else 32768
-        return cls(max_tokens=max_tokens)
+        if model is BackendModel.DEEPSEEK_FLASH:
+            return cls(max_turns=24, max_tokens=65536)
+        return cls(max_turns=12, max_tokens=32768)
 
 
 @dataclass(frozen=True)
