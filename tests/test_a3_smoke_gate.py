@@ -50,8 +50,8 @@ def knowledge_identity(seed="a"):
     }
 
 
-def trial_protocol_sha256(openai_turns=24):
-    return canonical_digest({
+def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
+    value = {
         "schema": "a3-trial-protocol-v1",
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
@@ -61,7 +61,10 @@ def trial_protocol_sha256(openai_turns=24):
                 "max_turns": 24, "max_tokens": 65536,
             },
         },
-    })
+    }
+    if mismatch_feedback:
+        value["verification_feedback_schema"] = "a3-verification-mismatch-v1"
+    return canonical_digest(value)
 
 
 def test_smoke_plan_is_one_registered_baseline_and_not_phase1_plan():
@@ -341,6 +344,25 @@ def test_smoke_resume_rejects_retained_twelve_turn_trial_protocol(tmp_path):
     terminal = wave.paths(cell).terminal
     record = json.loads(terminal.read_text())
     record["trial_protocol_sha256"] = trial_protocol_sha256(12)
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        wave.resume()
+
+
+def test_smoke_resume_rejects_protocol_without_mismatch_feedback(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        c for c in foundation_cells()
+        if c.knowledge is KnowledgeMode.WITHOUT_KDB
+    )
+    wave = SmokeWave(cfg, outcome, cells=(cell,), execution_profile="bz-a3-1")
+    wave.run()
+    terminal = wave.paths(cell).terminal
+    record = json.loads(terminal.read_text())
+    record["trial_protocol_sha256"] = trial_protocol_sha256(
+        mismatch_feedback=False
+    )
     terminal.write_text(json.dumps(record))
 
     with pytest.raises(ValueError, match="foreign|conflicting"):

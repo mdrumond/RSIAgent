@@ -146,6 +146,11 @@ def test_bz_flow_returns_bounded_failed_verification_for_wrong_finite_output(tmp
     assert result.passed is False
     assert result.max_abs_error == pytest.approx(expected_error)
     assert result.max_abs_error is not None
+    assert result.mismatch.logical_index == max(
+        range(plan.logical_length),
+        key=lambda index: abs(plan.input_a[index] + plan.input_b[index]),
+    )
+    assert result.mismatch.absolute_error == pytest.approx(expected_error)
     assert result.job_handle == "bz-a3-1:execute-wrong"
 
 

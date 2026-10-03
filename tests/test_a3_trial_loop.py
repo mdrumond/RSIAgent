@@ -18,7 +18,9 @@ from benchmarks.a3kernels.candidate import (
 from benchmarks.a3kernels.knowledge_agent import (
     Citation, KnowledgeQuery, KnowledgeResult,
 )
-from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a3kernels.phase1_evidence import (
+    EvidenceKind, EvidenceLedger, canonical_digest,
+)
 from benchmarks.a3kernels.phase1_memory import (
     AuthoritativeEvidence, Phase1LearningJournal,
 )
@@ -614,6 +616,23 @@ def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
     assert failure["max_abs_error"] == 3.0
     assert failure["tolerance"] == 1e-5
     assert failure["next_action"] == "write_source"
+    assert failure["mismatch"] == {
+        "logical_index": 0,
+        "input_a": 1.0,
+        "input_b": 2.0,
+        "actual": 0.0,
+        "expected": 3.0,
+        "absolute_error": 3.0,
+    }
+    assert set(failure) == {
+        "diagnostic", "max_abs_error", "tolerance", "mismatch",
+        "source_fingerprint", "execution_id", "evidence_sha256",
+        "attestation_sha256", "next_action",
+    }
+    assert not any(
+        term in json.dumps(failure).lower()
+        for term in ("datacopy", "setflag", "waitflag", "queue", "query")
+    )
     assert all(len(failure[key]) == 64 for key in (
         "source_fingerprint", "execution_id", "evidence_sha256",
         "attestation_sha256",
@@ -1122,6 +1141,22 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
 def test_public_no_arg_trial_budget_matches_the_openai_registered_default():
     assert TrialBudgets() == TrialBudgets.for_model(BackendModel.GPT_5_6_SOL)
     assert TrialBudgets() == TrialBudgets(24, 32768)
+
+
+def test_trial_protocol_versions_structured_mismatch_feedback():
+    legacy = canonical_digest({
+        "schema": "a3-trial-protocol-v1",
+        "model_budgets": {
+            BackendModel.GPT_5_6_SOL.value: {
+                "max_turns": 24, "max_tokens": 32768,
+            },
+            BackendModel.DEEPSEEK_FLASH.value: {
+                "max_turns": 24, "max_tokens": 65536,
+            },
+        },
+    })
+
+    assert trial_protocol_sha256() != legacy
 
 
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):

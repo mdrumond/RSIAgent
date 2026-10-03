@@ -393,6 +393,33 @@ def test_run_compiles_then_executes_aligned_and_padded_shapes(
     ]
 
 
+def test_local_run_returns_the_frozen_logical_mismatch_sample(tmp_path):
+    def command(argv, *, cwd, **_kwargs):
+        if "--compile-only" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A3CANDIDATE_COMPILED=" + "f" * 64 + "\n", "",
+            )
+        payload = json.loads((cwd / "input.json").read_text())
+        expected = [
+            a + b for a, b in zip(payload["input_a"], payload["input_b"])
+        ]
+        expected[1] += 2.0
+        expected[-1] = 999.0
+        return subprocess.CompletedProcess(
+            argv, 0, "A3KERNEL_OUTPUT=" + json.dumps(expected) + "\n", "",
+        )
+
+    result = A3CandidateBackend(command).run(
+        SOURCE, tmp_path, request_id="r", attempt_id="a", length=3,
+        padded_length=4,
+    )
+
+    assert isinstance(result, VerifiedResult) and not result.passed
+    assert result.max_abs_error == pytest.approx(2.0)
+    assert result.mismatch.logical_index == 1
+    assert result.mismatch.absolute_error == pytest.approx(2.0)
+
+
 def test_compile_failure_is_structured_and_stops_before_run(tmp_path):
     calls = []
 
@@ -423,6 +450,7 @@ def test_runtime_failure_is_structured(tmp_path):
     assert isinstance(result, FailedEvidence)
     assert result.stage == "execute" and result.error_type == "RuntimeError"
     assert "ACL launch failed" in result.detail
+    assert not hasattr(result, "mismatch")
 
 
 @pytest.mark.parametrize("stdout", ["", "A3KERNEL_OUTPUT=nope\n", "A3KERNEL_OUTPUT=[1]\n"])
@@ -438,6 +466,7 @@ def test_malformed_or_wrong_length_output_is_structured_verification_failure(tmp
 
     assert isinstance(result, FailedEvidence)
     assert result.stage == "verify" and result.error_type == "OutputError"
+    assert not hasattr(result, "mismatch")
 
 
 def test_agent_has_no_argv_or_build_descriptor_surface():

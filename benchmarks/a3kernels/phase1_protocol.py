@@ -173,6 +173,36 @@ class ExecutionReceipt:
 
 
 @dataclass(frozen=True)
+class VerificationMismatch:
+    logical_index: int
+    input_a: float
+    input_b: float
+    actual: float
+    expected: float
+    absolute_error: float
+
+    def __post_init__(self) -> None:
+        if type(self.logical_index) is not int or self.logical_index < 0:
+            raise ValueError("logical_index must be a non-negative integer")
+        for name in (
+            "input_a", "input_b", "actual", "expected", "absolute_error",
+        ):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value):
+                raise ValueError(f"{name} must be a finite number")
+            object.__setattr__(self, name, float(value))
+        if self.expected != self.input_a + self.input_b:
+            raise ValueError("expected must equal input_a plus input_b")
+        if (
+            self.absolute_error < 0
+            or self.absolute_error != abs(self.actual - self.expected)
+        ):
+            raise ValueError(
+                "absolute_error must equal the actual-to-expected difference"
+            )
+
+
+@dataclass(frozen=True)
 class VerifiedResult:
     request_id: str
     execution_id: str
@@ -187,6 +217,22 @@ class VerifiedResult:
     evidence_sha256: str
     job_handle: str | None
     attestation_sha256: str
+    mismatch: VerificationMismatch | None = None
+
+    def __post_init__(self) -> None:
+        if self.mismatch is not None and not isinstance(
+            self.mismatch, VerificationMismatch
+        ):
+            raise TypeError("mismatch must be a VerificationMismatch")
+        if self.mismatch is not None and (self.passed or self.exit_code != 0):
+            raise ValueError("only numerical verification failure has a mismatch")
+        if (
+            self.exit_code == 0
+            and self.max_abs_error is not None
+            and self.max_abs_error > self.tolerance
+            and self.mismatch is None
+        ):
+            raise ValueError("failed numerical verification requires a mismatch")
 
     @classmethod
     def from_receipt(
@@ -211,10 +257,37 @@ class VerifiedResult:
             raise ValueError("max_abs_error must be a finite non-negative number")
         if receipt.exit_code != 0 and max_abs_error is not None:
             raise ValueError("a failed exit code cannot have a verification metric")
+        mismatch = None
+        if max_abs_error is not None:
+            if len(receipt.output) != plan.padded_length:
+                raise ValueError(
+                    "verification metric requires the registered padded output"
+                )
+            samples = tuple(
+                VerificationMismatch(
+                    logical_index=index,
+                    input_a=plan.input_a[index],
+                    input_b=plan.input_b[index],
+                    actual=receipt.output[index],
+                    expected=plan.input_a[index] + plan.input_b[index],
+                    absolute_error=abs(
+                        receipt.output[index]
+                        - (plan.input_a[index] + plan.input_b[index])
+                    ),
+                )
+                for index in range(plan.logical_length)
+            )
+            selected = max(samples, key=lambda item: item.absolute_error)
+            if max_abs_error != selected.absolute_error:
+                raise ValueError(
+                    "max_abs_error must match the logical output maximum"
+                )
         metric_ok = (
             max_abs_error is not None
             and max_abs_error <= tolerance
         )
+        if not metric_ok and max_abs_error is not None:
+            mismatch = selected
         body = {
             "request_id": plan.request_id,
             "execution_id": plan.execution_id,
@@ -237,6 +310,7 @@ class VerifiedResult:
                 }
             ),
             "job_handle": receipt.job_handle,
+            "mismatch": mismatch,
         }
         return cls(**body, attestation_sha256=attest(body))
 

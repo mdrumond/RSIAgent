@@ -102,6 +102,42 @@ def test_remote_vertical_flow_health_upload_poll_wrapper_and_verify(tmp_path):
     assert "host_driver.py input.json" in execute[execute.index("bash") + 2]
 
 
+def test_gz_flow_returns_the_same_frozen_mismatch_shape_as_bz(tmp_path):
+    plan = _plan()
+
+    def process(argv, **kwargs):
+        if "upload" in argv:
+            return _completed(argv, '{"id":"u1","status":"queued"}')
+        if "status" in argv:
+            return _completed(argv, '{"id":"u1","status":"succeeded"}')
+        compiling = "a3-candidate-" in " ".join(argv)
+        body = (
+            "A3REMOTE_STAGE=compile\nA3CANDIDATE_COMPILED=" + "f" * 64
+            if compiling else
+            "A3REMOTE_STAGE=execute\nA3KERNEL_OUTPUT=[0.0,0.0,0.0,0.0]"
+        )
+        handle = "gz-a3:compile-wrong" if compiling else "gz-a3:execute-wrong"
+        return _completed(
+            argv,
+            body + "\nCATLASS_VALIDATION_PROFILE=gz-a3\n"
+            "CATLASS_VALIDATION_STATE=completed\n"
+            f"CATLASS_VALIDATION_HANDLE={handle}\n"
+            "CATLASS_VALIDATION_EXIT=0",
+        )
+
+    backend = _backend(tmp_path, process)
+    result = backend.execute(backend.compile(plan, tmp_path / "local"))
+
+    assert isinstance(result, VerifiedResult) and not result.passed
+    expected_error = max(abs(a + b) for a, b in zip(plan.input_a, plan.input_b))
+    assert result.max_abs_error == pytest.approx(expected_error)
+    assert result.mismatch.logical_index == max(
+        range(plan.logical_length),
+        key=lambda index: abs(plan.input_a[index] + plan.input_b[index]),
+    )
+    assert result.mismatch.absolute_error == pytest.approx(expected_error)
+
+
 def test_listener_gate_fails_closed_before_upload(tmp_path):
     calls = []
     backend = _backend(

@@ -151,6 +151,7 @@ def trial_protocol_sha256() -> str:
         }
     return canonical_digest({
         "schema": "a3-trial-protocol-v1",
+        "verification_feedback_schema": "a3-verification-mismatch-v1",
         "model_budgets": model_budgets,
     })
 
@@ -579,6 +580,7 @@ class A3TrialLoop:
                 "diagnostic": detail,
                 "max_abs_error": result.max_abs_error,
                 "tolerance": result.tolerance,
+                "mismatch": asdict(result.mismatch),
                 "source_fingerprint": result.source_fingerprint,
                 "execution_id": result.execution_id,
                 "evidence_sha256": result.evidence_sha256,
