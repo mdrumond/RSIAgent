@@ -53,6 +53,7 @@ def full_dry_run() -> dict[str, object]:
 
 SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[0],)
 TRIAL_RELIABILITY_SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[3],)
+LENGTH_KNEE_16_SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[4],)
 _SMOKE_QUERY = "A3 Ascend C vector addition tensor movement"
 
 
@@ -681,6 +682,7 @@ class SmokeWave(Phase1Wave):
 
 __all__ = [
     "CellPaths",
+    "LENGTH_KNEE_16_SMOKE_PROPOSALS",
     "Phase1Config",
     "Phase1Wave",
     "SMOKE_PROPOSALS",

@@ -1090,10 +1090,11 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
             memory=journal, workdir=tmp_path / model.name / "work", **kwargs,
         )
 
-    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(12, 32768)
+    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(24, 32768)
     assert build_loop(BackendModel.DEEPSEEK_FLASH).budgets == TrialBudgets(24, 65536)
     override = TrialBudgets(2, 17)
-    assert build_loop(BackendModel.DEEPSEEK_FLASH, budgets=override).budgets is override
+    for model in BackendModel:
+        assert build_loop(model, budgets=override).budgets is override
 
 
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
@@ -1137,6 +1138,59 @@ def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp
     short, _, _ = _run(
         tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
         budgets=TrialBudgets(12, 65536),
+    )
+    recovered, _, _ = _run(
+        tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),
+        model_default_budgets=True,
+    )
+
+    assert short.status == "budget-exhausted" and short.turns == 12
+    assert recovered.status == "passed" and recovered.turns == 16
+    assert len(recovered.failures) == 4
+    assert all("host verification failed" in item for item in recovered.failures)
+
+
+def test_openai_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
+    cell = _cell(model=BackendModel.GPT_5_6_SOL)
+
+    class FourMismatches(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **options):
+            self.runs += 1
+            if self.runs <= 4:
+                plan = self._plan(
+                    source, options["request_id"], options["attempt_id"],
+                    options["length"], options["project_id"],
+                    options.get("padded_length"), options.get("block_count", 1),
+                    options.get("execution_profile", "gz-a3"),
+                )
+                return VerifiedResult.from_receipt(
+                    plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
+                    max_abs_error=3.0,
+                )
+            return super().run(source, workdir, **options)
+
+    sources = [
+        SOURCE.replace(" {}", f" {{ uint32_t attempt = {attempt}; }}")
+        for attempt in range(5)
+    ]
+    actions = []
+    for source in sources:
+        actions.extend([
+            json.dumps({"action": "write_source", "source": source}),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+        ])
+    actions.append(json.dumps({
+        "action": "submit", "interpretation": "recovered", "supports": [],
+    }))
+
+    short, _, _ = _run(
+        tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
+        budgets=TrialBudgets(12, 32768),
     )
     recovered, _, _ = _run(
         tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),

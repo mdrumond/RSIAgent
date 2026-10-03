@@ -5,7 +5,9 @@ import pytest
 
 from benchmarks.a3_experiments import KnowledgeMode
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
+from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import (
+    LENGTH_KNEE_16_SMOKE_PROPOSALS,
     SMOKE_PROPOSALS,
     TRIAL_RELIABILITY_SMOKE_PROPOSALS,
     Phase1Config,
@@ -54,6 +56,14 @@ def test_smoke_plan_is_one_registered_baseline_and_not_phase1_plan():
     assert plan["mode"] == "smoke"
     assert len(plan["projects"]) == len(SMOKE_PROPOSALS) == 1
     assert plan["projects"][0]["family"] == "vector-add-baseline"
+
+
+def test_length_knee_16_smoke_plan_is_the_registered_project():
+    plan = smoke_dry_run(LENGTH_KNEE_16_SMOKE_PROPOSALS)
+    assert LENGTH_KNEE_16_SMOKE_PROPOSALS == (DEFAULT_PROPOSALS[4],)
+    assert len(plan["projects"]) == 1
+    assert plan["projects"][0]["family"] == "length-knee"
+    assert plan["projects"][0]["parameters"] == {"length": 16}
 
 
 def test_smoke_paths_and_terminals_are_isolated_from_full_phase1(tmp_path):
@@ -367,6 +377,7 @@ def test_smoke_shards_are_deterministic_disjoint_and_use_unique_paths(tmp_path):
     [
         ("baseline", SMOKE_PROPOSALS),
         ("runtime-recovery", TRIAL_RELIABILITY_SMOKE_PROPOSALS),
+        ("length-knee-16", LENGTH_KNEE_16_SMOKE_PROPOSALS),
     ],
 )
 def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
@@ -456,3 +467,46 @@ def test_cli_smoke_preflight_selects_runtime_recovery_identity(
     assert report["smoke_plan_fingerprint"] == canonical_digest(
         smoke_dry_run(TRIAL_RELIABILITY_SMOKE_PROPOSALS)
     )
+
+
+def test_cli_smoke_preflight_selects_length_knee_16_identity(
+    tmp_path, monkeypatch, capsys,
+):
+    import run_a3_phase1
+
+    cfg = config(tmp_path)
+    monkeypatch.setattr(
+        run_a3_phase1, "_bz_preflight", lambda *_args: {"state": "completed"}
+    )
+    monkeypatch.setattr(
+        "benchmarks.a3kernels.phase1_wave.authenticate_smoke_knowledge",
+        lambda *_args: knowledge_identity(),
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    argv = [
+        "smoke-preflight", "--state-root", str(cfg.state_root),
+        "--validation-wrapper", str(cfg.validation_wrapper),
+        "--embedding-cache", str(cfg.embedding_cache),
+        "--corpus-artifacts", str(cfg.corpus_artifacts),
+        "--knowledge-database", str(cfg.knowledge_database),
+        "--knowledge-manifest", str(cfg.knowledge_manifest),
+        "--profile", "bz-a3-1", "--cpl-remote", "/checked/cpl-remote",
+        "--smoke-project", "length-knee-16",
+    ]
+
+    assert run_a3_phase1.main(argv) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["smoke_plan_fingerprint"] == canonical_digest(
+        smoke_dry_run(LENGTH_KNEE_16_SMOKE_PROPOSALS)
+    )
+
+
+def test_cli_smoke_project_choices_reject_unregistered_alias(tmp_path):
+    import run_a3_phase1
+
+    with pytest.raises(SystemExit):
+        run_a3_phase1._parser().parse_args([
+            "smoke-report", "--state-root", str(tmp_path),
+            "--smoke-project", "length-knee-400",
+        ])
