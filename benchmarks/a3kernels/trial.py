@@ -127,8 +127,9 @@ class TrialBudgets:
     def for_model(cls, model: BackendModel) -> "TrialBudgets":
         if not isinstance(model, BackendModel):
             raise TypeError("default trial budgets require a registered backend model")
-        max_tokens = 65536 if model is BackendModel.DEEPSEEK_FLASH else 32768
-        return cls(max_tokens=max_tokens)
+        if model is BackendModel.DEEPSEEK_FLASH:
+            return cls(max_turns=24, max_tokens=65536)
+        return cls(max_turns=12, max_tokens=32768)
 
 
 @dataclass(frozen=True)
@@ -702,11 +703,11 @@ class A3TrialLoop:
         core = {
             "source-required": ("write_source",),
             "rewrite-required": ("write_source",),
-            "compile-required": ("compile", "write_source"),
+            "compile-required": ("compile",),
             "compile-retry": ("compile",),
-            "run-required": ("run", "write_source"),
+            "run-required": ("run",),
             "run-retry": ("run",),
-            "profile-required": ("profile", "write_source"),
+            "profile-required": ("profile",),
             "submit-ready": ("submit", "write_source"),
         }[state]
         if self.cell.knowledge is KnowledgeMode.WITH_KDB:
@@ -735,9 +736,7 @@ class A3TrialLoop:
                         observations, source_fingerprint
                     ),
                     "trial_state": state,
-                    "required_next_action": (
-                        "write_source" if state == "rewrite-required" else None
-                    ),
+                    "required_next_action": self._required_next_action(state),
                 },
                 "allowed_actions": {
                     kind: sorted(_ACTION_FIELDS[kind]) for kind in sorted(allowed)
@@ -760,6 +759,14 @@ class A3TrialLoop:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    def _required_next_action(self, state: str) -> str | None:
+        return {
+            "rewrite-required": "write_source",
+            "compile-required": "compile",
+            "run-required": "run",
+            "profile-required": "profile",
+        }.get(state)
 
 
 __all__ = ["A3TrialLoop", "Action", "TrialBudgets", "TrialResult", "parse_action"]

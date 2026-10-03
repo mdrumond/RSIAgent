@@ -29,8 +29,28 @@ def test_registered_profiles_have_exact_routes_and_stable_fingerprints():
         "deepseek-flash", DEEPSEEK_BASE_URL, "DEEPSEEK_API_KEY"
     )
     assert gpt.fingerprint == "e58ce9883286271c419262dd66d88d8d8c1bcab3b5da683eadc43891bf6b4ce8"
-    assert deepseek.fingerprint == "e9b6c97cbaca17596ead9fc2ab470e3df41e6b89e845410cb2871f62b4a94b7b"
+    assert deepseek.fingerprint == "c164f187111174f6eb6970809f1b9f6baef24ab2475d99e70c4ca0e0b0752f87"
     assert not gpt.allow_fallbacks and not deepseek.allow_fallbacks
+
+
+def test_deepseek_action_profile_is_bounded_and_non_thinking():
+    profile = load_a3_model_profile(BackendModel.DEEPSEEK_FLASH)
+
+    assert profile.base_url == DEEPSEEK_BASE_URL
+    assert profile.allow_fallbacks is False
+    assert profile.generation.max_tokens == 8192
+    assert profile.generation.thinking is False
+    assert profile.request("system", "user") == {
+        "model": "deepseek-flash",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "user"},
+        ],
+        "max_tokens": 8192,
+        "top_p": 1.0,
+        "reasoning_effort": "high",
+        "extra_body": {"thinking": {"type": "disabled"}},
+    }
 
 
 @pytest.mark.parametrize("alias", ["gpt-5.6-sol", "deepseek-v4-flash", "astra", "deepseek"])
@@ -112,10 +132,10 @@ def test_fake_transport_captures_exact_provider_specific_requests():
                     {"role": "system", "content": "system"},
                     {"role": "user", "content": "user"},
                 ],
-                "max_tokens": 32768,
+                "max_tokens": 8192,
                 "top_p": 1.0,
                 "reasoning_effort": "high",
-                "extra_body": {"thinking": {"type": "enabled"}},
+                "extra_body": {"thinking": {"type": "disabled"}},
             },
         },
     ]
@@ -185,7 +205,7 @@ def test_completion_provenance_is_deeply_immutable_and_caller_isolated():
 def test_transport_request_mutation_cannot_change_recorded_provenance():
     def mutating_transport(*, request, **_kwargs):
         request["reasoning_effort"] = "low"
-        request["extra_body"]["thinking"]["type"] = "disabled"
+        request["extra_body"]["thinking"]["type"] = "enabled"
         return A3TransportResult("candidate", 12)
 
     result = complete_a3(
@@ -193,11 +213,11 @@ def test_transport_request_mutation_cannot_change_recorded_provenance():
         environ={"DEEPSEEK_API_KEY": "secret"}, transport=mutating_transport,
     )
     assert result.as_dict()["provenance"]["generation"] == {
-        "max_tokens": 32768,
+        "max_tokens": 8192,
         "top_p": 1.0,
         "reasoning_effort": "high",
         "temperature": None,
-        "thinking": True,
+        "thinking": False,
     }
 
 

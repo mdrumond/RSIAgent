@@ -192,7 +192,11 @@ class A3ModelProfile:
         else:
             request["max_tokens"] = self.generation.max_tokens
             request["top_p"] = self.generation.top_p
-            request["extra_body"] = {"thinking": {"type": "enabled"}}
+            request["extra_body"] = {
+                "thinking": {
+                    "type": "enabled" if self.generation.thinking else "disabled"
+                }
+            }
         return request
 
 
@@ -219,8 +223,8 @@ _CANONICAL_VALUES: dict[BackendModel, dict[str, Any]] = {
         "credential_env": "DEEPSEEK_API_KEY",
         "allow_fallbacks": False,
         "generation": {
-            "max_tokens": 32768, "top_p": 1.0, "reasoning_effort": "high",
-            "temperature": None, "thinking": True,
+            "max_tokens": 8192, "top_p": 1.0, "reasoning_effort": "high",
+            "temperature": None, "thinking": False,
         },
     },
 }

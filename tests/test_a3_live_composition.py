@@ -233,9 +233,9 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     assert records[0]["completed_projects"] == 0
     assert records[0]["failed_project_id"] == SMOKE_PROPOSALS[0].project_id
     assert "invalid-content" not in first_paths.terminal.read_text()
-    assert len(invalid_calls) == 12
+    assert len(invalid_calls) == 24
     failures = EvidenceLedger(first_paths.evidence).entries
-    assert len(failures) == 12
+    assert len(failures) == 24
     assert all(
         entry.payload["provider_response_failure"]["code"]
         == "invalid-content-or-usage"
@@ -243,7 +243,7 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     )
     assert wave.paths(later).terminal.is_file()
     assert wave.resume() == records
-    assert len(invalid_calls) == 12
+    assert len(invalid_calls) == 24
     assert retained == (
         first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
     )
