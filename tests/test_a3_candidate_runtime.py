@@ -594,6 +594,29 @@ def test_fixed_driver_allocates_padding_but_launches_logical_count(
     assert values[logical:] == [0.0] * (padded - logical)
 
 
+def test_fixed_driver_preserves_finite_wrong_logical_output_for_host_scoring():
+    values = host_driver._canonical_output(
+        [9.0, -7.5, 123.0, 456.0], logical=2, padded=4,
+    )
+
+    assert values == [9.0, -7.5, 0.0, 0.0]
+
+
+@pytest.mark.parametrize(
+    "values, message",
+    [
+        ([1.0], "padded shape"),
+        ([1.0, 2.0, 3.0], "padded shape"),
+        ([1.0, float("nan")], "finite numeric"),
+        ([1.0, float("inf")], "finite numeric"),
+        ([1.0, "bad"], "finite numeric"),
+    ],
+)
+def test_fixed_driver_rejects_wrong_shape_or_nonfinite_output(values, message):
+    with pytest.raises(RuntimeError, match=message):
+        host_driver._canonical_output(values, logical=1, padded=2)
+
+
 def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tmp_path):
     class Tensor:
         def __init__(self, values): self.values = values

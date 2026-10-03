@@ -117,6 +117,72 @@ def test_complete_bz_flow_uploads_compiles_and_host_verifies(tmp_path, monkeypat
     assert "torch.npu.set_device(0)" in plan.files[3].content
 
 
+def test_bz_flow_returns_bounded_failed_verification_for_wrong_finite_output(tmp_path):
+    plan = _plan()
+
+    def process(argv, **kwargs):
+        if argv[0].endswith("cpl-remote"):
+            return _completed(argv, _upload_terminal())
+        if "a3-candidate-" in " ".join(argv):
+            result = _terminal(
+                "bz-a3-1", "bz-a3-1:compile-wrong",
+                "A3REMOTE_STAGE=compile", "A3CANDIDATE_COMPILED=" + "e" * 64,
+            )
+        else:
+            result = _terminal(
+                "bz-a3-1", "bz-a3-1:execute-wrong",
+                "A3REMOTE_STAGE=execute", "A3KERNEL_OUTPUT=[0.0,0.0,0.0,0.0]",
+            )
+        return subprocess.CompletedProcess(
+            argv, result.returncode, result.stdout, result.stderr
+        )
+
+    backend = _backend(tmp_path, process)
+    compilation = backend.compile(plan, tmp_path / "local")
+    result = backend.execute(compilation)
+
+    expected_error = max(abs(a + b) for a, b in zip(plan.input_a, plan.input_b))
+    assert isinstance(result, VerifiedResult)
+    assert result.passed is False
+    assert result.max_abs_error == pytest.approx(expected_error)
+    assert result.max_abs_error is not None
+    assert result.job_handle == "bz-a3-1:execute-wrong"
+
+
+@pytest.mark.parametrize(
+    "output",
+    ["[0.0]", "[0.0,0.0,NaN,0.0]"],
+)
+def test_bz_flow_keeps_wrong_shape_and_nonfinite_output_as_hard_errors(
+    tmp_path, output,
+):
+    def process(argv, **kwargs):
+        if argv[0].endswith("cpl-remote"):
+            return _completed(argv, _upload_terminal())
+        if "a3-candidate-" in " ".join(argv):
+            result = _terminal(
+                "bz-a3-1", "bz-a3-1:compile-malformed",
+                "A3REMOTE_STAGE=compile", "A3CANDIDATE_COMPILED=" + "f" * 64,
+            )
+        else:
+            result = _terminal(
+                "bz-a3-1", "bz-a3-1:execute-malformed",
+                "A3REMOTE_STAGE=execute", "A3KERNEL_OUTPUT=" + output,
+            )
+        return subprocess.CompletedProcess(
+            argv, result.returncode, result.stdout, result.stderr
+        )
+
+    backend = _backend(tmp_path, process)
+    compilation = backend.compile(_plan(), tmp_path / "local")
+    result = backend.execute(compilation)
+
+    assert isinstance(result, FailedEvidence)
+    assert result.stage == "verify"
+    assert result.error_type == "OutputError"
+    assert "finite padded numeric array" in result.detail
+
+
 @pytest.mark.parametrize("profile", ["bz-a3-1", "bz-a3-2"])
 def test_only_declared_bz_profiles_are_accepted(tmp_path, profile):
     assert _backend(tmp_path, lambda *a, **k: None, profile=profile).profile == profile
