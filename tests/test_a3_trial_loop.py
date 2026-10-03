@@ -641,6 +641,48 @@ def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
     assert any("failed_verification" in entry.payload for entry in entries)
 
 
+def test_failed_verified_result_without_mismatch_reaches_actor_feedback(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class ProcessFailureOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **kw):
+            self.runs += 1
+            if self.runs == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1),
+                    kw.get("execution_profile", "gz-a3"),
+                )
+                return VerifiedResult.from_receipt(
+                    plan, ExecutionReceipt(2, stderr="runtime failed"),
+                    max_abs_error=None,
+                )
+            return super().run(source, workdir, **kw)
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=ProcessFailureOnce())
+
+    feedback = json.loads(prompts[3])["observations"][-1][
+        "failed_verification"
+    ]
+    assert result.status == "passed"
+    assert feedback["max_abs_error"] is None
+    assert feedback["mismatch"] is None
+    assert feedback["next_action"] == "write_source"
+
+
 def test_submit_supports_are_only_for_current_source_revision(tmp_path):
     replacement = SOURCE.replace(" {}", " { return; }")
     cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)

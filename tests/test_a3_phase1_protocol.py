@@ -217,11 +217,29 @@ def test_mismatch_sample_is_attested_and_tampering_breaks_attestation():
     )
     tampered = replace(
         result,
-        mismatch=replace(result.mismatch, actual=6.0, absolute_error=2.0),
+        mismatch=replace(result.mismatch, logical_index=1),
     )
 
     assert result.attestation_sha256 == attest(result.attestation_payload())
     assert tampered.attestation_sha256 != attest(tampered.attestation_payload())
+
+
+def test_direct_result_rejects_mismatch_error_that_disagrees_with_maximum():
+    execution = plan()
+    result = VerifiedResult.from_receipt(
+        execution, ExecutionReceipt(0, (5.0, 3.0)), max_abs_error=1.0,
+    )
+    inconsistent = VerificationMismatch(
+        logical_index=0,
+        input_a=1.0,
+        input_b=3.0,
+        actual=6.0,
+        expected=4.0,
+        absolute_error=2.0,
+    )
+
+    with pytest.raises(ValueError, match="max_abs_error"):
+        replace(result, mismatch=inconsistent)
 
 
 def test_verified_result_attests_nondefault_tolerance():

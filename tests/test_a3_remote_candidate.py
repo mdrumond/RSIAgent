@@ -138,6 +138,43 @@ def test_gz_flow_returns_the_same_frozen_mismatch_shape_as_bz(tmp_path):
     assert result.mismatch.absolute_error == pytest.approx(expected_error)
 
 
+def test_shared_remote_verification_ignores_wrong_allocation_padding(tmp_path):
+    plan = _plan()
+    output_values = [
+        a + b for a, b in zip(plan.input_a, plan.input_b)
+    ]
+    output_values[plan.logical_length:] = [9876.5] * (
+        plan.padded_length - plan.logical_length
+    )
+
+    def process(argv, **kwargs):
+        if "upload" in argv:
+            return _completed(argv, '{"id":"u1","status":"queued"}')
+        if "status" in argv:
+            return _completed(argv, '{"id":"u1","status":"succeeded"}')
+        compiling = "a3-candidate-" in " ".join(argv)
+        body = (
+            "A3REMOTE_STAGE=compile\nA3CANDIDATE_COMPILED=" + "e" * 64
+            if compiling else
+            "A3REMOTE_STAGE=execute\nA3KERNEL_OUTPUT=" + json.dumps(output_values)
+        )
+        handle = "gz-a3:compile-padding" if compiling else "gz-a3:execute-padding"
+        return _completed(
+            argv,
+            body + "\nCATLASS_VALIDATION_PROFILE=gz-a3\n"
+            "CATLASS_VALIDATION_STATE=completed\n"
+            f"CATLASS_VALIDATION_HANDLE={handle}\n"
+            "CATLASS_VALIDATION_EXIT=0",
+        )
+
+    backend = _backend(tmp_path, process)
+    result = backend.execute(backend.compile(plan, tmp_path / "local"))
+
+    assert isinstance(result, VerifiedResult) and result.passed
+    assert result.max_abs_error == 0.0
+    assert result.mismatch is None
+
+
 def test_listener_gate_fails_closed_before_upload(tmp_path):
     calls = []
     backend = _backend(

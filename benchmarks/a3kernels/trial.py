@@ -580,7 +580,10 @@ class A3TrialLoop:
                 "diagnostic": detail,
                 "max_abs_error": result.max_abs_error,
                 "tolerance": result.tolerance,
-                "mismatch": asdict(result.mismatch),
+                "mismatch": (
+                    asdict(result.mismatch)
+                    if result.mismatch is not None else None
+                ),
                 "source_fingerprint": result.source_fingerprint,
                 "execution_id": result.execution_id,
                 "evidence_sha256": result.evidence_sha256,

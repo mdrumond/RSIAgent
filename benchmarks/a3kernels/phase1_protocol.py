@@ -226,6 +226,11 @@ class VerifiedResult:
             raise TypeError("mismatch must be a VerificationMismatch")
         if self.mismatch is not None and (self.passed or self.exit_code != 0):
             raise ValueError("only numerical verification failure has a mismatch")
+        if self.mismatch is not None and (
+            self.max_abs_error is None
+            or self.mismatch.absolute_error != self.max_abs_error
+        ):
+            raise ValueError("mismatch absolute_error must equal max_abs_error")
         if (
             self.exit_code == 0
             and self.max_abs_error is not None
