@@ -7,10 +7,10 @@
   "credential_env": "DEEPSEEK_API_KEY",
   "allow_fallbacks": false,
   "generation": {
-    "max_tokens": 32768,
+    "max_tokens": 8192,
     "top_p": 1.0,
     "reasoning_effort": "high",
     "temperature": null,
-    "thinking": true
+    "thinking": false
   }
 }
