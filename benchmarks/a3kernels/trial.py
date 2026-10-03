@@ -704,10 +704,14 @@ class A3TrialLoop:
             "rewrite-required": ("write_source",),
             "compile-required": ("compile",),
             "compile-retry": ("compile",),
-            "run-required": ("run", "write_source"),
+            "run-required": ("run",),
             "run-retry": ("run",),
-            "profile-required": ("profile", "write_source"),
-            "submit-ready": ("submit", "write_source"),
+            "profile-required": ("profile",),
+            "submit-ready": (
+                ("submit", "write_source")
+                if self.cell.profiling is ProfilingGuidance.WITH_GUIDANCE
+                else ("submit",)
+            ),
         }[state]
         if self.cell.knowledge is KnowledgeMode.WITH_KDB:
             return (*core, "query")
@@ -735,11 +739,7 @@ class A3TrialLoop:
                         observations, source_fingerprint
                     ),
                     "trial_state": state,
-                    "required_next_action": (
-                        "write_source" if state == "rewrite-required"
-                        else "compile" if state == "compile-required"
-                        else None
-                    ),
+                    "required_next_action": self._required_next_action(state),
                 },
                 "allowed_actions": {
                     kind: sorted(_ACTION_FIELDS[kind]) for kind in sorted(allowed)
@@ -762,6 +762,20 @@ class A3TrialLoop:
             sort_keys=True,
             separators=(",", ":"),
         )
+
+    def _required_next_action(self, state: str) -> str | None:
+        required = {
+            "rewrite-required": "write_source",
+            "compile-required": "compile",
+            "run-required": "run",
+            "profile-required": "profile",
+        }.get(state)
+        if (
+            state == "submit-ready"
+            and self.cell.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+        ):
+            return "submit"
+        return required
 
 
 __all__ = ["A3TrialLoop", "Action", "TrialBudgets", "TrialResult", "parse_action"]

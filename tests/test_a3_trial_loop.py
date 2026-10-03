@@ -441,6 +441,100 @@ def test_changed_source_requires_compile_before_another_rewrite(tmp_path):
     )
 
 
+def test_successful_compile_requires_run_before_another_rewrite(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+    later_rewrite = SOURCE.replace(" {}", " { uint32_t unused = count; }")
+    candidate = FakeCandidate()
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        json.dumps({"action": "write_source", "source": later_rewrite}),
+        '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "fallback", "supports": [],
+        }),
+    ], candidate=candidate)
+
+    assert result.status == "passed"
+    assert candidate.source == SOURCE
+    post_compile = json.loads(prompts[2])
+    assert post_compile["action_contract"] == {
+        "eligible_submit_supports": [
+            post_compile["observations"][-1]["authoritative_evidence"][
+                "evidence_sha256"
+            ]
+        ],
+        "profile_metric": "PipeUtilization",
+        "required_next_action": "run",
+        "trial_state": "run-required",
+    }
+    assert set(post_compile["allowed_actions"]) == {"run"}
+    assert result.failures == (
+        "write_source is not valid in run-required",
+        "write_source is not valid in run-required",
+    )
+
+
+def test_guided_candidate_requires_profile_then_allows_optimization_rewrite(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
+    profiler = FakeProfiler()
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"profile","metric":"PipeUtilization"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        '{"action":"profile","metric":"PipeUtilization"}',
+        json.dumps({
+            "action": "submit", "interpretation": "profiled", "supports": [],
+        }),
+    ], cell=cell, profiler=profiler)
+
+    assert result.status == "passed"
+    assert len(profiler.requests) == 2
+    before_profile = json.loads(prompts[3])
+    assert before_profile["action_contract"]["required_next_action"] == "profile"
+    assert set(before_profile["allowed_actions"]) == {"profile"}
+    after_profile = json.loads(prompts[5])
+    assert after_profile["action_contract"]["required_next_action"] is None
+    assert set(after_profile["allowed_actions"]) == {"submit", "write_source"}
+    assert result.failures == ("write_source is not valid in profile-required",)
+
+
+def test_unguided_verified_candidate_requires_submit(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+    candidate = FakeCandidate()
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "fallback", "supports": [],
+        }),
+    ], candidate=candidate)
+
+    assert result.status == "passed" and result.turns == 5
+    assert candidate.source == SOURCE
+    submit_ready = json.loads(prompts[3])
+    assert submit_ready["action_contract"]["required_next_action"] == "submit"
+    assert set(submit_ready["allowed_actions"]) == {"submit"}
+    assert result.failures == ("write_source is not valid in submit-ready",)
+
+
 def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
     replacement = SOURCE.replace(" {}", " { return; }")
 
@@ -491,17 +585,18 @@ def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
 
 def test_submit_supports_are_only_for_current_source_revision(tmp_path):
     replacement = SOURCE.replace(" {}", " { return; }")
+    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
 
     def rewrite_from_context(context):
         value = json.loads(context)
         old = value["action_contract"]["eligible_submit_supports"]
-        assert len(old) == 2
+        assert len(old) == 3
         return json.dumps({"action": "write_source", "source": replacement})
 
     def submit_current(context):
         value = json.loads(context)
         supports = value["action_contract"]["eligible_submit_supports"]
-        assert len(supports) == 2
+        assert len(supports) == 3
         observations = value["observations"]
         old = next(
             item["authoritative_evidence"]["evidence_sha256"]
@@ -516,11 +611,13 @@ def test_submit_supports_are_only_for_current_source_revision(tmp_path):
 
     result, _, journal = _run(tmp_path, [
         json.dumps({"action": "write_source", "source": SOURCE}),
-        '{"action":"compile"}', '{"action":"run"}', rewrite_from_context,
-        '{"action":"compile"}', '{"action":"run"}', submit_current,
-    ])
+        '{"action":"compile"}', '{"action":"run"}',
+        '{"action":"profile","metric":"PipeUtilization"}', rewrite_from_context,
+        '{"action":"compile"}', '{"action":"run"}',
+        '{"action":"profile","metric":"PipeUtilization"}', submit_current,
+    ], cell=cell)
     assert result.status == "passed"
-    assert len(journal.read()[0]["memory"]["agent_interpretations"][0]["supports"]) == 2
+    assert len(journal.read()[0]["memory"]["agent_interpretations"][0]["supports"]) == 3
 
 
 @pytest.mark.parametrize("pending", ["observation", "prepare", "runtime-evidence"])
@@ -739,6 +836,7 @@ def test_submit_gates_source_identity_verification_and_required_profile(tmp_path
 def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):
     second_source = SOURCE.replace(" {}", " { return; }")
     third_source = SOURCE.replace(" {}", " { uint32_t unused = count; }")
+    cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
     class FailSecondCompile(FakeCandidate):
         def __init__(self):
             super().__init__()
@@ -765,6 +863,7 @@ def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_pat
             json.dumps({"action": "write_source", "source": SOURCE}),
             '{"action":"compile"}',
             '{"action":"run"}',
+            '{"action":"profile","metric":"PipeUtilization"}',
             json.dumps({"action": "write_source", "source": second_source}),
             '{"action":"compile"}',
             json.dumps({
@@ -774,12 +873,15 @@ def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_pat
             json.dumps({"action": "write_source", "source": third_source}),
             '{"action":"compile"}',
             '{"action":"run"}',
+            '{"action":"profile","metric":"PipeUtilization"}',
             json.dumps({
                 "action": "submit", "interpretation": "fresh host result",
                 "supports": [],
             }),
         ],
+        cell=cell,
         candidate=FailSecondCompile(),
+        budgets=TrialBudgets(12, 2000),
     )
 
     assert result.status == "passed"
