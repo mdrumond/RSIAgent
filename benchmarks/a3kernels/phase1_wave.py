@@ -35,6 +35,7 @@ from benchmarks.a3kernels.embeddings import (
 )
 from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS, CurriculumProposal, dry_run_plan
+from benchmarks.a3kernels.trial import trial_protocol_sha256
 
 
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -53,6 +54,7 @@ def full_dry_run() -> dict[str, object]:
 
 SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[0],)
 TRIAL_RELIABILITY_SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[3],)
+LENGTH_KNEE_16_SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[4],)
 _SMOKE_QUERY = "A3 Ascend C vector addition tensor movement"
 
 
@@ -145,6 +147,7 @@ def _research_identity() -> dict[str, str]:
         "plan_fingerprint": canonical_digest(full_dry_run()),
         "profile_driver_sha256": profile_driver_asset().sha256,
         "host_fixture_sha256": canonical_digest(fixture),
+        "trial_protocol_sha256": trial_protocol_sha256(),
     }
 
 
@@ -509,14 +512,16 @@ class SmokeWave(Phase1Wave):
                 self._knowledge_identity = authenticate_smoke_knowledge(self.config)
             knowledge = self._knowledge_identity
         profile = load_a3_model_profile(cell.backend_model)
+        static = _research_identity()
         return {
             "plan_fingerprint": canonical_digest(smoke_dry_run(self.proposals)),
             "proposal_set_sha256": canonical_digest(
                 [proposal.as_dict() for proposal in self.proposals]
             ),
             "model_profile_sha256": profile.fingerprint,
-            "profile_driver_sha256": _research_identity()["profile_driver_sha256"],
-            "host_fixture_sha256": _research_identity()["host_fixture_sha256"],
+            "profile_driver_sha256": static["profile_driver_sha256"],
+            "host_fixture_sha256": static["host_fixture_sha256"],
+            "trial_protocol_sha256": static["trial_protocol_sha256"],
             "knowledge_identity": knowledge,
         }
 
@@ -601,6 +606,7 @@ class SmokeWave(Phase1Wave):
             "model_profile_sha256": profile.fingerprint,
             "profile_driver_sha256": static["profile_driver_sha256"],
             "host_fixture_sha256": static["host_fixture_sha256"],
+            "trial_protocol_sha256": static["trial_protocol_sha256"],
             "knowledge_identity": knowledge,
             "status": value.get("status"),
             "terminal_reason": value.get("terminal_reason"),
@@ -681,6 +687,7 @@ class SmokeWave(Phase1Wave):
 
 __all__ = [
     "CellPaths",
+    "LENGTH_KNEE_16_SMOKE_PROPOSALS",
     "Phase1Config",
     "Phase1Wave",
     "SMOKE_PROPOSALS",

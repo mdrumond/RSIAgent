@@ -144,6 +144,20 @@ def dependencies(knowledge_calls, profile_calls):
     )
 
 
+def trial_protocol_sha256(openai_turns=24):
+    return canonical_digest({
+        "schema": "a3-trial-protocol-v1",
+        "model_budgets": {
+            BackendModel.GPT_5_6_SOL.value: {
+                "max_turns": openai_turns, "max_tokens": 32768,
+            },
+            BackendModel.DEEPSEEK_FLASH.value: {
+                "max_turns": 24, "max_tokens": 65536,
+            },
+        },
+    })
+
+
 def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
     cfg = config(tmp_path); knowledge_calls, profile_calls = [], []
     composition = LiveComposition(cfg, dependencies(knowledge_calls, profile_calls))
@@ -187,6 +201,81 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
     assert len(entries) == 1
     assert entries[0]["memory"]["proposal"]["family"] == "vector-add-baseline"
     assert entries[0]["memory"]["lineage_id"].startswith("smoke-")
+
+
+@pytest.mark.parametrize("smoke", [False, True], ids=["full", "smoke"])
+def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
+    tmp_path, monkeypatch, smoke,
+):
+    import benchmarks.a3kernels.live_composition as composition_module
+
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    proposals = SMOKE_PROPOSALS if smoke else DEFAULT_PROPOSALS
+    lineage_prefix = "smoke" if smoke else "phase1"
+    if smoke:
+        paths = SmokeWave(
+            cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        ).paths(cell)
+    else:
+        paths = Phase1Wave(cfg, lambda *_: {}, cells=(cell,)).paths(cell)
+
+    old_dependencies = dependencies([], [])
+    if not smoke:
+        def interrupted_actor_factory(selected_cell, proposal):
+            if proposal == DEFAULT_PROPOSALS[1]:
+                def interrupt(*_args):
+                    raise KeyboardInterrupt()
+                return interrupt
+            return actor_factory(selected_cell, proposal)
+        old_dependencies = LiveDependencies(
+            actor_factory=interrupted_actor_factory,
+            candidate_factory=old_dependencies.candidate_factory,
+            knowledge_factory=old_dependencies.knowledge_factory,
+            profiler_factory=old_dependencies.profiler_factory,
+        )
+
+    monkeypatch.setattr(
+        composition_module, "trial_protocol_sha256",
+        lambda: trial_protocol_sha256(12),
+    )
+    old = LiveComposition(
+        cfg, old_dependencies, proposals=proposals,
+        lineage_prefix=lineage_prefix,
+    )
+    if smoke:
+        assert old.execute(cell, paths)["status"] == "passed"
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            old.execute(cell, paths)
+    assert len(paths.memory.read_text().splitlines()) == 1
+
+    dependency_calls = []
+    def forbidden(*_args, **_kwargs):
+        dependency_calls.append("called")
+        pytest.fail("retained memory mismatch reached a live dependency")
+    blocked_dependencies = LiveDependencies(
+        actor_factory=forbidden,
+        candidate_factory=forbidden,
+        knowledge_factory=forbidden,
+        profiler_factory=forbidden,
+    )
+    monkeypatch.setattr(
+        composition_module, "trial_protocol_sha256",
+        lambda: trial_protocol_sha256(),
+    )
+
+    with pytest.raises(ValueError, match="resume validation"):
+        LiveComposition(
+            cfg, blocked_dependencies, proposals=proposals,
+            lineage_prefix=lineage_prefix,
+        ).execute(cell, paths)
+    assert dependency_calls == []
 
 
 def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path):

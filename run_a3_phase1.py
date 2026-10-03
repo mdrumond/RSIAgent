@@ -10,6 +10,7 @@ import subprocess
 
 from benchmarks.a3kernels.artifact_prepare import prepare_phase1_artifacts
 from benchmarks.a3kernels.phase1_wave import (
+    LENGTH_KNEE_16_SMOKE_PROPOSALS,
     Phase1Config,
     Phase1Wave,
     SMOKE_PROPOSALS,
@@ -27,6 +28,11 @@ _SUPPORTED_PROVIDER_CREDENTIAL_ENVS = frozenset({
     "OPENAI_API_KEY",
     "OPENROUTER_API_KEY",
 })
+_SMOKE_PROJECTS = {
+    "baseline": SMOKE_PROPOSALS,
+    "runtime-recovery": TRIAL_RELIABILITY_SMOKE_PROPOSALS,
+    "length-knee-16": LENGTH_KNEE_16_SMOKE_PROPOSALS,
+}
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -69,13 +75,13 @@ def _parser() -> argparse.ArgumentParser:
         if name in ("smoke-preflight", "smoke", "smoke-resume"):
             command.add_argument(
                 "--smoke-project",
-                choices=("baseline", "runtime-recovery"),
+                choices=tuple(_SMOKE_PROJECTS),
                 default="baseline",
             )
     smoke_report = sub.add_parser("smoke-report")
     smoke_report.add_argument("--state-root", type=Path, required=True)
     smoke_report.add_argument(
-        "--smoke-project", choices=("baseline", "runtime-recovery"),
+        "--smoke-project", choices=tuple(_SMOKE_PROJECTS),
         default="baseline",
     )
     return parser
@@ -89,10 +95,7 @@ def _config(args) -> Phase1Config:
 
 
 def _smoke_proposals(name: str):
-    return (
-        TRIAL_RELIABILITY_SMOKE_PROPOSALS
-        if name == "runtime-recovery" else SMOKE_PROPOSALS
-    )
+    return _SMOKE_PROJECTS[name]
 
 
 def _marker(stdout: str, prefix: str) -> list[str]:

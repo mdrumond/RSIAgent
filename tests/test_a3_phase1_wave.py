@@ -34,6 +34,20 @@ def terminal_outcome(digest="a" * 64):
     }
 
 
+def trial_protocol_sha256(openai_turns=24):
+    return canonical_digest({
+        "schema": "a3-trial-protocol-v1",
+        "model_budgets": {
+            BackendModel.GPT_5_6_SOL.value: {
+                "max_turns": openai_turns, "max_tokens": 32768,
+            },
+            BackendModel.DEEPSEEK_FLASH.value: {
+                "max_turns": 24, "max_tokens": 65536,
+            },
+        },
+    })
+
+
 def test_all_eight_project_dry_run_has_no_side_effects(tmp_path):
     cfg = config(tmp_path)
     before = {p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*")}
@@ -57,6 +71,7 @@ def test_preflight_checks_credentials_paths_and_fixed_adapter(tmp_path):
     report = cfg.preflight({"OPENAI_API_KEY": "gpt", "DEEPSEEK_API_KEY": "ds"})
     assert report["ready"] is True and all(report["checks"].values())
     assert report["profile_driver_sha256"] == profile_driver_asset().sha256
+    assert report["trial_protocol_sha256"] == trial_protocol_sha256()
     with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
         cfg.preflight({"OPENAI_API_KEY": "gpt"})
 
@@ -255,6 +270,19 @@ def test_resume_rejects_terminal_from_stale_research_identity(tmp_path, field):
     terminal = wave.paths(foundation_cells()[0]).terminal
     record = json.loads(terminal.read_text())
     record[field] = canonical_digest({"stale": field})
+    terminal.write_text(json.dumps(record))
+
+    with pytest.raises(ValueError, match="foreign|conflicting"):
+        wave.resume()
+
+
+def test_full_resume_rejects_retained_twelve_turn_trial_protocol(tmp_path):
+    cfg = config(tmp_path)
+    wave = Phase1Wave(cfg, lambda *_: terminal_outcome())
+    wave.run()
+    terminal = wave.paths(foundation_cells()[0]).terminal
+    record = json.loads(terminal.read_text())
+    record["trial_protocol_sha256"] = trial_protocol_sha256(12)
     terminal.write_text(json.dumps(record))
 
     with pytest.raises(ValueError, match="foreign|conflicting"):

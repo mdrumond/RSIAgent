@@ -27,7 +27,9 @@ from benchmarks.a3kernels.phase1_protocol import (
 )
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.profiling import CompactProfileResult, ProfileMetric
-from benchmarks.a3kernels.trial import A3TrialLoop, Action, TrialBudgets, parse_action
+from benchmarks.a3kernels.trial import (
+    A3TrialLoop, Action, TrialBudgets, parse_action, trial_protocol_sha256,
+)
 
 
 SOURCE = 'extern "C" __global__ __aicore__ void vector_add(GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output, uint32_t count, uint32_t buffer_bytes) {}'
@@ -178,6 +180,7 @@ def _run(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=selected.cell_id, lineage_id="isolated-lineage",
         evidence_resolver=resolver,
+        trial_protocol_sha256=trial_protocol_sha256(),
     )
     selected_candidate = candidate or FakeCandidate(resolver)
     selected_profiler = profiler or FakeProfiler(resolver)
@@ -1078,6 +1081,7 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
             tmp_path / model.name / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
             cell_id=cell.cell_id, lineage_id="isolated-lineage",
             evidence_resolver=Resolver(),
+            trial_protocol_sha256=trial_protocol_sha256(),
         )
         kwargs = {}
         if budgets is not None:
@@ -1090,10 +1094,16 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
             memory=journal, workdir=tmp_path / model.name / "work", **kwargs,
         )
 
-    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(12, 32768)
+    assert build_loop(BackendModel.GPT_5_6_SOL).budgets == TrialBudgets(24, 32768)
     assert build_loop(BackendModel.DEEPSEEK_FLASH).budgets == TrialBudgets(24, 65536)
     override = TrialBudgets(2, 17)
-    assert build_loop(BackendModel.DEEPSEEK_FLASH, budgets=override).budgets is override
+    for model in BackendModel:
+        assert build_loop(model, budgets=override).budgets is override
+
+
+def test_public_no_arg_trial_budget_matches_the_openai_registered_default():
+    assert TrialBudgets() == TrialBudgets.for_model(BackendModel.GPT_5_6_SOL)
+    assert TrialBudgets() == TrialBudgets(24, 32768)
 
 
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
@@ -1149,6 +1159,59 @@ def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp
     assert all("host verification failed" in item for item in recovered.failures)
 
 
+def test_openai_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
+    cell = _cell(model=BackendModel.GPT_5_6_SOL)
+
+    class FourMismatches(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **options):
+            self.runs += 1
+            if self.runs <= 4:
+                plan = self._plan(
+                    source, options["request_id"], options["attempt_id"],
+                    options["length"], options["project_id"],
+                    options.get("padded_length"), options.get("block_count", 1),
+                    options.get("execution_profile", "gz-a3"),
+                )
+                return VerifiedResult.from_receipt(
+                    plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
+                    max_abs_error=3.0,
+                )
+            return super().run(source, workdir, **options)
+
+    sources = [
+        SOURCE.replace(" {}", f" {{ uint32_t attempt = {attempt}; }}")
+        for attempt in range(5)
+    ]
+    actions = []
+    for source in sources:
+        actions.extend([
+            json.dumps({"action": "write_source", "source": source}),
+            '{"action":"compile"}',
+            '{"action":"run"}',
+        ])
+    actions.append(json.dumps({
+        "action": "submit", "interpretation": "recovered", "supports": [],
+    }))
+
+    short, _, _ = _run(
+        tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
+        budgets=TrialBudgets(12, 32768),
+    )
+    recovered, _, _ = _run(
+        tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),
+        model_default_budgets=True,
+    )
+
+    assert short.status == "budget-exhausted" and short.turns == 12
+    assert recovered.status == "passed" and recovered.turns == 16
+    assert len(recovered.failures) == 4
+    assert all("host verification failed" in item for item in recovered.failures)
+
+
 def test_model_and_treatment_authorities_must_match_cell(tmp_path):
     cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
     with pytest.raises(ValueError, match="Knowledge Agent"):
@@ -1162,6 +1225,7 @@ def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=cell.cell_id, lineage_id="isolated-lineage",
         evidence_resolver=Resolver(),
+        trial_protocol_sha256=trial_protocol_sha256(),
     )
     loop = A3TrialLoop(
         cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
