@@ -21,7 +21,9 @@ from benchmarks.a3kernels.candidate import (
     CandidateCompilation,
 )
 from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery, KnowledgeResult
-from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a3kernels.phase1_evidence import (
+    EvidenceKind, EvidenceLedger, canonical_digest,
+)
 from benchmarks.a3kernels.phase1_memory import (
     AgentInterpretation,
     HostFact,
@@ -130,6 +132,20 @@ class TrialBudgets:
         if model is BackendModel.DEEPSEEK_FLASH:
             return cls(max_turns=24, max_tokens=65536)
         return cls(max_turns=24, max_tokens=32768)
+
+
+def trial_protocol_sha256() -> str:
+    model_budgets = {}
+    for model in BackendModel:
+        budgets = TrialBudgets.for_model(model)
+        model_budgets[model.value] = {
+            "max_turns": budgets.max_turns,
+            "max_tokens": budgets.max_tokens,
+        }
+    return canonical_digest({
+        "schema": "a3-trial-protocol-v1",
+        "model_budgets": model_budgets,
+    })
 
 
 @dataclass(frozen=True)

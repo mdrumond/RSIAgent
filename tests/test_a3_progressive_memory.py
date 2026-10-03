@@ -10,6 +10,7 @@ from benchmarks.a3kernels.phase1_memory import (
     ProjectMemory,
 )
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
+from benchmarks.a3kernels.trial import trial_protocol_sha256
 
 
 CELL = "a3-cell-0123456789abcdef"
@@ -70,6 +71,7 @@ def journal(path, *, cell_id=CELL, lineage_id=LINEAGE, resolver=None):
         cell_id=cell_id,
         lineage_id=lineage_id,
         evidence_resolver=resolver or Resolver(),
+        trial_protocol_sha256=trial_protocol_sha256(),
     )
 
 

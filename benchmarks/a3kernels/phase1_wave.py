@@ -14,7 +14,6 @@ from typing import Callable, Mapping, Sequence
 
 from benchmarks.a3_experiments import (
     A3ExperimentCell,
-    BackendModel,
     KnowledgeMode,
     ProgrammingLevel,
     build_a3_experiment_plan,
@@ -36,7 +35,7 @@ from benchmarks.a3kernels.embeddings import (
 )
 from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS, CurriculumProposal, dry_run_plan
-from benchmarks.a3kernels.trial import TrialBudgets
+from benchmarks.a3kernels.trial import trial_protocol_sha256
 
 
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -138,20 +137,6 @@ def select_foundation_cells(
     )
 
 
-def _trial_protocol_sha256() -> str:
-    model_budgets = {}
-    for model in BackendModel:
-        budgets = TrialBudgets.for_model(model)
-        model_budgets[model.value] = {
-            "max_turns": budgets.max_turns,
-            "max_tokens": budgets.max_tokens,
-        }
-    return canonical_digest({
-        "schema": "a3-trial-protocol-v1",
-        "model_budgets": model_budgets,
-    })
-
-
 def _research_identity() -> dict[str, str]:
     source = files("benchmarks.a3kernels.candidate_runtime")
     fixture = {
@@ -162,7 +147,7 @@ def _research_identity() -> dict[str, str]:
         "plan_fingerprint": canonical_digest(full_dry_run()),
         "profile_driver_sha256": profile_driver_asset().sha256,
         "host_fixture_sha256": canonical_digest(fixture),
-        "trial_protocol_sha256": _trial_protocol_sha256(),
+        "trial_protocol_sha256": trial_protocol_sha256(),
     }
 
 

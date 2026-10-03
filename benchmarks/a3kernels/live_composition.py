@@ -38,7 +38,7 @@ from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
 from benchmarks.a3kernels.profiling_bz import BZA3ProfilingBackend
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
 from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
-from benchmarks.a3kernels.trial import A3TrialLoop
+from benchmarks.a3kernels.trial import A3TrialLoop, trial_protocol_sha256
 
 
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -284,13 +284,14 @@ class LiveComposition:
         memory = Phase1LearningJournal(
             paths.memory, self.proposals, cell_id=cell.cell_id,
             lineage_id=f"{self.lineage_prefix}-{cell.cell_id}", evidence_resolver=store,
+            trial_protocol_sha256=trial_protocol_sha256(),
         )
+        digests = [entry["entry_sha256"] for entry in memory.read()]
+        start = memory.resume_state().completed_projects
         knowledge = self.dependencies.knowledge_factory(cell, paths)
         EvidenceLedger.recover_incomplete_tail(paths.evidence)
         evidence = EvidenceLedger(paths.evidence)
         profile = load_a3_model_profile(cell.backend_model)
-        digests = [entry["entry_sha256"] for entry in memory.read()]
-        start = memory.resume_state().completed_projects
         for proposal in self.proposals[start:]:
             policy = ProjectRuntimePolicy.from_proposal(proposal)
             candidate = _RecordingCandidate(

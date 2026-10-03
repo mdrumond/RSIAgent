@@ -27,7 +27,9 @@ from benchmarks.a3kernels.phase1_protocol import (
 )
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.profiling import CompactProfileResult, ProfileMetric
-from benchmarks.a3kernels.trial import A3TrialLoop, Action, TrialBudgets, parse_action
+from benchmarks.a3kernels.trial import (
+    A3TrialLoop, Action, TrialBudgets, parse_action, trial_protocol_sha256,
+)
 
 
 SOURCE = 'extern "C" __global__ __aicore__ void vector_add(GM_ADDR input_a, GM_ADDR input_b, GM_ADDR output, uint32_t count, uint32_t buffer_bytes) {}'
@@ -178,6 +180,7 @@ def _run(
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=selected.cell_id, lineage_id="isolated-lineage",
         evidence_resolver=resolver,
+        trial_protocol_sha256=trial_protocol_sha256(),
     )
     selected_candidate = candidate or FakeCandidate(resolver)
     selected_profiler = profiler or FakeProfiler(resolver)
@@ -1078,6 +1081,7 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
             tmp_path / model.name / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
             cell_id=cell.cell_id, lineage_id="isolated-lineage",
             evidence_resolver=Resolver(),
+            trial_protocol_sha256=trial_protocol_sha256(),
         )
         kwargs = {}
         if budgets is not None:
@@ -1221,6 +1225,7 @@ def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
         tmp_path / "memory.jsonl", (DEFAULT_PROPOSALS[0],),
         cell_id=cell.cell_id, lineage_id="isolated-lineage",
         evidence_resolver=Resolver(),
+        trial_protocol_sha256=trial_protocol_sha256(),
     )
     loop = A3TrialLoop(
         cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,

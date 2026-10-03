@@ -216,6 +216,7 @@ class Phase1LearningJournal:
         cell_id: str,
         lineage_id: str,
         evidence_resolver: EvidenceResolver,
+        trial_protocol_sha256: str,
     ) -> None:
         if type(cell_id) is not str or not _CELL_ID.fullmatch(cell_id):
             raise ValueError("journal requires a registered A3 cell identity")
@@ -225,6 +226,12 @@ class Phase1LearningJournal:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.cell_id = cell_id
         self.lineage_id = lineage_id
+        if (
+            type(trial_protocol_sha256) is not str
+            or not _SHA256.fullmatch(trial_protocol_sha256)
+        ):
+            raise ValueError("journal requires a trial protocol identity")
+        self.trial_protocol_sha256 = trial_protocol_sha256
         if not callable(getattr(evidence_resolver, "resolve", None)):
             raise TypeError("evidence_resolver must provide resolve(digest)")
         self._evidence_resolver = evidence_resolver
@@ -241,7 +248,10 @@ class Phase1LearningJournal:
             )
             for row in plan["projects"]
         )
-        self.plan_fingerprint = canonical_digest(plan)
+        self.plan_fingerprint = canonical_digest({
+            "plan": plan,
+            "trial_protocol_sha256": self.trial_protocol_sha256,
+        })
 
     def append(self, memory: ProjectMemory) -> Mapping[str, object]:
         if not isinstance(memory, ProjectMemory):
