@@ -34,6 +34,7 @@ def verified(binding=BINDING):
         "source_fingerprint": binding.source_fingerprint,
         "evidence_sha256": "d" * 64,
         "job_handle": "gz-a3:verified-job",
+        "mismatch": None,
     }
     return VerifiedResult(**body, attestation_sha256=attest(body))
 

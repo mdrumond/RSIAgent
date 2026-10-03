@@ -224,7 +224,10 @@ class GZA3RemoteCandidateBackend:
                 plan, stage="verify", error_type="OutputError", detail=str(exc)
             )
         expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
-        maximum = max(abs(got - want) for got, want in zip(output, expected))
+        maximum = max(
+            abs(output[index] - expected[index])
+            for index in range(plan.logical_length)
+        )
         receipt = ExecutionReceipt(
             exit_code=0, output=output, stdout=completed.stdout,
             stderr=completed.stderr, job_handle=handle,
