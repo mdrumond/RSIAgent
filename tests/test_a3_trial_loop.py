@@ -69,6 +69,24 @@ def test_action_schema_has_one_fixed_source_slot_and_no_argv():
         parse_action(json.dumps({"action": "write_source", "path": "other.cpp", "source": SOURCE}))
 
 
+@pytest.mark.parametrize(
+    "payload, expected, received",
+    [
+        ({"action": "compile", "argv": ["sh"]}, ["action"], ["action", "argv"]),
+        ({"action": "write_source"}, ["action", "source"], ["action"]),
+    ],
+)
+def test_action_field_mismatch_reports_expected_and_received_names(
+    payload, expected, received,
+):
+    with pytest.raises(ValueError) as failure:
+        parse_action(json.dumps(payload))
+
+    message = str(failure.value)
+    assert f"expected={expected!r}" in message
+    assert f"received={received!r}" in message
+
+
 class FakeCandidate:
     def __init__(self, resolver=None): self.source, self.resolver = None, resolver
     def _plan(

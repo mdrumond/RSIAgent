@@ -78,8 +78,15 @@ def parse_action(text: str) -> Action:
     if not isinstance(value, dict) or type(value.get("action")) is not str:
         raise ValueError("action must select a registered action")
     kind = value["action"]
-    if kind not in _ACTION_FIELDS or set(value) != _ACTION_FIELDS[kind]:
-        raise ValueError("action fields do not match the registered schema")
+    if kind not in _ACTION_FIELDS:
+        raise ValueError("action must select a registered action")
+    expected_fields = sorted(_ACTION_FIELDS[kind])
+    received_fields = sorted(value)
+    if received_fields != expected_fields:
+        raise ValueError(
+            "action fields do not match the registered schema: "
+            f"expected={expected_fields!r}; received={received_fields!r}"
+        )
     if kind == "write_source":
         if type(value["source"]) is not str or not value["source"].strip():
             raise ValueError("write_source action requires non-empty source")
