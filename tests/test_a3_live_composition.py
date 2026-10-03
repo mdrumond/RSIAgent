@@ -229,6 +229,10 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     )
 
     assert [record["status"] for record in records] == ["failed", "passed"]
+    assert records[0]["terminal_reason"] == "turn-budget-exhausted"
+    assert records[0]["completed_projects"] == 0
+    assert records[0]["failed_project_id"] == SMOKE_PROPOSALS[0].project_id
+    assert "invalid-content" not in first_paths.terminal.read_text()
     assert len(invalid_calls) == 12
     failures = EvidenceLedger(first_paths.evidence).entries
     assert len(failures) == 12
@@ -243,6 +247,36 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     assert retained == (
         first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
     )
+
+
+def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
+    cfg = config(tmp_path)
+    cell = foundation_cells()[0]
+
+    def expensive_actor_factory(selected, _proposal):
+        profile = load_a3_model_profile(selected.backend_model)
+        return lambda *_: A3Completion(
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            40000, {"profile_sha256": profile.fingerprint},
+        )
+
+    deps = LiveDependencies(
+        actor_factory=expensive_actor_factory,
+        candidate_factory=lambda *_: object(),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: object(),
+        execution_profile="bz-a3-1",
+    )
+    composition = LiveComposition(
+        cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
+    )
+    record = SmokeWave(
+        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
+    ).run()[0]
+
+    assert record["status"] == "failed"
+    assert record["terminal_reason"] == "token-budget-exhausted"
+    assert record["completed_projects"] == 0
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):
@@ -605,6 +639,9 @@ def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
             )
             return {
                 "status": "passed",
+                "terminal_reason": "completed",
+                "completed_projects": len(DEFAULT_PROPOSALS),
+                "failed_project_id": None,
                 "evidence_sha256": canonical_digest(selected),
             }
 

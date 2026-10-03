@@ -52,17 +52,22 @@ def full_dry_run() -> dict[str, object]:
 
 
 SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[0],)
+TRIAL_RELIABILITY_SMOKE_PROPOSALS = (DEFAULT_PROPOSALS[3],)
 _SMOKE_QUERY = "A3 Ascend C vector addition tensor movement"
 
 
-def smoke_dry_run() -> dict[str, object]:
-    project = SMOKE_PROPOSALS[0]
+def smoke_dry_run(
+    proposals: Sequence[CurriculumProposal] = SMOKE_PROPOSALS,
+) -> dict[str, object]:
+    selected = tuple(proposals)
+    if len(selected) != 1 or selected[0] not in DEFAULT_PROPOSALS:
+        raise ValueError("smoke requires one registered Phase 1 project")
     body = {
         "schema": "a3-ascendc-foundation-smoke-plan-v1",
         "mode": "smoke",
         "target": "Ascend910B4",
         "language": "ascend-c",
-        "projects": [project.as_dict()],
+        "projects": [selected[0].as_dict()],
     }
     return {**body, "plan_id": canonical_digest(body)}
 
@@ -338,14 +343,36 @@ class Phase1Wave:
         outcome: Mapping[str, object],
         execution_profile: str,
     ) -> dict[str, object]:
-        if set(outcome) != {"status", "evidence_sha256"}:
+        if set(outcome) != {
+            "status", "terminal_reason", "completed_projects", "failed_project_id",
+            "evidence_sha256",
+        }:
             raise ValueError("executor terminal outcome has an invalid schema")
         if outcome["status"] not in {"passed", "failed"}:
             raise ValueError("executor terminal status is invalid")
         if type(outcome["evidence_sha256"]) is not str or _SHA.fullmatch(outcome["evidence_sha256"]) is None:
             raise ValueError("executor terminal evidence digest is invalid")
+        if (
+            type(outcome["terminal_reason"]) is not str
+            or outcome["terminal_reason"] not in {
+                "completed", "token-budget-exhausted", "turn-budget-exhausted",
+            }
+            or type(outcome["completed_projects"]) is not int
+            or outcome["completed_projects"] < 0
+        ):
+            raise ValueError("executor terminal progress is invalid")
+        failed_project_id = outcome["failed_project_id"]
+        if outcome["status"] == "passed":
+            if outcome["terminal_reason"] != "completed" or failed_project_id is not None:
+                raise ValueError("passed executor terminal is inconsistent")
+        elif (
+            outcome["terminal_reason"] == "completed"
+            or type(failed_project_id) is not str
+            or _SHA.fullmatch(failed_project_id) is None
+        ):
+            raise ValueError("failed executor terminal is inconsistent")
         return {
-            "schema": "a3-phase1-cell-terminal-v3",
+            "schema": "a3-phase1-cell-terminal-v4",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
@@ -391,11 +418,21 @@ class Phase1Wave:
             if retained_profile not in A3_EXECUTION_PROFILES:
                 raise ValueError("terminal cell record has an invalid execution profile")
             execution_profile = retained_profile
-        expected = cls._terminal(
-            cell,
-            {"status": value.get("status"), "evidence_sha256": value.get("evidence_sha256")},
-            execution_profile,
-        )
+        try:
+            expected = cls._terminal(
+                cell,
+                {
+                    key: value.get(key) for key in (
+                        "status", "terminal_reason", "completed_projects",
+                        "failed_project_id", "evidence_sha256",
+                    )
+                },
+                execution_profile,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "terminal cell record has foreign or conflicting evidence"
+            ) from exc
         if value != expected:
             raise ValueError("terminal cell record has foreign or conflicting evidence")
         return value
@@ -412,6 +449,7 @@ class SmokeWave(Phase1Wave):
         cells: Sequence[A3ExperimentCell] | None = None,
         execution_profile: str,
         knowledge_identity: Mapping[str, str] | None = None,
+        proposals: Sequence[CurriculumProposal] = SMOKE_PROPOSALS,
     ) -> None:
         super().__init__(
             config, executor, cells=cells, execution_profile=execution_profile
@@ -419,6 +457,8 @@ class SmokeWave(Phase1Wave):
         if execution_profile not in _BZ_A3_EXECUTION_PROFILES:
             raise ValueError("smoke gate requires a BZ-A3 execution profile")
         self._knowledge_identity = _validated_knowledge_identity(knowledge_identity)
+        self.proposals = tuple(proposals)
+        smoke_dry_run(self.proposals)
 
     def paths(self, cell: A3ExperimentCell) -> CellPaths:
         root = self.config.state_root / "smoke-cells" / cell.cell_id
@@ -436,9 +476,9 @@ class SmokeWave(Phase1Wave):
             knowledge = self._knowledge_identity
         profile = load_a3_model_profile(cell.backend_model)
         return {
-            "plan_fingerprint": canonical_digest(smoke_dry_run()),
+            "plan_fingerprint": canonical_digest(smoke_dry_run(self.proposals)),
             "proposal_set_sha256": canonical_digest(
-                [proposal.as_dict() for proposal in SMOKE_PROPOSALS]
+                [proposal.as_dict() for proposal in self.proposals]
             ),
             "model_profile_sha256": profile.fingerprint,
             "profile_driver_sha256": _research_identity()["profile_driver_sha256"],
@@ -512,7 +552,7 @@ class SmokeWave(Phase1Wave):
         static = _research_identity()
         profile = load_a3_model_profile(cell.backend_model)
         expected = {
-            "schema": "a3-phase1-smoke-cell-terminal-v1",
+            "schema": "a3-phase1-smoke-cell-terminal-v2",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
@@ -520,23 +560,28 @@ class SmokeWave(Phase1Wave):
             "knowledge": cell.knowledge.value,
             "profiling": cell.profiling.value,
             "execution_profile": value.get("execution_profile"),
-            "plan_fingerprint": canonical_digest(smoke_dry_run()),
+            "plan_fingerprint": canonical_digest(smoke_dry_run(self.proposals)),
             "proposal_set_sha256": canonical_digest(
-                [proposal.as_dict() for proposal in SMOKE_PROPOSALS]
+                [proposal.as_dict() for proposal in self.proposals]
             ),
             "model_profile_sha256": profile.fingerprint,
             "profile_driver_sha256": static["profile_driver_sha256"],
             "host_fixture_sha256": static["host_fixture_sha256"],
             "knowledge_identity": knowledge,
             "status": value.get("status"),
+            "terminal_reason": value.get("terminal_reason"),
+            "completed_projects": value.get("completed_projects"),
+            "failed_project_id": value.get("failed_project_id"),
             "evidence_sha256": value.get("evidence_sha256"),
         }
         try:
             Phase1Wave._terminal(
                 cell,
                 {
-                    "status": value.get("status"),
-                    "evidence_sha256": value.get("evidence_sha256"),
+                    key: value.get(key) for key in (
+                        "status", "terminal_reason", "completed_projects",
+                        "failed_project_id", "evidence_sha256",
+                    )
                 },
                 str(value.get("execution_profile")),
             )
@@ -558,7 +603,7 @@ class SmokeWave(Phase1Wave):
     ) -> dict[str, object]:
         Phase1Wave._terminal(cell, outcome, self.execution_profile)
         return {
-            "schema": "a3-phase1-smoke-cell-terminal-v1",
+            "schema": "a3-phase1-smoke-cell-terminal-v2",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
@@ -585,8 +630,10 @@ class SmokeWave(Phase1Wave):
         expected = self._smoke_terminal(
             cell,
             {
-                "status": value.get("status"),
-                "evidence_sha256": value.get("evidence_sha256"),
+                key: value.get(key) for key in (
+                    "status", "terminal_reason", "completed_projects",
+                    "failed_project_id", "evidence_sha256",
+                )
             },
             identity,
         )
@@ -600,6 +647,7 @@ __all__ = [
     "Phase1Config",
     "Phase1Wave",
     "SMOKE_PROPOSALS",
+    "TRIAL_RELIABILITY_SMOKE_PROPOSALS",
     "SmokeWave",
     "authenticate_smoke_knowledge",
     "foundation_cells",

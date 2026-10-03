@@ -7,6 +7,7 @@ from benchmarks.a3_experiments import KnowledgeMode
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_wave import (
     SMOKE_PROPOSALS,
+    TRIAL_RELIABILITY_SMOKE_PROPOSALS,
     Phase1Config,
     SmokeWave,
     foundation_cells,
@@ -30,7 +31,11 @@ def config(tmp_path):
 
 
 def outcome(*_args):
-    return {"status": "passed", "evidence_sha256": "a" * 64}
+    return {
+        "status": "passed", "terminal_reason": "completed",
+        "completed_projects": 1, "failed_project_id": None,
+        "evidence_sha256": "a" * 64,
+    }
 
 
 def knowledge_identity(seed="a"):
@@ -59,7 +64,10 @@ def test_smoke_paths_and_terminals_are_isolated_from_full_phase1(tmp_path):
     )
     record = wave.run()[0]
     assert wave.paths(cell).root.parent == cfg.state_root / "smoke-cells"
-    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v1"
+    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v2"
+    assert record["terminal_reason"] == "completed"
+    assert record["completed_projects"] == 1
+    assert record["failed_project_id"] is None
     assert record["knowledge_identity"] is None
     assert record["plan_fingerprint"] == canonical_digest(smoke_dry_run())
     assert record["proposal_set_sha256"] == canonical_digest(
@@ -320,8 +328,15 @@ def test_smoke_shards_are_deterministic_disjoint_and_use_unique_paths(tmp_path):
     assert first_paths.isdisjoint(second_paths)
 
 
+@pytest.mark.parametrize(
+    ("smoke_project", "proposals"),
+    [
+        ("baseline", SMOKE_PROPOSALS),
+        ("runtime-recovery", TRIAL_RELIABILITY_SMOKE_PROPOSALS),
+    ],
+)
 def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
-    tmp_path, monkeypatch, capsys,
+    tmp_path, monkeypatch, capsys, smoke_project, proposals,
 ):
     import run_a3_phase1
 
@@ -354,11 +369,12 @@ def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
         "--profile", "bz-a3-1", "--cpl-remote", "/checked/cpl-remote",
         "--remote-workspace", "/remote/rsi", "--physical-device", "0",
         "--cell-id", cell.cell_id,
+        "--smoke-project", smoke_project,
     ]
     assert run_a3_phase1.main(argv) == 0
     record = json.loads(capsys.readouterr().out)[0]
-    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v1"
+    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v2"
     assert selected == {
-        "proposals": SMOKE_PROPOSALS,
+        "proposals": proposals,
         "lineage_prefix": "smoke",
     }

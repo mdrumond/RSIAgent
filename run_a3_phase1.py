@@ -13,6 +13,7 @@ from benchmarks.a3kernels.phase1_wave import (
     Phase1Config,
     Phase1Wave,
     SMOKE_PROPOSALS,
+    TRIAL_RELIABILITY_SMOKE_PROPOSALS,
     SmokeWave,
     full_dry_run,
     registered_credential_envs,
@@ -65,8 +66,18 @@ def _parser() -> argparse.ArgumentParser:
             )
             command.add_argument("--shard-count", type=int)
             command.add_argument("--shard-index", type=int)
+            if name in ("smoke", "smoke-resume"):
+                command.add_argument(
+                    "--smoke-project",
+                    choices=("baseline", "runtime-recovery"),
+                    default="baseline",
+                )
     smoke_report = sub.add_parser("smoke-report")
     smoke_report.add_argument("--state-root", type=Path, required=True)
+    smoke_report.add_argument(
+        "--smoke-project", choices=("baseline", "runtime-recovery"),
+        default="baseline",
+    )
     return parser
 
 
@@ -133,8 +144,13 @@ def main(argv=None) -> int:
         value = Phase1Wave(cfg, lambda *_: {}).report()
     elif args.command == "smoke-report":
         cfg = Phase1Config(args.state_root, *(Path("/unconfigured") for _ in range(5)))
+        proposals = (
+            TRIAL_RELIABILITY_SMOKE_PROPOSALS
+            if args.smoke_project == "runtime-recovery" else SMOKE_PROPOSALS
+        )
         value = SmokeWave(
-            cfg, lambda *_: {}, execution_profile="bz-a3-1"
+            cfg, lambda *_: {}, execution_profile="bz-a3-1",
+            proposals=proposals,
         ).report()
     elif args.command in ("preflight", "smoke-preflight"):
         cfg = _config(args)
@@ -168,15 +184,21 @@ def main(argv=None) -> int:
             physical_device=args.physical_device, environ=os.environ,
         )
         if smoke:
+            proposals = (
+                TRIAL_RELIABILITY_SMOKE_PROPOSALS
+                if args.smoke_project == "runtime-recovery"
+                else SMOKE_PROPOSALS
+            )
             wave = SmokeWave(
                 cfg,
                 LiveComposition(
-                    cfg, dependencies, proposals=SMOKE_PROPOSALS,
+                    cfg, dependencies, proposals=proposals,
                     lineage_prefix="smoke",
                 ).execute,
                 cells=cells,
                 execution_profile=args.profile,
                 knowledge_identity=local_preflight["knowledge_identity"],
+                proposals=proposals,
             )
         else:
             wave = Phase1Wave(
