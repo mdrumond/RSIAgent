@@ -702,7 +702,7 @@ class A3TrialLoop:
         core = {
             "source-required": ("write_source",),
             "rewrite-required": ("write_source",),
-            "compile-required": ("compile", "write_source"),
+            "compile-required": ("compile",),
             "compile-retry": ("compile",),
             "run-required": ("run", "write_source"),
             "run-retry": ("run",),
@@ -736,7 +736,9 @@ class A3TrialLoop:
                     ),
                     "trial_state": state,
                     "required_next_action": (
-                        "write_source" if state == "rewrite-required" else None
+                        "write_source" if state == "rewrite-required"
+                        else "compile" if state == "compile-required"
+                        else None
                     ),
                 },
                 "allowed_actions": {

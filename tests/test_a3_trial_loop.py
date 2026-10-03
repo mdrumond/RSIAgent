@@ -221,8 +221,8 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
         "write_source": ["action", "source"],
     }
     assert after_write["action_contract"]["trial_state"] == "compile-required"
-    assert after_write["action_contract"]["required_next_action"] is None
-    assert set(after_write["allowed_actions"]) == {"compile", "write_source"}
+    assert after_write["action_contract"]["required_next_action"] == "compile"
+    assert set(after_write["allowed_actions"]) == {"compile"}
     assert first["action_contract"] == {
         "profile_metric": "PipeUtilization",
         "eligible_submit_supports": [],
@@ -386,6 +386,59 @@ def test_deterministic_failure_requires_changed_source_without_backend_reentry(t
         "required_next_action": "write_source",
         "trial_state": "rewrite-required",
     }
+
+
+def test_changed_source_requires_compile_before_another_rewrite(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+    later_rewrite = SOURCE.replace(" {}", " { uint32_t unused = count; }")
+
+    class FailOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_calls = []
+
+        def compile(self, source, workdir, **options):
+            self.compile_calls.append(source)
+            if len(self.compile_calls) == 1:
+                plan = self._plan(
+                    source, options["request_id"], options["attempt_id"],
+                    options["length"], options["project_id"],
+                    options.get("padded_length"), options.get("block_count", 1),
+                    options.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="compile", error_type="CompileError",
+                    detail="ordinary deterministic compile failure",
+                )
+            return super().compile(source, workdir, **options)
+
+    candidate = FailOnce()
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        json.dumps({"action": "write_source", "source": later_rewrite}),
+        json.dumps({"action": "write_source", "source": later_rewrite}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=candidate)
+
+    assert result.status == "passed"
+    assert candidate.compile_calls == [SOURCE, replacement]
+    post_rewrite = json.loads(prompts[3])
+    assert post_rewrite["action_contract"] == {
+        "eligible_submit_supports": [],
+        "profile_metric": "PipeUtilization",
+        "required_next_action": "compile",
+        "trial_state": "compile-required",
+    }
+    assert set(post_rewrite["allowed_actions"]) == {"compile"}
+    assert result.failures[-2:] == (
+        "write_source is not valid in compile-required",
+        "write_source is not valid in compile-required",
+    )
 
 
 def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
