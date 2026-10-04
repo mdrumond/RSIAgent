@@ -160,6 +160,7 @@ def trial_protocol_sha256(
             },
             "token_ceiling": "absolute",
             "rewrite_required": "terminate",
+            "rewrite_terminal_status": "attempt-rewrite-required",
         },
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
@@ -398,6 +399,67 @@ def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
     assert record["status"] == "failed"
     assert record["terminal_reason"] == "token-budget-exhausted"
     assert record["completed_projects"] == 0
+
+
+def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    calls = []
+    actions = (
+        [{"action": "compile"}] * 23
+        + [{"action": "write_source", "source": SOURCE},
+           {"action": "compile"}, {"action": "run"},
+           {"action": "write_source", "source": SOURCE + "\n"}]
+    )
+
+    def late_actor_factory(_cell, _proposal):
+        iterator = iter(actions)
+        def actor(profile, _context):
+            calls.append("actor")
+            return A3Completion(
+                json.dumps(next(iterator)), 1,
+                {"profile_sha256": profile.fingerprint},
+            )
+        return actor
+
+    class HostMismatch(FakeCandidate):
+        def run(self, source, _workdir, **options):
+            plan = self.base.plan(source, **options)
+            output = (0.0,) * plan.padded_length
+            return VerifiedResult.from_receipt(
+                plan, ExecutionReceipt(0, output),
+                max_abs_error=max(
+                    abs(a + b) for a, b in zip(plan.input_a, plan.input_b)
+                ),
+            )
+
+    deps = LiveDependencies(
+        actor_factory=late_actor_factory,
+        candidate_factory=lambda _cell, proposal, _paths: HostMismatch(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    wave = SmokeWave(
+        cfg,
+        LiveComposition(
+            cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
+        ).execute,
+        cells=(cell,), execution_profile="bz-a3-1",
+    )
+
+    record = wave.run()[0]
+    assert record["status"] == "failed"
+    assert record["terminal_reason"] == "attempt-rewrite-required"
+    assert len(calls) == 26
+    assert wave.report()["records"][0]["terminal_reason"] == (
+        "attempt-rewrite-required"
+    )
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):

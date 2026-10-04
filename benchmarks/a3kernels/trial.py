@@ -172,6 +172,7 @@ def trial_protocol_sha256() -> str:
             },
             "token_ceiling": "absolute",
             "rewrite_required": "terminate",
+            "rewrite_terminal_status": "attempt-rewrite-required",
         },
         "model_budgets": model_budgets,
     })
@@ -365,6 +366,13 @@ class A3TrialLoop:
                         self._retain_candidate_failure(
                             turn, "compile", compile_result, failures, observations
                         )
+                        if in_completion and rewrite_source is not None:
+                            return TrialResult(
+                                "attempt-rewrite-required", turn, tokens,
+                                verified, profile_result, queries,
+                                tuple(failures),
+                                completion_turns=completion_turns,
+                            )
                         continue
                     if not isinstance(compile_result, CandidateCompilation):
                         raise TypeError("candidate compiler returned an invalid result")
@@ -397,6 +405,13 @@ class A3TrialLoop:
                         self._retain_candidate_failure(
                             turn, "run", result, failures, observations
                         )
+                        if in_completion and rewrite_source is not None:
+                            return TrialResult(
+                                "attempt-rewrite-required", turn, tokens,
+                                verified, profile_result, queries,
+                                tuple(failures),
+                                completion_turns=completion_turns,
+                            )
                         continue
                     if not isinstance(result, VerifiedResult):
                         raise TypeError("candidate runner returned an invalid result")
@@ -408,6 +423,13 @@ class A3TrialLoop:
                         self._retain_verification_failure(
                             turn, result, failures, observations
                         )
+                        if in_completion:
+                            return TrialResult(
+                                "attempt-rewrite-required", turn, tokens,
+                                verified, profile_result, queries,
+                                tuple(failures),
+                                completion_turns=completion_turns,
+                            )
                         continue
                     verified = result
                     rewrite_source = None

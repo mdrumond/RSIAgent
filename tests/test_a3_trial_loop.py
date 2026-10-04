@@ -1252,10 +1252,48 @@ def test_deterministic_completion_failure_terminates_without_requesting_rewrite(
         candidate=DeterministicCompileFailure(),
         budgets=TrialBudgets(24, 2000),
     )
-    assert result.status == "budget-exhausted"
+    assert result.status == "attempt-rewrite-required"
     assert result.turns == 25 and result.completion_turns == 1
     assert len(prompts) == 25
     assert result.failures[-1] == "compile failed: source rewrite required"
+
+
+def test_completion_host_mismatch_is_distinct_and_stops_before_source_rewrite(
+    tmp_path,
+):
+    class HostMismatch(FakeCandidate):
+        def run(self, source, _workdir, **kw):
+            plan = self._plan(
+                source, kw["request_id"], kw["attempt_id"], kw["length"],
+                kw["project_id"], kw.get("padded_length"),
+                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+            )
+            return VerifiedResult.from_receipt(
+                plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
+                max_abs_error=3.0,
+            )
+
+    result, prompts, _ = _run(
+        tmp_path,
+        _late_candidate_actions([
+            '{"action":"compile"}', '{"action":"run"}',
+            json.dumps({"action": "write_source", "source": SOURCE + "\n"}),
+        ]),
+        candidate=HostMismatch(), budgets=TrialBudgets(24, 2000),
+    )
+
+    assert result.status == "attempt-rewrite-required"
+    assert result.turns == 26 and result.completion_turns == 2
+    assert len(prompts) == 26
+    assert result.verified is None
+    assert result.failures[-1].startswith("host verification failed:")
+    failures = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    retained = [
+        entry.payload["failed_verification"] for entry in failures
+        if "failed_verification" in entry.payload
+    ]
+    assert len(retained) == 1
+    assert retained[0]["max_abs_error"] == 3.0
 
 
 def test_token_ceiling_is_absolute_during_attempt_completion(tmp_path):

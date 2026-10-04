@@ -65,6 +65,7 @@ def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
             },
             "token_ceiling": "absolute",
             "rewrite_required": "terminate",
+            "rewrite_terminal_status": "attempt-rewrite-required",
         },
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
