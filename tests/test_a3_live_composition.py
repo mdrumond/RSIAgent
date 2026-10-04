@@ -252,15 +252,29 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     )
     cfg = config(tmp_path)
     composition = LiveComposition(cfg, deps, proposals=(proposal,))
-    paths = Phase1Wave(cfg, composition.execute, cells=(cell,)).paths(cell)
+    wave = Phase1Wave(
+        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    )
+    record = wave.run()[0]
 
-    result = composition.execute(cell, paths)
-
-    assert result["status"] == "failed"
-    assert result["terminal_reason"] == "infrastructure-unverified"
-    assert result["completed_projects"] == 0
+    assert record["status"] == "failed"
+    assert record["terminal_reason"] == "infrastructure-unverified"
+    assert record["completed_projects"] == 0
     assert candidate.compile_calls == 1
     assert model_calls == []
+    reloaded = Phase1Wave(
+        cfg,
+        lambda *_: pytest.fail("persisted failure replayed the recovery starter"),
+        cells=(cell,), execution_profile="bz-a3-1", proposals=(proposal,),
+    )
+    assert reloaded.resume() == (record,)
+    assert reloaded.report() == {
+        "schema": "a3-phase1-foundation-report-v1",
+        "counts": {"failed": 1},
+        "records": [record],
+    }
+    paths = wave.paths(cell)
     failures = [
         json.loads(line)["payload"].get("failed_evidence")
         for line in paths.evidence.read_text().splitlines()
@@ -268,6 +282,70 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     ]
     assert [failure["error_type"] for failure in failures] == [
         "AmbiguousRemoteOutcome"
+    ]
+
+
+def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
+    proposal = next(
+        item for item in DEFAULT_PROPOSALS
+        if item.family.value == "runtime-recovery"
+    )
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+
+    class AmbiguousStarterRun(FakeCandidate):
+        def __init__(self):
+            super().__init__(proposal)
+            self.compile_calls = self.run_calls = 0
+
+        def compile(self, source, workdir, **options):
+            self.compile_calls += 1
+            return super().compile(source, workdir, **options)
+
+        def run(self, source, workdir, **options):
+            self.run_calls += 1
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(
+                plan, stage="execute", error_type="AmbiguousRemoteOutcome",
+                detail="retained runtime operation has no observable result",
+            )
+
+    candidate = AmbiguousStarterRun()
+    model_calls = []
+    deps = LiveDependencies(
+        actor_factory=lambda *_: (
+            lambda *_args: model_calls.append(True) or pytest.fail(
+                "ambiguous starter requested a model repair"
+            )
+        ),
+        candidate_factory=lambda *_: candidate,
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    composition = LiveComposition(cfg, deps, proposals=(proposal,))
+    paths = Phase1Wave(
+        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+
+    result = composition.execute(cell, paths)
+
+    assert result["terminal_reason"] == "infrastructure-unverified"
+    assert (candidate.compile_calls, candidate.run_calls) == (1, 1)
+    assert model_calls == []
+    failures = [
+        json.loads(line)["payload"].get("failed_evidence")
+        for line in paths.evidence.read_text().splitlines()
+        if json.loads(line)["kind"] == "failure"
+    ]
+    assert [(failure["stage"], failure["error_type"]) for failure in failures] == [
+        ("execute", "AmbiguousRemoteOutcome")
     ]
 
 
