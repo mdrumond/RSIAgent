@@ -54,8 +54,9 @@ def knowledge_identity(seed="a"):
 
 def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
     value = {
-        "schema": "a3-trial-protocol-v2",
+        "schema": "a3-trial-protocol-v3",
         "candidate_validation_exception": "rewrite-required",
+        "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
         "attempt_completion": {
             "schema": "a3-attempt-completion-v1",
             "source_frozen": True,
@@ -138,6 +139,39 @@ def test_runtime_recovery_preflight_and_terminal_share_proposal_identity(tmp_pat
         smoke_dry_run(TRIAL_RELIABILITY_SMOKE_PROPOSALS)
     )
     assert wave.report()["records"] == [record]
+
+
+def test_smoke_persists_and_reloads_infrastructure_unverified_terminal(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.knowledge is KnowledgeMode.WITHOUT_KDB
+    )
+    proposal = TRIAL_RELIABILITY_SMOKE_PROPOSALS[0]
+    failure = {
+        "status": "failed",
+        "terminal_reason": "infrastructure-unverified",
+        "completed_projects": 0,
+        "failed_project_id": proposal.project_id,
+        "evidence_sha256": "f" * 64,
+    }
+    wave = SmokeWave(
+        cfg, lambda *_: failure, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    )
+
+    record = wave.run()[0]
+    reloaded = SmokeWave(
+        cfg, lambda *_: pytest.fail("persisted smoke failure was replayed"),
+        cells=(cell,), execution_profile="bz-a3-1", proposals=(proposal,),
+    )
+
+    assert reloaded.resume() == (record,)
+    assert reloaded.report() == {
+        "schema": "a3-phase1-foundation-smoke-report-v1",
+        "counts": {"failed": 1},
+        "records": [record],
+    }
 
 
 def test_smoke_terminal_rejects_contradictory_project_progress(tmp_path):

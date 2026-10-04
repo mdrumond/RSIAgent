@@ -168,7 +168,7 @@ class GZA3RemoteCandidateBackend:
             )
         if completed.returncode != 0:
             return FailedEvidence.create(
-                plan, stage="compile", error_type="RemoteExecutionError",
+                plan, stage="compile", error_type=self._operation_error_type(completed),
                 detail=(completed.stderr or completed.stdout or "remote execution failed").strip(),
             )
         try:
@@ -213,7 +213,7 @@ class GZA3RemoteCandidateBackend:
             )
         if completed.returncode != 0:
             return FailedEvidence.create(
-                plan, stage="execute", error_type="RemoteExecutionError",
+                plan, stage="execute", error_type=self._operation_error_type(completed),
                 detail=(completed.stderr or completed.stdout or "remote execution failed").strip(),
             )
         try:
@@ -239,6 +239,11 @@ class GZA3RemoteCandidateBackend:
         result = VerifiedResult.from_receipt(plan, receipt, max_abs_error=maximum)
         self._pending_path(plan, "execute").unlink(missing_ok=True)
         return result
+
+    def _operation_error_type(
+        self, completed: subprocess.CompletedProcess[str],
+    ) -> str:
+        return "RemoteExecutionError"
 
     def run(self, plan: ExecutionPlan, local_directory: Path) -> VerifiedResult | FailedEvidence:
         compiled = self.compile(plan, local_directory)

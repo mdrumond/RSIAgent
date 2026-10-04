@@ -148,9 +148,10 @@ def trial_protocol_sha256(
     openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
 ):
     value = {
-        "schema": "a3-trial-protocol-v2",
+        "schema": "a3-trial-protocol-v3",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
+        "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
         "attempt_completion": {
             "schema": "a3-attempt-completion-v1",
             "source_frozen": True,
@@ -178,6 +179,7 @@ def trial_protocol_sha256(
         value["schema"] = "a3-trial-protocol-v1"
         del value["attempt_completion"]
         del value["candidate_validation_exception"]
+        del value["recovery_starter_ambiguous_outcome"]
     return canonical_digest(value)
 
 
@@ -205,6 +207,146 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
         ]
         assert {item.get("stage") for item in failures} >= {"compile", "verify"}
     assert Phase1Wave(cfg, composition.execute).resume() == records
+
+
+def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
+    tmp_path,
+):
+    proposal = next(
+        item for item in DEFAULT_PROPOSALS
+        if item.family.value == "runtime-recovery"
+    )
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+
+    class AmbiguousStarter(FakeCandidate):
+        def __init__(self):
+            super().__init__(proposal)
+            self.compile_calls = 0
+
+        def compile(self, source, workdir, **options):
+            self.compile_calls += 1
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="AmbiguousRemoteOutcome",
+                detail="retained operation completed without an observable result",
+            )
+
+    candidate = AmbiguousStarter()
+    model_calls = []
+
+    def unexpected_actor(*_args):
+        model_calls.append(True)
+        raise AssertionError("recovery did not stop at the forced starter")
+
+    deps = LiveDependencies(
+        actor_factory=lambda *_: unexpected_actor,
+        candidate_factory=lambda *_: candidate,
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    composition = LiveComposition(cfg, deps, proposals=(proposal,))
+    wave = Phase1Wave(
+        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    )
+    record = wave.run()[0]
+
+    assert record["status"] == "failed"
+    assert record["terminal_reason"] == "infrastructure-unverified"
+    assert record["completed_projects"] == 0
+    assert candidate.compile_calls == 1
+    assert model_calls == []
+    reloaded = Phase1Wave(
+        cfg,
+        lambda *_: pytest.fail("persisted failure replayed the recovery starter"),
+        cells=(cell,), execution_profile="bz-a3-1", proposals=(proposal,),
+    )
+    assert reloaded.resume() == (record,)
+    assert reloaded.report() == {
+        "schema": "a3-phase1-foundation-report-v1",
+        "counts": {"failed": 1},
+        "records": [record],
+    }
+    paths = wave.paths(cell)
+    failures = [
+        json.loads(line)["payload"].get("failed_evidence")
+        for line in paths.evidence.read_text().splitlines()
+        if json.loads(line)["kind"] == "failure"
+    ]
+    assert [failure["error_type"] for failure in failures] == [
+        "AmbiguousRemoteOutcome"
+    ]
+
+
+def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
+    proposal = next(
+        item for item in DEFAULT_PROPOSALS
+        if item.family.value == "runtime-recovery"
+    )
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+
+    class AmbiguousStarterRun(FakeCandidate):
+        def __init__(self):
+            super().__init__(proposal)
+            self.compile_calls = self.run_calls = 0
+
+        def compile(self, source, workdir, **options):
+            self.compile_calls += 1
+            return super().compile(source, workdir, **options)
+
+        def run(self, source, workdir, **options):
+            self.run_calls += 1
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(
+                plan, stage="execute", error_type="AmbiguousRemoteOutcome",
+                detail="retained runtime operation has no observable result",
+            )
+
+    candidate = AmbiguousStarterRun()
+    model_calls = []
+    deps = LiveDependencies(
+        actor_factory=lambda *_: (
+            lambda *_args: model_calls.append(True) or pytest.fail(
+                "ambiguous starter requested a model repair"
+            )
+        ),
+        candidate_factory=lambda *_: candidate,
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    composition = LiveComposition(cfg, deps, proposals=(proposal,))
+    paths = Phase1Wave(
+        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+
+    result = composition.execute(cell, paths)
+
+    assert result["terminal_reason"] == "infrastructure-unverified"
+    assert (candidate.compile_calls, candidate.run_calls) == (1, 1)
+    assert model_calls == []
+    failures = [
+        json.loads(line)["payload"].get("failed_evidence")
+        for line in paths.evidence.read_text().splitlines()
+        if json.loads(line)["kind"] == "failure"
+    ]
+    assert [(failure["stage"], failure["error_type"]) for failure in failures] == [
+        ("execute", "AmbiguousRemoteOutcome")
+    ]
 
 
 def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
