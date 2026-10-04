@@ -161,7 +161,18 @@ def trial_protocol_sha256() -> str:
             "max_tokens": budgets.max_tokens,
         }
     return canonical_digest({
-        "schema": "a3-trial-protocol-v3",
+        "schema": "a3-trial-protocol-v4",
+        "infrastructure_retry": {
+            "max_retries": 3,
+            "backoff_seconds": 120,
+            "retryable_status": "infrastructure-unverified",
+            "journal_schema": "a3-infrastructure-retry-v1",
+            "attempt_outcome_required_before_decision": True,
+            "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "interrupted_started_outcome": "terminal-infrastructure-unverified",
+            "cell_execution": "exclusive-nonblocking",
+            "memory_commit_reconciliation": "authenticated-passed-outcome",
+        },
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
         "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
@@ -214,6 +225,7 @@ class A3TrialLoop:
         budgets: TrialBudgets | None = None,
         timing_dimensions: StudyDimensions | None = None,
         execution_profile: str = "gz-a3",
+        infrastructure_attempt_ordinal: int = 0,
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -233,6 +245,12 @@ class A3TrialLoop:
         if execution_profile not in A3_EXECUTION_PROFILES:
             raise ValueError("trial execution_profile must be a registered A3 profile")
         self.execution_profile = execution_profile
+        if (
+            type(infrastructure_attempt_ordinal) is not int
+            or not 0 <= infrastructure_attempt_ordinal <= 3
+        ):
+            raise ValueError("infrastructure attempt ordinal must be in [0, 3]")
+        self.infrastructure_attempt_ordinal = infrastructure_attempt_ordinal
         if timing_dimensions is not None and not isinstance(timing_dimensions, StudyDimensions):
             raise TypeError("timing_dimensions must be StudyDimensions")
         self.timing_dimensions = timing_dimensions
@@ -353,7 +371,9 @@ class A3TrialLoop:
                     if source is None:
                         raise ValueError("write_source is required before compile")
                     if compile_attempt_id is None:
-                        compile_attempt_id = f"turn-{turn}"
+                        compile_attempt_id = (
+                            f"infra-{self.infrastructure_attempt_ordinal}-turn-{turn}"
+                        )
                     verified = profile_result = timing_result = None
                     try:
                         compile_result = self.candidate.compile(
@@ -390,6 +410,16 @@ class A3TrialLoop:
                             )
                         continue
                     if isinstance(compile_result, FailedEvidence):
+                        if compile_result.error_type == "AmbiguousRemoteOutcome":
+                            self._retain_candidate_failure(
+                                turn, "compile", compile_result, failures,
+                                observations, next_action="terminate-project",
+                            )
+                            return TrialResult(
+                                "infrastructure-unverified", turn, tokens,
+                                verified, profile_result, queries, tuple(failures),
+                                completion_turns=completion_turns,
+                            )
                         if not self._retryable_failure("compile", compile_result):
                             compile_attempt_id = None
                             rewrite_source = source
@@ -420,7 +450,9 @@ class A3TrialLoop:
                         raise ValueError("successful compile is required before run")
                     verified = profile_result = timing_result = None
                     if run_attempt_id is None:
-                        run_attempt_id = f"turn-{turn}"
+                        run_attempt_id = (
+                            f"infra-{self.infrastructure_attempt_ordinal}-turn-{turn}"
+                        )
                     try:
                         result = self.candidate.run(
                             source, self.workdir, request_id=self.cell.cell_id,
@@ -456,6 +488,16 @@ class A3TrialLoop:
                             )
                         continue
                     if isinstance(result, FailedEvidence):
+                        if result.error_type == "AmbiguousRemoteOutcome":
+                            self._retain_candidate_failure(
+                                turn, "run", result, failures, observations,
+                                next_action="terminate-project",
+                            )
+                            return TrialResult(
+                                "infrastructure-unverified", turn, tokens,
+                                verified, profile_result, queries, tuple(failures),
+                                completion_turns=completion_turns,
+                            )
                         if not self._retryable_failure("run", result):
                             run_attempt_id = None
                             rewrite_source = source
@@ -590,6 +632,9 @@ class A3TrialLoop:
             if entry.payload.get("cell_id") == self.cell.cell_id
             and entry.payload.get("project_id") == self.proposal.project_id
             and entry.payload.get("execution_profile") == self.execution_profile
+            and "infrastructure_retry" not in entry.payload
+            and entry.payload.get("infrastructure_attempt_ordinal", 0)
+            == self.infrastructure_attempt_ordinal
         ]
         if not retained:
             return 0, 0, [], []
@@ -808,6 +853,7 @@ class A3TrialLoop:
             "execution_profile": self.execution_profile,
             "runtime": "native-ascend-c",
             "cell_id": self.cell.cell_id, "project_id": self.proposal.project_id,
+            "infrastructure_attempt_ordinal": self.infrastructure_attempt_ordinal,
             **payload,
         }
 

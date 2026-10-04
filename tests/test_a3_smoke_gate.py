@@ -39,6 +39,8 @@ def outcome(*_args):
         "status": "passed", "terminal_reason": "completed",
         "completed_projects": 1, "failed_project_id": None,
         "evidence_sha256": "a" * 64,
+        "infrastructure_retries_used": 0,
+        "infrastructure_retry_evidence_sha256": canonical_digest([]),
     }
 
 
@@ -54,7 +56,17 @@ def knowledge_identity(seed="a"):
 
 def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
     value = {
-        "schema": "a3-trial-protocol-v3",
+        "schema": "a3-trial-protocol-v4",
+        "infrastructure_retry": {
+            "max_retries": 3, "backoff_seconds": 120,
+            "retryable_status": "infrastructure-unverified",
+            "journal_schema": "a3-infrastructure-retry-v1",
+            "attempt_outcome_required_before_decision": True,
+            "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "interrupted_started_outcome": "terminal-infrastructure-unverified",
+            "cell_execution": "exclusive-nonblocking",
+            "memory_commit_reconciliation": "authenticated-passed-outcome",
+        },
         "candidate_validation_exception": "rewrite-required",
         "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
         "attempt_completion": {
@@ -107,7 +119,7 @@ def test_smoke_paths_and_terminals_are_isolated_from_full_phase1(tmp_path):
     )
     record = wave.run()[0]
     assert wave.paths(cell).root.parent == cfg.state_root / "smoke-cells"
-    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v2"
+    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v3"
     assert record["terminal_reason"] == "completed"
     assert record["completed_projects"] == 1
     assert record["failed_project_id"] is None
@@ -154,6 +166,8 @@ def test_smoke_persists_and_reloads_infrastructure_unverified_terminal(tmp_path)
         "completed_projects": 0,
         "failed_project_id": proposal.project_id,
         "evidence_sha256": "f" * 64,
+        "infrastructure_retries_used": 3,
+        "infrastructure_retry_evidence_sha256": "e" * 64,
     }
     wave = SmokeWave(
         cfg, lambda *_: failure, cells=(cell,), execution_profile="bz-a3-1",
@@ -168,7 +182,7 @@ def test_smoke_persists_and_reloads_infrastructure_unverified_terminal(tmp_path)
 
     assert reloaded.resume() == (record,)
     assert reloaded.report() == {
-        "schema": "a3-phase1-foundation-smoke-report-v1",
+        "schema": "a3-phase1-foundation-smoke-report-v2",
         "counts": {"failed": 1},
         "records": [record],
     }
@@ -534,7 +548,7 @@ def test_cli_smoke_selects_one_project_composition_and_smoke_terminal(
     ]
     assert run_a3_phase1.main(argv) == 0
     record = json.loads(capsys.readouterr().out)[0]
-    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v2"
+    assert record["schema"] == "a3-phase1-smoke-cell-terminal-v3"
     assert selected == {
         "proposals": proposals,
         "preflight_proposals": proposals,

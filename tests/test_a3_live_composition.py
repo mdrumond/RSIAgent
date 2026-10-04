@@ -1,5 +1,6 @@
 import json
 from dataclasses import dataclass
+import fcntl
 from pathlib import PurePosixPath
 
 import pytest
@@ -39,6 +40,7 @@ from benchmarks.a3kernels.profiling import (
     StudyDimensions,
     TimingResult,
 )
+from benchmarks.a3kernels.trial import TrialResult
 
 
 SOURCE = '''extern "C" __global__ __aicore__ void vector_add(
@@ -148,7 +150,17 @@ def trial_protocol_sha256(
     openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
 ):
     value = {
-        "schema": "a3-trial-protocol-v3",
+        "schema": "a3-trial-protocol-v4",
+        "infrastructure_retry": {
+            "max_retries": 3, "backoff_seconds": 120,
+            "retryable_status": "infrastructure-unverified",
+            "journal_schema": "a3-infrastructure-retry-v1",
+            "attempt_outcome_required_before_decision": True,
+            "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "interrupted_started_outcome": "terminal-infrastructure-unverified",
+            "cell_execution": "exclusive-nonblocking",
+            "memory_commit_reconciliation": "authenticated-passed-outcome",
+        },
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
         "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
@@ -180,6 +192,7 @@ def trial_protocol_sha256(
         del value["attempt_completion"]
         del value["candidate_validation_exception"]
         del value["recovery_starter_ambiguous_outcome"]
+        del value["infrastructure_retry"]
     return canonical_digest(value)
 
 
@@ -251,7 +264,10 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
         execution_profile="bz-a3-1",
     )
     cfg = config(tmp_path)
-    composition = LiveComposition(cfg, deps, proposals=(proposal,))
+    sleeps = []
+    composition = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    )
     wave = Phase1Wave(
         cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
         proposals=(proposal,),
@@ -261,7 +277,8 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     assert record["status"] == "failed"
     assert record["terminal_reason"] == "infrastructure-unverified"
     assert record["completed_projects"] == 0
-    assert candidate.compile_calls == 1
+    assert candidate.compile_calls == 4
+    assert sleeps == [120, 120, 120]
     assert model_calls == []
     reloaded = Phase1Wave(
         cfg,
@@ -270,7 +287,7 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     )
     assert reloaded.resume() == (record,)
     assert reloaded.report() == {
-        "schema": "a3-phase1-foundation-report-v1",
+            "schema": "a3-phase1-foundation-report-v2",
         "counts": {"failed": 1},
         "records": [record],
     }
@@ -282,7 +299,7 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
     ]
     assert [failure["error_type"] for failure in failures] == [
         "AmbiguousRemoteOutcome"
-    ]
+    ] * 4
 
 
 def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
@@ -328,7 +345,10 @@ def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
         execution_profile="bz-a3-1",
     )
     cfg = config(tmp_path)
-    composition = LiveComposition(cfg, deps, proposals=(proposal,))
+    sleeps = []
+    composition = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    )
     paths = Phase1Wave(
         cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
         proposals=(proposal,),
@@ -337,7 +357,9 @@ def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
     result = composition.execute(cell, paths)
 
     assert result["terminal_reason"] == "infrastructure-unverified"
-    assert (candidate.compile_calls, candidate.run_calls) == (1, 1)
+    assert candidate.run_calls == 4
+    assert sleeps == [120, 120, 120]
+    assert candidate.compile_calls == 4
     assert model_calls == []
     failures = [
         json.loads(line)["payload"].get("failed_evidence")
@@ -346,7 +368,408 @@ def test_runtime_recovery_starter_run_loss_stops_before_model_repair(tmp_path):
     ]
     assert [(failure["stage"], failure["error_type"]) for failure in failures] == [
         ("execute", "AmbiguousRemoteOutcome")
+    ] * 4
+
+
+@pytest.mark.parametrize("operation", ["compile", "run"])
+def test_ordinary_ambiguous_candidate_evidence_uses_infrastructure_retries(
+    tmp_path, operation,
+):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    attempts, sleeps = [], []
+
+    class AmbiguousCandidate(FakeCandidate):
+        def _ambiguous(self, source, options, stage):
+            attempts.append(options["attempt_id"])
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(
+                plan, stage=stage, error_type="AmbiguousRemoteOutcome",
+                detail="ordinary candidate result unavailable",
+            )
+
+        def compile(self, source, workdir, **options):
+            if operation == "compile":
+                return self._ambiguous(source, options, "compile")
+            return super().compile(source, workdir, **options)
+
+        def run(self, source, workdir, **options):
+            if operation == "run":
+                return self._ambiguous(source, options, "execute")
+            return super().run(source, workdir, **options)
+
+    deps = LiveDependencies(
+        actor_factory=actor_factory,
+        candidate_factory=lambda *args: AmbiguousCandidate(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["terminal_reason"] == "infrastructure-unverified"
+    assert result["infrastructure_retries_used"] == 3
+    assert sleeps == [120, 120, 120]
+    assert len(attempts) == 4
+    failures = [
+        entry.payload["failed_evidence"]
+        for entry in EvidenceLedger(paths.evidence).entries
+        if "failed_evidence" in entry.payload
     ]
+    assert all(item["error_type"] == "AmbiguousRemoteOutcome" for item in failures)
+
+
+def test_cell_execution_lock_rejects_concurrent_same_process_run(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = foundation_cells()[0]
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+    paths.root.mkdir(parents=True)
+    lock_path = paths.root / "execution.lock"
+    calls = []
+    forbidden = lambda *_: calls.append("called") or pytest.fail(
+        "locked cell reached a live dependency"
+    )
+    deps = LiveDependencies(
+        actor_factory=forbidden, candidate_factory=forbidden,
+        knowledge_factory=forbidden, profiler_factory=forbidden,
+        execution_profile="bz-a3-1",
+    )
+
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="cell execution already active"):
+            LiveComposition(cfg, deps, proposals=(proposal,)).execute(cell, paths)
+
+    assert calls == []
+
+
+def test_committed_memory_repairs_missing_passed_attempt_outcome(
+    tmp_path, monkeypatch,
+):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+    original = LiveComposition._append_attempt_outcome.__func__
+
+    def crash_after_memory(cls, evidence, **kwargs):
+        if kwargs["trial"].status == "passed":
+            raise KeyboardInterrupt()
+        return original(cls, evidence, **kwargs)
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            LiveComposition, "_append_attempt_outcome",
+            classmethod(crash_after_memory),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            LiveComposition(
+                cfg, dependencies([], []), proposals=(proposal,),
+            ).execute(cell, paths)
+
+    memory_entry = json.loads(paths.memory.read_text().splitlines()[0])
+    calls = []
+    forbidden = lambda *_: calls.append("called") or pytest.fail(
+        "committed project was re-executed"
+    )
+    deps = LiveDependencies(
+        actor_factory=forbidden, candidate_factory=forbidden,
+        knowledge_factory=forbidden, profiler_factory=forbidden,
+        execution_profile="gz-a3",
+    )
+
+    result = LiveComposition(cfg, deps, proposals=(proposal,)).execute(cell, paths)
+
+    assert result["status"] == "passed"
+    assert calls == []
+    retry = LiveComposition._retry_entries(EvidenceLedger(paths.evidence))[-1]
+    outcome = retry.payload["infrastructure_retry"]
+    assert outcome["event"] == "outcome"
+    assert outcome["trial_status"] == "passed"
+    assert outcome["memory_entry_sha256"] == memory_entry["entry_sha256"]
+
+
+@pytest.mark.parametrize("failures_before_success", [1, 2, 3])
+def test_infrastructure_retry_succeeds_at_each_boundary_with_fresh_dependencies(
+    tmp_path, failures_before_success,
+):
+    proposal = DEFAULT_PROPOSALS[2]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    factory_calls, attempted_ids, profiler_calls, actor_calls, sleeps = [], [], [], [], []
+
+    class AttemptCandidate(FakeCandidate):
+        def __init__(self, ordinal):
+            super().__init__(proposal)
+            self.ordinal = ordinal
+
+        def compile(self, source, workdir, **options):
+            attempted_ids.append(options["attempt_id"])
+            if self.ordinal < failures_before_success:
+                plan = self.base.plan(source, **options)
+                return FailedEvidence.create(
+                    plan, stage="compile", error_type="AmbiguousRemoteOutcome",
+                    detail="launch result unavailable",
+                )
+            return super().compile(source, workdir, **options)
+
+    def candidate_factory(*_args):
+        ordinal = len(factory_calls)
+        factory_calls.append(ordinal)
+        return AttemptCandidate(ordinal)
+
+    def retry_actor_factory(selected, selected_proposal):
+        actor_calls.append(len(actor_calls))
+        return actor_factory(selected, selected_proposal)
+
+    def profiler_factory(cell, proposal, paths, candidate):
+        profiler_calls.append(len(profiler_calls))
+        return FakeProfiler(False, [])
+
+    deps = LiveDependencies(
+        actor_factory=retry_actor_factory,
+        candidate_factory=candidate_factory,
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=profiler_factory,
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    composition = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    )
+    paths = Phase1Wave(
+        cfg, composition.execute, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+
+    result = composition.execute(cell, paths)
+
+    assert result["status"] == "passed"
+    assert result["infrastructure_retries_used"] == failures_before_success
+    assert sleeps == [120] * failures_before_success
+    assert factory_calls == list(range(failures_before_success + 1))
+    assert profiler_calls == actor_calls == factory_calls
+    assert list(dict.fromkeys(
+        value.split("-turn-")[0] for value in attempted_ids
+    )) == [
+        f"infra-{ordinal}" for ordinal in range(failures_before_success + 1)
+    ]
+    assert len(paths.memory.read_text().splitlines()) == 1
+
+
+def test_interrupted_started_attempt_fails_closed_without_new_identity(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+    evidence = EvidenceLedger(paths.evidence)
+    LiveComposition._append_retry_event(
+        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
+        event="started", ordinal=0,
+    )
+    calls, sleeps = [], []
+    forbidden = lambda *_: calls.append("called") or pytest.fail(
+        "interrupted started attempt launched a dependency"
+    )
+    deps = LiveDependencies(
+        actor_factory=forbidden, candidate_factory=forbidden,
+        knowledge_factory=forbidden, profiler_factory=forbidden,
+        execution_profile="bz-a3-1",
+    )
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["terminal_reason"] == "infrastructure-unverified"
+    assert result["infrastructure_retries_used"] == 0
+    assert calls == sleeps == []
+    retry_events = [
+        entry.payload["infrastructure_retry"]["event"]
+        for entry in EvidenceLedger(paths.evidence).entries
+        if "infrastructure_retry" in entry.payload
+    ]
+    assert retry_events == ["started", "outcome"]
+
+
+def test_retained_noninfrastructure_outcome_stops_without_retry(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+    evidence = EvidenceLedger(paths.evidence)
+    LiveComposition._append_retry_event(
+        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
+        event="started", ordinal=0,
+    )
+    LiveComposition._append_attempt_outcome(
+        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
+        ordinal=0, trial=TrialResult(
+            "budget-exhausted", 24, 32768, None, None, 0,
+            ("token budget exhausted",),
+        ),
+    )
+    calls, sleeps = [], []
+    forbidden = lambda *_: calls.append("called") or pytest.fail(
+        "retained non-infrastructure outcome launched a dependency"
+    )
+    deps = LiveDependencies(
+        actor_factory=forbidden, candidate_factory=forbidden,
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=forbidden, execution_profile="bz-a3-1",
+    )
+
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["terminal_reason"] == "token-budget-exhausted"
+    assert result["infrastructure_retries_used"] == 0
+    assert calls == sleeps == []
+
+
+def test_retained_infrastructure_outcome_schedules_next_attempt(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+    evidence = EvidenceLedger(paths.evidence)
+    LiveComposition._append_retry_event(
+        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
+        event="started", ordinal=0,
+    )
+    LiveComposition._append_attempt_outcome(
+        evidence, cell=cell, proposal=proposal, execution_profile="bz-a3-1",
+        ordinal=0, trial=TrialResult(
+            "infrastructure-unverified", 2, 1, None, None, 0,
+            ("launch result unavailable",),
+        ),
+    )
+    attempt_ids, sleeps = [], []
+
+    class RecordingCandidate(FakeCandidate):
+        def compile(self, source, workdir, **options):
+            attempt_ids.append(options["attempt_id"])
+            return super().compile(source, workdir, **options)
+
+    deps = LiveDependencies(
+        actor_factory=actor_factory,
+        candidate_factory=lambda *args: RecordingCandidate(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["status"] == "passed"
+    assert result["infrastructure_retries_used"] == 1
+    assert sleeps == [120]
+    assert attempt_ids and all(value.startswith("infra-1-") for value in attempt_ids)
+
+
+def test_pending_retained_handle_does_not_consume_infrastructure_retry(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    attempts, sleeps = [], []
+
+    class PendingOnce(FakeCandidate):
+        def compile(self, source, workdir, **options):
+            attempts.append(options["attempt_id"])
+            if len(attempts) == 1:
+                plan = self.base.plan(source, **options)
+                return FailedEvidence.create(
+                    plan, stage="prepare", error_type="TransferPending",
+                    detail="observe retained handle",
+                )
+            return super().compile(source, workdir, **options)
+
+    actions = iter((
+        {"action": "write_source", "source": SOURCE},
+        {"action": "compile"}, {"action": "compile"}, {"action": "run"},
+        {"action": "submit", "interpretation": "host facts", "supports": []},
+    ))
+    deps = LiveDependencies(
+        actor_factory=lambda *_: lambda profile, context: A3Completion(
+            json.dumps(next(actions)), 1, {"profile_sha256": profile.fingerprint},
+        ),
+        candidate_factory=lambda *args: PendingOnce(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["status"] == "passed"
+    assert result["infrastructure_retries_used"] == 0
+    assert sleeps == []
+    assert attempts == ["infra-0-turn-2", "infra-0-turn-2"]
 
 
 def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
@@ -500,7 +923,10 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     assert records[0]["failed_project_id"] == SMOKE_PROPOSALS[0].project_id
     assert "invalid-content" not in first_paths.terminal.read_text()
     assert len(invalid_calls) == 24
-    failures = EvidenceLedger(first_paths.evidence).entries
+    failures = tuple(
+        entry for entry in EvidenceLedger(first_paths.evidence).entries
+        if "provider_response_failure" in entry.payload
+    )
     assert len(failures) == 24
     assert all(
         entry.payload["provider_response_failure"]["code"]
@@ -970,6 +1396,8 @@ def test_cli_selected_bz_transport_reaches_candidate_and_profiler(
                 "completed_projects": len(DEFAULT_PROPOSALS),
                 "failed_project_id": None,
                 "evidence_sha256": canonical_digest(selected),
+                "infrastructure_retries_used": 0,
+                "infrastructure_retry_evidence_sha256": canonical_digest([]),
             }
 
     monkeypatch.setattr(run_a3_phase1, "LiveComposition", InspectingComposition)

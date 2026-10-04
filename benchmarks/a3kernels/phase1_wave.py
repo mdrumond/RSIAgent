@@ -351,7 +351,7 @@ class Phase1Wave:
         for record in records:
             status = str(record["status"])
             counts[status] = counts.get(status, 0) + 1
-        return {"schema": "a3-phase1-foundation-report-v1", "counts": counts, "records": records}
+        return {"schema": "a3-phase1-foundation-report-v2", "counts": counts, "records": records}
 
     def _stage(self, paths: CellPaths) -> None:
         paths.workspace.mkdir(parents=True, exist_ok=True)
@@ -373,13 +373,21 @@ class Phase1Wave:
         selected_proposals = _validated_proposals(proposals)
         if set(outcome) != {
             "status", "terminal_reason", "completed_projects", "failed_project_id",
-            "evidence_sha256",
+            "evidence_sha256", "infrastructure_retries_used",
+            "infrastructure_retry_evidence_sha256",
         }:
             raise ValueError("executor terminal outcome has an invalid schema")
         if outcome["status"] not in {"passed", "failed"}:
             raise ValueError("executor terminal status is invalid")
         if type(outcome["evidence_sha256"]) is not str or _SHA.fullmatch(outcome["evidence_sha256"]) is None:
             raise ValueError("executor terminal evidence digest is invalid")
+        if (
+            type(outcome["infrastructure_retries_used"]) is not int
+            or outcome["infrastructure_retries_used"] < 0
+            or type(outcome["infrastructure_retry_evidence_sha256"]) is not str
+            or _SHA.fullmatch(outcome["infrastructure_retry_evidence_sha256"]) is None
+        ):
+            raise ValueError("executor infrastructure retry evidence is invalid")
         if (
             type(outcome["terminal_reason"]) is not str
             or outcome["terminal_reason"] not in {
@@ -408,7 +416,7 @@ class Phase1Wave:
         ):
             raise ValueError("failed executor terminal is inconsistent")
         return {
-            "schema": "a3-phase1-cell-terminal-v4",
+            "schema": "a3-phase1-cell-terminal-v5",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
@@ -462,6 +470,8 @@ class Phase1Wave:
                     key: value.get(key) for key in (
                         "status", "terminal_reason", "completed_projects",
                         "failed_project_id", "evidence_sha256",
+                        "infrastructure_retries_used",
+                        "infrastructure_retry_evidence_sha256",
                     )
                 },
                 execution_profile,
@@ -565,7 +575,7 @@ class SmokeWave(Phase1Wave):
             status = str(record["status"])
             counts[status] = counts.get(status, 0) + 1
         return {
-            "schema": "a3-phase1-foundation-smoke-report-v1",
+            "schema": "a3-phase1-foundation-smoke-report-v2",
             "counts": counts,
             "records": records,
         }
@@ -592,7 +602,7 @@ class SmokeWave(Phase1Wave):
         static = _research_identity()
         profile = load_a3_model_profile(cell.backend_model)
         expected = {
-            "schema": "a3-phase1-smoke-cell-terminal-v2",
+            "schema": "a3-phase1-smoke-cell-terminal-v3",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
@@ -614,6 +624,10 @@ class SmokeWave(Phase1Wave):
             "completed_projects": value.get("completed_projects"),
             "failed_project_id": value.get("failed_project_id"),
             "evidence_sha256": value.get("evidence_sha256"),
+            "infrastructure_retries_used": value.get("infrastructure_retries_used"),
+            "infrastructure_retry_evidence_sha256": value.get(
+                "infrastructure_retry_evidence_sha256"
+            ),
         }
         try:
             Phase1Wave._terminal(
@@ -622,6 +636,8 @@ class SmokeWave(Phase1Wave):
                     key: value.get(key) for key in (
                         "status", "terminal_reason", "completed_projects",
                         "failed_project_id", "evidence_sha256",
+                        "infrastructure_retries_used",
+                        "infrastructure_retry_evidence_sha256",
                     )
                 },
                 str(value.get("execution_profile")),
@@ -647,7 +663,7 @@ class SmokeWave(Phase1Wave):
             cell, outcome, self.execution_profile, self.proposals
         )
         return {
-            "schema": "a3-phase1-smoke-cell-terminal-v2",
+            "schema": "a3-phase1-smoke-cell-terminal-v3",
             "cell_id": cell.cell_id,
             "target": "a3",
             "language": "ascend-c",
@@ -677,6 +693,8 @@ class SmokeWave(Phase1Wave):
                 key: value.get(key) for key in (
                     "status", "terminal_reason", "completed_projects",
                     "failed_project_id", "evidence_sha256",
+                    "infrastructure_retries_used",
+                    "infrastructure_retry_evidence_sha256",
                 )
             },
             identity,

@@ -33,12 +33,24 @@ def terminal_outcome(digest="a" * 64):
         "status": "passed", "terminal_reason": "completed",
         "completed_projects": 8, "failed_project_id": None,
         "evidence_sha256": digest,
+        "infrastructure_retries_used": 0,
+        "infrastructure_retry_evidence_sha256": canonical_digest([]),
     }
 
 
 def trial_protocol_sha256(openai_turns=24):
     return canonical_digest({
-        "schema": "a3-trial-protocol-v3",
+        "schema": "a3-trial-protocol-v4",
+        "infrastructure_retry": {
+            "max_retries": 3, "backoff_seconds": 120,
+            "retryable_status": "infrastructure-unverified",
+            "journal_schema": "a3-infrastructure-retry-v1",
+            "attempt_outcome_required_before_decision": True,
+            "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "interrupted_started_outcome": "terminal-infrastructure-unverified",
+            "cell_execution": "exclusive-nonblocking",
+            "memory_commit_reconciliation": "authenticated-passed-outcome",
+        },
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
         "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
@@ -188,7 +200,7 @@ def test_fake_eight_cell_wave_is_isolated_terminal_and_reportable(tmp_path):
     records = wave.run()
     assert len(records) == len(seen) == 8
     assert {record["schema"] for record in records} == {
-        "a3-phase1-cell-terminal-v4"
+        "a3-phase1-cell-terminal-v5"
     }
     assert all(record["completed_projects"] == 8 for record in records)
     assert {record["status"] for record in records} == {"passed"}
@@ -263,6 +275,8 @@ def test_full_terminal_rejects_failed_project_out_of_sequence(tmp_path):
         "completed_projects": 2,
         "failed_project_id": DEFAULT_PROPOSALS[2].project_id,
         "evidence_sha256": "a" * 64,
+        "infrastructure_retries_used": 0,
+        "infrastructure_retry_evidence_sha256": canonical_digest([]),
     }
     wave = Phase1Wave(cfg, lambda *_: failure)
     wave.run()

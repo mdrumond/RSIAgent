@@ -769,7 +769,7 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
     )
 
     assert result.status == "passed"
-    assert candidate.attempts == ["turn-2", "turn-2"]
+    assert candidate.attempts == ["infra-0-turn-2", "infra-0-turn-2"]
     context = json.loads(prompts[2])
     assert context["action_contract"]["trial_state"] == "compile-retry"
     assert context["action_contract"]["required_next_action"] is None
@@ -815,7 +815,7 @@ def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_pa
     assert context["action_contract"]["trial_state"] == "run-retry"
     assert set(context["allowed_actions"]) == {"run"}
     assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
-    assert candidate.attempts == ["turn-3", "turn-3"]
+    assert candidate.attempts == ["infra-0-turn-3", "infra-0-turn-3"]
     assert result.status == "passed"
     assert result.failures[-1] == "write_source is not valid in run-retry"
 
