@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.a3_experiments import BackendModel, KnowledgeMode
+from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_wave import (
     Phase1Config,
     Phase1Wave,
@@ -37,6 +38,8 @@ def outcome(cell, _paths):
         "completed_projects": 8,
         "failed_project_id": None,
         "evidence_sha256": cell.cell_id.removeprefix("a3-cell-") * 4,
+        "infrastructure_retries_used": 0,
+        "infrastructure_retry_evidence_sha256": canonical_digest([]),
     }
 
 

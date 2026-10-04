@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from typing import Callable, Mapping, Protocol, Sequence
 
 from benchmarks.a3_experiments import A3ExperimentCell
@@ -21,7 +22,9 @@ from benchmarks.a3kernels.corpus import CorpusSpec
 from benchmarks.a3kernels.embeddings import PinnedBGEEmbeddings
 from benchmarks.a3kernels.knowledge import CollectionManifest, KnowledgeDB
 from benchmarks.a3kernels.knowledge_agent import KnowledgeAgent, QueryJournal
-from benchmarks.a3kernels.phase1_evidence import EvidenceLedger, canonical_bytes, canonical_digest
+from benchmarks.a3kernels.phase1_evidence import (
+    EvidenceKind, EvidenceLedger, canonical_bytes, canonical_digest,
+)
 from benchmarks.a3kernels.phase1_memory import AuthoritativeEvidence, Phase1LearningJournal
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
 from benchmarks.a3kernels.phase1_registry import (
@@ -39,13 +42,16 @@ from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
 from benchmarks.a3kernels.profiling_bz import BZA3ProfilingBackend
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
 from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
-from benchmarks.a3kernels.trial import A3TrialLoop, trial_protocol_sha256
+from benchmarks.a3kernels.trial import A3TrialLoop, TrialResult, trial_protocol_sha256
 
 
 _SHA = re.compile(r"[0-9a-f]{64}")
 _SYSTEM = """You are running one bounded A3 Ascend C learning project. Reply with
 exactly one JSON action from the supplied schema. Treat host compile, verification,
 and profiling observations as authoritative. Never claim correctness yourself."""
+_MAX_INFRASTRUCTURE_RETRIES = 3
+_INFRASTRUCTURE_BACKOFF_SECONDS = 120
+_RETRY_SCHEMA = "a3-infrastructure-retry-v1"
 
 
 class CandidateFactory(Protocol):
@@ -274,6 +280,7 @@ class LiveComposition:
         *,
         proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
         lineage_prefix: str = "phase1",
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         self.config, self.dependencies = config, dependencies
         supplied = tuple(proposals)
@@ -288,54 +295,304 @@ class LiveComposition:
         if not re.fullmatch(r"[a-z0-9-]+", lineage_prefix):
             raise ValueError("composition lineage prefix is invalid")
         self.lineage_prefix = lineage_prefix
+        self.sleeper = sleeper
         self.cell_digests: dict[str, tuple[str, ...]] = {}
 
+    @staticmethod
+    def _retry_entries(evidence: EvidenceLedger) -> tuple:
+        return tuple(
+            entry for entry in evidence.entries
+            if isinstance(entry.payload.get("infrastructure_retry"), Mapping)
+        )
+
+    @classmethod
+    def _retry_summary(cls, evidence: EvidenceLedger) -> tuple[int, str]:
+        entries = cls._retry_entries(evidence)
+        retries = sum(
+            entry.payload["infrastructure_retry"].get("event") == "scheduled"
+            for entry in entries
+        )
+        return retries, canonical_digest([entry.entry_sha256 for entry in entries])
+
+    def _project_retry_entries(
+        self, evidence: EvidenceLedger, cell: A3ExperimentCell,
+        proposal: CurriculumProposal,
+    ) -> list:
+        return [
+            entry for entry in self._retry_entries(evidence)
+            if entry.payload.get("cell_id") == cell.cell_id
+            and entry.payload.get("project_id") == proposal.project_id
+            and entry.payload.get("execution_profile")
+            == self.dependencies.execution_profile
+        ]
+
+    @staticmethod
+    def _append_retry_event(
+        evidence: EvidenceLedger, *, cell: A3ExperimentCell,
+        proposal: CurriculumProposal, execution_profile: str,
+        event: str, ordinal: int, **details,
+    ):
+        return evidence.append(EvidenceKind.PLAN, {
+            "target": "Ascend910B4", "language": "ascend-c",
+            "runtime": "native-ascend-c", "execution_profile": execution_profile,
+            "cell_id": cell.cell_id, "project_id": proposal.project_id,
+            "infrastructure_retry": {
+                "schema": _RETRY_SCHEMA, "event": event,
+                "attempt_ordinal": ordinal, **details,
+            },
+        })
+
+    @classmethod
+    def _append_attempt_outcome(
+        cls, evidence: EvidenceLedger, *, cell: A3ExperimentCell,
+        proposal: CurriculumProposal, execution_profile: str,
+        ordinal: int, trial: TrialResult,
+    ) -> None:
+        cls._append_retry_event(
+            evidence, cell=cell, proposal=proposal,
+            execution_profile=execution_profile, event="outcome", ordinal=ordinal,
+            trial_status=trial.status, turns=trial.turns, tokens=trial.tokens,
+            knowledge_queries=trial.knowledge_queries,
+            failures=list(trial.failures),
+            memory_entry_sha256=trial.memory_entry_sha256,
+            completion_turns=trial.completion_turns,
+        )
+
+    @staticmethod
+    def _trial_from_outcome(value: Mapping[str, object]) -> TrialResult:
+        required = {
+            "schema", "event", "attempt_ordinal", "trial_status", "turns",
+            "tokens", "knowledge_queries", "failures", "memory_entry_sha256",
+            "completion_turns",
+        }
+        status = value.get("trial_status")
+        memory_entry = value.get("memory_entry_sha256")
+        integer_fields = (
+            "attempt_ordinal", "turns", "tokens", "knowledge_queries",
+            "completion_turns",
+        )
+        if (
+            set(value) != required
+            or value.get("schema") != _RETRY_SCHEMA
+            or value.get("event") != "outcome"
+            or status not in {
+                "passed", "budget-exhausted", "attempt-rewrite-required",
+                "infrastructure-unverified",
+            }
+            or any(
+                type(value.get(key)) is not int or value[key] < 0
+                for key in integer_fields
+            )
+            or value["attempt_ordinal"] > _MAX_INFRASTRUCTURE_RETRIES
+            or not isinstance(value.get("failures"), (list, tuple))
+            or any(type(item) is not str for item in value["failures"])
+            or (
+                memory_entry is not None
+                and (
+                    type(memory_entry) is not str
+                    or _SHA.fullmatch(memory_entry) is None
+                )
+            )
+            or (status == "passed") != (memory_entry is not None)
+        ):
+            raise ValueError("infrastructure attempt outcome evidence is invalid")
+        return TrialResult(
+            value["trial_status"], value["turns"], value["tokens"], None, None,
+            value["knowledge_queries"], tuple(value["failures"]),
+            memory_entry, value["completion_turns"],
+        )
+
+    def _resume_retry_ordinal(
+        self, evidence: EvidenceLedger, cell: A3ExperimentCell,
+        proposal: CurriculumProposal,
+    ) -> tuple[int, bool, TrialResult | None]:
+        """Return next ordinal, wait state, and any retained terminal trial."""
+        relevant = self._project_retry_entries(evidence, cell, proposal)
+        if not relevant:
+            return 0, True, None
+        last = relevant[-1].payload["infrastructure_retry"]
+        event, ordinal = last.get("event"), last.get("attempt_ordinal")
+        if event == "wait-completed":
+            return ordinal + 1, True, None
+        if event == "scheduled":
+            return ordinal + 1, False, None
+        if event == "started":
+            # The retained handle may still be active. Fail closed without changing
+            # identity or consuming a retry; only an authenticated outcome may retry.
+            trial = TrialResult(
+                "infrastructure-unverified", 0, 0, None, None, 0,
+                ("interrupted infrastructure attempt was not replayed",),
+            )
+            self._append_attempt_outcome(
+                evidence, cell=cell, proposal=proposal,
+                execution_profile=self.dependencies.execution_profile,
+                ordinal=ordinal, trial=trial,
+            )
+            return ordinal, True, trial
+        if event == "outcome":
+            trial = self._trial_from_outcome(last)
+            if trial.status != "infrastructure-unverified":
+                return ordinal, True, trial
+            if ordinal >= _MAX_INFRASTRUCTURE_RETRIES:
+                return ordinal, True, trial
+            failed_digest = canonical_digest(last)
+            self._append_retry_event(
+                evidence, cell=cell, proposal=proposal,
+                execution_profile=self.dependencies.execution_profile,
+                event="scheduled", ordinal=ordinal,
+                next_attempt_ordinal=ordinal + 1,
+                backoff_seconds=_INFRASTRUCTURE_BACKOFF_SECONDS,
+                failed_attempt_sha256=failed_digest,
+            )
+            return ordinal + 1, False, None
+        raise ValueError("infrastructure retry evidence has an invalid event")
+
+    def _wait_for_retry(
+        self, evidence: EvidenceLedger, cell: A3ExperimentCell,
+        proposal: CurriculumProposal, ordinal: int,
+    ) -> None:
+        self.sleeper(_INFRASTRUCTURE_BACKOFF_SECONDS)
+        self._append_retry_event(
+            evidence, cell=cell, proposal=proposal,
+            execution_profile=self.dependencies.execution_profile,
+            event="wait-completed", ordinal=ordinal - 1,
+            next_attempt_ordinal=ordinal,
+            backoff_seconds=_INFRASTRUCTURE_BACKOFF_SECONDS,
+        )
+
+    def _reconcile_completed_outcomes(
+        self, evidence: EvidenceLedger, cell: A3ExperimentCell,
+        memory_entries: Sequence[Mapping[str, object]],
+    ) -> None:
+        """Close the memory-commit/outcome-append crash window."""
+        for proposal, memory_entry in zip(self.proposals, memory_entries):
+            relevant = self._project_retry_entries(evidence, cell, proposal)
+            if not relevant:
+                raise ValueError("completed memory has no infrastructure attempt journal")
+            last = relevant[-1].payload["infrastructure_retry"]
+            memory_sha256 = memory_entry.get("entry_sha256")
+            if last.get("event") == "started":
+                self._append_attempt_outcome(
+                    evidence, cell=cell, proposal=proposal,
+                    execution_profile=self.dependencies.execution_profile,
+                    ordinal=last.get("attempt_ordinal"),
+                    trial=TrialResult(
+                        "passed", 0, 0, None, None, 0, (), memory_sha256,
+                    ),
+                )
+                continue
+            if last.get("event") != "outcome":
+                raise ValueError("completed memory has an unfinished retry journal")
+            trial = self._trial_from_outcome(last)
+            if trial.status != "passed" or trial.memory_entry_sha256 != memory_sha256:
+                raise ValueError("completed memory conflicts with retry outcome")
+
     def execute(self, cell: A3ExperimentCell, paths: CellPaths) -> dict[str, object]:
+        paths.root.mkdir(parents=True, exist_ok=True)
+        with (paths.root / "execution.lock").open("a+b") as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError(
+                    f"cell execution already active: {cell.cell_id}"
+                ) from None
+            try:
+                return self._execute_locked(cell, paths)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _execute_locked(
+        self, cell: A3ExperimentCell, paths: CellPaths,
+    ) -> dict[str, object]:
         store = AuthoritativeResultStore(paths.root / "authority.jsonl")
         memory = Phase1LearningJournal(
             paths.memory, self.proposals, cell_id=cell.cell_id,
             lineage_id=f"{self.lineage_prefix}-{cell.cell_id}", evidence_resolver=store,
             trial_protocol_sha256=trial_protocol_sha256(),
         )
-        digests = [entry["entry_sha256"] for entry in memory.read()]
-        start = memory.resume_state().completed_projects
-        knowledge = self.dependencies.knowledge_factory(cell, paths)
         EvidenceLedger.recover_incomplete_tail(paths.evidence)
         evidence = EvidenceLedger(paths.evidence)
+        memory_entries = memory.read()
+        self._reconcile_completed_outcomes(evidence, cell, memory_entries)
+        digests = [entry["entry_sha256"] for entry in memory_entries]
+        start = memory.resume_state().completed_projects
+        knowledge = None
         profile = load_a3_model_profile(cell.backend_model)
         for proposal in self.proposals[start:]:
             policy = ProjectRuntimePolicy.from_proposal(proposal)
-            candidate = _RecordingCandidate(
-                _RecoveryCandidate(
-                    self.dependencies.candidate_factory(cell, proposal, paths), policy
-                ), store
+            ordinal, wait_complete, trial = self._resume_retry_ordinal(
+                evidence, cell, proposal
             )
-            profiler = _RecordingProfiler(
-                self.dependencies.profiler_factory(
-                    cell, proposal, paths, candidate
-                ),
-                store, proposal.project_id,
-            )
-            trial = A3TrialLoop(
-                cell=cell, proposal=proposal, profile=profile,
-                actor=_policy_actor(
-                    self.dependencies.actor_factory(cell, proposal), profile, policy
-                ),
-                candidate=candidate, knowledge=knowledge, profiler=profiler,
-                evidence=evidence, memory=memory,
-                workdir=paths.workspace / proposal.project_id,
-                timing_dimensions=(
-                    policy.study_dimensions
-                    if policy.performance_preset is PerformancePreset.TIMING else None
-                ),
-                execution_profile=self.dependencies.execution_profile,
-            ).run()
+            if not wait_complete:
+                self._wait_for_retry(evidence, cell, proposal, ordinal)
+            while trial is None:
+                if knowledge is None:
+                    knowledge = self.dependencies.knowledge_factory(cell, paths)
+                self._append_retry_event(
+                    evidence, cell=cell, proposal=proposal,
+                    execution_profile=self.dependencies.execution_profile,
+                    event="started", ordinal=ordinal,
+                )
+                candidate = _RecordingCandidate(
+                    _RecoveryCandidate(
+                        self.dependencies.candidate_factory(cell, proposal, paths), policy
+                    ), store
+                )
+                profiler = _RecordingProfiler(
+                    self.dependencies.profiler_factory(
+                        cell, proposal, paths, candidate
+                    ),
+                    store, proposal.project_id,
+                )
+                trial = A3TrialLoop(
+                    cell=cell, proposal=proposal, profile=profile,
+                    actor=_policy_actor(
+                        self.dependencies.actor_factory(cell, proposal), profile, policy
+                    ),
+                    candidate=candidate, knowledge=knowledge, profiler=profiler,
+                    evidence=evidence, memory=memory,
+                    workdir=paths.workspace / proposal.project_id,
+                    timing_dimensions=(
+                        policy.study_dimensions
+                        if policy.performance_preset is PerformancePreset.TIMING else None
+                    ),
+                    execution_profile=self.dependencies.execution_profile,
+                    infrastructure_attempt_ordinal=ordinal,
+                ).run()
+                self._append_attempt_outcome(
+                    evidence, cell=cell, proposal=proposal,
+                    execution_profile=self.dependencies.execution_profile,
+                    ordinal=ordinal, trial=trial,
+                )
+                if (
+                    trial.status != "infrastructure-unverified"
+                    or ordinal >= _MAX_INFRASTRUCTURE_RETRIES
+                ):
+                    break
+                failed_digest = canonical_digest(
+                    self._retry_entries(evidence)[-1].payload[
+                        "infrastructure_retry"
+                    ]
+                )
+                self._append_retry_event(
+                    evidence, cell=cell, proposal=proposal,
+                    execution_profile=self.dependencies.execution_profile,
+                    event="scheduled", ordinal=ordinal,
+                    next_attempt_ordinal=ordinal + 1,
+                    backoff_seconds=_INFRASTRUCTURE_BACKOFF_SECONDS,
+                    failed_attempt_sha256=failed_digest,
+                )
+                ordinal += 1
+                self._wait_for_retry(evidence, cell, proposal, ordinal)
+                trial = None
+            assert trial is not None
             if trial.status != "passed" or trial.memory_entry_sha256 is None:
                 failure = canonical_digest(
                     {"cell_id": cell.cell_id, "project_id": proposal.project_id,
                      "status": trial.status, "failures": trial.failures}
                 )
                 self.cell_digests[cell.cell_id] = tuple((*digests, failure))
+                retries, retry_digest = self._retry_summary(evidence)
                 return {
                     "status": "failed",
                     "terminal_reason": (
@@ -354,15 +611,20 @@ class LiveComposition:
                     "completed_projects": len(digests),
                     "failed_project_id": proposal.project_id,
                     "evidence_sha256": failure,
+                    "infrastructure_retries_used": retries,
+                    "infrastructure_retry_evidence_sha256": retry_digest,
                 }
             digests.append(trial.memory_entry_sha256)
         self.cell_digests[cell.cell_id] = tuple(digests)
+        retries, retry_digest = self._retry_summary(evidence)
         return {
             "status": "passed",
             "terminal_reason": "completed",
             "completed_projects": len(digests),
             "failed_project_id": None,
             "evidence_sha256": canonical_digest(tuple(digests)),
+            "infrastructure_retries_used": retries,
+            "infrastructure_retry_evidence_sha256": retry_digest,
         }
 
 
