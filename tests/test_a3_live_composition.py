@@ -144,10 +144,23 @@ def dependencies(knowledge_calls, profile_calls):
     )
 
 
-def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
+def trial_protocol_sha256(
+    openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
+):
     value = {
-        "schema": "a3-trial-protocol-v1",
+        "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "attempt_completion": {
+            "schema": "a3-attempt-completion-v1",
+            "source_frozen": True,
+            "allowed_operations": ["compile", "run", "profile", "submit"],
+            "call_limits": {
+                ProfilingGuidance.WITHOUT_GUIDANCE.value: 3,
+                ProfilingGuidance.WITH_GUIDANCE.value: 4,
+            },
+            "token_ceiling": "absolute",
+            "rewrite_required": "terminate",
+        },
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
                 "max_turns": openai_turns, "max_tokens": 32768,
@@ -159,6 +172,9 @@ def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
     }
     if not mismatch_feedback:
         del value["verification_feedback_schema"]
+    if not attempt_completion:
+        value["schema"] = "a3-trial-protocol-v1"
+        del value["attempt_completion"]
     return canonical_digest(value)
 
 
@@ -209,7 +225,8 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
 
 @pytest.mark.parametrize("smoke", [False, True], ids=["full", "smoke"])
 @pytest.mark.parametrize(
-    "old_protocol", ["twelve-turns", "no-mismatch-feedback"]
+    "old_protocol",
+    ["twelve-turns", "no-mismatch-feedback", "no-attempt-completion"],
 )
 def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
     tmp_path, monkeypatch, smoke, old_protocol,
@@ -249,11 +266,15 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
 
     monkeypatch.setattr(
         composition_module, "trial_protocol_sha256",
-        lambda: (
-            trial_protocol_sha256(12)
-            if old_protocol == "twelve-turns"
-            else trial_protocol_sha256(mismatch_feedback=False)
-        ),
+        lambda: {
+            "twelve-turns": trial_protocol_sha256(12),
+            "no-mismatch-feedback": trial_protocol_sha256(
+                mismatch_feedback=False
+            ),
+            "no-attempt-completion": trial_protocol_sha256(
+                attempt_completion=False
+            ),
+        }[old_protocol],
     )
     old = LiveComposition(
         cfg, old_dependencies, proposals=proposals,

@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -923,12 +924,16 @@ def test_trial_ledger_and_candidate_use_explicit_bz_profile(tmp_path):
 
 def test_submit_gates_source_identity_verification_and_required_profile(tmp_path):
     cell = _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
+    early_submit = json.dumps({
+        "action": "submit", "interpretation": "too early", "supports": [],
+    })
     result, _, journal = _run(tmp_path, [
         json.dumps({"action": "write_source", "source": SOURCE}),
         '{"action":"compile"}', '{"action":"run"}',
-        json.dumps({"action": "submit", "interpretation": "too early", "supports": []}),
+        early_submit, early_submit, early_submit, early_submit, early_submit,
     ], cell=cell, budgets=TrialBudgets(4, 2000))
     assert result.status == "budget-exhausted"
+    assert result.completion_turns == 4
     assert "profile" in result.failures[-1]
     assert journal.read() == ()
 
@@ -1003,6 +1008,298 @@ def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
     assert token_result.status == "budget-exhausted" and token_result.turns == 1
     assert token_result.failures == ("token budget exhausted",)
     assert token_journal.read() == ()
+
+
+def _late_candidate_actions(final_actions):
+    return ['{"action":"compile"}'] * 23 + [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        *final_actions,
+    ]
+
+
+@pytest.mark.parametrize(
+    "guidance, final_actions, expected_turns",
+    [
+        (
+            ProfilingGuidance.WITHOUT_GUIDANCE,
+            [
+                '{"action":"compile"}', '{"action":"run"}',
+                json.dumps({
+                    "action": "submit", "interpretation": "completed",
+                    "supports": [],
+                }),
+            ],
+            27,
+        ),
+        (
+            ProfilingGuidance.WITH_GUIDANCE,
+            [
+                '{"action":"compile"}', '{"action":"run"}',
+                '{"action":"profile","metric":"PipeUtilization"}',
+                json.dumps({
+                    "action": "submit", "interpretation": "completed",
+                    "supports": [],
+                }),
+            ],
+            28,
+        ),
+    ],
+)
+def test_fixed_candidate_finishes_in_treatment_bound_completion_calls(
+    tmp_path, guidance, final_actions, expected_turns,
+):
+    cell = _cell(profiling=guidance)
+    result, prompts, _ = _run(
+        tmp_path,
+        _late_candidate_actions(final_actions),
+        cell=cell,
+        budgets=TrialBudgets(24, 2000),
+    )
+
+    assert result.status == "passed"
+    assert result.turns == expected_turns
+    assert result.completion_turns == expected_turns - 24
+    assert all(
+        "attempt_completion" not in json.loads(prompt)
+        for prompt in prompts[:24]
+    )
+    completion_context = json.loads(prompts[24])
+    assert completion_context["attempt_completion"] == {
+        "active": True,
+        "call_limit": 4 if guidance is ProfilingGuidance.WITH_GUIDANCE else 3,
+        "calls_remaining": expected_turns - 24,
+        "source_frozen": True,
+    }
+    assert set(completion_context["allowed_actions"]) == {"compile"}
+
+
+@pytest.mark.parametrize(
+    "nominal_tail, completion_actions, expected_completion_turns",
+    [
+        (
+            [json.dumps({"action": "write_source", "source": SOURCE})],
+            ['{"action":"compile"}', '{"action":"run"}',
+             json.dumps({"action": "submit", "interpretation": "done", "supports": []})],
+            3,
+        ),
+        (
+            [json.dumps({"action": "write_source", "source": SOURCE}),
+             '{"action":"compile"}'],
+            ['{"action":"run"}',
+             json.dumps({"action": "submit", "interpretation": "done", "supports": []})],
+            2,
+        ),
+        (
+            [json.dumps({"action": "write_source", "source": SOURCE}),
+             '{"action":"compile"}', '{"action":"run"}'],
+            [json.dumps({"action": "submit", "interpretation": "done", "supports": []})],
+            1,
+        ),
+    ],
+)
+def test_completion_resumes_each_fixed_candidate_state(
+    tmp_path, nominal_tail, completion_actions, expected_completion_turns,
+):
+    padding = ['{"action":"compile"}'] * (24 - len(nominal_tail))
+    result, _, _ = _run(
+        tmp_path, padding + nominal_tail + completion_actions,
+        budgets=TrialBudgets(24, 2000),
+    )
+    assert result.status == "passed"
+    assert result.completion_turns == expected_completion_turns
+
+
+@pytest.mark.parametrize("operation", ["compile", "run"])
+def test_completion_resumes_retained_retry_attempt(operation, tmp_path):
+    class RetryOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_attempts = []
+            self.run_attempts = []
+
+        def compile(self, source, workdir, **kw):
+            self.compile_attempts.append(kw["attempt_id"])
+            if operation == "compile" and len(self.compile_attempts) == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1),
+                    kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="compile", error_type="RuntimeError",
+                    detail="observe retained compile",
+                )
+            return super().compile(source, workdir, **kw)
+
+        def run(self, source, workdir, **kw):
+            self.run_attempts.append(kw["attempt_id"])
+            if operation == "run" and len(self.run_attempts) == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1),
+                    kw.get("execution_profile", "gz-a3"),
+                )
+                return FailedEvidence.create(
+                    plan, stage="execute", error_type="RuntimeError",
+                    detail="observe retained run",
+                )
+            return super().run(source, workdir, **kw)
+
+    if operation == "compile":
+        nominal_tail = [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+        ]
+        completion = [
+            '{"action":"compile"}', '{"action":"run"}',
+            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
+        ]
+    else:
+        nominal_tail = [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}', '{"action":"run"}',
+        ]
+        completion = [
+            '{"action":"run"}',
+            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
+        ]
+    candidate = RetryOnce()
+    result, prompts, _ = _run(
+        tmp_path,
+        ['{"action":"compile"}'] * (24 - len(nominal_tail))
+        + nominal_tail + completion,
+        candidate=candidate, budgets=TrialBudgets(24, 2000),
+    )
+
+    assert result.status == "passed"
+    context = json.loads(prompts[24])
+    assert context["action_contract"]["trial_state"] == f"{operation}-retry"
+    attempts = (
+        candidate.compile_attempts if operation == "compile"
+        else candidate.run_attempts
+    )
+    assert attempts[0] == attempts[1]
+
+
+def test_completion_freezes_source_and_disallows_knowledge_queries(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+    cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
+    candidate = FakeCandidate()
+    result, prompts, _ = _run(
+        tmp_path,
+        _late_candidate_actions([
+            json.dumps({"action": "query", "query": "queues", "limit": 1}),
+            json.dumps({"action": "write_source", "source": replacement}),
+            '{"action":"compile"}',
+        ]),
+        cell=cell, knowledge=FakeKnowledge(True), candidate=candidate,
+        budgets=TrialBudgets(24, 2000),
+    )
+
+    assert result.status == "budget-exhausted"
+    assert result.turns == 27 and result.completion_turns == 3
+    assert result.failures[-2:] == (
+        "query is not valid in compile-required",
+        "write_source is not valid in compile-required",
+    )
+    assert candidate.source == SOURCE
+    assert set(json.loads(prompts[24])["allowed_actions"]) == {"compile"}
+
+
+def test_malformed_and_provider_failures_consume_completion_calls(tmp_path):
+    result, prompts, _ = _run(
+        tmp_path,
+        _late_candidate_actions([
+            "not json",
+            A3ProviderResponseError("invalid-content-or-usage"),
+            '{"action":"compile"}',
+        ]),
+        budgets=TrialBudgets(24, 2000),
+    )
+
+    assert result.status == "budget-exhausted"
+    assert result.turns == 27 and result.completion_turns == 3
+    assert result.failures[-2:] == (
+        "action must be one JSON object",
+        "provider response failure: invalid-content-or-usage",
+    )
+    assert len(prompts) == 27
+
+
+def test_deterministic_completion_failure_terminates_without_requesting_rewrite(
+    tmp_path,
+):
+    class DeterministicCompileFailure(FakeCandidate):
+        def compile(self, source, _workdir, **kw):
+            plan = self._plan(
+                source, kw["request_id"], kw["attempt_id"], kw["length"],
+                kw["project_id"], kw.get("padded_length"),
+                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+            )
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="CompileError",
+                detail="source rewrite required",
+            )
+
+    result, prompts, _ = _run(
+        tmp_path,
+        _late_candidate_actions([
+            '{"action":"compile"}',
+            json.dumps({"action": "write_source", "source": SOURCE + "\n"}),
+        ]),
+        candidate=DeterministicCompileFailure(),
+        budgets=TrialBudgets(24, 2000),
+    )
+    assert result.status == "budget-exhausted"
+    assert result.turns == 25 and result.completion_turns == 1
+    assert len(prompts) == 25
+    assert result.failures[-1] == "compile failed: source rewrite required"
+
+
+def test_token_ceiling_is_absolute_during_attempt_completion(tmp_path):
+    result, prompts, _ = _run(
+        tmp_path,
+        _late_candidate_actions(['{"action":"compile"}']),
+        budgets=TrialBudgets(24, 24),
+    )
+    assert result.status == "budget-exhausted"
+    assert result.turns == 25 and result.completion_turns == 1
+    assert result.tokens == 25
+    assert result.failures[-1] == "token budget exhausted"
+    assert len(prompts) == 25
+
+
+def test_completion_boundary_and_source_action_are_authenticated(tmp_path):
+    result, _, _ = _run(
+        tmp_path,
+        _late_candidate_actions([
+            '{"action":"compile"}', '{"action":"run"}',
+            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
+        ]),
+        budgets=TrialBudgets(24, 2000),
+    )
+    assert result.status == "passed"
+    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    write = next(
+        entry for entry in entries
+        if entry.kind == "action" and entry.payload["action"] == "write_source"
+    )
+    assert write.payload["source_sha256"] == hashlib.sha256(
+        SOURCE.encode("utf-8")
+    ).hexdigest()
+    boundary = next(
+        entry.payload["attempt_completion_boundary"] for entry in entries
+        if "attempt_completion_boundary" in entry.payload
+    )
+    assert boundary == {
+        "allowed_actions": ("compile",),
+        "call_limit": 3,
+        "nominal_max_turns": 24,
+        "source_sha256": write.payload["source_sha256"],
+        "trial_state": "compile-required",
+    }
 
 
 def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_path):
@@ -1188,6 +1485,7 @@ def test_public_no_arg_trial_budget_matches_the_openai_registered_default():
 def test_trial_protocol_versions_structured_mismatch_feedback():
     legacy = canonical_digest({
         "schema": "a3-trial-protocol-v1",
+        "verification_feedback_schema": "a3-verification-mismatch-v1",
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
                 "max_turns": 24, "max_tokens": 32768,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Callable, Mapping
@@ -68,6 +69,15 @@ _KNOWLEDGE_TEXT_LIMIT = 2048
 _PROFILE_PAIR_LIMIT = 16
 _PROFILE_NAME_LIMIT = 128
 _MODEL_DIAGNOSTIC_LIMIT = 2048
+_ATTEMPT_COMPLETION_SCHEMA = "a3-attempt-completion-v1"
+_COMPLETION_CALL_LIMITS = {
+    ProfilingGuidance.WITHOUT_GUIDANCE: 3,
+    ProfilingGuidance.WITH_GUIDANCE: 4,
+}
+_COMPLETION_STATES = frozenset({
+    "compile-required", "compile-retry", "run-required", "run-retry",
+    "profile-required", "submit-ready",
+})
 
 
 def parse_action(text: str) -> Action:
@@ -150,8 +160,19 @@ def trial_protocol_sha256() -> str:
             "max_tokens": budgets.max_tokens,
         }
     return canonical_digest({
-        "schema": "a3-trial-protocol-v1",
+        "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "attempt_completion": {
+            "schema": _ATTEMPT_COMPLETION_SCHEMA,
+            "source_frozen": True,
+            "allowed_operations": ["compile", "run", "profile", "submit"],
+            "call_limits": {
+                treatment.value: limit
+                for treatment, limit in _COMPLETION_CALL_LIMITS.items()
+            },
+            "token_ceiling": "absolute",
+            "rewrite_required": "terminate",
+        },
         "model_budgets": model_budgets,
     })
 
@@ -166,6 +187,7 @@ class TrialResult:
     knowledge_queries: int
     failures: tuple[str, ...]
     memory_entry_sha256: str | None = None
+    completion_turns: int = 0
 
 
 Actor = Callable[[A3ModelProfile, str], A3Completion]
@@ -225,13 +247,38 @@ class A3TrialLoop:
         run_attempt_id: str | None = None
         rewrite_source: str | None = None
         queries = 0
+        completion_turns = 0
+        completion_started = False
+        completion_limit = _COMPLETION_CALL_LIMITS[self.cell.profiling]
+        last_turn = consumed_turns
         if tokens > self.budgets.max_tokens:
             failures.append("token budget exhausted")
             return TrialResult(
                 "budget-exhausted", consumed_turns, tokens, verified,
                 profile_result, queries, tuple(failures),
+                completion_turns=completion_turns,
             )
-        for turn in range(consumed_turns + 1, self.budgets.max_turns + 1):
+        for turn in range(
+            consumed_turns + 1,
+            self.budgets.max_turns + completion_limit + 1,
+        ):
+            in_completion = turn > self.budgets.max_turns
+            if in_completion:
+                state = self._trial_state(
+                    source, compilation, verified, profile_result,
+                    rewrite_source, compile_attempt_id, run_attempt_id,
+                )
+                if not completion_started:
+                    if state not in _COMPLETION_STATES:
+                        break
+                    completion_started = True
+                    self._record_completion_boundary(
+                        source=source, state=state, call_limit=completion_limit,
+                    )
+                elif state not in _COMPLETION_STATES:
+                    break
+                completion_turns += 1
+            last_turn = turn
             try:
                 completion = self.actor(
                     self.profile,
@@ -239,6 +286,11 @@ class A3TrialLoop:
                         observations, source, compilation, verified,
                         profile_result, rewrite_source, compile_attempt_id,
                         run_attempt_id,
+                        completion_phase=in_completion,
+                        completion_calls_remaining=(
+                            completion_limit - completion_turns + 1
+                            if in_completion else None
+                        ),
                     ),
                 )
             except A3ProviderResponseError as exc:
@@ -251,6 +303,7 @@ class A3TrialLoop:
                     return TrialResult(
                         "budget-exhausted", turn, tokens, verified,
                         profile_result, queries, tuple(failures),
+                        completion_turns=completion_turns,
                     )
                 continue
             if not isinstance(completion, A3Completion):
@@ -258,7 +311,11 @@ class A3TrialLoop:
             tokens += completion.completion_tokens
             if tokens > self.budgets.max_tokens:
                 failures.append("token budget exhausted")
-                return TrialResult("budget-exhausted", turn, tokens, verified, profile_result, queries, tuple(failures))
+                return TrialResult(
+                    "budget-exhausted", turn, tokens, verified,
+                    profile_result, queries, tuple(failures),
+                    completion_turns=completion_turns,
+                )
             try:
                 if completion.provenance.get("profile_sha256") != self.profile.fingerprint:
                     raise ValueError("completion provenance does not match the cell model")
@@ -267,7 +324,9 @@ class A3TrialLoop:
                     source, compilation, verified, profile_result, rewrite_source,
                     compile_attempt_id, run_attempt_id,
                 )
-                if action.kind not in self._allowed_action_kinds(state):
+                if action.kind not in self._allowed_action_kinds(
+                    state, completion_phase=in_completion,
+                ):
                     raise ValueError(f"{action.kind} is not valid in {state}")
                 if (
                     action.kind == "write_source"
@@ -432,13 +491,20 @@ class A3TrialLoop:
                     )
                     entry = self.memory.append(project_memory)
                     self.evidence.append(EvidenceKind.RESULT, self._identity({"verified": verified, "memory_entry_sha256": entry["entry_sha256"]}))
-                    return TrialResult("passed", turn, tokens, verified, profile_result, queries, tuple(failures), entry["entry_sha256"])
+                    return TrialResult(
+                        "passed", turn, tokens, verified, profile_result,
+                        queries, tuple(failures), entry["entry_sha256"],
+                        completion_turns,
+                    )
             except (TypeError, ValueError, RuntimeError) as exc:
                 failure = str(exc)
                 failures.append(failure)
                 observations.append("failure: " + failure)
                 self.evidence.append(EvidenceKind.FAILURE, self._identity({"turn": turn, "detail": failure}))
-        return TrialResult("budget-exhausted", self.budgets.max_turns, tokens, verified, profile_result, queries, tuple(failures))
+        return TrialResult(
+            "budget-exhausted", last_turn, tokens, verified, profile_result,
+            queries, tuple(failures), completion_turns=completion_turns,
+        )
 
     def _recover_provider_response_failures(
         self,
@@ -656,9 +722,35 @@ class A3TrialLoop:
         }
 
     def _record_action(self, turn: int, action: Action) -> None:
+        payload: dict[str, object] = {"turn": turn, "action": action.kind}
+        if action.kind == "write_source":
+            assert action.source is not None
+            payload["source_sha256"] = self._source_sha256(action.source)
         self.evidence.append(
             EvidenceKind.ACTION,
-            self._identity({"turn": turn, "action": action.kind}),
+            self._identity(payload),
+        )
+
+    @staticmethod
+    def _source_sha256(source: str) -> str:
+        return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+    def _record_completion_boundary(
+        self, *, source: str | None, state: str, call_limit: int,
+    ) -> None:
+        assert source is not None
+        allowed = self._allowed_action_kinds(state, completion_phase=True)
+        self.evidence.append(
+            EvidenceKind.PLAN,
+            self._identity({
+                "attempt_completion_boundary": {
+                    "nominal_max_turns": self.budgets.max_turns,
+                    "call_limit": call_limit,
+                    "trial_state": state,
+                    "source_sha256": self._source_sha256(source),
+                    "allowed_actions": list(allowed),
+                }
+            }),
         )
 
     @staticmethod
@@ -727,7 +819,9 @@ class A3TrialLoop:
             return "profile-required"
         return "submit-ready"
 
-    def _allowed_action_kinds(self, state: str) -> tuple[str, ...]:
+    def _allowed_action_kinds(
+        self, state: str, *, completion_phase: bool = False,
+    ) -> tuple[str, ...]:
         core = {
             "source-required": ("write_source",),
             "rewrite-required": ("write_source",),
@@ -738,6 +832,8 @@ class A3TrialLoop:
             "profile-required": ("profile",),
             "submit-ready": ("submit", "write_source"),
         }[state]
+        if completion_phase:
+            return tuple(kind for kind in core if kind != "write_source")
         if self.cell.knowledge is KnowledgeMode.WITH_KDB:
             return (*core, "query")
         return core
@@ -746,6 +842,8 @@ class A3TrialLoop:
         self, observations: list[object], source: str | None,
         compilation=None, verified=None, profile_result=None,
         rewrite_source=None, compile_attempt_id=None, run_attempt_id=None,
+        *, completion_phase: bool = False,
+        completion_calls_remaining: int | None = None,
     ) -> str:
         state = self._trial_state(
             source, compilation, verified, profile_result, rewrite_source,
@@ -755,9 +853,10 @@ class A3TrialLoop:
             compilation.plan.source_fingerprint
             if isinstance(compilation, CandidateCompilation) else None
         )
-        allowed = self._allowed_action_kinds(state)
-        return json.dumps(
-            {
+        allowed = self._allowed_action_kinds(
+            state, completion_phase=completion_phase,
+        )
+        context = {
                 "action_contract": {
                     "profile_metric": ProfileMetric.PIPE_UTILIZATION.value,
                     "eligible_submit_supports": self._eligible_submit_supports(
@@ -783,7 +882,16 @@ class A3TrialLoop:
                 },
                 "proposal": self.proposal.as_dict(),
                 "source_slot": CANDIDATE_SOURCE_CONTRACT.source_slot,
-            },
+            }
+        if completion_phase:
+            context["attempt_completion"] = {
+                "active": True,
+                "call_limit": _COMPLETION_CALL_LIMITS[self.cell.profiling],
+                "calls_remaining": completion_calls_remaining,
+                "source_frozen": True,
+            }
+        return json.dumps(
+            context,
             sort_keys=True,
             separators=(",", ":"),
         )
