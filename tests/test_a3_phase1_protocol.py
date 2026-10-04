@@ -7,6 +7,7 @@ from benchmarks.a3kernels.phase1_protocol import (
     ExecutionReceipt,
     FailedEvidence,
     SourceFile,
+    VerificationMismatch,
     VerifiedResult,
     attest,
 )
@@ -144,20 +145,118 @@ def test_receipt_is_untrusted_and_attestation_is_host_derived():
     assert "agent_claim" not in str(result.attestation_payload())
 
 
+@pytest.mark.parametrize(
+    "changes, message",
+    [
+        ({"logical_index": True}, "logical_index"),
+        ({"logical_index": -1}, "logical_index"),
+        ({"actual": float("nan")}, "finite"),
+        ({"absolute_error": -1.0}, "absolute_error"),
+        ({"expected": 99.0}, "expected"),
+        ({"absolute_error": 0.5}, "absolute_error"),
+    ],
+)
+def test_verification_mismatch_rejects_invalid_or_inconsistent_values(
+    changes, message,
+):
+    values = {
+        "logical_index": 0,
+        "input_a": 1.0,
+        "input_b": 3.0,
+        "actual": 5.0,
+        "expected": 4.0,
+        "absolute_error": 1.0,
+    }
+    values.update(changes)
+
+    with pytest.raises(ValueError, match=message):
+        VerificationMismatch(**values)
+
+
+def test_failed_verification_selects_logical_max_with_lowest_index_ties():
+    execution = plan(
+        input_a=(1.0, -2.0, 0.0, 0.0),
+        input_b=(3.0, 5.0, 0.0, 0.0),
+        logical_length=2,
+        padded_length=4,
+    )
+    receipt = ExecutionReceipt(0, (5.0, 2.0, 999.0, -999.0))
+
+    result = VerifiedResult.from_receipt(
+        execution, receipt, max_abs_error=1.0,
+    )
+
+    assert result.passed is False
+    assert result.mismatch == VerificationMismatch(
+        logical_index=0,
+        input_a=1.0,
+        input_b=3.0,
+        actual=5.0,
+        expected=4.0,
+        absolute_error=1.0,
+    )
+
+
+def test_passing_and_failed_process_results_have_no_mismatch_sample():
+    execution = plan()
+    passed = VerifiedResult.from_receipt(
+        execution, ExecutionReceipt(0, (4.0, 3.0)), max_abs_error=0.0,
+    )
+    process_failed = VerifiedResult.from_receipt(
+        execution, ExecutionReceipt(2), max_abs_error=None,
+    )
+
+    assert passed.passed and passed.mismatch is None
+    assert not process_failed.passed and process_failed.mismatch is None
+
+
+def test_mismatch_sample_is_attested_and_tampering_breaks_attestation():
+    execution = plan()
+    result = VerifiedResult.from_receipt(
+        execution, ExecutionReceipt(0, (5.0, 3.0)), max_abs_error=1.0,
+    )
+    tampered = replace(
+        result,
+        mismatch=replace(result.mismatch, logical_index=1),
+    )
+
+    assert result.attestation_sha256 == attest(result.attestation_payload())
+    assert tampered.attestation_sha256 != attest(tampered.attestation_payload())
+
+
+def test_direct_result_rejects_mismatch_error_that_disagrees_with_maximum():
+    execution = plan()
+    result = VerifiedResult.from_receipt(
+        execution, ExecutionReceipt(0, (5.0, 3.0)), max_abs_error=1.0,
+    )
+    inconsistent = VerificationMismatch(
+        logical_index=0,
+        input_a=1.0,
+        input_b=3.0,
+        actual=6.0,
+        expected=4.0,
+        absolute_error=2.0,
+    )
+
+    with pytest.raises(ValueError, match="max_abs_error"):
+        replace(result, mismatch=inconsistent)
+
+
 def test_verified_result_attests_nondefault_tolerance():
     execution = plan()
-    receipt = ExecutionReceipt(exit_code=0, output=[4.0, 3.0])
+    receipt = ExecutionReceipt(exit_code=0, output=[4.5, 3.0])
 
     narrow = VerifiedResult.from_receipt(
-        execution, receipt, max_abs_error=0.05, tolerance=0.05
+        execution, receipt, max_abs_error=0.5, tolerance=0.5
     )
     wide = VerifiedResult.from_receipt(
-        execution, receipt, max_abs_error=0.05, tolerance=0.1
+        execution, receipt, max_abs_error=0.5, tolerance=0.6
     )
 
     assert narrow.passed is True
-    assert narrow.tolerance == 0.05
-    assert wide.tolerance == 0.1
+    assert narrow.tolerance == 0.5
+    assert wide.tolerance == 0.6
+    assert narrow.mismatch is wide.mismatch is None
     assert narrow.attestation_sha256 != wide.attestation_sha256
 
 

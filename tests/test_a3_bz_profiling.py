@@ -39,6 +39,7 @@ def verified() -> VerifiedResult:
         "source_fingerprint": BINDING.source_fingerprint,
         "evidence_sha256": "d" * 64,
         "job_handle": "bz-a3-1:verified-job",
+        "mismatch": None,
     }
     return VerifiedResult(**body, attestation_sha256=attest(body))
 

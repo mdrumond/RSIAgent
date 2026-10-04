@@ -37,6 +37,7 @@ def terminal_outcome(digest="a" * 64):
 def trial_protocol_sha256(openai_turns=24):
     return canonical_digest({
         "schema": "a3-trial-protocol-v1",
+        "verification_feedback_schema": "a3-verification-mismatch-v1",
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
                 "max_turns": openai_turns, "max_tokens": 32768,

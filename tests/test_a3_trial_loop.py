@@ -18,7 +18,9 @@ from benchmarks.a3kernels.candidate import (
 from benchmarks.a3kernels.knowledge_agent import (
     Citation, KnowledgeQuery, KnowledgeResult,
 )
-from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a3kernels.phase1_evidence import (
+    EvidenceKind, EvidenceLedger, canonical_digest,
+)
 from benchmarks.a3kernels.phase1_memory import (
     AuthoritativeEvidence, Phase1LearningJournal,
 )
@@ -614,12 +616,71 @@ def test_failed_verified_result_is_recoverable_and_requires_rewrite(tmp_path):
     assert failure["max_abs_error"] == 3.0
     assert failure["tolerance"] == 1e-5
     assert failure["next_action"] == "write_source"
+    assert failure["mismatch"] == {
+        "logical_index": 0,
+        "input_a": 1.0,
+        "input_b": 2.0,
+        "actual": 0.0,
+        "expected": 3.0,
+        "absolute_error": 3.0,
+    }
+    assert set(failure) == {
+        "diagnostic", "max_abs_error", "tolerance", "mismatch",
+        "source_fingerprint", "execution_id", "evidence_sha256",
+        "attestation_sha256", "next_action",
+    }
+    assert not any(
+        term in json.dumps(failure).lower()
+        for term in ("datacopy", "setflag", "waitflag", "queue", "query")
+    )
     assert all(len(failure[key]) == 64 for key in (
         "source_fingerprint", "execution_id", "evidence_sha256",
         "attestation_sha256",
     ))
     entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
     assert any("failed_verification" in entry.payload for entry in entries)
+
+
+def test_failed_verified_result_without_mismatch_reaches_actor_feedback(tmp_path):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class ProcessFailureOnce(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.runs = 0
+
+        def run(self, source, workdir, **kw):
+            self.runs += 1
+            if self.runs == 1:
+                plan = self._plan(
+                    source, kw["request_id"], kw["attempt_id"], kw["length"],
+                    kw["project_id"], kw.get("padded_length"),
+                    kw.get("block_count", 1),
+                    kw.get("execution_profile", "gz-a3"),
+                )
+                return VerifiedResult.from_receipt(
+                    plan, ExecutionReceipt(2, stderr="runtime failed"),
+                    max_abs_error=None,
+                )
+            return super().run(source, workdir, **kw)
+
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "write_source", "source": replacement}),
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({
+            "action": "submit", "interpretation": "host facts", "supports": [],
+        }),
+    ], candidate=ProcessFailureOnce())
+
+    feedback = json.loads(prompts[3])["observations"][-1][
+        "failed_verification"
+    ]
+    assert result.status == "passed"
+    assert feedback["max_abs_error"] is None
+    assert feedback["mismatch"] is None
+    assert feedback["next_action"] == "write_source"
 
 
 def test_submit_supports_are_only_for_current_source_revision(tmp_path):
@@ -1122,6 +1183,22 @@ def test_default_trial_budget_is_bound_to_the_cell_model(tmp_path):
 def test_public_no_arg_trial_budget_matches_the_openai_registered_default():
     assert TrialBudgets() == TrialBudgets.for_model(BackendModel.GPT_5_6_SOL)
     assert TrialBudgets() == TrialBudgets(24, 32768)
+
+
+def test_trial_protocol_versions_structured_mismatch_feedback():
+    legacy = canonical_digest({
+        "schema": "a3-trial-protocol-v1",
+        "model_budgets": {
+            BackendModel.GPT_5_6_SOL.value: {
+                "max_turns": 24, "max_tokens": 32768,
+            },
+            BackendModel.DEEPSEEK_FLASH.value: {
+                "max_turns": 24, "max_tokens": 65536,
+            },
+        },
+    })
+
+    assert trial_protocol_sha256() != legacy
 
 
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
