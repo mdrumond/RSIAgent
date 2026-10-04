@@ -40,6 +40,7 @@ def trial_protocol_sha256(openai_turns=24):
     return canonical_digest({
         "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "candidate_validation_exception": "rewrite-required",
         "attempt_completion": {
             "schema": "a3-attempt-completion-v1",
             "source_frozen": True,

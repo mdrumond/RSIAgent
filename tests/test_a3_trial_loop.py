@@ -1258,6 +1258,93 @@ def test_deterministic_completion_failure_terminates_without_requesting_rewrite(
     assert result.failures[-1] == "compile failed: source rewrite required"
 
 
+def test_nominal_candidate_validation_exception_requires_changed_source(
+    tmp_path,
+):
+    replacement = SOURCE.replace(" {}", " { return; }")
+
+    class RejectFirstSource(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.sources = []
+
+        def compile(self, source, workdir, **kw):
+            self.sources.append(source)
+            if len(self.sources) == 1:
+                raise ValueError(
+                    "candidate must contain the exact exported vector_add "
+                    "signature once"
+                )
+            return super().compile(source, workdir, **kw)
+
+    candidate = RejectFirstSource()
+    result, prompts, _ = _run(
+        tmp_path,
+        [
+            json.dumps({"action": "write_source", "source": SOURCE}),
+            '{"action":"compile"}',
+            json.dumps({"action": "write_source", "source": replacement}),
+            '{"action":"compile"}', '{"action":"run"}',
+            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
+        ],
+        candidate=candidate,
+    )
+
+    assert result.status == "passed"
+    assert candidate.sources == [SOURCE, replacement]
+    after_rejection = json.loads(prompts[2])
+    assert after_rejection["action_contract"]["trial_state"] == (
+        "rewrite-required"
+    )
+    assert after_rejection["observations"][-1] == (
+        "failure: candidate must contain the exact exported vector_add "
+        "signature once"
+    )
+
+
+@pytest.mark.parametrize("operation", ["compile", "run"])
+def test_completion_candidate_validation_exception_is_immediately_terminal(
+    tmp_path, operation,
+):
+    class ValidationFailure(FakeCandidate):
+        def compile(self, source, workdir, **kw):
+            if operation == "compile":
+                raise ValueError(
+                    "candidate must contain the exact exported vector_add "
+                    "signature once"
+                )
+            return super().compile(source, workdir, **kw)
+
+        def run(self, source, workdir, **kw):
+            raise ValueError("runtime fixture rejected candidate source")
+
+    nominal_tail = [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+    ]
+    completion = ['{"action":"compile"}']
+    if operation == "run":
+        nominal_tail.append('{"action":"compile"}')
+        completion = ['{"action":"run"}']
+    completion.append(
+        json.dumps({"action": "write_source", "source": SOURCE + "\n"})
+    )
+    result, prompts, _ = _run(
+        tmp_path,
+        ['{"action":"compile"}'] * (24 - len(nominal_tail))
+        + nominal_tail + completion,
+        candidate=ValidationFailure(), budgets=TrialBudgets(24, 2000),
+    )
+
+    assert result.status == "attempt-rewrite-required"
+    assert result.turns == 25 and result.completion_turns == 1
+    assert len(prompts) == 25
+    assert "candidate" in result.failures[-1]
+    retained = EvidenceLedger(tmp_path / "evidence.jsonl").entries[-1]
+    assert retained.kind == "failure"
+    assert retained.payload["turn"] == 25
+    assert retained.payload["detail"] == result.failures[-1]
+
+
 def test_completion_host_mismatch_is_distinct_and_stops_before_source_rewrite(
     tmp_path,
 ):

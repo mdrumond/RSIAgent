@@ -150,6 +150,7 @@ def trial_protocol_sha256(
     value = {
         "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "candidate_validation_exception": "rewrite-required",
         "attempt_completion": {
             "schema": "a3-attempt-completion-v1",
             "source_frozen": True,
@@ -176,6 +177,7 @@ def trial_protocol_sha256(
     if not attempt_completion:
         value["schema"] = "a3-trial-protocol-v1"
         del value["attempt_completion"]
+        del value["candidate_validation_exception"]
     return canonical_digest(value)
 
 

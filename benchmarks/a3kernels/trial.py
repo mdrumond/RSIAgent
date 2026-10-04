@@ -162,6 +162,7 @@ def trial_protocol_sha256() -> str:
     return canonical_digest({
         "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "candidate_validation_exception": "rewrite-required",
         "attempt_completion": {
             "schema": _ATTEMPT_COMPLETION_SCHEMA,
             "source_frozen": True,
@@ -352,13 +353,30 @@ class A3TrialLoop:
                     if compile_attempt_id is None:
                         compile_attempt_id = f"turn-{turn}"
                     verified = profile_result = timing_result = None
-                    compile_result = self.candidate.compile(
-                        source, self.workdir, request_id=self.cell.cell_id,
-                        attempt_id=compile_attempt_id, project_id=self.proposal.project_id,
-                        length=self._length(), padded_length=self._padded_length(),
-                        block_count=self._block_count(), seed=0,
-                        execution_profile=self.execution_profile,
-                    )
+                    try:
+                        compile_result = self.candidate.compile(
+                            source, self.workdir, request_id=self.cell.cell_id,
+                            attempt_id=compile_attempt_id,
+                            project_id=self.proposal.project_id,
+                            length=self._length(),
+                            padded_length=self._padded_length(),
+                            block_count=self._block_count(), seed=0,
+                            execution_profile=self.execution_profile,
+                        )
+                    except ValueError as exc:
+                        compile_attempt_id = None
+                        rewrite_source = source
+                        self._retain_loop_failure(
+                            turn, exc, failures, observations,
+                        )
+                        if in_completion:
+                            return TrialResult(
+                                "attempt-rewrite-required", turn, tokens,
+                                verified, profile_result, queries,
+                                tuple(failures),
+                                completion_turns=completion_turns,
+                            )
+                        continue
                     if isinstance(compile_result, FailedEvidence):
                         if not self._retryable_failure("compile", compile_result):
                             compile_attempt_id = None
@@ -391,13 +409,30 @@ class A3TrialLoop:
                     verified = profile_result = timing_result = None
                     if run_attempt_id is None:
                         run_attempt_id = f"turn-{turn}"
-                    result = self.candidate.run(
-                        source, self.workdir, request_id=self.cell.cell_id,
-                        attempt_id=run_attempt_id, project_id=self.proposal.project_id,
-                        length=self._length(), padded_length=self._padded_length(),
-                        block_count=self._block_count(), seed=0,
-                        execution_profile=self.execution_profile,
-                    )
+                    try:
+                        result = self.candidate.run(
+                            source, self.workdir, request_id=self.cell.cell_id,
+                            attempt_id=run_attempt_id,
+                            project_id=self.proposal.project_id,
+                            length=self._length(),
+                            padded_length=self._padded_length(),
+                            block_count=self._block_count(), seed=0,
+                            execution_profile=self.execution_profile,
+                        )
+                    except ValueError as exc:
+                        run_attempt_id = None
+                        rewrite_source = source
+                        self._retain_loop_failure(
+                            turn, exc, failures, observations,
+                        )
+                        if in_completion:
+                            return TrialResult(
+                                "attempt-rewrite-required", turn, tokens,
+                                verified, profile_result, queries,
+                                tuple(failures),
+                                completion_turns=completion_turns,
+                            )
+                        continue
                     if isinstance(result, FailedEvidence):
                         if not self._retryable_failure("run", result):
                             run_attempt_id = None
@@ -519,10 +554,7 @@ class A3TrialLoop:
                         completion_turns,
                     )
             except (TypeError, ValueError, RuntimeError) as exc:
-                failure = str(exc)
-                failures.append(failure)
-                observations.append("failure: " + failure)
-                self.evidence.append(EvidenceKind.FAILURE, self._identity({"turn": turn, "detail": failure}))
+                self._retain_loop_failure(turn, exc, failures, observations)
         return TrialResult(
             "budget-exhausted", last_turn, tokens, verified, profile_result,
             queries, tuple(failures), completion_turns=completion_turns,
@@ -594,6 +626,18 @@ class A3TrialLoop:
                 "turn": turn,
                 "provider_response_failure": structured,
             }),
+        )
+
+    def _retain_loop_failure(
+        self, turn: int, failure: Exception, failures: list[str],
+        observations: list[object],
+    ) -> None:
+        detail = str(failure)
+        failures.append(detail)
+        observations.append("failure: " + detail)
+        self.evidence.append(
+            EvidenceKind.FAILURE,
+            self._identity({"turn": turn, "detail": detail}),
         )
 
     def _submit_gate(self, source, compilation, verified, profile_result) -> str | None:
