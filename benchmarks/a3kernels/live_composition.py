@@ -328,9 +328,13 @@ class LiveComposition:
                 return {
                     "status": "failed",
                     "terminal_reason": (
-                        "token-budget-exhausted"
-                        if "token budget exhausted" in trial.failures
-                        else "turn-budget-exhausted"
+                        "attempt-rewrite-required"
+                        if trial.status == "attempt-rewrite-required"
+                        else (
+                            "token-budget-exhausted"
+                            if "token budget exhausted" in trial.failures
+                            else "turn-budget-exhausted"
+                        )
                     ),
                     "completed_projects": len(digests),
                     "failed_project_id": proposal.project_id,

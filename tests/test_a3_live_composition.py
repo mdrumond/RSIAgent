@@ -144,10 +144,25 @@ def dependencies(knowledge_calls, profile_calls):
     )
 
 
-def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
+def trial_protocol_sha256(
+    openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
+):
     value = {
-        "schema": "a3-trial-protocol-v1",
+        "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "candidate_validation_exception": "rewrite-required",
+        "attempt_completion": {
+            "schema": "a3-attempt-completion-v1",
+            "source_frozen": True,
+            "allowed_operations": ["compile", "run", "profile", "submit"],
+            "call_limits": {
+                ProfilingGuidance.WITHOUT_GUIDANCE.value: 3,
+                ProfilingGuidance.WITH_GUIDANCE.value: 4,
+            },
+            "token_ceiling": "absolute",
+            "rewrite_required": "terminate",
+            "rewrite_terminal_status": "attempt-rewrite-required",
+        },
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
                 "max_turns": openai_turns, "max_tokens": 32768,
@@ -159,6 +174,10 @@ def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
     }
     if not mismatch_feedback:
         del value["verification_feedback_schema"]
+    if not attempt_completion:
+        value["schema"] = "a3-trial-protocol-v1"
+        del value["attempt_completion"]
+        del value["candidate_validation_exception"]
     return canonical_digest(value)
 
 
@@ -209,7 +228,8 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
 
 @pytest.mark.parametrize("smoke", [False, True], ids=["full", "smoke"])
 @pytest.mark.parametrize(
-    "old_protocol", ["twelve-turns", "no-mismatch-feedback"]
+    "old_protocol",
+    ["twelve-turns", "no-mismatch-feedback", "no-attempt-completion"],
 )
 def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
     tmp_path, monkeypatch, smoke, old_protocol,
@@ -249,11 +269,15 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
 
     monkeypatch.setattr(
         composition_module, "trial_protocol_sha256",
-        lambda: (
-            trial_protocol_sha256(12)
-            if old_protocol == "twelve-turns"
-            else trial_protocol_sha256(mismatch_feedback=False)
-        ),
+        lambda: {
+            "twelve-turns": trial_protocol_sha256(12),
+            "no-mismatch-feedback": trial_protocol_sha256(
+                mismatch_feedback=False
+            ),
+            "no-attempt-completion": trial_protocol_sha256(
+                attempt_completion=False
+            ),
+        }[old_protocol],
     )
     old = LiveComposition(
         cfg, old_dependencies, proposals=proposals,
@@ -377,6 +401,67 @@ def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
     assert record["status"] == "failed"
     assert record["terminal_reason"] == "token-budget-exhausted"
     assert record["completed_projects"] == 0
+
+
+def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
+    cfg = config(tmp_path)
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    calls = []
+    actions = (
+        [{"action": "compile"}] * 23
+        + [{"action": "write_source", "source": SOURCE},
+           {"action": "compile"}, {"action": "run"},
+           {"action": "write_source", "source": SOURCE + "\n"}]
+    )
+
+    def late_actor_factory(_cell, _proposal):
+        iterator = iter(actions)
+        def actor(profile, _context):
+            calls.append("actor")
+            return A3Completion(
+                json.dumps(next(iterator)), 1,
+                {"profile_sha256": profile.fingerprint},
+            )
+        return actor
+
+    class HostMismatch(FakeCandidate):
+        def run(self, source, _workdir, **options):
+            plan = self.base.plan(source, **options)
+            output = (0.0,) * plan.padded_length
+            return VerifiedResult.from_receipt(
+                plan, ExecutionReceipt(0, output),
+                max_abs_error=max(
+                    abs(a + b) for a, b in zip(plan.input_a, plan.input_b)
+                ),
+            )
+
+    deps = LiveDependencies(
+        actor_factory=late_actor_factory,
+        candidate_factory=lambda _cell, proposal, _paths: HostMismatch(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    wave = SmokeWave(
+        cfg,
+        LiveComposition(
+            cfg, deps, proposals=SMOKE_PROPOSALS, lineage_prefix="smoke",
+        ).execute,
+        cells=(cell,), execution_profile="bz-a3-1",
+    )
+
+    record = wave.run()[0]
+    assert record["status"] == "failed"
+    assert record["terminal_reason"] == "attempt-rewrite-required"
+    assert len(calls) == 26
+    assert wave.report()["records"][0]["terminal_reason"] == (
+        "attempt-rewrite-required"
+    )
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):

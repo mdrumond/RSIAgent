@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a3_experiments import BackendModel, KnowledgeMode
+from benchmarks.a3_experiments import (
+    BackendModel, KnowledgeMode, ProfilingGuidance,
+)
 from benchmarks.a3kernels.candidate import profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
@@ -36,8 +38,21 @@ def terminal_outcome(digest="a" * 64):
 
 def trial_protocol_sha256(openai_turns=24):
     return canonical_digest({
-        "schema": "a3-trial-protocol-v1",
+        "schema": "a3-trial-protocol-v2",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
+        "candidate_validation_exception": "rewrite-required",
+        "attempt_completion": {
+            "schema": "a3-attempt-completion-v1",
+            "source_frozen": True,
+            "allowed_operations": ["compile", "run", "profile", "submit"],
+            "call_limits": {
+                ProfilingGuidance.WITHOUT_GUIDANCE.value: 3,
+                ProfilingGuidance.WITH_GUIDANCE.value: 4,
+            },
+            "token_ceiling": "absolute",
+            "rewrite_required": "terminate",
+            "rewrite_terminal_status": "attempt-rewrite-required",
+        },
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
                 "max_turns": openai_turns, "max_tokens": 32768,
