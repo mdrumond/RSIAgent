@@ -20,6 +20,7 @@ from .remote_candidate import (
 
 
 _PROFILES = frozenset(("bz-a3-1", "bz-a3-2"))
+_AMBIGUOUS_REMOTE_OUTCOME = "AmbiguousRemoteOutcome"
 
 
 class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
@@ -264,6 +265,17 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
         if len(handles) != 1 or not handles[0].startswith(self._profile + ":"):
             raise ValueError("neutral wrapper returned an invalid BZ-A3 handle")
         return handles[0]
+
+    def _operation_error_type(
+        self, completed: subprocess.CompletedProcess[str],
+    ) -> str:
+        # The outer wrapper can fail after cpl-remote retained and completed
+        # the operation but before it returned the authenticated command result.
+        # Its exit code must not become a compile or runtime observation.
+        text = "\n".join((completed.stdout or "", completed.stderr or ""))
+        if self._markers(text, "BZ_A3_JOB_STATE=") == ["transport-failed"]:
+            return _AMBIGUOUS_REMOTE_OUTCOME
+        return super()._operation_error_type(completed)
 
     @staticmethod
     def _require_logical_device_zero(plan: ExecutionPlan) -> None:

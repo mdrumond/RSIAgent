@@ -30,6 +30,7 @@ from benchmarks.a3kernels.phase1_registry import (
 from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Config
 from benchmarks.a3kernels.project_execution import (
     PerformancePreset, ProjectRuntimePolicy, RecoveryEvidence,
+    RecoveryStarterEvidenceUnavailable,
 )
 from benchmarks.a3kernels.profiling import (
     CompactProfileResult, ProfilingTreatment, TimingResult,
@@ -197,6 +198,11 @@ class _RecoveryCandidate:
             if source != recovery.source:
                 raise ValueError("registered recovery starter must be attempted first")
             result = self.backend.compile(source, workdir, **options)
+            if (
+                isinstance(result, FailedEvidence)
+                and result.error_type == "AmbiguousRemoteOutcome"
+            ):
+                raise RecoveryStarterEvidenceUnavailable(result)
             if recovery.required_evidence is RecoveryEvidence.COMPILE_FAILURE:
                 if not isinstance(result, FailedEvidence) or result.stage != "compile":
                     raise ValueError("compile recovery starter did not produce its registered failure")
@@ -214,6 +220,11 @@ class _RecoveryCandidate:
             if source != recovery.source:
                 raise ValueError("registered runtime recovery starter must run first")
             result = self.backend.run(source, workdir, **options)
+            if (
+                isinstance(result, FailedEvidence)
+                and result.error_type == "AmbiguousRemoteOutcome"
+            ):
+                raise RecoveryStarterEvidenceUnavailable(result)
             failed_evidence = (
                 isinstance(result, FailedEvidence)
                 and result.stage in {"execute", "verify"}
@@ -331,9 +342,13 @@ class LiveComposition:
                         "attempt-rewrite-required"
                         if trial.status == "attempt-rewrite-required"
                         else (
-                            "token-budget-exhausted"
-                            if "token budget exhausted" in trial.failures
-                            else "turn-budget-exhausted"
+                            "infrastructure-unverified"
+                            if trial.status == "infrastructure-unverified"
+                            else (
+                                "token-budget-exhausted"
+                                if "token budget exhausted" in trial.failures
+                                else "turn-budget-exhausted"
+                            )
                         )
                     ),
                     "completed_projects": len(digests),

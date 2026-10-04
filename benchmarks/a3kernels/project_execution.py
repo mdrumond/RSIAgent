@@ -35,6 +35,19 @@ class RecoveryEvidence(str, Enum):
     HOST_VERIFICATION_FAILURE = "host-verification-failure"
 
 
+class RecoveryStarterEvidenceUnavailable(RuntimeError):
+    """The mandatory starter ran, but its required result was not observed."""
+
+    def __init__(self, failure: FailedEvidence) -> None:
+        if not isinstance(failure, FailedEvidence):
+            raise TypeError("recovery starter failure must be FailedEvidence")
+        self.failure = failure
+        super().__init__(
+            "recovery starter evidence is unavailable after an ambiguous "
+            "remote operation"
+        )
+
+
 class PerformancePreset(str, Enum):
     NONE = "none"
     TIMING = "timing"

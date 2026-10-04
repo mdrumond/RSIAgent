@@ -34,6 +34,7 @@ from benchmarks.a3kernels.phase1_memory import (
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence, VerifiedResult
 from benchmarks.a3kernels.phase1_protocol import A3_EXECUTION_PROFILES
 from benchmarks.a3kernels.phase1_registry import CurriculumProposal
+from benchmarks.a3kernels.project_execution import RecoveryStarterEvidenceUnavailable
 from benchmarks.a3kernels.profiling import (
     A3ProfilingSession,
     CandidateBinding,
@@ -160,9 +161,10 @@ def trial_protocol_sha256() -> str:
             "max_tokens": budgets.max_tokens,
         }
     return canonical_digest({
-        "schema": "a3-trial-protocol-v2",
+        "schema": "a3-trial-protocol-v3",
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
+        "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
         "attempt_completion": {
             "schema": _ATTEMPT_COMPLETION_SCHEMA,
             "source_frozen": True,
@@ -363,6 +365,16 @@ class A3TrialLoop:
                             block_count=self._block_count(), seed=0,
                             execution_profile=self.execution_profile,
                         )
+                    except RecoveryStarterEvidenceUnavailable as exc:
+                        self._retain_candidate_failure(
+                            turn, "compile", exc.failure, failures, observations,
+                            next_action="terminate-project",
+                        )
+                        return TrialResult(
+                            "infrastructure-unverified", turn, tokens, verified,
+                            profile_result, queries, tuple(failures),
+                            completion_turns=completion_turns,
+                        )
                     except ValueError as exc:
                         compile_attempt_id = None
                         rewrite_source = source
@@ -418,6 +430,16 @@ class A3TrialLoop:
                             padded_length=self._padded_length(),
                             block_count=self._block_count(), seed=0,
                             execution_profile=self.execution_profile,
+                        )
+                    except RecoveryStarterEvidenceUnavailable as exc:
+                        self._retain_candidate_failure(
+                            turn, "run", exc.failure, failures, observations,
+                            next_action="terminate-project",
+                        )
+                        return TrialResult(
+                            "infrastructure-unverified", turn, tokens, verified,
+                            profile_result, queries, tuple(failures),
+                            completion_turns=completion_turns,
                         )
                     except ValueError as exc:
                         run_attempt_id = None
@@ -671,6 +693,8 @@ class A3TrialLoop:
         failure: FailedEvidence,
         failures: list[str],
         observations: list[object],
+        *,
+        next_action: str | None = None,
     ) -> None:
         detail = f"{operation} failed: {failure.detail}"
         failures.append(detail)
@@ -682,7 +706,7 @@ class A3TrialLoop:
                 source_fingerprint=failure.source_fingerprint,
                 execution_id=failure.execution_id,
                 attestation_sha256=failure.attestation_sha256,
-                next_action=(
+                next_action=next_action or (
                     "retry"
                     if self._retryable_failure(operation, failure)
                     else "write_source"

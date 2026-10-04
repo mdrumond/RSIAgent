@@ -301,6 +301,27 @@ def test_observation_unavailable_recovers_exact_compile_handle_without_upload(
     }
 
 
+def test_lost_launch_response_is_not_reported_as_a_compile_failure(tmp_path):
+    calls = []
+
+    def process(argv, **kwargs):
+        calls.append(tuple(argv))
+        if argv[0].endswith("cpl-remote"):
+            return _completed(argv, _upload_terminal())
+        return _terminal(
+            "bz-a3-1", "bz-a3-1:unavailable", "BZ_A3_JOB_STATE=transport-failed",
+            state="failed", code=2,
+            stderr="retained operation completed; launch response unavailable",
+        )
+
+    failed = _backend(tmp_path, process).compile(_plan(), tmp_path / "local")
+
+    assert isinstance(failed, FailedEvidence)
+    assert failed.stage == "compile"
+    assert failed.error_type == "AmbiguousRemoteOutcome"
+    assert len(calls) == 2
+
+
 def test_pending_observation_rejects_foreign_handle_and_remains_recoverable(tmp_path):
     calls = []
 
