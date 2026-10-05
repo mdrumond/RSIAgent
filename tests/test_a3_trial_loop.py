@@ -831,6 +831,35 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
         assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
 
 
+def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path):
+    class PrepareFailure(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_calls = 0
+
+        def compile(self, source, workdir, **kw):
+            self.compile_calls += 1
+            plan = self._plan(
+                source, kw["request_id"], kw["attempt_id"], kw["length"],
+                kw["project_id"], kw.get("padded_length"),
+                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+            )
+            return FailedEvidence.create(
+                plan, stage="prepare", error_type="RuntimeError",
+                detail="VPN route unavailable",
+            )
+
+    candidate = PrepareFailure()
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+    ], candidate=candidate)
+
+    assert result.status == "infrastructure-unverified"
+    assert candidate.compile_calls == 1
+    assert len(prompts) == 2
+
+
 def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
     class PendingRun(FakeCandidate):
         def __init__(self):

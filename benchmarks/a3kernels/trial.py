@@ -411,7 +411,7 @@ class A3TrialLoop:
                             )
                         continue
                     if isinstance(compile_result, FailedEvidence):
-                        if compile_result.error_type == "AmbiguousRemoteOutcome":
+                        if self._infrastructure_failure(compile_result):
                             self._retain_candidate_failure(
                                 turn, "compile", compile_result, failures,
                                 observations, next_action="terminate-project",
@@ -489,7 +489,7 @@ class A3TrialLoop:
                             )
                         continue
                     if isinstance(result, FailedEvidence):
-                        if result.error_type == "AmbiguousRemoteOutcome":
+                        if self._infrastructure_failure(result):
                             self._retain_candidate_failure(
                                 turn, "run", result, failures, observations,
                                 next_action="terminate-project",
@@ -796,6 +796,13 @@ class A3TrialLoop:
         self.evidence.append(
             EvidenceKind.FAILURE,
             self._identity({"turn": turn, "failed_verification": result}),
+        )
+
+    @staticmethod
+    def _infrastructure_failure(failure: FailedEvidence) -> bool:
+        return failure.error_type == "AmbiguousRemoteOutcome" or (
+            failure.stage == "prepare"
+            and failure.error_type == "RuntimeError"
         )
 
     @staticmethod

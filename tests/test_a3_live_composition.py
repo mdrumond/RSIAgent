@@ -436,6 +436,58 @@ def test_ordinary_ambiguous_candidate_evidence_uses_infrastructure_retries(
     assert all(item["error_type"] == "AmbiguousRemoteOutcome" for item in failures)
 
 
+def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    attempts, actor_calls, sleeps = [], [], []
+
+    class PrepareFailure(FakeCandidate):
+        def compile(self, source, workdir, **options):
+            attempts.append(options["attempt_id"])
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(
+                plan, stage="prepare", error_type="RuntimeError",
+                detail="VPN route unavailable",
+            )
+
+    def counting_actor_factory(selected, selected_proposal):
+        actor = actor_factory(selected, selected_proposal)
+
+        def counting_actor(*args):
+            actor_calls.append(True)
+            return actor(*args)
+
+        return counting_actor
+
+    deps = LiveDependencies(
+        actor_factory=counting_actor_factory,
+        candidate_factory=lambda *_: PrepareFailure(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["terminal_reason"] == "infrastructure-unverified"
+    assert result["infrastructure_retries_used"] == 3
+    assert sleeps == [120, 120, 120]
+    assert len(attempts) == 4
+    assert len(actor_calls) == 8
+
+
 def test_cell_execution_lock_rejects_concurrent_same_process_run(tmp_path):
     proposal = DEFAULT_PROPOSALS[0]
     cell = foundation_cells()[0]
