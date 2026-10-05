@@ -1711,6 +1711,12 @@ def test_trial_protocol_changed_from_v4_candidate_contract():
     )
 
 
+def test_trial_protocol_versions_prepare_runtime_infrastructure_classification():
+    assert trial_protocol_sha256() != (
+        "b082a4e71e97f2624869d8cfa280b2ea9eb233bd8fbec84ee5116f453d49e0b4"
+    )
+
+
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):
     cell = _cell(model=BackendModel.DEEPSEEK_FLASH)
 
