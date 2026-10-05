@@ -10,7 +10,9 @@ from benchmarks.a3_experiments import BackendModel
 from benchmarks.a3_model_profiles import (
     A3Completion, A3TransportResult, DEEPSEEK_BASE_URL, load_a3_model_profile,
 )
-from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
+from benchmarks.a3kernels.candidate import (
+    A3CandidateBackend, CANDIDATE_SOURCE_CONTRACT, CandidateCompilation,
+)
 from benchmarks.a3kernels.live_composition import (
     AuthoritativeResultStore,
     LiveComposition,
@@ -150,7 +152,8 @@ def trial_protocol_sha256(
     openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
 ):
     value = {
-        "schema": "a3-trial-protocol-v4",
+        "schema": "a3-trial-protocol-v5",
+        "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3, "backoff_seconds": 120,
             "retryable_status": "infrastructure-unverified",
@@ -189,6 +192,7 @@ def trial_protocol_sha256(
         del value["verification_feedback_schema"]
     if not attempt_completion:
         value["schema"] = "a3-trial-protocol-v1"
+        del value["candidate_source_contract"]
         del value["attempt_completion"]
         del value["candidate_validation_exception"]
         del value["recovery_starter_ambiguous_outcome"]

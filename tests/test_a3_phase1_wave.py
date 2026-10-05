@@ -7,7 +7,7 @@ import pytest
 from benchmarks.a3_experiments import (
     BackendModel, KnowledgeMode, ProfilingGuidance,
 )
-from benchmarks.a3kernels.candidate import profile_driver_asset
+from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT, profile_driver_asset
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import (
@@ -38,9 +38,13 @@ def terminal_outcome(digest="a" * 64):
     }
 
 
-def trial_protocol_sha256(openai_turns=24):
+def trial_protocol_sha256(openai_turns=24, *, candidate_contract=True):
     return canonical_digest({
-        "schema": "a3-trial-protocol-v4",
+        "schema": "a3-trial-protocol-v5" if candidate_contract else "a3-trial-protocol-v4",
+        **(
+            {"candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict()}
+            if candidate_contract else {}
+        ),
         "infrastructure_retry": {
             "max_retries": 3, "backoff_seconds": 120,
             "retryable_status": "infrastructure-unverified",
@@ -75,6 +79,15 @@ def trial_protocol_sha256(openai_turns=24):
             },
         },
     })
+
+
+def test_trial_protocol_identity_includes_exact_candidate_source_contract():
+    legacy_without_candidate_contract = trial_protocol_sha256(candidate_contract=False)
+
+    from benchmarks.a3kernels.trial import trial_protocol_sha256 as current_protocol
+
+    assert current_protocol() != legacy_without_candidate_contract
+    assert CANDIDATE_SOURCE_CONTRACT.as_dict()["argument_semantics"]
 
 
 def test_all_eight_project_dry_run_has_no_side_effects(tmp_path):

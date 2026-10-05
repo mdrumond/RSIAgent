@@ -6,6 +6,7 @@ import pytest
 from benchmarks.a3_experiments import (
     BackendModel, KnowledgeMode, ProfilingGuidance,
 )
+from benchmarks.a3kernels.candidate import CANDIDATE_SOURCE_CONTRACT
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import (
@@ -56,7 +57,8 @@ def knowledge_identity(seed="a"):
 
 def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
     value = {
-        "schema": "a3-trial-protocol-v4",
+        "schema": "a3-trial-protocol-v5",
+        "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3, "backoff_seconds": 120,
             "retryable_status": "infrastructure-unverified",
