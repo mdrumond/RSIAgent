@@ -42,7 +42,12 @@ from benchmarks.a3kernels.profiling_gz import GZA3ProfilingBackend
 from benchmarks.a3kernels.profiling_bz import BZA3ProfilingBackend
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend
 from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
-from benchmarks.a3kernels.trial import A3TrialLoop, TrialResult, trial_protocol_sha256
+from benchmarks.a3kernels.trial import (
+    A3TrialLoop,
+    TrialResult,
+    infrastructure_unavailable,
+    trial_protocol_sha256,
+)
 
 
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -206,7 +211,7 @@ class _RecoveryCandidate:
             result = self.backend.compile(source, workdir, **options)
             if (
                 isinstance(result, FailedEvidence)
-                and result.error_type == "AmbiguousRemoteOutcome"
+                and infrastructure_unavailable(result)
             ):
                 raise RecoveryStarterEvidenceUnavailable(result)
             if recovery.required_evidence is RecoveryEvidence.COMPILE_FAILURE:
@@ -228,7 +233,7 @@ class _RecoveryCandidate:
             result = self.backend.run(source, workdir, **options)
             if (
                 isinstance(result, FailedEvidence)
-                and result.error_type == "AmbiguousRemoteOutcome"
+                and infrastructure_unavailable(result)
             ):
                 raise RecoveryStarterEvidenceUnavailable(result)
             failed_evidence = (

@@ -150,6 +150,7 @@ def dependencies(knowledge_calls, profile_calls):
 
 def trial_protocol_sha256(
     openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
+    prepare_runtime_infrastructure=True,
 ):
     value = {
         "schema": "a3-trial-protocol-v5",
@@ -160,6 +161,7 @@ def trial_protocol_sha256(
             "journal_schema": "a3-infrastructure-retry-v1",
             "attempt_outcome_required_before_decision": True,
             "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "prepare_runtime_outcome": "infrastructure-unverified",
             "interrupted_started_outcome": "terminal-infrastructure-unverified",
             "cell_execution": "exclusive-nonblocking",
             "memory_commit_reconciliation": "authenticated-passed-outcome",
@@ -190,6 +192,8 @@ def trial_protocol_sha256(
     }
     if not mismatch_feedback:
         del value["verification_feedback_schema"]
+    if not prepare_runtime_infrastructure:
+        del value["infrastructure_retry"]["prepare_runtime_outcome"]
     if not attempt_completion:
         value["schema"] = "a3-trial-protocol-v1"
         del value["candidate_source_contract"]
@@ -226,12 +230,19 @@ def test_complete_eight_cell_local_proof_is_isolated_and_resumable(tmp_path):
     assert Phase1Wave(cfg, composition.execute).resume() == records
 
 
-def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
-    tmp_path,
+@pytest.mark.parametrize(
+    "family,stage,error_type",
+    [
+        ("runtime-recovery", "compile", "AmbiguousRemoteOutcome"),
+        ("compile-recovery", "prepare", "RuntimeError"),
+    ],
+)
+def test_recovery_starter_launch_loss_terminates_without_rewrite_loop(
+    tmp_path, family, stage, error_type,
 ):
     proposal = next(
         item for item in DEFAULT_PROPOSALS
-        if item.family.value == "runtime-recovery"
+        if item.family.value == family
     )
     cell = next(
         item for item in foundation_cells()
@@ -240,7 +251,7 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
         and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
     )
 
-    class AmbiguousStarter(FakeCandidate):
+    class InfrastructureStarter(FakeCandidate):
         def __init__(self):
             super().__init__(proposal)
             self.compile_calls = 0
@@ -249,11 +260,11 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
             self.compile_calls += 1
             plan = self.base.plan(source, **options)
             return FailedEvidence.create(
-                plan, stage="compile", error_type="AmbiguousRemoteOutcome",
+                plan, stage=stage, error_type=error_type,
                 detail="retained operation completed without an observable result",
             )
 
-    candidate = AmbiguousStarter()
+    candidate = InfrastructureStarter()
     model_calls = []
 
     def unexpected_actor(*_args):
@@ -301,8 +312,8 @@ def test_runtime_recovery_starter_launch_loss_terminates_without_rewrite_loop(
         for line in paths.evidence.read_text().splitlines()
         if json.loads(line)["kind"] == "failure"
     ]
-    assert [failure["error_type"] for failure in failures] == [
-        "AmbiguousRemoteOutcome"
+    assert [(failure["stage"], failure["error_type"]) for failure in failures] == [
+        (stage, error_type)
     ] * 4
 
 
@@ -434,6 +445,58 @@ def test_ordinary_ambiguous_candidate_evidence_uses_infrastructure_retries(
         if "failed_evidence" in entry.payload
     ]
     assert all(item["error_type"] == "AmbiguousRemoteOutcome" for item in failures)
+
+
+def test_prepare_runtime_failure_uses_all_infrastructure_retries(tmp_path):
+    proposal = DEFAULT_PROPOSALS[0]
+    cell = next(
+        item for item in foundation_cells()
+        if item.backend_model is BackendModel.GPT_5_6_SOL
+        and item.knowledge is KnowledgeMode.WITHOUT_KDB
+        and item.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+    )
+    attempts, actor_calls, sleeps = [], [], []
+
+    class PrepareFailure(FakeCandidate):
+        def compile(self, source, workdir, **options):
+            attempts.append(options["attempt_id"])
+            plan = self.base.plan(source, **options)
+            return FailedEvidence.create(
+                plan, stage="prepare", error_type="RuntimeError",
+                detail="VPN route unavailable",
+            )
+
+    def counting_actor_factory(selected, selected_proposal):
+        actor = actor_factory(selected, selected_proposal)
+
+        def counting_actor(*args):
+            actor_calls.append(True)
+            return actor(*args)
+
+        return counting_actor
+
+    deps = LiveDependencies(
+        actor_factory=counting_actor_factory,
+        candidate_factory=lambda *_: PrepareFailure(proposal),
+        knowledge_factory=lambda *_: FakeKnowledge(False, []),
+        profiler_factory=lambda *_: FakeProfiler(False, []),
+        execution_profile="bz-a3-1",
+    )
+    cfg = config(tmp_path)
+    paths = Phase1Wave(
+        cfg, lambda *_: {}, cells=(cell,), execution_profile="bz-a3-1",
+        proposals=(proposal,),
+    ).paths(cell)
+
+    result = LiveComposition(
+        cfg, deps, proposals=(proposal,), sleeper=sleeps.append,
+    ).execute(cell, paths)
+
+    assert result["terminal_reason"] == "infrastructure-unverified"
+    assert result["infrastructure_retries_used"] == 3
+    assert sleeps == [120, 120, 120]
+    assert len(attempts) == 4
+    assert len(actor_calls) == 8
 
 
 def test_cell_execution_lock_rejects_concurrent_same_process_run(tmp_path):
@@ -798,7 +861,10 @@ def test_smoke_composition_executes_exactly_one_baseline_project(tmp_path):
 @pytest.mark.parametrize("smoke", [False, True], ids=["full", "smoke"])
 @pytest.mark.parametrize(
     "old_protocol",
-    ["twelve-turns", "no-mismatch-feedback", "no-attempt-completion"],
+    [
+        "twelve-turns", "no-mismatch-feedback", "no-attempt-completion",
+        "no-prepare-runtime-infrastructure",
+    ],
 )
 def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
     tmp_path, monkeypatch, smoke, old_protocol,
@@ -845,6 +911,9 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
             ),
             "no-attempt-completion": trial_protocol_sha256(
                 attempt_completion=False
+            ),
+            "no-prepare-runtime-infrastructure": trial_protocol_sha256(
+                prepare_runtime_infrastructure=False
             ),
         }[old_protocol],
     )

@@ -831,6 +831,35 @@ def test_pending_compile_retry_reuses_the_original_attempt_identity(tmp_path, pe
         assert context["observations"][-1]["candidate_failure"]["next_action"] == "retry"
 
 
+def test_prepare_runtime_failure_terminates_for_infrastructure_retry(tmp_path):
+    class PrepareFailure(FakeCandidate):
+        def __init__(self):
+            super().__init__()
+            self.compile_calls = 0
+
+        def compile(self, source, workdir, **kw):
+            self.compile_calls += 1
+            plan = self._plan(
+                source, kw["request_id"], kw["attempt_id"], kw["length"],
+                kw["project_id"], kw.get("padded_length"),
+                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
+            )
+            return FailedEvidence.create(
+                plan, stage="prepare", error_type="RuntimeError",
+                detail="VPN route unavailable",
+            )
+
+    candidate = PrepareFailure()
+    result, prompts, _ = _run(tmp_path, [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+    ], candidate=candidate)
+
+    assert result.status == "infrastructure-unverified"
+    assert candidate.compile_calls == 1
+    assert len(prompts) == 2
+
+
 def test_execute_runtime_observation_retries_same_attempt_without_rewrite(tmp_path):
     class PendingRun(FakeCandidate):
         def __init__(self):
@@ -1679,6 +1708,12 @@ def test_trial_protocol_versions_structured_mismatch_feedback():
 def test_trial_protocol_changed_from_v4_candidate_contract():
     assert trial_protocol_sha256() != (
         "9ab21164435b56c95e9b1171ebccd0964102340b96bee8691524dd8b02ed489f"
+    )
+
+
+def test_trial_protocol_versions_prepare_runtime_infrastructure_classification():
+    assert trial_protocol_sha256() != (
+        "b082a4e71e97f2624869d8cfa280b2ea9eb233bd8fbec84ee5116f453d49e0b4"
     )
 
 

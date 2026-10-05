@@ -81,6 +81,13 @@ _COMPLETION_STATES = frozenset({
 })
 
 
+def infrastructure_unavailable(failure: FailedEvidence) -> bool:
+    return failure.error_type == "AmbiguousRemoteOutcome" or (
+        failure.stage == "prepare"
+        and failure.error_type == "RuntimeError"
+    )
+
+
 def parse_action(text: str) -> Action:
     try:
         value = json.loads(text)
@@ -170,6 +177,7 @@ def trial_protocol_sha256() -> str:
             "journal_schema": "a3-infrastructure-retry-v1",
             "attempt_outcome_required_before_decision": True,
             "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "prepare_runtime_outcome": "infrastructure-unverified",
             "interrupted_started_outcome": "terminal-infrastructure-unverified",
             "cell_execution": "exclusive-nonblocking",
             "memory_commit_reconciliation": "authenticated-passed-outcome",
@@ -411,7 +419,7 @@ class A3TrialLoop:
                             )
                         continue
                     if isinstance(compile_result, FailedEvidence):
-                        if compile_result.error_type == "AmbiguousRemoteOutcome":
+                        if infrastructure_unavailable(compile_result):
                             self._retain_candidate_failure(
                                 turn, "compile", compile_result, failures,
                                 observations, next_action="terminate-project",
@@ -489,7 +497,7 @@ class A3TrialLoop:
                             )
                         continue
                     if isinstance(result, FailedEvidence):
-                        if result.error_type == "AmbiguousRemoteOutcome":
+                        if infrastructure_unavailable(result):
                             self._retain_candidate_failure(
                                 turn, "run", result, failures, observations,
                                 next_action="terminate-project",
@@ -1042,4 +1050,7 @@ class A3TrialLoop:
         }.get(state)
 
 
-__all__ = ["A3TrialLoop", "Action", "TrialBudgets", "TrialResult", "parse_action"]
+__all__ = [
+    "A3TrialLoop", "Action", "TrialBudgets", "TrialResult",
+    "infrastructure_unavailable", "parse_action",
+]

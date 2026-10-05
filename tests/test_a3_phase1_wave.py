@@ -51,6 +51,7 @@ def trial_protocol_sha256(openai_turns=24, *, candidate_contract=True):
             "journal_schema": "a3-infrastructure-retry-v1",
             "attempt_outcome_required_before_decision": True,
             "ambiguous_candidate_outcome": "infrastructure-unverified",
+            "prepare_runtime_outcome": "infrastructure-unverified",
             "interrupted_started_outcome": "terminal-infrastructure-unverified",
             "cell_execution": "exclusive-nonblocking",
             "memory_commit_reconciliation": "authenticated-passed-outcome",
