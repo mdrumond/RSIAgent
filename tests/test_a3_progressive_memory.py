@@ -154,6 +154,25 @@ def test_lineages_and_cells_cannot_reopen_each_others_memory(tmp_path):
         journal(path, lineage_id="other-lineage").read()
 
 
+def test_memory_cannot_resume_under_a_stale_candidate_contract_protocol(tmp_path):
+    path = tmp_path / "learning.jsonl"
+    active = journal(path)
+    active.append(memory(1))
+    stale = Phase1LearningJournal(
+        path,
+        DEFAULT_PROPOSALS,
+        cell_id=CELL,
+        lineage_id=LINEAGE,
+        evidence_resolver=Resolver(),
+        trial_protocol_sha256=(
+            "9ab21164435b56c95e9b1171ebccd0964102340b96bee8691524dd8b02ed489f"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="resume validation"):
+        stale.resume_state()
+
+
 def test_append_rejects_memory_from_other_binding_or_project(tmp_path):
     active = journal(tmp_path / "learning.jsonl")
     with pytest.raises(ValueError, match="cell and lineage"):

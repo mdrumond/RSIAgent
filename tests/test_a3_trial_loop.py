@@ -270,6 +270,58 @@ def test_fake_actor_end_to_end_disabled_treatments_and_submit(tmp_path):
     )
 
 
+def test_candidate_contract_serializes_a3_argument_semantics_and_safe_baseline():
+    contract = CANDIDATE_SOURCE_CONTRACT.as_dict()
+
+    assert contract["argument_semantics"] == [
+        "count is the logical number of float32 elements to process.",
+        "Global-memory allocations may be padded, but process only indices in [0, count).",
+        "buffer_bytes is the capacity of each independent input-A, input-B, and output local buffer; do not divide it among buffers.",
+    ]
+    assert contract["safe_baseline"] == [
+        "Use three independent TBuf objects for input A, input B, and output, and initialize each one with the full buffer_bytes capacity.",
+        "Use DataCopyPad with blockLen = count * sizeof(float) for logical-tail-safe input and output transfers.",
+        "Order input copies before vector work with an MTE2-to-V event, and order vector work before the output copy with a V-to-MTE3 event.",
+    ]
+
+
+@pytest.mark.parametrize(
+    "cell",
+    build_a3_experiment_plan().cells,
+    ids=lambda cell: cell.cell_id,
+)
+def test_candidate_contract_is_identical_in_every_treatment_actor_prompt(
+    tmp_path, cell,
+):
+    actions = [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}',
+        '{"action":"run"}',
+        *(
+            ['{"action":"profile","metric":"PipeUtilization"}']
+            if cell.profiling is ProfilingGuidance.WITH_GUIDANCE else []
+        ),
+        json.dumps({
+            "action": "submit",
+            "interpretation": "host result passed",
+            "supports": [],
+        }),
+    ]
+    result, prompts, _journal = _run(
+        tmp_path / cell.cell_id,
+        actions,
+        cell=cell,
+        knowledge=FakeKnowledge(cell.knowledge is KnowledgeMode.WITH_KDB),
+    )
+
+    assert result.status == "passed"
+    assert all(
+        json.loads(prompt)["candidate_source_contract"]
+        == CANDIDATE_SOURCE_CONTRACT.as_dict()
+        for prompt in prompts
+    )
+
+
 def test_success_observations_expose_hashes_accepted_by_submit(tmp_path):
     submitted_supports = []
 
@@ -1622,6 +1674,12 @@ def test_trial_protocol_versions_structured_mismatch_feedback():
     })
 
     assert trial_protocol_sha256() != legacy
+
+
+def test_trial_protocol_changed_from_v4_candidate_contract():
+    assert trial_protocol_sha256() != (
+        "9ab21164435b56c95e9b1171ebccd0964102340b96bee8691524dd8b02ed489f"
+    )
 
 
 def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_path):

@@ -42,12 +42,16 @@ class CandidateSourceContract:
     source_slot: str
     exported_signature: str
     constraints: tuple[str, ...]
+    argument_semantics: tuple[str, ...]
+    safe_baseline: tuple[str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return {
             "source_slot": self.source_slot,
             "exported_signature": self.exported_signature,
             "constraints": list(self.constraints),
+            "argument_semantics": list(self.argument_semantics),
+            "safe_baseline": list(self.safe_baseline),
         }
 
 
@@ -58,6 +62,16 @@ CANDIDATE_SOURCE_CONTRACT = CandidateSourceContract(
         "Define the exported signature exactly once.",
         "Write only the complete Ascend C device implementation in the source slot.",
         "Do not include Catlass, TLA annotations, or Torch registration code.",
+    ),
+    argument_semantics=(
+        "count is the logical number of float32 elements to process.",
+        "Global-memory allocations may be padded, but process only indices in [0, count).",
+        "buffer_bytes is the capacity of each independent input-A, input-B, and output local buffer; do not divide it among buffers.",
+    ),
+    safe_baseline=(
+        "Use three independent TBuf objects for input A, input B, and output, and initialize each one with the full buffer_bytes capacity.",
+        "Use DataCopyPad with blockLen = count * sizeof(float) for logical-tail-safe input and output transfers.",
+        "Order input copies before vector work with an MTE2-to-V event, and order vector work before the output copy with a V-to-MTE3 event.",
     ),
 )
 _SIGNATURE_TOKEN = re.compile(r'"[^"]*"|[A-Za-z_]\w*|::|[(),]')

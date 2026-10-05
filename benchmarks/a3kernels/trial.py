@@ -161,7 +161,8 @@ def trial_protocol_sha256() -> str:
             "max_tokens": budgets.max_tokens,
         }
     return canonical_digest({
-        "schema": "a3-trial-protocol-v4",
+        "schema": "a3-trial-protocol-v5",
+        "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3,
             "backoff_seconds": 120,
