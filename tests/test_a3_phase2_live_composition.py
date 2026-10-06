@@ -9,6 +9,7 @@ import pytest
 import run_a3_phase2
 from benchmarks.a3_experiments import BackendModel, KnowledgeMode, ProfilingGuidance
 from benchmarks.a3_model_profiles import A3Completion
+from benchmarks.a3_model_profiles import A3ProviderResponseError
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
 from benchmarks.a3kernels.live_composition import LiveDependencies
 from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_digest
@@ -16,12 +17,15 @@ from benchmarks.a3kernels.phase1_protocol import (
     ExecutionReceipt, FailedEvidence, VerifiedResult, attest,
 )
 from benchmarks.a3kernels.phase2_protocol import (
-    A3Phase2Identity, A3Phase2InfrastructureError,
+    A3Phase2Identity, A3Phase2InfrastructureError, GroundedLearning,
+    GroundedTarget,
 )
 from benchmarks.a3kernels.remote_candidate import _PendingObservation
 from benchmarks.a3kernels.phase2_composition import Phase2Composition, qualification_cells
 from benchmarks.a3kernels.phase2_live import Phase2LiveRunner, phase2_cells
 from benchmarks.a3kernels.phase2_memory import Phase1Snapshot, phase2_cell_pairs
+from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
+from core.self_evolving_loop import TargetVerdict
 
 
 SOURCE = '''#include "kernel_operator.h"
@@ -98,6 +102,7 @@ def snapshot(tmp_path, cell):
 
 def live_dependencies(
     calls, knowledge_calls, *, query_kdb=False, bad_ready=False, backend=None,
+    actor_error=None, practice_sequence=(),
 ):
     def actor_factory(cell, _proposal):
         profile_sha = __import__(
@@ -109,8 +114,21 @@ def live_dependencies(
             nonlocal count
             count += 1
             calls.append((cell.backend_model, cell.knowledge, cell.profiling, prompt))
+            if actor_error is not None:
+                raise actor_error
             if '"role":"curriculum"' in prompt:
-                value = {"action": "ready", "reason": "host suite passed"}
+                completed = sum(
+                    item.get("kind") == "practice"
+                    for item in json.loads(prompt)["memory"]["phase2"]["learning"]
+                )
+                value = (
+                    {
+                        "action": "practice", "reason": "close the next evidence gap",
+                        "proposal": practice_sequence[completed].as_dict(),
+                    }
+                    if completed < len(practice_sequence)
+                    else {"action": "ready", "reason": "host suite passed"}
+                )
                 if bad_ready:
                     value["verdict"] = "PASS"
             elif query_kdb and cell.knowledge is KnowledgeMode.WITH_KDB and count == 1:
@@ -168,6 +186,74 @@ def test_two_provider_qualification_uses_host_verdicts(tmp_path):
     assert knowledge_calls == []
 
 
+def test_cli_persists_exact_pass_qualification_gate_and_fail_is_nonzero(
+    tmp_path, monkeypatch,
+):
+    common = [
+        "--state-root", str(tmp_path / "state"),
+        "--phase1-root", str(tmp_path / "phase1"),
+        "--validation-wrapper", str(tmp_path / "wrapper"),
+        "--cpl-remote", "/tmp/cpl-remote", "--profile", "bz-a3-1",
+        "--remote-workspace", "/tmp/remote", "--physical-device", "4",
+        "--acknowledge-execution", "I_ACCEPT_A3_PHASE2_EXECUTION",
+        "--target-direction", "canonical target",
+    ]
+    records = tuple(
+        {
+            "cell_id": cell.cell_id, "snapshot_id": str(index) * 64,
+            "execution_profile": "bz-a3-1", "verdict": "PASS",
+            "evidence_sha256": chr(96 + index) * 64,
+            "target_direction_sha256": run_a3_phase2._target_direction_sha256(
+                "canonical target"
+            ),
+        }
+        for index, cell in enumerate(qualification_cells(), 1)
+    )
+    monkeypatch.setattr(run_a3_phase2, "_run", lambda _args, _cells: records)
+
+    assert run_a3_phase2.main(["qualify", *common]) == 0
+    manifest = json.loads((tmp_path / "state" / "qualification.json").read_text())
+    assert manifest["schema"] == "a3-phase2-qualification-v1"
+    assert [item["verdict"] for item in manifest["cells"]] == ["PASS", "PASS"]
+
+    calls = []
+    monkeypatch.setattr(
+        run_a3_phase2, "_run", lambda _args, cells: calls.append(cells) or (),
+    )
+    assert run_a3_phase2.main(["run", *common]) == 0
+    assert calls == [phase2_cells()]
+
+    failed = ({**records[0], "verdict": "FAIL"}, records[1])
+    monkeypatch.setattr(run_a3_phase2, "_run", lambda _args, _cells: failed)
+    assert run_a3_phase2.main(["qualify", *common]) == 1
+    assert not (tmp_path / "state" / "qualification.json").exists()
+
+
+def test_run_rejects_missing_or_nonexact_qualification_gate(tmp_path, monkeypatch):
+    args = SimpleNamespace(
+        state_root=tmp_path, profile="bz-a3-1", target_direction="target",
+    )
+    with pytest.raises(ValueError, match="qualification"):
+        run_a3_phase2._require_qualification(args)
+    body = {
+        "schema": "a3-phase2-qualification-v1", "execution_profile": "bz-a3-1",
+        "target_direction_sha256": run_a3_phase2._target_direction_sha256("target"),
+        "cells": [
+            {
+                "cell_id": cell.cell_id, "snapshot_id": "a" * 64,
+                "verdict": "PASS", "evidence_sha256": "b" * 64,
+            }
+            for cell in qualification_cells()
+        ],
+    }
+    (tmp_path / "qualification.json").write_bytes(canonical_bytes(body) + b"\n")
+    run_a3_phase2._require_qualification(args)
+    body["cells"][1]["verdict"] = "FAIL"
+    (tmp_path / "qualification.json").write_bytes(canonical_bytes(body) + b"\n")
+    with pytest.raises(ValueError, match="qualification"):
+        run_a3_phase2._require_qualification(args)
+
+
 def test_all_treatments_keep_kdb_and_profiling_identity_isolated(tmp_path):
     calls, knowledge_calls = [], []
     composition = Phase2Composition(
@@ -208,6 +294,133 @@ def test_curriculum_agent_cannot_author_a_semantic_verdict(tmp_path):
     )
     with pytest.raises(ValueError, match="curriculum action"):
         runner.run("target")
+
+
+def test_curriculum_exposes_remaining_catalog_for_distinct_practices(tmp_path):
+    cell = qualification_cells()[0]
+    calls = []
+    sequence = DEFAULT_PROPOSALS[:2]
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(calls, [], practice_sequence=sequence),
+        execution_profile="bz-a3-1",
+    )
+    deps = composition.dependencies(cell, snapshot(tmp_path, cell), tmp_path / "run")
+    identity = A3Phase2Identity.from_cell(cell)
+    target = GroundedTarget(identity, TargetVerdict.FAIL, "host failed", "a" * 64)
+    learning = GroundedLearning(identity, {}, "diagnostic", "a" * 64)
+    empty = {"phase2": {"learning": []}}
+    first = deps.curriculum(identity, target, learning, empty, 0)
+    after_first = {"phase2": {"learning": [
+        {"kind": "practice", "project_id": first.project.project_id}
+    ]}}
+    second = deps.curriculum(identity, target, learning, after_first, 1)
+
+    assert first.project == sequence[0]
+    assert second.project == sequence[1]
+    payloads = [json.loads(item[3]) for item in calls]
+    assert [row["project_id"] for row in payloads[0]["remaining_proposals"]] == [
+        proposal.project_id for proposal in DEFAULT_PROPOSALS
+    ]
+    assert first.project.project_id not in {
+        row["project_id"] for row in payloads[1]["remaining_proposals"]
+    }
+
+
+def test_practice_returns_bounded_evidence_linked_lesson(tmp_path, monkeypatch):
+    cell = qualification_cells()[0]
+    proposal = DEFAULT_PROPOSALS[4]
+    evidence = "e" * 64
+    candidate = "c" * 64
+
+    class Wave:
+        def __init__(self, *_args):
+            pass
+
+        def _stage(self, paths):
+            paths.memory.parent.mkdir(parents=True, exist_ok=True)
+
+    class Composition:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def execute(self, _cell, paths):
+            memory = {
+                "source_revision": candidate,
+                "actions": ["compile", "run", "time", "submit"],
+                "host_facts": [
+                    {
+                        "category": "host-verification",
+                        "statement": "candidate output passed host verification",
+                        "evidence_sha256": evidence, "success": True,
+                    },
+                    {
+                        "category": "profiling",
+                        "statement": "host timing samples captured",
+                        "evidence_sha256": "f" * 64, "success": True,
+                    },
+                ],
+                "agent_interpretations": [{
+                    "statement": "the upper-length knee needs a larger tile",
+                    "supports": [evidence],
+                }],
+            }
+            paths.memory.write_bytes(canonical_bytes({"memory": memory}) + b"\n")
+            return {"status": "passed", "terminal_reason": "completed"}
+
+    monkeypatch.setattr("benchmarks.a3kernels.phase2_composition.Phase1Wave", Wave)
+    monkeypatch.setattr("benchmarks.a3kernels.phase2_composition.LiveComposition", Composition)
+    composition = Phase2Composition(
+        config=SimpleNamespace(), dependencies=live_dependencies([], []),
+        execution_profile="bz-a3-1",
+    )
+    deps = composition.dependencies(cell, snapshot(tmp_path / "snap", cell), tmp_path / "run")
+    completed = deps.practice(A3Phase2Identity.from_cell(cell), proposal, {}, 1)
+    lesson = json.loads(completed.statement)
+
+    assert completed.evidence_sha256 == evidence
+    assert lesson["schema"] == "a3-phase2-practice-lesson-v1"
+    assert lesson["primary_evidence_sha256"] == evidence
+    assert lesson["evidence"][0]["evidence_sha256"] == evidence
+    assert lesson["evidence"][1]["category"] == "profiling"
+    assert "knee" in lesson["interpretations"][0]["statement"]
+    assert len(completed.statement) <= 4096
+
+
+@pytest.mark.parametrize("error", [TimeoutError("timeout"), ConnectionError("reset")])
+def test_provider_transport_failures_receive_engine_retry_budget(tmp_path, error):
+    cell = qualification_cells()[0]
+    calls, sleeps = [], []
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(calls, [], actor_error=error),
+        execution_profile="bz-a3-1",
+    )
+    snap = snapshot(tmp_path / "snap", cell)
+    runner = Phase2LiveRunner(
+        root=tmp_path / "run", snapshot=snap,
+        dependencies=composition.dependencies(cell, snap, tmp_path / "run"),
+        sleeper=sleeps.append,
+    )
+    with pytest.raises(A3Phase2InfrastructureError, match="provider"):
+        runner.run("target")
+    assert len(calls) == 4
+    assert sleeps == [120, 120, 120]
+
+
+def test_provider_schema_failure_is_not_infrastructure(tmp_path):
+    cell = qualification_cells()[0]
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(
+            [], [], actor_error=A3ProviderResponseError("missing-response-fields"),
+        ),
+        execution_profile="bz-a3-1",
+    )
+    snap = snapshot(tmp_path / "snap", cell)
+    deps = composition.dependencies(cell, snap, tmp_path / "run")
+    with pytest.raises(A3ProviderResponseError):
+        deps.target_source(A3Phase2Identity.from_cell(cell), {}, 1)
 
 
 @pytest.mark.parametrize("pending", [False, True])
@@ -289,3 +502,6 @@ def test_cli_resume_reuses_bound_terminal_without_rerunning_cell(tmp_path, monke
 
     assert first == second
     assert calls == ["construct", "target"]
+    args.target_direction = "different target"
+    with pytest.raises(ValueError, match="target direction"):
+        run_a3_phase2._run(args, (cell,))

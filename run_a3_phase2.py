@@ -6,9 +6,11 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import tempfile
 
 from benchmarks.a3kernels.live_composition import bz_live_dependencies
-from benchmarks.a3kernels.phase1_evidence import canonical_bytes
+from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_digest
 from benchmarks.a3kernels.phase1_wave import Phase1Config
 from benchmarks.a3kernels.phase2_composition import Phase2Composition, qualification_cells
 from benchmarks.a3kernels.phase2_live import Phase2LiveRunner, phase2_cells
@@ -17,6 +19,8 @@ from run_a3_phase1 import _bz_preflight
 
 
 _ACK = "I_ACCEPT_A3_PHASE2_EXECUTION"
+_QUALIFICATION_SCHEMA = "a3-phase2-qualification-v1"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -60,6 +64,101 @@ def _selected(cell_ids: list[str]) -> tuple:
     )
 
 
+def _target_direction_sha256(target_direction: str) -> str:
+    if not isinstance(target_direction, str) or not target_direction.strip():
+        raise ValueError("target direction must be non-empty")
+    return canonical_digest({"target_direction": target_direction})
+
+
+def _qualification_path(state_root: Path) -> Path:
+    return Path(state_root).resolve() / "qualification.json"
+
+
+def _qualification_body(args, records) -> dict[str, object]:
+    rows = tuple(records)
+    expected_ids = [cell.cell_id for cell in qualification_cells()]
+    direction_sha256 = _target_direction_sha256(args.target_direction)
+    if [row.get("cell_id") for row in rows] != expected_ids:
+        raise ValueError("qualification must contain both canonical provider cells")
+    if any(
+        row.get("execution_profile") != args.profile
+        or row.get("target_direction_sha256") != direction_sha256
+        or row.get("verdict") not in {"PASS", "FAIL"}
+        or _SHA256.fullmatch(str(row.get("snapshot_id", ""))) is None
+        or _SHA256.fullmatch(str(row.get("evidence_sha256", ""))) is None
+        for row in rows
+    ):
+        raise ValueError("qualification results are not bound to this exact run")
+    cells = [
+        {
+            "cell_id": row.get("cell_id"),
+            "snapshot_id": row.get("snapshot_id"),
+            "verdict": row.get("verdict"),
+            "evidence_sha256": row.get("evidence_sha256"),
+        }
+        for row in rows
+    ]
+    return {
+        "schema": _QUALIFICATION_SCHEMA,
+        "execution_profile": args.profile,
+        "target_direction_sha256": direction_sha256,
+        "cells": cells,
+    }
+
+
+def _publish_qualification(args, records) -> dict[str, object]:
+    path = _qualification_path(args.state_root)
+    body = _qualification_body(args, records)
+    if any(item["verdict"] != "PASS" for item in body["cells"]):
+        path.unlink(missing_ok=True)
+        return {**body, "qualified": False}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "wb", dir=path.parent, prefix=".qualification-", delete=False,
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(canonical_bytes(body) + b"\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    return {**body, "qualified": True}
+
+
+def _require_qualification(args) -> dict[str, object]:
+    path = _qualification_path(args.state_root)
+    try:
+        body = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        raise ValueError("a successful Phase 2 qualification is required") from exc
+    expected_keys = {
+        "schema", "execution_profile", "target_direction_sha256", "cells",
+    }
+    expected_ids = [cell.cell_id for cell in qualification_cells()]
+    valid = (
+        isinstance(body, dict)
+        and set(body) == expected_keys
+        and body.get("schema") == _QUALIFICATION_SCHEMA
+        and body.get("execution_profile") == args.profile
+        and body.get("target_direction_sha256")
+        == _target_direction_sha256(args.target_direction)
+        and isinstance(body.get("cells"), list)
+        and [item.get("cell_id") for item in body.get("cells", [])] == expected_ids
+        and all(
+            isinstance(item, dict)
+            and set(item) == {
+                "cell_id", "snapshot_id", "verdict", "evidence_sha256",
+            }
+            and item.get("verdict") == "PASS"
+            and _SHA256.fullmatch(str(item.get("snapshot_id", ""))) is not None
+            and _SHA256.fullmatch(str(item.get("evidence_sha256", ""))) is not None
+            for item in body.get("cells", [])
+        )
+    )
+    if not valid:
+        raise ValueError("Phase 2 qualification does not exactly match this run")
+    return body
+
+
 def _source_cell_root(roots: list[Path], source_id: str) -> Path:
     matches = []
     for root in map(Path.resolve, roots):
@@ -78,12 +177,15 @@ def _source_cell_root(roots: list[Path], source_id: str) -> Path:
     return unique[0]
 
 
-def _terminal(result, snapshot, profile: str) -> dict[str, object]:
+def _terminal(
+    result, snapshot, profile: str, target_direction: str,
+) -> dict[str, object]:
     return {
         "schema": "a3-phase2-cell-terminal-v1",
         "cell_id": result.identity.cell_id,
         "snapshot_id": snapshot.snapshot_id,
         "execution_profile": profile,
+        "target_direction_sha256": _target_direction_sha256(target_direction),
         "verdict": result.verdict.value,
         "report": result.report,
         "target_attempts": result.target_attempts,
@@ -122,8 +224,17 @@ def _run(args, cells) -> tuple[dict[str, object], ...]:
             expected = {
                 "cell_id": cell.cell_id, "snapshot_id": snapshot.snapshot_id,
                 "execution_profile": args.profile,
+                "target_direction_sha256": _target_direction_sha256(
+                    args.target_direction
+                ),
             }
             if any(retained.get(key) != value for key, value in expected.items()):
+                if retained.get("target_direction_sha256") != expected[
+                    "target_direction_sha256"
+                ]:
+                    raise ValueError(
+                        "retained Phase 2 terminal conflicts with target direction"
+                    )
                 raise ValueError("retained Phase 2 terminal conflicts with this run")
             records.append(retained)
             continue
@@ -131,7 +242,7 @@ def _run(args, cells) -> tuple[dict[str, object], ...]:
             root=root, snapshot=snapshot,
             dependencies=composition.dependencies(cell, snapshot, root),
         ).run(args.target_direction)
-        record = _terminal(result, snapshot, args.profile)
+        record = _terminal(result, snapshot, args.profile, args.target_direction)
         terminal_path.parent.mkdir(parents=True, exist_ok=True)
         terminal_path.write_bytes(canonical_bytes(record) + b"\n")
         records.append(record)
@@ -151,6 +262,7 @@ def _report(root: Path) -> dict[str, object]:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    status = 0
     if args.command == "dry-run":
         value = {"schema": "a3-phase2-dry-run-v1",
                  "cells": [cell.as_dict() for cell in phase2_cells()]}
@@ -165,10 +277,15 @@ def main(argv=None) -> int:
             config.validation_wrapper, args.profile, args.cpl_remote,
         )}
     else:
-        cells = qualification_cells() if args.command == "qualify" else _selected(args.cell_id)
-        value = _run(args, cells)
+        if args.command == "qualify":
+            records = _run(args, qualification_cells())
+            value = _publish_qualification(args, records)
+            status = 0 if value["qualified"] else 1
+        else:
+            _require_qualification(args)
+            value = _run(args, _selected(args.cell_id))
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
-    return 0
+    return status
 
 
 if __name__ == "__main__":

@@ -33,11 +33,6 @@ from benchmarks.a3kernels.phase2_protocol import (
 from benchmarks.a3kernels.phase2_target import Phase2TargetVerifier
 
 
-_SYSTEM = """You are an A3 Ascend C research agent. Return exactly the requested
-JSON schema. Host evidence alone determines PASS or FAIL. Never claim a semantic
-verdict. Use only ordinary, reusable tiled vector-add techniques."""
-
-
 def qualification_cells() -> tuple[A3ExperimentCell, ...]:
     """One no-KDB/no-profile qualification cell for each provider."""
     return tuple(
@@ -55,6 +50,86 @@ def _json_object(text: str, *, label: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be one JSON object")
     return value
+
+
+def _transient_provider_failure(exc: Exception) -> bool:
+    """Recognize transport availability failures without hiding bad model output."""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    try:
+        from openai import APIConnectionError, APIStatusError, APITimeoutError
+    except ImportError:
+        return False
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    return isinstance(exc, APIStatusError) and (
+        exc.status_code in {408, 429} or exc.status_code >= 500
+    )
+
+
+def _completed_practice_projects(memory: Mapping[str, object]) -> set[str]:
+    try:
+        learning = memory["phase2"]["learning"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("Phase 2 curriculum memory is invalid") from exc
+    if not isinstance(learning, list):
+        raise ValueError("Phase 2 curriculum learning must be a list")
+    return {
+        item["project_id"]
+        for item in learning
+        if isinstance(item, Mapping)
+        and item.get("kind") == "practice"
+        and isinstance(item.get("project_id"), str)
+    }
+
+
+def _practice_lesson(
+    memory: Mapping[str, object], project_id: str, primary_evidence_sha256: str,
+) -> str:
+    facts = memory.get("host_facts")
+    interpretations = memory.get("agent_interpretations")
+    actions = memory.get("actions")
+    if not isinstance(facts, list) or not isinstance(interpretations, list):
+        raise ValueError("focused practice did not retain useful host learning")
+    evidence = [
+        {
+            "category": fact.get("category"),
+            "statement": str(fact.get("statement", ""))[:256],
+            "evidence_sha256": fact.get("evidence_sha256"),
+        }
+        for fact in facts
+        if isinstance(fact, Mapping) and fact.get("success") is True
+    ][:4]
+    if not evidence or any(
+        not item["category"] or not item["statement"]
+        or not isinstance(item["evidence_sha256"], str)
+        for item in evidence
+    ):
+        raise ValueError("focused practice lacks successful evidence-linked facts")
+    useful = [
+        {
+            "statement": str(item.get("statement", ""))[:256],
+            "supports": [str(value) for value in item.get("supports", [])[:4]],
+        }
+        for item in interpretations
+        if isinstance(item, Mapping) and str(item.get("statement", "")).strip()
+    ][:2]
+    lesson = json.dumps(
+        {
+            "schema": "a3-phase2-practice-lesson-v1",
+            "project_id": project_id,
+            "primary_evidence_sha256": primary_evidence_sha256,
+            "actions": [str(item)[:64] for item in actions[-8:]]
+            if isinstance(actions, list) else [],
+            "evidence": evidence,
+            "interpretations": useful,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(lesson) > 4096:
+        raise ValueError("focused practice lesson exceeds its bounded memory budget")
+    return lesson
 
 
 class Phase2Composition:
@@ -97,10 +172,17 @@ class Phase2Composition:
         )
 
         def complete(payload: Mapping[str, object]) -> dict[str, object]:
-            completion = actor(
-                profile,
-                json.dumps(payload, sort_keys=True, separators=(",", ":")),
-            )
+            try:
+                completion = actor(
+                    profile,
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                )
+            except Exception as exc:
+                if _transient_provider_failure(exc):
+                    raise A3Phase2InfrastructureError(
+                        "provider transport did not produce a response"
+                    ) from exc
+                raise
             if not isinstance(completion, A3Completion):
                 raise TypeError("Phase 2 actor must return A3Completion")
             if completion.provenance.get("profile_sha256") != profile.fingerprint:
@@ -169,6 +251,11 @@ class Phase2Composition:
             identity: A3Phase2Identity, target: GroundedTarget,
             learning: GroundedLearning, memory: dict[str, object], evolution: int,
         ) -> CurriculumDecision:
+            completed = _completed_practice_projects(memory)
+            remaining = tuple(
+                proposal for proposal in DEFAULT_PROPOSALS
+                if proposal.project_id not in completed
+            )
             action = complete({
                 "schema": "a3-phase2-curriculum-v1", "role": "curriculum",
                 "identity": identity.evidence_fields(), "host_target": {
@@ -177,10 +264,17 @@ class Phase2Composition:
                 },
                 "grounded_learning": learning.diagnosis, "memory": memory,
                 "evolution": evolution,
+                "remaining_proposals": [
+                    {
+                        "project_id": proposal.project_id,
+                        "proposal": proposal.as_dict(),
+                    }
+                    for proposal in remaining
+                ],
                 "ready_schema": {"action": "ready", "reason": "text"},
                 "practice_schema": {
                     "action": "practice", "reason": "text",
-                    "proposal": DEFAULT_PROPOSALS[0].as_dict(),
+                    "proposal": "one exact remaining_proposals[].proposal object",
                 },
             })
             if set(action) == {"action", "reason"} and action["action"] == "ready":
@@ -189,10 +283,12 @@ class Phase2Composition:
                 set(action) == {"action", "reason", "proposal"}
                 and action["action"] == "practice"
             ):
-                return CurriculumDecision.practice(
-                    identity, CurriculumProposal.from_mapping(action["proposal"]),
-                    action["reason"],
-                )
+                proposal = CurriculumProposal.from_mapping(action["proposal"])
+                if proposal.project_id not in {
+                    item.project_id for item in remaining
+                }:
+                    raise ValueError("curriculum selected a completed or unknown practice")
+                return CurriculumDecision.practice(identity, proposal, action["reason"])
             raise ValueError("curriculum action has an invalid schema")
 
         def practice(
@@ -224,7 +320,9 @@ class Phase2Composition:
             return PracticeExecution(
                 proposal.project_id, memory["source_revision"],
                 fact["evidence_sha256"], True,
-                "focused practice completed with host verification",
+                _practice_lesson(
+                    memory, proposal.project_id, fact["evidence_sha256"],
+                ),
             )
 
         return Phase2LiveDependencies(
