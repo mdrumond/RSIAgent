@@ -136,6 +136,33 @@ def test_default_curriculum_review_pass_ready_learns_grounded_result(tmp_path):
     assert events[-1].payload["event"] == "PHASE2_COMPLETED"
 
 
+@pytest.mark.parametrize("final_verdict", [TargetVerdict.PASS, TargetVerdict.FAIL])
+def test_terminal_head_binds_target_and_learning_evidence(tmp_path, final_verdict):
+    if final_verdict is TargetVerdict.FAIL:
+        adapter, _agents = _run(
+            tmp_path, [TargetVerdict.FAIL] * 9, list(DEFAULT_PROPOSALS)
+        )
+    else:
+        adapter, _agents = _run(tmp_path, [TargetVerdict.PASS], [None])
+
+    result = adapter.run("improve tiled vector add", {})
+
+    events = EvidenceLedger(tmp_path / "events.jsonl").entries
+    target = [e for e in events if e.payload["event"] == "TARGET_GROUNDED"][-1]
+    learning = [
+        e for e in events if e.payload["event"] == "TARGET_LEARNING_GROUNDED"
+    ][-1]
+    terminal = events[-1]
+    assert terminal.payload["target_evidence_sha256"] == target.payload[
+        "evidence_sha256"
+    ]
+    assert terminal.payload["learning_grounding_sha256"] == learning.payload[
+        "grounding_sha256"
+    ]
+    assert terminal.payload["verdict"] == final_verdict.value
+    assert result.evidence_sha256 == terminal.entry_sha256
+
+
 @pytest.mark.parametrize("first", [TargetVerdict.FAIL, TargetVerdict.PASS])
 def test_focused_practice_always_forces_a_fresh_target(tmp_path, first):
     adapter, agents = _run(
@@ -194,6 +221,37 @@ def test_identity_drift_is_rejected_and_environment_is_released(tmp_path):
     with pytest.raises(A3Phase2ProtocolError, match="identity drift"):
         adapter.run("improve tiled vector add", {})
     assert agents.released == ["environment-1"]
+
+
+@pytest.mark.parametrize("role", ["verifier", "actor"])
+def test_target_agent_instance_is_fresh_across_attempts(tmp_path, role):
+    adapter, agents = _run(
+        tmp_path,
+        [TargetVerdict.FAIL, TargetVerdict.PASS],
+        [DEFAULT_PROPOSALS[0], None],
+    )
+    hooks = agents.hooks()
+    constant = lambda identity, *args: OwnedAgent(identity, f"reused-{role}", {})
+    hooks = replace(hooks, **{f"fresh_target_{role}": constant})
+    adapter = A3Phase2Adapter(agents.identity, hooks, tmp_path / f"{role}.jsonl")
+
+    with pytest.raises(A3Phase2ProtocolError, match=f"{role} is not fresh"):
+        adapter.run("improve tiled vector add", {})
+    assert agents.targets == ["environment-1", "environment-2"]
+
+
+def test_actor_and_verifier_instance_ids_cannot_overlap(tmp_path):
+    adapter, agents = _run(tmp_path, [TargetVerdict.PASS], [None])
+    hooks = replace(
+        agents.hooks(),
+        fresh_target_actor=lambda identity, memory, attempt: OwnedAgent(
+            identity, f"verifier-{attempt}", {}
+        ),
+    )
+    adapter = A3Phase2Adapter(agents.identity, hooks, tmp_path / "roles.jsonl")
+
+    with pytest.raises(A3Phase2ProtocolError, match="Actor/Verifier role overlap"):
+        adapter.run("improve tiled vector add", {})
 
 
 def test_infrastructure_exception_remains_a_non_verdict(tmp_path):

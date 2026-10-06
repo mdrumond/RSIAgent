@@ -274,6 +274,8 @@ class A3Phase2Adapter:
 
     def run(self, target_direction: str, memory: Any) -> A3Phase2Result:
         seen_targets: set[str] = set()
+        seen_verifiers: set[str] = set()
+        seen_actors: set[str] = set()
         seen_projects: set[str] = set()
         current_verification: GroundedTarget | None = None
         current_learning: GroundedLearning | None = None
@@ -309,6 +311,11 @@ class A3Phase2Adapter:
             self._require_identity(item, "target verifier")
             if not isinstance(item, OwnedAgent):
                 raise A3Phase2ProtocolError("target verifier contract is invalid")
+            if item.instance_id in seen_verifiers:
+                raise A3Phase2ProtocolError("target verifier is not fresh")
+            if item.instance_id in seen_actors:
+                raise A3Phase2ProtocolError("Actor/Verifier role overlap")
+            seen_verifiers.add(item.instance_id)
             return item
 
         def actor(active_memory: Any, attempt: int) -> OwnedAgent:
@@ -316,6 +323,11 @@ class A3Phase2Adapter:
             self._require_identity(item, "target actor")
             if not isinstance(item, OwnedAgent):
                 raise A3Phase2ProtocolError("target actor contract is invalid")
+            if item.instance_id in seen_actors:
+                raise A3Phase2ProtocolError("target actor is not fresh")
+            if item.instance_id in seen_verifiers:
+                raise A3Phase2ProtocolError("Actor/Verifier role overlap")
+            seen_actors.add(item.instance_id)
             return item
 
         def work(
@@ -338,6 +350,15 @@ class A3Phase2Adapter:
             if not isinstance(item, GroundedTarget):
                 raise A3Phase2ProtocolError("target verification contract is invalid")
             current_verification = item
+            self._event(
+                "TARGET_GROUNDED",
+                {
+                    "target_attempt": len(seen_targets),
+                    "verdict": item.verdict.value,
+                    "evidence_sha256": item.evidence_sha256,
+                },
+                EvidenceKind.RESULT,
+            )
             return TargetVerification(item.verdict, item.report)
 
         def learn(
@@ -358,6 +379,15 @@ class A3Phase2Adapter:
             ):
                 raise A3Phase2ProtocolError("learning is not grounded by target evidence")
             current_learning = item
+            self._event(
+                "TARGET_LEARNING_GROUNDED",
+                {
+                    "target_attempt": len(seen_targets),
+                    "verdict": verified.verdict.value,
+                    "grounding_sha256": item.grounding_sha256,
+                },
+                EvidenceKind.RESULT,
+            )
             return ActorLearning(item.memory, item.diagnosis)
 
         def evolve(
@@ -468,12 +498,21 @@ class A3Phase2Adapter:
         termination = result.termination
         if practice_count == MAX_PRACTICE_PROJECTS:
             termination = "practice_budget_final_target"
+        if (
+            current_verification is None
+            or current_learning is None
+            or current_verification.verdict is not result.verifier_verdict
+            or current_verification.report != result.verifier_report
+        ):
+            raise A3Phase2ProtocolError("terminal result is not bound to grounded evidence")
         self._event(
             "PHASE2_COMPLETED",
             {"target_attempts": result.target_cycles,
              "practice_projects": result.practice_projects,
              "verdict": result.verifier_verdict.value,
-             "termination": termination},
+             "termination": termination,
+             "target_evidence_sha256": current_verification.evidence_sha256,
+             "learning_grounding_sha256": current_learning.grounding_sha256},
             EvidenceKind.RESULT,
         )
         if not isinstance(result.environment, OwnedAgent):
