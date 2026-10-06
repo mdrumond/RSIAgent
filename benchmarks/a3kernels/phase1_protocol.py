@@ -71,6 +71,7 @@ class ExecutionPlan:
     logical_length: int | None = None
     padded_length: int | None = None
     block_count: int = 1
+    verify_padding: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "files", tuple(self.files))
@@ -117,6 +118,8 @@ class ExecutionPlan:
             )
         if type(self.block_count) is not int or not 1 <= self.block_count <= 32:
             raise ValueError("block_count must be an integer in [1, 32]")
+        if type(self.verify_padding) is not bool:
+            raise ValueError("verify_padding must be a boolean")
         object.__setattr__(self, "files", tuple(sorted(self.files)))
 
     @property
@@ -127,8 +130,7 @@ class ExecutionPlan:
 
     @property
     def execution_id(self) -> str:
-        return canonical_digest(
-            {
+        value = {
                 "argv": self.argv,
                 "attempt_id": self.attempt_id,
                 "execution_profile": self.execution_profile,
@@ -145,7 +147,10 @@ class ExecutionPlan:
                 "source_fingerprint": self.source_fingerprint,
                 "target": self.target,
             }
-        )
+        # Preserve the identity of retained Phase 1 logical-only evidence.
+        if self.verify_padding:
+            value["verify_padding"] = True
+        return canonical_digest(value)
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -218,6 +223,8 @@ class VerifiedResult:
     job_handle: str | None
     attestation_sha256: str
     mismatch: VerificationMismatch | None = None
+    padding_max_abs_error: float | None = None
+    padding_mismatch_index: int | None = None
 
     def __post_init__(self) -> None:
         if self.mismatch is not None and not isinstance(
@@ -238,6 +245,30 @@ class VerifiedResult:
             and self.mismatch is None
         ):
             raise ValueError("failed numerical verification requires a mismatch")
+        if self.padding_max_abs_error is not None and (
+            type(self.padding_max_abs_error) not in (int, float)
+            or not math.isfinite(self.padding_max_abs_error)
+            or self.padding_max_abs_error < 0
+        ):
+            raise ValueError("padding_max_abs_error must be finite and non-negative")
+        if self.padding_mismatch_index is not None and (
+            type(self.padding_mismatch_index) is not int
+            or self.padding_mismatch_index < 0
+            or self.padding_max_abs_error is None
+            or self.padding_max_abs_error <= self.tolerance
+        ):
+            raise ValueError("padding mismatch must identify a failed padded element")
+        if (
+            self.padding_max_abs_error is not None
+            and self.padding_max_abs_error > self.tolerance
+            and self.padding_mismatch_index is None
+        ):
+            raise ValueError("failed padding verification requires a mismatch index")
+        if self.passed and (
+            self.padding_max_abs_error is not None
+            and self.padding_max_abs_error > self.tolerance
+        ):
+            raise ValueError("passed verification cannot contain padding corruption")
 
     @classmethod
     def from_receipt(
@@ -291,6 +322,29 @@ class VerifiedResult:
             max_abs_error is not None
             and max_abs_error <= tolerance
         )
+        padding_samples = tuple(
+            (index, abs(receipt.output[index]))
+            for index in range(plan.logical_length, plan.padded_length)
+        ) if plan.verify_padding else ()
+        padding_max_abs_error = (
+            max((error for _, error in padding_samples), default=0.0)
+            if max_abs_error is not None and plan.verify_padding else None
+        )
+        padding_mismatch_index = None
+        if (
+            padding_max_abs_error is not None
+            and padding_max_abs_error > tolerance
+        ):
+            padding_mismatch_index = max(
+                padding_samples, key=lambda item: item[1]
+            )[0]
+        padding_ok = (
+            not plan.verify_padding
+            or (
+                padding_max_abs_error is not None
+                and padding_max_abs_error <= tolerance
+            )
+        )
         if not metric_ok and max_abs_error is not None:
             mismatch = selected
         body = {
@@ -298,7 +352,7 @@ class VerifiedResult:
             "execution_id": plan.execution_id,
             "attempt_id": plan.attempt_id,
             "project_id": plan.project_id,
-            "passed": receipt.exit_code == 0 and metric_ok,
+            "passed": receipt.exit_code == 0 and metric_ok and padding_ok,
             "max_abs_error": max_abs_error,
             "tolerance": float(tolerance),
             "exit_code": receipt.exit_code,
@@ -317,14 +371,23 @@ class VerifiedResult:
             "job_handle": receipt.job_handle,
             "mismatch": mismatch,
         }
+        if padding_max_abs_error is not None:
+            body["padding_max_abs_error"] = padding_max_abs_error
+            body["padding_mismatch_index"] = padding_mismatch_index
         return cls(**body, attestation_sha256=attest(body))
 
     def attestation_payload(self) -> dict[str, Any]:
-        return {
+        value = {
             field.name: getattr(self, field.name)
             for field in fields(self)
             if field.name != "attestation_sha256"
         }
+        # Older retained A3 evidence predates explicit padding verification.
+        # Omitting absent fields preserves its original attestation identity.
+        if self.padding_max_abs_error is None:
+            value.pop("padding_max_abs_error")
+            value.pop("padding_mismatch_index")
+        return value
 
 
 @dataclass(frozen=True)
