@@ -12,7 +12,13 @@ from benchmarks.a3_model_profiles import A3Completion
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
 from benchmarks.a3kernels.live_composition import LiveDependencies
 from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_digest
-from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt, VerifiedResult, attest
+from benchmarks.a3kernels.phase1_protocol import (
+    ExecutionReceipt, FailedEvidence, VerifiedResult, attest,
+)
+from benchmarks.a3kernels.phase2_protocol import (
+    A3Phase2Identity, A3Phase2InfrastructureError,
+)
+from benchmarks.a3kernels.remote_candidate import _PendingObservation
 from benchmarks.a3kernels.phase2_composition import Phase2Composition, qualification_cells
 from benchmarks.a3kernels.phase2_live import Phase2LiveRunner, phase2_cells
 from benchmarks.a3kernels.phase2_memory import Phase1Snapshot, phase2_cell_pairs
@@ -90,7 +96,9 @@ def snapshot(tmp_path, cell):
     return Phase1Snapshot.open(root)
 
 
-def live_dependencies(calls, knowledge_calls, *, query_kdb=False, bad_ready=False):
+def live_dependencies(
+    calls, knowledge_calls, *, query_kdb=False, bad_ready=False, backend=None,
+):
     def actor_factory(cell, _proposal):
         profile_sha = __import__(
             "benchmarks.a3_model_profiles", fromlist=["load_a3_model_profile"]
@@ -114,7 +122,7 @@ def live_dependencies(calls, knowledge_calls, *, query_kdb=False, bad_ready=Fals
 
     return LiveDependencies(
         actor_factory=actor_factory,
-        candidate_factory=lambda *_: Backend(),
+        candidate_factory=lambda *_: backend or Backend(),
         knowledge_factory=lambda cell, _paths: Knowledge(
             cell.knowledge is KnowledgeMode.WITH_KDB, knowledge_calls,
         ),
@@ -171,8 +179,7 @@ def test_all_treatments_keep_kdb_and_profiling_identity_isolated(tmp_path):
         snap = snapshot(tmp_path / "snapshots", cell)
         deps = composition.dependencies(cell, snap, tmp_path / "runs" / cell.cell_id)
         source = deps.target_source(
-            __import__("benchmarks.a3kernels.phase2_protocol", fromlist=["A3Phase2Identity"])
-            .A3Phase2Identity.from_cell(cell),
+            A3Phase2Identity.from_cell(cell),
             {"phase1": {"entries": 8}}, 1,
         )
         assert source == SOURCE
@@ -201,6 +208,32 @@ def test_curriculum_agent_cannot_author_a_semantic_verdict(tmp_path):
     )
     with pytest.raises(ValueError, match="curriculum action"):
         runner.run("target")
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_candidate_infrastructure_never_becomes_semantic_fail(tmp_path, pending):
+    class InfrastructureBackend:
+        def compile(self, plan, _workdir):
+            if pending:
+                raise _PendingObservation("observe retained handle")
+            return FailedEvidence.create(
+                plan, stage="prepare", error_type="RuntimeError",
+                detail="transport unavailable",
+            )
+
+        def execute(self, _compilation):
+            pytest.fail("failed preparation cannot execute")
+
+    cell = qualification_cells()[0]
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies([], [], backend=InfrastructureBackend()),
+        execution_profile="bz-a3-1",
+    )
+    snap = snapshot(tmp_path / "snapshots", cell)
+    deps = composition.dependencies(cell, snap, tmp_path / "run")
+    with pytest.raises(A3Phase2InfrastructureError, match="candidate|observation"):
+        deps.target_verify(SOURCE, "request", "attempt", tmp_path / "target")
 
 
 def test_cli_resume_reuses_bound_terminal_without_rerunning_cell(tmp_path, monkeypatch):

@@ -18,7 +18,10 @@ from benchmarks.a3kernels.live_composition import (
 from benchmarks.a3kernels.phase1_registry import (
     DEFAULT_PROPOSALS, CurriculumProposal,
 )
+from benchmarks.a3kernels.phase1_protocol import FailedEvidence
 from benchmarks.a3kernels.phase1_wave import CellPaths, Phase1Wave
+from benchmarks.a3kernels.remote_candidate import _PendingObservation
+from benchmarks.a3kernels.trial import infrastructure_unavailable
 from benchmarks.a3kernels.phase2_live import (
     Phase2LiveDependencies, PracticeExecution, phase2_cells,
 )
@@ -143,10 +146,24 @@ class Phase2Composition:
             return source
 
         def target_verify(source, request_id, attempt_id, workdir):
-            return verifier.verify(
-                source, request_id=request_id, attempt_id=attempt_id,
-                execution_profile=self.execution_profile, workdir=workdir,
-            )
+            try:
+                evidence = verifier.verify(
+                    source, request_id=request_id, attempt_id=attempt_id,
+                    execution_profile=self.execution_profile, workdir=workdir,
+                )
+            except _PendingObservation as exc:
+                raise A3Phase2InfrastructureError(
+                    "retained candidate observation is not terminal"
+                ) from exc
+            if any(
+                isinstance(case.authority, FailedEvidence)
+                and infrastructure_unavailable(case.authority)
+                for case in evidence.cases
+            ):
+                raise A3Phase2InfrastructureError(
+                    "candidate infrastructure did not produce a semantic verdict"
+                )
+            return evidence
 
         def curriculum(
             identity: A3Phase2Identity, target: GroundedTarget,
