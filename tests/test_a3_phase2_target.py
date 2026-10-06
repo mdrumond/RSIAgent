@@ -118,7 +118,12 @@ def test_complete_fake_runtime_proves_every_case_and_persists_evidence(tmp_path)
     assert [item.job_handle for item in evidence.cases] == [
         f"bz-a3-1:{case.case_id}" for case in PHASE2_TARGET_CASES
     ]
-    assert all(item.passed and item.compile_attestation_sha256 for item in evidence.cases)
+    assert all(
+        item.passed
+        and item.compile_attestation_sha256
+        and item.library_sha256 == "a" * 64
+        for item in evidence.cases
+    )
     assert evidence.candidate_sha256 == hashlib.sha256(SOURCE.encode()).hexdigest()
 
     destination = tmp_path / "evidence.json"

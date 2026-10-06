@@ -62,6 +62,7 @@ class Phase2CaseEvidence:
     execution_id: str
     source_fingerprint: str
     compile_attestation_sha256: str | None
+    library_sha256: str | None
     result_kind: str
     passed: bool
     result_attestation_sha256: str
@@ -86,6 +87,7 @@ class Phase2CaseEvidence:
             if (
                 self.result_kind != "verified"
                 or self.compile_attestation_sha256 is None
+                or self.library_sha256 is None
                 or self.job_handle is None
                 or self.failure_stage is not None
                 or self.max_abs_error is None
@@ -239,14 +241,15 @@ class Phase2TargetVerifier:
                 raise RuntimeError("plan builder changed the candidate source identity")
             compilation = self._backend.compile(plan, workdir / case.case_id)
             if isinstance(compilation, FailedEvidence):
-                outcomes.append(_failed_case(case, plan, compilation, None))
+                outcomes.append(_failed_case(case, plan, compilation, None, None))
                 continue
             if not isinstance(compilation, CandidateCompilation) or compilation.plan != plan:
                 raise RuntimeError("candidate backend returned a foreign compilation")
             result = self._backend.execute(compilation)
             if isinstance(result, FailedEvidence):
                 outcomes.append(_failed_case(
-                    case, plan, result, compilation.attestation_sha256
+                    case, plan, result, compilation.attestation_sha256,
+                    compilation.library_sha256,
                 ))
             elif isinstance(result, VerifiedResult):
                 _require_result_binding(plan, result)
@@ -256,6 +259,7 @@ class Phase2TargetVerifier:
                     execution_id=plan.execution_id,
                     source_fingerprint=plan.source_fingerprint,
                     compile_attestation_sha256=compilation.attestation_sha256,
+                    library_sha256=compilation.library_sha256,
                     result_kind="verified",
                     passed=result.passed,
                     result_attestation_sha256=result.attestation_sha256,
@@ -290,7 +294,7 @@ def _require_result_binding(plan: ExecutionPlan, result: VerifiedResult) -> None
 
 def _failed_case(
     case: Phase2TargetCase, plan: ExecutionPlan, result: FailedEvidence,
-    compile_attestation: str | None,
+    compile_attestation: str | None, library_sha256: str | None,
 ) -> Phase2CaseEvidence:
     if (
         result.execution_id != plan.execution_id
@@ -304,6 +308,7 @@ def _failed_case(
         execution_id=plan.execution_id,
         source_fingerprint=plan.source_fingerprint,
         compile_attestation_sha256=compile_attestation,
+        library_sha256=library_sha256,
         result_kind="failed",
         passed=False,
         result_attestation_sha256=result.attestation_sha256,
