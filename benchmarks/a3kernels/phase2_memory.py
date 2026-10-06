@@ -16,14 +16,18 @@ from benchmarks.a3_experiments import (
     ProgrammingLevel,
     build_a3_experiment_plan,
 )
-from benchmarks.a3kernels.live_composition import AuthoritativeResultStore
 from benchmarks.a3kernels.phase1_evidence import (
     GENESIS_HASH,
     EvidenceLedger,
     canonical_bytes,
     canonical_digest,
 )
-from benchmarks.a3kernels.phase1_memory import Phase1LearningJournal
+from benchmarks.a3kernels.phase1_memory import (
+    AuthoritativeEvidence,
+    EvidenceResolver,
+    HostFact,
+    Phase1LearningJournal,
+)
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase1_wave import Phase1Wave
 
@@ -34,10 +38,34 @@ _LEARNING_SCHEMA = "a3-phase2-learning-v1"
 _LEARNING_KINDS = frozenset({
     "target-attempt", "target-verdict", "practice", "curriculum",
 })
+_AUTHORITATIVE_PROFILES = frozenset({"bz-a3-1", "bz-a3-2"})
 
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+class _ReadOnlyAuthorityResolver:
+    """Validate a frozen Phase 1 authority ledger without recovering it."""
+
+    def __init__(self, value: bytes) -> None:
+        if value and not value.endswith(b"\n"):
+            raise ValueError("Phase 1 authority ledger is unterminated")
+        records: dict[str, AuthoritativeEvidence] = {}
+        for number, line in enumerate(value.splitlines(), 1):
+            try:
+                record = AuthoritativeEvidence(**json.loads(line))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"invalid Phase 1 authority record at line {number}"
+                ) from exc
+            if record.evidence_sha256 in records:
+                raise ValueError("duplicate Phase 1 authority evidence")
+            records[record.evidence_sha256] = record
+        self._records = records
+
+    def resolve(self, evidence_sha256: str) -> AuthoritativeEvidence | None:
+        return self._records.get(evidence_sha256)
 
 
 def phase2_cell_pairs(
@@ -138,21 +166,19 @@ class Phase1Snapshot:
 def admit_phase1_snapshot(
     source_cell_root: str | Path,
     destination_root: str | Path,
-    *,
-    phase1_root_sha256: str,
 ) -> Phase1Snapshot:
     """Verify and byte-copy one completed Phase 1 lineage into Phase 2."""
-    if not isinstance(phase1_root_sha256, str) or not _SHA256.fullmatch(
-        phase1_root_sha256
-    ):
-        raise ValueError("Phase 1 root identity must be a lowercase SHA-256")
     source_root = Path(source_cell_root).resolve()
     memory_path = source_root / "memory.jsonl"
     terminal_path = source_root / "terminal.json"
     authority_path = source_root / "authority.jsonl"
     evidence_path = source_root / "evidence.jsonl"
     try:
-        terminal_value = json.loads(terminal_path.read_bytes())
+        terminal_bytes = terminal_path.read_bytes()
+        memory_bytes = memory_path.read_bytes()
+        authority_bytes = authority_path.read_bytes()
+        evidence_bytes = evidence_path.read_bytes()
+        terminal_value = json.loads(terminal_bytes)
         source_cell_id = terminal_value["cell_id"]
         source_cell, destination_cell = _cells_by_source()[source_cell_id]
     except (OSError, KeyError, json.JSONDecodeError) as exc:
@@ -166,11 +192,12 @@ def admit_phase1_snapshot(
         or terminal["completed_projects"] != len(DEFAULT_PROPOSALS)
     ):
         raise ValueError("Phase 1 terminal is not complete")
+    if terminal["execution_profile"] not in _AUTHORITATIVE_PROFILES:
+        raise ValueError("Phase 1 source must use an authoritative BZ-A3 profile")
     evidence = EvidenceLedger(evidence_path)
     if terminal["evidence_sha256"] != evidence.head_sha256:
         raise ValueError("Phase 1 terminal evidence head conflicts with its ledger")
 
-    memory_bytes = memory_path.read_bytes()
     try:
         raw_entries = [json.loads(line) for line in memory_bytes.splitlines()]
         lineage_id = raw_entries[0]["lineage_id"]
@@ -179,7 +206,7 @@ def admit_phase1_snapshot(
     journal = Phase1LearningJournal(
         memory_path, DEFAULT_PROPOSALS,
         cell_id=source_cell.cell_id, lineage_id=lineage_id,
-        evidence_resolver=AuthoritativeResultStore(authority_path),
+        evidence_resolver=_ReadOnlyAuthorityResolver(authority_bytes),
         trial_protocol_sha256=terminal["trial_protocol_sha256"],
     )
     entries = journal.read()
@@ -187,7 +214,13 @@ def admit_phase1_snapshot(
     if len(entries) != len(DEFAULT_PROPOSALS) or state.next_ordinal is not None:
         raise ValueError("Phase 1 memory journal is not complete")
 
-    terminal_bytes = terminal_path.read_bytes()
+    phase1_root_sha256 = canonical_digest({
+        "schema": "a3-phase2-phase1-root-v1",
+        "authority_sha256": _sha256(authority_bytes),
+        "evidence_sha256": _sha256(evidence_bytes),
+        "memory_sha256": _sha256(memory_bytes),
+        "terminal_sha256": _sha256(terminal_bytes),
+    })
     body = {
         "schema": _SNAPSHOT_SCHEMA,
         "target": "Ascend910B4",
@@ -222,32 +255,48 @@ def admit_phase1_snapshot(
 class Phase2Learning:
     kind: str
     statement: str
-    evidence_sha256: tuple[str, ...]
+    project_id: str
+    candidate_sha256: str
+    host_facts: tuple[HostFact, ...]
 
     def __post_init__(self) -> None:
         if self.kind not in _LEARNING_KINDS:
             raise ValueError("Phase 2 learning kind is not recognized")
         if not isinstance(self.statement, str) or not self.statement.strip():
             raise ValueError("Phase 2 learning statement must be non-empty")
-        if not isinstance(self.evidence_sha256, tuple) or any(
-            not isinstance(item, str) or not _SHA256.fullmatch(item)
-            for item in self.evidence_sha256
+        if not isinstance(self.project_id, str) or not _SHA256.fullmatch(
+            self.project_id
         ):
-            raise ValueError("Phase 2 learning evidence must be SHA-256 values")
+            raise ValueError("Phase 2 learning project must be a SHA-256")
+        if not isinstance(self.candidate_sha256, str) or not _SHA256.fullmatch(
+            self.candidate_sha256
+        ):
+            raise ValueError("Phase 2 learning candidate must be a SHA-256")
+        if not isinstance(self.host_facts, tuple) or not self.host_facts:
+            raise ValueError("Phase 2 learning requires a nonempty host fact tuple")
+        if any(not isinstance(fact, HostFact) for fact in self.host_facts):
+            raise TypeError("Phase 2 learning host facts must be HostFact values")
 
 
 class Phase2LearningJournal:
-    def __init__(self, path: str | Path, snapshot: Phase1Snapshot) -> None:
+    def __init__(
+        self, path: str | Path, snapshot: Phase1Snapshot,
+        evidence_resolver: EvidenceResolver,
+    ) -> None:
         if not isinstance(snapshot, Phase1Snapshot):
             raise TypeError("snapshot must be a Phase1Snapshot")
         snapshot.verify()
+        if not callable(getattr(evidence_resolver, "resolve", None)):
+            raise TypeError("evidence_resolver must provide resolve(digest)")
         self.path = Path(path).resolve()
         self.snapshot = snapshot
+        self._evidence_resolver = evidence_resolver
 
     def append(self, learning: Phase2Learning) -> Mapping[str, object]:
         if not isinstance(learning, Phase2Learning):
             raise TypeError("learning must be Phase2Learning")
         self.snapshot.verify()
+        self._validate_host_facts(learning)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+b") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -308,16 +357,40 @@ class Phase2LearningJournal:
                 learning = entry["learning"]
                 Phase2Learning(
                     learning["kind"], learning["statement"],
-                    tuple(learning["evidence_sha256"]),
+                    learning["project_id"], learning["candidate_sha256"],
+                    tuple(HostFact.from_mapping(fact) for fact in learning["host_facts"]),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError("invalid Phase 2 learning payload") from exc
             if not valid:
                 raise ValueError("Phase 2 learning journal failed validation")
+            self._validate_host_facts(Phase2Learning(
+                learning["kind"], learning["statement"],
+                learning["project_id"], learning["candidate_sha256"],
+                tuple(HostFact.from_mapping(fact) for fact in learning["host_facts"]),
+            ))
             entry["entry_sha256"] = digest
             previous = digest
             entries.append(entry)
         return entries
+
+    def _validate_host_facts(self, learning: Phase2Learning) -> None:
+        for fact in learning.host_facts:
+            resolved = self._evidence_resolver.resolve(fact.evidence_sha256)
+            if not isinstance(resolved, AuthoritativeEvidence):
+                raise ValueError("host fact must resolve to authoritative Phase 2 evidence")
+            checks = (
+                ("kind", resolved.kind, fact.category),
+                ("digest", resolved.evidence_sha256, fact.evidence_sha256),
+                ("project", resolved.project_id, learning.project_id),
+                ("candidate", resolved.candidate_sha256, learning.candidate_sha256),
+                ("success", resolved.success, fact.success),
+            )
+            for label, actual, expected in checks:
+                if actual != expected:
+                    raise ValueError(
+                        f"host fact {label} does not match authoritative Phase 2 evidence"
+                    )
 
     def context(self) -> dict[str, object]:
         entries = self.read()
