@@ -194,6 +194,8 @@ class Phase2LiveRunner:
                 raise TypeError("target verifier must return Phase2TargetEvidence")
             if result.request_id != request_id or result.attempt_id != attempt_id:
                 raise ValueError("target evidence is not bound to the live attempt")
+            if result.execution_profile != self.dependencies.execution_profile:
+                raise ValueError("target evidence changed the execution treatment")
             result.write(active_environment.value / "target-evidence.json")
             return GroundedTarget(
                 identity,

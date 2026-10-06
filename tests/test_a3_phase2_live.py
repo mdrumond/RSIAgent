@@ -19,7 +19,7 @@ from benchmarks.a3kernels.phase2_memory import Phase1Snapshot, phase2_cell_pairs
 from benchmarks.a3kernels.phase2_protocol import (
     A3Phase2InfrastructureError, CurriculumDecision,
 )
-from benchmarks.a3kernels.phase2_target import Phase2TargetVerifier
+from benchmarks.a3kernels.phase2_target import Phase2TargetEvidence, Phase2TargetVerifier
 
 
 SOURCE = '''#include "kernel_operator.h"
@@ -145,6 +145,35 @@ def test_treatments_must_exactly_match_snapshot_and_cell(tmp_path):
                 lambda *_: None, lambda *_: None,
             ),
         )
+
+
+def test_target_evidence_cannot_change_execution_profile(tmp_path):
+    cell = _cell(BackendModel.GPT_5_6_SOL)
+    snapshot = _snapshot(tmp_path, cell)
+    planner = A3CandidateBackend(lambda *_args, **_kwargs: None)
+
+    def verify(source, request, attempt, workdir):
+        evidence = Phase2TargetVerifier(_Backend(), plan_builder=planner.plan).verify(
+            source, request_id=request, attempt_id=attempt,
+            execution_profile="bz-a3-1", workdir=workdir,
+        )
+        return Phase2TargetEvidence.create(
+            request_id=evidence.request_id, attempt_id=evidence.attempt_id,
+            execution_profile="bz-a3-2",
+            candidate_sha256=evidence.candidate_sha256,
+            source_fingerprint=evidence.source_fingerprint, cases=evidence.cases,
+        )
+
+    runner = Phase2LiveRunner(
+        root=tmp_path / "run", snapshot=snapshot,
+        dependencies=Phase2LiveDependencies(
+            cell, "bz-a3-1", lambda *_: SOURCE, verify,
+            lambda identity, *_: CurriculumDecision.ready(identity, "ready"),
+            lambda *_: None,
+        ),
+    )
+    with pytest.raises(ValueError, match="execution treatment"):
+        runner.run("target")
 
 
 def test_infrastructure_is_retried_without_becoming_a_target_verdict(tmp_path):
