@@ -8,15 +8,21 @@ a second execution stack.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import hashlib
+import json
+import os
 from pathlib import Path
+import re
+import tempfile
 import time
 from typing import Any, Callable
 
 from benchmarks.a3_experiments import A3ExperimentCell
 from benchmarks.a3kernels.live_composition import AuthoritativeResultStore
-from benchmarks.a3kernels.phase1_evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a3kernels.phase1_evidence import (
+    EvidenceKind, EvidenceLedger, canonical_bytes, canonical_digest,
+)
 from benchmarks.a3kernels.phase1_memory import HostFact
 from benchmarks.a3kernels.phase1_registry import CurriculumProposal
 from benchmarks.a3kernels.phase2_memory import (
@@ -30,11 +36,40 @@ from benchmarks.a3kernels.phase2_protocol import (
 from benchmarks.a3kernels.phase2_target import (
     PHASE2_TARGET_SUITE_SHA256, Phase2TargetEvidence,
 )
-from core.self_evolving_loop import TargetVerdict
+from core.self_evolving_loop import SelfEvolvingStart, TargetVerdict
 
 
 _MAX_INFRASTRUCTURE_RETRIES = 3
 _INFRASTRUCTURE_BACKOFF_SECONDS = 120
+_RUN_STATE_SCHEMA = "a3-phase2-live-run-state-v1"
+_RESUMABLE_PHASES = frozenset({"source", "evidence", "learning"})
+_TARGET_DIRECTORY = re.compile(r"r[0-3]-t([1-9][0-9]*)")
+_MAX_DIAGNOSTIC_DETAIL = 512
+
+
+def _target_diagnostic(result: Phase2TargetEvidence) -> str:
+    """Render a bounded diagnostic containing only host target evidence."""
+    failed = []
+    for item in result.cases:
+        if item.passed:
+            continue
+        case = {"case_id": item.case.case_id, "stage": item.failure_stage}
+        for name in ("error_type", "max_abs_error"):
+            value = getattr(item, name)
+            if value is not None:
+                case[name] = value
+        if item.detail is not None:
+            case["detail"] = item.detail[:_MAX_DIAGNOSTIC_DETAIL]
+        mismatch = getattr(item.authority, "mismatch", None)
+        if mismatch is not None:
+            case["mismatch"] = asdict(mismatch)
+        failed.append(case)
+    return json.dumps({
+        "schema": "a3-phase2-target-diagnostic-v1",
+        "verdict": "PASS" if result.passed else "FAIL",
+        "failed_case_count": len(failed),
+        "failed_cases": failed,
+    }, sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
@@ -97,6 +132,8 @@ class Phase2LiveRunner:
         self.sleeper = sleeper
         self._retry_ordinal = 0
         self._target_serial = 0
+        self._state: dict[str, object] | None = None
+        self._resume_available = False
         self._validate_treatment()
 
     def _validate_treatment(self) -> None:
@@ -123,14 +160,23 @@ class Phase2LiveRunner:
         evidence_path = self.root / "evidence.jsonl"
         EvidenceLedger.recover_incomplete_tail(evidence_path)
 
-        for retry in range(_MAX_INFRASTRUCTURE_RETRIES + 1):
+        self._prepare_recovery(target_direction)
+        assert self._state is not None
+        first_retry = int(self._state["retry_ordinal"])
+
+        for retry in range(first_retry, _MAX_INFRASTRUCTURE_RETRIES + 1):
             self._retry_ordinal = retry
             adapter = A3Phase2Adapter(
                 A3Phase2Identity.from_cell(self.dependencies.cell),
                 self._hooks(authority, journal), evidence_path,
             )
             try:
-                result = adapter.run(target_direction, journal.context())
+                start, completed_projects = self._resume_boundary(journal)
+                result = adapter.run(
+                    target_direction, journal.context(), start=start,
+                    completed_practice_projects=completed_projects,
+                )
+                self._checkpoint(phase="complete")
                 self.snapshot.verify()
                 return result
             except A3Phase2InfrastructureError as exc:
@@ -141,14 +187,145 @@ class Phase2LiveRunner:
                     "semantic_verdict": None,
                 })
                 if retry == _MAX_INFRASTRUCTURE_RETRIES:
+                    self._checkpoint(phase="infrastructure-exhausted")
                     raise
+                self._checkpoint(
+                    phase="retry-wait", retry_ordinal=retry + 1,
+                    infrastructure_failures=retry + 1,
+                )
                 EvidenceLedger(evidence_path).append(EvidenceKind.PLAN, {
                     "phase": "phase2", "event": "INFRASTRUCTURE_RETRY_SCHEDULED",
                     "retry_ordinal": retry + 1,
                     "backoff_seconds": _INFRASTRUCTURE_BACKOFF_SECONDS,
                 })
                 self.sleeper(_INFRASTRUCTURE_BACKOFF_SECONDS)
+                self._checkpoint(phase="retry-ready")
         raise AssertionError("unreachable")
+
+    @property
+    def _state_path(self) -> Path:
+        return self.root / "run-state.json"
+
+    def _prepare_recovery(self, target_direction: str) -> None:
+        direction_sha256 = hashlib.sha256(target_direction.encode("utf-8")).hexdigest()
+        state = self._read_state()
+        serials = [
+            int(match.group(1))
+            for path in (self.root / "targets").glob("r*-t*")
+            if (match := _TARGET_DIRECTORY.fullmatch(path.name)) is not None
+        ]
+        self._target_serial = max(serials, default=0)
+        if state is None:
+            self._state = {
+                "schema": _RUN_STATE_SCHEMA,
+                "snapshot_id": self.snapshot.snapshot_id,
+                "cell_id": self.dependencies.cell.cell_id,
+                "target_direction_sha256": direction_sha256,
+                "retry_ordinal": 0,
+                "infrastructure_failures": 0,
+                "serial": self._target_serial,
+                "core_attempt": 0,
+                "phase": "ready",
+                "request_id": None,
+                "attempt_id": None,
+                "source_sha256": None,
+                "evidence_sha256": None,
+                "learning_entry_sha256": None,
+            }
+            self._checkpoint()
+            return
+        if (
+            state["snapshot_id"] != self.snapshot.snapshot_id
+            or state["cell_id"] != self.dependencies.cell.cell_id
+            or state["target_direction_sha256"] != direction_sha256
+        ):
+            raise ValueError("persisted Phase 2 run state changed lineage")
+        self._state = state
+        self._target_serial = max(self._target_serial, int(state["serial"]))
+        if state["phase"] == "retry-wait":
+            self.sleeper(_INFRASTRUCTURE_BACKOFF_SECONDS)
+            self._checkpoint(phase="retry-ready")
+        self._resume_available = state["phase"] in _RESUMABLE_PHASES
+
+    def _read_state(self) -> dict[str, object] | None:
+        if not self._state_path.exists():
+            return None
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+            digest = state.pop("state_sha256")
+        except (OSError, KeyError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid Phase 2 run state") from exc
+        required = {
+            "schema", "snapshot_id", "cell_id", "target_direction_sha256",
+            "retry_ordinal", "infrastructure_failures", "serial", "core_attempt",
+            "phase", "request_id", "attempt_id", "source_sha256",
+            "evidence_sha256", "learning_entry_sha256",
+        }
+        if (
+            set(state) != required
+            or state["schema"] != _RUN_STATE_SCHEMA
+            or digest != canonical_digest(state)
+            or type(state["retry_ordinal"]) is not int
+            or not 0 <= state["retry_ordinal"] <= _MAX_INFRASTRUCTURE_RETRIES
+            or type(state["serial"]) is not int
+            or state["serial"] < 0
+        ):
+            raise ValueError("invalid Phase 2 run state")
+        return state
+
+    def _checkpoint(self, **updates: object) -> None:
+        assert self._state is not None
+        self._state = {**self._state, **updates}
+        value = {**self._state, "state_sha256": canonical_digest(self._state)}
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=self.root, prefix=".phase2-state-", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(canonical_bytes(value) + b"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, self._state_path)
+
+    def _attempt_directory(self) -> Path:
+        assert self._state is not None
+        return self.root / "targets" / (
+            f"r{self._state['retry_ordinal']}-t{self._state['serial']}"
+        )
+
+    def _resume_boundary(
+        self, journal: Phase2LearningJournal,
+    ) -> tuple[SelfEvolvingStart | None, tuple[str, ...]]:
+        assert self._state is not None
+        core_attempt = int(self._state["core_attempt"])
+        if core_attempt <= 1 or self._state["phase"] in {"ready", "complete"}:
+            return None, ()
+        projects = tuple(
+            str(entry["learning"]["project_id"])
+            for entry in journal.read()
+            if entry["learning"]["kind"] == "practice"
+        )
+        if not projects:
+            raise ValueError("resumed target attempt is missing completed practice")
+        return SelfEvolvingStart(
+            target_cycles=core_attempt - 1,
+            evolutions=core_attempt - 1,
+            practice_projects=len(projects),
+            final_after_stall=len(projects) == 8,
+        ), projects
+
+    @staticmethod
+    def _publish_source(path: Path, source: str) -> None:
+        value = source.encode("utf-8")
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            if path.read_bytes() != value:
+                raise RuntimeError("persisted Phase 2 source conflicts") from None
+            return
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def _hooks(
         self, authority: AuthoritativeResultStore,
@@ -156,52 +333,102 @@ class Phase2LiveRunner:
     ) -> A3Phase2Hooks:
         identity = A3Phase2Identity.from_cell(self.dependencies.cell)
 
-        def fresh(kind: str, attempt: int, value: Any) -> OwnedAgent:
+        def fresh(kind: str, value: Any) -> OwnedAgent:
+            assert self._state is not None
             return OwnedAgent(
-                identity, f"{kind}-r{self._retry_ordinal}-t{attempt}", value,
+                identity,
+                f"{kind}-r{self._state['retry_ordinal']}-t{self._state['serial']}",
+                value,
             )
 
         def environment(_identity, attempt):
-            self._target_serial += 1
-            workdir = self.root / "targets" / f"r{self._retry_ordinal}-t{attempt}"
+            if self._resume_available:
+                self._resume_available = False
+                workdir = self._attempt_directory()
+            else:
+                self._target_serial += 1
+                request_id = (
+                    f"{self.snapshot.snapshot_id[:16]}-r{self._retry_ordinal}"
+                    f"-t{self._target_serial}"
+                )
+                self._checkpoint(
+                    retry_ordinal=self._retry_ordinal,
+                    serial=self._target_serial,
+                    core_attempt=attempt,
+                    phase="allocated",
+                    request_id=request_id,
+                    attempt_id=f"target-r{self._retry_ordinal}-t{self._target_serial}",
+                    source_sha256=None,
+                    evidence_sha256=None,
+                    learning_entry_sha256=None,
+                )
+                workdir = self._attempt_directory()
             workdir.mkdir(parents=True, exist_ok=True)
-            return fresh("environment", attempt, workdir)
+            return fresh("environment", workdir)
 
         def actor(_identity, memory, attempt):
-            return fresh("actor", attempt, memory)
+            return fresh("actor", memory)
 
         def verifier(_identity, _environment, attempt):
-            return fresh("verifier", attempt, None)
+            return fresh("verifier", None)
 
         def work(_identity, active_actor, _verifier, _environment, _direction):
+            source_path = self._attempt_directory() / "candidate.ascendc"
+            assert self._state is not None
+            if self._state["phase"] in _RESUMABLE_PHASES:
+                source = source_path.read_text(encoding="utf-8")
+                if hashlib.sha256(source.encode("utf-8")).hexdigest() != self._state[
+                    "source_sha256"
+                ]:
+                    raise ValueError("persisted Phase 2 source changed")
+                return source
             source = self.dependencies.target_source(
                 identity, active_actor.value, self._target_serial,
             )
             if not isinstance(source, str) or not source.strip():
                 raise ValueError("target actor must produce non-empty Ascend C source")
+            self._publish_source(source_path, source)
+            self._checkpoint(
+                phase="source",
+                source_sha256=hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            )
             return source
 
         def verify(_identity, _verifier, active_environment, _direction, source):
-            serial = self._target_serial
-            request_id = (
-                f"{self.snapshot.snapshot_id[:16]}-r{self._retry_ordinal}-t{serial}"
-            )
-            attempt_id = f"target-r{self._retry_ordinal}-t{serial}"
-            result = self.dependencies.target_verify(
-                source, request_id, attempt_id, active_environment.value,
-            )
+            assert self._state is not None
+            request_id = str(self._state["request_id"])
+            attempt_id = str(self._state["attempt_id"])
+            evidence_path = active_environment.value / "target-evidence.json"
+            if evidence_path.exists():
+                result = Phase2TargetEvidence.read(evidence_path)
+            else:
+                result = self.dependencies.target_verify(
+                    source, request_id, attempt_id, active_environment.value,
+                )
             if not isinstance(result, Phase2TargetEvidence):
                 raise TypeError("target verifier must return Phase2TargetEvidence")
             if result.request_id != request_id or result.attempt_id != attempt_id:
                 raise ValueError("target evidence is not bound to the live attempt")
             if result.execution_profile != self.dependencies.execution_profile:
                 raise ValueError("target evidence changed the execution treatment")
-            result.write(active_environment.value / "target-evidence.json")
+            candidate = hashlib.sha256(source.encode("utf-8")).hexdigest()
+            if result.candidate_sha256 != candidate or candidate != self._state[
+                "source_sha256"
+            ]:
+                raise ValueError("target evidence changed the persisted source")
+            if (
+                self._state["evidence_sha256"] is not None
+                and self._state["evidence_sha256"] != result.attestation_sha256
+            ):
+                raise ValueError("target evidence changed the persisted checkpoint")
+            result.write(evidence_path)
+            self._checkpoint(
+                phase="evidence", evidence_sha256=result.attestation_sha256,
+            )
             return GroundedTarget(
                 identity,
                 TargetVerdict.PASS if result.passed else TargetVerdict.FAIL,
-                "all held-out cases passed" if result.passed
-                else "one or more held-out cases failed",
+                _target_diagnostic(result),
                 result.attestation_sha256,
             )
 
@@ -218,7 +445,7 @@ class Phase2LiveRunner:
                 PHASE2_TARGET_SUITE_SHA256, candidate,
                 grounded.verdict is TargetVerdict.PASS,
             )
-            journal.append(Phase2Learning(
+            learning = Phase2Learning(
                 "target-verdict", grounded.report,
                 PHASE2_TARGET_SUITE_SHA256, candidate,
                 (HostFact(
@@ -226,7 +453,28 @@ class Phase2LiveRunner:
                     grounded.evidence_sha256,
                     success=grounded.verdict is TargetVerdict.PASS,
                 ),),
-            ))
+            )
+            matching = []
+            for entry in journal.read():
+                value = entry["learning"]
+                facts = value["host_facts"]
+                if any(
+                    fact["evidence_sha256"] == grounded.evidence_sha256
+                    for fact in facts
+                ):
+                    matching.append(entry)
+            if matching:
+                if len(matching) != 1 or matching[0]["learning"] != json.loads(
+                    canonical_bytes(asdict(learning))
+                ):
+                    raise ValueError("persisted Phase 2 learning conflicts")
+                entry = matching[0]
+            else:
+                entry = journal.append(learning)
+            self._checkpoint(
+                phase="learning",
+                learning_entry_sha256=entry["entry_sha256"],
+            )
             return GroundedLearning(
                 identity, journal.context(), grounded.report,
                 grounded.evidence_sha256,

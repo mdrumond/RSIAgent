@@ -10,12 +10,16 @@ from benchmarks.a3_experiments import BackendModel, KnowledgeMode, ProfilingGuid
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
 from benchmarks.a3kernels.live_composition import AuthoritativeResultStore
 from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_digest
-from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt, VerifiedResult, attest
+from benchmarks.a3kernels.phase1_protocol import (
+    ExecutionReceipt, FailedEvidence, VerifiedResult, attest,
+)
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a3kernels.phase2_live import (
     Phase2LiveDependencies, Phase2LiveRunner, PracticeExecution,
 )
-from benchmarks.a3kernels.phase2_memory import Phase1Snapshot, phase2_cell_pairs
+from benchmarks.a3kernels.phase2_memory import (
+    Phase1Snapshot, Phase2LearningJournal, phase2_cell_pairs,
+)
 from benchmarks.a3kernels.phase2_protocol import (
     A3Phase2InfrastructureError, CurriculumDecision,
 )
@@ -30,10 +34,19 @@ extern "C" __global__ __aicore__ void vector_add(
 
 
 class _Backend:
-    def __init__(self, passed=True):
+    def __init__(self, passed=True, fail_compile_case=None):
         self.passed = passed
+        self.fail_compile_case = fail_compile_case
 
     def compile(self, plan, _workdir):
+        if (
+            self.fail_compile_case is not None
+            and plan.project_id.endswith(f"/{self.fail_compile_case}")
+        ):
+            return FailedEvidence.create(
+                plan, stage="compile", error_type="CompileError",
+                detail="x" * 700,
+            )
         body = {"plan": plan, "library_sha256": "a" * 64,
                 "stdout": "compiled", "stderr": ""}
         return CandidateCompilation(plan, "a" * 64, "compiled", "", attest(body))
@@ -251,3 +264,164 @@ def test_failed_target_practices_once_then_uses_fresh_target(tmp_path):
     assert len(set(attempts)) == 2
     assert practices == [DEFAULT_PROPOSALS[0].project_id]
     assert len((tmp_path / "run" / "learning.jsonl").read_text().splitlines()) == 3
+
+
+def test_failed_target_diagnostic_is_host_structured_and_reaches_next_actor(tmp_path):
+    cell = _cell(BackendModel.GPT_5_6_SOL)
+    snapshot = _snapshot(tmp_path, cell)
+    planner = A3CandidateBackend(lambda *_args, **_kwargs: None)
+    attempts = []
+    reviews = []
+    actor_memories = []
+
+    def source(_identity, memory, _serial):
+        actor_memories.append(memory)
+        return SOURCE
+
+    def verify(source, request, attempt, workdir):
+        attempts.append(attempt)
+        return Phase2TargetVerifier(
+            _Backend(
+                passed=len(attempts) > 1,
+                fail_compile_case=("n1-p64-b1" if len(attempts) == 1 else None),
+            ),
+            plan_builder=planner.plan,
+        ).verify(source, request_id=request, attempt_id=attempt,
+                 execution_profile="bz-a3-1", workdir=workdir)
+
+    def curriculum(identity, target, learning, memory, _evolution):
+        reviews.append((target.report, learning.diagnosis, memory))
+        if target.verdict.value == "FAIL":
+            return CurriculumDecision.practice(
+                identity, DEFAULT_PROPOSALS[0], "repair host mismatch",
+            )
+        return CurriculumDecision.ready(identity, "ready")
+
+    Phase2LiveRunner(
+        root=tmp_path / "run", snapshot=snapshot,
+        dependencies=Phase2LiveDependencies(
+            cell, "bz-a3-1", source, verify, curriculum,
+            lambda _identity, proposal, *_: PracticeExecution(
+                proposal.project_id, "c" * 64, "d" * 64, True, "practiced",
+            ),
+        ),
+        sleeper=lambda _seconds: None,
+    ).run("target")
+
+    diagnostic = json.loads(reviews[0][0])
+    assert diagnostic["schema"] == "a3-phase2-target-diagnostic-v1"
+    assert diagnostic["verdict"] == "FAIL"
+    assert diagnostic["failed_case_count"] == 7
+    assert diagnostic["failed_cases"][0]["case_id"] == "n1-p64-b1"
+    assert diagnostic["failed_cases"][0]["stage"] == "compile"
+    assert diagnostic["failed_cases"][0]["error_type"] == "CompileError"
+    assert diagnostic["failed_cases"][0]["detail"] == "x" * 512
+    assert diagnostic["failed_cases"][1]["stage"] == "verify"
+    assert diagnostic["failed_cases"][1]["max_abs_error"] == pytest.approx(1.0)
+    assert diagnostic["failed_cases"][1]["mismatch"]["logical_index"] == 0
+    assert reviews[0][1] == reviews[0][0]
+    assert reviews[0][2]["phase2"]["learning"][-1]["statement"] == reviews[0][0]
+    assert actor_memories[1]["phase2"]["learning"][0]["statement"] == reviews[0][0]
+
+
+def test_restart_after_target_evidence_reconciles_without_reverification(
+    tmp_path, monkeypatch,
+):
+    cell = _cell(BackendModel.GPT_5_6_SOL)
+    snapshot = _snapshot(tmp_path, cell)
+    planner = A3CandidateBackend(lambda *_args, **_kwargs: None)
+    verifier = Phase2TargetVerifier(_Backend(), plan_builder=planner.plan)
+    verifies = []
+    original_write = Phase2TargetEvidence.write
+    interrupted = False
+
+    def verify(source, request, attempt, workdir):
+        verifies.append((request, attempt))
+        return verifier.verify(source, request_id=request, attempt_id=attempt,
+                               execution_profile="bz-a3-1", workdir=workdir)
+
+    def crash_after_write(self, path):
+        nonlocal interrupted
+        original_write(self, path)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupted after target evidence")
+
+    monkeypatch.setattr(Phase2TargetEvidence, "write", crash_after_write)
+    dependencies = Phase2LiveDependencies(
+        cell, "bz-a3-1", lambda *_: SOURCE, verify,
+        lambda identity, *_: CurriculumDecision.ready(identity, "ready"),
+        lambda *_: pytest.fail("qualification must not practice"),
+    )
+    root = tmp_path / "run"
+    with pytest.raises(RuntimeError, match="after target evidence"):
+        Phase2LiveRunner(root=root, snapshot=snapshot,
+                         dependencies=dependencies).run("target")
+
+    result = Phase2LiveRunner(
+        root=root, snapshot=snapshot, dependencies=dependencies,
+    ).run("target")
+
+    assert result.verdict.value == "PASS"
+    assert len(verifies) == 1
+    assert len((root / "learning.jsonl").read_text().splitlines()) == 1
+    assert json.loads((root / "run-state.json").read_text())["phase"] == "complete"
+
+
+def test_restart_after_learning_does_not_duplicate_learning(tmp_path, monkeypatch):
+    cell = _cell(BackendModel.GPT_5_6_SOL)
+    snapshot = _snapshot(tmp_path, cell)
+    planner = A3CandidateBackend(lambda *_args, **_kwargs: None)
+    verifies = []
+    original_append = Phase2LearningJournal.append
+    interrupted = False
+    target_learning = 0
+
+    def verify(source, request, attempt, workdir):
+        verifies.append((request, attempt))
+        return Phase2TargetVerifier(
+            _Backend(passed=len(verifies) > 1), plan_builder=planner.plan,
+        ).verify(source, request_id=request, attempt_id=attempt,
+                 execution_profile="bz-a3-1", workdir=workdir)
+
+    def crash_after_append(self, learning):
+        nonlocal interrupted, target_learning
+        result = original_append(self, learning)
+        if learning.kind == "target-verdict":
+            target_learning += 1
+        if target_learning == 2 and not interrupted:
+            interrupted = True
+            raise RuntimeError("interrupted after learning")
+        return result
+
+    def curriculum(identity, target, *_args):
+        if target.verdict.value == "FAIL":
+            return CurriculumDecision.practice(
+                identity, DEFAULT_PROPOSALS[0], "practice",
+            )
+        return CurriculumDecision.ready(identity, "ready")
+
+    monkeypatch.setattr(Phase2LearningJournal, "append", crash_after_append)
+    dependencies = Phase2LiveDependencies(
+        cell, "bz-a3-1", lambda *_: SOURCE, verify, curriculum,
+        lambda _identity, proposal, *_: PracticeExecution(
+            proposal.project_id, "c" * 64, "d" * 64, True, "practiced",
+        ),
+    )
+    root = tmp_path / "run"
+    with pytest.raises(RuntimeError, match="after learning"):
+        Phase2LiveRunner(root=root, snapshot=snapshot,
+                         dependencies=dependencies).run("target")
+
+    result = Phase2LiveRunner(
+        root=root, snapshot=snapshot, dependencies=dependencies,
+    ).run("target")
+
+    assert result.verdict.value == "PASS"
+    assert result.target_attempts == 2
+    assert result.practice_projects == 1
+    assert len(verifies) == 2
+    assert len((root / "learning.jsonl").read_text().splitlines()) == 3
+    state = json.loads((root / "run-state.json").read_text())
+    assert state["phase"] == "complete"
+    assert state["learning_entry_sha256"]

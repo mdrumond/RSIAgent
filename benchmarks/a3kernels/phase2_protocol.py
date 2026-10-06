@@ -24,6 +24,7 @@ from core.self_evolving_loop import (
     ActorLearning,
     EvolutionResult,
     EvolutionStatus,
+    SelfEvolvingStart,
     SelfEvolvingLoopHooks,
     TargetVerdict,
     TargetVerification,
@@ -272,14 +273,26 @@ class A3Phase2Adapter:
             },
         )
 
-    def run(self, target_direction: str, memory: Any) -> A3Phase2Result:
+    def run(
+        self, target_direction: str, memory: Any, *,
+        start: SelfEvolvingStart | None = None,
+        completed_practice_projects: tuple[str, ...] = (),
+    ) -> A3Phase2Result:
+        if start is None and completed_practice_projects:
+            raise ValueError("completed practice requires a resumed loop boundary")
+        if start is not None and start.practice_projects != len(
+            completed_practice_projects
+        ):
+            raise ValueError("resumed practice count does not match its projects")
         seen_targets: set[str] = set()
         seen_verifiers: set[str] = set()
         seen_actors: set[str] = set()
-        seen_projects: set[str] = set()
+        seen_projects = set(completed_practice_projects)
+        if len(seen_projects) != len(completed_practice_projects):
+            raise ValueError("resumed practice projects must be unique")
         current_verification: GroundedTarget | None = None
         current_learning: GroundedLearning | None = None
-        practice_count = 0
+        practice_count = len(completed_practice_projects)
 
         self._event(
             "PHASE2_STARTED",
@@ -470,7 +483,9 @@ class A3Phase2Adapter:
             on_event=lambda event, payload: self._event(event, payload),
         )
         try:
-            result = run_self_evolving_loop(target_direction, memory, core_hooks)
+            result = run_self_evolving_loop(
+                target_direction, memory, core_hooks, start=start,
+            )
         except A3Phase2InfrastructureError as exc:
             self._event(
                 "PHASE2_INFRASTRUCTURE_EXCEPTION",
