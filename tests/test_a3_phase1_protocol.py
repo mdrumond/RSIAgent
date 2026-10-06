@@ -197,6 +197,29 @@ def test_failed_verification_selects_logical_max_with_lowest_index_ties():
     )
 
 
+def test_logically_correct_padded_output_fails_when_tail_is_modified():
+    execution = plan(
+        input_a=(1.0, -2.0, 17.0, 17.0),
+        input_b=(3.0, 5.0, -5.0, -5.0),
+        logical_length=2,
+        padded_length=4,
+        verify_padding=True,
+    )
+
+    result = VerifiedResult.from_receipt(
+        execution,
+        ExecutionReceipt(0, (4.0, 3.0, 12.0, 12.0)),
+        max_abs_error=0.0,
+    )
+
+    assert result.passed is False
+    assert result.max_abs_error == 0.0
+    assert result.mismatch is None
+    assert result.padding_max_abs_error == 12.0
+    assert result.padding_mismatch_index == 2
+    assert result.attestation_sha256 == attest(result.attestation_payload())
+
+
 def test_passing_and_failed_process_results_have_no_mismatch_sample():
     execution = plan()
     passed = VerifiedResult.from_receipt(
