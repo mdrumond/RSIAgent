@@ -25,6 +25,7 @@ from benchmarks.a3kernels.phase2_composition import Phase2Composition, qualifica
 from benchmarks.a3kernels.phase2_live import Phase2LiveRunner, phase2_cells
 from benchmarks.a3kernels.phase2_memory import Phase1Snapshot, phase2_cell_pairs
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
+from benchmarks.a3kernels.phase2_target import Phase2TargetEvidence
 from core.self_evolving_loop import TargetVerdict
 
 
@@ -505,3 +506,96 @@ def test_cli_resume_reuses_bound_terminal_without_rerunning_cell(tmp_path, monke
     args.target_direction = "different target"
     with pytest.raises(ValueError, match="target direction"):
         run_a3_phase2._run(args, (cell,))
+
+
+def test_cli_resume_reconciles_interrupted_evidence_without_abandonment(
+    tmp_path, monkeypatch, capsys,
+):
+    cell = qualification_cells()[0]
+    snap = snapshot(tmp_path / "snapshots", cell)
+    source_root = tmp_path / "phase1-source"
+    source_root.mkdir()
+    calls = []
+
+    class CountingBackend(Backend):
+        def execute(self, compilation):
+            calls.append("execute")
+            return super().execute(compilation)
+
+    class Config:
+        def __init__(self, *args):
+            self.state_root, self.validation_wrapper = args[:2]
+
+        def preflight(self, _environment, *, cells):
+            assert cells == (next(
+                source for source, destination in phase2_cell_pairs()
+                if destination == cell
+            ),)
+            return {"ready": True}
+
+    live = live_dependencies(calls, [], backend=CountingBackend())
+    monkeypatch.setattr(run_a3_phase2, "Phase1Config", Config)
+    monkeypatch.setattr(run_a3_phase2, "_bz_preflight", lambda *_: {})
+    monkeypatch.setattr(run_a3_phase2, "bz_live_dependencies", lambda *_a, **_k: live)
+    monkeypatch.setattr(run_a3_phase2, "_source_cell_root", lambda *_: source_root)
+    monkeypatch.setattr(run_a3_phase2, "admit_phase1_snapshot", lambda *_: snap)
+
+    state_root = tmp_path / "state"
+    direction = "resume exact interrupted target"
+    gate = {
+        "schema": "a3-phase2-qualification-v1",
+        "execution_profile": "bz-a3-1",
+        "target_direction_sha256": run_a3_phase2._target_direction_sha256(direction),
+        "cells": [
+            {
+                "cell_id": item.cell_id, "snapshot_id": "a" * 64,
+                "verdict": "PASS", "evidence_sha256": "b" * 64,
+            }
+            for item in qualification_cells()
+        ],
+    }
+    state_root.mkdir()
+    (state_root / "qualification.json").write_bytes(canonical_bytes(gate) + b"\n")
+    argv = [
+        "resume", "--state-root", str(state_root),
+        "--phase1-root", str(tmp_path / "phase1"),
+        "--validation-wrapper", str(tmp_path / "wrapper"),
+        "--cpl-remote", "/tmp/cpl-remote", "--profile", "bz-a3-1",
+        "--remote-workspace", "/tmp/remote", "--physical-device", "4",
+        "--acknowledge-execution", "I_ACCEPT_A3_PHASE2_EXECUTION",
+        "--target-direction", direction, "--cell-id", cell.cell_id,
+    ]
+    original_write = Phase2TargetEvidence.write
+    interrupted = False
+
+    def crash_after_write(self, path):
+        nonlocal interrupted
+        original_write(self, path)
+        if not interrupted:
+            interrupted = True
+            raise RuntimeError("CLI interrupted after target evidence")
+
+    monkeypatch.setattr(Phase2TargetEvidence, "write", crash_after_write)
+    with pytest.raises(RuntimeError, match="CLI interrupted"):
+        run_a3_phase2.main(argv)
+    assert not (state_root / "cells" / cell.cell_id / "terminal.json").exists()
+    executions_after_interrupt = calls.count("execute")
+
+    assert run_a3_phase2.main(argv) == 0
+    capsys.readouterr()
+    root = state_root / "cells" / cell.cell_id
+    targets = tuple((root / "targets").iterdir())
+    evidence = [json.loads(line) for line in (root / "evidence.jsonl").read_text().splitlines()]
+
+    assert len(targets) == 1
+    assert (targets[0] / "candidate.ascendc").is_file()
+    assert (targets[0] / "target-evidence.json").is_file()
+    assert executions_after_interrupt == 7
+    assert calls.count("execute") == executions_after_interrupt
+    assert len([item for item in calls if isinstance(item, tuple)]) == 2
+    assert len((root / "learning.jsonl").read_text().splitlines()) == 1
+    assert len((root / "authority.jsonl").read_text().splitlines()) == 1
+    assert len({item["entry_sha256"] for item in evidence}) == len(evidence)
+    assert "abandon" not in json.dumps(evidence).lower()
+    assert json.loads((root / "run-state.json").read_text())["phase"] == "complete"
+    assert json.loads((root / "terminal.json").read_text())["verdict"] == "PASS"
