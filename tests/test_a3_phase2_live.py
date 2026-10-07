@@ -324,6 +324,70 @@ def test_failed_target_diagnostic_is_host_structured_and_reaches_next_actor(tmp_
     assert actor_memories[1]["phase2"]["learning"][0]["statement"] == reviews[0][0]
 
 
+def test_invalid_actor_candidate_is_grounded_then_corrected_on_next_attempt(tmp_path):
+    cell = _cell(BackendModel.GPT_5_6_SOL)
+    snapshot = _snapshot(tmp_path, cell)
+    planner = A3CandidateBackend(lambda *_args, **_kwargs: None)
+    backend = _Backend()
+    verifier = Phase2TargetVerifier(backend, plan_builder=planner.plan)
+    invalid = SOURCE.replace("vector_add", "add_custom")
+    candidates = iter((invalid, SOURCE))
+    actor_memories = []
+    reviews = []
+
+    def source(_identity, memory, _serial):
+        actor_memories.append(memory)
+        return next(candidates)
+
+    def verify(candidate, request, attempt, workdir):
+        return verifier.verify(
+            candidate, request_id=request, attempt_id=attempt,
+            execution_profile="bz-a3-1", workdir=workdir,
+        )
+
+    def curriculum(identity, target, _learning, _memory, _evolution):
+        reviews.append(target)
+        if target.verdict.value == "FAIL":
+            return CurriculumDecision.practice(
+                identity, DEFAULT_PROPOSALS[0], "repair exported source contract",
+            )
+        return CurriculumDecision.ready(identity, "host suite passed")
+
+    result = Phase2LiveRunner(
+        root=tmp_path / "run", snapshot=snapshot,
+        dependencies=Phase2LiveDependencies(
+            cell, "bz-a3-1", source, verify, curriculum,
+            lambda _identity, proposal, *_: PracticeExecution(
+                proposal.project_id, "c" * 64, "d" * 64, True,
+                "reviewed the host source contract",
+            ),
+        ),
+        sleeper=lambda _seconds: None,
+    ).run("target")
+
+    assert result.verdict.value == "PASS"
+    assert result.target_attempts == 2 and result.practice_projects == 1
+    assert reviews[0].verdict.value == "FAIL"
+    diagnostic = json.loads(reviews[0].report)
+    assert diagnostic == {
+        "failed_case_count": 1,
+        "failed_cases": [{
+            "detail": "candidate must contain the exact exported vector_add signature once",
+            "error_type": "CandidateSourceAdmissionError",
+            "stage": "admission",
+        }],
+        "schema": "a3-phase2-target-diagnostic-v1",
+        "verdict": "FAIL",
+    }
+    first_attempt = tmp_path / "run" / "targets" / "r0-t1"
+    evidence = json.loads((first_attempt / "target-evidence.json").read_text())
+    assert evidence["request_id"].endswith("-r0-t1")
+    assert evidence["attempt_id"] == "target-r0-t1"
+    assert evidence["candidate_sha256"] == hashlib.sha256(invalid.encode()).hexdigest()
+    assert evidence["passed"] is False
+    assert actor_memories[1]["phase2"]["learning"][0]["statement"] == reviews[0].report
+
+
 def test_restart_after_target_evidence_reconciles_without_reverification(
     tmp_path, monkeypatch,
 ):

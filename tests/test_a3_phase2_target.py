@@ -17,8 +17,10 @@ from benchmarks.a3kernels.phase1_protocol import (
 from benchmarks.a3kernels.phase2_target import (
     PHASE2_TARGET_CASES,
     PHASE2_TARGET_ID,
+    Phase2CandidateAdmissionEvidence,
     Phase2TargetEvidence,
     Phase2TargetVerifier,
+    read_phase2_evidence,
 )
 
 
@@ -159,6 +161,32 @@ def test_complete_fake_runtime_proves_every_case_and_persists_evidence(tmp_path)
     first_bytes = destination.read_bytes()
     evidence.write(destination)
     assert destination.read_bytes() == first_bytes
+
+
+def test_invalid_source_is_attested_without_backend_submission(tmp_path):
+    backend = FakeBackend()
+    source = SOURCE.replace("vector_add", "add_custom")
+
+    evidence = _verifier(backend).verify(
+        source, request_id="lineage-1", attempt_id="target-invalid",
+        execution_profile="bz-a3-1", workdir=tmp_path,
+    )
+
+    assert isinstance(evidence, Phase2CandidateAdmissionEvidence)
+    assert evidence.passed is False
+    assert evidence.request_id == "lineage-1"
+    assert evidence.attempt_id == "target-invalid"
+    assert evidence.candidate_sha256 == hashlib.sha256(source.encode()).hexdigest()
+    assert backend.compiled == [] and backend.executed == []
+    destination = tmp_path / "admission.json"
+    evidence.write(destination)
+    assert read_phase2_evidence(destination) == evidence
+
+    value = json.loads(destination.read_text())
+    value["candidate_sha256"] = "f" * 64
+    destination.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="admission evidence"):
+        read_phase2_evidence(destination)
 
 
 @pytest.mark.parametrize("mode", ["compile", "verify"])

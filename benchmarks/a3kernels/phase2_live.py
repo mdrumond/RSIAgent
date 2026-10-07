@@ -34,7 +34,8 @@ from benchmarks.a3kernels.phase2_protocol import (
     GroundedLearning, GroundedTarget, OwnedAgent, PracticeResult,
 )
 from benchmarks.a3kernels.phase2_target import (
-    PHASE2_TARGET_SUITE_SHA256, Phase2TargetEvidence,
+    PHASE2_TARGET_SUITE_SHA256, Phase2CandidateAdmissionEvidence,
+    Phase2Evidence, Phase2TargetEvidence, read_phase2_evidence,
 )
 from core.self_evolving_loop import SelfEvolvingStart, TargetVerdict
 
@@ -47,8 +48,19 @@ _TARGET_DIRECTORY = re.compile(r"r[0-3]-t([1-9][0-9]*)")
 _MAX_DIAGNOSTIC_DETAIL = 512
 
 
-def _target_diagnostic(result: Phase2TargetEvidence) -> str:
+def _target_diagnostic(result: Phase2Evidence) -> str:
     """Render a bounded diagnostic containing only host target evidence."""
+    if isinstance(result, Phase2CandidateAdmissionEvidence):
+        return json.dumps({
+            "schema": "a3-phase2-target-diagnostic-v1",
+            "verdict": "FAIL",
+            "failed_case_count": 1,
+            "failed_cases": [{
+                "stage": result.failure_stage,
+                "error_type": result.error_type,
+                "detail": result.detail[:_MAX_DIAGNOSTIC_DETAIL],
+            }],
+        }, sort_keys=True, separators=(",", ":"))
     failed = []
     for item in result.cases:
         if item.passed:
@@ -96,7 +108,7 @@ class Phase2LiveDependencies:
     cell: A3ExperimentCell
     execution_profile: str
     target_source: Callable[[A3Phase2Identity, dict[str, object], int], str]
-    target_verify: Callable[[str, str, str, Path], Phase2TargetEvidence]
+    target_verify: Callable[[str, str, str, Path], Phase2Evidence]
     curriculum: Callable[
         [A3Phase2Identity, GroundedTarget, GroundedLearning,
          dict[str, object], int], CurriculumDecision
@@ -385,8 +397,8 @@ class Phase2LiveRunner:
             source = self.dependencies.target_source(
                 identity, active_actor.value, self._target_serial,
             )
-            if not isinstance(source, str) or not source.strip():
-                raise ValueError("target actor must produce non-empty Ascend C source")
+            if not isinstance(source, str):
+                raise ValueError("target actor must produce Ascend C source text")
             self._publish_source(source_path, source)
             self._checkpoint(
                 phase="source",
@@ -400,13 +412,17 @@ class Phase2LiveRunner:
             attempt_id = str(self._state["attempt_id"])
             evidence_path = active_environment.value / "target-evidence.json"
             if evidence_path.exists():
-                result = Phase2TargetEvidence.read(evidence_path)
+                result = read_phase2_evidence(evidence_path)
             else:
                 result = self.dependencies.target_verify(
                     source, request_id, attempt_id, active_environment.value,
                 )
-            if not isinstance(result, Phase2TargetEvidence):
-                raise TypeError("target verifier must return Phase2TargetEvidence")
+            if not isinstance(
+                result, (Phase2TargetEvidence, Phase2CandidateAdmissionEvidence)
+            ):
+                raise TypeError(
+                    "target verifier must return authenticated target evidence"
+                )
             if result.request_id != request_id or result.attempt_id != attempt_id:
                 raise ValueError("target evidence is not bound to the live attempt")
             if result.execution_profile != self.dependencies.execution_profile:
@@ -434,7 +450,7 @@ class Phase2LiveRunner:
 
         def learn(_identity, _actor, environment, _direction, source,
                   grounded, _memory):
-            target = Phase2TargetEvidence.read(
+            target = read_phase2_evidence(
                 environment.value / "target-evidence.json"
             )
             candidate = hashlib.sha256(source.encode("utf-8")).hexdigest()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 from types import SimpleNamespace
@@ -22,10 +23,14 @@ from benchmarks.a3kernels.phase2_protocol import (
 )
 from benchmarks.a3kernels.remote_candidate import _PendingObservation
 from benchmarks.a3kernels.phase2_composition import Phase2Composition, qualification_cells
-from benchmarks.a3kernels.phase2_live import Phase2LiveRunner, phase2_cells
+from benchmarks.a3kernels.phase2_live import (
+    Phase2LiveRunner, PracticeExecution, phase2_cells,
+)
 from benchmarks.a3kernels.phase2_memory import Phase1Snapshot, phase2_cell_pairs
 from benchmarks.a3kernels.phase1_registry import DEFAULT_PROPOSALS
-from benchmarks.a3kernels.phase2_target import Phase2TargetEvidence
+from benchmarks.a3kernels.phase2_target import (
+    PHASE2_TARGET_CASES, Phase2TargetEvidence,
+)
 from core.self_evolving_loop import TargetVerdict
 
 
@@ -103,16 +108,17 @@ def snapshot(tmp_path, cell):
 
 def live_dependencies(
     calls, knowledge_calls, *, query_kdb=False, bad_ready=False, backend=None,
-    actor_error=None, practice_sequence=(),
+    actor_error=None, practice_sequence=(), candidate_sources=(),
 ):
     def actor_factory(cell, _proposal):
         profile_sha = __import__(
             "benchmarks.a3_model_profiles", fromlist=["load_a3_model_profile"]
         ).load_a3_model_profile(cell.backend_model).fingerprint
         count = 0
+        source_count = 0
 
         def actor(_profile, prompt):
-            nonlocal count
+            nonlocal count, source_count
             count += 1
             calls.append((cell.backend_model, cell.knowledge, cell.profiling, prompt))
             if actor_error is not None:
@@ -135,7 +141,13 @@ def live_dependencies(
             elif query_kdb and cell.knowledge is KnowledgeMode.WITH_KDB and count == 1:
                 value = {"action": "query", "query": "tiled A3 movement"}
             else:
-                value = {"action": "source", "source": SOURCE}
+                source = (
+                    candidate_sources[source_count]
+                    if source_count < len(candidate_sources)
+                    else SOURCE
+                )
+                source_count += 1
+                value = {"action": "source", "source": source}
             return A3Completion(json.dumps(value), 10, {"profile_sha256": profile_sha})
         return actor
 
@@ -424,6 +436,20 @@ def test_provider_schema_failure_is_not_infrastructure(tmp_path):
         deps.target_source(A3Phase2Identity.from_cell(cell), {}, 1)
 
 
+def test_composed_target_source_still_rejects_non_string_source(tmp_path):
+    cell = qualification_cells()[0]
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies([], [], candidate_sources=(None,)),
+        execution_profile="bz-a3-1",
+    )
+    snap = snapshot(tmp_path / "snapshot", cell)
+    deps = composition.dependencies(cell, snap, tmp_path / "run")
+
+    with pytest.raises(ValueError, match="must be a string"):
+        deps.target_source(A3Phase2Identity.from_cell(cell), {}, 1)
+
+
 @pytest.mark.parametrize("pending", [False, True])
 def test_candidate_infrastructure_never_becomes_semantic_fail(tmp_path, pending):
     class InfrastructureBackend:
@@ -448,6 +474,77 @@ def test_candidate_infrastructure_never_becomes_semantic_fail(tmp_path, pending)
     deps = composition.dependencies(cell, snap, tmp_path / "run")
     with pytest.raises(A3Phase2InfrastructureError, match="candidate|observation"):
         deps.target_verify(SOURCE, "request", "attempt", tmp_path / "target")
+
+
+@pytest.mark.parametrize(
+    ("invalid", "detail"),
+    [
+        (
+            SOURCE.replace("vector_add", "add_custom"),
+            "candidate must contain the exact exported vector_add signature once",
+        ),
+        ("   \n", "candidate must contain the exact exported vector_add signature"),
+    ],
+)
+def test_composed_invalid_candidate_is_grounded_before_corrected_retry(
+    tmp_path, invalid, detail,
+):
+    class CountingBackend(Backend):
+        def __init__(self):
+            self.compiled = 0
+
+        def compile(self, plan, workdir):
+            self.compiled += 1
+            return super().compile(plan, workdir)
+
+    backend = CountingBackend()
+    cell = qualification_cells()[0]
+    calls = []
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(
+            calls, [], backend=backend,
+            practice_sequence=DEFAULT_PROPOSALS[:1],
+            candidate_sources=(invalid, SOURCE),
+        ),
+        execution_profile="bz-a3-1",
+    )
+    snap = snapshot(tmp_path / "snapshot", cell)
+    deps = composition.dependencies(cell, snap, tmp_path / "run")
+    deps = replace(
+        deps,
+        practice=lambda _identity, proposal, *_: PracticeExecution(
+            proposal.project_id, "c" * 64, "d" * 64, True,
+            "reviewed the exported source contract",
+        ),
+    )
+
+    result = Phase2LiveRunner(
+        root=tmp_path / "run", snapshot=snap, dependencies=deps,
+        sleeper=lambda _seconds: None,
+    ).run("target")
+
+    assert result.verdict is TargetVerdict.PASS
+    assert result.target_attempts == 2
+    assert backend.compiled == len(PHASE2_TARGET_CASES)
+    learning = [
+        json.loads(line)["learning"]
+        for line in (tmp_path / "run" / "learning.jsonl").read_text().splitlines()
+    ]
+    admission = json.loads(learning[0]["statement"])
+    assert admission["verdict"] == "FAIL"
+    assert admission["failed_cases"] == [{
+        "detail": detail,
+        "error_type": "CandidateSourceAdmissionError",
+        "stage": "admission",
+    }]
+    target_prompts = [
+        json.loads(prompt) for *_identity, prompt in calls
+        if '"role":"target-actor"' in prompt
+    ]
+    assert admission == json.loads(
+        target_prompts[1]["memory"]["phase2"]["learning"][0]["statement"]
+    )
 
 
 def test_cli_resume_reuses_bound_terminal_without_rerunning_cell(tmp_path, monkeypatch):
