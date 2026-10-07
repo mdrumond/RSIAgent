@@ -397,8 +397,8 @@ class Phase2LiveRunner:
             source = self.dependencies.target_source(
                 identity, active_actor.value, self._target_serial,
             )
-            if not isinstance(source, str) or not source.strip():
-                raise ValueError("target actor must produce non-empty Ascend C source")
+            if not isinstance(source, str):
+                raise ValueError("target actor must produce Ascend C source text")
             self._publish_source(source_path, source)
             self._checkpoint(
                 phase="source",

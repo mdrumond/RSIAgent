@@ -30,7 +30,9 @@ from benchmarks.a3kernels.phase2_protocol import (
     A3Phase2Identity, A3Phase2InfrastructureError, CurriculumDecision,
     GroundedLearning, GroundedTarget,
 )
-from benchmarks.a3kernels.phase2_target import Phase2TargetVerifier
+from benchmarks.a3kernels.phase2_target import (
+    Phase2TargetEvidence, Phase2TargetVerifier,
+)
 
 
 def qualification_cells() -> tuple[A3ExperimentCell, ...]:
@@ -223,8 +225,8 @@ class Phase2Composition:
             if set(action) != {"action", "source"} or action["action"] != "source":
                 raise ValueError("target actor action has an invalid schema")
             source = action["source"]
-            if not isinstance(source, str) or not source.strip():
-                raise ValueError("target actor source must be non-empty")
+            if not isinstance(source, str):
+                raise ValueError("target actor source must be a string")
             return source
 
         def target_verify(source, request_id, attempt_id, workdir):
@@ -237,7 +239,7 @@ class Phase2Composition:
                 raise A3Phase2InfrastructureError(
                     "retained candidate observation is not terminal"
                 ) from exc
-            if any(
+            if isinstance(evidence, Phase2TargetEvidence) and any(
                 isinstance(case.authority, FailedEvidence)
                 and infrastructure_unavailable(case.authority)
                 for case in evidence.cases
