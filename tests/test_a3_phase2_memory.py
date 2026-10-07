@@ -23,7 +23,7 @@ def _phase1_cell(tmp_path, *, execution_profile="bz-a3-1"):
     root = tmp_path / "phase1-cell"
     root.mkdir()
     evidence = EvidenceLedger(root / "evidence.jsonl")
-    final = evidence.append(EvidenceKind.RESULT, {
+    evidence.append(EvidenceKind.RESULT, {
         "target": "Ascend910B4", "language": "ascend-c",
         "result": "synthetic-complete-phase1",
     })
@@ -34,21 +34,37 @@ def _phase1_cell(tmp_path, *, execution_profile="bz-a3-1"):
         evidence_resolver=authority,
         trial_protocol_sha256=trial_protocol_sha256(),
     )
+    memory_digests = []
+    retry_evidence_digests = []
     for ordinal, proposal in enumerate(DEFAULT_PROPOSALS, 1):
         fact = f"{ordinal:064x}"
         source = f"{ordinal + 20:064x}"
         authority.register("host-verification", fact, proposal.project_id, source, True)
-        journal.append(ProjectMemory(
+        entry = journal.append(ProjectMemory(
             proposal, proposal.project_id, cell.cell_id, f"phase1-{cell.cell_id}",
             source, (f"complete project {ordinal}",),
             (HostFact("host-verification", f"host pass {ordinal}", fact),),
         ))
+        memory_digests.append(entry["entry_sha256"])
+        retry_evidence = evidence.append(EvidenceKind.RESULT, {
+            "target": "Ascend910B4", "language": "ascend-c",
+            "runtime": "native-ascend-c", "execution_profile": execution_profile,
+            "cell_id": cell.cell_id, "project_id": proposal.project_id,
+            "infrastructure_retry": {
+                "schema": "a3-infrastructure-retry-v1", "event": "outcome",
+                "attempt_ordinal": 1, "status": "passed",
+                "memory_entry_sha256": entry["entry_sha256"],
+            },
+        })
+        retry_evidence_digests.append(retry_evidence.entry_sha256)
     terminal = Phase1Wave._terminal(cell, {
         "status": "passed", "terminal_reason": "completed",
         "completed_projects": 8, "failed_project_id": None,
-        "evidence_sha256": final.entry_sha256,
+        "evidence_sha256": canonical_digest(tuple(memory_digests)),
         "infrastructure_retries_used": 0,
-        "infrastructure_retry_evidence_sha256": canonical_digest([]),
+        "infrastructure_retry_evidence_sha256": canonical_digest(
+            retry_evidence_digests
+        ),
     }, execution_profile)
     (root / "terminal.json").write_text(
         json.dumps(terminal, sort_keys=True, separators=(",", ":")) + "\n"
@@ -136,6 +152,52 @@ def test_admission_rejects_memory_tampering(tmp_path):
     lines[3] = json.dumps(changed)
     (source / "memory.jsonl").write_text("\n".join(lines) + "\n")
     with pytest.raises(ValueError, match="journal|resume"):
+        admit_phase1_snapshot(source, tmp_path / "phase2")
+
+
+def test_admission_rejects_foreign_terminal_memory_aggregate(tmp_path):
+    _cell, source = _phase1_cell(tmp_path)
+    terminal = json.loads((source / "terminal.json").read_text())
+    terminal["evidence_sha256"] = canonical_digest(("f" * 64,))
+    (source / "terminal.json").write_text(json.dumps(terminal) + "\n")
+
+    with pytest.raises(ValueError, match="memory aggregate"):
+        admit_phase1_snapshot(source, tmp_path / "phase2")
+
+
+def test_admission_still_rejects_invalid_evidence_ledger_chain(tmp_path):
+    _cell, source = _phase1_cell(tmp_path)
+    lines = (source / "evidence.jsonl").read_text().splitlines()
+    evidence = json.loads(lines[-1])
+    evidence["entry_sha256"] = "f" * 64
+    lines[-1] = json.dumps(evidence)
+    (source / "evidence.jsonl").write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ValueError, match="evidence"):
+        admit_phase1_snapshot(source, tmp_path / "phase2")
+
+
+def test_admission_rejects_valid_evidence_suffix_truncation(tmp_path):
+    _cell, source = _phase1_cell(tmp_path)
+    evidence_path = source / "evidence.jsonl"
+    lines = evidence_path.read_bytes().splitlines()
+    evidence_path.write_bytes(b"\n".join(lines[:-1]) + b"\n")
+
+    with pytest.raises(ValueError, match="retry evidence"):
+        admit_phase1_snapshot(source, tmp_path / "phase2")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("infrastructure_retries_used", 1),
+    ("infrastructure_retry_evidence_sha256", "f" * 64),
+])
+def test_admission_rejects_conflicting_retry_summary(tmp_path, field, value):
+    _cell, source = _phase1_cell(tmp_path)
+    terminal = json.loads((source / "terminal.json").read_text())
+    terminal[field] = value
+    (source / "terminal.json").write_text(json.dumps(terminal) + "\n")
+
+    with pytest.raises(ValueError, match="retry evidence"):
         admit_phase1_snapshot(source, tmp_path / "phase2")
 
 

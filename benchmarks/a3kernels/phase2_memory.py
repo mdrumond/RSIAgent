@@ -16,6 +16,7 @@ from benchmarks.a3_experiments import (
     ProgrammingLevel,
     build_a3_experiment_plan,
 )
+from benchmarks.a3kernels.live_composition import infrastructure_retry_summary
 from benchmarks.a3kernels.phase1_evidence import (
     GENESIS_HASH,
     EvidenceLedger,
@@ -195,8 +196,13 @@ def admit_phase1_snapshot(
     if terminal["execution_profile"] not in _AUTHORITATIVE_PROFILES:
         raise ValueError("Phase 1 source must use an authoritative BZ-A3 profile")
     evidence = EvidenceLedger(evidence_path)
-    if terminal["evidence_sha256"] != evidence.head_sha256:
-        raise ValueError("Phase 1 terminal evidence head conflicts with its ledger")
+    retries, retry_evidence_sha256 = infrastructure_retry_summary(evidence)
+    if (
+        terminal["infrastructure_retries_used"] != retries
+        or terminal["infrastructure_retry_evidence_sha256"]
+        != retry_evidence_sha256
+    ):
+        raise ValueError("Phase 1 terminal conflicts with its retry evidence")
 
     try:
         raw_entries = [json.loads(line) for line in memory_bytes.splitlines()]
@@ -213,6 +219,11 @@ def admit_phase1_snapshot(
     state = journal.resume_state()
     if len(entries) != len(DEFAULT_PROPOSALS) or state.next_ordinal is not None:
         raise ValueError("Phase 1 memory journal is not complete")
+    memory_aggregate = canonical_digest(tuple(
+        entry["entry_sha256"] for entry in entries
+    ))
+    if terminal["evidence_sha256"] != memory_aggregate:
+        raise ValueError("Phase 1 terminal conflicts with its memory aggregate")
 
     phase1_root_sha256 = canonical_digest({
         "schema": "a3-phase2-phase1-root-v1",
