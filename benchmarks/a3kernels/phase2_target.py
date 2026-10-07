@@ -11,7 +11,11 @@ import random
 import tempfile
 from typing import Callable, Protocol
 
-from .candidate import CandidateCompilation
+from .candidate import (
+    CandidateCompilation,
+    CandidateSourceAdmissionError,
+    validate_candidate_source,
+)
 from .phase1_evidence import canonical_digest
 from .phase1_protocol import (
     ExecutionPlan,
@@ -239,28 +243,126 @@ class Phase2TargetEvidence:
         return cls(**value, cases=cases)
 
     def write(self, path: Path) -> None:
-        data = json.dumps(
-            self.as_dict(), sort_keys=True, separators=(",", ":")
-        ).encode("utf-8") + b"\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if path.exists():
-            if path.read_bytes() == data:
-                return
-            raise RuntimeError("persisted Phase 2 target evidence conflicts")
-        with tempfile.NamedTemporaryFile(
-            "wb", dir=path.parent, prefix=".phase2-target-", delete=False
-        ) as stream:
-            temporary = Path(stream.name)
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
-            if path.read_bytes() != data:
-                raise RuntimeError("persisted Phase 2 target evidence conflicts") from None
-        finally:
-            temporary.unlink(missing_ok=True)
+        _write_evidence(path, self.as_dict())
+
+
+@dataclass(frozen=True)
+class Phase2CandidateAdmissionEvidence:
+    """Authenticated host rejection before candidate execution."""
+
+    evidence_kind: str
+    target_id: str
+    suite_sha256: str
+    request_id: str
+    attempt_id: str
+    execution_profile: str
+    candidate_sha256: str
+    passed: bool
+    failure_stage: str
+    error_type: str
+    detail: str
+    attestation_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.evidence_kind != "candidate-admission-failure"
+            or self.target_id != PHASE2_TARGET_ID
+            or self.suite_sha256 != PHASE2_TARGET_SUITE_SHA256
+            or type(self.request_id) is not str
+            or not self.request_id
+            or type(self.attempt_id) is not str
+            or not self.attempt_id
+            or type(self.execution_profile) is not str
+            or not self.execution_profile
+            or type(self.candidate_sha256) is not str
+            or len(self.candidate_sha256) != 64
+            or self.passed is not False
+            or self.failure_stage != "admission"
+            or self.error_type != "CandidateSourceAdmissionError"
+            or type(self.detail) is not str
+            or not self.detail
+            or self.attestation_sha256 != canonical_digest(self.attestation_payload())
+        ):
+            raise ValueError("candidate admission evidence is invalid")
+
+    @classmethod
+    def create(
+        cls, source: str, *, request_id: str, attempt_id: str,
+        execution_profile: str, detail: str,
+    ) -> "Phase2CandidateAdmissionEvidence":
+        body = {
+            "evidence_kind": "candidate-admission-failure",
+            "target_id": PHASE2_TARGET_ID,
+            "suite_sha256": PHASE2_TARGET_SUITE_SHA256,
+            "request_id": request_id,
+            "attempt_id": attempt_id,
+            "execution_profile": execution_profile,
+            "candidate_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            "passed": False,
+            "failure_stage": "admission",
+            "error_type": "CandidateSourceAdmissionError",
+            "detail": detail,
+        }
+        return cls(**body, attestation_sha256=canonical_digest(body))
+
+    def attestation_payload(self) -> dict[str, object]:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if field.name != "attestation_sha256"
+        }
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+    @classmethod
+    def read(cls, path: Path) -> "Phase2CandidateAdmissionEvidence":
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if type(value) is not dict:
+            raise ValueError("candidate admission evidence must be a JSON object")
+        return cls(**value)
+
+    def write(self, path: Path) -> None:
+        _write_evidence(path, self.as_dict())
+
+
+def _write_evidence(path: Path, value: dict[str, object]) -> None:
+    data = json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8") + b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_bytes() == data:
+            return
+        raise RuntimeError("persisted Phase 2 target evidence conflicts")
+    with tempfile.NamedTemporaryFile(
+        "wb", dir=path.parent, prefix=".phase2-target-", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.link(temporary, path)
+    except FileExistsError:
+        if path.read_bytes() != data:
+            raise RuntimeError(
+                "persisted Phase 2 target evidence conflicts"
+            ) from None
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+Phase2Evidence = Phase2TargetEvidence | Phase2CandidateAdmissionEvidence
+
+
+def read_phase2_evidence(path: Path) -> Phase2Evidence:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if type(value) is not dict:
+        raise ValueError("Phase 2 target evidence must be a JSON object")
+    if value.get("evidence_kind") == "candidate-admission-failure":
+        return Phase2CandidateAdmissionEvidence(**value)
+    return Phase2TargetEvidence.read(path)
 
 
 class Phase2CandidateBackend(Protocol):
@@ -286,7 +388,14 @@ class Phase2TargetVerifier:
     def verify(
         self, source: str, *, request_id: str, attempt_id: str,
         execution_profile: str, workdir: Path,
-    ) -> Phase2TargetEvidence:
+    ) -> Phase2Evidence:
+        try:
+            validate_candidate_source(source)
+        except CandidateSourceAdmissionError as exc:
+            return Phase2CandidateAdmissionEvidence.create(
+                source, request_id=request_id, attempt_id=attempt_id,
+                execution_profile=execution_profile, detail=str(exc),
+            )
         outcomes: list[Phase2CaseEvidence] = []
         fingerprint: str | None = None
         for case in PHASE2_TARGET_CASES:
@@ -447,8 +556,11 @@ __all__ = [
     "PHASE2_TARGET_CASES",
     "PHASE2_TARGET_ID",
     "PHASE2_TARGET_SUITE_SHA256",
+    "Phase2CandidateAdmissionEvidence",
     "Phase2CaseEvidence",
+    "Phase2Evidence",
     "Phase2TargetCase",
     "Phase2TargetEvidence",
     "Phase2TargetVerifier",
+    "read_phase2_evidence",
 ]

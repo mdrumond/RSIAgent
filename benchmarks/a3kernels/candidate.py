@@ -37,6 +37,10 @@ CANDIDATE_EXPORTED_SIGNATURE = (
 )
 
 
+class CandidateSourceAdmissionError(ValueError):
+    """The actor-authored source does not satisfy the candidate contract."""
+
+
 @dataclass(frozen=True)
 class CandidateSourceContract:
     source_slot: str
@@ -113,11 +117,17 @@ def profile_driver_asset() -> SourceFile:
 
 def validate_candidate_source(source: str) -> None:
     if type(source) is not str or not source.strip():
-        raise ValueError("candidate must contain the exact exported vector_add signature")
+        raise CandidateSourceAdmissionError(
+            "candidate must contain the exact exported vector_add signature"
+        )
     if len(_SIGNATURE.findall(source)) != 1 or len(re.findall(r"\bvector_add\s*\(", source)) != 1:
-        raise ValueError("candidate must contain the exact exported vector_add signature once")
+        raise CandidateSourceAdmissionError(
+            "candidate must contain the exact exported vector_add signature once"
+        )
     if any(token in source.lower() for token in ("catlass", "@tla", "torch_library", "torch::")):
-        raise ValueError("candidate source must contain only the Ascend C device implementation")
+        raise CandidateSourceAdmissionError(
+            "candidate source must contain only the Ascend C device implementation"
+        )
 
 
 @dataclass(frozen=True)
@@ -338,6 +348,7 @@ def _detail(completed: subprocess.CompletedProcess[str]) -> str:
 __all__ = [
     "A3CandidateBackend", "CANDIDATE_EXPORTED_SIGNATURE",
     "CANDIDATE_SOURCE_CONTRACT", "CandidateCompilation", "CandidateSourceContract",
-    "FailedEvidence", "VerifiedResult", "profile_driver_asset",
+    "CandidateSourceAdmissionError", "FailedEvidence", "VerifiedResult",
+    "profile_driver_asset",
     "validate_candidate_source",
 ]
