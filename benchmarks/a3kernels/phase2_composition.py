@@ -10,7 +10,9 @@ from benchmarks.a3_experiments import (
     A3ExperimentCell, KnowledgeMode, ProfilingGuidance,
 )
 from benchmarks.a3_model_profiles import A3Completion, load_a3_model_profile
-from benchmarks.a3kernels.candidate import A3CandidateBackend
+from benchmarks.a3kernels.candidate import (
+    A3CandidateBackend, CANDIDATE_SOURCE_CONTRACT,
+)
 from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
 from benchmarks.a3kernels.live_composition import (
     LiveComposition, LiveDependencies, RemoteCandidateBundle,
@@ -200,6 +202,7 @@ class Phase2Composition:
                 "profiling_treatment": cell.profiling.value,
                 "memory": memory,
                 "actions": ["source", "query"],
+                "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
                 "source_schema": {"action": "source", "source": "Ascend C++"},
                 "query_schema": {"action": "query", "query": "text"},
             }

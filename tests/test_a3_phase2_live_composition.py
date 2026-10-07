@@ -11,7 +11,9 @@ import run_a3_phase2
 from benchmarks.a3_experiments import BackendModel, KnowledgeMode, ProfilingGuidance
 from benchmarks.a3_model_profiles import A3Completion
 from benchmarks.a3_model_profiles import A3ProviderResponseError
-from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
+from benchmarks.a3kernels.candidate import (
+    A3CandidateBackend, CANDIDATE_SOURCE_CONTRACT, CandidateCompilation,
+)
 from benchmarks.a3kernels.live_composition import LiveDependencies
 from benchmarks.a3kernels.phase1_evidence import canonical_bytes, canonical_digest
 from benchmarks.a3kernels.phase1_protocol import (
@@ -289,6 +291,43 @@ def test_all_treatments_keep_kdb_and_profiling_identity_isolated(tmp_path):
         assert model in BackendModel and knowledge in KnowledgeMode
         if '"role":"target-actor"' in prompt:
             assert profiling.value in prompt
+
+
+@pytest.mark.parametrize("query_kdb", [False, True])
+def test_target_actor_receives_exact_candidate_contract_on_every_source_request(
+    tmp_path, query_kdb,
+):
+    cell = next(
+        candidate for candidate in phase2_cells()
+        if (
+            candidate.knowledge is (
+                KnowledgeMode.WITH_KDB if query_kdb else KnowledgeMode.WITHOUT_KDB
+            )
+            and candidate.profiling is ProfilingGuidance.WITHOUT_GUIDANCE
+        )
+    )
+    calls = []
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(calls, [], query_kdb=query_kdb),
+        execution_profile="bz-a3-1",
+    )
+    snap = snapshot(tmp_path / "snapshots", cell)
+    deps = composition.dependencies(cell, snap, tmp_path / "run")
+
+    assert deps.target_source(A3Phase2Identity.from_cell(cell), {}, 1) == SOURCE
+
+    prompts = [
+        prompt for *_identity, prompt in calls
+        if '"role":"target-actor"' in prompt
+    ]
+    assert len(prompts) == (2 if query_kdb else 1)
+    for prompt in prompts:
+        payload = json.loads(prompt)
+        assert payload["candidate_source_contract"] == (
+            CANDIDATE_SOURCE_CONTRACT.as_dict()
+        )
+        assert prompt.count('"candidate_source_contract"') == 1
 
 
 def test_curriculum_agent_cannot_author_a_semantic_verdict(tmp_path):
