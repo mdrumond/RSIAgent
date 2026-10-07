@@ -23,7 +23,7 @@ def _phase1_cell(tmp_path, *, execution_profile="bz-a3-1"):
     root = tmp_path / "phase1-cell"
     root.mkdir()
     evidence = EvidenceLedger(root / "evidence.jsonl")
-    final = evidence.append(EvidenceKind.RESULT, {
+    evidence.append(EvidenceKind.RESULT, {
         "target": "Ascend910B4", "language": "ascend-c",
         "result": "synthetic-complete-phase1",
     })
@@ -34,19 +34,21 @@ def _phase1_cell(tmp_path, *, execution_profile="bz-a3-1"):
         evidence_resolver=authority,
         trial_protocol_sha256=trial_protocol_sha256(),
     )
+    memory_digests = []
     for ordinal, proposal in enumerate(DEFAULT_PROPOSALS, 1):
         fact = f"{ordinal:064x}"
         source = f"{ordinal + 20:064x}"
         authority.register("host-verification", fact, proposal.project_id, source, True)
-        journal.append(ProjectMemory(
+        entry = journal.append(ProjectMemory(
             proposal, proposal.project_id, cell.cell_id, f"phase1-{cell.cell_id}",
             source, (f"complete project {ordinal}",),
             (HostFact("host-verification", f"host pass {ordinal}", fact),),
         ))
+        memory_digests.append(entry["entry_sha256"])
     terminal = Phase1Wave._terminal(cell, {
         "status": "passed", "terminal_reason": "completed",
         "completed_projects": 8, "failed_project_id": None,
-        "evidence_sha256": final.entry_sha256,
+        "evidence_sha256": canonical_digest(tuple(memory_digests)),
         "infrastructure_retries_used": 0,
         "infrastructure_retry_evidence_sha256": canonical_digest([]),
     }, execution_profile)
@@ -136,6 +138,26 @@ def test_admission_rejects_memory_tampering(tmp_path):
     lines[3] = json.dumps(changed)
     (source / "memory.jsonl").write_text("\n".join(lines) + "\n")
     with pytest.raises(ValueError, match="journal|resume"):
+        admit_phase1_snapshot(source, tmp_path / "phase2")
+
+
+def test_admission_rejects_foreign_terminal_memory_aggregate(tmp_path):
+    _cell, source = _phase1_cell(tmp_path)
+    terminal = json.loads((source / "terminal.json").read_text())
+    terminal["evidence_sha256"] = canonical_digest(("f" * 64,))
+    (source / "terminal.json").write_text(json.dumps(terminal) + "\n")
+
+    with pytest.raises(ValueError, match="memory aggregate"):
+        admit_phase1_snapshot(source, tmp_path / "phase2")
+
+
+def test_admission_still_rejects_invalid_evidence_ledger_chain(tmp_path):
+    _cell, source = _phase1_cell(tmp_path)
+    evidence = json.loads((source / "evidence.jsonl").read_text())
+    evidence["entry_sha256"] = "f" * 64
+    (source / "evidence.jsonl").write_text(json.dumps(evidence) + "\n")
+
+    with pytest.raises(ValueError, match="evidence"):
         admit_phase1_snapshot(source, tmp_path / "phase2")
 
 
