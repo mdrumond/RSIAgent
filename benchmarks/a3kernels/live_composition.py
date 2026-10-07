@@ -59,6 +59,23 @@ _INFRASTRUCTURE_BACKOFF_SECONDS = 120
 _RETRY_SCHEMA = "a3-infrastructure-retry-v1"
 
 
+def _infrastructure_retry_entries(evidence: EvidenceLedger) -> tuple:
+    return tuple(
+        entry for entry in evidence.entries
+        if isinstance(entry.payload.get("infrastructure_retry"), Mapping)
+    )
+
+
+def infrastructure_retry_summary(evidence: EvidenceLedger) -> tuple[int, str]:
+    """Authenticate the retry count and digest recorded in cell terminals."""
+    entries = _infrastructure_retry_entries(evidence)
+    retries = sum(
+        entry.payload["infrastructure_retry"].get("event") == "scheduled"
+        for entry in entries
+    )
+    return retries, canonical_digest([entry.entry_sha256 for entry in entries])
+
+
 class CandidateFactory(Protocol):
     def __call__(self, cell: A3ExperimentCell, proposal: CurriculumProposal, paths: CellPaths): ...
 
@@ -305,19 +322,7 @@ class LiveComposition:
 
     @staticmethod
     def _retry_entries(evidence: EvidenceLedger) -> tuple:
-        return tuple(
-            entry for entry in evidence.entries
-            if isinstance(entry.payload.get("infrastructure_retry"), Mapping)
-        )
-
-    @classmethod
-    def _retry_summary(cls, evidence: EvidenceLedger) -> tuple[int, str]:
-        entries = cls._retry_entries(evidence)
-        retries = sum(
-            entry.payload["infrastructure_retry"].get("event") == "scheduled"
-            for entry in entries
-        )
-        return retries, canonical_digest([entry.entry_sha256 for entry in entries])
+        return _infrastructure_retry_entries(evidence)
 
     def _project_retry_entries(
         self, evidence: EvidenceLedger, cell: A3ExperimentCell,
@@ -597,7 +602,7 @@ class LiveComposition:
                      "status": trial.status, "failures": trial.failures}
                 )
                 self.cell_digests[cell.cell_id] = tuple((*digests, failure))
-                retries, retry_digest = self._retry_summary(evidence)
+                retries, retry_digest = infrastructure_retry_summary(evidence)
                 return {
                     "status": "failed",
                     "terminal_reason": (
@@ -621,7 +626,7 @@ class LiveComposition:
                 }
             digests.append(trial.memory_entry_sha256)
         self.cell_digests[cell.cell_id] = tuple(digests)
-        retries, retry_digest = self._retry_summary(evidence)
+        retries, retry_digest = infrastructure_retry_summary(evidence)
         return {
             "status": "passed",
             "terminal_reason": "completed",

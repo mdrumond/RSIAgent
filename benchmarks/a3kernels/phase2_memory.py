@@ -16,6 +16,7 @@ from benchmarks.a3_experiments import (
     ProgrammingLevel,
     build_a3_experiment_plan,
 )
+from benchmarks.a3kernels.live_composition import infrastructure_retry_summary
 from benchmarks.a3kernels.phase1_evidence import (
     GENESIS_HASH,
     EvidenceLedger,
@@ -195,6 +196,13 @@ def admit_phase1_snapshot(
     if terminal["execution_profile"] not in _AUTHORITATIVE_PROFILES:
         raise ValueError("Phase 1 source must use an authoritative BZ-A3 profile")
     evidence = EvidenceLedger(evidence_path)
+    retries, retry_evidence_sha256 = infrastructure_retry_summary(evidence)
+    if (
+        terminal["infrastructure_retries_used"] != retries
+        or terminal["infrastructure_retry_evidence_sha256"]
+        != retry_evidence_sha256
+    ):
+        raise ValueError("Phase 1 terminal conflicts with its retry evidence")
 
     try:
         raw_entries = [json.loads(line) for line in memory_bytes.splitlines()]
