@@ -122,7 +122,7 @@ def validate_contract_source(source: str, contract: HarnessContract | str) -> No
     required_calls = {
         HarnessContract.PADDED_SIMD: {"tla.copy"},
         HarnessContract.MULTIBLOCK_SIMT: {
-            "tla.arch.block_idx", "tla.arch.thread_idx",
+            "tla.arch.block_idx", "tla.arch.block_num", "tla.arch.thread_idx",
         },
         HarnessContract.CUBE_MATMUL: {"tla.copy", "tla.mmad"},
     }[selected]

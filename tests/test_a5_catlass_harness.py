@@ -30,10 +30,12 @@ def source_for(contract: HarnessContract) -> str:
             gm_out.store(gm_a.load())''',
         HarnessContract.MULTIBLOCK_SIMT: '''\
     block = tla.arch.block_idx()
+    blocks = tla.arch.block_num()
     with tla.vector():
         with tla.vec.func(mode="simt"):
             thread = tla.arch.thread_idx()
-            gm_out[block + thread[0]] = gm_a[block + thread[0]]''',
+            index = block + thread[0] * blocks
+            gm_out[index] = gm_a[index]''',
         HarnessContract.CUBE_MATMUL: '''\
     with tla.cube():
         tla.copy(gm_out, gm_a)
@@ -103,6 +105,16 @@ def test_contract_source_rejects_non_contract_modules(edit, message):
     source = source_for(HarnessContract.PADDED_SIMD)
     with pytest.raises(ValueError, match=message):
         validate_contract_source(edit(source), HarnessContract.PADDED_SIMD)
+
+
+def test_multiblock_source_must_use_declared_block_count():
+    source = source_for(HarnessContract.MULTIBLOCK_SIMT)
+    without_block_count = source.replace(
+        "    blocks = tla.arch.block_num()\n", "    blocks = 4\n"
+    )
+
+    with pytest.raises(ValueError, match="simt vector execution"):
+        validate_contract_source(without_block_count, HarnessContract.MULTIBLOCK_SIMT)
 
 
 def test_preflight_binds_exact_source_revision_profile_and_device():
