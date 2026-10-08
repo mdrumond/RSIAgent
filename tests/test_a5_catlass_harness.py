@@ -124,7 +124,8 @@ def test_preflight_binds_exact_source_revision_profile_and_device():
     )
 
     assert payload == {
-        "ready": True,
+        "source_admitted": True,
+        "runtime_ready": False,
         "contract": "padded-simd",
         "source_sha256": payload["source_sha256"],
         "catlass_revision": "9a6ac627b5f4078060287844189730cf0d184800",
@@ -253,7 +254,9 @@ def test_cli_preflight_run_and_report(monkeypatch, tmp_path, capsys):
         "--device", "0",
     ]
     assert cli.main(["preflight", *common]) == 0
-    assert json.loads(capsys.readouterr().out)["ready"] is True
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["source_admitted"] is True
+    assert payload["runtime_ready"] is False
 
     output = tmp_path / "results/result.json"
     assert cli.main(["run", *common, "--attempt-id", "cli-1", "--output", str(output)]) == 0

@@ -155,11 +155,13 @@ class CatlassContractHarness:
         self._device = device
 
     def preflight(self, source: str, contract: HarnessContract | str) -> Mapping[str, object]:
+        """Admit source and pinned provenance without claiming runtime readiness."""
         selected = HarnessContract(contract)
         validate_contract_source(source, selected)
         provenance = self._provenance()
         return {
-            "ready": True,
+            "source_admitted": True,
+            "runtime_ready": False,
             "contract": selected.value,
             "source_sha256": _sha(source.encode()),
             "catlass_revision": provenance["catlass_revision"],
