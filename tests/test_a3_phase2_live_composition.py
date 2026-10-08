@@ -111,6 +111,7 @@ def snapshot(tmp_path, cell):
 def live_dependencies(
     calls, knowledge_calls, *, query_kdb=False, bad_ready=False, backend=None,
     actor_error=None, practice_sequence=(), candidate_sources=(),
+    curriculum_actions=(),
 ):
     def actor_factory(cell, _proposal):
         profile_sha = __import__(
@@ -118,26 +119,32 @@ def live_dependencies(
         ).load_a3_model_profile(cell.backend_model).fingerprint
         count = 0
         source_count = 0
+        curriculum_count = 0
 
         def actor(_profile, prompt):
-            nonlocal count, source_count
+            nonlocal count, source_count, curriculum_count
             count += 1
             calls.append((cell.backend_model, cell.knowledge, cell.profiling, prompt))
             if actor_error is not None:
                 raise actor_error
             if '"role":"curriculum"' in prompt:
-                completed = sum(
-                    item.get("kind") == "practice"
-                    for item in json.loads(prompt)["memory"]["phase2"]["learning"]
-                )
-                value = (
-                    {
-                        "action": "practice", "reason": "close the next evidence gap",
-                        "proposal": practice_sequence[completed].as_dict(),
-                    }
-                    if completed < len(practice_sequence)
-                    else {"action": "ready", "reason": "host suite passed"}
-                )
+                if curriculum_count < len(curriculum_actions):
+                    value = curriculum_actions[curriculum_count]
+                    curriculum_count += 1
+                else:
+                    completed = sum(
+                        item.get("kind") == "practice"
+                        for item in json.loads(prompt)["memory"]["phase2"]["learning"]
+                    )
+                    value = (
+                        {
+                            "action": "practice",
+                            "reason": "close the next evidence gap",
+                            "proposal": practice_sequence[completed].as_dict(),
+                        }
+                        if completed < len(practice_sequence)
+                        else {"action": "ready", "reason": "host suite passed"}
+                    )
                 if bad_ready:
                     value["verdict"] = "PASS"
             elif query_kdb and cell.knowledge is KnowledgeMode.WITH_KDB and count == 1:
@@ -346,6 +353,77 @@ def test_curriculum_agent_cannot_author_a_semantic_verdict(tmp_path):
     )
     with pytest.raises(ValueError, match="curriculum action"):
         runner.run("target")
+
+
+def test_curriculum_repairs_observed_wrapped_practice_proposal_once(tmp_path):
+    cell = qualification_cells()[0]
+    proposal = DEFAULT_PROPOSALS[1]
+    wrapped = {
+        "project_id": proposal.project_id,
+        "proposal": proposal.as_dict(),
+    }
+    actions = (
+        {
+            "action": "practice", "reason": "close the next evidence gap",
+            "proposal": wrapped,
+        },
+        {
+            "action": "practice", "reason": "close the next evidence gap",
+            "proposal": proposal.as_dict(),
+        },
+    )
+    calls = []
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(
+            calls, [], curriculum_actions=actions,
+        ),
+        execution_profile="bz-a3-1",
+    )
+    deps = composition.dependencies(cell, snapshot(tmp_path, cell), tmp_path / "run")
+    identity = A3Phase2Identity.from_cell(cell)
+    target = GroundedTarget(identity, TargetVerdict.FAIL, "host failed", "a" * 64)
+    learning = GroundedLearning(identity, {}, "diagnostic", "b" * 64)
+    memory = {"phase2": {"learning": []}}
+
+    decision = deps.curriculum(identity, target, learning, memory, 2)
+
+    assert decision.project == proposal
+    prompts = [json.loads(prompt) for *_identity, prompt in calls]
+    assert len(prompts) == 2
+    first, corrected = prompts
+    error = (
+        "proposal fields must be exactly evidence_preset, family, hypothesis, "
+        "language, parameters, target"
+    )
+    assert corrected == {**first, "curriculum_validation_error": error}
+
+
+def test_curriculum_repeated_invalid_action_exhausts_single_repair(tmp_path):
+    cell = qualification_cells()[0]
+    invalid = {"action": "ready", "reason": "looks good", "verdict": "PASS"}
+    calls = []
+    composition = Phase2Composition(
+        config=SimpleNamespace(),
+        dependencies=live_dependencies(
+            calls, [], curriculum_actions=(invalid, invalid),
+        ),
+        execution_profile="bz-a3-1",
+    )
+    deps = composition.dependencies(cell, snapshot(tmp_path, cell), tmp_path / "run")
+    identity = A3Phase2Identity.from_cell(cell)
+    target = GroundedTarget(identity, TargetVerdict.FAIL, "host failed", "a" * 64)
+    learning = GroundedLearning(identity, {}, "diagnostic", "b" * 64)
+
+    with pytest.raises(ValueError, match="curriculum action has an invalid schema"):
+        deps.curriculum(
+            identity, target, learning, {"phase2": {"learning": []}}, 2,
+        )
+
+    assert len(calls) == 2
+    assert json.loads(calls[1][3])["curriculum_validation_error"] == (
+        "curriculum action has an invalid schema"
+    )
 
 
 def test_curriculum_exposes_remaining_catalog_for_distinct_practices(tmp_path):

@@ -261,7 +261,7 @@ class Phase2Composition:
                 proposal for proposal in DEFAULT_PROPOSALS
                 if proposal.project_id not in completed
             )
-            action = complete({
+            payload = {
                 "schema": "a3-phase2-curriculum-v1", "role": "curriculum",
                 "identity": identity.evidence_fields(), "host_target": {
                     "verdict": target.verdict.value, "report": target.report,
@@ -281,20 +281,39 @@ class Phase2Composition:
                     "action": "practice", "reason": "text",
                     "proposal": "one exact remaining_proposals[].proposal object",
                 },
-            })
-            if set(action) == {"action", "reason"} and action["action"] == "ready":
-                return CurriculumDecision.ready(identity, action["reason"])
-            if (
-                set(action) == {"action", "reason", "proposal"}
-                and action["action"] == "practice"
-            ):
-                proposal = CurriculumProposal.from_mapping(action["proposal"])
-                if proposal.project_id not in {
-                    item.project_id for item in remaining
-                }:
-                    raise ValueError("curriculum selected a completed or unknown practice")
-                return CurriculumDecision.practice(identity, proposal, action["reason"])
-            raise ValueError("curriculum action has an invalid schema")
+            }
+
+            def parse_action(action: Mapping[str, object]) -> CurriculumDecision:
+                if (
+                    set(action) == {"action", "reason"}
+                    and action["action"] == "ready"
+                ):
+                    return CurriculumDecision.ready(identity, action["reason"])
+                if (
+                    set(action) == {"action", "reason", "proposal"}
+                    and action["action"] == "practice"
+                ):
+                    proposal = CurriculumProposal.from_mapping(action["proposal"])
+                    if proposal.project_id not in {
+                        item.project_id for item in remaining
+                    }:
+                        raise ValueError(
+                            "curriculum selected a completed or unknown practice"
+                        )
+                    return CurriculumDecision.practice(
+                        identity, proposal, action["reason"],
+                    )
+                raise ValueError("curriculum action has an invalid schema")
+
+            for correction in range(2):
+                action = complete(payload)
+                try:
+                    return parse_action(action)
+                except ValueError as exc:
+                    if correction:
+                        raise
+                    payload["curriculum_validation_error"] = str(exc)[:512]
+            raise AssertionError("curriculum correction bound is unreachable")
 
         def practice(
             _identity: A3Phase2Identity, proposal: CurriculumProposal,
