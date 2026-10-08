@@ -549,6 +549,21 @@ def catlass_candidate_fixture(source: str) -> Fixture:
     )
 
 
+def catlass_source_fixture(source: str, host_runtime: str) -> Fixture:
+    """Attach a host-owned runtime to source containing only a DSL kernel."""
+
+    fixture = _FIXTURES[Language.CATLASS_DSL]
+    kernel = f"{source.rstrip()}\n\n{host_runtime.lstrip()}"
+    files = tuple(
+        SourceFile(item.relative_path, kernel)
+        if item.relative_path == "kernel.py" else item
+        for item in fixture.files
+    )
+    return Fixture(
+        fixture.language, files, fixture.argv, fixture.max_length, fixture.environment
+    )
+
+
 def fixture_for(language: Language | str) -> Fixture:
     try:
         selected = Language(language)

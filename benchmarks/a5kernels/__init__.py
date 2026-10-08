@@ -35,6 +35,15 @@ from benchmarks.a5kernels.candidate import (
     CompileDiagnostics,
     validate_candidate_source,
 )
+from benchmarks.a5kernels.catlass_harness import (
+    CATLASS_REVISION,
+    CatlassContractHarness,
+    HarnessContract,
+    HarnessResult,
+    report_results,
+    validate_contract_source,
+    write_result,
+)
 from benchmarks.a5kernels.profiling import (
     AccessClass,
     MetricDomain,
@@ -110,6 +119,8 @@ __all__ = [
     "CandidateRun",
     "CandidateProfileEvaluation",
     "CatlassCandidateBackend",
+    "CatlassContractHarness",
+    "CATLASS_REVISION",
     "CompileDiagnostics",
     "Citation",
     "CollectionManifest",
@@ -145,6 +156,8 @@ __all__ = [
     "PHASE1_BRIEF",
     "AgentInterpretation",
     "HostFact",
+    "HarnessContract",
+    "HarnessResult",
     "Phase1LearningJournal",
     "Phase1ProjectMemory",
     "Phase1ResumeState",
@@ -172,8 +185,11 @@ __all__ = [
     "dry_run_plan",
     "parse_knowledge_action",
     "parse_trial_action",
+    "report_results",
     "saturation_status",
     "validate_candidate_source",
+    "validate_contract_source",
+    "write_result",
     "complete_a5",
     "load_a5_model_profile",
 ]
