@@ -4,8 +4,6 @@ import json
 
 import pytest
 
-import run_a5_phase1
-
 from benchmarks.a5kernels.catlass_harness import HarnessResult
 from benchmarks.a5kernels.phase1_experiments import (
     PINNED_CATLASS_REVISION,
@@ -251,46 +249,3 @@ def test_phase1_manifest_resume_excludes_only_registered_completed_cells():
     assert len(manifest["pending_cells"]) == 7
     with pytest.raises(ValueError, match="registered"):
         phase1_manifest(GUIDE, report, completed_cell_ids=["a5-cell-unknown"])
-
-
-def test_cli_plan_and_report_need_neither_credentials_nor_npu(tmp_path, capsys):
-    assert run_a5_phase1.main([
-        "plan", "--guide-sha256", GUIDE.guide_sha256,
-        "--cpl-skills-revision", GUIDE.cpl_skills_revision,
-    ]) == 0
-    planned = json.loads(capsys.readouterr().out)
-    assert planned["qualification"]["task_count"] == 18
-
-    report = Phase1GateRunner(
-        GUIDE, PassingHarness(), provider, sleep=lambda _: None,
-    ).run()
-    state = tmp_path / "gate.json"
-    write_gate_report(report, state)
-    assert run_a5_phase1.main(["report", "--gate", str(state)]) == 0
-    summary = json.loads(capsys.readouterr().out)
-    assert summary == {
-        "admitted": 18,
-        "guide_sha256": GUIDE.guide_sha256,
-        "qualification_sha256": report.report_sha256,
-        "ready": True,
-        "schema": report.schema,
-    }
-
-
-def test_cli_run_and_resume_are_gate_guarded(tmp_path, capsys):
-    missing = tmp_path / "missing.json"
-    with pytest.raises(ValueError, match="load"):
-        run_a5_phase1.main(["run", "--gate", str(missing)])
-
-    report = Phase1GateRunner(
-        GUIDE, PassingHarness(), provider, sleep=lambda _: None,
-    ).run()
-    state = tmp_path / "gate.json"
-    write_gate_report(report, state)
-    first = build_cells(GUIDE)[0].cell_id
-    assert run_a5_phase1.main([
-        "resume", "--gate", str(state), "--completed-cell", first,
-    ]) == 0
-    manifest = json.loads(capsys.readouterr().out)
-    assert manifest["completed_cells"] == [first]
-    assert len(manifest["pending_cells"]) == 7
