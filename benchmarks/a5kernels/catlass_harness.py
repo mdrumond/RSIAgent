@@ -310,8 +310,10 @@ def run(input_a, input_b):
     import torch_npu
     from catlass.tla.runtime import from_dlpack
 
-    device = int(os.environ["BZ_A5_PROFILE_PHYSICAL_DEVICE"])
-    torch.npu.set_device(device)
+    physical_device = int(os.environ["BZ_A5_PROFILE_PHYSICAL_DEVICE"])
+    if physical_device < 0:
+        raise ValueError("BZ_A5_PROFILE_PHYSICAL_DEVICE must be non-negative")
+    torch.npu.set_device(0)
     a = torch.tensor(input_a, dtype={dtype}, device="npu"){reshape}
     b = torch.tensor(input_b, dtype={dtype}, device="npu"){reshape}
     out = torch.full({shape[:2] if matrix else (spec.physical_length,)}, float("nan"), dtype={output_dtype}, device="npu")

@@ -169,6 +169,9 @@ def test_run_uses_host_case_runtime_oracle_and_evidence(contract):
     assert source.rstrip() in kernel
     assert "--npu-arch 3510" in kernel
     assert "torch.npu.synchronize()" in kernel
+    assert 'physical_device = int(os.environ["BZ_A5_PROFILE_PHYSICAL_DEVICE"])' in kernel
+    assert "torch.npu.set_device(0)" in kernel
+    assert "torch.npu.set_device(physical_device)" not in kernel
     assert "def run(input_a, input_b):" in kernel
 
 
