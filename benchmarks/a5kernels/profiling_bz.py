@@ -174,6 +174,8 @@ class BZProfileBackend:
             environment = environment.with_binding("A5KERNEL_BLOCK_NUM", block_num)
         environment = environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(request.device)
+        ).with_binding(
+            "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE", "1"
         )
         if action == "run":
             environment = environment.with_binding(

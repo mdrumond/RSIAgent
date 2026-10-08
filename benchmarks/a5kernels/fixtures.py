@@ -79,10 +79,16 @@ def run(input_a, input_b):
     padded_length = ((original_length + VL_ELE - 1) // VL_ELE) * VL_ELE
     input_a = [*input_a, *([0.0] * (padded_length - original_length))]
     input_b = [*input_b, *([0.0] * (padded_length - original_length))]
-    device = int(os.environ.get("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0"))
-    if device < 0:
+    physical_device = int(os.environ.get("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0"))
+    if physical_device < 0:
         raise ValueError("BZ_A5_PROFILE_PHYSICAL_DEVICE must be non-negative")
-    torch.npu.set_device(device)
+    direct_physical = os.environ.get("A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE")
+    if direct_physical not in {None, "1"}:
+        raise ValueError("A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE must be 1 when set")
+    # Ordinary validation is masked to one physical NPU by the BZ adapter, so
+    # its payload must address logical zero. Profiling deliberately retains the
+    # checked profile's direct-physical convention.
+    torch.npu.set_device(physical_device if direct_physical == "1" else 0)
     a = torch.tensor(input_a, dtype=torch.float32, device="npu")
     b = torch.tensor(input_b, dtype=torch.float32, device="npu")
     out = torch.empty_like(a)
@@ -504,6 +510,7 @@ _FIXTURES = {
                 "A5KERNEL_COMPILE_ONLY",
                 "A5KERNEL_EMIT_TIMING",
                 "A5KERNEL_LAUNCH_COUNT",
+                "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE",
                 "A5KERNEL_WARM_UP",
                 "PYTHONPYCACHEPREFIX",
             ),

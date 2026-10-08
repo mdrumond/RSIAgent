@@ -28,6 +28,7 @@ class CommandInvocation:
     files: tuple[SourceFile, ...]
     stdin: str
     remote_directory: str
+    physical_device: int | None
 
 
 @dataclass(frozen=True)
@@ -196,7 +197,7 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
         return self._runtime_provenance
 
     def probe_device(self, device: int) -> None:
-        """Prove the exact configured NPU is selectable through the BZ profile."""
+        """Prove one physical NPU maps to logical device zero in the payload."""
 
         if isinstance(device, bool) or not isinstance(device, int) or device < 0:
             raise ValueError("device must be a non-negative integer")
@@ -211,6 +212,8 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
                 "run",
                 "--catlass-src",
                 self._catlass_source,
+                "--device",
+                str(device),
                 "--timeout",
                 "600",
                 "--",
@@ -220,8 +223,8 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
                 "-c",
                 (
                     "import os, torch, torch_npu; "
-                    "device=int(os.environ['BZ_A5_PROFILE_PHYSICAL_DEVICE']); "
-                    "torch.npu.set_device(device); "
+                    "physical=int(os.environ['BZ_A5_PROFILE_PHYSICAL_DEVICE']); "
+                    "torch.npu.set_device(0); "
                     f"print('{marker}')"
                 ),
             )
@@ -230,6 +233,8 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
             raise RuntimeUnavailableError("configured A5 device probe failed")
 
     def _dispatch(self, invocation: CommandInvocation):
+        if invocation.physical_device is None:
+            raise ValueError("Catlass execution must declare a physical A5 device")
         operation = _session_name(invocation.argv)
         timeout = _option_value(invocation.argv, "--observe-timeout")
         try:
@@ -256,6 +261,8 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
                 "run",
                 "--catlass-src",
                 self._catlass_source,
+                "--device",
+                str(invocation.physical_device),
                 "--timeout",
                 timeout,
                 "--",
@@ -291,6 +298,7 @@ class BZSessionAdapter:
                 f"no executable runtime is registered for {plan.language}"
             )
         plan = self.prepare_execution(plan)
+        physical_device = _declared_physical_device(plan)
         session_name = f"codex-a5hello-{plan.execution_id}-{plan.attempt_id}"
         remote_directory = f".a5kernels/{plan.execution_id}/{plan.attempt_id}"
         payload = json.dumps(
@@ -319,6 +327,7 @@ class BZSessionAdapter:
             files=staged_files,
             stdin="",
             remote_directory=remote_directory,
+            physical_device=physical_device,
         )
         dispatch = self._executor.run(invocation)
         if dispatch.exit_code != 0 and not _proven_observation_uncertain(
@@ -441,6 +450,27 @@ def _option_value(argv: tuple[str, ...], option: str) -> str:
         return argv[argv.index(option) + 1]
     except (ValueError, IndexError) as exc:
         raise ValueError(f"invocation is missing {option}") from exc
+
+
+def _declared_physical_device(plan: ExecutionPlan) -> int | None:
+    """Return the canonical physical ordinal selected by the neutral adapter."""
+
+    encoded = dict(plan.environment.bindings).get(
+        "BZ_A5_PROFILE_PHYSICAL_DEVICE"
+    )
+    if encoded is None:
+        return None
+    try:
+        device = int(encoded)
+    except ValueError as exc:
+        raise ValueError(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE must be a canonical non-negative integer"
+        ) from exc
+    if device < 0 or str(device) != encoded:
+        raise ValueError(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE must be a canonical non-negative integer"
+        )
+    return device
 
 
 def _is_revision(value: str) -> bool:

@@ -633,11 +633,12 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         if "--operation" in call and call[call.index("--operation") + 2] == "run"
     )
     separator = timing_call.index("--")
-    assert timing_call[separator + 1 : separator + 7] == (
+    assert timing_call[separator + 1 : separator + 8] == (
         "env",
         "A5KERNEL_BLOCK_NUM=4",
         "A5KERNEL_EMIT_TIMING=1",
         "A5KERNEL_LAUNCH_COUNT=1",
+        "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE=1",
         "A5KERNEL_WARM_UP=0",
         f"BZ_A5_PROFILE_PHYSICAL_DEVICE={profiled_request.device}",
     )
@@ -973,6 +974,8 @@ def test_real_catlass_fixture_exposes_host_owned_timing_and_device_contract() ->
     )
 
     assert 'os.environ.get("BZ_A5_PROFILE_PHYSICAL_DEVICE", "0")' in kernel_source
+    assert 'os.environ.get("A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE")' in kernel_source
+    assert 'physical_device if direct_physical == "1" else 0' in kernel_source
     assert 'os.environ.get("A5KERNEL_EMIT_TIMING") == "1"' in kernel_source
     assert 'os.environ.get("A5KERNEL_WARM_UP", "0")' in kernel_source
     assert 'os.environ.get("A5KERNEL_LAUNCH_COUNT", "1")' in kernel_source
