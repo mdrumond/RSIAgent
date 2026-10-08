@@ -98,13 +98,15 @@ def test_registered_profiles_are_exact_and_deepseek_is_direct():
             "backend_model": "openai/gpt-5.6-sol",
             "profile_id": "openai-gpt-5.6-sol-v1",
             "provider": "OpenAI",
-            "route": "openrouter:OpenAI",
+            "route": "direct:https://api.openai.com/v1",
+            "credential_env": "OPENAI_API_KEY",
         },
         {
             "backend_model": "deepseek-flash",
             "profile_id": "deepseek-flash-native-v1",
             "provider": "DeepSeek",
             "route": "direct:https://api.deepseek.com",
+            "credential_env": "DEEPSEEK_API_KEY",
         },
     ]
     with pytest.raises(ValueError, match="registered A5 profile"):
@@ -113,7 +115,12 @@ def test_registered_profiles_are_exact_and_deepseek_is_direct():
             "deepseek-flash-native-v1",
             "DeepSeek",
             "openrouter:DeepSeek",
+            "DEEPSEEK_API_KEY",
         )
+
+    serialized = json.dumps([item.as_dict() for item in MODEL_IDENTITIES])
+    assert "OPENROUTER_API_KEY" not in serialized
+    assert "openrouter:" not in serialized
 
 
 def test_plan_is_exact_catlass_only_eight_cell_cross_product(tmp_path):

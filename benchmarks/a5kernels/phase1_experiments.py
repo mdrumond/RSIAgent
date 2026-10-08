@@ -54,6 +54,7 @@ class A5ModelIdentity:
     profile_id: str
     provider: str
     route: str
+    credential_env: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend_model, A5BackendModel):
@@ -68,6 +69,7 @@ class A5ModelIdentity:
             "profile_id": self.profile_id,
             "provider": self.provider,
             "route": self.route,
+            "credential_env": self.credential_env,
         }
 
 
@@ -76,13 +78,15 @@ _MODEL_VALUES = {
         "backend_model": "openai/gpt-5.6-sol",
         "profile_id": "openai-gpt-5.6-sol-v1",
         "provider": "OpenAI",
-        "route": "openrouter:OpenAI",
+        "route": "direct:https://api.openai.com/v1",
+        "credential_env": "OPENAI_API_KEY",
     },
     A5BackendModel.DEEPSEEK_FLASH: {
         "backend_model": "deepseek-flash",
         "profile_id": "deepseek-flash-native-v1",
         "provider": "DeepSeek",
         "route": "direct:https://api.deepseek.com",
+        "credential_env": "DEEPSEEK_API_KEY",
     },
 }
 
