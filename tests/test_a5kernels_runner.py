@@ -341,14 +341,16 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
         "input_b": list(plan.input_b),
     }
     assert invocation.remote_directory == f".a5kernels/{plan.execution_id}/trial-1"
+    assert invocation.physical_device == 0
     separator = invocation.argv.index("--")
     rendered = invocation.argv[separator + 1 :]
     assert rendered.count("env") == 1
-    assert rendered[:11] == (
+    assert rendered[:13] == (
         "env",
         "-u", "A5KERNEL_COMPILE_ONLY",
         "-u", "A5KERNEL_EMIT_TIMING",
         "-u", "A5KERNEL_LAUNCH_COUNT",
+        "-u", "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE",
         "-u", "A5KERNEL_WARM_UP",
         "-u", "PYTHONPYCACHEPREFIX",
     )
@@ -470,6 +472,7 @@ def test_catlass_fixture_uses_current_imperative_runtime_api():
         "A5KERNEL_COMPILE_ONLY",
         "A5KERNEL_EMIT_TIMING",
         "A5KERNEL_LAUNCH_COUNT",
+        "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE",
         "A5KERNEL_WARM_UP",
         "PYTHONPYCACHEPREFIX",
     }
@@ -907,7 +910,8 @@ def test_catlass_fixture_compile_path_accepts_host_owned_block_six(monkeypatch):
     runtime.from_dlpack = lambda _tensor, layout_tag: FakeTLATensor()
     torch = ModuleType("torch")
     torch.float32 = object()
-    torch.npu = SimpleNamespace(set_device=lambda _device: None)
+    selected_devices = []
+    torch.npu = SimpleNamespace(set_device=selected_devices.append)
     torch.tensor = lambda *args, **kwargs: FakeTensor()
     torch.empty_like = lambda _tensor: FakeTensor()
     monkeypatch.setitem(sys.modules, "catlass", catlass)
@@ -917,10 +921,13 @@ def test_catlass_fixture_compile_path_accepts_host_owned_block_six(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_npu", ModuleType("torch_npu"))
     monkeypatch.setenv("A5KERNEL_BLOCK_NUM", "6")
     monkeypatch.setenv("A5KERNEL_COMPILE_ONLY", "1")
+    monkeypatch.setenv("BZ_A5_PROFILE_PHYSICAL_DEVICE", "5")
+    monkeypatch.delenv("A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE", raising=False)
     namespace = {}
     exec(compile(source, "kernel.py", "exec"), namespace)
 
     assert namespace["run"]([1.0, 2.0], [3.0, 4.0]) == [4.0, 6.0]
+    assert selected_devices == [0]
 
 
 def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence():
@@ -949,7 +956,7 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
             assert (Path(argv[2]) / "input.json").is_file()
             return subprocess.CompletedProcess(argv, 0, "uploaded", "")
         if argv[0].endswith("catlass-validation.sh"):
-            assert argv[:10] == (
+            assert argv[:12] == (
                 "execution-profiles/catlass-validation.sh",
                 "--profile",
                 "bz-a5",
@@ -958,10 +965,13 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
                 "run",
                 "--catlass-src",
                 source,
+                "--device",
+                "5",
                 "--timeout",
                 "600",
             )
             assert argv[-6] == revision
+            assert "BZ_A5_PROFILE_PHYSICAL_DEVICE=5" in argv
             assert argv[-11:-6] == (
                 "python",
                 "-B",
@@ -990,6 +1000,12 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
     )
     plan = A5KernelRunner(backend).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+    plan = replace(
+        plan,
+        environment=plan.environment.with_binding(
+            "BZ_A5_PROFILE_PHYSICAL_DEVICE", "5"
+        ),
     )
 
     receipt = backend.execute(plan)
@@ -1061,11 +1077,13 @@ def test_catlass_executor_probes_exact_device_through_checked_profile():
             "--profile", "bz-a5",
             "--operation", "codex-a5-preflight-device-3",
             "run", "--catlass-src", "/retained/catlass",
+            "--device", "3",
             "--timeout", "600", "--",
             "env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=3",
             "python", "-c", calls[0][-1],
         )
     ]
+    assert "torch.npu.set_device(0)" in calls[0][-1]
 
 
 def test_catlass_executor_rejects_unavailable_device():
