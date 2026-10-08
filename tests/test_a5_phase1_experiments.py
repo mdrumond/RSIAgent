@@ -238,6 +238,9 @@ def test_plan_rejects_missing_duplicate_or_foreign_cells(tmp_path):
     with pytest.raises(ValueError, match="bind the admitted guide"):
         A5Phase1Plan((*cells[:-1], build_cells(other)[-1]), guide)
 
+    with pytest.raises(ValueError, match="A5Phase1Cell"):
+        A5Phase1Plan((*cells[:-1], object()), guide)
+
 
 def test_cell_and_guide_are_immutable_and_fail_closed(tmp_path):
     guide = admitted(tmp_path)

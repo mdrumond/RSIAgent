@@ -220,10 +220,10 @@ class A5Phase1Plan:
             or self.language is not A5Language.CATLASS_DSL
         ):
             raise ValueError("plan must use the registered A5 Catlass Phase 1 schema")
-        if len(self.cells) != 8 or len({cell.cell_id for cell in self.cells}) != 8:
-            raise ValueError("A5 Phase 1 requires eight unique cells")
         if any(not isinstance(cell, A5Phase1Cell) for cell in self.cells):
             raise ValueError("plan cells must be A5Phase1Cell values")
+        if len(self.cells) != 8 or len({cell.cell_id for cell in self.cells}) != 8:
+            raise ValueError("A5 Phase 1 requires eight unique cells")
         if any(cell.guide != self.guide for cell in self.cells):
             raise ValueError("every Phase 1 cell must bind the admitted guide identity")
         expected = build_cells(self.guide)
