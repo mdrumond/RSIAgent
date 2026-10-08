@@ -466,3 +466,64 @@ class TrialOrchestrator:
                                workspace, memory, context, ledger.head_sha256)
         finally:
             knowledge.close()
+
+    @staticmethod
+    def run_bound(
+        *,
+        trial_root: Path,
+        request_payload: Mapping[str, object],
+        language: str,
+        workload: Workload,
+        instruction: str,
+        profile,
+        backend: KernelTrialBackend,
+        actor: ActorDriver,
+        knowledge: KnowledgeAgent,
+        profiling: ProfileEvaluation,
+        profiling_guidance: bool,
+        ledger: EvidenceLedger,
+    ) -> TrialResult:
+        """Run one host-bound project without the legacy pilot matrix scheduler.
+
+        The Phase 1 cell registry has its own exact model and treatment identities.
+        This entry point preserves the established restricted action executor while
+        leaving cell selection and durable resume policy to the outer composition.
+        """
+
+        trial_root = Path(trial_root)
+        trial_root.mkdir(parents=True, exist_ok=False)
+        workspace, memory, context = (
+            trial_root / name for name in ("workspace", "memory", "context")
+        )
+        for path in (workspace, memory, context):
+            path.mkdir()
+        ledger.append(EvidenceKind.REQUEST, dict(request_payload))
+        executor = TrialActionExecutor(
+            workspace=workspace,
+            language=language,
+            workload=workload,
+            backend=backend,
+            ledger=ledger,
+            knowledge=knowledge,
+            profiling=profiling,
+            profiling_guidance=profiling_guidance,
+        )
+        outcome = actor(
+            instruction,
+            profile=profile,
+            workspace=workspace,
+            context=context,
+            turn_parser=parse_trial_action,
+            action_executor=executor,
+        )
+        if executor.final_run is None or executor.final_profile is None:
+            raise RuntimeError("Actor ended without a host-verified submit action")
+        return TrialResult(
+            outcome,
+            executor.final_run,
+            executor.final_profile,
+            workspace,
+            memory,
+            context,
+            ledger.head_sha256,
+        )
