@@ -27,6 +27,7 @@ from benchmarks.a5kernels.phase1_composition import (
     LiveProjectRequest,
 )
 from benchmarks.a5kernels.phase1_experiments import PINNED_CATLASS_REVISION
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
 from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.phase1_provider import (
@@ -49,6 +50,16 @@ from benchmarks.a5kernels.profiling import ProfilingTreatmentController
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.trial import TrialOrchestrator, _trial_instruction
 from config.runtime_paths import resolve_env_file
+
+
+def _require_host_verification(verified) -> None:
+    if verified.passed:
+        return
+    if verified.exit_code == 255 and verified.session_handle is None:
+        raise InfrastructureFailure(
+            "A5 candidate verification transport was unavailable"
+        )
+    raise RuntimeError("submitted A5 candidate did not pass host verification")
 
 
 def load_direct_environment(
@@ -124,8 +135,7 @@ class ProductionProjectExecutor:
             profiling_guidance=profiling_guidance is not None,
             ledger=ledger,
         )
-        if not trial.verified.passed:
-            raise RuntimeError("submitted A5 candidate did not pass host verification")
+        _require_host_verification(trial.verified)
 
         facts = [HostFact(
             "host-verification",

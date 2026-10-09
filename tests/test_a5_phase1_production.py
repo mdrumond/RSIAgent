@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,9 +18,11 @@ from benchmarks.a5kernels.phase1_experiments import (
 )
 from benchmarks.a5kernels.phase1_production import (
     ProductionProjectExecutor,
+    _require_host_verification,
     build_phase1_live_dependencies,
     load_direct_environment,
 )
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
@@ -40,6 +43,18 @@ ENVIRONMENT = {
     "OPENAI_API_KEY": "openai-secret",
     "DEEPSEEK_API_KEY": "deepseek-secret",
 }
+
+
+def test_transport_failure_during_final_verification_is_retryable():
+    with pytest.raises(InfrastructureFailure, match="transport"):
+        _require_host_verification(SimpleNamespace(
+            passed=False, exit_code=255, session_handle=None,
+        ))
+
+    with pytest.raises(RuntimeError, match="did not pass host"):
+        _require_host_verification(SimpleNamespace(
+            passed=False, exit_code=1, session_handle="bz-a5:completed",
+        ))
 
 
 def test_direct_credentials_load_from_the_explicit_secret_file(tmp_path):
