@@ -135,16 +135,30 @@ def test_preset_ignores_caller_launch_flags_for_identity_and_commands():
 
 
 def test_basic_and_pipe_presets_keep_metric_domains_in_separate_replays():
+    study_variant = variant()
     basic_backend = FakeStudyBackend()
     basic = Phase1PerformanceStudy(basic_backend).run(
-        StudyPreset.BASIC_INFO, [variant()]
+        StudyPreset.BASIC_INFO, [study_variant]
     )
     assert [item.domain for item in basic.metrics] == [MetricDomain.BASIC_INFO]
-    assert basic_backend.commands[0].kernel_name is None
+    assert basic_backend.commands[0].kernel_name == REQUEST.expected_kernel
+    assert basic_backend.commands[0].replay_id == Phase1PerformanceStudy._study_replay_id(
+        StudyPreset.BASIC_INFO,
+        study_variant,
+        MetricDomain.BASIC_INFO,
+        1,
+        capture_kernel_name=REQUEST.expected_kernel,
+    )
+    assert basic_backend.commands[0].replay_id != Phase1PerformanceStudy._study_replay_id(
+        StudyPreset.BASIC_INFO,
+        study_variant,
+        MetricDomain.BASIC_INFO,
+        1,
+    )
 
     pipe_backend = FakeStudyBackend()
     pipe = Phase1PerformanceStudy(pipe_backend).run(
-        StudyPreset.PIPE_UTILIZATION, [variant()]
+        StudyPreset.PIPE_UTILIZATION, [study_variant]
     )
     assert [item.domain for item in pipe.metrics] == [
         MetricDomain.BASIC_INFO,
@@ -154,7 +168,29 @@ def test_basic_and_pipe_presets_keep_metric_domains_in_separate_replays():
         ProfileMetric.BASIC_INFO,
         ProfileMetric.PIPE_UTILIZATION,
     ]
-    assert pipe_backend.commands[1].kernel_name == REQUEST.expected_kernel
+    assert [command.kernel_name for command in pipe_backend.commands] == [
+        REQUEST.expected_kernel,
+        REQUEST.expected_kernel,
+    ]
+    assert len({command.replay_id for command in pipe_backend.commands}) == 2
+    for command, domain in zip(
+        pipe_backend.commands,
+        (MetricDomain.BASIC_INFO, MetricDomain.PIPE_UTILIZATION),
+        strict=True,
+    ):
+        assert command.replay_id == Phase1PerformanceStudy._study_replay_id(
+            StudyPreset.PIPE_UTILIZATION,
+            study_variant,
+            domain,
+            1,
+            capture_kernel_name=REQUEST.expected_kernel,
+        )
+        assert command.replay_id != Phase1PerformanceStudy._study_replay_id(
+            StudyPreset.PIPE_UTILIZATION,
+            study_variant,
+            domain,
+            1,
+        )
     assert pipe.metrics[0].evidence_manifest_sha256 != ""
     assert pipe.metrics[1].evidence_manifest_sha256 != ""
 
