@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import hashlib
 import json
 import os
@@ -57,6 +58,43 @@ A5_PROFILING_GUIDANCE = (
 )
 
 
+class CellExecutionStatus(str, Enum):
+    RUNNABLE = "runnable"
+    PENDING = "pending"
+
+
+@dataclass(frozen=True)
+class CellDisposition:
+    """Host decision made before a cell can reach treatment dependencies."""
+
+    status: CellExecutionStatus
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, CellExecutionStatus):
+            raise TypeError("cell execution status must be registered")
+        if self.status is CellExecutionStatus.RUNNABLE and self.reason is not None:
+            raise ValueError("runnable cells cannot have a pending reason")
+        if self.status is CellExecutionStatus.PENDING and not (
+            isinstance(self.reason, str) and self.reason.strip()
+        ):
+            raise ValueError("pending cells require a reason")
+
+    @classmethod
+    def runnable(cls) -> "CellDisposition":
+        return cls(CellExecutionStatus.RUNNABLE)
+
+    @classmethod
+    def pending(cls, reason: str) -> "CellDisposition":
+        return cls(CellExecutionStatus.PENDING, reason)
+
+
+def runnable_cell(_cell: A5Phase1Cell) -> CellDisposition:
+    """Default policy seam; registered treatments are runnable unless gated."""
+
+    return CellDisposition.runnable()
+
+
 @dataclass(frozen=True)
 class LiveProjectRequest:
     """Host-selected inputs visible to one isolated project agent."""
@@ -106,6 +144,7 @@ class Phase1CellComposition:
         dependencies: LiveDependencies,
         *,
         proposals: Sequence[CurriculumProposal] = DEFAULT_PROPOSALS,
+        cell_disposition: Callable[[A5Phase1Cell], CellDisposition] = runnable_cell,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if qualification is None:
@@ -141,12 +180,41 @@ class Phase1CellComposition:
         self.dependencies = dependencies
         self.proposals = canonical
         self.cells = build_cells(guide)
+        dispositions = tuple(cell_disposition(cell) for cell in self.cells)
+        if any(not isinstance(item, CellDisposition) for item in dispositions):
+            raise TypeError("cell_disposition must return CellDisposition values")
+        self._cell_dispositions = dict(zip(self.cells, dispositions, strict=True))
         self.sleeper = sleeper
+
+    @classmethod
+    def one_project_smoke(
+        cls,
+        root: Path,
+        guide_path: Path,
+        guide: ProgrammingGuideIdentity,
+        qualification: GateReport | None,
+        dependencies: LiveDependencies,
+        *,
+        cell_disposition: Callable[[A5Phase1Cell], CellDisposition] = runnable_cell,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> "Phase1CellComposition":
+        """Build the resumable smoke over exactly the first registered project."""
+
+        return cls(
+            root,
+            guide_path,
+            guide,
+            qualification,
+            dependencies,
+            proposals=(DEFAULT_PROPOSALS[0],),
+            cell_disposition=cell_disposition,
+            sleeper=sleeper,
+        )
 
     def plan(self) -> dict[str, object]:
         """Return the complete stable live plan without invoking a provider."""
 
-        return {
+        plan = {
             "schema": PLAN_SCHEMA,
             "guide": self.guide.as_dict(),
             "qualification_sha256": self.qualification.report_sha256,
@@ -157,11 +225,17 @@ class Phase1CellComposition:
             "cells": [cell.as_dict() for cell in self.cells],
             "projects": dry_run_plan(self.proposals)["projects"],
         }
+        pending = self._pending_treatment_cells()
+        if pending:
+            plan["pending_treatment_cells"] = pending
+        return plan
 
     def run(self) -> tuple[dict[str, object], ...]:
         self._ensure_plan()
         records = []
         for cell in self.cells:
+            if not self._is_runnable(cell):
+                continue
             terminal = self._load_terminal(cell)
             if terminal is None:
                 terminal = self._run_cell(cell)
@@ -174,21 +248,44 @@ class Phase1CellComposition:
     def report(self) -> dict[str, object]:
         records = []
         for cell in self.cells:
+            if not self._is_runnable(cell):
+                continue
             terminal = self._load_terminal(cell)
             if terminal is not None:
                 records.append(terminal)
-        return {
+        completed = {row["cell_id"] for row in records}
+        runnable = [cell for cell in self.cells if self._is_runnable(cell)]
+        pending_treatments = self._pending_treatment_cells()
+        complete = len(records) == len(runnable)
+        report = {
             "schema": REPORT_SCHEMA,
-            "status": "complete" if len(records) == len(self.cells) else "pending",
+            "status": (
+                "complete-with-pending-treatments"
+                if complete and pending_treatments
+                else "complete" if complete else "pending"
+            ),
             "guide": self.guide.as_dict(),
             "qualification_sha256": self.qualification.report_sha256,
             "completed_cell_ids": [row["cell_id"] for row in records],
             "pending_cell_ids": [
-                cell.cell_id for cell in self.cells
-                if cell.cell_id not in {row["cell_id"] for row in records}
+                cell.cell_id for cell in runnable if cell.cell_id not in completed
             ],
             "records": records,
         }
+        if pending_treatments:
+            report["pending_treatment_cells"] = pending_treatments
+        return report
+
+    def _is_runnable(self, cell: A5Phase1Cell) -> bool:
+        return self._cell_dispositions[cell].status is CellExecutionStatus.RUNNABLE
+
+    def _pending_treatment_cells(self) -> list[dict[str, str]]:
+        return [
+            {"cell_id": cell.cell_id, "reason": disposition.reason or ""}
+            for cell in self.cells
+            if (disposition := self._cell_dispositions[cell]).status
+            is CellExecutionStatus.PENDING
+        ]
 
     def evidence(self, cell_id: str) -> EvidenceLedger:
         registered = {cell.cell_id for cell in self.cells}
@@ -369,7 +466,10 @@ class Phase1CellComposition:
 
 __all__ = [
     "A5_PROFILING_GUIDANCE",
+    "CellDisposition",
+    "CellExecutionStatus",
     "LiveDependencies",
     "LiveProjectRequest",
     "Phase1CellComposition",
+    "runnable_cell",
 ]

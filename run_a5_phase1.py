@@ -25,6 +25,11 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--gate", type=Path, required=True)
         command.add_argument("--guide", type=Path, required=True)
         command.add_argument("--root", type=Path, required=True)
+        command.add_argument(
+            "--one-project-smoke",
+            action="store_true",
+            help="run exactly the first registered project in every runnable cell",
+        )
         if name in {"run", "resume"}:
             command.add_argument("--tla-root", type=Path, required=True)
             command.add_argument("--profiling-skill-root", type=Path, required=True)
@@ -73,12 +78,13 @@ def main(
             _paths(args, gate.guide.catlass_revision),
             env_file=args.env_file,
         )
-    composition = Phase1CellComposition(
-        args.root,
-        args.guide,
-        gate.guide,
-        gate,
-        dependencies,
+    factory = (
+        Phase1CellComposition.one_project_smoke
+        if args.one_project_smoke
+        else Phase1CellComposition
+    )
+    composition = factory(
+        args.root, args.guide, gate.guide, gate, dependencies,
     )
     if args.command == "plan":
         value = composition.plan()

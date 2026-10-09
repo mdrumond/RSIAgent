@@ -19,6 +19,7 @@ from benchmarks.a5kernels.knowledge_agent import (
 )
 from benchmarks.a5kernels.phase1_composition import (
     A5_PROFILING_GUIDANCE,
+    CellDisposition,
     LiveDependencies,
     Phase1CellComposition,
 )
@@ -201,6 +202,65 @@ def test_all_eight_cells_isolate_treatments_checkpoint_and_resume(tmp_path):
     assert [record["cell_id"] for record in summary["records"]] == [
         cell["cell_id"] for cell in composition.plan()["cells"]
     ]
+
+
+def test_one_project_smoke_runs_only_first_registered_project_and_resumes(tmp_path):
+    guide_path, guide, report = _guide_and_report(tmp_path)
+    calls = []
+    composition = Phase1CellComposition.one_project_smoke(
+        tmp_path / "smoke", guide_path, guide, report,
+        _dependencies(tmp_path / "deps", calls), sleeper=lambda _seconds: None,
+    )
+
+    projects = composition.plan()["projects"]
+    assert len(projects) == 1
+    assert projects[0]["family"] == DEFAULT_PROPOSALS[0].family.value
+    records = composition.run()
+    assert len(records) == 8
+    assert len(calls) == 8
+    assert {call["ordinal"] for call in calls} == {1}
+    assert {call["runtime"]["family"] for call in calls} == {
+        DEFAULT_PROPOSALS[0].family.value
+    }
+
+    assert composition.resume() == records
+    assert len(calls) == 8
+
+
+def test_pending_cells_are_reported_before_any_treatment_dependency_dispatch(tmp_path):
+    guide_path, guide, report = _guide_and_report(tmp_path)
+    calls = []
+    base = _dependencies(tmp_path / "deps", calls)
+    knowledge_calls = []
+
+    def knowledge_factory(cell, memory_path):
+        knowledge_calls.append(cell.cell_id)
+        return base.knowledge_factory(cell, memory_path)
+
+    def disposition(cell):
+        if cell.profiling.value == "with-profiling-guidance":
+            return CellDisposition.pending("new profiler is not ready")
+        return CellDisposition.runnable()
+
+    composition = Phase1CellComposition.one_project_smoke(
+        tmp_path / "smoke", guide_path, guide, report,
+        LiveDependencies(base.execute, knowledge_factory),
+        cell_disposition=disposition,
+        sleeper=lambda _seconds: None,
+    )
+
+    records = composition.run()
+    summary = composition.report()
+    pending = summary["pending_treatment_cells"]
+    assert len(records) == len(calls) == 4
+    assert len(knowledge_calls) == 2
+    assert summary["status"] == "complete-with-pending-treatments"
+    assert len(pending) == 4
+    assert {row["reason"] for row in pending} == {"new profiler is not ready"}
+    assert {row["cell_id"] for row in pending}.isdisjoint(
+        {call["cell"] for call in calls}
+    )
+    assert summary["pending_cell_ids"] == []
 
 
 def test_project_boundary_resume_and_three_120_second_infrastructure_retries(tmp_path):

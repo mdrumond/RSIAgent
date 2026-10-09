@@ -238,6 +238,32 @@ def test_cli_plan_run_resume_and_report_use_the_bound_dependencies(tmp_path, cap
     assert len(completed["records"]) == 8
     assert len(calls) == 64
 
+    smoke_root = tmp_path / "smoke"
+    smoke_shared = [
+        "--gate", str(state), "--guide", str(guide_path),
+        "--root", str(smoke_root), "--one-project-smoke",
+    ]
+    smoke_runtime = [*smoke_shared, *runtime[len(shared):]]
+    smoke_calls = []
+    smoke_dependencies = _dependencies(tmp_path / "smoke-dependencies", smoke_calls)
+
+    def smoke_builder(_paths, **_kwargs):
+        return smoke_dependencies
+
+    assert run_a5_phase1.main(
+        ["run", *smoke_runtime], dependency_builder=smoke_builder
+    ) == 0
+    smoke = json.loads(capsys.readouterr().out)
+    assert smoke["status"] == "complete"
+    assert len(smoke["records"]) == len(smoke_calls) == 8
+    assert {call["ordinal"] for call in smoke_calls} == {1}
+
+    assert run_a5_phase1.main(
+        ["resume", *smoke_runtime], dependency_builder=smoke_builder
+    ) == 0
+    assert json.loads(capsys.readouterr().out) == smoke
+    assert len(smoke_calls) == 8
+
     assert run_a5_phase1.main(["resume", *runtime], dependency_builder=builder) == 0
     assert json.loads(capsys.readouterr().out) == completed
     assert len(calls) == 64
