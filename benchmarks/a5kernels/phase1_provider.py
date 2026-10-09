@@ -44,6 +44,8 @@ _DIRECT_VALUES = {
     },
 }
 
+_PROVIDER_TIMEOUT_SECONDS = 120
+
 
 @dataclass(frozen=True)
 class DirectModelProfile:
@@ -109,7 +111,12 @@ Transport = Callable[..., DirectCompletion]
 def openai_compatible_transport(*, base_url, api_key, request) -> DirectCompletion:
     from openai import OpenAI
 
-    response = OpenAI(api_key=api_key, base_url=base_url).chat.completions.create(
+    response = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=_PROVIDER_TIMEOUT_SECONDS,
+        max_retries=0,
+    ).chat.completions.create(
         **dict(request)
     )
     try:

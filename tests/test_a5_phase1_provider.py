@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +17,7 @@ from benchmarks.a5kernels.phase1_provider import (
     DirectCompletion,
     DirectCompletionProvider,
     direct_profile,
+    openai_compatible_transport,
 )
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
@@ -27,6 +30,38 @@ ENVIRONMENT = {
     "DEEPSEEK_API_KEY": "deepseek-secret",
 }
 SOURCE = "agent source"
+
+
+def test_openai_transport_bounds_each_attempt_and_disables_sdk_retries(monkeypatch):
+    constructor = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            constructor.append(kwargs)
+            usage = SimpleNamespace(completion_tokens=3)
+            message = SimpleNamespace(content="answer")
+            response = SimpleNamespace(
+                choices=[SimpleNamespace(message=message)], usage=usage,
+            )
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=lambda **_request: response),
+            )
+
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    result = openai_compatible_transport(
+        base_url="https://provider.invalid",
+        api_key="secret",
+        request={"model": "model", "messages": []},
+    )
+
+    assert result == DirectCompletion("answer", 3)
+    assert constructor == [{
+        "api_key": "secret",
+        "base_url": "https://provider.invalid",
+        "timeout": 120,
+        "max_retries": 0,
+    }]
 
 
 class FakeBackend:
