@@ -556,10 +556,12 @@ def _write_compact_archive(destination: Path) -> None:
 
 def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) -> None:
     calls = []
+    collector_environments = []
 
     def run(argv, **kwargs):
         calls.append(tuple(argv))
         if Path(argv[0]).name == "collect_profile.sh":
+            collector_environments.append(kwargs["env"])
             destination = Path(argv[argv.index("--output") + 1])
             destination.mkdir(parents=True, exist_ok=True)
             _write_compact_archive(destination)
@@ -678,6 +680,8 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     assert "--kernel-name" not in collection_calls[1]
     assert "--kernel-name" in collection_calls[2]
     assert "--kernel-name" not in collection_calls[3]
+    assert len(collector_environments) == 4
+    assert all(environment["TLA_ROOT"] == "/" for environment in collector_environments)
 
     class RecordingExecutor:
         runtime_provenance = profiled_plan.runtime_provenance

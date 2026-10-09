@@ -6,6 +6,7 @@ import csv
 import gzip
 import hashlib
 import io
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
@@ -73,6 +74,7 @@ class BZProfileBackend:
         if observation_backoff_seconds < 0:
             raise ValueError("observation_backoff_seconds cannot be negative")
         self._validation = validation_wrapper
+        self._tla_root = str(Path(validation_wrapper).parent.parent)
         self._session = session_wrapper
         self._collector = collection_wrapper
         self._catlass_source = catlass_source
@@ -340,7 +342,9 @@ class BZProfileBackend:
             argv += ["--kernel-name", request.expected_kernel]
         if implementation == "dsl":
             argv += ["--catlass-src", self._catlass_source]
-        completed = self._call(tuple(argv))
+        completed = self._call(
+            tuple(argv), extra_environment={"TLA_ROOT": self._tla_root}
+        )
         archive_path = destination / "ascend-profile-summary.tar.gz"
         if completed.returncode or not archive_path.is_file():
             raise RuntimeError("compact profile evidence collection failed")
@@ -354,7 +358,15 @@ class BZProfileBackend:
             _archive_entries(data),
         )
 
-    def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    def _call(
+        self,
+        argv: tuple[str, ...],
+        *,
+        extra_environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = None
+        if extra_environment is not None:
+            environment = {**os.environ, **extra_environment}
         try:
             return self._run(
                 argv,
@@ -362,6 +374,7 @@ class BZProfileBackend:
                 capture_output=True,
                 check=False,
                 timeout=self._timeout,
+                env=environment,
             )
         except subprocess.TimeoutExpired as exc:
             raise InfrastructureFailure(
