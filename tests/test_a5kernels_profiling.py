@@ -28,6 +28,7 @@ from benchmarks.a5kernels.profiling import (
     bind_study_dimensions,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest
 from benchmarks.a5kernels.bz import CommandResult
 from benchmarks.a5kernels.protocol import (
@@ -843,6 +844,41 @@ def test_concrete_backend_recovers_after_timing_observation_timeout(
     )
 
     assert result.duration_us == 9.5
+
+
+def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 255, "", "banner timeout")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(InfrastructureFailure, match="timing replay"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "offline-timing")
+        )
 
 
 def test_concrete_backend_rejects_divergent_reuse_of_timing_replay(tmp_path: Path) -> None:

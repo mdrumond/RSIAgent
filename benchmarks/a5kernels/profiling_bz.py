@@ -23,10 +23,17 @@ from benchmarks.a5kernels.profiling import (
     TimingResult,
     study_dimensions_from_plan,
 )
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 
 
 _TIMING_MARKER = "A5KERNEL_TIMING_US="
 _REMOTE_MARKER = "MSPROF_PROFILE_REMOTE_DIR="
+
+
+def _raise_replay_failure(returncode: int, message: str) -> None:
+    if returncode in {75, 255}:
+        raise InfrastructureFailure(message)
+    raise RuntimeError(message)
 
 
 class BZProfileBackend:
@@ -95,7 +102,8 @@ class BZProfileBackend:
         )
         values = _marked_values(output, _TIMING_MARKER)
         if returncode or len(values) != 1:
-            raise RuntimeError(
+            _raise_replay_failure(
+                returncode,
                 "canonical timing replay failed or returned no unique timing"
             )
         try:
@@ -149,7 +157,9 @@ class BZProfileBackend:
         )
         remote_values = _marked_values(output, _REMOTE_MARKER)
         if returncode or len(remote_values) != 1:
-            raise RuntimeError(f"{command.metric.value} profiling replay failed")
+            _raise_replay_failure(
+                returncode, f"{command.metric.value} profiling replay failed"
+            )
         remote_tree = remote_values[0]
         if not PurePosixPath(remote_tree).is_absolute():
             raise RuntimeError("profiler returned a non-absolute retained tree")
@@ -332,7 +342,9 @@ class BZProfileBackend:
                 timeout=self._timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("profiling subprocess exceeded its timeout") from exc
+            raise InfrastructureFailure(
+                "profiling subprocess exceeded its timeout"
+            ) from exc
 
 
 def _marked_values(output: str, marker: str) -> list[str]:
