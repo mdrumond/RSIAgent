@@ -202,8 +202,8 @@ class CaptureCommand:
     kernel_name: str | None = None
 
     def __post_init__(self) -> None:
-        if self.metric is ProfileMetric.BASIC_INFO and self.kernel_name is not None:
-            raise ValueError("BasicInfo discovers the exported kernel name")
+        if self.kernel_name is not None and not self.kernel_name:
+            raise ValueError("kernel name must be non-empty when supplied")
         if self.metric is ProfileMetric.PIPE_UTILIZATION and not self.kernel_name:
             raise ValueError("PipeUtilization requires an exact kernel name")
 
@@ -384,6 +384,7 @@ class ProfilingTreatmentController:
             request,
             ProfileMetric.BASIC_INFO,
             _replay_id(request, campaign, "basic"),
+            kernel_name=request.expected_kernel,
         )
         basic = self._backend.capture(basic_command)
         self._validate_capture(basic, basic_command)
