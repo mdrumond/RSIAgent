@@ -36,6 +36,7 @@ class BZProfileBackend:
         self,
         *,
         validation_wrapper: str,
+        session_wrapper: str | None = None,
         collection_wrapper: str,
         catlass_source: str,
         evidence_directory: str,
@@ -44,6 +45,12 @@ class BZProfileBackend:
     ) -> None:
         if Path(validation_wrapper).name != "catlass-validation.sh":
             raise ValueError("validation_wrapper must identify catlass-validation.sh")
+        if session_wrapper is None:
+            session_wrapper = str(
+                Path(validation_wrapper).parent / "bz-a5" / "session.sh"
+            )
+        if Path(session_wrapper).name != "session.sh":
+            raise ValueError("session_wrapper must identify session.sh")
         if Path(collection_wrapper).name != "collect_profile.sh":
             raise ValueError("collection_wrapper must identify collect_profile.sh")
         if not PurePosixPath(catlass_source).is_absolute():
@@ -51,6 +58,7 @@ class BZProfileBackend:
         if timeout < 1:
             raise ValueError("timeout must be positive")
         self._validation = validation_wrapper
+        self._session = session_wrapper
         self._collector = collection_wrapper
         self._catlass_source = catlass_source
         self._evidence_directory = Path(evidence_directory)
@@ -82,7 +90,10 @@ class BZProfileBackend:
         completed = self._call(
             self._adapter_argv(command.replay_id, "run", command.request)
         )
-        values = _marked_values(completed.stdout, _TIMING_MARKER)
+        output = self._marker_output(
+            completed, command.replay_id, _TIMING_MARKER
+        )
+        values = _marked_values(output, _TIMING_MARKER)
         if completed.returncode or len(values) != 1:
             raise RuntimeError(
                 "canonical timing replay failed or returned no unique timing"
@@ -94,7 +105,7 @@ class BZProfileBackend:
                 "canonical timing replay returned an invalid duration"
             ) from exc
         evidence_sha256 = self._retain_timing_evidence(
-            command.replay_id, completed.stdout
+            command.replay_id, output
         )
         return duration, evidence_sha256
 
@@ -133,7 +144,8 @@ class BZProfileBackend:
             options += ["--kernel-name", command.kernel_name]
         argv[separator:separator] = options
         completed = self._call(tuple(argv))
-        remote_values = _marked_values(completed.stdout, _REMOTE_MARKER)
+        output = self._marker_output(completed, command.replay_id, _REMOTE_MARKER)
+        remote_values = _marked_values(output, _REMOTE_MARKER)
         if completed.returncode or len(remote_values) != 1:
             raise RuntimeError(f"{command.metric.value} profiling replay failed")
         remote_tree = remote_values[0]
@@ -158,6 +170,21 @@ class BZProfileBackend:
             summary,
             archive,
         )
+
+    def _marker_output(
+        self,
+        completed: subprocess.CompletedProcess[str],
+        replay_id: str,
+        marker: str,
+    ) -> str:
+        """Read workload markers from the retained session when summaries omit them."""
+
+        if completed.returncode or _marked_values(completed.stdout, marker):
+            return completed.stdout
+        logs = self._call(
+            (self._session, "--name", replay_id, "logs", "--lines", "2000")
+        )
+        return logs.stdout if logs.returncode == 0 else completed.stdout
 
     def _adapter_argv(
         self, replay_id: str, action: str, request: ProfileRequest

@@ -733,6 +733,67 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     )
 
 
+def test_concrete_backend_reads_markers_from_retained_session_logs(
+    tmp_path: Path,
+) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        if Path(argv[0]).name == "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 0, "A5KERNEL_TIMING_US=6.25\n", ""
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "CATLASS_VALIDATION_STATE=completed\n",
+            "",
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "retained-timing")
+    )
+
+    assert result.duration_us == 6.25
+    assert calls[-1] == (
+        "/profiles/bz-a5/session.sh",
+        "--name",
+        "retained-timing",
+        "logs",
+        "--lines",
+        "2000",
+    )
+    assert (tmp_path / "retained-timing" / "timing-stdout.txt").read_text() == (
+        "A5KERNEL_TIMING_US=6.25\n"
+    )
+
+
 def test_concrete_backend_rejects_divergent_reuse_of_timing_replay(tmp_path: Path) -> None:
     outputs = iter(("A5KERNEL_TIMING_US=7.5\n", "A5KERNEL_TIMING_US=8.0\n"))
 

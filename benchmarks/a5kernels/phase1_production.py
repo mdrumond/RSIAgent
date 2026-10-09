@@ -338,6 +338,7 @@ def build_phase1_live_dependencies(
     if profile_backend is None:
         profile_backend = BZProfileBackend(
             validation_wrapper=str(paths.validation_wrapper),
+            session_wrapper=str(paths.session_wrapper),
             collection_wrapper=str(paths.collection_wrapper),
             catlass_source=paths.catlass_source,
             evidence_directory=str(paths.results_root / "profile-evidence"),
