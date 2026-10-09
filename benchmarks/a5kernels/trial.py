@@ -230,12 +230,46 @@ _TRIAL_CONTRACTS = {
 }
 
 
-def _trial_instruction(language: str, workload: Workload) -> str:
+def _trial_instruction(
+    language: str,
+    workload: Workload,
+    *,
+    logical_length: int = 32,
+    padded_length: int = 64,
+    block_count: int = 1,
+) -> str:
     contract = _TRIAL_CONTRACTS.get((language, workload))
     if contract is None:
         raise CapabilityUnavailableError(
             f"no executable trial contract for {language}/{workload.value}; "
             "this combination is preregistered for future implementation")
+    if (
+        type(logical_length) is not int
+        or type(padded_length) is not int
+        or type(block_count) is not int
+        or logical_length < 1
+        or padded_length < logical_length
+        or block_count < 1
+    ):
+        raise ValueError("invalid host-owned executable contract dimensions")
+    contract = dict(contract)
+    contract["shape"] = (
+        f"This production case has logical length N = {logical_length}. "
+        f"The host zero-pads inputs to P = {padded_length} elements. Read P from "
+        "gm_a.origin_shape[0]; handle every element of that padded shape. This "
+        "trial does not establish correctness for other logical lengths."
+    )
+    contract["output"] = (
+        "Write gm_c[i] = gm_a[i] + gm_b[i] for 0 <= i < P. Do not mutate "
+        f"inputs. Return no value; the first {logical_length} elements carry "
+        f"logical data, and the host evaluates all {padded_length} output "
+        "elements including the zero-padded tail."
+    )
+    contract["runtime"] = (
+        "The host owns allocation, compilation for A5 (3510), launch with "
+        f"block_num={block_count}, synchronization, and verification. Supply "
+        "only the kernel module, not a run function or host driver."
+    )
     return (
         f"Develop a {language} kernel for the {workload.value} workload. "
         f"Write the complete source to the kernel slot ({_SOURCE_PATHS[language]}). "
@@ -466,3 +500,64 @@ class TrialOrchestrator:
                                workspace, memory, context, ledger.head_sha256)
         finally:
             knowledge.close()
+
+    @staticmethod
+    def run_bound(
+        *,
+        trial_root: Path,
+        request_payload: Mapping[str, object],
+        language: str,
+        workload: Workload,
+        instruction: str,
+        profile,
+        backend: KernelTrialBackend,
+        actor: ActorDriver,
+        knowledge: KnowledgeAgent,
+        profiling: ProfileEvaluation,
+        profiling_guidance: bool,
+        ledger: EvidenceLedger,
+    ) -> TrialResult:
+        """Run one host-bound project without the legacy pilot matrix scheduler.
+
+        The Phase 1 cell registry has its own exact model and treatment identities.
+        This entry point preserves the established restricted action executor while
+        leaving cell selection and durable resume policy to the outer composition.
+        """
+
+        trial_root = Path(trial_root)
+        trial_root.mkdir(parents=True, exist_ok=False)
+        workspace, memory, context = (
+            trial_root / name for name in ("workspace", "memory", "context")
+        )
+        for path in (workspace, memory, context):
+            path.mkdir()
+        ledger.append(EvidenceKind.REQUEST, dict(request_payload))
+        executor = TrialActionExecutor(
+            workspace=workspace,
+            language=language,
+            workload=workload,
+            backend=backend,
+            ledger=ledger,
+            knowledge=knowledge,
+            profiling=profiling,
+            profiling_guidance=profiling_guidance,
+        )
+        outcome = actor(
+            instruction,
+            profile=profile,
+            workspace=workspace,
+            context=context,
+            turn_parser=parse_trial_action,
+            action_executor=executor,
+        )
+        if executor.final_run is None or executor.final_profile is None:
+            raise RuntimeError("Actor ended without a host-verified submit action")
+        return TrialResult(
+            outcome,
+            executor.final_run,
+            executor.final_profile,
+            workspace,
+            memory,
+            context,
+            ledger.head_sha256,
+        )

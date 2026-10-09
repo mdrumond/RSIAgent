@@ -16,11 +16,12 @@ import re
 from typing import Mapping
 
 
-PLAN_SCHEMA = "a5-catlass-phase1-experiment-plan-v1"
+PLAN_SCHEMA = "a5-catlass-phase1-experiment-plan-v2"
 GUIDE_SCHEMA = "catlass-dsl-programming-guide-v1"
 PINNED_CATLASS_REVISION = "9a6ac627b5f4078060287844189730cf0d184800"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_REVISION = re.compile(r"[0-9a-f]{40}")
+PENDING_PROFILER_REASON = "new profiler is not ready"
 
 
 class A5Target(str, Enum):
@@ -44,6 +45,23 @@ class KnowledgeMode(str, Enum):
 class ProfilingGuidance(str, Enum):
     WITHOUT_GUIDANCE = "without-profiling-guidance"
     WITH_GUIDANCE = "with-profiling-guidance"
+    NEW = "new"
+
+
+class TreatmentStatus(str, Enum):
+    READY = "ready"
+    PENDING = "pending"
+
+
+_PROFILING_STATUS = {
+    ProfilingGuidance.WITHOUT_GUIDANCE: TreatmentStatus.READY,
+    ProfilingGuidance.WITH_GUIDANCE: TreatmentStatus.READY,
+    ProfilingGuidance.NEW: TreatmentStatus.PENDING,
+}
+
+
+class PendingTreatmentError(RuntimeError):
+    """Raised before dispatch when a registered treatment is not runnable."""
 
 
 @dataclass(frozen=True)
@@ -201,8 +219,33 @@ class A5Phase1Cell:
             "guide": self.guide.as_dict(),
         }
 
+    @property
+    def status(self) -> TreatmentStatus:
+        return _PROFILING_STATUS[self.profiling]
+
+    @property
+    def runnable(self) -> bool:
+        return self.status is TreatmentStatus.READY
+
     def as_dict(self) -> dict[str, object]:
-        return {"cell_id": self.cell_id, **self.identity_values()}
+        return {
+            "cell_id": self.cell_id,
+            **self.identity_values(),
+            "status": self.status.value,
+        }
+
+
+def admit_runnable_cell(cell: A5Phase1Cell) -> A5Phase1Cell:
+    """Fail closed before a pending treatment can reach a dispatcher."""
+
+    if not isinstance(cell, A5Phase1Cell):
+        raise ValueError("dispatch admission requires an A5Phase1Cell")
+    if not cell.runnable:
+        raise PendingTreatmentError(
+            f"profiling guidance {cell.profiling.value!r} is pending: "
+            f"{PENDING_PROFILER_REASON}"
+        )
+    return cell
 
 
 @dataclass(frozen=True)
@@ -222,8 +265,8 @@ class A5Phase1Plan:
             raise ValueError("plan must use the registered A5 Catlass Phase 1 schema")
         if any(not isinstance(cell, A5Phase1Cell) for cell in self.cells):
             raise ValueError("plan cells must be A5Phase1Cell values")
-        if len(self.cells) != 8 or len({cell.cell_id for cell in self.cells}) != 8:
-            raise ValueError("A5 Phase 1 requires eight unique cells")
+        if len(self.cells) != 12 or len({cell.cell_id for cell in self.cells}) != 12:
+            raise ValueError("A5 Phase 1 requires twelve unique cells")
         if any(cell.guide != self.guide for cell in self.cells):
             raise ValueError("every Phase 1 cell must bind the admitted guide identity")
         expected = build_cells(self.guide)
@@ -241,6 +284,14 @@ class A5Phase1Plan:
 
     def to_json(self) -> str:
         return _canonical_json(self.as_dict()) + "\n"
+
+    @property
+    def runnable_cells(self) -> tuple[A5Phase1Cell, ...]:
+        return tuple(cell for cell in self.cells if cell.runnable)
+
+    @property
+    def pending_cells(self) -> tuple[A5Phase1Cell, ...]:
+        return tuple(cell for cell in self.cells if not cell.runnable)
 
 
 def build_cells(guide: ProgrammingGuideIdentity) -> tuple[A5Phase1Cell, ...]:
@@ -291,9 +342,13 @@ __all__ = [
     "KnowledgeMode",
     "MODEL_IDENTITIES",
     "PINNED_CATLASS_REVISION",
+    "PENDING_PROFILER_REASON",
     "PLAN_SCHEMA",
+    "PendingTreatmentError",
     "ProfilingGuidance",
     "ProgrammingGuideIdentity",
+    "TreatmentStatus",
+    "admit_runnable_cell",
     "admit_programming_guide",
     "build_a5_phase1_plan",
     "build_cells",

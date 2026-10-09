@@ -106,7 +106,7 @@ def run(input_a, input_b):
     artifact = tla.compile(
         vector_add, tla_a, tla_b, tla_out, options="--npu-arch 3510"
     )
-    print("A5KERNEL_NAME=vector_add__kernel0")
+    print("A5KERNEL_NAME=vector_add")
     if os.environ.get("A5KERNEL_COMPILE_ONLY") == "1":
         return [left + right for left, right in zip(input_a, input_b)][:original_length]
     emit_timing = os.environ.get("A5KERNEL_EMIT_TIMING") == "1"

@@ -28,6 +28,7 @@ from benchmarks.a5kernels.profiling import (
     bind_study_dimensions,
 )
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest
 from benchmarks.a5kernels.bz import CommandResult
 from benchmarks.a5kernels.protocol import (
@@ -65,7 +66,7 @@ def archive(metric: str) -> EvidenceArchive:
 REQUEST = ProfileRequest(
     PLAN,
     "catlass",
-    "vector_add__kernel0",
+    "vector_add",
     3,
 )
 CORRECT = VerifiedResult(
@@ -105,7 +106,7 @@ def test_profile_request_binds_to_host_prepared_attempt() -> None:
     request = ProfileRequest.from_execution_plan(
         plan,
         implementation="catlass",
-        expected_kernel="vector_add__kernel0",
+        expected_kernel="vector_add",
         device=3,
     )
 
@@ -124,7 +125,7 @@ def test_profile_request_rejects_foundational_plan_without_runtime() -> None:
         ProfileRequest.from_execution_plan(
             plan,
             implementation="catlass",
-            expected_kernel="vector_add__kernel0",
+            expected_kernel="vector_add",
             device=3,
         )
 
@@ -133,7 +134,7 @@ def test_changed_argv_cannot_reuse_correctness_from_original_plan() -> None:
     changed = ProfileRequest.from_execution_plan(
         replace(PLAN, argv=("python", "other-driver.py")),
         implementation="catlass",
-        expected_kernel="vector_add__kernel0",
+        expected_kernel="vector_add",
         device=3,
     )
 
@@ -193,13 +194,13 @@ def test_treatment_runs_basic_then_exact_bound_pipe_replay() -> None:
     feedback = controller.run_intermediate(CORRECT, REQUEST)
 
     assert feedback is not None
-    assert feedback.kernel_name == "vector_add__kernel0"
+    assert feedback.kernel_name == "vector_add"
     assert [command.metric for command in backend.commands] == [
         ProfileMetric.BASIC_INFO,
         ProfileMetric.PIPE_UTILIZATION,
     ]
-    assert backend.commands[0].kernel_name is None
-    assert backend.commands[1].kernel_name == "vector_add__kernel0"
+    assert backend.commands[0].kernel_name == "vector_add"
+    assert backend.commands[1].kernel_name == "vector_add"
     assert backend.commands[0].replay_id != backend.commands[1].replay_id
 
 
@@ -245,15 +246,15 @@ def _final_replay_ids(request: ProfileRequest) -> tuple[str, ...]:
     return tuple(command.replay_id for command in backend.commands)
 
 
-def test_default_profile_identity_preserves_legacy_golden_values() -> None:
+def test_default_profile_identity_preserves_device_kernel_golden_values() -> None:
     assert REQUEST.block_count is None
     assert REQUEST.configuration_id == (
-        "a995f98acd42f00fd1b3a51fb4bf645e12aa8f9723b338bb8f5da0c9a3b21997"
+        "2cda5a4ebab2e76ad3c84aac08ad237ac618722b9480b24a9776e027037f04bd"
     )
     assert _final_replay_ids(REQUEST) == (
-        "profile-c7b74c5aa1941f9fde61200b11b3d9b2122f8db1292c44aa688997bc50756ae5",
-        "profile-a9a848aedbb429dbe44f5003dacc4f352657f4b124054154465e92aeffc6d3f5",
-        "profile-a3e5e34fbc4e930832c31df545a987ae308fca1f930e07655861ba116161f5a9",
+        "profile-a10aee228045d8c8085b3a49c46ed77d25e565bd2d6176be5679fc59f2ef9507",
+        "profile-595f34c1a6ef3b7857df715ec4cd74d74e457ae2df2097907267acae6321f8c5",
+        "profile-4f242a3361cf0b4590cb9f16fc82f62d568558a8771f92daf1b2ae1e6b8ce10b",
     )
 
 
@@ -386,7 +387,7 @@ def test_basic_info_must_export_expected_kernel_exactly_once() -> None:
         def capture(self, command: CaptureCommand) -> ProfileCapture:
             result = super().capture(command)
             if command.metric is ProfileMetric.BASIC_INFO:
-                return replace(result, exported_kernels=("vector_add",))
+                return replace(result, exported_kernels=("other_kernel",))
             return result
 
     backend = WrongKernelBackend()
@@ -429,10 +430,10 @@ def test_basic_info_must_include_meaningful_summary(summary) -> None:
     "replacement, message",
     [
         ({"exported_kernels": ()}, "exact expected kernel"),
-        ({"exported_kernels": ("vector_add",)}, "exact expected kernel"),
-        ({"exported_kernels": ("vector_add__kernel0",) * 2}, "exact expected kernel"),
+        ({"exported_kernels": ("other_kernel",)}, "exact expected kernel"),
+        ({"exported_kernels": ("vector_add",) * 2}, "exact expected kernel"),
         (
-            {"exported_kernels": ("vector_add__kernel0", "helper_kernel")},
+            {"exported_kernels": ("other_kernel", "helper_kernel")},
             "exact expected kernel",
         ),
         ({"summary": ()}, "meaningful summary"),
@@ -538,7 +539,7 @@ def test_measurements_must_match_execution_and_replay(result_kind, identity) -> 
 
 def _write_compact_archive(destination: Path) -> None:
     basic_data = gzip.compress(
-        b"Kernel Name,Vector Ratio\nvector_add__kernel0,0.75\n", mtime=0
+        b"Kernel Name,Vector Ratio\nvector_add,0.75\n", mtime=0
     )
     pipe_data = gzip.compress(
         b"block_id,sub_block_id,aiv_vec_ratio\n0,vector0,0.75\n", mtime=0
@@ -555,10 +556,12 @@ def _write_compact_archive(destination: Path) -> None:
 
 def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) -> None:
     calls = []
+    collector_environments = []
 
     def run(argv, **kwargs):
         calls.append(tuple(argv))
         if Path(argv[0]).name == "collect_profile.sh":
+            collector_environments.append(kwargs["env"])
             destination = Path(argv[argv.index("--output") + 1])
             destination.mkdir(parents=True, exist_ok=True)
             _write_compact_archive(destination)
@@ -656,7 +659,15 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         "BasicInfo",
         "PipeUtilization",
     ]
-    assert "--kernel-name" not in profile_calls[0]
+    assert all(
+        call[call.index("--expected-catlass-revision") + 1] == "revision"
+        for call in profile_calls
+    )
+    assert all("--application-cwd-home" in call for call in profile_calls)
+    assert all(
+        call[call.index("--kernel-name") + 1] == "vector_add"
+        for call in profile_calls
+    )
     assert (
         profile_calls[1][profile_calls[1].index("--kernel-name") + 1]
         == profiled_request.expected_kernel
@@ -669,6 +680,8 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     assert "--kernel-name" not in collection_calls[1]
     assert "--kernel-name" in collection_calls[2]
     assert "--kernel-name" not in collection_calls[3]
+    assert len(collector_environments) == 4
+    assert all(environment["TLA_ROOT"] == "/" for environment in collector_environments)
 
     class RecordingExecutor:
         runtime_provenance = profiled_plan.runtime_provenance
@@ -731,6 +744,245 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         call[call.index("--operation") + 1].startswith("profile-")
         for call in profile_calls
     )
+
+
+@pytest.mark.parametrize(
+    "exit_code,error_type",
+    [(75, InfrastructureFailure), (255, InfrastructureFailure), (1, RuntimeError)],
+)
+def test_compact_collector_distinguishes_transport_from_semantic_failure(
+    tmp_path: Path, exit_code: int, error_type: type[Exception],
+) -> None:
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, exit_code, "", "collection failed")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    command = CaptureCommand(
+        CampaignKind.FINAL,
+        REQUEST,
+        ProfileMetric.BASIC_INFO,
+        f"collector-exit-{exit_code}",
+    )
+
+    with pytest.raises(error_type, match="compact profile evidence collection"):
+        backend._collect(command, "/retained/profile")
+
+
+def test_concrete_backend_reads_markers_from_retained_session_logs(
+    tmp_path: Path,
+) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        if Path(argv[0]).name == "session.sh":
+            if argv[-1] == "result":
+                return subprocess.CompletedProcess(argv, 0, "SESSION_RESULT=0\n", "")
+            return subprocess.CompletedProcess(
+                argv, 0, "A5KERNEL_TIMING_US=6.25\n", ""
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "CATLASS_VALIDATION_STATE=completed\n",
+            "",
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "retained-timing")
+    )
+
+    assert result.duration_us == 6.25
+    assert calls[-2] == (
+        "/profiles/bz-a5/session.sh",
+        "--name",
+        "retained-timing",
+        "logs",
+        "--lines",
+        "2000",
+    )
+    assert calls[-1] == (
+        "/profiles/bz-a5/session.sh", "--name", "retained-timing", "result",
+    )
+    assert (tmp_path / "retained-timing" / "timing-stdout.txt").read_text() == (
+        "A5KERNEL_TIMING_US=6.25\n"
+    )
+
+
+def test_concrete_backend_recovers_after_timing_observation_timeout(
+    tmp_path: Path,
+) -> None:
+    def run(argv, **kwargs):
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 75, "SESSION_STATE=observation-unavailable\n", ""
+            )
+        if "logs" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A5KERNEL_TIMING_US=9.5\n", ""
+            )
+        return subprocess.CompletedProcess(argv, 0, "SESSION_RESULT=0\n", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "uncertain-timing")
+    )
+
+    assert result.duration_us == 9.5
+
+
+def test_concrete_backend_retries_the_same_retained_timing_observation(
+    tmp_path: Path,
+) -> None:
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal result_calls
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 75, "SESSION_STATE=observation-unavailable\n", ""
+            )
+        if "result" in argv:
+            result_calls += 1
+            return subprocess.CompletedProcess(
+                argv,
+                0 if result_calls == 3 else 75,
+                "SESSION_RESULT=0\n" if result_calls == 3 else "",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0 if result_calls == 2 else 75,
+            "A5KERNEL_TIMING_US=9.5\n" if result_calls == 2 else "",
+            "",
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=3,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "retained-after-outage")
+    )
+
+    assert result.duration_us == 9.5
+    assert result_calls == 3
+    assert sleeps == [120, 120]
+
+
+def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 255, "", "banner timeout")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(InfrastructureFailure, match="timing replay"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "offline-timing")
+        )
 
 
 def test_concrete_backend_rejects_divergent_reuse_of_timing_replay(tmp_path: Path) -> None:

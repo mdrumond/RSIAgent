@@ -15,8 +15,11 @@ from benchmarks.a5kernels.phase1_experiments import (
     MODEL_IDENTITIES,
     PINNED_CATLASS_REVISION,
     PLAN_SCHEMA,
+    PendingTreatmentError,
     ProfilingGuidance,
     ProgrammingGuideIdentity,
+    TreatmentStatus,
+    admit_runnable_cell,
     admit_programming_guide,
     build_a5_phase1_plan,
     build_cells,
@@ -123,7 +126,7 @@ def test_registered_profiles_are_exact_and_deepseek_is_direct():
     assert "openrouter:" not in serialized
 
 
-def test_plan_is_exact_catlass_only_eight_cell_cross_product(tmp_path):
+def test_plan_is_exact_catlass_only_twelve_cell_cross_product(tmp_path):
     plan = build_a5_phase1_plan(
         write_guide(tmp_path / "guide.md"), cpl_skills_revision=CPL_REVISION
     )
@@ -131,7 +134,7 @@ def test_plan_is_exact_catlass_only_eight_cell_cross_product(tmp_path):
     assert plan.schema == PLAN_SCHEMA
     assert plan.target is A5Target.A5
     assert plan.language is A5Language.CATLASS_DSL
-    assert len(plan.cells) == 8
+    assert len(plan.cells) == 12
     assert {
         (cell.model.backend_model, cell.knowledge, cell.profiling)
         for cell in plan.cells
@@ -143,6 +146,15 @@ def test_plan_is_exact_catlass_only_eight_cell_cross_product(tmp_path):
     }
     assert {cell.target for cell in plan.cells} == {A5Target.A5}
     assert {cell.language for cell in plan.cells} == {A5Language.CATLASS_DSL}
+    assert len(plan.runnable_cells) == 8
+    assert len(plan.pending_cells) == 4
+    assert {
+        (cell.profiling, cell.status, cell.runnable) for cell in plan.cells
+    } == {
+        (ProfilingGuidance.WITHOUT_GUIDANCE, TreatmentStatus.READY, True),
+        (ProfilingGuidance.WITH_GUIDANCE, TreatmentStatus.READY, True),
+        (ProfilingGuidance.NEW, TreatmentStatus.PENDING, False),
+    }
 
 
 def test_one_admitted_guide_identity_binds_every_cell(tmp_path):
@@ -184,6 +196,45 @@ def test_cell_ids_are_stable_and_change_with_guide_identity(tmp_path):
         {cell.cell_id for cell in changed}
     )
     assert all(cell.cell_id.startswith("a5-cell-") for cell in first)
+
+
+def test_new_treatment_is_pending_and_fails_before_dispatch(tmp_path):
+    cell = next(
+        cell
+        for cell in build_cells(admitted(tmp_path))
+        if cell.profiling is ProfilingGuidance.NEW
+    )
+    dispatches = []
+
+    def dispatch(candidate):
+        dispatches.append(admit_runnable_cell(candidate))
+
+    with pytest.raises(PendingTreatmentError, match="pending: new profiler"):
+        dispatch(cell)
+
+    assert dispatches == []
+    payload = cell.as_dict()
+    assert payload["profiling"] == "new"
+    assert payload["status"] == "pending"
+
+
+def test_ready_treatments_keep_existing_identity_and_pass_admission(tmp_path):
+    cells = build_cells(admitted(tmp_path))
+    ready = [cell for cell in cells if cell.profiling is not ProfilingGuidance.NEW]
+
+    assert len(ready) == 8
+    assert all(admit_runnable_cell(cell) is cell for cell in ready)
+    assert all(cell.as_dict()["status"] == "ready" for cell in ready)
+    assert [cell.cell_id for cell in ready] == [
+        "a5-cell-33eb4f8487bbc477",
+        "a5-cell-95e087ce908ee6b6",
+        "a5-cell-b0c27c98a9f7d197",
+        "a5-cell-f41ab3e2d72235fc",
+        "a5-cell-8ccdb70257d91f84",
+        "a5-cell-c8e7a4fac1408e3e",
+        "a5-cell-94158efe1d6f2200",
+        "a5-cell-faf4080210856be3",
+    ]
 
 
 def test_treatment_pairs_differ_only_in_declared_dimension(tmp_path):
@@ -229,9 +280,9 @@ def test_model_pairs_differ_only_in_profile_identity(tmp_path):
 def test_plan_rejects_missing_duplicate_or_foreign_cells(tmp_path):
     guide = admitted(tmp_path)
     cells = build_cells(guide)
-    with pytest.raises(ValueError, match="eight unique"):
+    with pytest.raises(ValueError, match="twelve unique"):
         A5Phase1Plan(cells[:-1], guide)
-    with pytest.raises(ValueError, match="eight unique"):
+    with pytest.raises(ValueError, match="twelve unique"):
         A5Phase1Plan((*cells[:-1], cells[0]), guide)
 
     other = admitted(tmp_path / "other", "different guide\n")

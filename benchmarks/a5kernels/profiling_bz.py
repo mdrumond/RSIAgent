@@ -6,9 +6,11 @@ import csv
 import gzip
 import hashlib
 import io
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
+import time
 from typing import Callable
 
 from benchmarks.a5kernels.profiling import (
@@ -23,10 +25,17 @@ from benchmarks.a5kernels.profiling import (
     TimingResult,
     study_dimensions_from_plan,
 )
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 
 
 _TIMING_MARKER = "A5KERNEL_TIMING_US="
 _REMOTE_MARKER = "MSPROF_PROFILE_REMOTE_DIR="
+
+
+def _raise_replay_failure(returncode: int, message: str) -> None:
+    if returncode in {75, 255}:
+        raise InfrastructureFailure(message)
+    raise RuntimeError(message)
 
 
 class BZProfileBackend:
@@ -36,26 +45,45 @@ class BZProfileBackend:
         self,
         *,
         validation_wrapper: str,
+        session_wrapper: str | None = None,
         collection_wrapper: str,
         catlass_source: str,
         evidence_directory: str,
         process_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout: int = 600,
+        observation_retries: int = 0,
+        observation_backoff_seconds: float = 0,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if Path(validation_wrapper).name != "catlass-validation.sh":
             raise ValueError("validation_wrapper must identify catlass-validation.sh")
+        if session_wrapper is None:
+            session_wrapper = str(
+                Path(validation_wrapper).parent / "bz-a5" / "session.sh"
+            )
+        if Path(session_wrapper).name != "session.sh":
+            raise ValueError("session_wrapper must identify session.sh")
         if Path(collection_wrapper).name != "collect_profile.sh":
             raise ValueError("collection_wrapper must identify collect_profile.sh")
         if not PurePosixPath(catlass_source).is_absolute():
             raise ValueError("catlass_source must be an absolute retained BZ path")
         if timeout < 1:
             raise ValueError("timeout must be positive")
+        if observation_retries < 0:
+            raise ValueError("observation_retries cannot be negative")
+        if observation_backoff_seconds < 0:
+            raise ValueError("observation_backoff_seconds cannot be negative")
         self._validation = validation_wrapper
+        self._tla_root = str(Path(validation_wrapper).parent.parent)
+        self._session = session_wrapper
         self._collector = collection_wrapper
         self._catlass_source = catlass_source
         self._evidence_directory = Path(evidence_directory)
         self._run = process_runner
         self._timeout = timeout
+        self._observation_retries = observation_retries
+        self._observation_backoff_seconds = observation_backoff_seconds
+        self._sleep = sleeper
 
     def time(self, command: TimingCommand) -> TimingResult:
         duration, _evidence_sha256 = self._timing_replay(command)
@@ -82,9 +110,13 @@ class BZProfileBackend:
         completed = self._call(
             self._adapter_argv(command.replay_id, "run", command.request)
         )
-        values = _marked_values(completed.stdout, _TIMING_MARKER)
-        if completed.returncode or len(values) != 1:
-            raise RuntimeError(
+        output, returncode = self._marker_result(
+            completed, command.replay_id, _TIMING_MARKER
+        )
+        values = _marked_values(output, _TIMING_MARKER)
+        if returncode or len(values) != 1:
+            _raise_replay_failure(
+                returncode,
                 "canonical timing replay failed or returned no unique timing"
             )
         try:
@@ -94,7 +126,7 @@ class BZProfileBackend:
                 "canonical timing replay returned an invalid duration"
             ) from exc
         evidence_sha256 = self._retain_timing_evidence(
-            command.replay_id, completed.stdout
+            command.replay_id, output
         )
         return duration, evidence_sha256
 
@@ -120,6 +152,9 @@ class BZProfileBackend:
         options = [
             "--device",
             str(request.device),
+            "--expected-catlass-revision",
+            dict(request.plan.runtime_provenance)["catlass_revision"],
+            "--application-cwd-home",
             "--metric",
             command.metric.value,
             "--warm-up",
@@ -133,9 +168,14 @@ class BZProfileBackend:
             options += ["--kernel-name", command.kernel_name]
         argv[separator:separator] = options
         completed = self._call(tuple(argv))
-        remote_values = _marked_values(completed.stdout, _REMOTE_MARKER)
-        if completed.returncode or len(remote_values) != 1:
-            raise RuntimeError(f"{command.metric.value} profiling replay failed")
+        output, returncode = self._marker_result(
+            completed, command.replay_id, _REMOTE_MARKER
+        )
+        remote_values = _marked_values(output, _REMOTE_MARKER)
+        if returncode or len(remote_values) != 1:
+            _raise_replay_failure(
+                returncode, f"{command.metric.value} profiling replay failed"
+            )
         remote_tree = remote_values[0]
         if not PurePosixPath(remote_tree).is_absolute():
             raise RuntimeError("profiler returned a non-absolute retained tree")
@@ -158,6 +198,36 @@ class BZProfileBackend:
             summary,
             archive,
         )
+
+    def _marker_result(
+        self,
+        completed: subprocess.CompletedProcess[str],
+        replay_id: str,
+        marker: str,
+    ) -> tuple[str, int]:
+        """Recover workload markers and terminal status from the retained session."""
+
+        if _marked_values(completed.stdout, marker):
+            return completed.stdout, completed.returncode
+        retries = (
+            self._observation_retries
+            if completed.returncode in {75, 255}
+            else 0
+        )
+        for attempt in range(retries + 1):
+            logs = self._call(
+                (self._session, "--name", replay_id, "logs", "--lines", "2000")
+            )
+            result = self._call((self._session, "--name", replay_id, "result"))
+            if (
+                logs.returncode == 0
+                and result.returncode == 0
+                and _marked_values(logs.stdout, marker)
+            ):
+                return logs.stdout, 0
+            if attempt < retries:
+                self._sleep(self._observation_backoff_seconds)
+        return completed.stdout, completed.returncode
 
     def _adapter_argv(
         self, replay_id: str, action: str, request: ProfileRequest
@@ -272,8 +342,14 @@ class BZProfileBackend:
             argv += ["--kernel-name", request.expected_kernel]
         if implementation == "dsl":
             argv += ["--catlass-src", self._catlass_source]
-        completed = self._call(tuple(argv))
+        completed = self._call(
+            tuple(argv), extra_environment={"TLA_ROOT": self._tla_root}
+        )
         archive_path = destination / "ascend-profile-summary.tar.gz"
+        if completed.returncode in {75, 255}:
+            raise InfrastructureFailure(
+                "compact profile evidence collection transport was unavailable"
+            )
         if completed.returncode or not archive_path.is_file():
             raise RuntimeError("compact profile evidence collection failed")
         data = archive_path.read_bytes()
@@ -286,7 +362,15 @@ class BZProfileBackend:
             _archive_entries(data),
         )
 
-    def _call(self, argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    def _call(
+        self,
+        argv: tuple[str, ...],
+        *,
+        extra_environment: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = None
+        if extra_environment is not None:
+            environment = {**os.environ, **extra_environment}
         try:
             return self._run(
                 argv,
@@ -294,9 +378,12 @@ class BZProfileBackend:
                 capture_output=True,
                 check=False,
                 timeout=self._timeout,
+                env=environment,
             )
         except subprocess.TimeoutExpired as exc:
-            raise RuntimeError("profiling subprocess exceeded its timeout") from exc
+            raise InfrastructureFailure(
+                "profiling subprocess exceeded its timeout"
+            ) from exc
 
 
 def _marked_values(output: str, marker: str) -> list[str]:
