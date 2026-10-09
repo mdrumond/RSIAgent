@@ -59,11 +59,31 @@ from config.runtime_paths import resolve_env_file
 def _require_host_verification(verified) -> None:
     if verified.passed:
         return
-    if verified.exit_code == 255 and verified.session_handle is None:
+    if verified.exit_code in {75, 255}:
         raise InfrastructureFailure(
             "A5 candidate verification transport was unavailable"
         )
     raise RuntimeError("submitted A5 candidate did not pass host verification")
+
+
+def _require_semantic_recovery_failure(*, passed, exit_code, label: str) -> None:
+    """Admit only a real compiler/runtime result as recovery evidence."""
+
+    if label not in {"compile", "runtime"} or type(exit_code) is not int:
+        raise RuntimeError(f"registered {label}-recovery starter was not observed")
+    if exit_code in {75, 255}:
+        raise InfrastructureFailure(
+            f"A5 {label} recovery observation transport was unavailable"
+        )
+    intended_failure = (
+        passed is False
+        and (
+            (label == "compile" and exit_code != 0)
+            or (label == "runtime" and exit_code == 0)
+        )
+    )
+    if not intended_failure:
+        raise RuntimeError(f"registered {label}-recovery starter did not fail")
 
 
 def load_direct_environment(
@@ -108,6 +128,7 @@ class ProductionProjectExecutor:
         profiling_guidance: str | None,
         ledger: EvidenceLedger,
     ) -> Phase1ProjectMemory:
+        project_entry_start = len(ledger.entries)
         backend = runtime.backend(self.execution_backend, device=self.device)
         recovery = self._run_recovery_starter(request, runtime, backend, ledger)
         profiling = CandidateProfileEvaluation(
@@ -118,7 +139,9 @@ class ProductionProjectExecutor:
             device=self.device,
         )
         attempt = self._next_attempt(request.memory_path)
-        instruction = self._instruction(request, profiling_guidance, recovery)
+        instruction = self._instruction(
+            request, runtime, profiling_guidance, recovery
+        )
         trial = TrialOrchestrator.run_bound(
             trial_root=attempt,
             request_payload={
@@ -160,7 +183,7 @@ class ProductionProjectExecutor:
         facts.extend(self._performance_facts(request, runtime, trial, ledger))
         source = (trial.workspace / "kernel.py").read_bytes()
         actions = tuple(
-            entry.payload["action"] for entry in ledger.entries
+            entry.payload["action"] for entry in ledger.entries[project_entry_start:]
             if entry.kind == EvidenceKind.ACTION.value
             and isinstance(entry.payload.get("action"), str)
         )
@@ -183,16 +206,21 @@ class ProductionProjectExecutor:
         attempt_id = f"{request.cell.cell_id[:24]}-p{request.ordinal}-recovery"
         if recovery.required_evidence is RecoveryEvidence.COMPILE_FAILURE:
             result = dict(backend.compile(root, "catlass-dsl", attempt_id))
-            if result.get("passed") is not False:
-                raise RuntimeError("registered compile-recovery starter did not fail")
+            _require_semantic_recovery_failure(
+                passed=result.get("passed"), exit_code=result.get("exit_code"),
+                label="compile",
+            )
             evidence = result.get("attestation_sha256")
             stage = "compile"
         else:
             candidate = backend.run(
                 root, "catlass-dsl", Workload.SMOKE_VECTOR_ADD, attempt_id, ledger,
             )
-            if candidate.verified.passed:
-                raise RuntimeError("registered runtime-recovery starter did not fail")
+            _require_semantic_recovery_failure(
+                passed=candidate.verified.passed,
+                exit_code=candidate.verified.exit_code,
+                label="runtime",
+            )
             evidence = candidate.verified.evidence_sha256
             stage = "host-verification"
         ledger.append(EvidenceKind.RESULT, {
@@ -246,9 +274,15 @@ class ProductionProjectExecutor:
         )]
 
     @staticmethod
-    def _instruction(request, profiling_guidance, recovery):
+    def _instruction(request, runtime, profiling_guidance, recovery):
         sections = [
-            _trial_instruction("catlass-dsl", Workload.SMOKE_VECTOR_ADD),
+            _trial_instruction(
+                "catlass-dsl",
+                Workload.SMOKE_VECTOR_ADD,
+                logical_length=runtime.logical_length,
+                padded_length=runtime.padded_length,
+                block_count=runtime.block_count,
+            ),
             "Pinned programming guide:\n" + request.guide_text,
             "Registered project:\n" + json.dumps(
                 request.proposal.as_dict(), sort_keys=True, separators=(",", ":")

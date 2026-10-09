@@ -19,6 +19,7 @@ from benchmarks.a5kernels.phase1_experiments import (
 from benchmarks.a5kernels.phase1_production import (
     ProductionProjectExecutor,
     _require_host_verification,
+    _require_semantic_recovery_failure,
     build_phase1_live_dependencies,
     load_direct_environment,
 )
@@ -45,16 +46,53 @@ ENVIRONMENT = {
 }
 
 
-def test_transport_failure_during_final_verification_is_retryable():
+@pytest.mark.parametrize("exit_code", [75, 255])
+@pytest.mark.parametrize("session_handle", [None, "bz-a5:retained"])
+def test_transport_failure_during_final_verification_is_retryable(
+    exit_code, session_handle,
+):
     with pytest.raises(InfrastructureFailure, match="transport"):
         _require_host_verification(SimpleNamespace(
-            passed=False, exit_code=255, session_handle=None,
+            passed=False, exit_code=exit_code, session_handle=session_handle,
         ))
 
     with pytest.raises(RuntimeError, match="did not pass host"):
         _require_host_verification(SimpleNamespace(
             passed=False, exit_code=1, session_handle="bz-a5:completed",
         ))
+
+
+@pytest.mark.parametrize("exit_code", [75, 255])
+def test_recovery_starters_reject_unavailable_transport(exit_code):
+    with pytest.raises(InfrastructureFailure, match="recovery observation transport"):
+        _require_semantic_recovery_failure(
+            passed=False, exit_code=exit_code, label="compile"
+        )
+
+
+def test_recovery_starters_accept_only_semantic_failures():
+    _require_semantic_recovery_failure(
+        passed=False, exit_code=1, label="compile"
+    )
+    _require_semantic_recovery_failure(
+        passed=False, exit_code=0, label="runtime"
+    )
+    with pytest.raises(RuntimeError, match="did not fail"):
+        _require_semantic_recovery_failure(
+            passed=True, exit_code=0, label="runtime"
+        )
+    with pytest.raises(RuntimeError, match="did not fail"):
+        _require_semantic_recovery_failure(
+            passed=False, exit_code=0, label="compile"
+        )
+    with pytest.raises(RuntimeError, match="did not fail"):
+        _require_semantic_recovery_failure(
+            passed=False, exit_code=1, label="runtime"
+        )
+    with pytest.raises(RuntimeError, match="was not observed"):
+        _require_semantic_recovery_failure(
+            passed=False, exit_code=None, label="compile"
+        )
 
 
 def test_direct_credentials_load_from_the_explicit_secret_file(tmp_path):
@@ -204,12 +242,14 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         journal=ProgressiveMemoryJournal(memory_path / "knowledge.jsonl"),
     )
 
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    ledger.append("action", {"action": "previous-project-action"})
     memory = executor(
         request,
         Phase1ProjectRuntime.from_proposal(proposal),
         knowledge,
         guidance,
-        EvidenceLedger(tmp_path / "evidence.jsonl"),
+        ledger,
     )
 
     assert memory.host_facts[0].category == "host-verification"
@@ -217,6 +257,27 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     instruction = provider_calls[0]["request"]["messages"][1]["content"]
     assert ("Profiling guidance:" in instruction) == (guidance is not None)
+    assert "previous-project-action" not in memory.actions
+
+
+def test_project_instruction_uses_registered_runtime_dimensions():
+    proposal = next(
+        item for item in DEFAULT_PROPOSALS
+        if item.family.value == "padded-multitile"
+    )
+    runtime = Phase1ProjectRuntime.from_proposal(proposal)
+    request = SimpleNamespace(
+        guide_text="guide", proposal=proposal, memory_context="memory"
+    )
+
+    instruction = ProductionProjectExecutor._instruction(
+        request, runtime, None, None
+    )
+
+    assert "logical length N = 400" in instruction
+    assert "zero-pads inputs to P = 448" in instruction
+    assert "first 400 elements" in instruction
+    assert "all 448 output elements" in instruction
 
 
 def test_cli_plan_run_resume_and_report_use_the_bound_dependencies(tmp_path, capsys):

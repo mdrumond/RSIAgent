@@ -746,6 +746,34 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     )
 
 
+@pytest.mark.parametrize(
+    "exit_code,error_type",
+    [(75, InfrastructureFailure), (255, InfrastructureFailure), (1, RuntimeError)],
+)
+def test_compact_collector_distinguishes_transport_from_semantic_failure(
+    tmp_path: Path, exit_code: int, error_type: type[Exception],
+) -> None:
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, exit_code, "", "collection failed")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    command = CaptureCommand(
+        CampaignKind.FINAL,
+        REQUEST,
+        ProfileMetric.BASIC_INFO,
+        f"collector-exit-{exit_code}",
+    )
+
+    with pytest.raises(error_type, match="compact profile evidence collection"):
+        backend._collect(command, "/retained/profile")
+
+
 def test_concrete_backend_reads_markers_from_retained_session_logs(
     tmp_path: Path,
 ) -> None:

@@ -346,6 +346,10 @@ class BZProfileBackend:
             tuple(argv), extra_environment={"TLA_ROOT": self._tla_root}
         )
         archive_path = destination / "ascend-profile-summary.tar.gz"
+        if completed.returncode in {75, 255}:
+            raise InfrastructureFailure(
+                "compact profile evidence collection transport was unavailable"
+            )
         if completed.returncode or not archive_path.is_file():
             raise RuntimeError("compact profile evidence collection failed")
         data = archive_path.read_bytes()

@@ -230,12 +230,46 @@ _TRIAL_CONTRACTS = {
 }
 
 
-def _trial_instruction(language: str, workload: Workload) -> str:
+def _trial_instruction(
+    language: str,
+    workload: Workload,
+    *,
+    logical_length: int = 32,
+    padded_length: int = 64,
+    block_count: int = 1,
+) -> str:
     contract = _TRIAL_CONTRACTS.get((language, workload))
     if contract is None:
         raise CapabilityUnavailableError(
             f"no executable trial contract for {language}/{workload.value}; "
             "this combination is preregistered for future implementation")
+    if (
+        type(logical_length) is not int
+        or type(padded_length) is not int
+        or type(block_count) is not int
+        or logical_length < 1
+        or padded_length < logical_length
+        or block_count < 1
+    ):
+        raise ValueError("invalid host-owned executable contract dimensions")
+    contract = dict(contract)
+    contract["shape"] = (
+        f"This production case has logical length N = {logical_length}. "
+        f"The host zero-pads inputs to P = {padded_length} elements. Read P from "
+        "gm_a.origin_shape[0]; handle every element of that padded shape. This "
+        "trial does not establish correctness for other logical lengths."
+    )
+    contract["output"] = (
+        "Write gm_c[i] = gm_a[i] + gm_b[i] for 0 <= i < P. Do not mutate "
+        f"inputs. Return no value; the first {logical_length} elements carry "
+        f"logical data, and the host evaluates all {padded_length} output "
+        "elements including the zero-padded tail."
+    )
+    contract["runtime"] = (
+        "The host owns allocation, compilation for A5 (3510), launch with "
+        f"block_num={block_count}, synchronization, and verification. Supply "
+        "only the kernel module, not a run function or host driver."
+    )
     return (
         f"Develop a {language} kernel for the {workload.value} workload. "
         f"Write the complete source to the kernel slot ({_SOURCE_PATHS[language]}). "

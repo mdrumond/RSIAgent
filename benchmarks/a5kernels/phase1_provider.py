@@ -108,6 +108,16 @@ class DirectCompletion:
 Transport = Callable[..., DirectCompletion]
 
 
+def _is_openai_transport_failure(exc: Exception) -> bool:
+    """Recognize optional OpenAI SDK connection failures when it is installed."""
+
+    try:
+        from openai import APIConnectionError, APITimeoutError
+    except ImportError:
+        return False
+    return isinstance(exc, (APIConnectionError, APITimeoutError))
+
+
 def openai_compatible_transport(*, base_url, api_key, request) -> DirectCompletion:
     from openai import OpenAI
 
@@ -164,6 +174,7 @@ class DirectCompletionProvider:
             status = getattr(exc, "status_code", None)
             retryable = (
                 isinstance(exc, (ConnectionError, TimeoutError))
+                or _is_openai_transport_failure(exc)
                 or status in {408, 409, 425, 429}
                 or isinstance(status, int) and 500 <= status <= 599
             )

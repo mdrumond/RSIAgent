@@ -189,6 +189,31 @@ def test_retryable_provider_failures_use_the_shared_infrastructure_signal(failur
         provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
 
 
+@pytest.mark.parametrize("exception_name", ["APIConnectionError", "APITimeoutError"])
+def test_openai_sdk_transport_failures_use_infrastructure_signal(
+    monkeypatch, exception_name,
+):
+    class APIConnectionError(Exception):
+        pass
+
+    class APITimeoutError(Exception):
+        pass
+
+    sdk = SimpleNamespace(
+        APIConnectionError=APIConnectionError,
+        APITimeoutError=APITimeoutError,
+    )
+    monkeypatch.setitem(sys.modules, "openai", sdk)
+    failure = getattr(sdk, exception_name)("provider unavailable")
+
+    def transport(**_kwargs):
+        raise failure
+
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport)
+    with pytest.raises(InfrastructureFailure, match="provider transport"):
+        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
+
+
 def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations():
     calls = []
     provider = _scripted_provider([
