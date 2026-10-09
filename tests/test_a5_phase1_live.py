@@ -92,7 +92,7 @@ def test_registry_has_six_independent_agents_and_eighteen_contract_tasks():
     }
 
 
-def test_dry_run_binds_one_guide_to_gate_and_all_eight_cells():
+def test_dry_run_separates_eight_runnable_and_four_pending_cells():
     manifest = dry_run_manifest(GUIDE)
     encoded = json.dumps(manifest, sort_keys=True)
 
@@ -103,6 +103,15 @@ def test_dry_run_binds_one_guide_to_gate_and_all_eight_cells():
         "max_retries": 3, "backoff_seconds": 120,
     }
     assert len(manifest["phase1"]["cells"]) == 8
+    assert len(manifest["phase1"]["pending_treatment_cells"]) == 4
+    assert {
+        cell["profiling"]
+        for cell in manifest["phase1"]["pending_treatment_cells"]
+    } == {"new"}
+    assert {
+        cell["status"]
+        for cell in manifest["phase1"]["pending_treatment_cells"]
+    } == {"pending"}
     assert {
         cell["guide"]["guide_sha256"]
         for cell in manifest["phase1"]["cells"]
@@ -129,6 +138,7 @@ def test_complete_gate_runs_every_contract_twice_and_admits_phase1():
     manifest = phase1_manifest(GUIDE, report)
     assert manifest["status"] == "ready"
     assert len(manifest["pending_cells"]) == 8
+    assert len(manifest["pending_treatment_cells"]) == 4
 
 
 def test_semantic_failure_gets_at_most_three_source_revisions():
@@ -247,5 +257,23 @@ def test_phase1_manifest_resume_excludes_only_registered_completed_cells():
     assert manifest["status"] == "ready"
     assert manifest["completed_cells"] == [cells[0].cell_id]
     assert len(manifest["pending_cells"]) == 7
+    assert len(manifest["pending_treatment_cells"]) == 4
     with pytest.raises(ValueError, match="registered"):
         phase1_manifest(GUIDE, report, completed_cell_ids=["a5-cell-unknown"])
+    pending = next(cell for cell in cells if not cell.runnable)
+    with pytest.raises(ValueError, match="registered runnable"):
+        phase1_manifest(GUIDE, report, completed_cell_ids=[pending.cell_id])
+
+
+def test_phase1_manifest_completion_counts_only_runnable_cells():
+    report = Phase1GateRunner(
+        GUIDE, PassingHarness(), provider, sleep=lambda _: None,
+    ).run()
+    runnable = [cell.cell_id for cell in build_cells(GUIDE) if cell.runnable]
+
+    manifest = phase1_manifest(GUIDE, report, completed_cell_ids=runnable)
+
+    assert manifest["status"] == "complete-with-pending-treatments"
+    assert manifest["completed_cells"] == runnable
+    assert manifest["pending_cells"] == []
+    assert len(manifest["pending_treatment_cells"]) == 4

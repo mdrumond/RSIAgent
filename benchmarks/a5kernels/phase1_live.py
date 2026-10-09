@@ -19,6 +19,7 @@ from benchmarks.a5kernels.catlass_harness import (
 from benchmarks.a5kernels.phase1_experiments import (
     A5ModelIdentity,
     MODEL_IDENTITIES,
+    PENDING_PROFILER_REASON,
     ProgrammingGuideIdentity,
     build_cells,
 )
@@ -256,8 +257,10 @@ class Phase1GateRunner:
 
 def dry_run_manifest(guide: ProgrammingGuideIdentity) -> dict[str, object]:
     cells = build_cells(guide)
+    runnable = tuple(cell for cell in cells if cell.runnable)
+    pending = tuple(cell for cell in cells if not cell.runnable)
     return {
-        "schema": "a5-catlass-phase1-dry-run-v1",
+        "schema": "a5-catlass-phase1-dry-run-v2",
         "guide": guide.as_dict(),
         "qualification": {
             "agents": [item.as_dict() for item in qualification_agents()],
@@ -270,7 +273,13 @@ def dry_run_manifest(guide: ProgrammingGuideIdentity) -> dict[str, object]:
                 "backoff_seconds": BACKOFF_SECONDS,
             },
         },
-        "phase1": {"cells": [cell.as_dict() for cell in cells]},
+        "phase1": {
+            "cells": [cell.as_dict() for cell in runnable],
+            "pending_treatment_cells": [
+                {**cell.as_dict(), "reason": PENDING_PROFILER_REASON}
+                for cell in pending
+            ],
+        },
     }
 
 
@@ -345,18 +354,28 @@ def phase1_manifest(
         raise ValueError("a complete Phase 1 qualification gate is required")
     require_gate(report, guide)
     cells = build_cells(guide)
+    runnable = tuple(cell for cell in cells if cell.runnable)
+    pending_treatments = tuple(cell for cell in cells if not cell.runnable)
     completed = tuple(completed_cell_ids)
-    registered = {cell.cell_id for cell in cells}
+    registered = {cell.cell_id for cell in runnable}
     if len(set(completed)) != len(completed) or not set(completed) <= registered:
-        raise ValueError("completed cell IDs must be unique registered Phase 1 cells")
+        raise ValueError(
+            "completed cell IDs must be unique registered runnable Phase 1 cells"
+        )
+    complete = len(completed) == len(runnable)
     return {
-        "schema": "a5-catlass-phase1-live-manifest-v1",
-        "status": "ready" if len(completed) < len(cells) else "complete",
+        "schema": "a5-catlass-phase1-live-manifest-v2",
+        "status": "complete-with-pending-treatments" if complete else "ready",
         "guide": guide.as_dict(),
         "qualification_sha256": report.report_sha256,
         "completed_cells": list(completed),
         "pending_cells": [
-            cell.as_dict() for cell in cells if cell.cell_id not in set(completed)
+            cell.as_dict() for cell in runnable
+            if cell.cell_id not in set(completed)
+        ],
+        "pending_treatment_cells": [
+            {**cell.as_dict(), "reason": PENDING_PROFILER_REASON}
+            for cell in pending_treatments
         ],
     }
 

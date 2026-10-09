@@ -234,7 +234,8 @@ def test_cli_plan_run_resume_and_report_use_the_bound_dependencies(tmp_path, cap
     ]
     assert run_a5_phase1.main(["run", *runtime], dependency_builder=builder) == 0
     completed = json.loads(capsys.readouterr().out)
-    assert completed["status"] == "complete"
+    assert completed["status"] == "complete-with-pending-treatments"
+    assert len(completed["pending_treatment_cells"]) == 4
     assert len(completed["records"]) == 8
     assert len(calls) == 64
 
@@ -254,7 +255,8 @@ def test_cli_plan_run_resume_and_report_use_the_bound_dependencies(tmp_path, cap
         ["run", *smoke_runtime], dependency_builder=smoke_builder
     ) == 0
     smoke = json.loads(capsys.readouterr().out)
-    assert smoke["status"] == "complete"
+    assert smoke["status"] == "complete-with-pending-treatments"
+    assert len(smoke["pending_treatment_cells"]) == 4
     assert len(smoke["records"]) == len(smoke_calls) == 8
     assert {call["ordinal"] for call in smoke_calls} == {1}
 

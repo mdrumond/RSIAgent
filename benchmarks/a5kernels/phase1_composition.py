@@ -25,6 +25,7 @@ from benchmarks.a5kernels.knowledge_agent import (
 from benchmarks.a5kernels.phase1_experiments import (
     A5Phase1Cell,
     KnowledgeMode,
+    PENDING_PROFILER_REASON,
     ProfilingGuidance,
     ProgrammingGuideIdentity,
     build_cells,
@@ -89,10 +90,14 @@ class CellDisposition:
         return cls(CellExecutionStatus.PENDING, reason)
 
 
-def runnable_cell(_cell: A5Phase1Cell) -> CellDisposition:
-    """Default policy seam; registered treatments are runnable unless gated."""
+def runnable_cell(cell: A5Phase1Cell) -> CellDisposition:
+    """Apply the registry readiness decision before treatment dependencies."""
 
-    return CellDisposition.runnable()
+    return (
+        CellDisposition.runnable()
+        if cell.runnable
+        else CellDisposition.pending(PENDING_PROFILER_REASON)
+    )
 
 
 @dataclass(frozen=True)
@@ -133,7 +138,7 @@ class LiveDependencies:
 
 
 class Phase1CellComposition:
-    """Execute and durably resume the complete qualified eight-cell registry."""
+    """Execute runnable cells and report pending registered treatments."""
 
     def __init__(
         self,
@@ -180,7 +185,10 @@ class Phase1CellComposition:
         self.dependencies = dependencies
         self.proposals = canonical
         self.cells = build_cells(guide)
-        dispositions = tuple(cell_disposition(cell) for cell in self.cells)
+        dispositions = tuple(
+            runnable_cell(cell) if not cell.runnable else cell_disposition(cell)
+            for cell in self.cells
+        )
         if any(not isinstance(item, CellDisposition) for item in dispositions):
             raise TypeError("cell_disposition must return CellDisposition values")
         self._cell_dispositions = dict(zip(self.cells, dispositions, strict=True))
@@ -222,7 +230,9 @@ class Phase1CellComposition:
                 "max_retries": MAX_INFRASTRUCTURE_RETRIES,
                 "backoff_seconds": BACKOFF_SECONDS,
             },
-            "cells": [cell.as_dict() for cell in self.cells],
+            "cells": [
+                cell.as_dict() for cell in self.cells if self._is_runnable(cell)
+            ],
             "projects": dry_run_plan(self.proposals)["projects"],
         }
         pending = self._pending_treatment_cells()
@@ -279,9 +289,9 @@ class Phase1CellComposition:
     def _is_runnable(self, cell: A5Phase1Cell) -> bool:
         return self._cell_dispositions[cell].status is CellExecutionStatus.RUNNABLE
 
-    def _pending_treatment_cells(self) -> list[dict[str, str]]:
+    def _pending_treatment_cells(self) -> list[dict[str, object]]:
         return [
-            {"cell_id": cell.cell_id, "reason": disposition.reason or ""}
+            {**cell.as_dict(), "reason": disposition.reason or ""}
             for cell in self.cells
             if (disposition := self._cell_dispositions[cell]).status
             is CellExecutionStatus.PENDING

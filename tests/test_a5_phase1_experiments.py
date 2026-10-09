@@ -209,7 +209,7 @@ def test_new_treatment_is_pending_and_fails_before_dispatch(tmp_path):
     def dispatch(candidate):
         dispatches.append(admit_runnable_cell(candidate))
 
-    with pytest.raises(PendingTreatmentError, match="pending until the new profiler"):
+    with pytest.raises(PendingTreatmentError, match="pending: new profiler"):
         dispatch(cell)
 
     assert dispatches == []

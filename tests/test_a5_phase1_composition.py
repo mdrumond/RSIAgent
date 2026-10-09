@@ -149,6 +149,8 @@ def test_plan_is_deterministic_and_binds_gate_guide_profiles_and_retry_policy(tm
     assert first["guide"] == guide.as_dict()
     assert first["qualification_sha256"] == report.report_sha256
     assert len(first["cells"]) == 8
+    assert len(first["pending_treatment_cells"]) == 4
+    assert {row["profiling"] for row in first["pending_treatment_cells"]} == {"new"}
     assert first["infrastructure_retry"] == {
         "max_retries": 3, "backoff_seconds": 120,
     }
@@ -197,7 +199,8 @@ def test_all_eight_cells_isolate_treatments_checkpoint_and_resume(tmp_path):
     assert composition.resume() == records
     assert len(calls) == call_count
     summary = composition.report()
-    assert summary["status"] == "complete"
+    assert summary["status"] == "complete-with-pending-treatments"
+    assert len(summary["pending_treatment_cells"]) == 4
     assert summary["qualification_sha256"] == report.report_sha256
     assert [record["cell_id"] for record in summary["records"]] == [
         cell["cell_id"] for cell in composition.plan()["cells"]
@@ -255,12 +258,36 @@ def test_pending_cells_are_reported_before_any_treatment_dependency_dispatch(tmp
     assert len(records) == len(calls) == 4
     assert len(knowledge_calls) == 2
     assert summary["status"] == "complete-with-pending-treatments"
-    assert len(pending) == 4
+    assert len(pending) == 8
     assert {row["reason"] for row in pending} == {"new profiler is not ready"}
     assert {row["cell_id"] for row in pending}.isdisjoint(
         {call["cell"] for call in calls}
     )
     assert summary["pending_cell_ids"] == []
+
+
+def test_registered_new_profiler_cells_are_pending_by_default(tmp_path):
+    guide_path, guide, report = _guide_and_report(tmp_path)
+    calls = []
+    composition = Phase1CellComposition.one_project_smoke(
+        tmp_path / "run",
+        guide_path,
+        guide,
+        report,
+        _dependencies(tmp_path / "deps", calls),
+        sleeper=lambda _seconds: None,
+    )
+
+    records = composition.run()
+    summary = composition.report()
+
+    assert len(records) == 8
+    assert len(calls) == 8
+    assert sum(call["knowledge"] for call in calls) == 4
+    assert len(summary["pending_treatment_cells"]) == 4
+    assert {
+        row["profiling"] for row in summary["pending_treatment_cells"]
+    } == {"new"}
 
 
 def test_project_boundary_resume_and_three_120_second_infrastructure_retries(tmp_path):

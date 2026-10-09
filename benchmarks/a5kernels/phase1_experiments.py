@@ -21,6 +21,7 @@ GUIDE_SCHEMA = "catlass-dsl-programming-guide-v1"
 PINNED_CATLASS_REVISION = "9a6ac627b5f4078060287844189730cf0d184800"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _GIT_REVISION = re.compile(r"[0-9a-f]{40}")
+PENDING_PROFILER_REASON = "new profiler is not ready"
 
 
 class A5Target(str, Enum):
@@ -241,8 +242,8 @@ def admit_runnable_cell(cell: A5Phase1Cell) -> A5Phase1Cell:
         raise ValueError("dispatch admission requires an A5Phase1Cell")
     if not cell.runnable:
         raise PendingTreatmentError(
-            f"profiling guidance {cell.profiling.value!r} is pending until "
-            "the new profiler is ready"
+            f"profiling guidance {cell.profiling.value!r} is pending: "
+            f"{PENDING_PROFILER_REASON}"
         )
     return cell
 
@@ -341,6 +342,7 @@ __all__ = [
     "KnowledgeMode",
     "MODEL_IDENTITIES",
     "PINNED_CATLASS_REVISION",
+    "PENDING_PROFILER_REASON",
     "PLAN_SCHEMA",
     "PendingTreatmentError",
     "ProfilingGuidance",
