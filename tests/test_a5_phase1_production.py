@@ -271,3 +271,42 @@ def test_cli_plan_run_resume_and_report_use_the_bound_dependencies(tmp_path, cap
     assert len(calls) == 64
     assert run_a5_phase1.main(["report", *shared]) == 0
     assert json.loads(capsys.readouterr().out) == completed
+
+
+def test_cli_retries_live_dependency_preflight(tmp_path, capsys):
+    gate_root = tmp_path / "gate"
+    gate_root.mkdir()
+    guide_path, _guide, report = _guide_and_report(gate_root)
+    state = tmp_path / "gate.json"
+    from benchmarks.a5kernels.phase1_live import write_gate_report
+    write_gate_report(report, state)
+    calls = []
+    sleeps = []
+    dependencies = _dependencies(tmp_path / "dependencies", [])
+
+    def builder(_paths, **_kwargs):
+        calls.append(1)
+        if len(calls) < 3:
+            from benchmarks.a5kernels.bz import RuntimeUnavailableError
+            raise RuntimeUnavailableError("temporary BZ outage")
+        return dependencies
+
+    runtime = [
+        "--gate", str(state), "--guide", str(guide_path),
+        "--root", str(tmp_path / "run"), "--one-project-smoke",
+        "--tla-root", str(tmp_path),
+        "--profiling-skill-root", str(tmp_path),
+        "--catlass-source", "/remote/catlass",
+        "--bge-cache", str(tmp_path),
+        "--kdb", str(tmp_path / "kdb.sqlite"),
+        "--collection", "catlass", "--device", "0",
+    ]
+
+    assert run_a5_phase1.main(
+        ["run", *runtime], dependency_builder=builder, sleeper=sleeps.append,
+    ) == 0
+    assert len(calls) == 3
+    assert sleeps == [120, 120]
+    assert json.loads(capsys.readouterr().out)["status"] == (
+        "complete-with-pending-treatments"
+    )

@@ -6,13 +6,20 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 from typing import Callable, Sequence
 
+from benchmarks.a5kernels.bz import RuntimeUnavailableError
 from benchmarks.a5kernels.phase1_composition import (
     LiveDependencies,
     Phase1CellComposition,
 )
-from benchmarks.a5kernels.phase1_live import load_gate_report
+from benchmarks.a5kernels.phase1_live import (
+    BACKOFF_SECONDS,
+    MAX_INFRASTRUCTURE_RETRIES,
+    InfrastructureFailure,
+    load_gate_report,
+)
 from benchmarks.a5kernels.phase1_production import build_phase1_live_dependencies
 from benchmarks.a5kernels.production import ProductionPaths
 
@@ -69,15 +76,25 @@ def main(
     dependency_builder: Callable[..., LiveDependencies] = (
         build_phase1_live_dependencies
     ),
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> int:
     args = _parser().parse_args(argv)
     gate = load_gate_report(args.gate)
     dependencies = _unavailable_dependencies()
     if args.command in {"run", "resume"}:
-        dependencies = dependency_builder(
-            _paths(args, gate.guide.catlass_revision),
-            env_file=args.env_file,
-        )
+        failures = 0
+        while True:
+            try:
+                dependencies = dependency_builder(
+                    _paths(args, gate.guide.catlass_revision),
+                    env_file=args.env_file,
+                )
+                break
+            except (InfrastructureFailure, RuntimeUnavailableError):
+                if failures >= MAX_INFRASTRUCTURE_RETRIES:
+                    raise
+                failures += 1
+                sleeper(BACKOFF_SECONDS)
     factory = (
         Phase1CellComposition.one_project_smoke
         if args.one_project_smoke
