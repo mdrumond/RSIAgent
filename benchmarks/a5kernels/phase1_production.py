@@ -27,7 +27,11 @@ from benchmarks.a5kernels.phase1_composition import (
     LiveProjectRequest,
 )
 from benchmarks.a5kernels.phase1_experiments import PINNED_CATLASS_REVISION
-from benchmarks.a5kernels.phase1_live import InfrastructureFailure
+from benchmarks.a5kernels.phase1_live import (
+    BACKOFF_SECONDS,
+    MAX_INFRASTRUCTURE_RETRIES,
+    InfrastructureFailure,
+)
 from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
 from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.phase1_provider import (
@@ -352,6 +356,8 @@ def build_phase1_live_dependencies(
             collection_wrapper=str(paths.collection_wrapper),
             catlass_source=paths.catlass_source,
             evidence_directory=str(paths.results_root / "profile-evidence"),
+            observation_retries=MAX_INFRASTRUCTURE_RETRIES,
+            observation_backoff_seconds=BACKOFF_SECONDS,
         )
 
     def knowledge_factory(_cell, memory_path):

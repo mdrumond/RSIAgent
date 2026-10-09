@@ -9,6 +9,7 @@ import io
 from pathlib import Path, PurePosixPath
 import subprocess
 import tarfile
+import time
 from typing import Callable
 
 from benchmarks.a5kernels.profiling import (
@@ -49,6 +50,9 @@ class BZProfileBackend:
         evidence_directory: str,
         process_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout: int = 600,
+        observation_retries: int = 0,
+        observation_backoff_seconds: float = 0,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         if Path(validation_wrapper).name != "catlass-validation.sh":
             raise ValueError("validation_wrapper must identify catlass-validation.sh")
@@ -64,6 +68,10 @@ class BZProfileBackend:
             raise ValueError("catlass_source must be an absolute retained BZ path")
         if timeout < 1:
             raise ValueError("timeout must be positive")
+        if observation_retries < 0:
+            raise ValueError("observation_retries cannot be negative")
+        if observation_backoff_seconds < 0:
+            raise ValueError("observation_backoff_seconds cannot be negative")
         self._validation = validation_wrapper
         self._session = session_wrapper
         self._collector = collection_wrapper
@@ -71,6 +79,9 @@ class BZProfileBackend:
         self._evidence_directory = Path(evidence_directory)
         self._run = process_runner
         self._timeout = timeout
+        self._observation_retries = observation_retries
+        self._observation_backoff_seconds = observation_backoff_seconds
+        self._sleep = sleeper
 
     def time(self, command: TimingCommand) -> TimingResult:
         duration, _evidence_sha256 = self._timing_replay(command)
@@ -196,16 +207,24 @@ class BZProfileBackend:
 
         if _marked_values(completed.stdout, marker):
             return completed.stdout, completed.returncode
-        logs = self._call(
-            (self._session, "--name", replay_id, "logs", "--lines", "2000")
+        retries = (
+            self._observation_retries
+            if completed.returncode in {75, 255}
+            else 0
         )
-        result = self._call((self._session, "--name", replay_id, "result"))
-        if (
-            logs.returncode == 0
-            and result.returncode == 0
-            and _marked_values(logs.stdout, marker)
-        ):
-            return logs.stdout, 0
+        for attempt in range(retries + 1):
+            logs = self._call(
+                (self._session, "--name", replay_id, "logs", "--lines", "2000")
+            )
+            result = self._call((self._session, "--name", replay_id, "result"))
+            if (
+                logs.returncode == 0
+                and result.returncode == 0
+                and _marked_values(logs.stdout, marker)
+            ):
+                return logs.stdout, 0
+            if attempt < retries:
+                self._sleep(self._observation_backoff_seconds)
         return completed.stdout, completed.returncode
 
     def _adapter_argv(

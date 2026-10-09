@@ -854,6 +854,70 @@ def test_concrete_backend_recovers_after_timing_observation_timeout(
     assert result.duration_us == 9.5
 
 
+def test_concrete_backend_retries_the_same_retained_timing_observation(
+    tmp_path: Path,
+) -> None:
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal result_calls
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 75, "SESSION_STATE=observation-unavailable\n", ""
+            )
+        if "result" in argv:
+            result_calls += 1
+            return subprocess.CompletedProcess(
+                argv,
+                0 if result_calls == 3 else 75,
+                "SESSION_RESULT=0\n" if result_calls == 3 else "",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            argv,
+            0 if result_calls == 2 else 75,
+            "A5KERNEL_TIMING_US=9.5\n" if result_calls == 2 else "",
+            "",
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=3,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "retained-after-outage")
+    )
+
+    assert result.duration_us == 9.5
+    assert result_calls == 3
+    assert sleeps == [120, 120]
+
+
 def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
     def run(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 255, "", "banner timeout")
