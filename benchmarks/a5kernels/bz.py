@@ -143,6 +143,9 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
         self._provenance_wrapper = str(
             Path(validation_wrapper).parent / "bz-a5" / "catlass-provenance.sh"
         )
+        self._session_wrapper = str(
+            Path(validation_wrapper).parent / "bz-a5" / "session.sh"
+        )
         self._catlass_source = catlass_source
         self._catlass_revision = catlass_revision
         self._runtime_provenance: tuple[tuple[str, str], ...] | None = None
@@ -229,7 +232,21 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
                 ),
             )
         )
-        if completed.returncode != 0 or marker not in completed.stdout.splitlines():
+        if completed.returncode != 0:
+            raise RuntimeUnavailableError("configured A5 device probe failed")
+        if marker in completed.stdout.splitlines():
+            return
+        logs = self._call(
+            (
+                self._session_wrapper,
+                "--name",
+                f"codex-a5-preflight-device-{device}",
+                "logs",
+                "--lines",
+                "200",
+            )
+        )
+        if logs.returncode != 0 or marker not in logs.stdout.splitlines():
             raise RuntimeUnavailableError("configured A5 device probe failed")
 
     def _dispatch(self, invocation: CommandInvocation):
