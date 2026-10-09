@@ -866,6 +866,7 @@ class Phase1PerformanceStudy:
         self, preset: StudyPreset, variant: StudyVariant, metric: ProfileMetric
     ) -> ProfileCapture:
         request = replace(variant.request, warm_up=0, launch_count=1)
+        kernel_name = request.expected_kernel
         command = CaptureCommand(
             CampaignKind.FINAL,
             request,
@@ -876,10 +877,9 @@ class Phase1PerformanceStudy:
                 MetricDomain.BASIC_INFO if metric is ProfileMetric.BASIC_INFO
                 else MetricDomain.PIPE_UTILIZATION,
                 1,
+                capture_kernel_name=kernel_name,
             ),
-            kernel_name=(
-                None if metric is ProfileMetric.BASIC_INFO else request.expected_kernel
-            ),
+            kernel_name=kernel_name,
         )
         capture = self._backend.capture(command)
         ProfilingTreatmentController._validate_capture(self, capture, command)
@@ -911,10 +911,18 @@ class Phase1PerformanceStudy:
         variant: StudyVariant,
         domain: MetricDomain,
         ordinal: int,
+        *,
+        capture_kernel_name: str | None = None,
     ) -> str:
-        return "study-" + canonical_hash({
+        identity = {
             "domain": domain.value,
             "ordinal": ordinal,
             "preset": preset.value,
             "variant_id": variant.variant_id,
-        })
+        }
+        if capture_kernel_name is not None:
+            identity.update({
+                "capture_schema": "exact-kernel-v1",
+                "kernel_name": capture_kernel_name,
+            })
+        return "study-" + canonical_hash(identity)
