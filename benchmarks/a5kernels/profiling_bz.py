@@ -141,6 +141,7 @@ class BZProfileBackend:
             str(request.device),
             "--expected-catlass-revision",
             dict(request.plan.runtime_provenance)["catlass_revision"],
+            "--application-cwd-home",
             "--metric",
             command.metric.value,
             "--warm-up",

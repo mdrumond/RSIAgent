@@ -661,6 +661,7 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         call[call.index("--expected-catlass-revision") + 1] == "revision"
         for call in profile_calls
     )
+    assert all("--application-cwd-home" in call for call in profile_calls)
     assert "--kernel-name" not in profile_calls[0]
     assert (
         profile_calls[1][profile_calls[1].index("--kernel-name") + 1]
