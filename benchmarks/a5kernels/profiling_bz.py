@@ -90,11 +90,11 @@ class BZProfileBackend:
         completed = self._call(
             self._adapter_argv(command.replay_id, "run", command.request)
         )
-        output = self._marker_output(
+        output, returncode = self._marker_result(
             completed, command.replay_id, _TIMING_MARKER
         )
         values = _marked_values(output, _TIMING_MARKER)
-        if completed.returncode or len(values) != 1:
+        if returncode or len(values) != 1:
             raise RuntimeError(
                 "canonical timing replay failed or returned no unique timing"
             )
@@ -144,9 +144,11 @@ class BZProfileBackend:
             options += ["--kernel-name", command.kernel_name]
         argv[separator:separator] = options
         completed = self._call(tuple(argv))
-        output = self._marker_output(completed, command.replay_id, _REMOTE_MARKER)
+        output, returncode = self._marker_result(
+            completed, command.replay_id, _REMOTE_MARKER
+        )
         remote_values = _marked_values(output, _REMOTE_MARKER)
-        if completed.returncode or len(remote_values) != 1:
+        if returncode or len(remote_values) != 1:
             raise RuntimeError(f"{command.metric.value} profiling replay failed")
         remote_tree = remote_values[0]
         if not PurePosixPath(remote_tree).is_absolute():
@@ -171,20 +173,27 @@ class BZProfileBackend:
             archive,
         )
 
-    def _marker_output(
+    def _marker_result(
         self,
         completed: subprocess.CompletedProcess[str],
         replay_id: str,
         marker: str,
-    ) -> str:
-        """Read workload markers from the retained session when summaries omit them."""
+    ) -> tuple[str, int]:
+        """Recover workload markers and terminal status from the retained session."""
 
-        if completed.returncode or _marked_values(completed.stdout, marker):
-            return completed.stdout
+        if _marked_values(completed.stdout, marker):
+            return completed.stdout, completed.returncode
         logs = self._call(
             (self._session, "--name", replay_id, "logs", "--lines", "2000")
         )
-        return logs.stdout if logs.returncode == 0 else completed.stdout
+        result = self._call((self._session, "--name", replay_id, "result"))
+        if (
+            logs.returncode == 0
+            and result.returncode == 0
+            and _marked_values(logs.stdout, marker)
+        ):
+            return logs.stdout, 0
+        return completed.stdout, completed.returncode
 
     def _adapter_argv(
         self, replay_id: str, action: str, request: ProfileRequest
