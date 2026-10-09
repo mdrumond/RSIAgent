@@ -29,7 +29,7 @@ from benchmarks.a5kernels.runner import A5KernelRunner, ExecutionBackend
 from benchmarks.a5kernels.trial import CandidateRun
 
 
-EXACT_KERNEL_NAME = "vector_add__kernel0"
+EXACT_KERNEL_NAME = "vector_add"
 _KERNEL_MARKER = "A5KERNEL_NAME="
 _VECTOR_ARGUMENTS = ("gm_a", "gm_b", "gm_c")
 

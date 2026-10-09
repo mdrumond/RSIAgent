@@ -66,7 +66,7 @@ def archive(metric: str) -> EvidenceArchive:
 REQUEST = ProfileRequest(
     PLAN,
     "catlass",
-    "vector_add__kernel0",
+    "vector_add",
     3,
 )
 CORRECT = VerifiedResult(
@@ -106,7 +106,7 @@ def test_profile_request_binds_to_host_prepared_attempt() -> None:
     request = ProfileRequest.from_execution_plan(
         plan,
         implementation="catlass",
-        expected_kernel="vector_add__kernel0",
+        expected_kernel="vector_add",
         device=3,
     )
 
@@ -125,7 +125,7 @@ def test_profile_request_rejects_foundational_plan_without_runtime() -> None:
         ProfileRequest.from_execution_plan(
             plan,
             implementation="catlass",
-            expected_kernel="vector_add__kernel0",
+            expected_kernel="vector_add",
             device=3,
         )
 
@@ -134,7 +134,7 @@ def test_changed_argv_cannot_reuse_correctness_from_original_plan() -> None:
     changed = ProfileRequest.from_execution_plan(
         replace(PLAN, argv=("python", "other-driver.py")),
         implementation="catlass",
-        expected_kernel="vector_add__kernel0",
+        expected_kernel="vector_add",
         device=3,
     )
 
@@ -194,13 +194,13 @@ def test_treatment_runs_basic_then_exact_bound_pipe_replay() -> None:
     feedback = controller.run_intermediate(CORRECT, REQUEST)
 
     assert feedback is not None
-    assert feedback.kernel_name == "vector_add__kernel0"
+    assert feedback.kernel_name == "vector_add"
     assert [command.metric for command in backend.commands] == [
         ProfileMetric.BASIC_INFO,
         ProfileMetric.PIPE_UTILIZATION,
     ]
     assert backend.commands[0].kernel_name is None
-    assert backend.commands[1].kernel_name == "vector_add__kernel0"
+    assert backend.commands[1].kernel_name == "vector_add"
     assert backend.commands[0].replay_id != backend.commands[1].replay_id
 
 
@@ -246,15 +246,15 @@ def _final_replay_ids(request: ProfileRequest) -> tuple[str, ...]:
     return tuple(command.replay_id for command in backend.commands)
 
 
-def test_default_profile_identity_preserves_legacy_golden_values() -> None:
+def test_default_profile_identity_preserves_device_kernel_golden_values() -> None:
     assert REQUEST.block_count is None
     assert REQUEST.configuration_id == (
-        "a995f98acd42f00fd1b3a51fb4bf645e12aa8f9723b338bb8f5da0c9a3b21997"
+        "2cda5a4ebab2e76ad3c84aac08ad237ac618722b9480b24a9776e027037f04bd"
     )
     assert _final_replay_ids(REQUEST) == (
-        "profile-c7b74c5aa1941f9fde61200b11b3d9b2122f8db1292c44aa688997bc50756ae5",
-        "profile-a9a848aedbb429dbe44f5003dacc4f352657f4b124054154465e92aeffc6d3f5",
-        "profile-a3e5e34fbc4e930832c31df545a987ae308fca1f930e07655861ba116161f5a9",
+        "profile-a10aee228045d8c8085b3a49c46ed77d25e565bd2d6176be5679fc59f2ef9507",
+        "profile-595f34c1a6ef3b7857df715ec4cd74d74e457ae2df2097907267acae6321f8c5",
+        "profile-4f242a3361cf0b4590cb9f16fc82f62d568558a8771f92daf1b2ae1e6b8ce10b",
     )
 
 
@@ -387,7 +387,7 @@ def test_basic_info_must_export_expected_kernel_exactly_once() -> None:
         def capture(self, command: CaptureCommand) -> ProfileCapture:
             result = super().capture(command)
             if command.metric is ProfileMetric.BASIC_INFO:
-                return replace(result, exported_kernels=("vector_add",))
+                return replace(result, exported_kernels=("other_kernel",))
             return result
 
     backend = WrongKernelBackend()
@@ -430,10 +430,10 @@ def test_basic_info_must_include_meaningful_summary(summary) -> None:
     "replacement, message",
     [
         ({"exported_kernels": ()}, "exact expected kernel"),
-        ({"exported_kernels": ("vector_add",)}, "exact expected kernel"),
-        ({"exported_kernels": ("vector_add__kernel0",) * 2}, "exact expected kernel"),
+        ({"exported_kernels": ("other_kernel",)}, "exact expected kernel"),
+        ({"exported_kernels": ("vector_add",) * 2}, "exact expected kernel"),
         (
-            {"exported_kernels": ("vector_add__kernel0", "helper_kernel")},
+            {"exported_kernels": ("other_kernel", "helper_kernel")},
             "exact expected kernel",
         ),
         ({"summary": ()}, "meaningful summary"),
@@ -539,7 +539,7 @@ def test_measurements_must_match_execution_and_replay(result_kind, identity) -> 
 
 def _write_compact_archive(destination: Path) -> None:
     basic_data = gzip.compress(
-        b"Kernel Name,Vector Ratio\nvector_add__kernel0,0.75\n", mtime=0
+        b"Kernel Name,Vector Ratio\nvector_add,0.75\n", mtime=0
     )
     pipe_data = gzip.compress(
         b"block_id,sub_block_id,aiv_vec_ratio\n0,vector0,0.75\n", mtime=0

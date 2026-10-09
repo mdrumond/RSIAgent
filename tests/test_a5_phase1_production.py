@@ -91,7 +91,7 @@ class ProjectExecution(FakeExecution):
         return ExecutionReceipt(
             0,
             expected,
-            stdout="A5KERNEL_NAME=vector_add__kernel0\n",
+            stdout="A5KERNEL_NAME=vector_add\n",
             session_handle="bz-a5:project-fake",
         )
 
