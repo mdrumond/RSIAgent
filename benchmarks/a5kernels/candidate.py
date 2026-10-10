@@ -17,6 +17,7 @@ from benchmarks.a5kernels.fixtures import (
     catlass_candidate_fixture,
 )
 from benchmarks.a5kernels.matrix import Workload
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.profiling import (
     ProfileRequest,
     ProfilingTreatmentController,
@@ -188,6 +189,10 @@ class CatlassCandidateBackend:
         plan = bind_study_dimensions(plan, dimensions)
         verified = runner.run_plan(request, plan)
         if not verified.passed:
+            if verified.exit_code in {75, 255}:
+                raise InfrastructureFailure(
+                    "A5 study verification transport was unavailable"
+                )
             raise ValueError("candidate correctness must pass before a study variant")
         kernel_name = _discovered_kernel(capture.receipt)
         profile = ProfileRequest.from_execution_plan(
