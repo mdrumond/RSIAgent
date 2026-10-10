@@ -280,6 +280,33 @@ def test_project_instruction_uses_registered_runtime_dimensions():
     assert "all 448 output elements" in instruction
 
 
+def test_study_attempt_identity_is_retry_scoped_not_scientific():
+    proposal = next(
+        item for item in DEFAULT_PROPOSALS
+        if item.evidence_preset.value == "msprof-guided"
+    )
+    cell = SimpleNamespace(cell_id="a5-cell-" + "a" * 54)
+    first = SimpleNamespace(
+        cell=cell, ordinal=8, proposal=proposal,
+    )
+    retry = SimpleNamespace(
+        cell=cell, ordinal=8, proposal=proposal,
+    )
+    first_trial = SimpleNamespace(
+        verified=SimpleNamespace(attempt_id="candidate-1-final"),
+    )
+    retry_trial = SimpleNamespace(
+        verified=SimpleNamespace(attempt_id="candidate-2-final"),
+    )
+
+    first_id = ProductionProjectExecutor._study_attempt_id(first, first_trial)
+    retry_id = ProductionProjectExecutor._study_attempt_id(retry, retry_trial)
+
+    assert first_id != retry_id
+    assert first.proposal == retry.proposal
+    assert first_id.rsplit("-", 1)[0] == retry_id.rsplit("-", 1)[0]
+
+
 def test_cli_plan_run_resume_and_report_use_the_bound_dependencies(tmp_path, capsys):
     gate_root = tmp_path / "gate"
     gate_root.mkdir()

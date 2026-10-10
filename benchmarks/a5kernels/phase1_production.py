@@ -246,7 +246,7 @@ class ProductionProjectExecutor:
         variant = runtime.run_study(
             self.execution_backend,
             trial.workspace,
-            f"{request.cell.cell_id[:20]}-p{request.ordinal}-study",
+            self._study_attempt_id(request, trial),
             ledger,
             device=self.device,
         )
@@ -272,6 +272,22 @@ class ProductionProjectExecutor:
             "profiling", "registered performance study completed",
             canonical_digest(payload),
         )]
+
+    @staticmethod
+    def _study_attempt_id(request: LiveProjectRequest, trial) -> str:
+        """Namespace retained study operations without changing the study point."""
+
+        # Every campaign-level infrastructure retry creates a fresh provider trial.
+        # Deriving only the retained-operation suffix from that trial prevents a
+        # failed compact collection from poisoning its retry while the registered
+        # proposal and typed study dimensions remain the scientific identity.
+        retry_id = canonical_digest({
+            "trial_attempt_id": trial.verified.attempt_id,
+        })[:16]
+        return (
+            f"{request.cell.cell_id[:20]}-p{request.ordinal}-study-"
+            f"{retry_id}"
+        )
 
     @staticmethod
     def _instruction(request, runtime, profiling_guidance, recovery):
