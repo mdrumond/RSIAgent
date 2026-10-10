@@ -15,6 +15,7 @@ from benchmarks.a5kernels.candidate import (
 )
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.matrix import Workload
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.profiling import (
     AccessClass,
     PaddingClass,
@@ -253,6 +254,57 @@ def test_n400_align256_candidate_runs_and_forms_study_variant(tmp_path):
     assert len(plan.input_a) == len(plan.input_b) == 512
     assert plan.input_a[400:] == plan.input_b[400:] == (0.0,) * 112
     assert registered.dimensions.padding is PaddingClass.ALIGN_256
+
+
+@pytest.mark.parametrize("exit_code", [75, 255])
+def test_study_transport_failure_is_retryable(tmp_path, exit_code):
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    backend = CatlassCandidateBackend(
+        FakeExecution(marker=None, exit_code=exit_code),
+        length=400,
+        padded_length=512,
+        block_count=6,
+    )
+
+    with pytest.raises(InfrastructureFailure, match="study verification transport"):
+        backend.run_study(
+            tmp_path,
+            "catlass-dsl",
+            Workload.SMOKE_VECTOR_ADD,
+            "study-transport-failure",
+            EvidenceLedger(tmp_path / "evidence.jsonl"),
+            StudyDimensions(
+                ShapeClass.N400,
+                PaddingClass.ALIGN_256,
+                AccessClass.CONTIGUOUS,
+                ParallelismClass.SIX,
+            ),
+        )
+
+
+def test_study_correctness_failure_remains_semantic(tmp_path):
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    backend = CatlassCandidateBackend(
+        FakeExecution(marker=None, exit_code=1),
+        length=400,
+        padded_length=512,
+        block_count=6,
+    )
+
+    with pytest.raises(ValueError, match="correctness must pass"):
+        backend.run_study(
+            tmp_path,
+            "catlass-dsl",
+            Workload.SMOKE_VECTOR_ADD,
+            "study-correctness-failure",
+            EvidenceLedger(tmp_path / "evidence.jsonl"),
+            StudyDimensions(
+                ShapeClass.N400,
+                PaddingClass.ALIGN_256,
+                AccessClass.CONTIGUOUS,
+                ParallelismClass.SIX,
+            ),
+        )
 
 
 @pytest.mark.parametrize("padding", [(), (float("nan"),) * 32, (1.0,) * 32])
