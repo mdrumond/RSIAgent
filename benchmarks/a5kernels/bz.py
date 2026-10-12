@@ -9,6 +9,7 @@ shell syntax.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -352,7 +353,7 @@ class BZSessionAdapter:
             )
         plan = self.prepare_execution(plan)
         physical_device = _declared_physical_device(plan)
-        session_name = f"codex-a5hello-{plan.execution_id}-{plan.attempt_id}"
+        session_name = _execution_session_name(plan)
         remote_directory = f".a5kernels/{plan.execution_id}/{plan.attempt_id}"
         payload = json.dumps(
             {"input_a": plan.input_a, "input_b": plan.input_b},
@@ -530,6 +531,20 @@ def _session_name(argv: tuple[str, ...]) -> str:
         return argv[argv.index("--name") + 1]
     except (ValueError, IndexError) as exc:
         raise ValueError("session invocation is missing --name") from exc
+
+
+def _execution_session_name(plan: ExecutionPlan) -> str:
+    """Map an immutable execution identity to a Screen-safe retained name."""
+
+    identity = json.dumps(
+        {
+            "attempt_id": plan.attempt_id,
+            "execution_id": plan.execution_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"codex-a5hello-{hashlib.sha256(identity).hexdigest()[:32]}"
 
 
 def _option_value(argv: tuple[str, ...], option: str) -> str:

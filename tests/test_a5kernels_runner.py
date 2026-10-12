@@ -22,6 +22,7 @@ from benchmarks.a5kernels.bz import (
     CommandResult,
     OUTPUT_MARKER,
     RuntimeUnavailableError,
+    _execution_session_name,
 )
 from benchmarks.a5kernels.protocol import (
     ExecutionEnvironment,
@@ -334,10 +335,11 @@ def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
     assert receipt.output == (1.25, 2.0)
     assert receipt.session_handle == "bz-a5:s1"
     invocation = command.invocations[0]
+    session = _execution_session_name(plan)
     assert invocation.argv[:4] == (
         "execution-profiles/bz-a5/session.sh",
         "--name",
-        f"codex-a5hello-{plan.execution_id}-trial-1",
+        session,
         "run",
     )
     assert invocation.files[:-1] == plan.files
@@ -401,7 +403,7 @@ def test_bz_adapter_observes_only_explicitly_identified_uncertain_dispatch():
     plan = A5KernelRunner(FakeBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
     )
-    session = f"codex-a5hello-{plan.execution_id}-trial-1"
+    session = _execution_session_name(plan)
     command = FakeCommandExecutor(
         CommandResult(
             2,
@@ -435,7 +437,7 @@ def test_bz_adapter_reobserves_exact_handle_when_result_is_nonterminal():
     plan = A5KernelRunner(FakeBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
     )
-    session = f"codex-a5hello-{plan.execution_id}-trial-1"
+    session = _execution_session_name(plan)
     unavailable = (
         "SESSION_STATE=observation-unavailable "
         f"session={session} handle=remote:bz-a5:session:{session}\n"
@@ -473,7 +475,7 @@ def test_bz_adapter_never_converts_unavailable_exact_observation_to_candidate_re
     plan = A5KernelRunner(FakeBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
     )
-    session = f"codex-a5hello-{plan.execution_id}-trial-1"
+    session = _execution_session_name(plan)
     marker = (
         "CATLASS_VALIDATION_STATE=observation-unavailable\n"
         f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n"
@@ -520,13 +522,31 @@ def test_bz_adapter_uses_full_execution_id_to_isolate_colliding_prefixes():
         commands.append(command)
 
     sessions = [command.invocations[0].argv[2] for command in commands]
-    assert sessions == [f"codex-a5hello-{identity}-same" for identity in identities]
+    assert sessions == [
+        _execution_session_name(ForcedExecutionIdentity(plan, identity))
+        for identity in identities
+    ]
     assert sessions[0] != sessions[1]
+    assert all(len(session) <= 48 for session in sessions)
     assert all(
         argv[2] == session
         for command, session in zip(commands, sessions)
         for argv in command.inspect_argv
     )
+
+
+def test_bz_adapter_bounds_long_candidate_shaped_session_name():
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1),
+        attempt_id="a" * 64,
+    )
+
+    session = _execution_session_name(plan)
+
+    assert session.startswith("codex-a5hello-")
+    assert len(session) == 46
+    assert session.removeprefix("codex-a5hello-").isalnum()
+    assert session == _execution_session_name(plan)
 
 
 def test_catlass_fixture_uses_current_imperative_runtime_api():
@@ -1033,12 +1053,13 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
             assert (staged / "input.json").is_file()
             return subprocess.CompletedProcess(argv, 0, "uploaded", "")
         if argv[0].endswith("catlass-validation.sh"):
+            session = _execution_session_name(plan)
             assert argv[:12] == (
                 "execution-profiles/catlass-validation.sh",
                 "--profile",
                 "bz-a5",
                 "--operation",
-                f"codex-a5hello-{plan.execution_id}-trial-1",
+                session,
                 "run",
                 "--catlass-src",
                 source,
@@ -1088,7 +1109,7 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
     receipt = backend.execute(plan)
 
     assert receipt.output == (3.0,)
-    assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.execution_id}-trial-1"
+    assert receipt.session_handle == f"bz-a5:{_execution_session_name(plan)}"
     assert len(calls) == 5
 
 
@@ -1170,7 +1191,7 @@ def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
     second = A5KernelRunner(second_backend).prepare(request, attempt_id="same")
     assert first.execution_id != second.execution_id
     assert f".a5kernels/{first.execution_id}/same" != f".a5kernels/{second.execution_id}/same"
-    assert f"codex-a5hello-{first.execution_id}-same" != f"codex-a5hello-{second.execution_id}-same"
+    assert _execution_session_name(first) != _execution_session_name(second)
     assert dict(first.runtime_provenance)["manifest_sha256"] == "1" * 64
     assert dict(second.runtime_provenance)["manifest_sha256"] == "2" * 64
     assert first_backend.runtime_provenance == first_backend.runtime_provenance
@@ -1523,8 +1544,14 @@ def test_runtime_revision_changes_identity_session_and_attestation():
     assert first_result.runtime_provenance != second_result.runtime_provenance
     assert first_result.evidence_sha256 != second_result.evidence_sha256
     assert first_result.attestation_sha256 != second_result.attestation_sha256
-    first_session = f"codex-a5hello-{first_result.execution_id}-same-attempt"
-    second_session = f"codex-a5hello-{second_result.execution_id}-same-attempt"
+    first_plan = A5KernelRunner(
+        FakeBackend(runtime_provenance=first_provenance)
+    ).prepare(request, attempt_id="same-attempt")
+    second_plan = A5KernelRunner(
+        FakeBackend(runtime_provenance=second_provenance)
+    ).prepare(request, attempt_id="same-attempt")
+    first_session = _execution_session_name(first_plan)
+    second_session = _execution_session_name(second_plan)
     assert first_session != second_session
 
 
