@@ -5,7 +5,9 @@ import json
 
 import pytest
 
+import benchmarks.a5kernels.phase2_live as phase2_live_module
 from benchmarks.a5kernels.phase2_attention import (
+    CANDIDATE_ABI_SHA256,
     AttentionInfrastructureError,
     AttentionReceipt,
     AttentionTargetVerifier,
@@ -80,14 +82,20 @@ def test_pass_is_host_owned_and_protocol_binds_full_treatment(tmp_path):
 
     cell_root = root / "cells" / destination.cell_id
     protocol = json.loads((cell_root / "protocol.json").read_text())
+    attempt = json.loads(
+        (cell_root / "attempts" / "attempt-01" / "attempt.json").read_text()
+    )
     assert terminal["status"] == "passed"
     assert terminal["completed_attempts"] == 1
     assert terminal["evidence_head_sha256"]
     assert protocol["identity"] == {
         "target_suite_sha256": destination.suite_sha256,
+        "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
         "source_snapshot_id": snapshot.snapshot_id,
         "cell": destination.as_dict(),
     }
+    assert attempt["candidate_abi_sha256"] == CANDIDATE_ABI_SHA256
+    assert attempt["protocol_sha256"] == protocol["protocol_sha256"]
     assert calls[0].phase1_memory == snapshot.memory_entries()
     assert calls[0].phase2_memory == ()
     assert len(backend.calls) == 4
@@ -191,6 +199,21 @@ def test_resume_does_not_redo_committed_attempt_or_terminal(tmp_path):
     assert repeated == expected
     assert runner.memory_path.read_bytes() == memory
     assert len(calls) == 1
+
+
+def test_resume_rejects_changed_candidate_abi(tmp_path, monkeypatch):
+    _composition, _source, _destination, snapshot = _snapshot(tmp_path)
+    runner = Phase2LiveRunner(
+        phase2_root=tmp_path / "phase2", snapshot=snapshot,
+        dependencies=_deps(snapshot, _Backend((True,)), []),
+    )
+    runner.run()
+    retained = json.loads(runner.protocol_path.read_text())
+
+    monkeypatch.setattr(phase2_live_module, "CANDIDATE_ABI_SHA256", "f" * 64)
+    assert runner._protocol_body()["identity"] != retained["identity"]
+    with pytest.raises(ValueError, match="immutable Phase 2 artifact conflicts"):
+        runner.run()
 
 
 def test_resume_reverifies_snapshot_and_rejects_tamper(tmp_path):

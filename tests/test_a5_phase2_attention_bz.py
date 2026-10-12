@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import benchmarks.a5kernels.phase2_attention_bz as attention_bz
 from benchmarks.a5kernels.bz import CommandResult
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
@@ -109,6 +110,9 @@ def test_complete_suite_stages_exact_case_and_checked_argv(tmp_path, case):
     assert [item.relative_path for item in invocation.files] == [
         "kernel.py", "host_driver.py", "input.json",
     ]
+    driver = invocation.files[1].content
+    assert "from_dlpack(tensor.contiguous().reshape(-1)" in driver
+    assert "output.float().cpu().reshape(-1).tolist()" in driver
     payload = json.loads(invocation.files[-1].content)
     assert payload["case"]["case_id"] == case.case_id
     assert tuple(payload["q"]) == execution.q
@@ -139,8 +143,57 @@ def test_same_candidate_and_case_have_deterministic_paths_and_no_source_in_argv(
     first, second = (item.invocations[0] for item in executors)
     assert first.remote_directory == second.remote_directory
     assert first.argv[2] == second.argv[2]
+    assert first.argv[2].startswith("codex-a5attn-")
+    assert len(first.argv[2]) <= 48
     assert SOURCE not in first.argv
     assert all(" " not in argument for argument in first.argv[-3:])
+
+
+def test_host_driver_revision_changes_session_and_remote_identity(tmp_path, monkeypatch):
+    execution = build_execution(ATTENTION_CASES[0])
+    executors = [FakeCheckedExecutor(inspections=_success(execution)) for _ in range(2)]
+    _backend(executors[0]).execute(SOURCE, execution, tmp_path / "original")
+    monkeypatch.setattr(
+        attention_bz,
+        "_ATTENTION_DRIVER",
+        attention_bz._ATTENTION_DRIVER + "\n# revised host harness\n",
+    )
+    _backend(executors[1]).execute(SOURCE, execution, tmp_path / "revised")
+
+    first, second = (item.invocations[0] for item in executors)
+    assert first.files[1].content != second.files[1].content
+    assert first.remote_directory != second.remote_directory
+    assert first.argv[2] != second.argv[2]
+
+
+def test_runtime_provenance_changes_session_and_remote_identity(tmp_path):
+    execution = build_execution(ATTENTION_CASES[0])
+    executors = [
+        FakeCheckedExecutor(inspections=_success(execution)) for _ in range(3)
+    ]
+    executors[0].runtime_provenance = (("catlass_revision", "a" * 40),)
+    executors[1].runtime_provenance = (("catlass_revision", "a" * 40),)
+    executors[2].runtime_provenance = (("catlass_revision", "b" * 40),)
+    for index, executor in enumerate(executors):
+        _backend(executor).execute(SOURCE, execution, tmp_path / str(index))
+
+    first, repeated, changed = (item.invocations[0] for item in executors)
+    assert first.remote_directory == repeated.remote_directory
+    assert first.argv[2] == repeated.argv[2]
+    assert first.remote_directory != changed.remote_directory
+    assert first.argv[2] != changed.argv[2]
+
+
+def test_same_candidate_and_case_are_isolated_by_physical_device(tmp_path):
+    execution = build_execution(ATTENTION_CASES[0])
+    executors = [FakeCheckedExecutor(inspections=_success(execution)) for _ in range(2)]
+    _backend(executors[0], device=2).execute(SOURCE, execution, tmp_path / "device-2")
+    _backend(executors[1], device=5).execute(SOURCE, execution, tmp_path / "device-5")
+
+    first, second = (item.invocations[0] for item in executors)
+    assert first.remote_directory != second.remote_directory
+    assert first.argv[2] != second.argv[2]
+    assert all(len(item.argv[2]) <= 48 for item in (first, second))
 
 
 @pytest.mark.parametrize(
@@ -162,7 +215,12 @@ def test_candidate_export_contract_fails_before_dispatch(tmp_path, source, messa
 
 def test_hand_authored_fixture_uses_the_same_validated_tla_abi():
     validate_attention_candidate(ATTENTION_CANDIDATE_FIXTURE)
-    assert "tla.copy(gm_output, local_v)" in ATTENTION_CANDIDATE_FIXTURE
+    assert """\
+        tla.copy(local_v, gm_v)
+        tla.pipe_barrier(tla.pipes.ALL)
+        tla.copy(gm_output, local_v)
+        tla.pipe_barrier(tla.pipes.ALL)
+""" in ATTENTION_CANDIDATE_FIXTURE
 
 
 @pytest.mark.parametrize("exit_code", [2, 19, 75])
@@ -190,6 +248,49 @@ def test_confirmed_nonzero_dispatch_retains_compiler_log_and_terminal(tmp_path, 
     assert dict(receipt.metadata)["dispatch_exit_code"] == str(exit_code)
     assert dict(receipt.metadata)["result_exit_code"] == str(exit_code)
     assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
+
+
+def test_current_wrapper_completed_dispatch_retains_nonzero_result(tmp_path):
+    def dispatch(invocation):
+        session = invocation.argv[2]
+        return CommandResult(
+            2,
+            f"SESSION_STATE=completed session={session} exit=2 "
+            f"handle=remote:bz-a5:session:{session}\n",
+            session_handle=f"bz-a5:{session}",
+        )
+
+    executor = FakeCheckedExecutor(dispatch=dispatch, inspections=(
+        CommandResult(0, "TLA compiler: layout failure"),
+        CommandResult(2, "placeholder", "runtime returned 2"),
+    ))
+
+    receipt = _backend(executor).execute(
+        SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
+    )
+
+    assert receipt.exit_code == 2
+    assert "TLA compiler: layout failure" in receipt.stdout
+    assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
+
+
+@pytest.mark.parametrize(
+    ("record", "exit_code", "expected"),
+    [
+        ("exit=1", 1, True),
+        ("exit=1 handle=remote:bz-a5:session:example", 1, True),
+        ("exit=1 handle=remote:bz-a5:session:example", 2, False),
+        ("exit=01 handle=remote:bz-a5:session:example", 1, False),
+        ("exit=1 handle=", 1, False),
+        ("exit=1 unexpected=value", 1, False),
+    ],
+)
+def test_completed_result_accepts_only_exact_wrapper_record(
+    record, exit_code, expected,
+):
+    session = "codex-a5attn-example"
+    stdout = f"SESSION_STATE=completed session={session} {record}\n"
+    assert attention_bz._completed_result(exit_code, stdout, session) is expected
 
 
 def test_confirmed_host_failure_reaches_digest_bound_target_evidence(tmp_path):
@@ -240,6 +341,23 @@ def test_unconfirmed_wrapper_failure_is_infrastructure_even_with_handle(tmp_path
         _backend(executor).execute(
             SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
         )
+
+
+def test_completed_dispatch_with_mismatched_exit_is_infrastructure(tmp_path):
+    def dispatch(invocation):
+        session = invocation.argv[2]
+        return CommandResult(
+            2,
+            f"SESSION_STATE=completed session={session} exit=1\n",
+            session_handle=f"bz-a5:{session}",
+        )
+
+    executor = FakeCheckedExecutor(dispatch=dispatch)
+    with pytest.raises(AttentionInfrastructureError, match="unavailable"):
+        _backend(executor).execute(
+            SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
+        )
+    assert executor.inspect_argv == []
 
 
 def test_runtime_exit_is_semantic_and_retains_all_exit_metadata(tmp_path):

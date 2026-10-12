@@ -44,6 +44,7 @@ def dense_attention(gm_q: tla.Tensor, gm_k: tla.Tensor,
     local_v = tla.make_tensor_like(local_ptr, gm_v, tla.arch.RowMajor)
     with tla.vector():
         tla.copy(local_v, gm_v)
+        tla.pipe_barrier(tla.pipes.ALL)
         tla.copy(gm_output, local_v)
         tla.pipe_barrier(tla.pipes.ALL)
 """
@@ -144,14 +145,20 @@ class CatlassAttentionBackend:
             destination = workdir / source.relative_path
             destination.write_text(source.content, encoding="utf-8")
 
+        runtime_provenance = [
+            list(item) for item in self._executor.runtime_provenance
+        ]
         identity = hashlib.sha256(json.dumps(
             {
                 "candidate": hashlib.sha256(candidate_source.encode()).hexdigest(),
                 "case": asdict(execution.case),
+                "host_driver": hashlib.sha256(_ATTENTION_DRIVER.encode()).hexdigest(),
+                "physical_device": self._device,
                 "input": hashlib.sha256(payload_text.encode()).hexdigest(),
+                "runtime_provenance": runtime_provenance,
             }, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
-        session_name = f"codex-a5attn-{identity}"
+        session_name = f"codex-a5attn-{identity[:32]}"
         remote_directory = f".a5kernels/attention/{identity}"
         remote_argv = (
             "env",
@@ -181,7 +188,9 @@ class CatlassAttentionBackend:
         uncertain = _observation_uncertain(
             dispatch.exit_code, dispatch.stdout, session_name
         )
-        confirmed = _dispatch_confirmed(dispatch.stdout, session_name)
+        confirmed = _dispatch_confirmed(
+            dispatch.exit_code, dispatch.stdout, session_name
+        )
         if dispatch.exit_code != 0 and not (uncertain or confirmed):
             raise AttentionInfrastructureError("A5 attention dispatch was unavailable")
 
@@ -292,22 +301,33 @@ def _observation_uncertain(exit_code: int, stdout: str, session_name: str) -> bo
     )
 
 
-def _dispatch_confirmed(stdout: str, session_name: str) -> bool:
+def _dispatch_confirmed(exit_code: int, stdout: str, session_name: str) -> bool:
     prefix = f"SESSION_DISPATCH=confirmed session={session_name}"
-    return any(line == prefix or line.startswith(prefix + " ")
-               for line in stdout.splitlines())
+    legacy = any(line == prefix or line.startswith(prefix + " ")
+                 for line in stdout.splitlines())
+    return legacy or _completed_result(exit_code, stdout, session_name)
 
 
 def _completed_result(exit_code: int, stdout: str, session_name: str) -> bool:
     prefix = f"SESSION_STATE=completed session={session_name} exit="
     values = [line.removeprefix(prefix) for line in stdout.splitlines()
               if line.startswith(prefix)]
+    if len(values) != 1:
+        return False
+    exit_value, separator, suffix = values[0].partition(" ")
+    handle = suffix.removeprefix("handle=")
+    suffix_valid = not separator or (
+        suffix.startswith("handle=")
+        and bool(handle)
+        and handle.isascii()
+        and not any(character.isspace() for character in handle)
+    )
     return (
-        len(values) == 1
-        and values[0].isascii()
-        and values[0].isdigit()
-        and str(int(values[0])) == values[0]
-        and int(values[0]) == exit_code
+        exit_value.isascii()
+        and exit_value.isdigit()
+        and str(int(exit_value)) == exit_value
+        and int(exit_value) == exit_code
+        and suffix_valid
     )
 
 
@@ -350,7 +370,7 @@ def main():
     tensors = [torch.tensor(item, dtype=dtype, device="npu").reshape(shape)
                for item in (q, k, v)]
     output = torch.empty(shape, dtype=dtype, device="npu")
-    as_tla = lambda tensor: from_dlpack(tensor.contiguous(), layout_tag=tla.arch.RowMajor)
+    as_tla = lambda tensor: from_dlpack(tensor.contiguous().reshape(-1), layout_tag=tla.arch.RowMajor)
     tla_q, tla_k, tla_v, tla_output = [as_tla(item) for item in (*tensors, output)]
     artifact = tla.compile(kernel.dense_attention, tla_q, tla_k, tla_v, tla_output,
                            options="--npu-arch 3510")

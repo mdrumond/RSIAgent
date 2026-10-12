@@ -7,6 +7,8 @@ import pytest
 
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
+    CANDIDATE_ABI,
+    CANDIDATE_ABI_SHA256,
     SUITE_SHA256,
     AttentionCase,
     AttentionInfrastructureError,
@@ -82,6 +84,16 @@ def test_suite_covers_fixed_dense_forward_contract():
         ("float16", 0.02, 0.02),
         ("bfloat16", 0.05, 0.05),
     }
+
+
+def test_candidate_abi_identity_is_stable_and_explicit():
+    assert CANDIDATE_ABI == (
+        ("arguments", ("gm_q", "gm_k", "gm_v", "gm_output")),
+        ("physical_layout", "flat-contiguous-row-major"),
+        ("logical_shape", "[B,H,S,D]"),
+        ("logical_dimensions", ("BATCH", "HEADS", "SEQUENCE", "HEAD_DIM")),
+    )
+    assert len(CANDIDATE_ABI_SHA256) == 64
 
 
 def test_execution_inputs_are_deterministic_quantized_bhsd_tensors():
