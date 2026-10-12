@@ -114,6 +114,7 @@ from benchmarks.a5kernels.phase1_runtime import (
 )
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
+    CANDIDATE_ABI_SHA256 as PHASE2_ATTENTION_CANDIDATE_ABI_SHA256,
     SUITE_SHA256 as PHASE2_ATTENTION_SUITE_SHA256,
     AttentionBackend,
     AttentionCase,
@@ -194,6 +195,7 @@ __all__ = [
     "ProfilingTreatmentController",
     "PROJECT_REGISTRY",
     "PHASE1_BRIEF",
+    "PHASE2_ATTENTION_CANDIDATE_ABI_SHA256",
     "PHASE2_ATTENTION_SUITE_SHA256",
     "AgentInterpretation",
     "HostFact",

@@ -166,6 +166,24 @@ def test_host_driver_revision_changes_session_and_remote_identity(tmp_path, monk
     assert first.argv[2] != second.argv[2]
 
 
+def test_runtime_provenance_changes_session_and_remote_identity(tmp_path):
+    execution = build_execution(ATTENTION_CASES[0])
+    executors = [
+        FakeCheckedExecutor(inspections=_success(execution)) for _ in range(3)
+    ]
+    executors[0].runtime_provenance = (("catlass_revision", "a" * 40),)
+    executors[1].runtime_provenance = (("catlass_revision", "a" * 40),)
+    executors[2].runtime_provenance = (("catlass_revision", "b" * 40),)
+    for index, executor in enumerate(executors):
+        _backend(executor).execute(SOURCE, execution, tmp_path / str(index))
+
+    first, repeated, changed = (item.invocations[0] for item in executors)
+    assert first.remote_directory == repeated.remote_directory
+    assert first.argv[2] == repeated.argv[2]
+    assert first.remote_directory != changed.remote_directory
+    assert first.argv[2] != changed.argv[2]
+
+
 def test_same_candidate_and_case_are_isolated_by_physical_device(tmp_path):
     execution = build_execution(ATTENTION_CASES[0])
     executors = [FakeCheckedExecutor(inspections=_success(execution)) for _ in range(2)]

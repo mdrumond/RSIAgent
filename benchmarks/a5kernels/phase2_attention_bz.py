@@ -145,6 +145,9 @@ class CatlassAttentionBackend:
             destination = workdir / source.relative_path
             destination.write_text(source.content, encoding="utf-8")
 
+        runtime_provenance = [
+            list(item) for item in self._executor.runtime_provenance
+        ]
         identity = hashlib.sha256(json.dumps(
             {
                 "candidate": hashlib.sha256(candidate_source.encode()).hexdigest(),
@@ -152,6 +155,7 @@ class CatlassAttentionBackend:
                 "host_driver": hashlib.sha256(_ATTENTION_DRIVER.encode()).hexdigest(),
                 "physical_device": self._device,
                 "input": hashlib.sha256(payload_text.encode()).hexdigest(),
+                "runtime_provenance": runtime_provenance,
             }, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
         session_name = f"codex-a5attn-{identity[:32]}"

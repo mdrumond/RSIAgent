@@ -4,10 +4,12 @@ The execution backend is deliberately untrusted: it receives immutable inputs an
 returns only raw output.  This module owns the cases, FP32 reference, tolerances,
 and verdict so an agent-authored candidate cannot claim correctness.
 
-The contract is Q/K/V in ``[B,H,S,D]`` float16 or bfloat16, causal or unmasked,
-scaled by ``1/sqrt(D)``, with the attention output as its only result.  Backward,
-dropout, KV caching, GQA, paging, RoPE, ALiBi, and packed variable-length inputs
-are deliberately outside this target.
+The logical contract is Q/K/V in ``[B,H,S,D]`` float16 or bfloat16, causal or
+unmasked, scaled by ``1/sqrt(D)``, with the attention output as its only result.
+The candidate ABI presents each tensor as flat contiguous row-major storage and
+provides the logical dimensions as compile-time constants.  Backward, dropout,
+KV caching, GQA, paging, RoPE, ALiBi, and packed variable-length inputs are
+deliberately outside this target.
 """
 
 from __future__ import annotations
@@ -45,6 +47,15 @@ def _jsonable(value: object) -> object:
     if isinstance(value, float) and not math.isfinite(value):
         return {"nonfinite": repr(value)}
     return value
+
+
+CANDIDATE_ABI = (
+    ("arguments", ("gm_q", "gm_k", "gm_v", "gm_output")),
+    ("physical_layout", "flat-contiguous-row-major"),
+    ("logical_shape", "[B,H,S,D]"),
+    ("logical_dimensions", ("BATCH", "HEADS", "SEQUENCE", "HEAD_DIM")),
+)
+CANDIDATE_ABI_SHA256 = _digest(CANDIDATE_ABI)
 
 
 @dataclass(frozen=True)

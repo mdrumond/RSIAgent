@@ -19,6 +19,7 @@ from benchmarks.a5kernels.phase1_provider import (
 )
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
+    CANDIDATE_ABI_SHA256,
     SUITE_SHA256,
     TARGET_ID,
 )
@@ -104,6 +105,7 @@ def _target_contract() -> dict[str, object]:
     return {
         "target_id": TARGET_ID,
         "suite_sha256": SUITE_SHA256,
+        "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
         "candidate_module": {
             "only_import": "import catlass.tla as tla",
             "only_decorator": "@tla.kernel",

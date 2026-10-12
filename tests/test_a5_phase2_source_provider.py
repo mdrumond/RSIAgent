@@ -141,6 +141,9 @@ def test_registered_models_receive_exact_host_context_and_emit_source(tmp_path, 
     contract = prompt["target_contract"]
     assert contract["target_id"] == source_provider_module.TARGET_ID
     assert contract["suite_sha256"] == cell.suite_sha256
+    assert contract["candidate_abi_sha256"] == (
+        source_provider_module.CANDIDATE_ABI_SHA256
+    )
     assert contract["candidate_module"] == {
         "only_import": "import catlass.tla as tla",
         "only_decorator": "@tla.kernel",
