@@ -211,14 +211,17 @@ def test_screen_worker_rejects_non_live_or_inexact_sessions(tmp_path, listing):
     assert pool.observe(assignment) == Observation.incomplete()
 
 
-def test_screen_worker_treats_exact_attached_session_as_active(tmp_path):
+@pytest.mark.parametrize(
+    "state", ["Attached", "Detached", "Multi, attached", "Multi, detached"]
+)
+def test_screen_worker_treats_exact_live_session_as_active(tmp_path, state):
     handle = "rsi-a5-attached"
 
     def screen(argv, **_kwargs):
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout=f"\t1234.{handle}\t(10/12/26 12:00:00)\t(Attached)\n",
+            stdout=f"\t1234.{handle}\t(10/12/26 12:00:00)\t({state})\n",
         )
 
     pool = ScreenWorkerPool(

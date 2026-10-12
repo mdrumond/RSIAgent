@@ -142,7 +142,8 @@ def _has_live_session(output: str, handle: str) -> bool:
     """Return whether Screen lists the exact worker as attached or detached."""
 
     session = re.compile(
-        rf"^\s*\d+\.{re.escape(handle)}\s+\([^\r\n]*\)\s+\((?:Attached|Detached)\)\s*$"
+        rf"^\s*\d+\.{re.escape(handle)}\s+\([^\r\n]*\)\s+"
+        rf"\((?:Attached|Detached|Multi, attached|Multi, detached)\)\s*$"
     )
     return any(session.fullmatch(line) for line in output.splitlines())
 
