@@ -243,6 +243,10 @@ class BZProfileBackend:
                 observation_returncode = logs.returncode
             elif result.returncode in {75, 255}:
                 observation_returncode = result.returncode
+            elif result.returncode != 0:
+                observation_returncode = result.returncode
+            elif logs.returncode != 0:
+                observation_returncode = logs.returncode
             else:
                 observation_returncode = completed.returncode
             if (

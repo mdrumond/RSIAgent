@@ -1255,6 +1255,49 @@ def test_terminal_semantic_failure_does_not_back_off_for_marker(tmp_path: Path) 
     assert sleeps == []
 
 
+def test_marker_never_overrides_failed_retained_result(tmp_path: Path) -> None:
+    def run(argv, **kwargs):
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", ""
+            )
+        if "logs" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A5KERNEL_TIMING_US=3.5\n", ""
+            )
+        return subprocess.CompletedProcess(argv, 1, "result failed\n", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="timing replay failed"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "failed-result-marker")
+        )
+
+
 def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
     def run(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 255, "", "banner timeout")
