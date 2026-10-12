@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -130,9 +131,20 @@ class ScreenWorkerPool:
             ("screen", "-ls", assignment.worker_handle),
             text=True, capture_output=True, check=False,
         )
-        if completed.returncode == 0 and assignment.worker_handle in completed.stdout:
+        if completed.returncode == 0 and _has_detached_session(
+            completed.stdout, assignment.worker_handle,
+        ):
             return Observation.active()
         return Observation.incomplete()
+
+
+def _has_detached_session(output: str, handle: str) -> bool:
+    """Return whether Screen lists the exact worker as genuinely detached."""
+
+    session = re.compile(
+        rf"^\s*\d+\.{re.escape(handle)}\s+\([^\r\n]*\)\s+\(Detached\)\s*$"
+    )
+    return any(session.fullmatch(line) for line in output.splitlines())
 
 
 def _read_request(path: Path) -> dict[str, object]:
