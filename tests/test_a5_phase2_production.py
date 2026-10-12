@@ -5,6 +5,7 @@ import json
 import pytest
 
 import run_a5_phase2
+import benchmarks.a5kernels.phase2_production as production_module
 from benchmarks.a5kernels.bz import RuntimeUnavailableError
 from benchmarks.a5kernels.phase1_composition import (
     A5_PROFILING_GUIDANCE,
@@ -254,6 +255,60 @@ def test_identity_mismatch_fails_before_checked_runtime(tmp_path):
             executor=executor, backend=CopyVBackend(),
         )
     assert executor.probes == []
+
+
+@pytest.mark.parametrize(
+    "environment,error",
+    [
+        ({"OPENAI_API_KEY": "present"}, "DEEPSEEK_API_KEY"),
+        ({"DEEPSEEK_API_KEY": "present"}, "OPENAI_API_KEY"),
+    ],
+)
+def test_missing_local_credentials_fail_before_bz(
+    tmp_path, environment, error,
+):
+    _composition, destination, config = _config(tmp_path)
+    executor = FakeExecutor(destination.catlass_revision)
+    backend = CopyVBackend()
+
+    with pytest.raises(ValueError, match=error):
+        build_phase2_production(
+            config, environment=environment, transport=_transport,
+            executor=executor, backend=backend,
+        )
+    assert executor.probes == []
+    assert backend.calls == []
+
+
+def test_missing_openai_package_fails_before_bz(tmp_path, monkeypatch):
+    _composition, destination, config = _config(tmp_path)
+    executor = FakeExecutor(destination.catlass_revision)
+    backend = CopyVBackend()
+    monkeypatch.setattr(production_module.importlib.util, "find_spec", lambda _name: None)
+
+    with pytest.raises(RuntimeError, match="openai package"):
+        build_phase2_production(
+            config, environment=ENVIRONMENT,
+            executor=executor, backend=backend,
+        )
+    assert executor.probes == []
+    assert backend.calls == []
+
+
+def test_missing_with_kdb_inputs_fail_before_bz(tmp_path):
+    destination, config = _treatment_config(
+        tmp_path, KnowledgeMode.WITH_KDB, ProfilingGuidance.WITHOUT_GUIDANCE,
+    )
+    executor = FakeExecutor(destination.catlass_revision)
+    backend = CopyVBackend()
+
+    with pytest.raises(ValueError, match="requires cache"):
+        build_phase2_production(
+            config, environment=ENVIRONMENT, transport=_transport,
+            executor=executor, backend=backend,
+        )
+    assert executor.probes == []
+    assert backend.calls == []
 
 
 @pytest.mark.parametrize(

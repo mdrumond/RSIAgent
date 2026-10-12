@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -265,6 +266,42 @@ def build_phase2_production(
         raise ValueError("requested snapshot path does not match the registered cell")
     snapshot = admit_phase1_snapshot(composition, cell, config.phase2_root)
 
+    # Exhaust every local dependency check before probing or dispatching BZ-A5.
+    # Constructing the provider is side-effect free; its first model call remains
+    # gated by the transport qualification below.
+    values = load_direct_environment(environment, env_file=config.env_file)
+    provider = DirectCompletionProvider(values, transport=transport)
+    if (
+        transport is openai_compatible_transport
+        and importlib.util.find_spec("openai") is None
+    ):
+        raise RuntimeError("the openai package is required for direct providers")
+    knowledge_factory = None
+    if cell.knowledge is KnowledgeMode.WITH_KDB:
+        if config.bge_cache is None or config.kdb is None or not config.collection:
+            raise ValueError("with-KDB treatment requires cache, KDB, and collection")
+        if not config.bge_cache.is_dir() or not config.kdb.is_file():
+            raise ValueError("pinned embeddings and KDB are unavailable")
+        if embeddings is None:
+            from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+
+            embeddings = PinnedBGEEmbeddings(
+                cache_dir=_transformers_cache(config.bge_cache)
+            )
+        embeddings.embed_query(["A5 Phase 2 preflight"])
+        database = KnowledgeDB.open_read_only(config.kdb, embeddings)
+        try:
+            manifest = database.manifest(config.collection)
+            if (
+                manifest.embedding_model != embeddings.model
+                or manifest.embedding_revision != embeddings.revision
+            ):
+                raise ValueError("KDB manifest does not match pinned embeddings")
+            _probe_knowledge_query(database, config.collection)
+        finally:
+            database.close()
+        knowledge_factory = _knowledge_factory(config, embeddings)
+
     if executor is None:
         for wrapper in (
             config.validation_wrapper, config.session_wrapper, config.upload_wrapper,
@@ -292,34 +329,6 @@ def build_phase2_production(
             executor, session_wrapper=str(config.session_wrapper), device=config.device
         )
     _qualify(config, cell, backend, provenance)
-
-    values = load_direct_environment(environment, env_file=config.env_file)
-    provider = DirectCompletionProvider(values, transport=transport)
-    knowledge_factory = None
-    if cell.knowledge is KnowledgeMode.WITH_KDB:
-        if config.bge_cache is None or config.kdb is None or not config.collection:
-            raise ValueError("with-KDB treatment requires cache, KDB, and collection")
-        if not config.bge_cache.is_dir() or not config.kdb.is_file():
-            raise ValueError("pinned embeddings and KDB are unavailable")
-        if embeddings is None:
-            from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
-
-            embeddings = PinnedBGEEmbeddings(
-                cache_dir=_transformers_cache(config.bge_cache)
-            )
-        embeddings.embed_query(["A5 Phase 2 preflight"])
-        database = KnowledgeDB.open_read_only(config.kdb, embeddings)
-        try:
-            manifest = database.manifest(config.collection)
-            if (
-                manifest.embedding_model != embeddings.model
-                or manifest.embedding_revision != embeddings.revision
-            ):
-                raise ValueError("KDB manifest does not match pinned embeddings")
-            _probe_knowledge_query(database, config.collection)
-        finally:
-            database.close()
-        knowledge_factory = _knowledge_factory(config, embeddings)
 
     guidance = (
         A5_PROFILING_GUIDANCE
