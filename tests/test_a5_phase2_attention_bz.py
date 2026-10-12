@@ -143,6 +143,17 @@ def test_same_candidate_and_case_have_deterministic_paths_and_no_source_in_argv(
     assert all(" " not in argument for argument in first.argv[-3:])
 
 
+def test_same_candidate_and_case_are_isolated_by_physical_device(tmp_path):
+    execution = build_execution(ATTENTION_CASES[0])
+    executors = [FakeCheckedExecutor(inspections=_success(execution)) for _ in range(2)]
+    _backend(executors[0], device=2).execute(SOURCE, execution, tmp_path / "device-2")
+    _backend(executors[1], device=5).execute(SOURCE, execution, tmp_path / "device-5")
+
+    first, second = (item.invocations[0] for item in executors)
+    assert first.remote_directory != second.remote_directory
+    assert first.argv[2] != second.argv[2]
+
+
 @pytest.mark.parametrize(
     ("source", "message"),
     [

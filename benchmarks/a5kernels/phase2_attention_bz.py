@@ -148,6 +148,7 @@ class CatlassAttentionBackend:
             {
                 "candidate": hashlib.sha256(candidate_source.encode()).hexdigest(),
                 "case": asdict(execution.case),
+                "physical_device": self._device,
                 "input": hashlib.sha256(payload_text.encode()).hexdigest(),
             }, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
