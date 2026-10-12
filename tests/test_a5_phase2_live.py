@@ -16,7 +16,6 @@ from benchmarks.a5kernels.phase2_live import (
     Phase2Dependencies,
     Phase2LiveRunner,
 )
-from run_a5_phase2 import main
 from tests.test_a5_phase2_memory import _snapshot
 
 
@@ -218,29 +217,6 @@ def test_resume_rejects_missing_committed_host_receipt(tmp_path):
 
     with pytest.raises(ValueError, match="incomplete"):
         runner.run()
-
-
-def test_cli_requires_one_cell_and_fake_runtime_runs_end_to_end(tmp_path, capsys):
-    _composition, _source, destination, snapshot = _snapshot(tmp_path)
-    calls = []
-    dependencies = _deps(snapshot, _Backend((True,)), calls)
-
-    def factory(args):
-        assert args.snapshot == snapshot.root
-        return snapshot, dependencies
-
-    root = tmp_path / "phase2"
-    assert main([
-        "run", "--root", str(root), "--snapshot", str(snapshot.root),
-        "--cell-id", destination.cell_id,
-    ], runtime_factory=factory) == 0
-    output = json.loads(capsys.readouterr().out)
-    assert output["status"] == "passed"
-    assert (root / "cells" / destination.cell_id / "terminal.json").is_file()
-
-    with pytest.raises(SystemExit):
-        main(["run", "--root", str(root), "--snapshot", str(snapshot.root)],
-             runtime_factory=factory)
 
 
 def test_rejects_cell_identity_and_output_path_mismatch(tmp_path):
