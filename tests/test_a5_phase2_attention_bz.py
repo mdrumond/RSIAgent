@@ -197,7 +197,12 @@ def test_candidate_export_contract_fails_before_dispatch(tmp_path, source, messa
 
 def test_hand_authored_fixture_uses_the_same_validated_tla_abi():
     validate_attention_candidate(ATTENTION_CANDIDATE_FIXTURE)
-    assert "tla.copy(gm_output, local_v)" in ATTENTION_CANDIDATE_FIXTURE
+    assert """\
+        tla.copy(local_v, gm_v)
+        tla.pipe_barrier(tla.pipes.ALL)
+        tla.copy(gm_output, local_v)
+        tla.pipe_barrier(tla.pipes.ALL)
+""" in ATTENTION_CANDIDATE_FIXTURE
 
 
 @pytest.mark.parametrize("exit_code", [2, 19, 75])
@@ -232,7 +237,8 @@ def test_current_wrapper_completed_dispatch_retains_nonzero_result(tmp_path):
         session = invocation.argv[2]
         return CommandResult(
             2,
-            f"SESSION_STATE=completed session={session} exit=2\n",
+            f"SESSION_STATE=completed session={session} exit=2 "
+            f"handle=remote:bz-a5:session:{session}\n",
             session_handle=f"bz-a5:{session}",
         )
 
@@ -248,6 +254,25 @@ def test_current_wrapper_completed_dispatch_retains_nonzero_result(tmp_path):
     assert receipt.exit_code == 2
     assert "TLA compiler: layout failure" in receipt.stdout
     assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
+
+
+@pytest.mark.parametrize(
+    ("record", "exit_code", "expected"),
+    [
+        ("exit=1", 1, True),
+        ("exit=1 handle=remote:bz-a5:session:example", 1, True),
+        ("exit=1 handle=remote:bz-a5:session:example", 2, False),
+        ("exit=01 handle=remote:bz-a5:session:example", 1, False),
+        ("exit=1 handle=", 1, False),
+        ("exit=1 unexpected=value", 1, False),
+    ],
+)
+def test_completed_result_accepts_only_exact_wrapper_record(
+    record, exit_code, expected,
+):
+    session = "codex-a5attn-example"
+    stdout = f"SESSION_STATE=completed session={session} {record}\n"
+    assert attention_bz._completed_result(exit_code, stdout, session) is expected
 
 
 def test_confirmed_host_failure_reaches_digest_bound_target_evidence(tmp_path):

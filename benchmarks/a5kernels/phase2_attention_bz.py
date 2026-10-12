@@ -44,6 +44,7 @@ def dense_attention(gm_q: tla.Tensor, gm_k: tla.Tensor,
     local_v = tla.make_tensor_like(local_ptr, gm_v, tla.arch.RowMajor)
     with tla.vector():
         tla.copy(local_v, gm_v)
+        tla.pipe_barrier(tla.pipes.ALL)
         tla.copy(gm_output, local_v)
         tla.pipe_barrier(tla.pipes.ALL)
 """
@@ -307,12 +308,22 @@ def _completed_result(exit_code: int, stdout: str, session_name: str) -> bool:
     prefix = f"SESSION_STATE=completed session={session_name} exit="
     values = [line.removeprefix(prefix) for line in stdout.splitlines()
               if line.startswith(prefix)]
+    if len(values) != 1:
+        return False
+    exit_value, separator, suffix = values[0].partition(" ")
+    handle = suffix.removeprefix("handle=")
+    suffix_valid = not separator or (
+        suffix.startswith("handle=")
+        and bool(handle)
+        and handle.isascii()
+        and not any(character.isspace() for character in handle)
+    )
     return (
-        len(values) == 1
-        and values[0].isascii()
-        and values[0].isdigit()
-        and str(int(values[0])) == values[0]
-        and int(values[0]) == exit_code
+        exit_value.isascii()
+        and exit_value.isdigit()
+        and str(int(exit_value)) == exit_value
+        and int(exit_value) == exit_code
+        and suffix_valid
     )
 
 
