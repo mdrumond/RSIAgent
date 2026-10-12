@@ -152,7 +152,7 @@ class CatlassAttentionBackend:
                 "input": hashlib.sha256(payload_text.encode()).hexdigest(),
             }, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
-        session_name = f"codex-a5attn-{identity}"
+        session_name = f"codex-a5attn-{identity[:32]}"
         remote_directory = f".a5kernels/attention/{identity}"
         remote_argv = (
             "env",

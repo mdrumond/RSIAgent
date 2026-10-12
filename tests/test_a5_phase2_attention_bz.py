@@ -139,6 +139,8 @@ def test_same_candidate_and_case_have_deterministic_paths_and_no_source_in_argv(
     first, second = (item.invocations[0] for item in executors)
     assert first.remote_directory == second.remote_directory
     assert first.argv[2] == second.argv[2]
+    assert first.argv[2].startswith("codex-a5attn-")
+    assert len(first.argv[2]) <= 48
     assert SOURCE not in first.argv
     assert all(" " not in argument for argument in first.argv[-3:])
 
@@ -152,6 +154,7 @@ def test_same_candidate_and_case_are_isolated_by_physical_device(tmp_path):
     first, second = (item.invocations[0] for item in executors)
     assert first.remote_directory != second.remote_directory
     assert first.argv[2] != second.argv[2]
+    assert all(len(item.argv[2]) <= 48 for item in (first, second))
 
 
 @pytest.mark.parametrize(
