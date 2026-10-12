@@ -190,6 +190,24 @@ def test_inventory_rejects_contradictory_unavailable_evidence(stdout):
     assert type(caught.value) is DeviceInventoryError
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        terminal(2),
+        candidate(2),
+        "BZ_A5_DEVICE_CANDIDATE "
+        "id=1 state=excluded reason=health-unresponsive",
+    ],
+)
+def test_inventory_rejects_contradictory_stderr_unavailable_evidence(stderr):
+    marker = "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"
+    probe, _ = inventory("", returncode=1, stderr=f"{marker}\n{stderr}\n")
+
+    with pytest.raises(DeviceInventoryError) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
+
+
 def test_inventory_classifies_complete_excluded_snapshot_without_stderr_marker():
     stdout = "\n".join(
         [

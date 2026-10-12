@@ -136,11 +136,10 @@ def _has_canonical_unavailable_record(stdout: object, stderr: object) -> bool:
         for line in stream.splitlines()
     ) != 1:
         return False
-    if not isinstance(stdout, str):
-        return True
     selector_lines = tuple(
         line
-        for line in stdout.splitlines()
+        for stream in streams
+        for line in stream.splitlines()
         if line.startswith((_CANDIDATE, _DEVICE, _STATE))
         and line != _PROFILING_UNAVAILABLE
     )
