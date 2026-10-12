@@ -6,15 +6,25 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 from typing import Callable, Sequence
 
+from benchmarks.a5kernels.bz import RuntimeUnavailableError
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure, load_gate_report
+from benchmarks.a5kernels.phase2_attention import AttentionInfrastructureError
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies, Phase2LiveRunner
 from benchmarks.a5kernels.phase2_memory import A5Phase1Snapshot
+from benchmarks.a5kernels.phase2_production import (
+    Phase2ProductionConfig,
+    build_phase2_production,
+)
 
 
 RuntimeFactory = Callable[
     [argparse.Namespace], tuple[A5Phase1Snapshot, Phase2Dependencies]
 ]
+MAX_INFRASTRUCTURE_RETRIES = 3
+BACKOFF_SECONDS = 120
 
 
 class _OneCell(argparse.Action):
@@ -34,38 +44,91 @@ def _parser() -> argparse.ArgumentParser:
     command.add_argument("--root", type=Path, required=True)
     command.add_argument("--snapshot", type=Path, required=True)
     command.add_argument("--cell-id", action=_OneCell, required=True)
+    command.add_argument("--phase1-root", type=Path)
+    command.add_argument("--gate", type=Path)
+    command.add_argument("--guide", type=Path)
+    command.add_argument("--tla-root", type=Path)
+    command.add_argument("--catlass-source")
+    command.add_argument("--bge-cache", type=Path)
+    command.add_argument("--kdb", type=Path)
+    command.add_argument("--collection")
+    command.add_argument("--device", type=int)
+    command.add_argument("--env-file", type=Path)
     return parser
 
 
-def _production_not_composed(
-    _args: argparse.Namespace,
+def _production_factory(
+    args: argparse.Namespace,
 ) -> tuple[A5Phase1Snapshot, Phase2Dependencies]:
-    raise RuntimeError("A5 Phase 2 production dependencies are not composed")
+    required = {
+        "phase1_root": args.phase1_root,
+        "gate": args.gate,
+        "guide": args.guide,
+        "tla_root": args.tla_root,
+        "catlass_source": args.catlass_source,
+        "device": args.device,
+    }
+    missing = [name.replace("_", "-") for name, value in required.items()
+               if value is None]
+    if missing:
+        raise RuntimeError(
+            "A5 Phase 2 production dependencies are missing: " + ", ".join(missing)
+        )
+    gate = load_gate_report(args.gate)
+    return build_phase2_production(Phase2ProductionConfig(
+        phase1_root=args.phase1_root,
+        gate=gate,
+        guide_path=args.guide,
+        phase2_root=args.root,
+        snapshot_path=args.snapshot,
+        cell_id=args.cell_id,
+        tla_root=args.tla_root,
+        catlass_source=args.catlass_source,
+        device=args.device,
+        bge_cache=args.bge_cache,
+        kdb=args.kdb,
+        collection=args.collection,
+        env_file=args.env_file,
+    ))
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
-    runtime_factory: RuntimeFactory = _production_not_composed,
+    runtime_factory: RuntimeFactory = _production_factory,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> int:
     args = _parser().parse_args(argv)
-    snapshot, dependencies = runtime_factory(args)
-    if not isinstance(snapshot, A5Phase1Snapshot):
-        raise TypeError("runtime factory must return an A5Phase1Snapshot")
-    if not isinstance(dependencies, Phase2Dependencies):
-        raise TypeError("runtime factory must return Phase2Dependencies")
-    if args.snapshot.resolve() != snapshot.root.resolve():
-        raise ValueError("requested snapshot path does not match admitted snapshot")
-    if args.cell_id != snapshot.destination.cell_id:
-        raise ValueError("requested cell does not match admitted snapshot")
-    if dependencies.cell != snapshot.destination:
-        raise ValueError("runtime cell does not match admitted snapshot")
+    failures = 0
+    while True:
+        try:
+            snapshot, dependencies = runtime_factory(args)
+            if not isinstance(snapshot, A5Phase1Snapshot):
+                raise TypeError("runtime factory must return an A5Phase1Snapshot")
+            if not isinstance(dependencies, Phase2Dependencies):
+                raise TypeError("runtime factory must return Phase2Dependencies")
+            if args.snapshot.resolve() != snapshot.root.resolve():
+                raise ValueError("requested snapshot path does not match admitted snapshot")
+            if args.cell_id != snapshot.destination.cell_id:
+                raise ValueError("requested cell does not match admitted snapshot")
+            if dependencies.cell != snapshot.destination:
+                raise ValueError("runtime cell does not match admitted snapshot")
 
-    terminal = Phase2LiveRunner(
-        phase2_root=args.root,
-        snapshot=snapshot,
-        dependencies=dependencies,
-    ).run()
+            terminal = Phase2LiveRunner(
+                phase2_root=args.root,
+                snapshot=snapshot,
+                dependencies=dependencies,
+            ).run()
+            break
+        except (
+            InfrastructureFailure,
+            AttentionInfrastructureError,
+            RuntimeUnavailableError,
+        ):
+            if failures >= MAX_INFRASTRUCTURE_RETRIES:
+                raise
+            failures += 1
+            sleeper(BACKOFF_SECONDS)
     print(json.dumps(terminal, sort_keys=True, separators=(",", ":")))
     return 0
 
