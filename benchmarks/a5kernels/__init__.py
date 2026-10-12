@@ -8,6 +8,7 @@ from benchmarks.a5kernels.bz import (
 from benchmarks.a5kernels.device_inventory import (
     BZDeviceInventory,
     DeviceInventoryError,
+    DeviceInventoryUnavailable,
     ProfilingDevice,
     ProfilingDeviceSnapshot,
 )
@@ -134,6 +135,7 @@ __all__ = [
     "DEFAULT_EMBEDDING_MODEL",
     "DEFAULT_EMBEDDING_REVISION",
     "DeviceInventoryError",
+    "DeviceInventoryUnavailable",
     "CoreAttemptDriver",
     "EmbeddingBackend",
     "EmbeddingLoadError",

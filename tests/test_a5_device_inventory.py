@@ -4,11 +4,17 @@ import subprocess
 
 import pytest
 
+import benchmarks.a5kernels as a5kernels
 from benchmarks.a5kernels.device_inventory import (
     BZDeviceInventory,
     DeviceInventoryError,
     DeviceInventoryUnavailable,
 )
+
+
+def test_retryable_inventory_error_is_part_of_package_api():
+    assert a5kernels.DeviceInventoryUnavailable is DeviceInventoryUnavailable
+    assert "DeviceInventoryUnavailable" in a5kernels.__all__
 
 
 def candidate(device, *, hbm=0, utilization=0):
