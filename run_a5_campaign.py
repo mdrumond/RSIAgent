@@ -118,7 +118,8 @@ def _terminal(args, destination):
     if not (root / "terminal.json").exists():
         return None
     snapshot = A5Phase1Snapshot.open(root / "snapshot", destination)
-    unavailable = lambda *_args, **_kwargs: _unavailable()
+    def unavailable(*_args, **_kwargs):
+        return _unavailable()
     runner = Phase2LiveRunner(
         phase2_root=args.phase2_root, snapshot=snapshot,
         dependencies=Phase2Dependencies(destination, unavailable, unavailable),
