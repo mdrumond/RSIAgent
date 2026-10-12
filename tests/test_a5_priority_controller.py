@@ -115,12 +115,12 @@ def test_dead_phase1_worker_is_truthfully_incomplete_then_resumed(tmp_path):
     workers = Workers()
     subject = controller(tmp_path, devices=(1,), workers=workers)
     subject.reconcile()
-    workers.observations["phase1-run:p1-a"] = Observation.incomplete(17)
+    workers.observations["phase1-run:p1-a"] = Observation.incomplete()
     resumed = controller(
         tmp_path, devices=(1,), workers=workers, phase1_progress=("p1-a",)
     ).reconcile()
 
-    assert resumed.incomplete[0]["exit_code"] == 17
+    assert resumed.incomplete[0]["exit_code"] is None
     assert resumed.incomplete[0]["classification"] == "infrastructure-incomplete"
     assert resumed.active[0].job == Job(JobKind.PHASE1_RESUME, "p1-a")
     assert workers.started[-1][2].parts[-2:] == ("phase1-resume", "p1-a")
@@ -213,6 +213,8 @@ def test_state_rejects_out_of_range_devices_and_malformed_incomplete(tmp_path, m
 def test_observation_invariants_reject_ambiguous_active_exit_code():
     with pytest.raises(ValueError, match="active"):
         Observation("active", 0)
+    with pytest.raises(ValueError, match="incomplete"):
+        Observation("incomplete", 17)
 
 
 def test_retained_unknown_job_fails_closed_before_observation(tmp_path):
