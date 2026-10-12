@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import benchmarks.a5kernels.phase2_attention_bz as attention_bz
 from benchmarks.a5kernels.bz import CommandResult
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
@@ -146,6 +147,23 @@ def test_same_candidate_and_case_have_deterministic_paths_and_no_source_in_argv(
     assert len(first.argv[2]) <= 48
     assert SOURCE not in first.argv
     assert all(" " not in argument for argument in first.argv[-3:])
+
+
+def test_host_driver_revision_changes_session_and_remote_identity(tmp_path, monkeypatch):
+    execution = build_execution(ATTENTION_CASES[0])
+    executors = [FakeCheckedExecutor(inspections=_success(execution)) for _ in range(2)]
+    _backend(executors[0]).execute(SOURCE, execution, tmp_path / "original")
+    monkeypatch.setattr(
+        attention_bz,
+        "_ATTENTION_DRIVER",
+        attention_bz._ATTENTION_DRIVER + "\n# revised host harness\n",
+    )
+    _backend(executors[1]).execute(SOURCE, execution, tmp_path / "revised")
+
+    first, second = (item.invocations[0] for item in executors)
+    assert first.files[1].content != second.files[1].content
+    assert first.remote_directory != second.remote_directory
+    assert first.argv[2] != second.argv[2]
 
 
 def test_same_candidate_and_case_are_isolated_by_physical_device(tmp_path):
