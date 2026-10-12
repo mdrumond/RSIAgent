@@ -40,20 +40,21 @@ class _OneCell(argparse.Action):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    command = commands.add_parser("run")
-    command.add_argument("--root", type=Path, required=True)
-    command.add_argument("--snapshot", type=Path, required=True)
-    command.add_argument("--cell-id", action=_OneCell, required=True)
-    command.add_argument("--phase1-root", type=Path)
-    command.add_argument("--gate", type=Path)
-    command.add_argument("--guide", type=Path)
-    command.add_argument("--tla-root", type=Path)
-    command.add_argument("--catlass-source")
-    command.add_argument("--bge-cache", type=Path)
-    command.add_argument("--kdb", type=Path)
-    command.add_argument("--collection")
-    command.add_argument("--device", type=int)
-    command.add_argument("--env-file", type=Path)
+    for name in ("qualify", "run"):
+        command = commands.add_parser(name)
+        command.add_argument("--root", type=Path, required=True)
+        command.add_argument("--snapshot", type=Path, required=True)
+        command.add_argument("--cell-id", action=_OneCell, required=True)
+        command.add_argument("--phase1-root", type=Path)
+        command.add_argument("--gate", type=Path)
+        command.add_argument("--guide", type=Path)
+        command.add_argument("--tla-root", type=Path)
+        command.add_argument("--catlass-source")
+        command.add_argument("--bge-cache", type=Path)
+        command.add_argument("--kdb", type=Path)
+        command.add_argument("--collection")
+        command.add_argument("--device", type=int)
+        command.add_argument("--env-file", type=Path)
     return parser
 
 
@@ -114,11 +115,23 @@ def main(
             if dependencies.cell != snapshot.destination:
                 raise ValueError("runtime cell does not match admitted snapshot")
 
-            terminal = Phase2LiveRunner(
-                phase2_root=args.root,
-                snapshot=snapshot,
-                dependencies=dependencies,
-            ).run()
+            if args.command == "qualify":
+                path = args.root.resolve() / "cells" / args.cell_id / "qualification.json"
+                try:
+                    qualification = json.loads(path.read_bytes())
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError("production factory did not retain qualification") from exc
+                if qualification.get("status") != "transport-qualified":
+                    raise ValueError("production factory retained invalid qualification")
+                terminal = {
+                    "cell_id": args.cell_id, "status": "transport-qualified",
+                }
+            else:
+                terminal = Phase2LiveRunner(
+                    phase2_root=args.root,
+                    snapshot=snapshot,
+                    dependencies=dependencies,
+                ).run()
             break
         except (
             InfrastructureFailure,

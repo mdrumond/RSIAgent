@@ -132,18 +132,36 @@ class Phase2LiveRunner:
                 return self._publish_terminal(protocol, memories, "passed")
         return self._publish_terminal(protocol, memories, "failed")
 
-    def _ensure_protocol(self) -> dict[str, object]:
+    def load_terminal(self) -> Mapping[str, object] | None:
+        """Authenticate a retained terminal without creating campaign state."""
+
+        self.snapshot.verify()
+        if not self.terminal_path.exists():
+            return None
+        protocol = _read_object(self.protocol_path, "Phase 2 protocol")
+        digest = protocol.pop("protocol_sha256", None)
+        if protocol != self._protocol_body() or digest != canonical_digest(protocol):
+            raise ValueError("Phase 2 protocol identity changed")
+        protocol["protocol_sha256"] = digest
+        memories = self._read_memory(protocol)
+        self._verify_committed_attempts(protocol, memories)
+        return self._read_terminal(protocol, memories)
+
+    def _protocol_body(self) -> dict[str, object]:
         identity = {
             "target_suite_sha256": SUITE_SHA256,
             "source_snapshot_id": self.snapshot.snapshot_id,
             "cell": self.dependencies.cell.as_dict(),
         }
-        body = {
+        return {
             "schema": PROTOCOL_SCHEMA,
             "identity": identity,
             "execution_profile": "bz-a5",
             "maximum_semantic_attempts": MAX_ATTEMPTS,
         }
+
+    def _ensure_protocol(self) -> dict[str, object]:
+        body = self._protocol_body()
         value = {**body, "protocol_sha256": canonical_digest(body)}
         _publish_exact(self.protocol_path, canonical_bytes(value) + b"\n")
         retained = _read_object(self.protocol_path, "Phase 2 protocol")

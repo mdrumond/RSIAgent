@@ -1,0 +1,151 @@
+import json
+from pathlib import Path
+
+import pytest
+
+import run_a5_phase2
+import run_a5_campaign
+from benchmarks.a5kernels.priority_controller import Job, JobKind, Observation
+from benchmarks.a5kernels.screen_workers import ScreenWorkerPool, run_request
+from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
+
+
+def test_phase2_qualify_command_stops_before_model_or_live_runner(tmp_path, capsys):
+    from tests.test_a5_phase2_cli import _dependencies
+    from tests.test_a5_phase2_memory import _snapshot
+
+    _composition, _source, destination, snapshot = _snapshot(tmp_path)
+    dependencies = _dependencies(snapshot)
+    dependencies = type(dependencies)(
+        dependencies.cell,
+        lambda *_args: pytest.fail("qualification called the model"),
+        dependencies.verify,
+    )
+    qualification = snapshot.root.parent / "qualification.json"
+
+    def factory(_args):
+        qualification.parent.mkdir(parents=True, exist_ok=True)
+        qualification.write_text('{"status":"transport-qualified"}\n')
+        return snapshot, dependencies
+
+    assert run_a5_phase2.main([
+        "qualify", "--root", str(tmp_path / "phase2"),
+        "--snapshot", str(snapshot.root), "--cell-id", destination.cell_id,
+    ], runtime_factory=factory, sleeper=pytest.fail) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "cell_id": destination.cell_id, "status": "transport-qualified"
+    }
+    assert not (qualification.parent / "terminal.json").exists()
+
+
+def test_screen_worker_consumes_exact_argv_and_retains_result(tmp_path):
+    calls = []
+
+    def screen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": ""})()
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-a"
+    pool = ScreenWorkerPool(root, screen_runner=screen,
+                            script=Path("/repo/run_a5_campaign.py"))
+    job = Job(JobKind.PHASE1_RUN, "p1-a")
+    assignment = pool.start(job, 3, worker, ("python", "run.py"))
+    request = worker / "attempt-0001" / "request.json"
+    assert calls[0][0][:3] == ("screen", "-DmS", assignment.worker_handle)
+    assert calls[0][0][-3:] == ("worker", "--request", str(request))
+    value = json.loads(request.read_text())
+    assert value["command"] == ["python", "run.py"]
+    assert value["physical_device"] == 3
+
+    def execute(argv, **kwargs):
+        assert argv == ["python", "run.py"]
+        assert kwargs == {"check": False}
+        return type("Completed", (), {"returncode": 19})()
+
+    run_request(request, process_runner=execute)
+    assert pool.observe(assignment) == Observation.incomplete(19)
+
+
+def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
+    outputs = []
+
+    def screen(argv, **kwargs):
+        if argv[:2] == ("screen", "-DmS"):
+            return type("Completed", (), {"returncode": 0, "stdout": ""})()
+        outputs.append(argv)
+        return type("Completed", (), {
+            "returncode": 0, "stdout": f"1234.{assignment.worker_handle}\n"
+        })()
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase2-run" / "p2-a"
+    pool = ScreenWorkerPool(root, screen_runner=screen,
+                            script=Path("/repo/run_a5_campaign.py"))
+    assignment = pool.start(
+        Job(JobKind.PHASE2_RUN, "p2-a"), 4, worker, ("run",),
+    )
+
+    assert pool.observe(assignment) == Observation.active()
+    assert outputs == [("screen", "-ls", assignment.worker_handle)]
+
+
+def test_screen_worker_recovers_unrecorded_active_envelope(tmp_path):
+    def screen(argv, **_kwargs):
+        if argv[:2] == ("screen", "-DmS"):
+            return type("Completed", (), {"returncode": 0, "stdout": ""})()
+        return type("Completed", (), {
+            "returncode": 0, "stdout": f"1234.{assignment.worker_handle}\n"
+        })()
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-a"
+    pool = ScreenWorkerPool(root, screen_runner=screen,
+                            script=Path("/repo/run_a5_campaign.py"))
+    assignment = pool.start(
+        Job(JobKind.PHASE1_RUN, "p1-a"), 2, worker, ("run",),
+    )
+
+    assert pool.recover() == (assignment,)
+
+
+def test_until_complete_reconciles_again_after_bounded_poll(monkeypatch, capsys):
+    reports = iter([
+        type("Report", (), {"status": "incomplete", "as_dict": lambda self: {"status": self.status}})(),
+        type("Report", (), {"status": "complete", "as_dict": lambda self: {"status": self.status}})(),
+    ])
+    controller = type("Controller", (), {"reconcile": lambda self: next(reports)})()
+    monkeypatch.setattr(run_a5_campaign, "_controller", lambda _args: controller)
+    sleeps = []
+    required = [
+        "--controller-root", "/c", "--phase1-root", "/p1", "--phase2-root", "/p2",
+        "--gate", "/gate", "--guide", "/guide", "--tla-root", "/tla",
+        "--profiling-skill-root", "/skill", "--bge-cache", "/bge", "--kdb", "/kdb",
+        "--catlass-source", "/remote/catlass", "--collection", "catlass",
+    ]
+
+    assert run_a5_campaign.main(
+        ["reconcile", *required, "--until-complete", "--poll-seconds", "2"],
+        sleeper=sleeps.append,
+    ) == 0
+    assert sleeps == [2.0]
+    assert [json.loads(line)["status"] for line in capsys.readouterr().out.splitlines()] == [
+        "incomplete", "complete",
+    ]
+
+
+def test_public_phase2_terminal_loader_authenticates_without_mutation(tmp_path):
+    from tests.test_a5_phase2_cli import _dependencies
+    from tests.test_a5_phase2_memory import _snapshot
+
+    _composition, _source, _destination, snapshot = _snapshot(tmp_path)
+    dependencies = _dependencies(snapshot)
+    runner = Phase2LiveRunner(
+        phase2_root=tmp_path / "phase2", snapshot=snapshot,
+        dependencies=dependencies,
+    )
+    terminal = runner.run()
+    before = {path: path.read_bytes() for path in runner.root.rglob("*") if path.is_file()}
+
+    assert runner.load_terminal() == terminal
+    assert {path: path.read_bytes() for path in runner.root.rglob("*") if path.is_file()} == before

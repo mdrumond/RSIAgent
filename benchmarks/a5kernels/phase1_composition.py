@@ -289,7 +289,7 @@ class Phase1CellComposition:
         if not self._is_runnable(selected):
             raise PendingTreatmentError("selected A5 Phase 1 cell is pending")
         self._ensure_plan()
-        terminal = self._load_terminal(selected)
+        terminal = self.load_terminal(selected)
         return terminal if terminal is not None else self._run_cell(selected)
 
     def report(self) -> dict[str, object]:
