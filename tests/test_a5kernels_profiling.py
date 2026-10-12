@@ -27,7 +27,7 @@ from benchmarks.a5kernels.profiling import (
     bind_profile_device,
     bind_study_dimensions,
 )
-from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.profiling_bz import BZProfileBackend, _profiling_operation
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest
 from benchmarks.a5kernels.bz import CommandResult
@@ -732,7 +732,8 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         call
         for call in calls
         if "--operation" in call
-        and call[call.index("--operation") + 1] == "phase1-sample"
+        and call[call.index("--operation") + 1]
+        == _profiling_operation("phase1-sample")
     )
     assert "A5KERNEL_WARM_UP=5" in study_call
     assert "A5KERNEL_LAUNCH_COUNT=20" in study_call
@@ -741,9 +742,25 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     }
     assert len(evidence_destinations) == 4
     assert all(
-        call[call.index("--operation") + 1].startswith("profile-")
+        call[call.index("--operation") + 1].startswith("a5-profile-")
         for call in profile_calls
     )
+
+
+def test_profiling_operations_bound_full_replay_identity() -> None:
+    replay_ids = (
+        "profile-timing-" + "a" * 96,
+        "profile-timing-" + "a" * 95 + "b",
+    )
+
+    operations = tuple(_profiling_operation(replay_id) for replay_id in replay_ids)
+
+    assert operations == tuple(
+        f"a5-profile-{hashlib.sha256(replay_id.encode()).hexdigest()[:32]}"
+        for replay_id in replay_ids
+    )
+    assert len(set(operations)) == 2
+    assert all(len(operation) == 43 for operation in operations)
 
 
 @pytest.mark.parametrize(
@@ -772,6 +789,50 @@ def test_compact_collector_distinguishes_transport_from_semantic_failure(
 
     with pytest.raises(error_type, match="compact profile evidence collection"):
         backend._collect(command, "/retained/profile")
+
+
+def test_compact_collector_bounds_session_name_from_full_replay_identity(
+    tmp_path: Path,
+) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        destination = Path(argv[argv.index("--output") + 1])
+        destination.mkdir(parents=True, exist_ok=True)
+        _write_compact_archive(destination)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    replay_ids = (
+        "profile-basic-info-" + "a" * 96,
+        "profile-basic-info-" + "a" * 95 + "b",
+    )
+
+    for replay_id in replay_ids:
+        backend._collect(
+            CaptureCommand(
+                CampaignKind.FINAL, REQUEST, ProfileMetric.BASIC_INFO, replay_id,
+            ),
+            f"/retained/{replay_id}",
+        )
+
+    operations = [call[call.index("--operation") + 1] for call in calls]
+    assert operations == [
+        f"a5-collect-{hashlib.sha256(replay_id.encode()).hexdigest()[:32]}"
+        for replay_id in replay_ids
+    ]
+    assert len(set(operations)) == 2
+    assert all(len(operation) == 43 for operation in operations)
+    assert [call[call.index("--output") + 1] for call in calls] == [
+        str(tmp_path / replay_id) for replay_id in replay_ids
+    ]
 
 
 def test_concrete_backend_reads_markers_from_retained_session_logs(
@@ -827,13 +888,16 @@ def test_concrete_backend_reads_markers_from_retained_session_logs(
     assert calls[-2] == (
         "/profiles/bz-a5/session.sh",
         "--name",
-        "retained-timing",
+        _profiling_operation("retained-timing"),
         "logs",
         "--lines",
         "2000",
     )
     assert calls[-1] == (
-        "/profiles/bz-a5/session.sh", "--name", "retained-timing", "result",
+        "/profiles/bz-a5/session.sh",
+        "--name",
+        _profiling_operation("retained-timing"),
+        "result",
     )
     assert (tmp_path / "retained-timing" / "timing-stdout.txt").read_text() == (
         "A5KERNEL_TIMING_US=6.25\n"
@@ -948,6 +1012,290 @@ def test_concrete_backend_retries_the_same_retained_timing_observation(
     assert result.duration_us == 9.5
     assert result_calls == 3
     assert sleeps == [120, 120]
+
+
+@pytest.mark.parametrize("first_observation", ["missing-marker", "nonterminal"])
+def test_completed_dispatch_retries_same_retained_marker_observation(
+    tmp_path: Path, first_observation: str,
+) -> None:
+    dispatches = 0
+    log_calls = 0
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal dispatches, log_calls, result_calls
+        if Path(argv[0]).name != "session.sh":
+            dispatches += 1
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", "",
+            )
+        if "logs" in argv:
+            log_calls += 1
+            marker = (
+                "A5KERNEL_TIMING_US=8.75\n"
+                if log_calls > 1 or first_observation == "nonterminal"
+                else ""
+            )
+            return subprocess.CompletedProcess(argv, 0, marker, "")
+        result_calls += 1
+        return subprocess.CompletedProcess(
+            argv,
+            75 if result_calls == 1 and first_observation == "nonterminal" else 0,
+            "" if result_calls == 1 and first_observation == "nonterminal"
+            else "SESSION_RESULT=0\n",
+            "",
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=2,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "completed-marker-race")
+    )
+
+    assert result.duration_us == 8.75
+    assert dispatches == 1
+    assert log_calls == result_calls == 2
+    assert sleeps == [120]
+
+
+def test_completed_dispatch_marker_observation_exhaustion_fails_closed(
+    tmp_path: Path,
+) -> None:
+    dispatches = 0
+    log_calls = 0
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal dispatches, log_calls, result_calls
+        if Path(argv[0]).name != "session.sh":
+            dispatches += 1
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", "",
+            )
+        if "logs" in argv:
+            log_calls += 1
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        result_calls += 1
+        return subprocess.CompletedProcess(argv, 0, "SESSION_RESULT=0\n", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=2,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="no unique timing"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "missing-marker")
+        )
+
+    assert dispatches == 1
+    assert log_calls == result_calls == 3
+    assert sleeps == [120, 120]
+
+
+def test_completed_dispatch_unavailable_observation_remains_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    dispatches = 0
+    log_calls = 0
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal dispatches, log_calls, result_calls
+        if Path(argv[0]).name != "session.sh":
+            dispatches += 1
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", "",
+            )
+        if "logs" in argv:
+            log_calls += 1
+        else:
+            result_calls += 1
+        return subprocess.CompletedProcess(
+            argv, 75, "SESSION_STATE=observation-unavailable\n", ""
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=2,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(InfrastructureFailure, match="timing replay failed"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "unavailable-marker")
+        )
+
+    assert dispatches == 1
+    assert log_calls == result_calls == 3
+    assert sleeps == [120, 120]
+
+
+def test_terminal_semantic_failure_does_not_back_off_for_marker(tmp_path: Path) -> None:
+    sleeps = []
+
+    def run(argv, **kwargs):
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 1, "CATLASS_VALIDATION_STATE=failed\n", ""
+            )
+        if "logs" in argv:
+            return subprocess.CompletedProcess(argv, 0, "compile failed\n", "")
+        return subprocess.CompletedProcess(
+            argv, 1, "SESSION_STATE=completed session=replay exit=1\n", ""
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=3,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="timing replay failed"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "semantic-failure")
+        )
+
+    assert sleeps == []
+
+
+def test_marker_never_overrides_failed_retained_result(tmp_path: Path) -> None:
+    def run(argv, **kwargs):
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", ""
+            )
+        if "logs" in argv:
+            return subprocess.CompletedProcess(
+                argv, 0, "A5KERNEL_TIMING_US=3.5\n", ""
+            )
+        return subprocess.CompletedProcess(argv, 1, "result failed\n", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="timing replay failed"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "failed-result-marker")
+        )
 
 
 def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
