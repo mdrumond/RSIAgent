@@ -234,7 +234,8 @@ def test_real_composition_only_schedules_eight_runnable_sources(tmp_path):
     from tests.test_a5_phase1_composition import _guide_and_report
 
     guide_path, guide, gate = _guide_and_report(tmp_path)
-    unavailable = lambda *_args, **_kwargs: None
+    def unavailable(*_args, **_kwargs):
+        return None
     phase1 = Phase1CellComposition(
         tmp_path / "phase1", guide_path, guide, gate,
         LiveDependencies(unavailable, unavailable),
