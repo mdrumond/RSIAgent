@@ -1024,7 +1024,9 @@ def test_catlass_fixture_compile_path_accepts_host_owned_block_six(monkeypatch):
     tla.Tensor = object
     tla.kernel = lambda function: function
     tla.arch = SimpleNamespace(RowMajor=object())
-    artifact = lambda *args, **kwargs: None
+    def artifact(*args, **kwargs):
+        return None
+
     tla.compile = lambda *args, **kwargs: artifact
     runtime = ModuleType("catlass.tla.runtime")
     catlass.tla = tla
