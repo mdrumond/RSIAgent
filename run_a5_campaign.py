@@ -34,6 +34,10 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--env-file", type=Path)
     reconcile.add_argument("--until-complete", action="store_true")
     reconcile.add_argument("--poll-seconds", type=float, default=30.0)
+    reconcile.add_argument(
+        "--retry-job", action="append", default=[],
+        help="explicitly retry one blocked logical job ID",
+    )
     worker = commands.add_parser("worker")
     worker.add_argument("--request", type=Path, required=True)
     return parser
@@ -92,10 +96,10 @@ def _command_factory(args, destinations):
     return command
 
 
-def _qualification(args, destination) -> bool:
+def _qualification(args, destination) -> int | None:
     path = args.phase2_root / "cells" / destination.cell_id / "qualification.json"
     if not path.exists():
-        return False
+        return None
     try:
         value = json.loads(path.read_bytes())
     except (OSError, json.JSONDecodeError) as exc:
@@ -107,10 +111,13 @@ def _qualification(args, destination) -> bool:
         or value.get("cell_id") != destination.cell_id
         or value.get("catlass_revision") != destination.catlass_revision
         or value.get("catlass_source") != args.catlass_source
+        or isinstance(value.get("physical_device"), bool)
+        or not isinstance(value.get("physical_device"), int)
+        or not 1 <= value["physical_device"] <= 7
         or value.get("record_sha256") != canonical_digest(body)
     ):
         raise ValueError("invalid retained Phase 2 qualification")
-    return True
+    return value["physical_device"]
 
 
 def _terminal(args, destination):
@@ -164,14 +171,19 @@ def main(argv=None, *, sleeper=time.sleep) -> int:
     if args.poll_seconds <= 0:
         raise ValueError("poll-seconds must be positive")
     controller = _controller(args)
+    retry_job_ids = tuple(args.retry_job)
     while True:
-        report = controller.reconcile()
+        report = (
+            controller.reconcile(retry_job_ids=retry_job_ids)
+            if retry_job_ids else controller.reconcile()
+        )
+        retry_job_ids = ()
         print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")),
               flush=True)
-        if not args.until_complete or report.status == "complete":
+        if not args.until_complete or report.status in {"complete", "blocked"}:
             break
         sleeper(args.poll_seconds)
-    return 0
+    return 2 if report.status == "blocked" else 0
 
 
 if __name__ == "__main__":

@@ -116,9 +116,7 @@ class ScreenWorkerPool:
                 or result.get("record_sha256") != canonical_digest(body)
             ):
                 raise ValueError("invalid Screen worker result")
-            return (Observation.completed(result["exit_code"])
-                    if result["exit_code"] == 0
-                    else Observation.incomplete(result["exit_code"]))
+            return Observation.completed(result["exit_code"])
         completed = self.run(
             ("screen", "-ls", assignment.worker_handle),
             text=True, capture_output=True, check=False,

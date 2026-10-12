@@ -145,5 +145,12 @@ def main(
     return 0
 
 
+def _entry() -> int:
+    try:
+        return main()
+    except (InfrastructureFailure, RuntimeUnavailableError):
+        return 75
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_entry())

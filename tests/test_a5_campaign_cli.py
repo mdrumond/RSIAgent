@@ -3,8 +3,11 @@ from pathlib import Path
 
 import pytest
 
+import run_a5_phase1
 import run_a5_phase2
 import run_a5_campaign
+from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.priority_controller import Job, JobKind, Observation
 from benchmarks.a5kernels.screen_workers import ScreenWorkerPool, run_request
 from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
@@ -64,7 +67,7 @@ def test_screen_worker_consumes_exact_argv_and_retains_result(tmp_path):
         return type("Completed", (), {"returncode": 19})()
 
     run_request(request, process_runner=execute)
-    assert pool.observe(assignment) == Observation.incomplete(19)
+    assert pool.observe(assignment) == Observation.completed(19)
 
 
 def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
@@ -132,6 +135,69 @@ def test_until_complete_reconciles_again_after_bounded_poll(monkeypatch, capsys)
     assert [json.loads(line)["status"] for line in capsys.readouterr().out.splitlines()] == [
         "incomplete", "complete",
     ]
+
+
+def test_until_complete_stops_on_blocked_and_retry_is_explicit(monkeypatch, capsys):
+    calls = []
+    report = type("Report", (), {
+        "status": "blocked", "as_dict": lambda self: {"status": self.status},
+    })()
+
+    class Controller:
+        def reconcile(self, **kwargs):
+            calls.append(kwargs)
+            return report
+
+    monkeypatch.setattr(run_a5_campaign, "_controller", lambda _args: Controller())
+    required = [
+        "--controller-root", "/c", "--phase1-root", "/p1", "--phase2-root", "/p2",
+        "--gate", "/gate", "--guide", "/guide", "--tla-root", "/tla",
+        "--profiling-skill-root", "/skill", "--bge-cache", "/bge", "--kdb", "/kdb",
+        "--catlass-source", "/remote/catlass", "--collection", "catlass",
+    ]
+
+    assert run_a5_campaign.main([
+        "reconcile", *required, "--until-complete",
+        "--retry-job", "phase1-run:p1-a",
+    ], sleeper=pytest.fail) == 2
+    assert calls == [{"retry_job_ids": ("phase1-run:p1-a",)}]
+    assert json.loads(capsys.readouterr().out)["status"] == "blocked"
+
+
+def test_authenticated_qualification_returns_bound_physical_device(tmp_path):
+    destination = type("Destination", (), {
+        "cell_id": "p2-a", "catlass_revision": "a" * 40,
+    })()
+    args = type("Args", (), {
+        "phase2_root": tmp_path, "catlass_source": "/remote/catlass",
+    })()
+    path = tmp_path / "cells" / "p2-a" / "qualification.json"
+    path.parent.mkdir(parents=True)
+    body = {
+        "schema": "a5-catlass-phase2-transport-qualification-v1",
+        "status": "transport-qualified", "cell_id": "p2-a",
+        "catlass_revision": "a" * 40, "catlass_source": "/remote/catlass",
+        "physical_device": 3,
+    }
+    path.write_text(json.dumps({**body, "record_sha256": canonical_digest(body)}))
+
+    assert run_a5_campaign._qualification(args, destination) == 3
+
+
+@pytest.mark.parametrize("module", [run_a5_phase1, run_a5_phase2])
+def test_top_level_infrastructure_exhaustion_uses_exit_75(module, monkeypatch):
+    monkeypatch.setattr(module, "main", lambda: (_ for _ in ()).throw(
+        InfrastructureFailure("offline")
+    ))
+    assert module._entry() == 75
+
+
+def test_top_level_semantic_error_is_not_reclassified(monkeypatch):
+    monkeypatch.setattr(run_a5_phase2, "main", lambda: (_ for _ in ()).throw(
+        ValueError("bad configuration")
+    ))
+    with pytest.raises(ValueError, match="configuration"):
+        run_a5_phase2._entry()
 
 
 def test_public_phase2_terminal_loader_authenticates_without_mutation(tmp_path):
