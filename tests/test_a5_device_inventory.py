@@ -172,6 +172,24 @@ def test_inventory_classifies_exact_profiling_unavailable_record(stream):
         probe.profiling_snapshot()
 
 
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        output(candidate(2))
+        + "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto\n",
+        output(candidate(2)).replace(terminal(2), "")
+        + "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto\n",
+        "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto\n" * 2,
+    ],
+)
+def test_inventory_rejects_contradictory_unavailable_evidence(stdout):
+    probe, _ = inventory(stdout, returncode=1)
+
+    with pytest.raises(DeviceInventoryError) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
+
+
 def test_inventory_classifies_complete_excluded_snapshot_without_stderr_marker():
     stdout = "\n".join(
         [

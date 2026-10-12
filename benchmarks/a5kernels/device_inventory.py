@@ -98,11 +98,8 @@ class BZDeviceInventory:
             raise DeviceInventoryUnavailable(
                 "checked BZ-A5 selector infrastructure is temporarily unavailable"
             )
-        streams = (completed.stdout, completed.stderr)
-        has_unavailable_record = any(
-            line == _PROFILING_UNAVAILABLE
-            for stream in streams if isinstance(stream, str)
-            for line in stream.splitlines()
+        has_unavailable_record = _has_canonical_unavailable_record(
+            completed.stdout, completed.stderr
         )
         has_complete_excluded_inventory = (
             completed.returncode == 1
@@ -127,6 +124,34 @@ class BZDeviceInventory:
         if not isinstance(completed.stdout, str):
             raise DeviceInventoryError("checked BZ-A5 selector returned invalid output")
         return _parse_profiling_snapshot(completed.stdout)
+
+
+def _has_canonical_unavailable_record(stdout: object, stderr: object) -> bool:
+    """Accept one unavailable terminal without contradictory selector evidence."""
+
+    streams = tuple(stream for stream in (stdout, stderr) if isinstance(stream, str))
+    if sum(
+        line == _PROFILING_UNAVAILABLE
+        for stream in streams
+        for line in stream.splitlines()
+    ) != 1:
+        return False
+    if not isinstance(stdout, str):
+        return True
+    selector_lines = tuple(
+        line
+        for line in stdout.splitlines()
+        if line.startswith((_CANDIDATE, _DEVICE, _STATE))
+        and line != _PROFILING_UNAVAILABLE
+    )
+    candidate_lines = tuple(
+        line for line in selector_lines if line.startswith(_CANDIDATE)
+    )
+    if any(line.startswith((_DEVICE, _STATE)) for line in selector_lines):
+        return False
+    if not candidate_lines:
+        return True
+    return _is_complete_excluded_inventory("\n".join(candidate_lines))
 
 
 def _is_complete_excluded_inventory(stdout: str) -> bool:
