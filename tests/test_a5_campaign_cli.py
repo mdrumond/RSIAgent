@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -58,7 +59,7 @@ def test_screen_worker_consumes_exact_argv_and_retains_result(tmp_path):
     job = Job(JobKind.PHASE1_RUN, "p1-a")
     assignment = pool.start(job, 3, worker, ("python", "run.py"))
     request = worker / "attempt-0001" / "request.json"
-    assert calls[0][0][:3] == ("screen", "-DmS", assignment.worker_handle)
+    assert calls[0][0][:3] == ("screen", "-dmS", assignment.worker_handle)
     assert calls[0][0][-3:] == ("worker", "--request", str(request))
     value = json.loads(request.read_text())
     assert value["command"] == ["python", "run.py"]
@@ -119,11 +120,46 @@ def test_screen_worker_start_reports_screen_diagnostics(tmp_path):
         pool.start(Job(JobKind.PHASE1_RUN, "p1-failed"), 2, worker, ("run",))
 
 
+def test_screen_worker_real_screen_returns_while_worker_is_active(
+    tmp_path, monkeypatch,
+):
+    if shutil.which("screen") is None:
+        pytest.skip("GNU Screen is unavailable")
+    screen_dir = tmp_path / "screen"
+    screen_dir.mkdir(mode=0o700)
+    screen_dir.chmod(0o700)
+    monkeypatch.setenv("SCREENDIR", str(screen_dir))
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-real-screen"
+    pool = ScreenWorkerPool(root, script=Path(run_a5_campaign.__file__))
+    assignment = None
+
+    try:
+        started = time.monotonic()
+        assignment = pool.start(
+            Job(JobKind.PHASE1_RUN, "p1-real-screen"),
+            2,
+            worker,
+            (sys.executable, "-c", "import time; time.sleep(2)"),
+        )
+        assert time.monotonic() - started < 0.5
+        assert pool.observe(assignment) == Observation.active()
+    finally:
+        if assignment is not None:
+            subprocess.run(
+                ("screen", "-S", assignment.worker_handle, "-X", "quit"),
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=3,
+            )
+
+
 def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
     outputs = []
 
     def screen(argv, **kwargs):
-        if argv[:2] == ("screen", "-DmS"):
+        if argv[:2] == ("screen", "-dmS"):
             return type("Completed", (), {"returncode": 0, "stdout": ""})()
         outputs.append(argv)
         return type("Completed", (), {
@@ -144,7 +180,7 @@ def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
 
 def test_screen_worker_recovers_unrecorded_active_envelope(tmp_path):
     def screen(argv, **_kwargs):
-        if argv[:2] == ("screen", "-DmS"):
+        if argv[:2] == ("screen", "-dmS"):
             return type("Completed", (), {"returncode": 0, "stdout": ""})()
         return type("Completed", (), {
             "returncode": 0, "stdout": f"1234.{assignment.worker_handle}\n"

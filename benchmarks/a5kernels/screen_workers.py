@@ -85,12 +85,12 @@ class ScreenWorkerPool:
         request_path = attempt / "request.json"
         request_path.write_bytes(canonical_bytes(request) + b"\n")
         handle = self._handle(job, device, ordinal)
-        # A detached Screen server inherits its launcher's file descriptors.
-        # Regular files let subprocess.run return when the Screen client exits;
-        # capture pipes would stay open until the detached worker finishes.
+        # Lowercase -d with -m forks a detached Screen server. Uppercase -D
+        # keeps the launcher attached until the worker exits. Regular files
+        # also prevent a detached server from retaining capture pipes.
         with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as diagnostics:
             completed = self.run(
-                ("screen", "-DmS", handle, sys.executable, str(self.script),
+                ("screen", "-dmS", handle, sys.executable, str(self.script),
                  "worker", "--request", str(request_path)),
                 text=True, stdout=diagnostics, stderr=subprocess.STDOUT,
                 check=False,
