@@ -26,8 +26,10 @@ from benchmarks.a5kernels.phase1_experiments import (
     A5Phase1Cell,
     KnowledgeMode,
     PENDING_PROFILER_REASON,
+    PendingTreatmentError,
     ProfilingGuidance,
     ProgrammingGuideIdentity,
+    admit_runnable_cell,
     build_cells,
 )
 from benchmarks.a5kernels.phase1_live import (
@@ -98,6 +100,27 @@ def runnable_cell(cell: A5Phase1Cell) -> CellDisposition:
         if cell.runnable
         else CellDisposition.pending(PENDING_PROFILER_REASON)
     )
+
+
+def select_worker_cell(
+    guide: ProgrammingGuideIdentity,
+    cell_ids: Sequence[str] | None,
+) -> A5Phase1Cell | None:
+    """Resolve an optional single-cell worker selection against the registry."""
+
+    if not cell_ids:
+        return None
+    requested = tuple(cell_ids)
+    if len(set(requested)) != len(requested):
+        raise ValueError("duplicate A5 Phase 1 cell ID")
+    if len(requested) != 1:
+        raise ValueError("single-cell worker requires exactly one cell ID")
+    registered = {cell.cell_id: cell for cell in build_cells(guide)}
+    try:
+        selected = registered[requested[0]]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("unknown A5 Phase 1 cell ID") from exc
+    return admit_runnable_cell(selected)
 
 
 @dataclass(frozen=True)
@@ -254,6 +277,20 @@ class Phase1CellComposition:
 
     def resume(self) -> tuple[dict[str, object], ...]:
         return self.run()
+
+    def run_cell(self, cell_id: str) -> dict[str, object]:
+        """Run or resume one registered cell without staging sibling cells."""
+
+        selected = next(
+            (cell for cell in self.cells if cell.cell_id == cell_id), None
+        )
+        if selected is None:
+            raise ValueError("cell_id is not registered in this Phase 1 plan")
+        if not self._is_runnable(selected):
+            raise PendingTreatmentError("selected A5 Phase 1 cell is pending")
+        self._ensure_plan()
+        terminal = self._load_terminal(selected)
+        return terminal if terminal is not None else self._run_cell(selected)
 
     def report(self) -> dict[str, object]:
         records = []
@@ -488,4 +525,5 @@ __all__ = [
     "LiveProjectRequest",
     "Phase1CellComposition",
     "runnable_cell",
+    "select_worker_cell",
 ]
