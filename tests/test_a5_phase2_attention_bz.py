@@ -109,6 +109,9 @@ def test_complete_suite_stages_exact_case_and_checked_argv(tmp_path, case):
     assert [item.relative_path for item in invocation.files] == [
         "kernel.py", "host_driver.py", "input.json",
     ]
+    driver = invocation.files[1].content
+    assert "from_dlpack(tensor.contiguous().reshape(-1)" in driver
+    assert "output.float().cpu().reshape(-1).tolist()" in driver
     payload = json.loads(invocation.files[-1].content)
     assert payload["case"]["case_id"] == case.case_id
     assert tuple(payload["q"]) == execution.q
@@ -206,6 +209,29 @@ def test_confirmed_nonzero_dispatch_retains_compiler_log_and_terminal(tmp_path, 
     assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
 
 
+def test_current_wrapper_completed_dispatch_retains_nonzero_result(tmp_path):
+    def dispatch(invocation):
+        session = invocation.argv[2]
+        return CommandResult(
+            2,
+            f"SESSION_STATE=completed session={session} exit=2\n",
+            session_handle=f"bz-a5:{session}",
+        )
+
+    executor = FakeCheckedExecutor(dispatch=dispatch, inspections=(
+        CommandResult(0, "TLA compiler: layout failure"),
+        CommandResult(2, "placeholder", "runtime returned 2"),
+    ))
+
+    receipt = _backend(executor).execute(
+        SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
+    )
+
+    assert receipt.exit_code == 2
+    assert "TLA compiler: layout failure" in receipt.stdout
+    assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
+
+
 def test_confirmed_host_failure_reaches_digest_bound_target_evidence(tmp_path):
     def dispatch(invocation):
         session = invocation.argv[2]
@@ -254,6 +280,23 @@ def test_unconfirmed_wrapper_failure_is_infrastructure_even_with_handle(tmp_path
         _backend(executor).execute(
             SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
         )
+
+
+def test_completed_dispatch_with_mismatched_exit_is_infrastructure(tmp_path):
+    def dispatch(invocation):
+        session = invocation.argv[2]
+        return CommandResult(
+            2,
+            f"SESSION_STATE=completed session={session} exit=1\n",
+            session_handle=f"bz-a5:{session}",
+        )
+
+    executor = FakeCheckedExecutor(dispatch=dispatch)
+    with pytest.raises(AttentionInfrastructureError, match="unavailable"):
+        _backend(executor).execute(
+            SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
+        )
+    assert executor.inspect_argv == []
 
 
 def test_runtime_exit_is_semantic_and_retains_all_exit_metadata(tmp_path):

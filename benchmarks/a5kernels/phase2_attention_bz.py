@@ -182,7 +182,9 @@ class CatlassAttentionBackend:
         uncertain = _observation_uncertain(
             dispatch.exit_code, dispatch.stdout, session_name
         )
-        confirmed = _dispatch_confirmed(dispatch.stdout, session_name)
+        confirmed = _dispatch_confirmed(
+            dispatch.exit_code, dispatch.stdout, session_name
+        )
         if dispatch.exit_code != 0 and not (uncertain or confirmed):
             raise AttentionInfrastructureError("A5 attention dispatch was unavailable")
 
@@ -293,10 +295,11 @@ def _observation_uncertain(exit_code: int, stdout: str, session_name: str) -> bo
     )
 
 
-def _dispatch_confirmed(stdout: str, session_name: str) -> bool:
+def _dispatch_confirmed(exit_code: int, stdout: str, session_name: str) -> bool:
     prefix = f"SESSION_DISPATCH=confirmed session={session_name}"
-    return any(line == prefix or line.startswith(prefix + " ")
-               for line in stdout.splitlines())
+    legacy = any(line == prefix or line.startswith(prefix + " ")
+                 for line in stdout.splitlines())
+    return legacy or _completed_result(exit_code, stdout, session_name)
 
 
 def _completed_result(exit_code: int, stdout: str, session_name: str) -> bool:
@@ -351,7 +354,7 @@ def main():
     tensors = [torch.tensor(item, dtype=dtype, device="npu").reshape(shape)
                for item in (q, k, v)]
     output = torch.empty(shape, dtype=dtype, device="npu")
-    as_tla = lambda tensor: from_dlpack(tensor.contiguous(), layout_tag=tla.arch.RowMajor)
+    as_tla = lambda tensor: from_dlpack(tensor.contiguous().reshape(-1), layout_tag=tla.arch.RowMajor)
     tla_q, tla_k, tla_v, tla_output = [as_tla(item) for item in (*tensors, output)]
     artifact = tla.compile(kernel.dense_attention, tla_q, tla_k, tla_v, tla_output,
                            options="--npu-arch 3510")
