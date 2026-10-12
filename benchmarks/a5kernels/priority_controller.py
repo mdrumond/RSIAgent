@@ -101,6 +101,8 @@ class Observation:
             raise ValueError("invalid worker observation state")
         if self.state == "active" and self.exit_code is not None:
             raise ValueError("active worker observation cannot have an exit code")
+        if self.state == "incomplete" and self.exit_code is not None:
+            raise ValueError("incomplete worker observation cannot claim an exit code")
         if self.exit_code is not None and (
             isinstance(self.exit_code, bool) or not isinstance(self.exit_code, int)
         ):
@@ -115,8 +117,8 @@ class Observation:
         return cls("completed", exit_code)
 
     @classmethod
-    def incomplete(cls, exit_code: int | None = None) -> "Observation":
-        return cls("incomplete", exit_code)
+    def incomplete(cls) -> "Observation":
+        return cls("incomplete")
 
 
 class WorkerPool(Protocol):
