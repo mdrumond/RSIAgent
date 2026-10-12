@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from io import StringIO
 import json
-from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -15,7 +14,11 @@ from benchmarks.a5kernels import (
     RunRequest,
     fixture_for,
 )
-from benchmarks.a5kernels.bz import CommandResult, OUTPUT_MARKER
+from benchmarks.a5kernels.bz import (
+    CommandResult,
+    OUTPUT_MARKER,
+    _execution_session_name,
+)
 from benchmarks.a5kernels.ascendc_runtime import host_driver
 
 
@@ -78,7 +81,8 @@ def test_concrete_plan_keeps_host_attempt_and_retained_result_lifecycle():
     ))
     assert payload == {"input_a": list(plan.input_a), "input_b": list(plan.input_b)}
     assert plan.attempt_id == "ascend-1"
-    assert executor.dispatch.argv[2].endswith("-ascend-1")
+    assert executor.dispatch.argv[2] == _execution_session_name(plan)
+    assert len(executor.dispatch.argv[2]) == 46
     assert [argv[-1] for argv in executor.inspections] == ["logs", "result"]
     assert receipt.output == (3.0,)
     assert receipt.session_handle == "bz-a5:ascend"
