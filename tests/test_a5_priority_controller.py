@@ -10,6 +10,7 @@ from benchmarks.a5kernels.priority_controller import (
     JobKind,
     Observation,
     RetainedAssignment,
+    STATE_SCHEMA,
 )
 
 
@@ -55,13 +56,16 @@ class Workers:
 
 
 def controller(tmp_path, *, devices=(1, 2), completed=(), workers=None,
-               phase1_progress=(), qualified=(), phase2_terminal=()):
+               phase1_progress=(), qualified=(), qualification_devices=None,
+               phase2_terminal=()):
     campaign = Campaign(tmp_path / "phase1", completed=completed)
     destinations = tuple(
         type("Destination", (), {"cell_id": f"p2-{name[-1]}",
                                   "source_cell_id": name})()
         for name in ("p1-b", "p1-a")
     )
+    bound = ({item: 3 for item in qualified} if qualification_devices is None
+             else dict(qualification_devices))
     return CampaignController(
         root=tmp_path / "controller",
         phase1=campaign,
@@ -73,7 +77,7 @@ def controller(tmp_path, *, devices=(1, 2), completed=(), workers=None,
                                      str(device)),
         phase1_progress=lambda cell_id: cell_id in phase1_progress,
         snapshot=lambda destination: tmp_path / "phase2" / destination.cell_id / "snapshot",
-        qualified=lambda destination: destination.cell_id in qualified,
+        qualified=lambda destination: bound.get(destination.cell_id),
         phase2_terminal=lambda destination: (
             {"status": "passed"} if destination.cell_id in phase2_terminal else None
         ),
@@ -126,7 +130,7 @@ def test_dead_phase1_worker_is_truthfully_incomplete_then_resumed(tmp_path):
 def test_phase1_has_priority_then_qualification_then_phase2(tmp_path):
     workers = Workers()
     report = controller(
-        tmp_path, devices=(1, 2), workers=workers,
+        tmp_path, devices=(1, 3), workers=workers,
         completed=("p1-a",), qualified=("p2-a",),
     ).reconcile()
 
@@ -137,7 +141,7 @@ def test_phase1_has_priority_then_qualification_then_phase2(tmp_path):
 
     workers = Workers()
     report = controller(
-        tmp_path / "qualification", devices=(1, 2), workers=workers,
+        tmp_path / "qualification", devices=(1, 3), workers=workers,
         completed=("p1-a", "p1-b"), qualified=("p2-a",),
     ).reconcile()
     assert [(item.job.kind, item.job.cell_id) for item in report.active] == [
@@ -215,11 +219,12 @@ def test_retained_unknown_job_fails_closed_before_observation(tmp_path):
     subject = controller(tmp_path)
     subject.root.mkdir(parents=True)
     subject.state_path.write_text(json.dumps({
-        "schema": "a5-priority-controller-state-v1",
+        "schema": STATE_SCHEMA,
         "active": [RetainedAssignment(
             Job(JobKind.PHASE1_RUN, "unknown"), 1, "stale-screen", 1,
         ).as_dict()],
         "incomplete": [],
+        "blocked": [],
     }))
 
     with pytest.raises(ValueError, match="job universe"):
@@ -249,7 +254,7 @@ def test_real_composition_only_schedules_eight_runnable_sources(tmp_path):
         command=lambda job, device: (job.job_id, str(device)),
         phase1_progress=lambda _cell_id: False,
         snapshot=lambda destination: tmp_path / destination.cell_id,
-        qualified=lambda _destination: False,
+        qualified=lambda _destination: None,
         phase2_terminal=lambda _destination: None,
     )
 
@@ -267,3 +272,93 @@ def test_real_composition_only_schedules_eight_runnable_sources(tmp_path):
         item.source_cell_id for item in destinations
     }
     assert all(item[0].kind is JobKind.PHASE1_RUN for item in workers.started)
+
+
+def test_phase2_run_uses_qualification_device_and_waits_when_unavailable(tmp_path):
+    ready = controller(
+        tmp_path / "ready", devices=(2, 3), completed=("p1-a", "p1-b"),
+        qualification_devices={"p2-a": 3}, phase2_terminal=("p2-b",),
+    ).reconcile()
+    assert [(item.job, item.physical_device) for item in ready.active] == [
+        (Job(JobKind.PHASE2_RUN, "p2-a"), 3),
+    ]
+
+    waiting = controller(
+        tmp_path / "waiting", devices=(2,), completed=("p1-a", "p1-b"),
+        qualification_devices={"p2-a": 3}, phase2_terminal=("p2-b",),
+    ).reconcile()
+    assert waiting.active == ()
+    assert waiting.status == "incomplete"
+
+
+def test_unbound_eligible_job_fills_other_device_while_bound_run_waits(tmp_path):
+    report = controller(
+        tmp_path, devices=(2,), completed=("p1-a", "p1-b"),
+        qualification_devices={"p2-a": 3},
+    ).reconcile()
+
+    assert [(item.job, item.physical_device) for item in report.active] == [
+        (Job(JobKind.PHASE2_QUALIFY, "p2-b"), 2),
+    ]
+
+
+def test_unbound_job_reserves_later_pinned_device_when_an_alternative_is_idle(tmp_path):
+    report = controller(
+        tmp_path, devices=(2, 3), completed=("p1-a", "p1-b"),
+        qualification_devices={"p2-a": 2},
+    ).reconcile()
+
+    assert [(item.job, item.physical_device) for item in report.active] == [
+        (Job(JobKind.PHASE2_RUN, "p2-a"), 2),
+        (Job(JobKind.PHASE2_QUALIFY, "p2-b"), 3),
+    ]
+
+    constrained = controller(
+        tmp_path / "constrained", devices=(2,), completed=("p1-a", "p1-b"),
+        qualification_devices={"p2-a": 2},
+    ).reconcile()
+    assert [(item.job, item.physical_device) for item in constrained.active] == [
+        (Job(JobKind.PHASE2_QUALIFY, "p2-b"), 2),
+    ]
+
+
+def test_noninfra_exit_blocks_without_implicit_retry_and_explicit_retry_recovers(tmp_path):
+    workers = Workers()
+    progress = set()
+    subject = controller(
+        tmp_path, devices=(1,), workers=workers, completed=("p1-b",),
+        phase1_progress=progress, phase2_terminal=("p2-b",),
+    )
+    subject.reconcile()
+    progress.add("p1-a")
+    workers.observations["phase1-run:p1-a"] = Observation.completed(2)
+
+    blocked = subject.reconcile()
+    assert blocked.status == "blocked"
+    assert blocked.incomplete == ()
+    assert blocked.blocked[0]["classification"] == "worker-nonzero"
+    assert len(workers.started) == 1
+
+    workers.observations.clear()
+    retried = subject.reconcile(retry_job_ids=("phase1-run:p1-a",))
+    assert retried.status == "incomplete"
+    assert retried.blocked == ()
+    assert len(workers.started) == 2
+    assert workers.started[-1][0] == Job(JobKind.PHASE1_RESUME, "p1-a")
+
+
+@pytest.mark.parametrize("exit_code", [75, 255])
+def test_recognized_infrastructure_exit_is_incomplete_and_resumed(tmp_path, exit_code):
+    workers = Workers()
+    subject = controller(
+        tmp_path, devices=(1,), workers=workers, completed=("p1-b",),
+        phase1_progress=("p1-a",), phase2_terminal=("p2-b",),
+    )
+    subject.reconcile()
+    workers.observations["phase1-resume:p1-a"] = Observation.completed(exit_code)
+
+    report = subject.reconcile()
+
+    assert report.incomplete[-1]["exit_code"] == exit_code
+    assert report.blocked == ()
+    assert workers.started[-1][0] == Job(JobKind.PHASE1_RESUME, "p1-a")
