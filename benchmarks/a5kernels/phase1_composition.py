@@ -246,7 +246,7 @@ class Phase1CellComposition:
         for cell in self.cells:
             if not self._is_runnable(cell):
                 continue
-            terminal = self._load_terminal(cell)
+            terminal = self.load_terminal(cell)
             if terminal is None:
                 terminal = self._run_cell(cell)
             records.append(terminal)
@@ -260,7 +260,7 @@ class Phase1CellComposition:
         for cell in self.cells:
             if not self._is_runnable(cell):
                 continue
-            terminal = self._load_terminal(cell)
+            terminal = self.load_terminal(cell)
             if terminal is not None:
                 records.append(terminal)
         completed = {row["cell_id"] for row in records}
@@ -424,7 +424,13 @@ class Phase1CellComposition:
             return
         path.write_bytes(expected)
 
-    def _load_terminal(self, cell: A5Phase1Cell) -> dict[str, object] | None:
+    def load_terminal(self, cell: A5Phase1Cell) -> dict[str, object] | None:
+        """Load one registered terminal through the composition's full checks."""
+
+        if cell not in self.cells:
+            raise ValueError("cell is not registered in this Phase 1 composition")
+        if not self._is_runnable(cell):
+            raise ValueError("pending Phase 1 cells cannot have admitted terminals")
         path = self._terminal_path(cell)
         if not path.exists():
             return None
