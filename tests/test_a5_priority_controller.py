@@ -267,4 +267,3 @@ def test_real_composition_only_schedules_eight_runnable_sources(tmp_path):
         item.source_cell_id for item in destinations
     }
     assert all(item[0].kind is JobKind.PHASE1_RUN for item in workers.started)
-
