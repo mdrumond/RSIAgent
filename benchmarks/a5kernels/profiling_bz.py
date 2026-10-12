@@ -209,11 +209,7 @@ class BZProfileBackend:
 
         if _marked_values(completed.stdout, marker):
             return completed.stdout, completed.returncode
-        retries = (
-            self._observation_retries
-            if completed.returncode in {75, 255}
-            else 0
-        )
+        retries = self._observation_retries
         for attempt in range(retries + 1):
             logs = self._call(
                 (self._session, "--name", replay_id, "logs", "--lines", "2000")

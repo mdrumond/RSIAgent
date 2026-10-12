@@ -950,6 +950,136 @@ def test_concrete_backend_retries_the_same_retained_timing_observation(
     assert sleeps == [120, 120]
 
 
+@pytest.mark.parametrize("first_observation", ["missing-marker", "nonterminal"])
+def test_completed_dispatch_retries_same_retained_marker_observation(
+    tmp_path: Path, first_observation: str,
+) -> None:
+    dispatches = 0
+    log_calls = 0
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal dispatches, log_calls, result_calls
+        if Path(argv[0]).name != "session.sh":
+            dispatches += 1
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", "",
+            )
+        if "logs" in argv:
+            log_calls += 1
+            marker = (
+                "A5KERNEL_TIMING_US=8.75\n"
+                if log_calls > 1 or first_observation == "nonterminal"
+                else ""
+            )
+            return subprocess.CompletedProcess(argv, 0, marker, "")
+        result_calls += 1
+        return subprocess.CompletedProcess(
+            argv,
+            75 if result_calls == 1 and first_observation == "nonterminal" else 0,
+            "" if result_calls == 1 and first_observation == "nonterminal"
+            else "SESSION_RESULT=0\n",
+            "",
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=2,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    result = backend.time_sample(
+        TimingCommand(CampaignKind.FINAL, request, "completed-marker-race")
+    )
+
+    assert result.duration_us == 8.75
+    assert dispatches == 1
+    assert log_calls == result_calls == 2
+    assert sleeps == [120]
+
+
+def test_completed_dispatch_marker_observation_exhaustion_fails_closed(
+    tmp_path: Path,
+) -> None:
+    dispatches = 0
+    log_calls = 0
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal dispatches, log_calls, result_calls
+        if Path(argv[0]).name != "session.sh":
+            dispatches += 1
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", "",
+            )
+        if "logs" in argv:
+            log_calls += 1
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        result_calls += 1
+        return subprocess.CompletedProcess(argv, 0, "SESSION_RESULT=0\n", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=2,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="no unique timing"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "missing-marker")
+        )
+
+    assert dispatches == 1
+    assert log_calls == result_calls == 3
+    assert sleeps == [120, 120]
+
+
 def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
     def run(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 255, "", "banner timeout")
