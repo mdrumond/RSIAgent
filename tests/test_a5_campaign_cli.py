@@ -191,7 +191,9 @@ def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
 
 @pytest.mark.parametrize("listing", [
     "\t1234.{handle}\t(10/12/26 12:00:00)\t(Dead ???)\n",
+    "\t1234.{handle}\t(Dead ???)\n",
     "\t1234.{handle}-suffix\t(10/12/26 12:00:00)\t(Detached)\n",
+    "\t1234.{handle}-suffix\t(Detached)\n",
 ])
 def test_screen_worker_rejects_non_live_or_inexact_sessions(tmp_path, listing):
     root = tmp_path / "controller"
@@ -214,14 +216,17 @@ def test_screen_worker_rejects_non_live_or_inexact_sessions(tmp_path, listing):
 @pytest.mark.parametrize(
     "state", ["Attached", "Detached", "Multi, attached", "Multi, detached"]
 )
-def test_screen_worker_treats_exact_live_session_as_active(tmp_path, state):
+@pytest.mark.parametrize("metadata", ["(10/12/26 12:00:00)\t", ""])
+def test_screen_worker_treats_exact_live_session_as_active(
+    tmp_path, state, metadata
+):
     handle = "rsi-a5-attached"
 
     def screen(argv, **_kwargs):
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout=f"\t1234.{handle}\t(10/12/26 12:00:00)\t({state})\n",
+            stdout=f"\t1234.{handle}\t{metadata}({state})\n",
         )
 
     pool = ScreenWorkerPool(
