@@ -471,6 +471,40 @@ def test_bz_adapter_reobserves_exact_handle_when_result_is_nonterminal():
     ]
 
 
+def test_bz_adapter_reobserves_raw_unavailable_log_transport():
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+    session = _execution_session_name(plan)
+    command = FakeCommandExecutor(
+        CommandResult(0, "dispatch completed"),
+        (
+            CommandResult(75, "REMOTE_STATE=observation-unavailable\n"),
+            CommandResult(0, f"SESSION_STATE=completed session={session} exit=0"),
+            CommandResult(0, f"{OUTPUT_MARKER}[3]\n"),
+            CommandResult(0, f"SESSION_STATE=completed session={session} exit=0"),
+        ),
+        observations=(
+            CommandResult(
+                0,
+                "CATLASS_VALIDATION_STATE=completed\n"
+                f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n",
+                session_handle=f"bz-a5:{session}",
+            ),
+        ),
+    )
+
+    receipt = BZSessionAdapter(
+        command, session_wrapper="execution-profiles/bz-a5/session.sh"
+    ).execute(plan)
+
+    assert receipt.output == (3.0,)
+    assert command.observe_handles == [f"bz-a5:{session}"]
+    assert [argv[-1] for argv in command.inspect_argv] == [
+        "logs", "result", "logs", "result"
+    ]
+
+
 def test_bz_adapter_never_converts_unavailable_exact_observation_to_candidate_result():
     plan = A5KernelRunner(FakeBackend()).prepare(
         RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"

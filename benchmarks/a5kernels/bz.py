@@ -587,6 +587,16 @@ def _proven_observation_uncertain(result: CommandResult, session_name: str) -> b
 
 
 def _session_observation_uncertain(result: CommandResult, session_name: str) -> bool:
+    if result.exit_code in {75, 255}:
+        return True
+    raw_states = {
+        "REMOTE_STATE=running",
+        "REMOTE_STATE=reconnecting",
+        "REMOTE_STATE=observation-unavailable",
+        "REMOTE_STATE=missing",
+    }
+    if any(line in raw_states for line in result.stdout.splitlines()):
+        return True
     prefixes = tuple(
         f"SESSION_STATE={state} session={session_name}"
         for state in ("running", "reconnecting", "observation-unavailable", "missing")
