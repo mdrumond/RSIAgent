@@ -32,6 +32,20 @@ _TIMING_MARKER = "A5KERNEL_TIMING_US="
 _REMOTE_MARKER = "MSPROF_PROFILE_REMOTE_DIR="
 
 
+def _collection_operation(replay_id: str) -> str:
+    """Derive a short durable-session name from the full replay identity."""
+
+    digest = hashlib.sha256(replay_id.encode("utf-8")).hexdigest()[:32]
+    return f"a5-collect-{digest}"
+
+
+def _profiling_operation(replay_id: str) -> str:
+    """Derive a short durable-session name from the full profiling identity."""
+
+    digest = hashlib.sha256(replay_id.encode("utf-8")).hexdigest()[:32]
+    return f"a5-profile-{digest}"
+
+
 def _raise_replay_failure(returncode: int, message: str) -> None:
     if returncode in {75, 255}:
         raise InfrastructureFailure(message)
@@ -209,25 +223,43 @@ class BZProfileBackend:
 
         if _marked_values(completed.stdout, marker):
             return completed.stdout, completed.returncode
-        retries = (
-            self._observation_retries
-            if completed.returncode in {75, 255}
-            else 0
-        )
+        operation = _profiling_operation(replay_id)
+        retries = self._observation_retries
+        observation_returncode = completed.returncode
+        observation_output = completed.stdout
         for attempt in range(retries + 1):
             logs = self._call(
-                (self._session, "--name", replay_id, "logs", "--lines", "2000")
+                (self._session, "--name", operation, "logs", "--lines", "2000")
             )
-            result = self._call((self._session, "--name", replay_id, "result"))
+            result = self._call((self._session, "--name", operation, "result"))
             if (
                 logs.returncode == 0
                 and result.returncode == 0
                 and _marked_values(logs.stdout, marker)
             ):
                 return logs.stdout, 0
+            observation_output = logs.stdout
+            if logs.returncode in {75, 255}:
+                observation_returncode = logs.returncode
+            elif result.returncode in {75, 255}:
+                observation_returncode = result.returncode
+            elif result.returncode != 0:
+                observation_returncode = result.returncode
+            elif logs.returncode != 0:
+                observation_returncode = logs.returncode
+            else:
+                observation_returncode = completed.returncode
+            if (
+                result.returncode not in {0, 75, 255}
+                and any(
+                    line.startswith("SESSION_STATE=completed ")
+                    for line in result.stdout.splitlines()
+                )
+            ):
+                return logs.stdout, result.returncode
             if attempt < retries:
                 self._sleep(self._observation_backoff_seconds)
-        return completed.stdout, completed.returncode
+        return observation_output, observation_returncode
 
     def _adapter_argv(
         self, replay_id: str, action: str, request: ProfileRequest
@@ -261,7 +293,7 @@ class BZProfileBackend:
             "--profile",
             "bz-a5",
             "--operation",
-            replay_id,
+            _profiling_operation(replay_id),
             action,
             "--catlass-src",
             self._catlass_source,
@@ -332,7 +364,7 @@ class BZProfileBackend:
             "--mode",
             "summary",
             "--operation",
-            f"{command.replay_id}-collect",
+            _collection_operation(command.replay_id),
         ]
         # BasicInfo rows carry an operator-name column and can be curated by exact
         # name. PipeUtilization rows are keyed by block/sub-block instead; the
