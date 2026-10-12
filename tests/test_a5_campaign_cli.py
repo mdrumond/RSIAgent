@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -15,7 +17,9 @@ from benchmarks.a5kernels.device_inventory import (
     DeviceInventoryError, DeviceInventoryUnavailable,
 )
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
-from benchmarks.a5kernels.priority_controller import Job, JobKind, Observation
+from benchmarks.a5kernels.priority_controller import (
+    Job, JobKind, Observation, RetainedAssignment,
+)
 from benchmarks.a5kernels.screen_workers import ScreenWorkerPool, run_request
 from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
 
@@ -166,7 +170,11 @@ def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
             return type("Completed", (), {"returncode": 0, "stdout": ""})()
         outputs.append(argv)
         return type("Completed", (), {
-            "returncode": 0, "stdout": f"1234.{assignment.worker_handle}\n"
+            "returncode": 0,
+            "stdout": (
+                f"\t1234.{assignment.worker_handle}\t"
+                "(10/12/26 12:00:00)\t(Detached)\n"
+            ),
         })()
 
     root = tmp_path / "controller"
@@ -181,12 +189,133 @@ def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
     assert outputs == [("screen", "-ls", assignment.worker_handle)]
 
 
+@pytest.mark.parametrize("listing", [
+    "\t1234.{handle}\t(10/12/26 12:00:00)\t(Dead ???)\n",
+    "\t1234.{handle}\t(Dead ???)\n",
+    "\t1234.{handle}-suffix\t(10/12/26 12:00:00)\t(Detached)\n",
+    "\t1234.{handle}-suffix\t(Detached)\n",
+])
+def test_screen_worker_rejects_non_live_or_inexact_sessions(tmp_path, listing):
+    root = tmp_path / "controller"
+    assignment = RetainedAssignment(
+        Job(JobKind.PHASE1_RUN, "p1-stale"), 2, "rsi-a5-stale", 1,
+    )
+
+    def screen(_argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            _argv, 0, stdout=listing.format(handle=assignment.worker_handle),
+        )
+
+    pool = ScreenWorkerPool(
+        root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+
+    assert pool.observe(assignment) == Observation.incomplete()
+
+
+@pytest.mark.parametrize(
+    "state", ["Attached", "Detached", "Multi, attached", "Multi, detached"]
+)
+@pytest.mark.parametrize("metadata", ["(10/12/26 12:00:00)\t", ""])
+def test_screen_worker_treats_exact_live_session_as_active(
+    tmp_path, state, metadata
+):
+    handle = "rsi-a5-attached"
+
+    def screen(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=f"\t1234.{handle}\t{metadata}({state})\n",
+        )
+
+    pool = ScreenWorkerPool(
+        tmp_path, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+    assignment = RetainedAssignment(
+        Job(JobKind.PHASE1_RUN, "attached"), 1, handle, 1
+    )
+
+    assert pool.observe(assignment) == Observation.active()
+
+
+def test_screen_worker_authenticated_result_precedes_dead_session(tmp_path):
+    calls = []
+
+    def screen(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="\t1234.rsi-a5-result\t(Dead ???)\n",
+        )
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-result"
+    pool = ScreenWorkerPool(
+        root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+    assignment = pool.start(
+        Job(JobKind.PHASE1_RUN, "p1-result"), 2, worker, ("run",),
+    )
+    request = worker / "attempt-0001" / "request.json"
+    run_request(
+        request,
+        process_runner=lambda _argv, **_kwargs: subprocess.CompletedProcess(
+            _argv, 7,
+        ),
+    )
+
+    assert pool.observe(assignment) == Observation.completed(7)
+    assert len(calls) == 1
+
+
+def test_screen_worker_real_dead_session_is_incomplete(tmp_path, monkeypatch):
+    if shutil.which("screen") is None:
+        pytest.skip("GNU Screen is unavailable")
+    screen_dir = tmp_path / "screen"
+    screen_dir.mkdir(mode=0o700)
+    screen_dir.chmod(0o700)
+    monkeypatch.setenv("SCREENDIR", str(screen_dir))
+    handle = "rsi-a5-real-dead"
+    assignment = RetainedAssignment(
+        Job(JobKind.PHASE1_RUN, "p1-real-dead"), 2, handle, 1,
+    )
+    pool = ScreenWorkerPool(
+        tmp_path / "controller", script=Path(run_a5_campaign.__file__)
+    )
+
+    subprocess.run(
+        ("screen", "-dmS", handle, "sleep", "60"), check=True, timeout=3,
+    )
+    socket = next(screen_dir.glob(f"*.{handle}"))
+    try:
+        os.kill(int(socket.name.partition(".")[0]), signal.SIGKILL)
+        for _ in range(30):
+            listing = subprocess.run(
+                ("screen", "-ls", handle), text=True, capture_output=True,
+                check=False, timeout=3,
+            )
+            if "(Dead ???)" in listing.stdout:
+                break
+            time.sleep(0.01)
+        assert "(Dead ???)" in listing.stdout
+        assert pool.observe(assignment) == Observation.incomplete()
+    finally:
+        subprocess.run(
+            ("screen", "-wipe"), text=True, capture_output=True,
+            check=False, timeout=3,
+        )
+
+
 def test_screen_worker_recovers_unrecorded_active_envelope(tmp_path):
     def screen(argv, **_kwargs):
         if argv[:2] == ("screen", "-dmS"):
             return type("Completed", (), {"returncode": 0, "stdout": ""})()
         return type("Completed", (), {
-            "returncode": 0, "stdout": f"1234.{assignment.worker_handle}\n"
+            "returncode": 0,
+            "stdout": (
+                f"\t1234.{assignment.worker_handle}\t"
+                "(10/12/26 12:00:00)\t(Detached)\n"
+            ),
         })()
 
     root = tmp_path / "controller"
@@ -198,6 +327,31 @@ def test_screen_worker_recovers_unrecorded_active_envelope(tmp_path):
     )
 
     assert pool.recover() == (assignment,)
+
+
+def test_screen_worker_does_not_recover_dead_envelope(tmp_path):
+    def screen(argv, **_kwargs):
+        if argv[:2] == ("screen", "-dmS"):
+            return subprocess.CompletedProcess(argv, 0, stdout="")
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                f"\t1234.{assignment.worker_handle}\t"
+                "(10/12/26 12:00:00)\t(Dead ???)\n"
+            ),
+        )
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-dead"
+    pool = ScreenWorkerPool(
+        root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+    assignment = pool.start(
+        Job(JobKind.PHASE1_RUN, "p1-dead"), 2, worker, ("run",),
+    )
+
+    assert pool.recover() == ()
 
 
 def test_until_complete_reconciles_again_after_bounded_poll(monkeypatch, capsys):
