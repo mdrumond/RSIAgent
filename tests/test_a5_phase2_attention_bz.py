@@ -8,6 +8,7 @@ from benchmarks.a5kernels.bz import CommandResult
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
     AttentionInfrastructureError,
+    AttentionTargetVerifier,
     build_execution,
 )
 from benchmarks.a5kernels.phase2_attention_bz import (
@@ -189,6 +190,42 @@ def test_confirmed_nonzero_dispatch_retains_compiler_log_and_terminal(tmp_path, 
     assert dict(receipt.metadata)["dispatch_exit_code"] == str(exit_code)
     assert dict(receipt.metadata)["result_exit_code"] == str(exit_code)
     assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
+
+
+def test_confirmed_host_failure_reaches_digest_bound_target_evidence(tmp_path):
+    def dispatch(invocation):
+        session = invocation.argv[2]
+        return CommandResult(
+            19,
+            f"SESSION_DISPATCH=confirmed session={session} output=.codex/output.log\n",
+            session_handle=f"bz-a5:{session}",
+        )
+
+    inspections = []
+    for _case in ATTENTION_CASES:
+        inspections.extend((
+            CommandResult(0, "TLA compiler: ordinary tile failure"),
+            CommandResult(19, "placeholder", "runtime returned 19"),
+        ))
+    executor = FakeCheckedExecutor(dispatch=dispatch, inspections=inspections)
+
+    evidence = AttentionTargetVerifier(_backend(executor)).verify(
+        SOURCE,
+        request_id="phase2-cell-1",
+        attempt_id="target-1",
+        execution_profile="bz-a5",
+        workdir=tmp_path / "runs",
+    )
+
+    assert evidence.passed is False
+    assert len(evidence.cases) == len(ATTENTION_CASES)
+    assert all(item.failure == "runtime-exit" for item in evidence.cases)
+    assert all(
+        item.diagnostic is not None
+        and "TLA compiler: ordinary tile failure" in item.diagnostic
+        and "runtime returned 19" in item.diagnostic
+        for item in evidence.cases
+    )
 
 
 def test_unconfirmed_wrapper_failure_is_infrastructure_even_with_handle(tmp_path):
