@@ -181,10 +181,9 @@ class CatlassAttentionBackend:
         uncertain = _observation_uncertain(
             dispatch.exit_code, dispatch.stdout, session_name
         )
-        if dispatch.exit_code != 0 and not uncertain:
-            if dispatch.session_handle is None or dispatch.exit_code in {75, 255}:
-                raise AttentionInfrastructureError("A5 attention dispatch was unavailable")
-            return _semantic_receipt(dispatch, execution, ("dispatch",))
+        confirmed = _dispatch_confirmed(dispatch.stdout, session_name)
+        if dispatch.exit_code != 0 and not (uncertain or confirmed):
+            raise AttentionInfrastructureError("A5 attention dispatch was unavailable")
 
         try:
             logs = self._executor.inspect(
@@ -199,15 +198,17 @@ class CatlassAttentionBackend:
             ) from exc
         if logs.exit_code != 0:
             raise AttentionInfrastructureError("A5 attention retained logs are unavailable")
-        if _observation_uncertain(result.exit_code, result.stdout, session_name) or (
-            result.exit_code in {75, 255}
-        ):
+        if _observation_uncertain(result.exit_code, result.stdout, session_name):
             raise AttentionInfrastructureError("A5 attention result is indeterminate")
+        if not _completed_result(result.exit_code, result.stdout, session_name):
+            raise AttentionInfrastructureError("A5 attention terminal result is unavailable")
 
         stdout = _bounded_join(dispatch.stdout, logs.stdout)
         stderr = _bounded_join(dispatch.stderr, logs.stderr, result.stderr)
-        output = _parse_output(logs.stdout, execution.case.output_elements) \
+        output = (
+            _parse_output(logs.stdout, execution.case.output_elements)
             if result.exit_code == 0 else ()
+        )
         handle = (
             result.session_handle or logs.session_handle or dispatch.session_handle
             or f"bz-a5:{session_name}"
@@ -226,20 +227,6 @@ class CatlassAttentionBackend:
                 ("remote_directory", remote_directory),
             ),
         )
-
-
-def _semantic_receipt(result, execution: AttentionExecution, stages: tuple[str, ...]):
-    return AttentionReceipt(
-        exit_code=result.exit_code,
-        output=(),
-        stdout=_bounded(result.stdout),
-        stderr=_bounded(result.stderr),
-        session_handle=result.session_handle,
-        metadata=(
-            ("case_id", execution.case.case_id),
-            (f"{stages[0]}_exit_code", str(result.exit_code)),
-        ),
-    )
 
 
 def _input_payload(execution: AttentionExecution) -> dict[str, object]:
@@ -302,6 +289,25 @@ def _observation_uncertain(exit_code: int, stdout: str, session_name: str) -> bo
         exit_code == 75
         and "CATLASS_VALIDATION_STATE=observation-unavailable" in stdout.splitlines()
         and f"CATLASS_VALIDATION_HANDLE=bz-a5:{session_name}" in stdout.splitlines()
+    )
+
+
+def _dispatch_confirmed(stdout: str, session_name: str) -> bool:
+    prefix = f"SESSION_DISPATCH=confirmed session={session_name}"
+    return any(line == prefix or line.startswith(prefix + " ")
+               for line in stdout.splitlines())
+
+
+def _completed_result(exit_code: int, stdout: str, session_name: str) -> bool:
+    prefix = f"SESSION_STATE=completed session={session_name} exit="
+    values = [line.removeprefix(prefix) for line in stdout.splitlines()
+              if line.startswith(prefix)]
+    return (
+        len(values) == 1
+        and values[0].isascii()
+        and values[0].isdigit()
+        and str(int(values[0])) == values[0]
+        and int(values[0]) == exit_code
     )
 
 

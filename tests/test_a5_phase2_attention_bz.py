@@ -42,6 +42,8 @@ class FakeCheckedExecutor:
         self.invocations.append(invocation)
         if isinstance(self.dispatch, Exception):
             raise self.dispatch
+        if callable(self.dispatch):
+            return self.dispatch(invocation)
         return self.dispatch
 
     def inspect(self, argv):
@@ -49,6 +51,13 @@ class FakeCheckedExecutor:
         result = self.inspections.pop(0)
         if isinstance(result, Exception):
             raise result
+        if argv[-1] == "result" and result.stdout in {"", "placeholder", "exit=0"}:
+            result = CommandResult(
+                result.exit_code,
+                f"SESSION_STATE=completed session={argv[2]} exit={result.exit_code}",
+                result.stderr,
+                result.session_handle,
+            )
         return result
 
 
@@ -56,7 +65,7 @@ def _success(execution, *, handle="bz-a5:finished"):
     output = [0.0] * execution.case.output_elements
     return (
         CommandResult(0, "banner\n" + OUTPUT_MARKER + json.dumps(output)),
-        CommandResult(0, "SESSION_STATE=finished exit=0", session_handle=handle),
+        CommandResult(0, "", session_handle=handle),
     )
 
 
@@ -155,11 +164,19 @@ def test_hand_authored_fixture_uses_the_same_validated_tla_abi():
     assert "tla.copy(gm_output, local_v)" in ATTENTION_CANDIDATE_FIXTURE
 
 
-@pytest.mark.parametrize("exit_code", [2, 19])
-def test_definite_dispatch_failure_is_semantic_and_not_observed(tmp_path, exit_code):
-    executor = FakeCheckedExecutor(
-        dispatch=CommandResult(exit_code, "compiler output", "compiler error", "bz-a5:c")
-    )
+@pytest.mark.parametrize("exit_code", [2, 19, 75])
+def test_confirmed_nonzero_dispatch_retains_compiler_log_and_terminal(tmp_path, exit_code):
+    def dispatch(invocation):
+        session = invocation.argv[2]
+        return CommandResult(
+            exit_code,
+            f"SESSION_DISPATCH=confirmed session={session} output=.codex/output.log\n",
+            session_handle=f"bz-a5:{session}",
+        )
+    executor = FakeCheckedExecutor(dispatch=dispatch, inspections=(
+        CommandResult(0, "TLA compiler: invalid tile shape"),
+        CommandResult(exit_code, "placeholder", "", "bz-a5:terminal"),
+    ))
 
     receipt = _backend(executor).execute(
         SOURCE, build_execution(ATTENTION_CASES[0]), tmp_path
@@ -167,16 +184,19 @@ def test_definite_dispatch_failure_is_semantic_and_not_observed(tmp_path, exit_c
 
     assert receipt.exit_code == exit_code
     assert receipt.output == ()
-    assert receipt.stdout == "compiler output"
-    assert receipt.stderr == "compiler error"
-    assert receipt.session_handle == "bz-a5:c"
+    assert "TLA compiler: invalid tile shape" in receipt.stdout
+    assert receipt.session_handle == "bz-a5:terminal"
     assert dict(receipt.metadata)["dispatch_exit_code"] == str(exit_code)
-    assert executor.inspect_argv == []
+    assert dict(receipt.metadata)["result_exit_code"] == str(exit_code)
+    assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
 
 
-def test_failed_staging_without_retained_handle_is_infrastructure(tmp_path):
+def test_unconfirmed_wrapper_failure_is_infrastructure_even_with_handle(tmp_path):
     executor = FakeCheckedExecutor(
-        dispatch=CommandResult(1, "upload failed", "transport error")
+        dispatch=CommandResult(
+            1, "wrapper failed before SESSION_DISPATCH", "transport error",
+            "bz-a5:synthesized",
+        )
     )
 
     with pytest.raises(AttentionInfrastructureError, match="unavailable"):
@@ -189,7 +209,7 @@ def test_runtime_exit_is_semantic_and_retains_all_exit_metadata(tmp_path):
     execution = build_execution(ATTENTION_CASES[0])
     executor = FakeCheckedExecutor(inspections=(
         CommandResult(0, "ordinary runtime log"),
-        CommandResult(17, "SESSION_STATE=finished exit=17", "kernel failed", "bz-a5:r"),
+        CommandResult(17, "placeholder", "kernel failed", "bz-a5:r"),
     ))
 
     receipt = _backend(executor).execute(SOURCE, execution, tmp_path)
