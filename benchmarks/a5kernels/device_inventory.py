@@ -118,6 +118,10 @@ def _parse_profiling_snapshot(stdout: str) -> ProfilingDeviceSnapshot:
 
     if len(selected_records) != 1 or len(terminal_records) != 1:
         raise DeviceInventoryError("selector output must contain one unique terminal record")
+    if set(candidates) != set(range(1, 8)):
+        raise DeviceInventoryError(
+            "profiling inventory must contain complete devices 1 through 7"
+        )
     selected = selected_records[0]
     terminal = terminal_records[0]
     expected_keys = {"purpose", "physical", "application_device"}

@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 
 import pytest
@@ -27,8 +28,21 @@ def terminal(device):
     )
 
 
-def output(*lines, selected=2):
-    return "\n".join((*lines, terminal(selected))) + "\n"
+def output(*lines, selected=2, complete=True):
+    records = list(lines)
+    if complete:
+        present = {
+            int(match.group(1))
+            for line in records
+            if (match := re.search(r"(?:^| )id=([0-9]+)(?: |$)", line))
+        }
+        records.extend(
+            "BZ_A5_DEVICE_CANDIDATE "
+            f"id={device} state=excluded reason=health-unresponsive"
+            for device in range(1, 8)
+            if device not in present
+        )
+    return "\n".join((*records, terminal(selected))) + "\n"
 
 
 def inventory(stdout, *, returncode=0, stderr=""):
@@ -123,6 +137,20 @@ def test_inventory_reports_checked_selector_failure_without_parsing_partial_outp
     probe, _ = inventory(candidate(2), returncode=1, stderr="no isolated device")
 
     with pytest.raises(DeviceInventoryError, match="selector failed with exit 1"):
+        probe.profiling_snapshot()
+
+
+def test_inventory_rejects_successful_but_truncated_candidate_coverage():
+    probe, _ = inventory(output(candidate(2), selected=2, complete=False))
+
+    with pytest.raises(DeviceInventoryError, match="complete devices 1 through 7"):
+        probe.profiling_snapshot()
+
+
+def test_inventory_rejects_unexpected_candidate_device():
+    probe, _ = inventory(output(candidate(2), candidate(8), selected=2))
+
+    with pytest.raises(DeviceInventoryError, match="candidate device"):
         probe.profiling_snapshot()
 
 
