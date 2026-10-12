@@ -98,23 +98,82 @@ class BZDeviceInventory:
             raise DeviceInventoryUnavailable(
                 "checked BZ-A5 selector infrastructure is temporarily unavailable"
             )
-        streams = (completed.stdout, completed.stderr)
-        has_unavailable_record = any(
-            line == _PROFILING_UNAVAILABLE
-            for stream in streams if isinstance(stream, str)
-            for line in stream.splitlines()
+        has_unavailable_record = _has_canonical_unavailable_record(
+            completed.stdout, completed.stderr
         )
-        if completed.returncode == 1 and has_unavailable_record:
+        has_complete_excluded_inventory = (
+            completed.returncode == 1
+            and isinstance(completed.stdout, str)
+            and _is_complete_excluded_inventory(completed.stdout)
+        )
+        if completed.returncode == 1 and (
+            has_unavailable_record or has_complete_excluded_inventory
+        ):
             raise DeviceInventoryUnavailable(
                 "checked BZ-A5 profiling inventory is temporarily unavailable"
             )
         if completed.returncode != 0:
+            detail = (
+                " without canonical unavailability evidence"
+                if completed.returncode == 1 else ""
+            )
             raise DeviceInventoryError(
-                f"checked BZ-A5 selector failed with exit {completed.returncode}"
+                "checked BZ-A5 selector failed with exit "
+                f"{completed.returncode}{detail}"
             )
         if not isinstance(completed.stdout, str):
             raise DeviceInventoryError("checked BZ-A5 selector returned invalid output")
         return _parse_profiling_snapshot(completed.stdout)
+
+
+def _has_canonical_unavailable_record(stdout: object, stderr: object) -> bool:
+    """Accept one unavailable terminal without contradictory selector evidence."""
+
+    streams = tuple(stream for stream in (stdout, stderr) if isinstance(stream, str))
+    if sum(
+        line == _PROFILING_UNAVAILABLE
+        for stream in streams
+        for line in stream.splitlines()
+    ) != 1:
+        return False
+    selector_lines = tuple(
+        line
+        for stream in streams
+        for line in stream.splitlines()
+        if line.startswith((_CANDIDATE, _DEVICE, _STATE))
+        and line != _PROFILING_UNAVAILABLE
+    )
+    candidate_lines = tuple(
+        line for line in selector_lines if line.startswith(_CANDIDATE)
+    )
+    if any(line.startswith((_DEVICE, _STATE)) for line in selector_lines):
+        return False
+    if not candidate_lines:
+        return True
+    return _is_complete_excluded_inventory("\n".join(candidate_lines))
+
+
+def _is_complete_excluded_inventory(stdout: str) -> bool:
+    """Prove that a failed profiling probe exhausted all automatic devices."""
+
+    candidates: dict[int, ProfilingDevice | None] = {}
+    has_terminal_record = False
+    for line in stdout.splitlines():
+        if line.startswith(_CANDIDATE):
+            if not line.startswith(f"{_CANDIDATE} "):
+                raise DeviceInventoryError("malformed candidate record")
+            fields = _fields(line, _CANDIDATE)
+            device = _candidate_device(fields)
+            if device in candidates:
+                raise DeviceInventoryError(f"duplicate candidate device {device}")
+            candidates[device] = _eligible_device(fields, device)
+        elif line.startswith(_DEVICE) or line.startswith(_STATE):
+            has_terminal_record = True
+    return (
+        not has_terminal_record
+        and set(candidates) == set(range(1, 8))
+        and all(candidate is None for candidate in candidates.values())
+    )
 
 
 def _parse_profiling_snapshot(stdout: str) -> ProfilingDeviceSnapshot:
