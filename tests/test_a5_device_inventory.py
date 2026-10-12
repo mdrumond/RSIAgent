@@ -7,6 +7,7 @@ import pytest
 from benchmarks.a5kernels.device_inventory import (
     BZDeviceInventory,
     DeviceInventoryError,
+    DeviceInventoryUnavailable,
 )
 
 
@@ -140,6 +141,13 @@ def test_inventory_reports_checked_selector_failure_without_parsing_partial_outp
         probe.profiling_snapshot()
 
 
+def test_inventory_classifies_checked_transport_exit_as_unavailable():
+    probe, _ = inventory("", returncode=75)
+
+    with pytest.raises(DeviceInventoryUnavailable, match="temporarily unavailable"):
+        probe.profiling_snapshot()
+
+
 def test_inventory_rejects_successful_but_truncated_candidate_coverage():
     probe, _ = inventory(output(candidate(2), selected=2, complete=False))
 
@@ -163,7 +171,7 @@ def test_inventory_normalizes_selector_launch_failure():
         process_runner=fail,
     )
 
-    with pytest.raises(DeviceInventoryError, match="could not run"):
+    with pytest.raises(DeviceInventoryUnavailable, match="could not run"):
         probe.profiling_snapshot()
 
 

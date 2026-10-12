@@ -32,6 +32,10 @@ class DeviceInventoryError(RuntimeError):
     """The checked selector could not prove an unambiguous inventory."""
 
 
+class DeviceInventoryUnavailable(DeviceInventoryError):
+    """The checked selector's infrastructure is temporarily unavailable."""
+
+
 @dataclass(frozen=True, order=True)
 class ProfilingDevice:
     """One healthy, fault-free, idle physical NPU."""
@@ -84,7 +88,13 @@ class BZDeviceInventory:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise DeviceInventoryError("checked BZ-A5 selector could not run") from exc
+            raise DeviceInventoryUnavailable(
+                "checked BZ-A5 selector could not run"
+            ) from exc
+        if completed.returncode == 75:
+            raise DeviceInventoryUnavailable(
+                "checked BZ-A5 selector infrastructure is temporarily unavailable"
+            )
         if completed.returncode != 0:
             raise DeviceInventoryError(
                 f"checked BZ-A5 selector failed with exit {completed.returncode}"

@@ -9,7 +9,9 @@ from pathlib import Path
 import sys
 import time
 
-from benchmarks.a5kernels.device_inventory import BZDeviceInventory
+from benchmarks.a5kernels.device_inventory import (
+    BZDeviceInventory, DeviceInventoryUnavailable,
+)
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_composition import LiveDependencies, Phase1CellComposition
 from benchmarks.a5kernels.phase1_live import load_gate_report
@@ -173,10 +175,21 @@ def main(argv=None, *, sleeper=time.sleep) -> int:
     controller = _controller(args)
     retry_job_ids = tuple(args.retry_job)
     while True:
-        report = (
-            controller.reconcile(retry_job_ids=retry_job_ids)
-            if retry_job_ids else controller.reconcile()
-        )
+        try:
+            report = (
+                controller.reconcile(retry_job_ids=retry_job_ids)
+                if retry_job_ids else controller.reconcile()
+            )
+        except DeviceInventoryUnavailable:
+            if not args.until_complete:
+                raise
+            print(json.dumps({
+                "reason": "device-inventory-unavailable",
+                "retry_in_seconds": args.poll_seconds,
+                "status": "retrying",
+            }, sort_keys=True, separators=(",", ":")), flush=True)
+            sleeper(args.poll_seconds)
+            continue
         retry_job_ids = ()
         print(json.dumps(report.as_dict(), sort_keys=True, separators=(",", ":")),
               flush=True)

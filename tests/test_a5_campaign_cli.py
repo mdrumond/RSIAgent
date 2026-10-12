@@ -11,6 +11,9 @@ import run_a5_phase1
 import run_a5_phase2
 import run_a5_campaign
 from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.device_inventory import (
+    DeviceInventoryError, DeviceInventoryUnavailable,
+)
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.priority_controller import Job, JobKind, Observation
 from benchmarks.a5kernels.screen_workers import ScreenWorkerPool, run_request
@@ -220,6 +223,84 @@ def test_until_complete_reconciles_again_after_bounded_poll(monkeypatch, capsys)
     assert [json.loads(line)["status"] for line in capsys.readouterr().out.splitlines()] == [
         "incomplete", "complete",
     ]
+
+
+def test_until_complete_retries_inventory_unavailability_without_scheduling(
+    monkeypatch, capsys,
+):
+    complete = type("Report", (), {
+        "status": "complete", "as_dict": lambda self: {"status": self.status},
+    })()
+
+    class Controller:
+        calls = 0
+
+        def reconcile(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise DeviceInventoryUnavailable("transport details are private")
+            return complete
+
+    controller = Controller()
+    monkeypatch.setattr(run_a5_campaign, "_controller", lambda _args: controller)
+    required = [
+        "--controller-root", "/c", "--phase1-root", "/p1", "--phase2-root", "/p2",
+        "--gate", "/gate", "--guide", "/guide", "--tla-root", "/tla",
+        "--profiling-skill-root", "/skill", "--bge-cache", "/bge", "--kdb", "/kdb",
+        "--catlass-source", "/remote/catlass", "--collection", "catlass",
+    ]
+    sleeps = []
+
+    assert run_a5_campaign.main(
+        ["reconcile", *required, "--until-complete", "--poll-seconds", "2"],
+        sleeper=sleeps.append,
+    ) == 0
+    assert controller.calls == 2
+    assert sleeps == [2.0]
+    assert [json.loads(line) for line in capsys.readouterr().out.splitlines()] == [
+        {
+            "reason": "device-inventory-unavailable",
+            "retry_in_seconds": 2.0,
+            "status": "retrying",
+        },
+        {"status": "complete"},
+    ]
+
+
+def test_one_shot_inventory_unavailability_fails_closed(monkeypatch):
+    class Controller:
+        def reconcile(self):
+            raise DeviceInventoryUnavailable("offline")
+
+    monkeypatch.setattr(run_a5_campaign, "_controller", lambda _args: Controller())
+    required = [
+        "--controller-root", "/c", "--phase1-root", "/p1", "--phase2-root", "/p2",
+        "--gate", "/gate", "--guide", "/guide", "--tla-root", "/tla",
+        "--profiling-skill-root", "/skill", "--bge-cache", "/bge", "--kdb", "/kdb",
+        "--catlass-source", "/remote/catlass", "--collection", "catlass",
+    ]
+
+    with pytest.raises(DeviceInventoryUnavailable, match="offline"):
+        run_a5_campaign.main(["reconcile", *required], sleeper=pytest.fail)
+
+
+def test_until_complete_does_not_retry_semantic_inventory_error(monkeypatch):
+    class Controller:
+        def reconcile(self):
+            raise DeviceInventoryError("malformed checked evidence")
+
+    monkeypatch.setattr(run_a5_campaign, "_controller", lambda _args: Controller())
+    required = [
+        "--controller-root", "/c", "--phase1-root", "/p1", "--phase2-root", "/p2",
+        "--gate", "/gate", "--guide", "/guide", "--tla-root", "/tla",
+        "--profiling-skill-root", "/skill", "--bge-cache", "/bge", "--kdb", "/kdb",
+        "--catlass-source", "/remote/catlass", "--collection", "catlass",
+    ]
+
+    with pytest.raises(DeviceInventoryError, match="malformed checked evidence"):
+        run_a5_campaign.main(
+            ["reconcile", *required, "--until-complete"], sleeper=pytest.fail,
+        )
 
 
 def test_until_complete_stops_on_blocked_and_retry_is_explicit(monkeypatch, capsys):
