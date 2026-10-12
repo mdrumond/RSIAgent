@@ -5,6 +5,12 @@ from benchmarks.a5kernels.bz import (
     CatlassValidationExecutor,
     ProfileCommandExecutor,
 )
+from benchmarks.a5kernels.device_inventory import (
+    BZDeviceInventory,
+    DeviceInventoryError,
+    ProfilingDevice,
+    ProfilingDeviceSnapshot,
+)
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.fixtures import Language, fixture_for
 from benchmarks.a5kernels.knowledge import (
@@ -114,6 +120,7 @@ __all__ = [
     "AccessClass",
     "ActorOutcome",
     "BZSessionAdapter",
+    "BZDeviceInventory",
     "BZProfileBackend",
     "CatlassValidationExecutor",
     "CandidateRun",
@@ -126,6 +133,7 @@ __all__ = [
     "CollectionManifest",
     "DEFAULT_EMBEDDING_MODEL",
     "DEFAULT_EMBEDDING_REVISION",
+    "DeviceInventoryError",
     "CoreAttemptDriver",
     "EmbeddingBackend",
     "EmbeddingLoadError",
@@ -149,6 +157,8 @@ __all__ = [
     "Phase1StudyBackend",
     "Phase1StudyResult",
     "ProfileCommandExecutor",
+    "ProfilingDevice",
+    "ProfilingDeviceSnapshot",
     "ProfileEvaluation",
     "ProfileRequest",
     "ProfilingTreatmentController",
