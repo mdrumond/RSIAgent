@@ -4,10 +4,17 @@ import subprocess
 
 import pytest
 
+import benchmarks.a5kernels as a5kernels
 from benchmarks.a5kernels.device_inventory import (
     BZDeviceInventory,
     DeviceInventoryError,
+    DeviceInventoryUnavailable,
 )
+
+
+def test_retryable_inventory_error_is_part_of_package_api():
+    assert a5kernels.DeviceInventoryUnavailable is DeviceInventoryUnavailable
+    assert "DeviceInventoryUnavailable" in a5kernels.__all__
 
 
 def candidate(device, *, hbm=0, utilization=0):
@@ -136,8 +143,140 @@ def test_inventory_accepts_each_checked_selector_exclusion(excluded):
 def test_inventory_reports_checked_selector_failure_without_parsing_partial_output():
     probe, _ = inventory(candidate(2), returncode=1, stderr="no isolated device")
 
-    with pytest.raises(DeviceInventoryError, match="selector failed with exit 1"):
+    with pytest.raises(
+        DeviceInventoryError, match="exit 1 without canonical unavailability evidence"
+    ):
         probe.profiling_snapshot()
+
+
+def test_inventory_classifies_checked_transport_exit_as_unavailable():
+    probe, _ = inventory("", returncode=75)
+
+    with pytest.raises(DeviceInventoryUnavailable, match="temporarily unavailable"):
+        probe.profiling_snapshot()
+
+
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_inventory_classifies_exact_profiling_unavailable_record(stream):
+    marker = "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"
+    values = {
+        "stdout": "REMOTE_STATE=failed\n",
+        "stderr": "wrapper diagnostic\n",
+    }
+    values[stream] += f"{marker}\n"
+    probe, _ = inventory(
+        values["stdout"], returncode=1, stderr=values["stderr"],
+    )
+
+    with pytest.raises(DeviceInventoryUnavailable, match="temporarily unavailable"):
+        probe.profiling_snapshot()
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        output(candidate(2))
+        + "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto\n",
+        output(candidate(2)).replace(terminal(2), "")
+        + "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto\n",
+        "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto\n" * 2,
+    ],
+)
+def test_inventory_rejects_contradictory_unavailable_evidence(stdout):
+    probe, _ = inventory(stdout, returncode=1)
+
+    with pytest.raises(DeviceInventoryError) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        terminal(2),
+        candidate(2),
+        "BZ_A5_DEVICE_CANDIDATE "
+        "id=1 state=excluded reason=health-unresponsive",
+    ],
+)
+def test_inventory_rejects_contradictory_stderr_unavailable_evidence(stderr):
+    marker = "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"
+    probe, _ = inventory("", returncode=1, stderr=f"{marker}\n{stderr}\n")
+
+    with pytest.raises(DeviceInventoryError) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
+
+
+def test_inventory_classifies_complete_excluded_snapshot_without_stderr_marker():
+    stdout = "\n".join(
+        [
+            "REMOTE_STATE=failed",
+            "REMOTE_EXIT=1",
+            *(
+                "BZ_A5_DEVICE_CANDIDATE "
+                f"id={device} state=excluded reason=health-unresponsive"
+                for device in range(1, 8)
+            ),
+        ]
+    )
+    probe, _ = inventory(stdout, returncode=1)
+
+    with pytest.raises(DeviceInventoryUnavailable, match="temporarily unavailable"):
+        probe.profiling_snapshot()
+
+
+@pytest.mark.parametrize(
+    "records, message",
+    [
+        (
+            [
+                "BZ_A5_DEVICE_CANDIDATE "
+                f"id={device} state=excluded reason=health-unresponsive"
+                for device in range(1, 7)
+            ],
+            "without canonical unavailability evidence",
+        ),
+        (
+            [
+                *(
+                    "BZ_A5_DEVICE_CANDIDATE "
+                    f"id={device} state=excluded reason=health-unresponsive"
+                    for device in range(1, 8)
+                ),
+                candidate(2),
+            ],
+            "duplicate candidate device 2",
+        ),
+    ],
+)
+def test_inventory_does_not_retry_incomplete_or_inconsistent_excluded_snapshot(
+    records, message,
+):
+    probe, _ = inventory("\n".join(records), returncode=1)
+
+    with pytest.raises(DeviceInventoryError, match=message) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
+
+
+@pytest.mark.parametrize(
+    "returncode, marker",
+    [
+        (1, "BZ_A5_DEVICE_STATE=unavailable purpose=regular requested=auto"),
+        (1, "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=3"),
+        (1, "prefix BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"),
+        (2, "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"),
+    ],
+)
+def test_inventory_does_not_retry_noncanonical_unavailable_record(
+    returncode, marker,
+):
+    probe, _ = inventory("", returncode=returncode, stderr=f"{marker}\n")
+
+    with pytest.raises(DeviceInventoryError) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
 
 
 def test_inventory_rejects_successful_but_truncated_candidate_coverage():
@@ -163,7 +302,7 @@ def test_inventory_normalizes_selector_launch_failure():
         process_runner=fail,
     )
 
-    with pytest.raises(DeviceInventoryError, match="could not run"):
+    with pytest.raises(DeviceInventoryUnavailable, match="could not run"):
         probe.profiling_snapshot()
 
 
