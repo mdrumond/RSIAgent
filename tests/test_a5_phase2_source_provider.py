@@ -359,6 +359,41 @@ def test_completed_attempt_resumes_without_provider_and_rejects_tampering(tmp_pa
         provider(request)
 
 
+def test_interrupted_candidate_publication_replays_same_uncommitted_attempt(
+    tmp_path, monkeypatch,
+):
+    request = _request(_cell())
+    provider, calls = _provider(
+        tmp_path,
+        [
+            '{"candidate_source":{"source":"unbound-source"}}',
+            '{"candidate_source":{"source":"replayed-source"}}',
+        ],
+    )
+    publish = source_provider_module._publish_exact
+    interrupted = True
+
+    def stop_before_manifest(path, value):
+        nonlocal interrupted
+        if path.name == "provider.json" and interrupted:
+            interrupted = False
+            raise RuntimeError("simulated publication interruption")
+        return publish(path, value)
+
+    monkeypatch.setattr(source_provider_module, "_publish_exact", stop_before_manifest)
+    with pytest.raises(RuntimeError, match="publication interruption"):
+        provider(request)
+    attempt_root = tmp_path / request.cell.cell_id / request.attempt_id
+    assert (attempt_root / "candidate.py").read_text() == "unbound-source"
+    assert not (attempt_root / "provider.json").exists()
+
+    assert provider(request) == "replayed-source"
+    assert (attempt_root / "candidate.py").read_text() == "replayed-source"
+    assert (attempt_root / "provider.json").is_file()
+    assert len(calls) == 2
+    assert calls[0]["request"]["messages"] == calls[1]["request"]["messages"]
+
+
 def test_resume_rejects_changed_request_context(tmp_path):
     request = _request(_cell())
     provider, _calls = _provider(

@@ -428,6 +428,16 @@ class Phase2SourceProvider:
         manifest_path = root / "provider.json"
         if not source_path.exists() and not manifest_path.exists():
             return None
+        if source_path.exists() != manifest_path.exists():
+            # Candidate and binding manifest commit as a pair.  A process can
+            # die after publishing either attempt-local file; neither half is
+            # committed evidence.  Delete only that partial file and replay
+            # this same request from the last committed semantic state.
+            partial = source_path if source_path.exists() else manifest_path
+            if not partial.is_file():
+                raise ValueError("completed provider evidence is incomplete")
+            partial.unlink()
+            return None
         if not source_path.is_file() or not manifest_path.is_file():
             raise ValueError("completed provider evidence is incomplete")
         try:

@@ -314,10 +314,14 @@ def build_phase2_production(
             catlass_source=config.catlass_source,
             catlass_revision=cell.catlass_revision,
         )
-    provenance = _retained_qualification_provenance(config, cell)
-    is_resume = provenance is not None
-    if provenance is None:
-        provenance = tuple(executor.runtime_provenance)
+    retained_provenance = _retained_qualification_provenance(config, cell)
+    live_provenance = tuple(executor.runtime_provenance)
+    is_resume = retained_provenance is not None
+    if is_resume and retained_provenance != live_provenance:
+        raise ValueError(
+            "retained Phase 2 qualification runtime provenance changed"
+        )
+    provenance = live_provenance
     if dict(provenance).get("catlass_revision") != cell.catlass_revision:
         raise ValueError("runtime provenance changed the admitted Catlass revision")
     if dict(provenance).get("catlass_source") != config.catlass_source:

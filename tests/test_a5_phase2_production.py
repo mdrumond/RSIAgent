@@ -47,6 +47,7 @@ class FakeExecutor:
             ("catlass_source", source),
             ("execution_profile", "bz-a5"),
             ("manifest_sha256", "a" * 64),
+            ("cann_version", "9.1"),
         )
 
     def probe_device(self, device):
@@ -159,6 +160,41 @@ def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
         executor=executor, backend=backend,
     )
     assert retained == snapshot
+    assert len(backend.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "field,replacement",
+    [("manifest_sha256", "b" * 64), ("cann_version", "9.1-patch")],
+)
+def test_retained_qualification_rejects_changed_live_runtime_provenance(
+    tmp_path, field, replacement,
+):
+    _composition, destination, config = _config(tmp_path)
+    original = FakeExecutor(destination.catlass_revision)
+    backend = CopyVBackend()
+    build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=original, backend=backend,
+    )
+    qualification = (
+        config.phase2_root / "cells" / destination.cell_id / "qualification.json"
+    )
+    retained = qualification.read_bytes()
+    changed = FakeExecutor(destination.catlass_revision)
+    changed.runtime_provenance = tuple(
+        (key, replacement if key == field else value)
+        for key, value in changed.runtime_provenance
+    )
+
+    with pytest.raises(ValueError, match="runtime provenance changed"):
+        build_phase2_production(
+            config, environment=ENVIRONMENT, transport=_transport,
+            executor=changed, backend=backend,
+        )
+
+    assert qualification.read_bytes() == retained
+    assert changed.probes == []
     assert len(backend.calls) == 1
 
 
