@@ -118,6 +118,11 @@ from benchmarks.a5kernels.phase2_attention import (
     attention_reference,
     build_execution,
 )
+from benchmarks.a5kernels.phase2_attention_bz import (
+    ATTENTION_CANDIDATE_FIXTURE,
+    CatlassAttentionBackend,
+    validate_attention_candidate,
+)
 
 __all__ = [
     "A5KernelRunner",
@@ -125,6 +130,7 @@ __all__ = [
     "A5ModelProfile",
     "A5RunProvenance",
     "ATTENTION_CASES",
+    "ATTENTION_CANDIDATE_FIXTURE",
     "AccessClass",
     "ActorOutcome",
     "AttentionBackend",
@@ -140,6 +146,7 @@ __all__ = [
     "CandidateRun",
     "CandidateProfileEvaluation",
     "CatlassCandidateBackend",
+    "CatlassAttentionBackend",
     "CatlassContractHarness",
     "CATLASS_REVISION",
     "CompileDiagnostics",
@@ -203,6 +210,7 @@ __all__ = [
     "TrialResult",
     "attention_reference",
     "build_execution",
+    "validate_attention_candidate",
     "CurriculumProposal",
     "VerifiedResult",
     "fixture_for",

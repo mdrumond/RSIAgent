@@ -24,7 +24,8 @@ from typing import Protocol
 
 
 TARGET_ID = "a5-phase2-dense-forward-attention-v1"
-SCHEMA = "a5-phase2-attention-evidence-v1"
+SCHEMA = "a5-phase2-attention-evidence-v2"
+MAX_DIAGNOSTIC_BYTES = 4096
 
 
 def _digest(value: object) -> str:
@@ -164,6 +165,7 @@ class AttentionCaseEvidence:
     mismatch_expected: float | None
     mismatch_actual: float | None
     failure: str | None
+    diagnostic: str | None
     session_handle: str | None
     evidence_sha256: str
 
@@ -176,6 +178,14 @@ class AttentionCaseEvidence:
             raise ValueError("case evidence digest is invalid")
         if self.passed != (self.failure is None):
             raise ValueError("case verdict and failure must agree")
+        if self.passed and self.diagnostic is not None:
+            raise ValueError("passed case evidence must not carry a diagnostic")
+        if self.diagnostic is not None and (
+            not self.diagnostic
+            or len(self.diagnostic.encode("utf-8")) > MAX_DIAGNOSTIC_BYTES
+            or "\r" in self.diagnostic
+        ):
+            raise ValueError("case diagnostic must be normalized and bounded")
         if self.passed and (
             self.exit_code != 0 or self.mismatch_index is not None
             or self.max_abs_error is None or self.max_rel_error is None
@@ -372,6 +382,9 @@ def _grade(
         "mismatch_actual": (None if mismatch is None or
                             not math.isfinite(mismatch[2]) else mismatch[2]),
         "failure": failure,
+        "diagnostic": (
+            _receipt_diagnostic(receipt) if receipt.exit_code != 0 else None
+        ),
         "session_handle": receipt.session_handle,
     }
     return AttentionCaseEvidence.create(**values)
@@ -393,8 +406,43 @@ def _execution_failure(
         mismatch_expected=None,
         mismatch_actual=None,
         failure=f"execution-error:{type(error).__name__}",
+        diagnostic=None,
         session_handle=None,
     )
+
+
+def _receipt_diagnostic(receipt: AttentionReceipt) -> str | None:
+    """Return bounded host text for a failed receipt, never agent-authored prose."""
+
+    streams = []
+    for label, value in (("stdout", receipt.stdout), ("stderr", receipt.stderr)):
+        normalized = "\n".join(
+            line.rstrip()
+            for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        ).strip()
+        if normalized:
+            streams.append((label, normalized))
+    if not streams:
+        return None
+
+    overhead = sum(len(f"{label}:\n".encode("utf-8")) for label, _ in streams)
+    overhead += len(streams) - 1  # Newlines between labeled streams.
+    content_budget = MAX_DIAGNOSTIC_BYTES - overhead
+    base, remainder = divmod(content_budget, len(streams))
+    rendered = []
+    for index, (label, value) in enumerate(streams):
+        budget = base + (1 if index < remainder else 0)
+        rendered.append(f"{label}:\n{_truncate_utf8(value, budget)}")
+    return "\n".join(rendered)
+
+
+def _truncate_utf8(value: str, budget: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= budget:
+        return value
+    marker = b"\n...[truncated]"
+    prefix = encoded[:budget - len(marker)].decode("utf-8", errors="ignore")
+    return prefix + marker.decode("ascii")
 
 
 def _f32(value: float) -> float:

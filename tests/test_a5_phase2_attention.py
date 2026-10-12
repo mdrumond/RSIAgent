@@ -120,6 +120,51 @@ def test_complete_fake_backend_passes_and_round_trips_evidence(tmp_path):
     assert AttentionTargetEvidence.read(path) == evidence
 
 
+def test_passing_receipt_does_not_publish_host_diagnostics(tmp_path):
+    class NoisyPassingBackend(FakeBackend):
+        def execute(self, source, execution, workdir):
+            receipt = super().execute(source, execution, workdir)
+            return replace(
+                receipt,
+                stdout="compiler warning from checked host",
+                stderr="runtime warning from checked host",
+            )
+
+    evidence = _verify(tmp_path, NoisyPassingBackend())
+
+    assert evidence.passed is True
+    assert all(item.diagnostic is None for item in evidence.cases)
+
+
+def test_nonzero_receipt_publishes_bounded_digest_bound_host_diagnostics(tmp_path):
+    class FailingBackend(FakeBackend):
+        def execute(self, source, execution, workdir):
+            return AttentionReceipt(
+                exit_code=17,
+                output=(),
+                stdout="compiler\r\n" + "x" * 5000,
+                stderr="runtime failed\rwith ordinary input",
+                session_handle=f"bz-a5:{execution.case.case_id}",
+            )
+
+    evidence = _verify(tmp_path, FailingBackend())
+
+    assert evidence.passed is False
+    for item in evidence.cases:
+        assert item.failure == "runtime-exit"
+        assert item.diagnostic is not None
+        assert item.diagnostic.startswith("stdout:\ncompiler\n")
+        assert "\n...[truncated]\nstderr:\nruntime failed\nwith ordinary input" in item.diagnostic
+        assert "\r" not in item.diagnostic
+        assert len(item.diagnostic.encode("utf-8")) <= 4096
+        with pytest.raises(ValueError, match="digest"):
+            replace(item, diagnostic="agent-authored explanation")
+
+    path = tmp_path / "failed-evidence.json"
+    evidence.write(path)
+    assert AttentionTargetEvidence.read(path) == evidence
+
+
 @pytest.mark.parametrize(
     ("mutate", "failure"),
     [
@@ -133,6 +178,33 @@ def test_host_rejects_wrong_nonfinite_and_wrong_shape_outputs(tmp_path, mutate, 
 
     assert evidence.passed is False
     assert all(item.failure == failure for item in evidence.cases)
+
+
+def test_numerical_mismatch_fields_are_directly_consumable(tmp_path):
+    class NoisyMismatchBackend(FakeBackend):
+        def execute(self, source, execution, workdir):
+            receipt = super().execute(source, execution, workdir)
+            return replace(
+                receipt,
+                stdout="A5ATTENTION_OUTPUT=[large host tensor omitted by evidence]",
+                stderr="host runner completed",
+            )
+
+    evidence = _verify(
+        tmp_path,
+        NoisyMismatchBackend(
+            mutate=lambda case, output: (output[0] + 1.0, *output[1:])
+        ),
+    )
+
+    for item in evidence.cases:
+        assert item.failure == "numerical-mismatch"
+        assert item.mismatch_index == 0
+        assert item.mismatch_expected is not None
+        assert item.mismatch_actual == pytest.approx(item.mismatch_expected + 1.0)
+        assert item.max_abs_error == pytest.approx(1.0)
+        assert item.max_rel_error is not None
+        assert item.diagnostic is None
 
 
 def test_backend_exception_is_case_local_and_complete_suite_is_retained(tmp_path):
