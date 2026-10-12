@@ -217,6 +217,8 @@ class BZProfileBackend:
         if _marked_values(completed.stdout, marker):
             return completed.stdout, completed.returncode
         retries = self._observation_retries
+        observation_returncode = completed.returncode
+        observation_output = completed.stdout
         for attempt in range(retries + 1):
             logs = self._call(
                 (self._session, "--name", replay_id, "logs", "--lines", "2000")
@@ -228,9 +230,24 @@ class BZProfileBackend:
                 and _marked_values(logs.stdout, marker)
             ):
                 return logs.stdout, 0
+            observation_output = logs.stdout
+            if logs.returncode in {75, 255}:
+                observation_returncode = logs.returncode
+            elif result.returncode in {75, 255}:
+                observation_returncode = result.returncode
+            else:
+                observation_returncode = completed.returncode
+            if (
+                result.returncode not in {0, 75, 255}
+                and any(
+                    line.startswith("SESSION_STATE=completed ")
+                    for line in result.stdout.splitlines()
+                )
+            ):
+                return logs.stdout, result.returncode
             if attempt < retries:
                 self._sleep(self._observation_backoff_seconds)
-        return completed.stdout, completed.returncode
+        return observation_output, observation_returncode
 
     def _adapter_argv(
         self, replay_id: str, action: str, request: ProfileRequest

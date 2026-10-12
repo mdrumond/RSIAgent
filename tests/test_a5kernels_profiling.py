@@ -1124,6 +1124,117 @@ def test_completed_dispatch_marker_observation_exhaustion_fails_closed(
     assert sleeps == [120, 120]
 
 
+def test_completed_dispatch_unavailable_observation_remains_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    dispatches = 0
+    log_calls = 0
+    result_calls = 0
+    sleeps = []
+
+    def run(argv, **kwargs):
+        nonlocal dispatches, log_calls, result_calls
+        if Path(argv[0]).name != "session.sh":
+            dispatches += 1
+            return subprocess.CompletedProcess(
+                argv, 0, "CATLASS_VALIDATION_STATE=completed\n", "",
+            )
+        if "logs" in argv:
+            log_calls += 1
+        else:
+            result_calls += 1
+        return subprocess.CompletedProcess(
+            argv, 75, "SESSION_STATE=observation-unavailable\n", ""
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=2,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(InfrastructureFailure, match="timing replay failed"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "unavailable-marker")
+        )
+
+    assert dispatches == 1
+    assert log_calls == result_calls == 3
+    assert sleeps == [120, 120]
+
+
+def test_terminal_semantic_failure_does_not_back_off_for_marker(tmp_path: Path) -> None:
+    sleeps = []
+
+    def run(argv, **kwargs):
+        if Path(argv[0]).name != "session.sh":
+            return subprocess.CompletedProcess(
+                argv, 1, "CATLASS_VALIDATION_STATE=failed\n", ""
+            )
+        if "logs" in argv:
+            return subprocess.CompletedProcess(argv, 0, "compile failed\n", "")
+        return subprocess.CompletedProcess(
+            argv, 1, "SESSION_STATE=completed session=replay exit=1\n", ""
+        )
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        session_wrapper="/profiles/bz-a5/session.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+        observation_retries=3,
+        observation_backoff_seconds=120,
+        sleeper=sleeps.append,
+    )
+    request = replace(
+        REQUEST,
+        plan=replace(
+            PLAN,
+            runtime_provenance=(
+                ("ascendnpu_ir_gitlink", "gitlink"),
+                ("ascendnpu_ir_install_commit", "install"),
+                ("bridge_sha256", "bridge"),
+                ("cann_version", "9.1"),
+                ("catlass_revision", "revision"),
+                ("catlass_source", "/remote/catlass"),
+                ("execution_profile", "bz-a5"),
+                ("manifest_sha256", "manifest"),
+            ),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="timing replay failed"):
+        backend.time_sample(
+            TimingCommand(CampaignKind.FINAL, request, "semantic-failure")
+        )
+
+    assert sleeps == []
+
+
 def test_profiling_transport_exit_is_retryable(tmp_path: Path) -> None:
     def run(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 255, "", "banner timeout")
