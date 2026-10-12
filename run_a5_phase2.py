@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Callable, Sequence
 
@@ -153,8 +154,18 @@ def _entry() -> int:
         InfrastructureFailure,
         AttentionInfrastructureError,
         RuntimeUnavailableError,
-    ):
+    ) as exc:
+        _write_infrastructure_diagnostic(exc)
         return 75
+
+
+def _write_infrastructure_diagnostic(exc: Exception) -> None:
+    detail = " ".join(str(exc).split()) or "unavailable"
+    message = f"{type(exc).__name__}: {detail}"
+    encoded = message.encode("utf-8")
+    if len(encoded) > 512:
+        message = encoded[:509].decode("utf-8", errors="ignore") + "..."
+    print(message, file=sys.stderr)
 
 
 if __name__ == "__main__":

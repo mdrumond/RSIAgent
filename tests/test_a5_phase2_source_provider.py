@@ -144,13 +144,30 @@ def test_registered_models_receive_exact_host_context_and_emit_source(tmp_path, 
     assert contract["candidate_abi_sha256"] == (
         source_provider_module.CANDIDATE_ABI_SHA256
     )
+    assert contract["candidate_abi"] == json.loads(json.dumps(
+        dict(source_provider_module.CANDIDATE_ABI)
+    ))
+    assert contract["host_target_grading_sha256"] == (
+        source_provider_module.HOST_TARGET_GRADING_SHA256
+    )
+    assert contract["host_target_grading"] == json.loads(json.dumps(dict(
+        source_provider_module.HOST_TARGET_GRADING_CONTRACT
+    )))
     assert contract["candidate_module"] == {
         "only_import": "import catlass.tla as tla",
+        "module_members": "exactly one import and one synchronous kernel definition",
         "only_decorator": "@tla.kernel",
         "only_export": "dense_attention(gm_q, gm_k, gm_v, gm_output)",
+        "signature_policy": (
+            "four positional arguments; no defaults, varargs, or kwargs"
+        ),
         "host_prepends_compile_time_constants": [
             "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL", "DTYPE",
         ],
+        "launch_policy": {
+            "block_num": 1,
+            "required_coverage": "block 0 must produce the complete output tensor",
+        },
     }
     assert contract["semantics"] == {
         "tensor_arguments": (

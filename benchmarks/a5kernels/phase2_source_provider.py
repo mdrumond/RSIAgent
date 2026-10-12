@@ -19,7 +19,10 @@ from benchmarks.a5kernels.phase1_provider import (
 )
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
+    CANDIDATE_ABI,
     CANDIDATE_ABI_SHA256,
+    HOST_TARGET_GRADING_CONTRACT,
+    HOST_TARGET_GRADING_SHA256,
     SUITE_SHA256,
     TARGET_ID,
 )
@@ -102,18 +105,27 @@ def _parse_action(text: str) -> tuple[str, object] | None:
 def _target_contract() -> dict[str, object]:
     """Serialize the checked host target without duplicating its case values."""
 
+    candidate_abi = dict(CANDIDATE_ABI)
     return {
         "target_id": TARGET_ID,
         "suite_sha256": SUITE_SHA256,
         "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
+        "candidate_abi": candidate_abi,
+        "host_target_grading_sha256": HOST_TARGET_GRADING_SHA256,
+        "host_target_grading": dict(HOST_TARGET_GRADING_CONTRACT),
         "candidate_module": {
-            "only_import": "import catlass.tla as tla",
-            "only_decorator": "@tla.kernel",
-            "only_export": "dense_attention(gm_q, gm_k, gm_v, gm_output)",
-            "host_prepends_compile_time_constants": [
-                "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL",
-                "DTYPE",
-            ],
+            "only_import": candidate_abi["module_import"],
+            "module_members": candidate_abi["module_members"],
+            "only_decorator": candidate_abi["kernel_decorator"],
+            "only_export": candidate_abi["kernel_export"],
+            "signature_policy": candidate_abi["signature_policy"],
+            "host_prepends_compile_time_constants": list(
+                candidate_abi["host_prepended_constants"]
+            ),
+            "launch_policy": {
+                "block_num": candidate_abi["launch_block_num"],
+                "required_coverage": candidate_abi["launch_coverage"],
+            },
         },
         "semantics": {
             "tensor_arguments": (

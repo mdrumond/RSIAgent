@@ -50,12 +50,35 @@ def _jsonable(value: object) -> object:
 
 
 CANDIDATE_ABI = (
+    ("module_import", "import catlass.tla as tla"),
+    ("module_members", "exactly one import and one synchronous kernel definition"),
+    ("kernel_decorator", "@tla.kernel"),
+    ("kernel_export", "dense_attention(gm_q, gm_k, gm_v, gm_output)"),
+    ("signature_policy", "four positional arguments; no defaults, varargs, or kwargs"),
+    ("host_prepended_constants", (
+        "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL", "DTYPE",
+    )),
     ("arguments", ("gm_q", "gm_k", "gm_v", "gm_output")),
     ("physical_layout", "flat-contiguous-row-major"),
     ("logical_shape", "[B,H,S,D]"),
     ("logical_dimensions", ("BATCH", "HEADS", "SEQUENCE", "HEAD_DIM")),
+    ("launch_block_num", 1),
+    ("launch_coverage", "block 0 must produce the complete output tensor"),
 )
 CANDIDATE_ABI_SHA256 = _digest(CANDIDATE_ABI)
+
+DTYPE_TOLERANCES = (
+    ("float16", (("atol", 0.02), ("rtol", 0.02))),
+    ("bfloat16", (("atol", 0.05), ("rtol", 0.05))),
+)
+HOST_TARGET_GRADING_CONTRACT = (
+    ("reference", "dense QK^T, stable softmax, and V reduction with FP32 intermediates"),
+    ("output", "complete finite flat [B,H,S,D] tensor"),
+    ("comparison", "abs(actual-expected) <= atol + rtol*abs(expected)"),
+    ("dtype_tolerances", DTYPE_TOLERANCES),
+    ("suite_verdict", "pass only when every registered case passes"),
+)
+HOST_TARGET_GRADING_SHA256 = _digest(HOST_TARGET_GRADING_CONTRACT)
 
 
 @dataclass(frozen=True)
@@ -97,11 +120,11 @@ class AttentionCase:
 
     @property
     def rtol(self) -> float:
-        return 0.02 if self.dtype == "float16" else 0.05
+        return dict(dict(DTYPE_TOLERANCES)[self.dtype])["rtol"]
 
     @property
     def atol(self) -> float:
-        return self.rtol
+        return dict(dict(DTYPE_TOLERANCES)[self.dtype])["atol"]
 
 
 # These cases are large enough to require genuine attention tiling while remaining

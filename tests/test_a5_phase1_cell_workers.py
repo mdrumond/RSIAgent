@@ -56,6 +56,14 @@ def test_worker_selection_is_canonical_and_fails_closed(tmp_path):
         select_worker_cell(guide, (pending.cell_id,))
 
 
+def test_smoke_help_requires_a_distinct_full_campaign_root(capsys):
+    with pytest.raises(SystemExit) as stopped:
+        run_a5_phase1._parser().parse_args(["run", "--help"])
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "use a root distinct from every full campaign" in help_text
+
+
 def test_cli_single_cell_isolated_resume_and_terminal_reuse(tmp_path, capsys):
     gate_root = tmp_path / "gate"
     gate_root.mkdir()

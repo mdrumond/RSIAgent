@@ -505,11 +505,28 @@ def test_authenticated_qualification_returns_bound_physical_device(tmp_path):
 
 
 @pytest.mark.parametrize("module", [run_a5_phase1, run_a5_phase2])
-def test_top_level_infrastructure_exhaustion_uses_exit_75(module, monkeypatch):
+def test_top_level_infrastructure_exhaustion_uses_exit_75(
+    module, monkeypatch, capsys,
+):
     monkeypatch.setattr(module, "main", lambda: (_ for _ in ()).throw(
-        InfrastructureFailure("offline")
+        InfrastructureFailure("offline\nwithout traceback")
     ))
     assert module._entry() == 75
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "InfrastructureFailure: offline without traceback\n"
+
+
+@pytest.mark.parametrize("module", [run_a5_phase1, run_a5_phase2])
+def test_top_level_infrastructure_diagnostic_is_bounded(module, monkeypatch, capsys):
+    monkeypatch.setattr(module, "main", lambda: (_ for _ in ()).throw(
+        InfrastructureFailure("x" * 1024)
+    ))
+    assert module._entry() == 75
+    diagnostic = capsys.readouterr().err.rstrip("\n")
+    assert diagnostic.startswith("InfrastructureFailure: ")
+    assert diagnostic.endswith("...")
+    assert len(diagnostic.encode("utf-8")) <= 512
 
 
 def test_top_level_semantic_error_is_not_reclassified(monkeypatch):

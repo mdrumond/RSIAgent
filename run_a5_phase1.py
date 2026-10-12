@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Callable, Sequence
 
@@ -36,7 +37,10 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--one-project-smoke",
             action="store_true",
-            help="run the first registered project in each selected runnable cell",
+            help=(
+                "run the first registered project in each selected runnable cell; "
+                "use a root distinct from every full campaign"
+            ),
         )
         if name in {"run", "resume"}:
             command.add_argument(
@@ -148,8 +152,18 @@ def main(
 def _entry() -> int:
     try:
         return main()
-    except (InfrastructureFailure, RuntimeUnavailableError):
+    except (InfrastructureFailure, RuntimeUnavailableError) as exc:
+        _write_infrastructure_diagnostic(exc)
         return 75
+
+
+def _write_infrastructure_diagnostic(exc: Exception) -> None:
+    detail = " ".join(str(exc).split()) or "unavailable"
+    message = f"{type(exc).__name__}: {detail}"
+    encoded = message.encode("utf-8")
+    if len(encoded) > 512:
+        message = encoded[:509].decode("utf-8", errors="ignore") + "..."
+    print(message, file=sys.stderr)
 
 
 if __name__ == "__main__":

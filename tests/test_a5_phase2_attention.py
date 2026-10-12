@@ -9,6 +9,8 @@ from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
     CANDIDATE_ABI,
     CANDIDATE_ABI_SHA256,
+    HOST_TARGET_GRADING_CONTRACT,
+    HOST_TARGET_GRADING_SHA256,
     SUITE_SHA256,
     AttentionCase,
     AttentionInfrastructureError,
@@ -88,12 +90,37 @@ def test_suite_covers_fixed_dense_forward_contract():
 
 def test_candidate_abi_identity_is_stable_and_explicit():
     assert CANDIDATE_ABI == (
+        ("module_import", "import catlass.tla as tla"),
+        ("module_members", "exactly one import and one synchronous kernel definition"),
+        ("kernel_decorator", "@tla.kernel"),
+        ("kernel_export", "dense_attention(gm_q, gm_k, gm_v, gm_output)"),
+        ("signature_policy", "four positional arguments; no defaults, varargs, or kwargs"),
+        ("host_prepended_constants", (
+            "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL", "DTYPE",
+        )),
         ("arguments", ("gm_q", "gm_k", "gm_v", "gm_output")),
         ("physical_layout", "flat-contiguous-row-major"),
         ("logical_shape", "[B,H,S,D]"),
         ("logical_dimensions", ("BATCH", "HEADS", "SEQUENCE", "HEAD_DIM")),
+        ("launch_block_num", 1),
+        ("launch_coverage", "block 0 must produce the complete output tensor"),
     )
     assert len(CANDIDATE_ABI_SHA256) == 64
+
+
+def test_host_grading_identity_is_stable_and_explicit():
+    contract = dict(HOST_TARGET_GRADING_CONTRACT)
+    assert contract["comparison"] == (
+        "abs(actual-expected) <= atol + rtol*abs(expected)"
+    )
+    assert dict(contract["dtype_tolerances"]) == {
+        "float16": (("atol", 0.02), ("rtol", 0.02)),
+        "bfloat16": (("atol", 0.05), ("rtol", 0.05)),
+    }
+    assert contract["suite_verdict"] == (
+        "pass only when every registered case passes"
+    )
+    assert len(HOST_TARGET_GRADING_SHA256) == 64
 
 
 def test_execution_inputs_are_deterministic_quantized_bhsd_tensors():

@@ -12,6 +12,7 @@ from typing import Callable, Mapping
 from benchmarks.a5kernels.evidence import GENESIS_HASH, canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase2_attention import (
     CANDIDATE_ABI_SHA256,
+    HOST_TARGET_GRADING_SHA256,
     SUITE_SHA256,
     AttentionTargetEvidence,
 )
@@ -152,6 +153,7 @@ class Phase2LiveRunner:
         identity = {
             "target_suite_sha256": SUITE_SHA256,
             "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
+            "host_target_grading_sha256": HOST_TARGET_GRADING_SHA256,
             "source_snapshot_id": self.snapshot.snapshot_id,
             "cell": self.dependencies.cell.as_dict(),
         }
@@ -183,6 +185,7 @@ class Phase2LiveRunner:
             "snapshot_id": self.snapshot.snapshot_id,
             "suite_sha256": SUITE_SHA256,
             "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
+            "host_target_grading_sha256": HOST_TARGET_GRADING_SHA256,
             "attempt": ordinal,
             "request_id": prefix,
             "attempt_id": f"target-{prefix}",

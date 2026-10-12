@@ -8,6 +8,7 @@ import pytest
 import benchmarks.a5kernels.phase2_live as phase2_live_module
 from benchmarks.a5kernels.phase2_attention import (
     CANDIDATE_ABI_SHA256,
+    HOST_TARGET_GRADING_SHA256,
     AttentionInfrastructureError,
     AttentionReceipt,
     AttentionTargetVerifier,
@@ -91,10 +92,12 @@ def test_pass_is_host_owned_and_protocol_binds_full_treatment(tmp_path):
     assert protocol["identity"] == {
         "target_suite_sha256": destination.suite_sha256,
         "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
+        "host_target_grading_sha256": HOST_TARGET_GRADING_SHA256,
         "source_snapshot_id": snapshot.snapshot_id,
         "cell": destination.as_dict(),
     }
     assert attempt["candidate_abi_sha256"] == CANDIDATE_ABI_SHA256
+    assert attempt["host_target_grading_sha256"] == HOST_TARGET_GRADING_SHA256
     assert attempt["protocol_sha256"] == protocol["protocol_sha256"]
     assert calls[0].phase1_memory == snapshot.memory_entries()
     assert calls[0].phase2_memory == ()
@@ -211,6 +214,23 @@ def test_resume_rejects_changed_candidate_abi(tmp_path, monkeypatch):
     retained = json.loads(runner.protocol_path.read_text())
 
     monkeypatch.setattr(phase2_live_module, "CANDIDATE_ABI_SHA256", "f" * 64)
+    assert runner._protocol_body()["identity"] != retained["identity"]
+    with pytest.raises(ValueError, match="immutable Phase 2 artifact conflicts"):
+        runner.run()
+
+
+def test_resume_rejects_changed_host_grading_contract(tmp_path, monkeypatch):
+    _composition, _source, _destination, snapshot = _snapshot(tmp_path)
+    runner = Phase2LiveRunner(
+        phase2_root=tmp_path / "phase2", snapshot=snapshot,
+        dependencies=_deps(snapshot, _Backend((True,)), []),
+    )
+    runner.run()
+    retained = json.loads(runner.protocol_path.read_text())
+
+    monkeypatch.setattr(
+        phase2_live_module, "HOST_TARGET_GRADING_SHA256", "e" * 64,
+    )
     assert runner._protocol_body()["identity"] != retained["identity"]
     with pytest.raises(ValueError, match="immutable Phase 2 artifact conflicts"):
         runner.run()
