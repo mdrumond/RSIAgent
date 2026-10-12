@@ -192,7 +192,6 @@ def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):
 @pytest.mark.parametrize("listing", [
     "\t1234.{handle}\t(10/12/26 12:00:00)\t(Dead ???)\n",
     "\t1234.{handle}-suffix\t(10/12/26 12:00:00)\t(Detached)\n",
-    "\t1234.{handle}\t(10/12/26 12:00:00)\t(Attached)\n",
 ])
 def test_screen_worker_rejects_non_live_or_inexact_sessions(tmp_path, listing):
     root = tmp_path / "controller"
@@ -210,6 +209,26 @@ def test_screen_worker_rejects_non_live_or_inexact_sessions(tmp_path, listing):
     )
 
     assert pool.observe(assignment) == Observation.incomplete()
+
+
+def test_screen_worker_treats_exact_attached_session_as_active(tmp_path):
+    handle = "rsi-a5-attached"
+
+    def screen(argv, **_kwargs):
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=f"\t1234.{handle}\t(10/12/26 12:00:00)\t(Attached)\n",
+        )
+
+    pool = ScreenWorkerPool(
+        tmp_path, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+    assignment = RetainedAssignment(
+        Job(JobKind.PHASE1_RUN, "attached"), 1, handle, 1
+    )
+
+    assert pool.observe(assignment) == Observation.active()
 
 
 def test_screen_worker_authenticated_result_precedes_dead_session(tmp_path):
