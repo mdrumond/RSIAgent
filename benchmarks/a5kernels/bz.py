@@ -46,6 +46,8 @@ class BZCommandExecutor(Protocol):
 
     def inspect(self, argv: tuple[str, ...]) -> CommandResult: ...
 
+    def observe(self, handle: str) -> CommandResult: ...
+
     @property
     def runtime_provenance(self) -> tuple[tuple[str, str], ...]: ...
 
@@ -73,17 +75,25 @@ class ProfileCommandExecutor:
         return ()
 
     def run(self, invocation: CommandInvocation) -> CommandResult:
+        remote = PurePosixPath(invocation.remote_directory)
+        if (
+            remote.is_absolute()
+            or ".." in remote.parts
+            or len(remote.parts) < 2
+            or remote.parts[0] != ".a5kernels"
+        ):
+            raise ValueError("remote directory must be safely nested beneath .a5kernels")
         with tempfile.TemporaryDirectory(prefix="a5kernel-") as temporary:
             stage = Path(temporary)
             for source in invocation.files:
                 relative = PurePosixPath(source.relative_path)
                 if relative.is_absolute() or ".." in relative.parts:
                     raise ValueError(f"unsafe fixture path: {source.relative_path!r}")
-                destination = stage.joinpath(*relative.parts)
+                destination = stage.joinpath(*remote.parts[1:], *relative.parts)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_text(source.content, encoding="utf-8")
             uploaded = self._call(
-                (self._upload_wrapper, "--recursive", f"{stage}/", invocation.remote_directory)
+                (self._upload_wrapper, "--recursive", f"{stage}/", ".a5kernels/")
             )
         if uploaded.returncode != 0:
             return CommandResult(uploaded.returncode, uploaded.stdout, uploaded.stderr)
@@ -288,6 +298,32 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
             stdin=invocation.stdin,
         )
 
+    def observe(self, handle: str) -> CommandResult:
+        """Observe one exact retained Catlass handle without resubmitting it."""
+
+        prefix = "bz-a5:"
+        if not handle.startswith(prefix) or not handle.removeprefix(prefix):
+            raise ValueError("retained Catlass handle must begin with bz-a5:")
+        operation = handle.removeprefix(prefix)
+        completed = self._call(
+            (
+                self._validation_wrapper,
+                "--profile",
+                "bz-a5",
+                "--operation",
+                operation,
+                "observe",
+                "--handle",
+                handle,
+            )
+        )
+        return CommandResult(
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            handle,
+        )
+
 class BZSessionAdapter:
     """Translate execution plans into named durable BZ-A5 sessions."""
 
@@ -347,9 +383,9 @@ class BZSessionAdapter:
             physical_device=physical_device,
         )
         dispatch = self._executor.run(invocation)
-        if dispatch.exit_code != 0 and not _proven_observation_uncertain(
-            dispatch, session_name
-        ):
+        handle = dispatch.session_handle or f"bz-a5:{session_name}"
+        uncertain = _proven_observation_uncertain(dispatch, session_name)
+        if dispatch.exit_code != 0 and not uncertain:
             return ExecutionReceipt(
                 exit_code=dispatch.exit_code,
                 output=(),
@@ -357,10 +393,28 @@ class BZSessionAdapter:
                 stderr=dispatch.stderr,
                 session_handle=dispatch.session_handle,
             )
+        if uncertain:
+            self._observe_retained(handle, session_name)
         logs = self._executor.inspect((self._wrapper, "--name", session_name, "logs"))
         result = self._executor.inspect(
             (self._wrapper, "--name", session_name, "result")
         )
+        if _session_observation_uncertain(logs, session_name) or _session_observation_uncertain(
+            result, session_name
+        ):
+            self._observe_retained(handle, session_name)
+            logs = self._executor.inspect(
+                (self._wrapper, "--name", session_name, "logs")
+            )
+            result = self._executor.inspect(
+                (self._wrapper, "--name", session_name, "result")
+            )
+        if _session_observation_uncertain(logs, session_name) or _session_observation_uncertain(
+            result, session_name
+        ):
+            raise RuntimeUnavailableError(
+                f"retained A5 session observation is unavailable: {handle}"
+            )
         output = _parse_output(logs.stdout) if result.exit_code == 0 else ()
         return ExecutionReceipt(
             exit_code=result.exit_code,
@@ -376,6 +430,22 @@ class BZSessionAdapter:
                 or f"bz-a5:{session_name}"
             ),
         )
+
+    def _observe_retained(self, handle: str, session_name: str) -> None:
+        observe = getattr(self._executor, "observe", None)
+        if observe is None:
+            raise RuntimeUnavailableError(
+                f"retained A5 session observation is unavailable: {handle}"
+            )
+        observed = observe(handle)
+        if _proven_observation_uncertain(observed, session_name):
+            raise RuntimeUnavailableError(
+                f"retained A5 session observation is unavailable: {handle}"
+            )
+        if not _proven_terminal_observation(observed, session_name):
+            raise RuntimeUnavailableError(
+                f"retained A5 session observation returned no terminal state: {handle}"
+            )
 
     def prepare_execution(self, plan: ExecutionPlan) -> ExecutionPlan:
         """Return the exact immutable plan that will cross the BZ boundary."""
@@ -496,9 +566,31 @@ def _is_revision(value: str) -> bool:
 
 def _proven_observation_uncertain(result: CommandResult, session_name: str) -> bool:
     return (
-        result.exit_code == 75
-        and "CATLASS_VALIDATION_STATE=observation-unavailable" in result.stdout
-        and f"CATLASS_VALIDATION_HANDLE=bz-a5:{session_name}" in result.stdout
+        "CATLASS_VALIDATION_STATE=observation-unavailable" in result.stdout.splitlines()
+        and f"CATLASS_VALIDATION_HANDLE=bz-a5:{session_name}" in result.stdout.splitlines()
+    )
+
+
+def _session_observation_uncertain(result: CommandResult, session_name: str) -> bool:
+    prefixes = tuple(
+        f"SESSION_STATE={state} session={session_name}"
+        for state in ("running", "reconnecting", "observation-unavailable", "missing")
+    )
+    return any(
+        line == prefix or line.startswith(prefix + " ")
+        for line in result.stdout.splitlines()
+        for prefix in prefixes
+    )
+
+
+def _proven_terminal_observation(result: CommandResult, session_name: str) -> bool:
+    lines = result.stdout.splitlines()
+    return (
+        f"CATLASS_VALIDATION_HANDLE=bz-a5:{session_name}" in lines
+        and any(
+            f"CATLASS_VALIDATION_STATE={state}" in lines
+            for state in ("completed", "failed")
+        )
     )
 
 

@@ -292,11 +292,13 @@ def test_invalid_lengths_are_rejected(length):
 
 
 class FakeCommandExecutor:
-    def __init__(self, dispatch, inspections=(), runtime_provenance=()):
+    def __init__(self, dispatch, inspections=(), runtime_provenance=(), observations=()):
         self.dispatch = dispatch
         self.inspections = list(inspections)
+        self.observations = list(observations)
         self.invocations = []
         self.inspect_argv = []
+        self.observe_handles = []
         self.runtime_provenance = runtime_provenance
 
     def run(self, invocation):
@@ -306,6 +308,10 @@ class FakeCommandExecutor:
     def inspect(self, argv):
         self.inspect_argv.append(argv)
         return self.inspections.pop(0)
+
+    def observe(self, handle):
+        self.observe_handles.append(handle)
+        return self.observations.pop(0)
 
 
 def test_bz_adapter_retrieves_retained_logs_and_result_before_parsing():
@@ -398,13 +404,21 @@ def test_bz_adapter_observes_only_explicitly_identified_uncertain_dispatch():
     session = f"codex-a5hello-{plan.execution_id}-trial-1"
     command = FakeCommandExecutor(
         CommandResult(
-            75,
+            2,
             "CATLASS_VALIDATION_STATE=observation-unavailable\n"
             f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n",
         ),
         (
             CommandResult(0, f"{OUTPUT_MARKER}[3]\n"),
             CommandResult(0, "exit=0"),
+        ),
+        observations=(
+            CommandResult(
+                0,
+                "CATLASS_VALIDATION_STATE=completed\n"
+                f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n",
+                session_handle=f"bz-a5:{session}",
+            ),
         ),
     )
 
@@ -413,7 +427,69 @@ def test_bz_adapter_observes_only_explicitly_identified_uncertain_dispatch():
     ).execute(plan)
 
     assert receipt.output == (3.0,)
+    assert command.observe_handles == [f"bz-a5:{session}"]
     assert [argv[-1] for argv in command.inspect_argv] == ["logs", "result"]
+
+
+def test_bz_adapter_reobserves_exact_handle_when_result_is_nonterminal():
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+    session = f"codex-a5hello-{plan.execution_id}-trial-1"
+    unavailable = (
+        "SESSION_STATE=observation-unavailable "
+        f"session={session} handle=remote:bz-a5:session:{session}\n"
+    )
+    command = FakeCommandExecutor(
+        CommandResult(0, "dispatch completed"),
+        (
+            CommandResult(75, unavailable),
+            CommandResult(75, unavailable),
+            CommandResult(0, f"{OUTPUT_MARKER}[3]\n"),
+            CommandResult(0, f"SESSION_STATE=completed session={session} exit=0"),
+        ),
+        observations=(
+            CommandResult(
+                0,
+                "CATLASS_VALIDATION_STATE=completed\n"
+                f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n",
+                session_handle=f"bz-a5:{session}",
+            ),
+        ),
+    )
+
+    receipt = BZSessionAdapter(
+        command, session_wrapper="execution-profiles/bz-a5/session.sh"
+    ).execute(plan)
+
+    assert receipt.output == (3.0,)
+    assert command.observe_handles == [f"bz-a5:{session}"]
+    assert [argv[-1] for argv in command.inspect_argv] == [
+        "logs", "result", "logs", "result"
+    ]
+
+
+def test_bz_adapter_never_converts_unavailable_exact_observation_to_candidate_result():
+    plan = A5KernelRunner(FakeBackend()).prepare(
+        RunRequest(Language.CATLASS_DSL.value, length=1), attempt_id="trial-1"
+    )
+    session = f"codex-a5hello-{plan.execution_id}-trial-1"
+    marker = (
+        "CATLASS_VALIDATION_STATE=observation-unavailable\n"
+        f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}\n"
+    )
+    command = FakeCommandExecutor(
+        CommandResult(255, marker),
+        observations=(CommandResult(75, marker),),
+    )
+
+    with pytest.raises(RuntimeUnavailableError, match="retained.*unavailable"):
+        BZSessionAdapter(
+            command, session_wrapper="execution-profiles/bz-a5/session.sh"
+        ).execute(plan)
+
+    assert command.observe_handles == [f"bz-a5:{session}"]
+    assert command.inspect_argv == []
 
 
 def test_bz_adapter_uses_full_execution_id_to_isolate_colliding_prefixes():
@@ -950,10 +1026,11 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
             )
         if argv[0].endswith("upload.sh"):
             assert argv[1] == "--recursive"
-            assert argv[3].startswith(".a5kernels/")
-            assert (Path(argv[2]) / "host_driver.py").is_file()
-            assert (Path(argv[2]) / "kernel.py").is_file()
-            assert (Path(argv[2]) / "input.json").is_file()
+            assert argv[3] == ".a5kernels/"
+            staged = Path(argv[2]) / plan.execution_id / "trial-1"
+            assert (staged / "host_driver.py").is_file()
+            assert (staged / "kernel.py").is_file()
+            assert (staged / "input.json").is_file()
             return subprocess.CompletedProcess(argv, 0, "uploaded", "")
         if argv[0].endswith("catlass-validation.sh"):
             assert argv[:12] == (
@@ -1013,6 +1090,52 @@ def test_catlass_executor_selects_adapter_source_revision_and_retained_evidence(
     assert receipt.output == (3.0,)
     assert receipt.session_handle == f"bz-a5:codex-a5hello-{plan.execution_id}-trial-1"
     assert len(calls) == 5
+
+
+def test_profile_executor_rejects_remote_staging_outside_a5kernels():
+    executor = ProfileCommandExecutor(
+        upload_wrapper="execution-profiles/bz-a5/upload.sh",
+        process_runner=lambda *_args, **_kwargs: pytest.fail("must not upload"),
+    )
+    invocation = SimpleNamespace(
+        files=(SourceFile("kernel.py", "pass\n"),),
+        remote_directory="other-root/execution/attempt",
+    )
+
+    with pytest.raises(ValueError, match="beneath .a5kernels"):
+        executor.run(invocation)
+
+
+def test_catlass_executor_observes_the_exact_retained_handle():
+    calls = []
+
+    def run(argv, **_kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "CATLASS_VALIDATION_STATE=completed\n"
+            "CATLASS_VALIDATION_HANDLE=bz-a5:codex-exact-session\n",
+            "",
+        )
+
+    executor = CatlassValidationExecutor(
+        upload_wrapper="execution-profiles/bz-a5/upload.sh",
+        validation_wrapper="execution-profiles/catlass-validation.sh",
+        catlass_source="/retained/catlass",
+        catlass_revision="9" * 40,
+        process_runner=run,
+    )
+
+    result = executor.observe("bz-a5:codex-exact-session")
+
+    assert result.session_handle == "bz-a5:codex-exact-session"
+    assert calls == [(
+        "execution-profiles/catlass-validation.sh",
+        "--profile", "bz-a5",
+        "--operation", "codex-exact-session",
+        "observe", "--handle", "bz-a5:codex-exact-session",
+    )]
 
 
 def test_native_rebuild_probe_changes_execution_identity_and_is_cached():
