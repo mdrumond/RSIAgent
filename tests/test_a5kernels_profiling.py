@@ -774,6 +774,50 @@ def test_compact_collector_distinguishes_transport_from_semantic_failure(
         backend._collect(command, "/retained/profile")
 
 
+def test_compact_collector_bounds_session_name_from_full_replay_identity(
+    tmp_path: Path,
+) -> None:
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append(tuple(argv))
+        destination = Path(argv[argv.index("--output") + 1])
+        destination.mkdir(parents=True, exist_ok=True)
+        _write_compact_archive(destination)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = BZProfileBackend(
+        validation_wrapper="/profiles/catlass-validation.sh",
+        collection_wrapper="/skills/collect_profile.sh",
+        catlass_source="/remote/catlass",
+        evidence_directory=str(tmp_path),
+        process_runner=run,
+    )
+    replay_ids = (
+        "profile-basic-info-" + "a" * 96,
+        "profile-basic-info-" + "a" * 95 + "b",
+    )
+
+    for replay_id in replay_ids:
+        backend._collect(
+            CaptureCommand(
+                CampaignKind.FINAL, REQUEST, ProfileMetric.BASIC_INFO, replay_id,
+            ),
+            f"/retained/{replay_id}",
+        )
+
+    operations = [call[call.index("--operation") + 1] for call in calls]
+    assert operations == [
+        f"a5-collect-{hashlib.sha256(replay_id.encode()).hexdigest()[:32]}"
+        for replay_id in replay_ids
+    ]
+    assert len(set(operations)) == 2
+    assert all(len(operation) == 43 for operation in operations)
+    assert [call[call.index("--output") + 1] for call in calls] == [
+        str(tmp_path / replay_id) for replay_id in replay_ids
+    ]
+
+
 def test_concrete_backend_reads_markers_from_retained_session_logs(
     tmp_path: Path,
 ) -> None:

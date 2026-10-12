@@ -32,6 +32,13 @@ _TIMING_MARKER = "A5KERNEL_TIMING_US="
 _REMOTE_MARKER = "MSPROF_PROFILE_REMOTE_DIR="
 
 
+def _collection_operation(replay_id: str) -> str:
+    """Derive a short durable-session name from the full replay identity."""
+
+    digest = hashlib.sha256(replay_id.encode("utf-8")).hexdigest()[:32]
+    return f"a5-collect-{digest}"
+
+
 def _raise_replay_failure(returncode: int, message: str) -> None:
     if returncode in {75, 255}:
         raise InfrastructureFailure(message)
@@ -328,7 +335,7 @@ class BZProfileBackend:
             "--mode",
             "summary",
             "--operation",
-            f"{command.replay_id}-collect",
+            _collection_operation(command.replay_id),
         ]
         # BasicInfo rows carry an operator-name column and can be curated by exact
         # name. PipeUtilization rows are keyed by block/sub-block instead; the
