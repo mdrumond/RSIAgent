@@ -27,7 +27,7 @@ from benchmarks.a5kernels.profiling import (
     bind_profile_device,
     bind_study_dimensions,
 )
-from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+from benchmarks.a5kernels.profiling_bz import BZProfileBackend, _profiling_operation
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels import A5KernelRunner, BZSessionAdapter, Language, RunRequest
 from benchmarks.a5kernels.bz import CommandResult
@@ -732,7 +732,8 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
         call
         for call in calls
         if "--operation" in call
-        and call[call.index("--operation") + 1] == "phase1-sample"
+        and call[call.index("--operation") + 1]
+        == _profiling_operation("phase1-sample")
     )
     assert "A5KERNEL_WARM_UP=5" in study_call
     assert "A5KERNEL_LAUNCH_COUNT=20" in study_call
@@ -741,9 +742,25 @@ def test_concrete_backend_routes_exact_bound_separate_replays(tmp_path: Path) ->
     }
     assert len(evidence_destinations) == 4
     assert all(
-        call[call.index("--operation") + 1].startswith("profile-")
+        call[call.index("--operation") + 1].startswith("a5-profile-")
         for call in profile_calls
     )
+
+
+def test_profiling_operations_bound_full_replay_identity() -> None:
+    replay_ids = (
+        "profile-timing-" + "a" * 96,
+        "profile-timing-" + "a" * 95 + "b",
+    )
+
+    operations = tuple(_profiling_operation(replay_id) for replay_id in replay_ids)
+
+    assert operations == tuple(
+        f"a5-profile-{hashlib.sha256(replay_id.encode()).hexdigest()[:32]}"
+        for replay_id in replay_ids
+    )
+    assert len(set(operations)) == 2
+    assert all(len(operation) == 43 for operation in operations)
 
 
 @pytest.mark.parametrize(
@@ -871,13 +888,16 @@ def test_concrete_backend_reads_markers_from_retained_session_logs(
     assert calls[-2] == (
         "/profiles/bz-a5/session.sh",
         "--name",
-        "retained-timing",
+        _profiling_operation("retained-timing"),
         "logs",
         "--lines",
         "2000",
     )
     assert calls[-1] == (
-        "/profiles/bz-a5/session.sh", "--name", "retained-timing", "result",
+        "/profiles/bz-a5/session.sh",
+        "--name",
+        _profiling_operation("retained-timing"),
+        "result",
     )
     assert (tmp_path / "retained-timing" / "timing-stdout.txt").read_text() == (
         "A5KERNEL_TIMING_US=6.25\n"

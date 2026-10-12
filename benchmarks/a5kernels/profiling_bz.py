@@ -39,6 +39,13 @@ def _collection_operation(replay_id: str) -> str:
     return f"a5-collect-{digest}"
 
 
+def _profiling_operation(replay_id: str) -> str:
+    """Derive a short durable-session name from the full profiling identity."""
+
+    digest = hashlib.sha256(replay_id.encode("utf-8")).hexdigest()[:32]
+    return f"a5-profile-{digest}"
+
+
 def _raise_replay_failure(returncode: int, message: str) -> None:
     if returncode in {75, 255}:
         raise InfrastructureFailure(message)
@@ -216,14 +223,15 @@ class BZProfileBackend:
 
         if _marked_values(completed.stdout, marker):
             return completed.stdout, completed.returncode
+        operation = _profiling_operation(replay_id)
         retries = self._observation_retries
         observation_returncode = completed.returncode
         observation_output = completed.stdout
         for attempt in range(retries + 1):
             logs = self._call(
-                (self._session, "--name", replay_id, "logs", "--lines", "2000")
+                (self._session, "--name", operation, "logs", "--lines", "2000")
             )
-            result = self._call((self._session, "--name", replay_id, "result"))
+            result = self._call((self._session, "--name", operation, "result"))
             if (
                 logs.returncode == 0
                 and result.returncode == 0
@@ -281,7 +289,7 @@ class BZProfileBackend:
             "--profile",
             "bz-a5",
             "--operation",
-            replay_id,
+            _profiling_operation(replay_id),
             action,
             "--catlass-src",
             self._catlass_source,
