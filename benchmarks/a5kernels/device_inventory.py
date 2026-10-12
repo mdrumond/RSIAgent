@@ -17,6 +17,9 @@ from typing import Callable
 _CANDIDATE = "BZ_A5_DEVICE_CANDIDATE"
 _DEVICE = "BZ_A5_DEVICE="
 _STATE = "BZ_A5_DEVICE_STATE"
+_PROFILING_UNAVAILABLE = (
+    "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"
+)
 _UNRESPONSIVE_REASONS = frozenset(
     {
         "health-unresponsive",
@@ -94,6 +97,16 @@ class BZDeviceInventory:
         if completed.returncode == 75:
             raise DeviceInventoryUnavailable(
                 "checked BZ-A5 selector infrastructure is temporarily unavailable"
+            )
+        streams = (completed.stdout, completed.stderr)
+        has_unavailable_record = any(
+            line == _PROFILING_UNAVAILABLE
+            for stream in streams if isinstance(stream, str)
+            for line in stream.splitlines()
+        )
+        if completed.returncode == 1 and has_unavailable_record:
+            raise DeviceInventoryUnavailable(
+                "checked BZ-A5 profiling inventory is temporarily unavailable"
             )
         if completed.returncode != 0:
             raise DeviceInventoryError(

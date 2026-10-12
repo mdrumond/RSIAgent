@@ -148,6 +148,41 @@ def test_inventory_classifies_checked_transport_exit_as_unavailable():
         probe.profiling_snapshot()
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_inventory_classifies_exact_profiling_unavailable_record(stream):
+    marker = "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"
+    values = {
+        "stdout": "REMOTE_STATE=failed\n",
+        "stderr": "wrapper diagnostic\n",
+    }
+    values[stream] += f"{marker}\n"
+    probe, _ = inventory(
+        values["stdout"], returncode=1, stderr=values["stderr"],
+    )
+
+    with pytest.raises(DeviceInventoryUnavailable, match="temporarily unavailable"):
+        probe.profiling_snapshot()
+
+
+@pytest.mark.parametrize(
+    "returncode, marker",
+    [
+        (1, "BZ_A5_DEVICE_STATE=unavailable purpose=regular requested=auto"),
+        (1, "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=3"),
+        (1, "prefix BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"),
+        (2, "BZ_A5_DEVICE_STATE=unavailable purpose=profiling requested=auto"),
+    ],
+)
+def test_inventory_does_not_retry_noncanonical_unavailable_record(
+    returncode, marker,
+):
+    probe, _ = inventory("", returncode=returncode, stderr=f"{marker}\n")
+
+    with pytest.raises(DeviceInventoryError) as caught:
+        probe.profiling_snapshot()
+    assert type(caught.value) is DeviceInventoryError
+
+
 def test_inventory_rejects_successful_but_truncated_candidate_coverage():
     probe, _ = inventory(output(candidate(2), selected=2, complete=False))
 
