@@ -192,6 +192,22 @@ class CampaignController:
                     raise ValueError("recovered worker changed retained identity")
                 by_handle[assignment.worker_handle] = assignment
             active = list(by_handle.values())
+            phase1_ids = {item.source_cell_id for item in self.destinations}
+            phase2_ids = {item.cell_id for item in self.destinations}
+            for assignment in active:
+                valid = (
+                    assignment.job.kind in {
+                        JobKind.PHASE1_RUN, JobKind.PHASE1_RESUME,
+                    }
+                    and assignment.job.cell_id in phase1_ids
+                ) or (
+                    assignment.job.kind in {
+                        JobKind.PHASE2_QUALIFY, JobKind.PHASE2_RUN,
+                    }
+                    and assignment.job.cell_id in phase2_ids
+                )
+                if not valid:
+                    raise ValueError("retained assignment is outside campaign job universe")
             retained = []
             for assignment in active:
                 observation = self.workers.observe(assignment)

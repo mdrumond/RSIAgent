@@ -211,6 +211,21 @@ def test_observation_invariants_reject_ambiguous_active_exit_code():
         Observation("active", 0)
 
 
+def test_retained_unknown_job_fails_closed_before_observation(tmp_path):
+    subject = controller(tmp_path)
+    subject.root.mkdir(parents=True)
+    subject.state_path.write_text(json.dumps({
+        "schema": "a5-priority-controller-state-v1",
+        "active": [RetainedAssignment(
+            Job(JobKind.PHASE1_RUN, "unknown"), 1, "stale-screen", 1,
+        ).as_dict()],
+        "incomplete": [],
+    }))
+
+    with pytest.raises(ValueError, match="job universe"):
+        subject.reconcile()
+
+
 def test_real_composition_only_schedules_eight_runnable_sources(tmp_path):
     from benchmarks.a5kernels.phase1_composition import (
         LiveDependencies, Phase1CellComposition,
