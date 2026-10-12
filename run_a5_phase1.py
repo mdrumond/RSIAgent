@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
 import time
 from typing import Callable, Sequence
 
@@ -13,6 +14,7 @@ from benchmarks.a5kernels.bz import RuntimeUnavailableError
 from benchmarks.a5kernels.phase1_composition import (
     LiveDependencies,
     Phase1CellComposition,
+    select_worker_cell,
 )
 from benchmarks.a5kernels.phase1_live import (
     BACKOFF_SECONDS,
@@ -35,9 +37,17 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--one-project-smoke",
             action="store_true",
-            help="run exactly the first registered project in every runnable cell",
+            help=(
+                "run the first registered project in each selected runnable cell; "
+                "use a root distinct from every full campaign"
+            ),
         )
         if name in {"run", "resume"}:
+            command.add_argument(
+                "--cell-id",
+                action="append",
+                help="run or resume exactly one registered runnable cell",
+            )
             command.add_argument("--tla-root", type=Path, required=True)
             command.add_argument("--profiling-skill-root", type=Path, required=True)
             command.add_argument("--catlass-source", required=True)
@@ -56,7 +66,12 @@ def _unavailable_dependencies() -> LiveDependencies:
     return LiveDependencies(unavailable, unavailable)
 
 
-def _paths(args, revision: str) -> ProductionPaths:
+def _paths(
+    args,
+    revision: str,
+    *,
+    results_root: Path | None = None,
+) -> ProductionPaths:
     return ProductionPaths(
         tla_root=args.tla_root,
         profiling_skill_root=args.profiling_skill_root,
@@ -65,7 +80,7 @@ def _paths(args, revision: str) -> ProductionPaths:
         bge_cache=args.bge_cache,
         kdb=args.kdb,
         collection=args.collection,
-        results_root=args.root,
+        results_root=args.root if results_root is None else results_root,
         device=args.device,
     )
 
@@ -80,13 +95,24 @@ def main(
 ) -> int:
     args = _parser().parse_args(argv)
     gate = load_gate_report(args.gate)
+    selected = select_worker_cell(
+        gate.guide, getattr(args, "cell_id", None),
+    )
     dependencies = _unavailable_dependencies()
     if args.command in {"run", "resume"}:
+        worker_root = None
+        if selected is not None:
+            worker_root = args.root / "cells" / selected.cell_id
+            worker_root.mkdir(parents=True, exist_ok=True)
         failures = 0
         while True:
             try:
                 dependencies = dependency_builder(
-                    _paths(args, gate.guide.catlass_revision),
+                    _paths(
+                        args,
+                        gate.guide.catlass_revision,
+                        results_root=worker_root,
+                    ),
                     env_file=args.env_file,
                 )
                 break
@@ -106,10 +132,16 @@ def main(
     if args.command == "plan":
         value = composition.plan()
     elif args.command == "run":
-        composition.run()
+        if selected is None:
+            composition.run()
+        else:
+            composition.run_cell(selected.cell_id)
         value = composition.report()
     elif args.command == "resume":
-        composition.resume()
+        if selected is None:
+            composition.resume()
+        else:
+            composition.run_cell(selected.cell_id)
         value = composition.report()
     else:
         value = composition.report()
@@ -117,5 +149,22 @@ def main(
     return 0
 
 
+def _entry() -> int:
+    try:
+        return main()
+    except (InfrastructureFailure, RuntimeUnavailableError) as exc:
+        _write_infrastructure_diagnostic(exc)
+        return 75
+
+
+def _write_infrastructure_diagnostic(exc: Exception) -> None:
+    detail = " ".join(str(exc).split()) or "unavailable"
+    message = f"{type(exc).__name__}: {detail}"
+    encoded = message.encode("utf-8")
+    if len(encoded) > 512:
+        message = encoded[:509].decode("utf-8", errors="ignore") + "..."
+    print(message, file=sys.stderr)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_entry())
