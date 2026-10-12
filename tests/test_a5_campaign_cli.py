@@ -1,5 +1,8 @@
 import json
 from pathlib import Path
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -68,6 +71,52 @@ def test_screen_worker_consumes_exact_argv_and_retains_result(tmp_path):
 
     run_request(request, process_runner=execute)
     assert pool.observe(assignment) == Observation.completed(19)
+
+
+def test_screen_worker_start_does_not_wait_for_detached_output_holder(tmp_path):
+    """A detached Screen descendant must not keep start's capture pipes open."""
+
+    def screen(_argv, **kwargs):
+        return subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import subprocess, sys; "
+                    "subprocess.Popen([sys.executable, '-c', "
+                    "'import time; time.sleep(1)'], "
+                    "stdout=sys.stdout, stderr=sys.stderr)"
+                ),
+            ],
+            timeout=0.25,
+            **kwargs,
+        )
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-detach"
+    pool = ScreenWorkerPool(
+        root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+
+    started = time.monotonic()
+    pool.start(Job(JobKind.PHASE1_RUN, "p1-detach"), 2, worker, ("run",))
+
+    assert time.monotonic() - started < 0.25
+
+
+def test_screen_worker_start_reports_screen_diagnostics(tmp_path):
+    def screen(_argv, **kwargs):
+        kwargs["stdout"].write("Cannot make directory /run/screen\n")
+        return subprocess.CompletedProcess(_argv, 1)
+
+    root = tmp_path / "controller"
+    worker = root / "workers" / "phase1-run" / "p1-failed"
+    pool = ScreenWorkerPool(
+        root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
+    )
+
+    with pytest.raises(RuntimeError, match="Cannot make directory /run/screen"):
+        pool.start(Job(JobKind.PHASE1_RUN, "p1-failed"), 2, worker, ("run",))
 
 
 def test_screen_worker_observes_retained_screen_without_relaunch(tmp_path):

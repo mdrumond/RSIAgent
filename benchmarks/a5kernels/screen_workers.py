@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 from typing import Callable, Sequence
 
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
@@ -84,13 +85,21 @@ class ScreenWorkerPool:
         request_path = attempt / "request.json"
         request_path.write_bytes(canonical_bytes(request) + b"\n")
         handle = self._handle(job, device, ordinal)
-        completed = self.run(
-            ("screen", "-DmS", handle, sys.executable, str(self.script),
-             "worker", "--request", str(request_path)),
-            text=True, capture_output=True, check=False,
-        )
+        # A detached Screen server inherits its launcher's file descriptors.
+        # Regular files let subprocess.run return when the Screen client exits;
+        # capture pipes would stay open until the detached worker finishes.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as diagnostics:
+            completed = self.run(
+                ("screen", "-DmS", handle, sys.executable, str(self.script),
+                 "worker", "--request", str(request_path)),
+                text=True, stdout=diagnostics, stderr=subprocess.STDOUT,
+                check=False,
+            )
+            diagnostics.seek(0)
+            detail = diagnostics.read().strip()
         if completed.returncode != 0:
-            raise RuntimeError("GNU Screen worker could not start")
+            message = "GNU Screen worker could not start"
+            raise RuntimeError(f"{message}: {detail}" if detail else message)
         return RetainedAssignment(job, device, handle, ordinal)
 
     def observe(self, assignment: RetainedAssignment) -> Observation:
