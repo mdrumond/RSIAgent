@@ -31,6 +31,7 @@ from benchmarks.a5kernels.phase2_attention import SUITE_SHA256
 
 
 CELL_SCHEMA = "a5-catlass-phase2-cell-v1"
+CELL_SCHEMA_V2 = "a5-catlass-phase2-cell-v2"
 SNAPSHOT_SCHEMA = "a5-catlass-phase2-phase1-snapshot-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -60,11 +61,11 @@ class A5Phase2Cell:
     target: A5Target = A5Target.A5
     language: A5Language = A5Language.CATLASS_DSL
     schema: str = CELL_SCHEMA
+    source_guide: ProgrammingGuideIdentity | None = None
 
     def __post_init__(self) -> None:
         if (
-            self.schema != CELL_SCHEMA
-            or self.target is not A5Target.A5
+            self.target is not A5Target.A5
             or self.language is not A5Language.CATLASS_DSL
             or not isinstance(self.model, A5ModelIdentity)
             or not isinstance(self.knowledge, KnowledgeMode)
@@ -72,12 +73,25 @@ class A5Phase2Cell:
             or not isinstance(self.guide, ProgrammingGuideIdentity)
         ):
             raise ValueError("Phase 2 cell must use registered A5 Catlass identities")
+        if self.schema == CELL_SCHEMA:
+            if self.source_guide is not None:
+                raise ValueError("legacy Phase 2 cells cannot declare a source guide")
+        elif self.schema == CELL_SCHEMA_V2:
+            if (
+                not isinstance(self.source_guide, ProgrammingGuideIdentity)
+                or self.source_guide == self.guide
+            ):
+                raise ValueError(
+                    "dual-guide Phase 2 cells require distinct source and destination guides"
+                )
+        else:
+            raise ValueError("Phase 2 cell schema does not match its guide identity")
         if self.profiling is ProfilingGuidance.NEW:
             raise ValueError("pending profiler treatments cannot enter Phase 2")
         _require_digest(self.qualification_sha256, "qualification_sha256")
         if self.suite_sha256 != SUITE_SHA256:
             raise ValueError("Phase 2 cell changed the host-owned attention suite")
-        source = _source_by_id(self.guide).get(self.source_cell_id)
+        source = _source_by_id(self.phase1_guide).get(self.source_cell_id)
         if source is None or (
             source.model,
             source.knowledge,
@@ -91,8 +105,14 @@ class A5Phase2Cell:
     def catlass_revision(self) -> str:
         return self.guide.catlass_revision
 
+    @property
+    def phase1_guide(self) -> ProgrammingGuideIdentity:
+        """Guide identity that produced the admitted Phase 1 memory."""
+
+        return self.source_guide or self.guide
+
     def identity_values(self) -> dict[str, object]:
-        return {
+        identity = {
             "schema": self.schema,
             "target": self.target.value,
             "language": self.language.value,
@@ -105,6 +125,9 @@ class A5Phase2Cell:
             "qualification_sha256": self.qualification_sha256,
             "catlass_revision": self.catlass_revision,
         }
+        if self.source_guide is not None:
+            identity["source_guide"] = self.source_guide.as_dict()
+        return identity
 
     def as_dict(self) -> dict[str, object]:
         return {"cell_id": self.cell_id, **self.identity_values()}
@@ -121,20 +144,31 @@ def _source_by_id(guide: ProgrammingGuideIdentity) -> dict[str, A5Phase1Cell]:
 def phase2_cell_pairs(
     guide: ProgrammingGuideIdentity,
     qualification_sha256: str,
+    *,
+    destination_guide: ProgrammingGuideIdentity | None = None,
 ) -> tuple[tuple[A5Phase1Cell, A5Phase2Cell], ...]:
-    """Return the eight canonical runnable Phase 1→Phase 2 treatment pairs."""
+    """Return canonical Phase 1→Phase 2 pairs for source and current guides.
+
+    Omitting ``destination_guide`` retains the legacy v1 identity byte for byte.
+    """
 
     if not isinstance(guide, ProgrammingGuideIdentity):
         raise TypeError("guide must be a ProgrammingGuideIdentity")
+    if destination_guide is None:
+        destination_guide = guide
+    if not isinstance(destination_guide, ProgrammingGuideIdentity):
+        raise TypeError("destination_guide must be a ProgrammingGuideIdentity")
     qualification_sha256 = _require_digest(
         qualification_sha256, "qualification_sha256"
     )
+    schema = CELL_SCHEMA if destination_guide == guide else CELL_SCHEMA_V2
+    source_guide = None if schema == CELL_SCHEMA else guide
     pairs = []
     for source in build_cells(guide):
         if not source.runnable:
             continue
         identity = {
-            "schema": CELL_SCHEMA,
+            "schema": schema,
             "target": source.target.value,
             "language": source.language.value,
             "source_cell_id": source.cell_id,
@@ -142,18 +176,22 @@ def phase2_cell_pairs(
             "knowledge": source.knowledge.value,
             "profiling": source.profiling.value,
             "suite_sha256": SUITE_SHA256,
-            "guide": guide.as_dict(),
+            "guide": destination_guide.as_dict(),
             "qualification_sha256": qualification_sha256,
-            "catlass_revision": guide.catlass_revision,
+            "catlass_revision": destination_guide.catlass_revision,
         }
+        if source_guide is not None:
+            identity["source_guide"] = source_guide.as_dict()
         destination = A5Phase2Cell(
             _cell_id(identity),
             source.cell_id,
             source.model,
             source.knowledge,
             source.profiling,
-            guide,
+            destination_guide,
             qualification_sha256,
+            schema=schema,
+            source_guide=source_guide,
         )
         pairs.append((source, destination))
     if len(pairs) != 8 or len({item.cell_id for _source, item in pairs}) != 8:
@@ -164,10 +202,16 @@ def phase2_cell_pairs(
 def phase2_cells(
     guide: ProgrammingGuideIdentity,
     qualification_sha256: str,
+    *,
+    destination_guide: ProgrammingGuideIdentity | None = None,
 ) -> tuple[A5Phase2Cell, ...]:
     return tuple(
         destination
-        for _source, destination in phase2_cell_pairs(guide, qualification_sha256)
+        for _source, destination in phase2_cell_pairs(
+            guide,
+            qualification_sha256,
+            destination_guide=destination_guide,
+        )
     )
 
 
@@ -260,7 +304,8 @@ class A5Phase1Snapshot:
             or terminal.get("status") != "passed"
             or terminal.get("cell_id") != self.destination.source_cell_id
             or terminal.get("model") != self.destination.model.as_dict()
-            or terminal.get("guide_sha256") != self.destination.guide.guide_sha256
+            or terminal.get("guide_sha256")
+            != self.destination.phase1_guide.guide_sha256
             or terminal.get("qualification_sha256")
             != self.destination.qualification_sha256
             or terminal.get("completed_projects") != len(DEFAULT_PROPOSALS)
@@ -314,14 +359,18 @@ def admit_phase1_snapshot(
     if not isinstance(destination, A5Phase2Cell):
         raise TypeError("destination must be an A5Phase2Cell")
     expected = phase2_cells(
-        composition.guide, composition.qualification.report_sha256
+        composition.guide,
+        composition.qualification.report_sha256,
+        destination_guide=destination.guide,
     )
     if destination not in expected:
         raise ValueError("Phase 2 destination identity does not match this composition")
     sources = {
         source.cell_id: source
         for source, _destination in phase2_cell_pairs(
-            composition.guide, composition.qualification.report_sha256
+            composition.guide,
+            composition.qualification.report_sha256,
+            destination_guide=destination.guide,
         )
     }
     source = sources[destination.source_cell_id]
@@ -375,6 +424,7 @@ __all__ = [
     "A5Phase1Snapshot",
     "A5Phase2Cell",
     "CELL_SCHEMA",
+    "CELL_SCHEMA_V2",
     "SNAPSHOT_SCHEMA",
     "admit_phase1_snapshot",
     "phase2_cell_pairs",
