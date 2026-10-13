@@ -14,6 +14,7 @@ from benchmarks.a5kernels.device_inventory import (
 )
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_composition import LiveDependencies, Phase1CellComposition
+from benchmarks.a5kernels.phase1_experiments import admit_programming_guide
 from benchmarks.a5kernels.phase1_live import load_gate_report
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies, Phase2LiveRunner
 from benchmarks.a5kernels.phase2_memory import (
@@ -32,6 +33,8 @@ def _parser() -> argparse.ArgumentParser:
                  "tla-root", "profiling-skill-root", "bge-cache", "kdb"):
         reconcile.add_argument(f"--{flag}", type=Path, required=True)
     reconcile.add_argument("--catlass-source", required=True)
+    reconcile.add_argument("--phase2-guide", type=Path)
+    reconcile.add_argument("--phase2-cpl-skills-revision")
     reconcile.add_argument("--collection", required=True)
     reconcile.add_argument("--env-file", type=Path)
     reconcile.add_argument("--until-complete", action="store_true")
@@ -89,6 +92,11 @@ def _command_factory(args, destinations):
                 ("bge-cache", args.bge_cache), ("kdb", args.kdb),
                 ("collection", args.collection), ("device", device),
             )
+            if args.phase2_guide is not None:
+                values += (
+                    ("phase2-guide", args.phase2_guide),
+                    ("phase2-cpl-skills-revision", args.phase2_cpl_skills_revision),
+                )
         for name, value in values:
             _option(argv, name, value)
         if args.env_file is not None:
@@ -142,7 +150,22 @@ def _controller(args) -> CampaignController:
         args.phase1_root, args.guide, gate.guide, gate,
         LiveDependencies(_unavailable, _unavailable),
     )
-    destinations = phase2_cells(gate.guide, gate.report_sha256)
+    if (args.phase2_guide is None) != (args.phase2_cpl_skills_revision is None):
+        raise ValueError(
+            "Phase 2 guide path and CPL skills revision must be supplied together"
+        )
+    phase2_guide = gate.guide
+    if args.phase2_guide is not None:
+        phase2_guide = admit_programming_guide(
+            args.phase2_guide,
+            cpl_skills_revision=args.phase2_cpl_skills_revision,
+            catlass_revision=gate.guide.catlass_revision,
+        )
+    destinations = phase2_cells(
+        gate.guide,
+        gate.report_sha256,
+        destination_guide=phase2_guide,
+    )
     return CampaignController(
         root=args.controller_root,
         phase1=phase1,

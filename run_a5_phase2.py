@@ -49,6 +49,8 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--phase1-root", type=Path)
         command.add_argument("--gate", type=Path)
         command.add_argument("--guide", type=Path)
+        command.add_argument("--phase2-guide", type=Path)
+        command.add_argument("--phase2-cpl-skills-revision")
         command.add_argument("--tla-root", type=Path)
         command.add_argument("--catlass-source")
         command.add_argument("--bge-cache", type=Path)
@@ -91,6 +93,8 @@ def _production_factory(
         kdb=args.kdb,
         collection=args.collection,
         env_file=args.env_file,
+        phase2_guide_path=args.phase2_guide,
+        phase2_cpl_skills_revision=args.phase2_cpl_skills_revision,
     ))
 
 
