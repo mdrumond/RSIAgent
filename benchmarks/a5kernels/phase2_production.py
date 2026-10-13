@@ -161,9 +161,19 @@ def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
     retained = dict(value)
     digest = retained.pop("record_sha256", None)
     output = retained.get("output")
+    expected_identity = dict(identity)
+    if (
+        "runtime_catlass_revision" not in retained
+        and expected_identity["runtime_catlass_revision"]
+        == expected_identity["catlass_revision"]
+    ):
+        expected_identity.pop("runtime_catlass_revision")
     if (
         digest != canonical_digest(retained)
-        or any(retained.get(key) != expected for key, expected in identity.items())
+        or any(
+            retained.get(key) != expected
+            for key, expected in expected_identity.items()
+        )
         or retained.get("status") != "transport-qualified"
         or retained.get("exit_code") != 0
         or not isinstance(retained.get("session_handle"), str)
