@@ -268,6 +268,8 @@ def test_candidate_contract_rejects_non_abi_module_members(suffix, message):
 
 def test_hand_authored_fixture_uses_the_same_validated_tla_abi():
     validate_attention_candidate(ATTENTION_CANDIDATE_FIXTURE)
+    assert "def padded_elements(elements):" in ATTENTION_CANDIDATE_FIXTURE
+    assert "tla.allocate(padded, DTYPE," in ATTENTION_CANDIDATE_FIXTURE
     assert """\
         tla.copy(local_v, gm_v)
         tla.pipe_barrier(tla.pipes.ALL)

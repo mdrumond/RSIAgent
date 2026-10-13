@@ -44,12 +44,17 @@ _CATLASS_NUMERIC_DTYPES = frozenset({
 ATTENTION_CANDIDATE_FIXTURE = """\
 import catlass.tla as tla
 
+TILE = 128
+
+def padded_elements(elements):
+    return ((elements + TILE - 1) // TILE) * TILE
+
 @tla.kernel
 def dense_attention(gm_q: tla.Tensor, gm_k: tla.Tensor,
                     gm_v: tla.Tensor, gm_output: tla.Tensor) -> None:
     elements = BATCH * HEADS * SEQUENCE * HEAD_DIM
-    padded = ((elements + 127) // 128) * 128
-    local_ptr = tla.allocate(padded, tla.Float16, tla.AddressSpace.ub, 256)
+    padded = padded_elements(elements)
+    local_ptr = tla.allocate(padded, DTYPE, tla.AddressSpace.ub, 256)
     local_v = tla.make_tensor_like(local_ptr, gm_v, tla.arch.RowMajor)
     with tla.vector():
         tla.copy(local_v, gm_v)
