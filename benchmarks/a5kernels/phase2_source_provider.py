@@ -119,9 +119,13 @@ def _target_contract() -> dict[str, object]:
             "only_decorator": candidate_abi["kernel_decorator"],
             "only_export": candidate_abi["kernel_export"],
             "signature_policy": candidate_abi["signature_policy"],
-            "host_prepends_compile_time_constants": list(
-                candidate_abi["host_prepended_constants"]
+            "host_binds_compile_time_constants": list(
+                candidate_abi["host_bound_constants"]
             ),
+            "host_bound_dtype": candidate_abi["host_bound_dtype"],
+            "candidate_assignment_policy": candidate_abi[
+                "candidate_assignment_policy"
+            ],
             "launch_policy": {
                 "block_num": candidate_abi["launch_block_num"],
                 "required_coverage": candidate_abi["launch_coverage"],
