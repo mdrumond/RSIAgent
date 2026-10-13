@@ -213,7 +213,10 @@ class DirectActorDriver:
             {"role": "user", "content": instruction},
         ]
         tokens = 0
-        for turn in range(1, self.max_turns + 1):
+        turn = 0
+        ordinary_turns = 0
+        while ordinary_turns < self.max_turns:
+            turn += 1
             completion = self.provider.complete(profile, messages)
             tokens += completion.completion_tokens
             messages.append({"role": "assistant", "content": completion.text})
@@ -225,10 +228,14 @@ class DirectActorDriver:
             else:
                 outcome = action_executor(action)
                 observation = outcome.observation
+                if not outcome.budget_exempt:
+                    ordinary_turns += 1
                 if outcome.terminal:
-                    return ActorOutcome(outcome.status, turn, tokens)
+                    return ActorOutcome(outcome.status, ordinary_turns, tokens)
             messages.append({"role": "user", "content": observation})
-        return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
+            if action is None:
+                ordinary_turns += 1
+        return ActorOutcome("turn-budget-exhausted", ordinary_turns, tokens)
 
 
 __all__ = [

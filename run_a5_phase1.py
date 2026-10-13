@@ -26,6 +26,13 @@ from benchmarks.a5kernels.phase1_production import build_phase1_live_dependencie
 from benchmarks.a5kernels.production import ProductionPaths
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -56,6 +63,15 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--collection", required=True)
             command.add_argument("--device", type=int, required=True)
             command.add_argument("--env-file", type=Path)
+            command.add_argument(
+                "--compile-probes",
+                type=_positive_int,
+                metavar="LIMIT",
+                help=(
+                    "give compile actions a separate positive LIMIT instead of "
+                    "charging the ordinary agent action budget"
+                ),
+            )
     return parser
 
 
@@ -107,13 +123,18 @@ def main(
         failures = 0
         while True:
             try:
+                builder_options = {"env_file": args.env_file}
+                if args.compile_probes is not None:
+                    builder_options["unmetered_compile_probes"] = (
+                        args.compile_probes
+                    )
                 dependencies = dependency_builder(
                     _paths(
                         args,
                         gate.guide.catlass_revision,
                         results_root=worker_root,
                     ),
-                    env_file=args.env_file,
+                    **builder_options,
                 )
                 break
             except (InfrastructureFailure, RuntimeUnavailableError):

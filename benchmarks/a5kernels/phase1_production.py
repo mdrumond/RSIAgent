@@ -114,11 +114,13 @@ def load_direct_environment(
 class ProductionProjectExecutor:
     """Bind one registered project to direct model and checked BZ-A5 authorities."""
 
-    def __init__(self, execution_backend, profile_backend, provider, *, device: int):
+    def __init__(self, execution_backend, profile_backend, provider, *, device: int,
+                 unmetered_compile_probes: int | None = None):
         self.execution_backend = execution_backend
         self.profile_backend = profile_backend
         self.actor = DirectActorDriver(provider)
         self.device = device
+        self.unmetered_compile_probes = unmetered_compile_probes
 
     def __call__(
         self,
@@ -161,6 +163,7 @@ class ProductionProjectExecutor:
             profiling=profiling,
             profiling_guidance=profiling_guidance is not None,
             ledger=ledger,
+            unmetered_compile_probes=self.unmetered_compile_probes,
         )
         _require_host_verification(trial.verified)
 
@@ -335,6 +338,7 @@ def build_phase1_live_dependencies(
     execution_backend=None,
     profile_backend=None,
     embeddings=None,
+    unmetered_compile_probes: int | None = None,
 ) -> LiveDependencies:
     """Validate all dependencies, then construct the real eight-cell binding."""
 
@@ -422,7 +426,11 @@ def build_phase1_live_dependencies(
         return agent
 
     executor = ProductionProjectExecutor(
-        execution_backend, profile_backend, provider, device=paths.device
+        execution_backend,
+        profile_backend,
+        provider,
+        device=paths.device,
+        unmetered_compile_probes=unmetered_compile_probes,
     )
     return LiveDependencies(executor, knowledge_factory)
 

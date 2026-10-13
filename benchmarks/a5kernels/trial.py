@@ -48,6 +48,7 @@ class ActionOutcome:
     observation: str
     terminal: bool = False
     status: str = "done"
+    budget_exempt: bool = False
 
 
 def parse_trial_action(text: str) -> TrialAction | None:
@@ -190,7 +191,12 @@ class CoreAttemptDriver:
         cfg.history_keep_pairs = 0
         def execute(action):
             outcome = action_executor(action)
-            return DomainActionResult(outcome.observation, outcome.terminal, outcome.status)
+            return DomainActionResult(
+                outcome.observation,
+                outcome.terminal,
+                outcome.status,
+                budget_exempt=outcome.budget_exempt,
+            )
 
         result, _ = run_attempt(
             instruction, self.vm, cfg, self.sink_factory(context),
@@ -210,7 +216,9 @@ _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON obj
 {"propose":{"text":"..."}}, {"write":{"slot":"kernel","content":"..."}},
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
 {"request-profile":{}}, or {"submit":{}}.
-You cannot choose paths or commands and cannot report a score or authoritative result."""
+You cannot choose paths or commands and cannot report a score or authoritative result.
+Compile checks source with the host compiler only; it never launches the kernel or
+establishes runtime or numerical correctness."""
 
 _ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
 compile, run, query-knowledge, request-profile, or submit. Use the object shape shown
@@ -283,17 +291,33 @@ class TrialActionExecutor:
                  backend: KernelTrialBackend, ledger: EvidenceLedger,
                  knowledge: KnowledgeAgent, profiling: ProfileEvaluation,
                  profiling_guidance: bool,
-                 max_actions: int = 40, max_source_bytes: int = 128_000):
+                 max_actions: int = 40, max_source_bytes: int = 128_000,
+                 unmetered_compile_probes: int | None = None):
+        if type(max_actions) is not int or max_actions < 1:
+            raise ValueError("max_actions must be a positive integer")
+        if (
+            unmetered_compile_probes is not None
+            and (
+                type(unmetered_compile_probes) is not int
+                or unmetered_compile_probes < 1
+            )
+        ):
+            raise ValueError(
+                "unmetered_compile_probes must be a positive integer or None"
+            )
         self.workspace, self.language, self.workload = workspace, language, workload
         self.backend, self.ledger = backend, ledger
         self.knowledge, self.profiling = knowledge, profiling
         self.profiling_guidance = profiling_guidance
         self.max_actions, self.max_source_bytes = max_actions, max_source_bytes
+        self.unmetered_compile_probes = unmetered_compile_probes
         # The same source can recur across cells and determinism repeats. BZ
         # sessions use attempt IDs, so local workspace isolation must reach them.
         self._attempt_namespace = hashlib.sha256(
             str(workspace.resolve()).encode("utf-8")).hexdigest()[:24]
         self.actions = 0
+        self.total_actions = 0
+        self.compile_probes = 0
         self.latest_run: CandidateRun | None = None
         self.final_run: CandidateRun | None = None
         self.final_profile: Mapping[str, object] | None = None
@@ -301,18 +325,49 @@ class TrialActionExecutor:
     def __call__(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
             raise TypeError("A5 trials accept only TrialAction values")
-        self.actions += 1
-        if self.actions > self.max_actions:
-            return ActionOutcome('{"error":"action budget exhausted"}', True,
-                                 "safety_ceiling")
-        handler = getattr(self, "_" + action.kind.replace("-", "_"))
+        self.total_actions += 1
+        compile_exempt = (
+            action.kind == "compile" and self.unmetered_compile_probes is not None
+        )
+        if compile_exempt:
+            self.compile_probes += 1
+        else:
+            self.actions += 1
+        exhausted = (
+            self.compile_probes > self.unmetered_compile_probes
+            if compile_exempt else self.actions > self.max_actions
+        )
         self.ledger.append(EvidenceKind.ACTION, {
-            "ordinal": self.actions,
+            "ordinal": self.total_actions,
             "action": action.kind,
             "payload_sha256": hashlib.sha256(
                 json.dumps(action.payload, sort_keys=True).encode()).hexdigest(),
+            "budget": {
+                "ordinary_used": self.actions,
+                "ordinary_limit": self.max_actions,
+                "compile_probes_used": self.compile_probes,
+                "compile_probe_limit": self.unmetered_compile_probes,
+                "ordinary_budget_exempt": compile_exempt,
+            },
         })
-        return handler(action.payload)
+        if exhausted:
+            budget = "compile probe" if compile_exempt else "action"
+            return ActionOutcome(
+                json.dumps({"error": f"{budget} budget exhausted"}),
+                True,
+                "safety_ceiling",
+                budget_exempt=compile_exempt,
+            )
+        handler = getattr(self, "_" + action.kind.replace("-", "_"))
+        outcome = handler(action.payload)
+        if compile_exempt:
+            return ActionOutcome(
+                outcome.observation,
+                outcome.terminal,
+                outcome.status,
+                budget_exempt=True,
+            )
+        return outcome
 
     def _propose(self, payload) -> ActionOutcome:
         return self._observation("proposal-recorded", chars=len(payload["text"]))
@@ -333,7 +388,7 @@ class TrialActionExecutor:
         try:
             result = dict(self.backend.compile(
                 self.workspace, self.language,
-                f"{self._attempt_namespace}-compile-{self.actions}"))
+                f"{self._attempt_namespace}-compile-{self.total_actions}"))
         except ValueError as exc:
             return self._observation("compile", status="source-validation-error",
                                      error=str(exc))
@@ -343,7 +398,7 @@ class TrialActionExecutor:
         if not self._has_source():
             return self._observation("run", error="write kernel source first")
         self.latest_run = None
-        attempt_id = f"{self._attempt_namespace}-candidate-{self.actions}"
+        attempt_id = f"{self._attempt_namespace}-candidate-{self.total_actions}"
         try:
             candidate = self.backend.run(
                 self.workspace, self.language, self.workload,
@@ -516,6 +571,7 @@ class TrialOrchestrator:
         profiling: ProfileEvaluation,
         profiling_guidance: bool,
         ledger: EvidenceLedger,
+        unmetered_compile_probes: int | None = None,
     ) -> TrialResult:
         """Run one host-bound project without the legacy pilot matrix scheduler.
 
@@ -531,7 +587,12 @@ class TrialOrchestrator:
         )
         for path in (workspace, memory, context):
             path.mkdir()
-        ledger.append(EvidenceKind.REQUEST, dict(request_payload))
+        request = dict(request_payload)
+        request["trial_budget"] = {
+            "ordinary_action_limit": 40,
+            "unmetered_compile_probes": unmetered_compile_probes,
+        }
+        ledger.append(EvidenceKind.REQUEST, request)
         executor = TrialActionExecutor(
             workspace=workspace,
             language=language,
@@ -541,9 +602,19 @@ class TrialOrchestrator:
             knowledge=knowledge,
             profiling=profiling,
             profiling_guidance=profiling_guidance,
+            unmetered_compile_probes=unmetered_compile_probes,
         )
+        actor_instruction = instruction
+        if unmetered_compile_probes is not None:
+            actor_instruction += (
+                "\n\nCompile-probe allowance: compile actions do not consume your "
+                "ordinary action budget in this trial. You have exactly "
+                f"{unmetered_compile_probes} compile probe(s); failed or rejected "
+                "compiles consume a probe. Compilation does not launch the kernel "
+                "or establish correctness. Use run and submit for host verification."
+            )
         outcome = actor(
-            instruction,
+            actor_instruction,
             profile=profile,
             workspace=workspace,
             context=context,

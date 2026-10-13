@@ -512,7 +512,7 @@ def test_run_feedback_distinguishes_runtime_failure_from_incorrect_output(
     }
 
 
-def _executor(tmp_path, backend):
+def _executor(tmp_path, backend, **kwargs):
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     return TrialActionExecutor(
@@ -521,7 +521,80 @@ def _executor(tmp_path, backend):
         ledger=EvidenceLedger(tmp_path / "evidence.jsonl"),
         knowledge=type("Knowledge", (), {"enabled": False})(),
         profiling=FakeProfile(), profiling_guidance=False,
+        **kwargs,
     )
+
+
+def test_compile_probes_use_separate_finite_budget_and_retained_accounting(tmp_path):
+    backend = FakeBackend()
+    executor = _executor(
+        tmp_path, backend, max_actions=2, unmetered_compile_probes=2,
+    )
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+
+    first = executor(parse_trial_action('{"compile":{}}'))
+    second = executor(parse_trial_action('{"compile":{}}'))
+    exhausted = executor(parse_trial_action('{"compile":{}}'))
+
+    assert first.budget_exempt and second.budget_exempt
+    assert exhausted.terminal and exhausted.status == "safety_ceiling"
+    assert exhausted.budget_exempt
+    assert json.loads(exhausted.observation) == {
+        "error": "compile probe budget exhausted"
+    }
+    assert len(backend.compiles) == 2
+    assert executor.actions == 1
+    assert executor.compile_probes == 3
+    budgets = [
+        entry.payload["budget"]
+        for entry in EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    ]
+    assert budgets[-1] == {
+        "ordinary_used": 1,
+        "ordinary_limit": 2,
+        "compile_probes_used": 3,
+        "compile_probe_limit": 2,
+        "ordinary_budget_exempt": True,
+    }
+
+
+def test_compile_probes_remain_metered_by_default(tmp_path):
+    executor = _executor(tmp_path, FakeBackend(), max_actions=1)
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    exhausted = executor(parse_trial_action('{"compile":{}}'))
+
+    assert exhausted.terminal and exhausted.status == "safety_ceiling"
+    assert not exhausted.budget_exempt
+    assert executor.compile_probes == 0
+    assert json.loads(exhausted.observation) == {"error": "action budget exhausted"}
+
+
+def test_rejected_source_compile_still_consumes_one_compile_probe(tmp_path):
+    class RejectingBackend(FakeBackend):
+        def compile(self, workspace, language, attempt_id):
+            raise ValueError("invalid candidate source")
+
+    executor = _executor(
+        tmp_path, RejectingBackend(), unmetered_compile_probes=1,
+    )
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    rejected = executor(parse_trial_action('{"compile":{}}'))
+    exhausted = executor(parse_trial_action('{"compile":{}}'))
+
+    assert rejected.budget_exempt
+    assert json.loads(rejected.observation)["host"]["status"] == (
+        "source-validation-error"
+    )
+    assert exhausted.terminal
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_compile_probe_limit_must_be_a_positive_integer(tmp_path, value):
+    with pytest.raises(ValueError, match="unmetered_compile_probes"):
+        _executor(tmp_path, FakeBackend(), unmetered_compile_probes=value)
 
 
 @pytest.mark.parametrize("action", ["compile", "run", "submit"])

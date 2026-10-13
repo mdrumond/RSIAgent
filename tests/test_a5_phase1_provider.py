@@ -22,7 +22,12 @@ from benchmarks.a5kernels.phase1_provider import (
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.protocol import ExecutionPlan, SourceFile, VerifiedResult
-from benchmarks.a5kernels.trial import CandidateRun, TrialOrchestrator
+from benchmarks.a5kernels.trial import (
+    ActionOutcome,
+    CandidateRun,
+    TrialOrchestrator,
+    parse_trial_action,
+)
 
 
 ENVIRONMENT = {
@@ -255,6 +260,35 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
     }
 
 
+def test_direct_actor_counts_tokens_but_not_opted_in_compile_probes():
+    calls = []
+    provider = _scripted_provider([
+        '{"write":{"slot":"kernel","content":"source"}}',
+        '{"compile":{}}',
+        '{"compile":{}}',
+        '{"submit":{}}',
+    ], calls)
+    actor = DirectActorDriver(provider, max_turns=2)
+
+    outcome = actor(
+        "instruction",
+        profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=None,
+        context=None,
+        turn_parser=parse_trial_action,
+        action_executor=lambda action: ActionOutcome(
+            json.dumps({"host": {"event": action.kind}}),
+            terminal=action.kind == "submit",
+            budget_exempt=action.kind == "compile",
+        ),
+    )
+
+    assert outcome.status == "done"
+    assert outcome.iterations == 2
+    assert outcome.tokens == 8
+    assert len(calls) == 4
+
+
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
 def test_every_registered_project_family_can_use_the_bound_trial_executor(
     tmp_path, proposal
@@ -302,6 +336,68 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     ]
     assert request_entries[-1].payload["proposal"] == proposal.as_dict()
     assert request_entries[-1].payload["runtime"] == runtime.as_dict()
+    assert request_entries[-1].payload["trial_budget"] == {
+        "ordinary_action_limit": 40,
+        "unmetered_compile_probes": None,
+    }
+
+
+def test_bound_trial_retains_and_explains_unmetered_compile_allowance(tmp_path):
+    class RecordingCompileBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.compiles = []
+
+        def compile(self, workspace, language, attempt_id):
+            self.compiles.append(attempt_id)
+            return super().compile(workspace, language, attempt_id)
+
+    calls = []
+    provider = _scripted_provider([
+        json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
+        '{"compile":{}}',
+        '{"submit":{}}',
+    ], calls)
+    backend = RecordingCompileBackend()
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    knowledge = KnowledgeAgent(
+        enabled=False,
+        journal=ProgressiveMemoryJournal(memory / "knowledge.jsonl"),
+    )
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+
+    result = TrialOrchestrator.run_bound(
+        trial_root=tmp_path / "trial",
+        request_payload={"schema": "unmetered-compile-test-v1"},
+        language="catlass-dsl",
+        workload=Workload.SMOKE_VECTOR_ADD,
+        instruction="develop the kernel",
+        profile=direct_profile(MODEL_IDENTITIES[0]),
+        backend=backend,
+        actor=DirectActorDriver(provider, max_turns=2),
+        knowledge=knowledge,
+        profiling=FakeProfile(),
+        profiling_guidance=False,
+        ledger=ledger,
+        unmetered_compile_probes=1,
+    )
+
+    assert result.verified.passed
+    assert result.outcome.iterations == 2
+    assert result.outcome.tokens == 6
+    assert len(backend.compiles) == 1
+    opening = calls[0]["request"]["messages"][1]["content"]
+    assert "exactly 1 compile probe(s)" in opening
+    assert "does not launch the kernel or establish correctness" in opening
+    request = next(
+        entry for entry in ledger.entries
+        if entry.kind == EvidenceKind.REQUEST.value
+    )
+    assert request.payload["trial_budget"] == {
+        "ordinary_action_limit": 40,
+        "unmetered_compile_probes": 1,
+    }
 
 
 def test_bound_trial_requires_a_host_verified_submit(tmp_path):
