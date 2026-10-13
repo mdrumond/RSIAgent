@@ -254,9 +254,12 @@ def _phase2_guide(config: Phase2ProductionConfig, composition):
         catlass_revision=composition.guide.catlass_revision,
     )
     try:
-        text = config.phase2_guide_path.read_text(encoding="utf-8")
+        payload = config.phase2_guide_path.read_bytes()
+        text = payload.decode("utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("unable to read admitted Phase 2 guide content") from exc
+    if hashlib.sha256(payload).hexdigest() != guide.guide_sha256:
+        raise ValueError("Phase 2 guide content changed during admission")
     return guide, text
 
 

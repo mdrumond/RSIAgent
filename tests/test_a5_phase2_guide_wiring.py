@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from argparse import Namespace
-from pathlib import Path
 
 import pytest
 
 import run_a5_campaign
 import run_a5_phase2
+import benchmarks.a5kernels.phase2_production as phase2_production_module
 from benchmarks.a5kernels.phase1_experiments import admit_programming_guide
 from benchmarks.a5kernels.phase1_live import write_gate_report
 from benchmarks.a5kernels.phase2_memory import CELL_SCHEMA_V2, phase2_cell_pairs
@@ -95,6 +95,42 @@ def test_production_rejects_partial_phase2_guide_admission(tmp_path, missing):
             device=3,
             **values,
         )
+
+
+def test_phase2_guide_rejects_content_changed_during_admission(
+    monkeypatch, tmp_path
+):
+    composition, _source, destination = _completed_source(tmp_path)
+    path = tmp_path / "phase2-guide.md"
+    path.write_text("admitted guide\n", encoding="utf-8")
+    config = Phase2ProductionConfig(
+        phase1_root=composition.root,
+        gate=composition.qualification,
+        guide_path=tmp_path / "agent-guide.md",
+        phase2_root=tmp_path / "phase2",
+        snapshot_path=tmp_path / "phase2" / "cells" / destination.cell_id / "snapshot",
+        cell_id=destination.cell_id,
+        tla_root=tmp_path / "tla",
+        catlass_source="/remote/catlass",
+        device=3,
+        phase2_guide_path=path,
+        phase2_cpl_skills_revision=CPL_REVISION,
+    )
+    admit = phase2_production_module.admit_programming_guide
+
+    def replace_after_admission(*args, **kwargs):
+        guide = admit(*args, **kwargs)
+        path.write_text("changed guide\n", encoding="utf-8")
+        return guide
+
+    monkeypatch.setattr(
+        phase2_production_module,
+        "admit_programming_guide",
+        replace_after_admission,
+    )
+
+    with pytest.raises(ValueError, match="changed during admission"):
+        phase2_production_module._phase2_guide(config, composition)
 
 
 def test_phase2_cli_forwards_separate_guide_admission(monkeypatch, tmp_path):
