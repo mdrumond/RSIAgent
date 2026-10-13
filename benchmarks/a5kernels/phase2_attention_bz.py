@@ -406,10 +406,13 @@ def main():
     q, k, v = (_numbers(payload[name], name) for name in ("q", "k", "v"))
     if any(len(tensor) != count for tensor in (q, k, v)):
         raise ValueError("Q, K, and V must have exact [B,H,S,D] shape")
-    source, native_location, native_sha256 = _preflight_runtime(*sys.argv[3:])
+    source, native_location, native_sha256, generated_importables = _preflight_runtime(*sys.argv[3:])
     import catlass.tla as tla
     kernel = _load_kernel(sys.argv[1])
-    _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
+    _verify_loaded_catlass_modules(
+        source, sys.argv[3], native_location, native_sha256,
+        generated_importables,
+    )
     kernel.BATCH = case["batch"]
     kernel.HEADS = case["heads"]
     kernel.SEQUENCE = case["sequence"]

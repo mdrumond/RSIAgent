@@ -7,6 +7,7 @@ import pytest
 import run_a5_phase2
 import benchmarks.a5kernels.phase2_production as production_module
 from benchmarks.a5kernels.bz import RuntimeUnavailableError
+from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_composition import (
     A5_PROFILING_GUIDANCE,
     CellDisposition,
@@ -150,6 +151,7 @@ def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
     assert qualification["status"] == "transport-qualified"
     assert qualification["physical_device"] == 3
     assert qualification["catlass_revision"] == composition.guide.catlass_revision
+    assert qualification["runtime_catlass_revision"] == destination.catlass_revision
     assert qualification["session_handle"] == "bz-a5:qualification"
     assert "correct" not in qualification and "attention_passed" not in qualification
     assert dependencies.source.knowledge_factory is None
@@ -160,6 +162,50 @@ def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
         executor=executor, backend=backend,
     )
     assert retained == snapshot
+    assert len(backend.calls) == 1
+
+
+def test_historical_snapshot_can_use_explicit_current_runtime(tmp_path):
+    composition, destination, config = _config(
+        tmp_path, runtime_catlass_revision="b" * 40,
+    )
+    executor = FakeExecutor("b" * 40)
+
+    snapshot, dependencies = build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=executor, backend=CopyVBackend(),
+    )
+
+    assert snapshot.destination.catlass_revision == composition.guide.catlass_revision
+    assert dependencies.cell == destination
+    qualification = json.loads(
+        (config.phase2_root / "cells" / destination.cell_id / "qualification.json").read_text()
+    )
+    assert qualification["catlass_revision"] == destination.catlass_revision
+    assert qualification["runtime_catlass_revision"] == "b" * 40
+    assert dict(qualification["runtime_provenance"])["catlass_revision"] == "b" * 40
+
+
+def test_same_runtime_accepts_legacy_v1_qualification_without_runtime_field(tmp_path):
+    _composition, destination, config = _config(tmp_path)
+    executor = FakeExecutor(destination.catlass_revision)
+    backend = CopyVBackend()
+    build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=executor, backend=backend,
+    )
+    path = config.phase2_root / "cells" / destination.cell_id / "qualification.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("runtime_catlass_revision")
+    legacy.pop("record_sha256")
+    legacy["record_sha256"] = canonical_digest(legacy)
+    path.write_text(json.dumps(legacy))
+
+    build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=executor, backend=backend,
+    )
+
     assert len(backend.calls) == 1
 
 
