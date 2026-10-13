@@ -32,9 +32,9 @@ _HOST_BOUND_GLOBALS = frozenset({
     "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL", "DTYPE",
 })
 _CATLASS_NUMERIC_DTYPES = frozenset({
-    "BFloat16", "Float16", "Float32", "Float64",
+    "BFloat16", "Float16", "Float32", "Bool",
     "Int8", "Int16", "Int32", "Int64",
-    "Uint8", "Uint16", "Uint32", "Uint64",
+    "UInt8", "UInt16", "UInt32", "UInt64",
 })
 
 
@@ -115,9 +115,10 @@ def validate_attention_candidate(source: str) -> None:
                 "candidate module may contain only imports, assignments, and "
                 "synchronous functions"
             )
-        name, value = _assignment(node)
-        if name in _HOST_BOUND_GLOBALS:
-            raise ValueError(f"candidate may not assign host-owned global {name}")
+        names, value = _assignment(node)
+        reserved = next((name for name in names if name in _HOST_BOUND_GLOBALS), None)
+        if reserved is not None:
+            raise ValueError(f"candidate may not assign host-owned global {reserved}")
         if not _is_candidate_constant(value):
             raise ValueError(
                 "candidate assignments require a numeric literal or Catlass "
@@ -125,11 +126,13 @@ def validate_attention_candidate(source: str) -> None:
             )
 
 
-def _assignment(node: ast.Assign | ast.AnnAssign) -> tuple[str, ast.expr]:
+def _assignment(node: ast.Assign | ast.AnnAssign) -> tuple[tuple[str, ...], ast.expr]:
     targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-    if len(targets) != 1 or not isinstance(targets[0], ast.Name) or node.value is None:
-        raise ValueError("candidate assignments require one simple module name")
-    return targets[0].id, node.value
+    if not targets or any(not isinstance(target, ast.Name) for target in targets):
+        raise ValueError("candidate assignments require simple module names")
+    if node.value is None:
+        raise ValueError("candidate assignments require a value")
+    return tuple(target.id for target in targets), node.value
 
 
 def _is_candidate_constant(value: ast.expr) -> bool:

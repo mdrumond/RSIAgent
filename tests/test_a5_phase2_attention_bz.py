@@ -229,9 +229,12 @@ def test_candidate_contract_accepts_helpers_and_compile_time_constants():
 import catlass.tla as tla
 
 TILE = 128
+TILE_M = TILE_N = 128
 NEGATIVE_SENTINEL = -1
 ACC_DTYPE = tla.Float32
 INPUT_DTYPE = tla.BFloat16
+INDEX_DTYPE = tla.UInt32
+PREDICATE_DTYPE = tla.Bool
 
 def padded(value):
     return ((value + TILE - 1) // TILE) * TILE
@@ -252,6 +255,8 @@ def dense_attention(gm_q: tla.Tensor, gm_k: tla.Tensor,
         ("\n@tla.kernel\ndef helper():\n    pass\n", "helper functions must be undecorated"),
         ("\nX = True\n", "numeric literal or Catlass numeric dtype"),
         ("\nX = tla.Float16()\n", "numeric literal or Catlass numeric dtype"),
+        ("\nX = tla.Float64\n", "numeric literal or Catlass numeric dtype"),
+        ("\nX = tla.Uint32\n", "numeric literal or Catlass numeric dtype"),
         ("\nimport torch\n", "may import only"),
         ("\ndef helper():\n    import torch\n", "may import only"),
     ],
