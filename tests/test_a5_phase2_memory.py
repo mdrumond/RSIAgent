@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import json
 
@@ -11,6 +12,7 @@ from benchmarks.a5kernels.phase1_experiments import ProfilingGuidance
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase2_attention import SUITE_SHA256
 from benchmarks.a5kernels.phase2_memory import (
+    CELL_SCHEMA_V2,
     SNAPSHOT_SCHEMA,
     A5Phase1Snapshot,
     admit_phase1_snapshot,
@@ -84,6 +86,61 @@ def test_phase2_registry_has_exactly_eight_runnable_a5_treatments(tmp_path):
     assert {cell.target.value for cell in cells} == {"a5"}
     assert {cell.language.value for cell in cells} == {"catlass-dsl"}
     assert all(cell.as_dict()["cell_id"] == cell.cell_id for cell in cells)
+
+
+def test_same_guide_preserves_legacy_v1_identity_exactly(tmp_path):
+    _path, guide, report = _guide_and_report(tmp_path)
+
+    implicit = phase2_cells(guide, report.report_sha256)
+    explicit = phase2_cells(guide, report.report_sha256, destination_guide=guide)
+
+    assert explicit == implicit
+    assert implicit[0].cell_id == "a5-phase2-cell-4bf906a8bc06c72c"
+    assert implicit[0].schema == "a5-catlass-phase2-cell-v1"
+    assert "source_guide" not in implicit[0].as_dict()
+
+
+def test_different_guides_have_deterministic_dual_guide_identity(tmp_path):
+    _path, source_guide, report = _guide_and_report(tmp_path)
+    destination_guide = replace(source_guide, guide_sha256="a" * 64)
+
+    first = phase2_cells(
+        source_guide,
+        report.report_sha256,
+        destination_guide=destination_guide,
+    )
+    second = phase2_cells(
+        source_guide,
+        report.report_sha256,
+        destination_guide=destination_guide,
+    )
+
+    assert first == second
+    assert [cell.cell_id for cell in first] != [
+        cell.cell_id for cell in phase2_cells(source_guide, report.report_sha256)
+    ]
+    assert {cell.schema for cell in first} == {CELL_SCHEMA_V2}
+    assert {cell.source_guide for cell in first} == {source_guide}
+    assert {cell.guide for cell in first} == {destination_guide}
+    assert all(
+        cell.as_dict()["source_guide"] == source_guide.as_dict() for cell in first
+    )
+    assert all(cell.as_dict()["guide"] == destination_guide.as_dict() for cell in first)
+
+
+def test_dual_guide_identity_rejects_tampering(tmp_path):
+    _path, source_guide, report = _guide_and_report(tmp_path)
+    destination_guide = replace(source_guide, guide_sha256="a" * 64)
+    cell = phase2_cells(
+        source_guide,
+        report.report_sha256,
+        destination_guide=destination_guide,
+    )[0]
+
+    with pytest.raises(ValueError, match="ID|identity"):
+        replace(cell, guide=replace(destination_guide, guide_sha256="c" * 64))
+    with pytest.raises(ValueError, match="source|guide|schema"):
+        replace(cell, source_guide=destination_guide)
 
 
 def test_phase2_identity_changes_with_qualification_and_rejects_bad_digest(tmp_path):
@@ -162,6 +219,49 @@ def test_open_rejects_rehashed_terminal_with_changed_source_identity(tmp_path):
     terminal["cell_id"] = "a5-cell-" + "0" * 16
     body = {key: value for key, value in terminal.items() if key != "record_sha256"}
     terminal["record_sha256"] = canonical_digest(body)
+    terminal_bytes = canonical_bytes(terminal) + b"\n"
+    snapshot.terminal_path.write_bytes(terminal_bytes)
+    manifest = dict(snapshot.manifest)
+    manifest["phase1_terminal_sha256"] = hashlib.sha256(terminal_bytes).hexdigest()
+    manifest_body = {
+        key: value for key, value in manifest.items() if key != "snapshot_id"
+    }
+    manifest["snapshot_id"] = canonical_digest(manifest_body)
+    snapshot.manifest_path.write_bytes(canonical_bytes(manifest) + b"\n")
+
+    with pytest.raises(ValueError, match="terminal identity"):
+        A5Phase1Snapshot.open(snapshot.root, destination)
+
+
+def test_snapshot_uses_source_guide_while_cell_records_destination_guide(tmp_path):
+    composition, source, legacy_destination = _completed_source(tmp_path)
+    source_guide = source.guide
+    destination_guide = replace(source_guide, guide_sha256="a" * 64)
+    destination = next(
+        cell
+        for cell in phase2_cells(
+            source_guide,
+            composition.qualification.report_sha256,
+            destination_guide=destination_guide,
+        )
+        if cell.source_cell_id == legacy_destination.source_cell_id
+    )
+
+    snapshot = admit_phase1_snapshot(composition, destination, tmp_path / "phase2")
+
+    assert destination.source_guide == source_guide
+    assert destination.guide == destination_guide
+    assert json.loads(snapshot.terminal_path.read_text())["guide_sha256"] == (
+        source_guide.guide_sha256
+    )
+    assert A5Phase1Snapshot.open(snapshot.root, destination) == snapshot
+
+    terminal = json.loads(snapshot.terminal_path.read_text())
+    terminal["guide_sha256"] = destination_guide.guide_sha256
+    terminal_body = {
+        key: value for key, value in terminal.items() if key != "record_sha256"
+    }
+    terminal["record_sha256"] = canonical_digest(terminal_body)
     terminal_bytes = canonical_bytes(terminal) + b"\n"
     snapshot.terminal_path.write_bytes(terminal_bytes)
     manifest = dict(snapshot.manifest)
