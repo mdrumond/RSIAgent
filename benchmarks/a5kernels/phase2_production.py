@@ -20,7 +20,11 @@ from benchmarks.a5kernels.phase1_composition import (
     LiveDependencies,
     Phase1CellComposition,
 )
-from benchmarks.a5kernels.phase1_experiments import KnowledgeMode, ProfilingGuidance
+from benchmarks.a5kernels.phase1_experiments import (
+    KnowledgeMode,
+    ProfilingGuidance,
+    admit_programming_guide,
+)
 from benchmarks.a5kernels.phase1_live import GateReport
 from benchmarks.a5kernels.phase1_production import load_direct_environment
 from benchmarks.a5kernels.phase1_provider import (
@@ -67,6 +71,8 @@ class Phase2ProductionConfig:
     kdb: Path | None = None
     collection: str | None = None
     env_file: Path | None = None
+    phase2_guide_path: Path | None = None
+    phase2_cpl_skills_revision: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.gate, GateReport):
@@ -77,6 +83,12 @@ class Phase2ProductionConfig:
             raise ValueError("device must be a non-negative integer")
         if not isinstance(self.cell_id, str) or not self.cell_id:
             raise ValueError("cell_id must be non-empty")
+        if (self.phase2_guide_path is None) != (
+            self.phase2_cpl_skills_revision is None
+        ):
+            raise ValueError(
+                "Phase 2 guide path and CPL skills revision must be supplied together"
+            )
 
     @property
     def validation_wrapper(self) -> Path:
@@ -233,6 +245,21 @@ def _knowledge_factory(config, embeddings):
     return factory
 
 
+def _phase2_guide(config: Phase2ProductionConfig, composition):
+    if config.phase2_guide_path is None:
+        return composition.guide, composition.guide_text
+    guide = admit_programming_guide(
+        config.phase2_guide_path,
+        cpl_skills_revision=config.phase2_cpl_skills_revision,
+        catlass_revision=composition.guide.catlass_revision,
+    )
+    try:
+        text = config.phase2_guide_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("unable to read admitted Phase 2 guide content") from exc
+    return guide, text
+
+
 def build_phase2_production(
     config: Phase2ProductionConfig,
     *,
@@ -251,9 +278,14 @@ def build_phase2_production(
         config.gate,
         _unavailable_dependencies(),
     )
+    phase2_guide, phase2_guide_text = _phase2_guide(config, composition)
     destinations = {
         cell.cell_id: cell
-        for cell in phase2_cells(config.gate.guide, config.gate.report_sha256)
+        for cell in phase2_cells(
+            config.gate.guide,
+            config.gate.report_sha256,
+            destination_guide=phase2_guide,
+        )
     }
     try:
         cell = destinations[config.cell_id]
@@ -341,7 +373,7 @@ def build_phase2_production(
     source = Phase2SourceProvider(
         provider,
         evidence_root=config.phase2_root.resolve() / "cells",
-        guide_text=composition.guide_text,
+        guide_text=phase2_guide_text,
         knowledge_factory=knowledge_factory,
         profiling_guidance=guidance,
     )
