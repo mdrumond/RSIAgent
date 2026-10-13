@@ -340,6 +340,9 @@ class Phase2SourceProvider:
                         continue
 
                 if action is not None and action[0] == "knowledge_query":
+                    # Compile probes are the only accepted action exempt from
+                    # the ordinary provider-turn allowance.
+                    ordinary_turns += 1
                     query = action[1]
                     assert isinstance(query, KnowledgeQuery)
                     if len(queries) >= self.max_queries:
@@ -371,11 +374,11 @@ class Phase2SourceProvider:
                             "available": True, "citations": citations,
                         })
                 else:
+                    ordinary_turns += 1
                     observation = {"host": {
                         "event": "invalid-action",
                         "required": "one knowledge_query or candidate_source JSON object",
                     }}
-                ordinary_turns += 1
                 observation_text = json.dumps(
                     observation, sort_keys=True, separators=(",", ":")
                 )

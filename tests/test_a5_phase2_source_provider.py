@@ -367,6 +367,24 @@ def test_compile_probe_does_not_consume_ordinary_turn_and_retains_tokens(tmp_pat
     assert len(probes) == 1
 
 
+def test_compile_probe_is_exempt_but_knowledge_query_consumes_last_turn(tmp_path):
+    def compile_probe(_source, _workdir):
+        return {
+            "status": "compiled", "case_id": "case", "exit_code": 0,
+            "diagnostic": "", "session_handle": "bz-a5:probe",
+        }
+    provider, calls = _provider(tmp_path, [
+        '{"compile_probe":{"source":"candidate"}}',
+        '{"knowledge_query":{"query":"Catlass copy"}}',
+        '{"candidate_source":{"source":"must-not-run"}}',
+    ], max_turns=1, max_queries=1, compile_probe=compile_probe,
+       max_compile_probes=1)
+
+    with pytest.raises(RuntimeError, match="turn budget exhausted"):
+        provider(_request(_cell()))
+    assert len(calls) == 2
+
+
 def test_compile_probe_limit_exhaustion_is_bounded(tmp_path):
     def callback(_source, _workdir):
         return {
