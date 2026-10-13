@@ -176,13 +176,13 @@ def _native_artifact(
     expected_gitlink: str,
     expected_install_commit: str,
     expected_cann_version: str,
-) -> tuple[Path, str]:
+) -> tuple[Path, str, dict[Path, str]]:
     manifest_path = source / NATIVE_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"Catlass native provenance is unavailable: {manifest_path}") from exc
-    expected_keys = {
+    base_keys = {
         "schema",
         "catlass_revision",
         "ascendnpu_ir_gitlink",
@@ -195,12 +195,22 @@ def _native_artifact(
     ).encode("utf-8")
     if hashlib.sha256(canonical_manifest).hexdigest() != expected_manifest_sha256:
         raise RuntimeError("Catlass native provenance manifest digest mismatch")
-    if not isinstance(manifest, dict) or set(manifest) != expected_keys:
+    if not isinstance(manifest, dict):
+        raise RuntimeError("Catlass native provenance manifest has an invalid schema")
+    schema = manifest.get("schema")
+    if schema == "catlass-native-build-v1" and set(manifest) == base_keys:
+        generated_entries = []
+    elif (
+        schema == "catlass-native-build-v2"
+        and set(manifest) == base_keys | {"generated_importables"}
+        and isinstance(manifest["generated_importables"], list)
+    ):
+        generated_entries = manifest["generated_importables"]
+    else:
         raise RuntimeError("Catlass native provenance manifest has an invalid schema")
     artifacts = manifest["artifacts"]
     if (
-        manifest["schema"] != "catlass-native-build-v1"
-        or manifest["catlass_revision"] != expected_revision
+        manifest["catlass_revision"] != expected_revision
         or not isinstance(artifacts, list)
         or len(artifacts) != 1
         or not isinstance(artifacts[0], dict)
@@ -285,7 +295,42 @@ def _native_artifact(
         raise RuntimeError("Catlass native provenance bridge digest mismatch")
     if hashlib.sha256(location.read_bytes()).hexdigest() != digest:
         raise RuntimeError("Catlass native provenance bridge contents mismatch")
-    return location, digest
+    generated_importables = {}
+    for entry in generated_entries:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"path", "sha256"}
+            or not isinstance(entry["path"], str)
+            or not isinstance(entry["sha256"], str)
+        ):
+            raise RuntimeError("Catlass generated import provenance is invalid")
+        generated_relative = Path(entry["path"])
+        generated_digest = entry["sha256"]
+        if (
+            generated_relative.is_absolute()
+            or ".." in generated_relative.parts
+            or not generated_relative.is_relative_to(GENERATED_MLIR_PACKAGE)
+            or generated_relative.suffix.lower()
+            not in {".py", ".pyc", ".so", ".pyd", ".dll", ".dylib"}
+            or not isinstance(generated_digest, str)
+            or len(generated_digest) != 64
+            or any(character not in "0123456789abcdef" for character in generated_digest)
+        ):
+            raise RuntimeError("Catlass generated import provenance is invalid")
+        generated_location = (source / generated_relative).resolve()
+        try:
+            generated_location.relative_to(source)
+        except ValueError as exc:
+            raise RuntimeError("Catlass generated import escapes the retained source") from exc
+        if (
+            generated_location in generated_importables
+            or not generated_location.is_file()
+            or hashlib.sha256(generated_location.read_bytes()).hexdigest()
+            != generated_digest
+        ):
+            raise RuntimeError("Catlass generated import provenance mismatch")
+        generated_importables[generated_location] = generated_digest
+    return location, digest, generated_importables
 
 
 def _verify_loaded_catlass_modules(
@@ -293,6 +338,7 @@ def _verify_loaded_catlass_modules(
     expected_revision: str,
     native_location: Path,
     native_sha256: str,
+    generated_importables: dict[Path, str],
 ) -> None:
     native_seen = False
     package_root = (source / "python/tla_dsl/catlass").resolve()
@@ -320,6 +366,14 @@ def _verify_loaded_catlass_modules(
         except ValueError as exc:
             raise RuntimeError(f"Catlass import provenance mismatch: {name} at {location} is not under {source}") from exc
         if relative.is_relative_to(GENERATED_MLIR_PACKAGE):
+            digest = generated_importables.get(location)
+            if (
+                digest is None
+                or hashlib.sha256(location.read_bytes()).hexdigest() != digest
+            ):
+                raise RuntimeError(
+                    f"Catlass generated import provenance mismatch: {name} at {location}"
+                )
             continue
         expected_blob = subprocess.run(
             ["git", "-C", str(source), "rev-parse", f"{expected_revision}:{relative.as_posix()}"],
@@ -335,7 +389,11 @@ def _verify_loaded_catlass_modules(
         raise RuntimeError("Catlass native import provenance is missing")
 
 
-def _reject_untracked_importables(source: Path, native_location: Path) -> None:
+def _reject_untracked_importables(
+    source: Path,
+    native_location: Path,
+    generated_importables: dict[Path, str],
+) -> None:
     discovered = set()
     generated_mlir = (source / GENERATED_MLIR_PACKAGE).resolve()
     package_root = (source / "python/tla_dsl/catlass").resolve()
@@ -365,7 +423,11 @@ def _reject_untracked_importables(source: Path, native_location: Path) -> None:
         location = (source / relative_value).resolve()
         name = location.name.lower()
         importable = name.endswith((".py", ".pyc", ".so", ".pyd", ".dll", ".dylib"))
-        generated = location.is_relative_to(generated_mlir)
+        generated = (
+            location.is_relative_to(generated_mlir)
+            and generated_importables.get(location)
+            == hashlib.sha256(location.read_bytes()).hexdigest()
+        )
         packaged_bridge = (
             location.parent == package_root
             and name.startswith("_tla_type_bridge_native")
@@ -429,7 +491,7 @@ def _preflight_runtime(
             f"Catlass retained source is not clean at {source}: {detail}"
         )
 
-    native_location, native_sha256 = _native_artifact(
+    native_location, native_sha256, generated_importables = _native_artifact(
         source,
         expected_revision,
         expected_manifest_sha256,
@@ -438,11 +500,17 @@ def _preflight_runtime(
         expected_install_commit,
         expected_cann_version,
     )
-    _reject_untracked_importables(source, native_location)
+    _reject_untracked_importables(source, native_location, generated_importables)
     import catlass.tla as tla
     importlib.import_module("catlass.tla.runtime")
 
-    _verify_loaded_catlass_modules(source, expected_revision, native_location, native_sha256)
+    _verify_loaded_catlass_modules(
+        source,
+        expected_revision,
+        native_location,
+        native_sha256,
+        generated_importables,
+    )
     """All Catlass imports above are verified before kernel or NPU setup."""
     location = Path(getattr(tla, "__file__", "<unknown>")).resolve()
     missing = [name for name in REQUIRED_TLA_API if not hasattr(tla, name)]
@@ -453,7 +521,7 @@ def _preflight_runtime(
             f"{','.join(missing)}; install a Catlass revision that provides "
             "the @tla.kernel frontend and tla.compile before A5 dispatch"
         )
-    return source, native_location, native_sha256
+    return source, native_location, native_sha256, generated_importables
 
 def _load_kernel(path: str):
     source = Path(path)
@@ -484,11 +552,15 @@ def main() -> int:
     input_b = _numbers(payload["input_b"], "input_b")
     if len(input_a) != len(input_b):
         raise ValueError("input vectors must have equal length")
-    source, native_location, native_sha256 = _preflight_runtime(*sys.argv[3:])
+    source, native_location, native_sha256, generated_importables = _preflight_runtime(*sys.argv[3:])
     kernel = _load_kernel(sys.argv[1])
-    _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
+    _verify_loaded_catlass_modules(
+        source, sys.argv[3], native_location, native_sha256, generated_importables
+    )
     raw_output = kernel.run(input_a, input_b)
-    _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
+    _verify_loaded_catlass_modules(
+        source, sys.argv[3], native_location, native_sha256, generated_importables
+    )
     output = _numbers(raw_output, "output")
     print(OUTPUT_MARKER + json.dumps(output, separators=(",", ":"), allow_nan=False))
     return 0
