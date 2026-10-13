@@ -101,7 +101,8 @@ def _request(cell, *, attempt=1):
 
 def _provider(tmp_path, replies, *, cell=None, knowledge_factory=None,
               guidance=None, max_turns=4, max_queries=None,
-              max_completion_bytes=256 * 1024):
+              max_completion_bytes=256 * 1024, compile_probe=None,
+              max_compile_probes=0):
     calls = []
     replies = iter(replies)
 
@@ -120,6 +121,8 @@ def _provider(tmp_path, replies, *, cell=None, knowledge_factory=None,
         profiling_guidance=guidance,
         max_turns=max_turns,
         max_queries=min(2, max_turns) if max_queries is None else max_queries,
+        compile_probe=compile_probe,
+        max_compile_probes=max_compile_probes,
         max_completion_bytes=max_completion_bytes,
     )
     return provider, calls
@@ -325,6 +328,145 @@ def test_query_budget_is_bounded(tmp_path):
     )
     with pytest.raises(RuntimeError, match="turn budget exhausted"):
         provider(_request(cell))
+
+
+def test_compile_probe_is_opt_in_and_disabled_action_consumes_ordinary_turn(tmp_path):
+    provider, calls = _provider(
+        tmp_path, ['{"compile_probe":{"source":"source"}}'], max_turns=1,
+    )
+    with pytest.raises(RuntimeError, match="turn budget exhausted"):
+        provider(_request(_cell()))
+    assert "compile_probe" not in calls[0]["request"]["messages"][0]["content"]
+    assert not list(tmp_path.rglob("compile-probes"))
+
+
+def test_compile_probe_does_not_consume_ordinary_turn_and_retains_tokens(tmp_path):
+    probes = []
+
+    def compile_probe(source, workdir):
+        probes.append((source, workdir))
+        return {
+            "status": "compile-failed", "case_id": "fp16-noncausal",
+            "exit_code": 1, "diagnostic": "error: bad tile",
+            "session_handle": "bz-a5:probe-1",
+        }
+
+    provider, calls = _provider(tmp_path, [
+        '{"compile_probe":{"source":"broken"}}',
+        '{"candidate_source":{"source":"fixed"}}',
+    ], max_turns=1, compile_probe=compile_probe, max_compile_probes=1)
+    request = _request(_cell())
+    assert provider(request) == "fixed"
+    observation = json.loads(calls[1]["request"]["messages"][-1]["content"])
+    assert observation["compile_probe"]["status"] == "compile-failed"
+    assert observation["compile_probe"]["correctness_established"] is False
+    manifest = json.loads(next(tmp_path.rglob("provider.json")).read_text())
+    assert manifest["ordinary_turns"] == 1
+    assert manifest["compile_probes"] == 1
+    assert manifest["completion_tokens"] == 6
+    assert len(probes) == 1
+
+
+def test_compile_probe_limit_exhaustion_is_bounded(tmp_path):
+    def callback(_source, _workdir):
+        return {
+            "status": "compiled", "case_id": "case", "exit_code": 0,
+            "diagnostic": "", "session_handle": "bz-a5:probe",
+        }
+    provider, calls = _provider(tmp_path, [
+        '{"compile_probe":{"source":"one"}}',
+        '{"compile_probe":{"source":"two"}}',
+        '{"candidate_source":{"source":"done"}}',
+    ], max_turns=2, compile_probe=callback, max_compile_probes=1)
+    assert provider(_request(_cell())) == "done"
+    observation = json.loads(calls[2]["request"]["messages"][-1]["content"])
+    assert observation["compile_probe"]["status"] == "probe-budget-exhausted"
+
+
+def test_compile_probe_rejects_unbounded_or_invalid_host_evidence(tmp_path):
+    for result in (
+        {"status": "compiled"},
+        {
+            "status": "compile-failed", "case_id": "case", "exit_code": 1,
+            "diagnostic": "x" * 4097, "session_handle": None,
+        },
+    ):
+        provider, _ = _provider(
+            tmp_path / str(len(result)),
+            ['{"compile_probe":{"source":"source"}}'],
+            compile_probe=lambda _source, _workdir, result=result: result,
+            max_compile_probes=1,
+        )
+        with pytest.raises(ValueError, match="compile probe returned"):
+            provider(_request(_cell()))
+
+
+def test_completed_probe_is_source_bound_and_reused_after_interruption(tmp_path):
+    calls = []
+
+    def probe(source, _workdir):
+        calls.append(source)
+        return {
+            "status": "invalid-source", "case_id": "case", "exit_code": 2,
+            "diagnostic": "candidate source is not valid Python",
+            "session_handle": None,
+        }
+
+    provider, _ = _provider(tmp_path, [
+        '{"compile_probe":{"source":"bad source"}}', TimeoutError("offline"),
+    ], compile_probe=probe, max_compile_probes=1)
+    request = _request(_cell())
+    with pytest.raises(InfrastructureFailure):
+        provider(request)
+
+    resumed, resumed_calls = _provider(
+        tmp_path, ['{"candidate_source":{"source":"fixed"}}'],
+        compile_probe=probe, max_compile_probes=1,
+    )
+    assert resumed(request) == "fixed"
+    assert calls == ["bad source"]
+    assert json.loads(
+        resumed_calls[0]["request"]["messages"][-1]["content"]
+    )["compile_probe"]["status"] == "invalid-source"
+
+    retained = next(tmp_path.rglob("compile-probes/probe-01/candidate.py"))
+    retained.write_text("different", encoding="utf-8")
+    replay, _ = _provider(
+        tmp_path, ['{"compile_probe":{"source":"bad source"}}'],
+        compile_probe=probe, max_compile_probes=1,
+    )
+    with pytest.raises(ValueError, match="compile probe"):
+        replay(request)
+
+
+def test_probe_infrastructure_failure_resumes_pending_source_without_model_recall(
+    tmp_path,
+):
+    probe_calls = []
+
+    def probe(source, _workdir):
+        probe_calls.append(source)
+        if len(probe_calls) == 1:
+            raise InfrastructureFailure("BZ unavailable")
+        return {
+            "status": "compiled", "case_id": "case", "exit_code": 0,
+            "diagnostic": "", "session_handle": "bz-a5:resumed",
+        }
+
+    request = _request(_cell())
+    provider, _ = _provider(
+        tmp_path, ['{"compile_probe":{"source":"pending"}}'],
+        compile_probe=probe, max_compile_probes=1,
+    )
+    with pytest.raises(InfrastructureFailure, match="BZ unavailable"):
+        provider(request)
+    resumed, calls = _provider(
+        tmp_path, ['{"candidate_source":{"source":"done"}}'],
+        compile_probe=probe, max_compile_probes=1,
+    )
+    assert resumed(request) == "done"
+    assert probe_calls == ["pending", "pending"]
+    assert len(calls) == 1
 
 
 def test_retryable_transport_propagates_without_completed_artifacts(tmp_path):

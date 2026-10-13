@@ -58,6 +58,13 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--collection")
         command.add_argument("--device", type=int)
         command.add_argument("--env-file", type=Path)
+        command.add_argument(
+            "--compile-probes", type=int, default=0, metavar="N",
+            help=(
+                "allow N host compile-only probes per semantic attempt; probes "
+                "do not consume ordinary model turns or establish correctness"
+            ),
+        )
     return parser
 
 
@@ -95,6 +102,7 @@ def _production_factory(
         env_file=args.env_file,
         phase2_guide_path=args.phase2_guide,
         phase2_cpl_skills_revision=args.phase2_cpl_skills_revision,
+        compile_probes=args.compile_probes,
     ))
 
 
