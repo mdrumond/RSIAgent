@@ -17,6 +17,8 @@ from benchmarks.a5kernels.phase2_attention import (
     AttentionReceipt,
     AttentionTargetEvidence,
     AttentionTargetVerifier,
+    MAX_DIAGNOSTIC_BYTES,
+    _truncate_utf8,
     attention_reference,
     build_execution,
 )
@@ -181,7 +183,10 @@ def test_nonzero_receipt_publishes_bounded_digest_bound_host_diagnostics(tmp_pat
             return AttentionReceipt(
                 exit_code=17,
                 output=(),
-                stdout="compiler\r\n" + "x" * 5000,
+                stdout=(
+                    "Traceback (most recent call last):\r\ncompile.py:1\r\n"
+                    + "x" * 5000 + "\nValueError: tile overflow"
+                ),
                 stderr="runtime failed\rwith ordinary input",
                 session_handle=f"bz-a5:{execution.case.case_id}",
             )
@@ -192,8 +197,11 @@ def test_nonzero_receipt_publishes_bounded_digest_bound_host_diagnostics(tmp_pat
     for item in evidence.cases:
         assert item.failure == "runtime-exit"
         assert item.diagnostic is not None
-        assert item.diagnostic.startswith("stdout:\ncompiler\n")
-        assert "\n...[truncated]\nstderr:\nruntime failed\nwith ordinary input" in item.diagnostic
+        assert item.diagnostic.startswith(
+            "stdout:\nTraceback (most recent call last):\ncompile.py:1\n"
+        )
+        assert "\n...[truncated]...\n" in item.diagnostic
+        assert "ValueError: tile overflow\nstderr:\nruntime failed" in item.diagnostic
         assert "\r" not in item.diagnostic
         assert len(item.diagnostic.encode("utf-8")) <= 4096
         with pytest.raises(ValueError, match="digest"):
@@ -254,7 +262,39 @@ def test_backend_exception_is_case_local_and_complete_suite_is_retained(tmp_path
     assert len(evidence.cases) == len(ATTENTION_CASES)
     item = next(item for item in evidence.cases if item.case_id == failed)
     assert item.failure == "execution-error:RuntimeError"
+    assert item.diagnostic == "RuntimeError: synthetic runtime failure"
     assert len(evidence.cases) == len(ATTENTION_CASES)
+
+
+def test_local_value_error_message_is_normalized_bounded_and_retained(tmp_path):
+    class RejectingBackend(FakeBackend):
+        def execute(self, source, execution, workdir):
+            raise ValueError(
+                "candidate validation failed\r\n" + "x" * 5000
+                + "\ninvalid dense_attention signature"
+            )
+
+    evidence = _verify(tmp_path, RejectingBackend())
+
+    for item in evidence.cases:
+        assert item.failure == "execution-error:ValueError"
+        assert item.diagnostic is not None
+        assert item.diagnostic.startswith("ValueError: candidate validation failed\n")
+        assert "\n...[truncated]...\n" in item.diagnostic
+        assert item.diagnostic.endswith("invalid dense_attention signature")
+        assert "\r" not in item.diagnostic
+        assert len(item.diagnostic.encode("utf-8")) <= MAX_DIAGNOSTIC_BYTES
+
+
+def test_utf8_truncation_preserves_short_text_and_long_head_and_tail():
+    assert _truncate_utf8("alpha 🙂 omega", 100) == "alpha 🙂 omega"
+
+    rendered = _truncate_utf8("head:" + "🙂" * 100 + ":tail", 64)
+
+    assert rendered.startswith("head:")
+    assert rendered.endswith(":tail")
+    assert "\n...[truncated]...\n" in rendered
+    assert len(rendered.encode("utf-8")) <= 64
 
 
 def test_infrastructure_failure_aborts_without_semantic_evidence(tmp_path):
