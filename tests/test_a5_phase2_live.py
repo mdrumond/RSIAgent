@@ -138,6 +138,42 @@ def test_failed_host_receipt_advances_memory_and_next_attempt(tmp_path):
     assert [entry["passed"] for entry in entries] == [False, True]
 
 
+def test_long_host_diagnostic_head_and_tail_reach_next_attempt(tmp_path):
+    class DiagnosticBackend(_Backend):
+        def execute(self, source, execution, workdir):
+            if not self.passed:
+                return AttentionReceipt(
+                    1,
+                    (),
+                    stdout=(
+                        "Traceback (most recent call last):\n"
+                        + "x" * 2000
+                        + "\nValueError: dynamic loop value escaped its scope"
+                    ),
+                    session_handle="bz-a5:test",
+                )
+            return super().execute(source, execution, workdir)
+
+    _composition, _source, _destination, snapshot = _snapshot(tmp_path)
+    source_calls = []
+    runner = Phase2LiveRunner(
+        phase2_root=tmp_path / "phase2",
+        snapshot=snapshot,
+        dependencies=_deps(
+            snapshot, DiagnosticBackend((False, True)), source_calls
+        ),
+    )
+
+    terminal = runner.run()
+
+    assert terminal["status"] == "passed"
+    diagnostic = source_calls[1].phase2_memory[0]["failed_cases"][0]["diagnostic"]
+    assert diagnostic.startswith("stdout:\nTraceback (most recent call last):")
+    assert "\n...[truncated]...\n" in diagnostic
+    assert diagnostic.endswith("dynamic loop value escaped its scope")
+    assert len(diagnostic.encode("utf-8")) <= 512
+
+
 def test_exhausted_semantic_attempts_emit_failed_terminal(tmp_path):
     _composition, _source, _destination, snapshot = _snapshot(tmp_path)
     calls = []
