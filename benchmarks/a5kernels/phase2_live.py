@@ -15,11 +15,12 @@ from benchmarks.a5kernels.phase2_attention import (
     HOST_TARGET_GRADING_SHA256,
     SUITE_SHA256,
     AttentionTargetEvidence,
+    _truncate_utf8,
 )
 from benchmarks.a5kernels.phase2_memory import A5Phase1Snapshot, A5Phase2Cell
 
 
-PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v1"
+PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v2"
 ATTEMPT_SCHEMA = "a5-catlass-phase2-attempt-v1"
 MEMORY_SCHEMA = "a5-catlass-phase2-memory-v1"
 TERMINAL_SCHEMA = "a5-catlass-phase2-terminal-v1"
@@ -355,7 +356,9 @@ class Phase2LiveRunner:
         }
         diagnostic = getattr(item, "diagnostic", None)
         if diagnostic is not None:
-            failure["diagnostic"] = str(diagnostic)[:_MAX_HOST_DIAGNOSTIC]
+            failure["diagnostic"] = _truncate_utf8(
+                str(diagnostic), _MAX_HOST_DIAGNOSTIC
+            )
         return failure
 
     @staticmethod

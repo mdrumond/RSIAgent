@@ -437,6 +437,15 @@ def _grade(
 def _execution_failure(
     case: AttentionCase, expected: tuple[float, ...], error: Exception,
 ) -> AttentionCaseEvidence:
+    message = "\n".join(
+        line.rstrip()
+        for line in str(error).replace("\r\n", "\n").replace("\r", "\n").split(
+            "\n"
+        )
+    ).strip()
+    diagnostic = type(error).__name__
+    if message:
+        diagnostic += f": {message}"
     return AttentionCaseEvidence.create(
         case_id=case.case_id,
         case_sha256=_digest(asdict(case)),
@@ -450,7 +459,7 @@ def _execution_failure(
         mismatch_expected=None,
         mismatch_actual=None,
         failure=f"execution-error:{type(error).__name__}",
-        diagnostic=None,
+        diagnostic=_truncate_utf8(diagnostic, MAX_DIAGNOSTIC_BYTES),
         session_handle=None,
     )
 
@@ -484,9 +493,20 @@ def _truncate_utf8(value: str, budget: int) -> str:
     encoded = value.encode("utf-8")
     if len(encoded) <= budget:
         return value
-    marker = b"\n...[truncated]"
-    prefix = encoded[:budget - len(marker)].decode("utf-8", errors="ignore")
-    return prefix + marker.decode("ascii")
+    if budget <= 0:
+        return ""
+    marker = b"\n...[truncated]...\n"
+    if budget <= len(marker):
+        return encoded[:budget].decode("utf-8", errors="ignore")
+    content_budget = budget - len(marker)
+    head_budget = (content_budget + 1) // 2
+    tail_budget = content_budget - head_budget
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    tail = (
+        encoded[-tail_budget:].decode("utf-8", errors="ignore")
+        if tail_budget else ""
+    )
+    return head + marker.decode("ascii") + tail
 
 
 def _f32(value: float) -> float:
