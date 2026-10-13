@@ -89,6 +89,7 @@ def test_pass_is_host_owned_and_protocol_binds_full_treatment(tmp_path):
     assert terminal["status"] == "passed"
     assert terminal["completed_attempts"] == 1
     assert terminal["evidence_head_sha256"]
+    assert protocol["schema"] == "a5-catlass-phase2-live-protocol-v2"
     assert protocol["identity"] == {
         "target_suite_sha256": destination.suite_sha256,
         "candidate_abi_sha256": CANDIDATE_ABI_SHA256,

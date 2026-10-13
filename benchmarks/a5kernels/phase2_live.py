@@ -20,7 +20,7 @@ from benchmarks.a5kernels.phase2_attention import (
 from benchmarks.a5kernels.phase2_memory import A5Phase1Snapshot, A5Phase2Cell
 
 
-PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v1"
+PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v2"
 ATTEMPT_SCHEMA = "a5-catlass-phase2-attempt-v1"
 MEMORY_SCHEMA = "a5-catlass-phase2-memory-v1"
 TERMINAL_SCHEMA = "a5-catlass-phase2-terminal-v1"
