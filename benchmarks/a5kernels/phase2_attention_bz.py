@@ -1,7 +1,8 @@
 """Checked BZ-A5 execution backend for the Phase 2 attention target.
 
-Candidate modules own one TLA kernel and nothing else.  Case constants, tensors,
-launch policy, retained-session observation, and output parsing remain host-owned.
+Candidate modules may define compile-time constants and synchronous helpers around
+one TLA kernel.  Case constants, tensors, launch policy, retained-session
+observation, and output parsing remain host-owned.
 """
 
 from __future__ import annotations
@@ -27,6 +28,14 @@ OUTPUT_MARKER = "A5ATTENTION_OUTPUT="
 KERNEL_NAME = "dense_attention"
 MAX_OBSERVED_BYTES = 4 * 1024 * 1024
 _ARGUMENTS = ("gm_q", "gm_k", "gm_v", "gm_output")
+_HOST_BOUND_GLOBALS = frozenset({
+    "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL", "DTYPE",
+})
+_CATLASS_NUMERIC_DTYPES = frozenset({
+    "BFloat16", "Float16", "Float32", "Float64",
+    "Int8", "Int16", "Int32", "Int64",
+    "Uint8", "Uint16", "Uint32", "Uint64",
+})
 
 
 # This transport-only fixture demonstrates the exact ABI with already-proven TLA
@@ -59,12 +68,21 @@ def validate_attention_candidate(source: str) -> None:
         module = ast.parse(source, filename="kernel.py")
     except SyntaxError as exc:
         raise ValueError(f"candidate source is not valid Python: {exc.msg}") from exc
-    functions = [node for node in module.body if isinstance(
-        node, (ast.FunctionDef, ast.AsyncFunctionDef)
-    )]
-    if len(functions) != 1 or isinstance(functions[0], ast.AsyncFunctionDef):
-        raise ValueError("candidate must define exactly one synchronous kernel")
-    function = functions[0]
+    imports = [node for node in ast.walk(module) if isinstance(node, ast.Import)]
+    import_froms = [
+        node for node in ast.walk(module) if isinstance(node, ast.ImportFrom)
+    ]
+    if len(imports) != 1 or import_froms or imports[0] not in module.body or [
+        (alias.name, alias.asname) for alias in imports[0].names
+    ] != [("catlass.tla", "tla")]:
+        raise ValueError("candidate may import only catlass.tla as tla")
+    if any(isinstance(node, ast.AsyncFunctionDef) for node in module.body):
+        raise ValueError("candidate module may contain only synchronous functions")
+    functions = [node for node in module.body if isinstance(node, ast.FunctionDef)]
+    kernels = [node for node in functions if node.name == KERNEL_NAME]
+    if len(kernels) != 1:
+        raise ValueError("candidate must use dense_attention exactly once")
+    function = kernels[0]
     arguments = function.args
     if (
         function.name != KERNEL_NAME
@@ -86,13 +104,50 @@ def validate_attention_candidate(source: str) -> None:
         function.decorator_list[0]
     ) != ast.dump(decorator):
         raise ValueError("candidate dense_attention must use exactly @tla.kernel")
-    if any(not isinstance(node, (ast.Import, ast.FunctionDef)) for node in module.body):
-        raise ValueError("candidate module may contain only its import and kernel")
-    imports = [node for node in module.body if isinstance(node, ast.Import)]
-    if len(imports) != 1 or [
-        (alias.name, alias.asname) for alias in imports[0].names
-    ] != [("catlass.tla", "tla")]:
-        raise ValueError("candidate may import only catlass.tla as tla")
+    helpers = [node for node in functions if node is not function]
+    if any(node.decorator_list for node in helpers):
+        raise ValueError("candidate helper functions must be undecorated")
+    for node in module.body:
+        if isinstance(node, (ast.Import, ast.FunctionDef)):
+            continue
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            raise ValueError(
+                "candidate module may contain only imports, assignments, and "
+                "synchronous functions"
+            )
+        name, value = _assignment(node)
+        if name in _HOST_BOUND_GLOBALS:
+            raise ValueError(f"candidate may not assign host-owned global {name}")
+        if not _is_candidate_constant(value):
+            raise ValueError(
+                "candidate assignments require a numeric literal or Catlass "
+                "numeric dtype attribute"
+            )
+
+
+def _assignment(node: ast.Assign | ast.AnnAssign) -> tuple[str, ast.expr]:
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+    if len(targets) != 1 or not isinstance(targets[0], ast.Name) or node.value is None:
+        raise ValueError("candidate assignments require one simple module name")
+    return targets[0].id, node.value
+
+
+def _is_candidate_constant(value: ast.expr) -> bool:
+    if isinstance(value, ast.Constant):
+        return not isinstance(value.value, bool) and isinstance(value.value, (int, float))
+    if (
+        isinstance(value, ast.UnaryOp)
+        and isinstance(value.op, (ast.UAdd, ast.USub))
+        and isinstance(value.operand, ast.Constant)
+    ):
+        literal = value.operand.value
+        return not isinstance(literal, bool) and isinstance(literal, (int, float))
+    return (
+        isinstance(value, ast.Attribute)
+        and isinstance(value.value, ast.Name)
+        and value.value.id == "tla"
+        and value.attr in _CATLASS_NUMERIC_DTYPES
+    )
 
 
 class CatlassAttentionBackend:
@@ -135,9 +190,8 @@ class CatlassAttentionBackend:
         payload_text = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
-        composed_source = _case_constants(execution) + candidate_source
         files = (
-            SourceFile("kernel.py", composed_source),
+            SourceFile("kernel.py", candidate_source),
             SourceFile("host_driver.py", _ATTENTION_DRIVER),
             SourceFile("input.json", payload_text),
         )
@@ -249,20 +303,6 @@ def _input_payload(execution: AttentionExecution) -> dict[str, object]:
     }
 
 
-def _case_constants(execution: AttentionExecution) -> str:
-    case = execution.case
-    values = {
-        "BATCH": case.batch,
-        "HEADS": case.heads,
-        "SEQUENCE": case.sequence,
-        "HEAD_DIM": case.head_dim,
-        "SCALE": execution.scale,
-        "CAUSAL": case.causal,
-        "DTYPE": case.dtype,
-    }
-    return "\n".join(f"{name} = {value!r}" for name, value in values.items()) + "\n"
-
-
 def _parse_output(stdout: str, expected_elements: int) -> tuple[float, ...]:
     _bounded(stdout)
     records = [
@@ -359,9 +399,17 @@ def main():
     if any(len(tensor) != count for tensor in (q, k, v)):
         raise ValueError("Q, K, and V must have exact [B,H,S,D] shape")
     source, native_location, native_sha256 = _preflight_runtime(*sys.argv[3:])
+    import catlass.tla as tla
     kernel = _load_kernel(sys.argv[1])
     _verify_loaded_catlass_modules(source, sys.argv[3], native_location, native_sha256)
-    import catlass.tla as tla
+    kernel.BATCH = case["batch"]
+    kernel.HEADS = case["heads"]
+    kernel.SEQUENCE = case["sequence"]
+    kernel.HEAD_DIM = case["head_dim"]
+    kernel.SCALE = payload["scale"]
+    kernel.CAUSAL = case["causal"]
+    tla_dtype = {{"float16": tla.Float16, "bfloat16": tla.BFloat16}}[case["dtype"]]
+    kernel.DTYPE = tla_dtype
     import torch
     import torch_npu
     from catlass.tla.runtime import from_dlpack

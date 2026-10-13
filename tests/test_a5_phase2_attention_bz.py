@@ -124,9 +124,16 @@ def test_complete_suite_stages_exact_case_and_checked_argv(tmp_path, case):
         "kernel.py", "host_driver.py", "input.json",
     }
     kernel = (staged / "kernel.py").read_text()
-    assert f"BATCH = {case.batch}" in kernel
-    assert f"CAUSAL = {case.causal!r}" in kernel
-    assert kernel.endswith(SOURCE)
+    assert kernel == SOURCE
+    assert "kernel.BATCH = case[\"batch\"]" in driver
+    assert "kernel.HEADS = case[\"heads\"]" in driver
+    assert "kernel.SEQUENCE = case[\"sequence\"]" in driver
+    assert "kernel.HEAD_DIM = case[\"head_dim\"]" in driver
+    assert "kernel.SCALE = payload[\"scale\"]" in driver
+    assert "kernel.CAUSAL = case[\"causal\"]" in driver
+    assert '"float16": tla.Float16' in driver
+    assert '"bfloat16": tla.BFloat16' in driver
+    assert "kernel.DTYPE = tla_dtype" in driver
     assert [argv[-1] for argv in executor.inspect_argv] == ["logs", "result"]
     metadata = dict(receipt.metadata)
     assert metadata["dispatch_exit_code"] == "0"
@@ -203,7 +210,11 @@ def test_same_candidate_and_case_are_isolated_by_physical_device(tmp_path):
         ("import os\n" + SOURCE, "may import only"),
         (SOURCE.replace("dense_attention", "attention"), "must use dense_attention"),
         (SOURCE.replace("@tla.kernel", ""), "exactly @tla.kernel"),
-        (SOURCE + "\nX = 1\n", "import and kernel"),
+        (SOURCE + "\nX = 'host file'\n", "numeric literal or Catlass numeric dtype"),
+        (SOURCE + "\nBATCH = 2\n", "host-owned global BATCH"),
+        (SOURCE + "\nDTYPE = tla.Float16\n", "host-owned global DTYPE"),
+        (SOURCE + "\nX = tla.AddressSpace.ub\n", "numeric literal or Catlass numeric dtype"),
+        (SOURCE + "\nprint('ran')\n", "imports, assignments, and synchronous functions"),
     ],
 )
 def test_candidate_export_contract_fails_before_dispatch(tmp_path, source, message):
@@ -211,6 +222,43 @@ def test_candidate_export_contract_fails_before_dispatch(tmp_path, source, messa
     with pytest.raises(ValueError, match=message):
         _backend(executor).execute(source, build_execution(ATTENTION_CASES[0]), tmp_path)
     assert executor.invocations == []
+
+
+def test_candidate_contract_accepts_helpers_and_compile_time_constants():
+    source = """\
+import catlass.tla as tla
+
+TILE = 128
+NEGATIVE_SENTINEL = -1
+ACC_DTYPE = tla.Float32
+INPUT_DTYPE = tla.BFloat16
+
+def padded(value):
+    return ((value + TILE - 1) // TILE) * TILE
+
+@tla.kernel
+def dense_attention(gm_q: tla.Tensor, gm_k: tla.Tensor,
+                    gm_v: tla.Tensor, gm_output: tla.Tensor) -> None:
+    elements = padded(BATCH * HEADS * SEQUENCE * HEAD_DIM)
+"""
+
+    validate_attention_candidate(source)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "message"),
+    [
+        ("\nasync def helper():\n    pass\n", "synchronous functions"),
+        ("\n@tla.kernel\ndef helper():\n    pass\n", "helper functions must be undecorated"),
+        ("\nX = True\n", "numeric literal or Catlass numeric dtype"),
+        ("\nX = tla.Float16()\n", "numeric literal or Catlass numeric dtype"),
+        ("\nimport torch\n", "may import only"),
+        ("\ndef helper():\n    import torch\n", "may import only"),
+    ],
+)
+def test_candidate_contract_rejects_non_abi_module_members(suffix, message):
+    with pytest.raises(ValueError, match=message):
+        validate_attention_candidate(SOURCE + suffix)
 
 
 def test_hand_authored_fixture_uses_the_same_validated_tla_abi():

@@ -91,12 +91,22 @@ def test_suite_covers_fixed_dense_forward_contract():
 def test_candidate_abi_identity_is_stable_and_explicit():
     assert CANDIDATE_ABI == (
         ("module_import", "import catlass.tla as tla"),
-        ("module_members", "exactly one import and one synchronous kernel definition"),
+        ("module_members", (
+            "one import, numeric or Catlass-dtype assignments, undecorated "
+            "synchronous helpers, and one synchronous kernel definition"
+        )),
         ("kernel_decorator", "@tla.kernel"),
         ("kernel_export", "dense_attention(gm_q, gm_k, gm_v, gm_output)"),
         ("signature_policy", "four positional arguments; no defaults, varargs, or kwargs"),
-        ("host_prepended_constants", (
+        ("host_bound_constants", (
             "BATCH", "HEADS", "SEQUENCE", "HEAD_DIM", "SCALE", "CAUSAL", "DTYPE",
+        )),
+        ("host_bound_dtype", (
+            "DTYPE is the actual tla.Float16 or tla.BFloat16 type matching the case"
+        )),
+        ("candidate_assignment_policy", (
+            "numeric literals and Catlass numeric dtype attributes; host-bound "
+            "constant names are reserved"
         )),
         ("arguments", ("gm_q", "gm_k", "gm_v", "gm_output")),
         ("physical_layout", "flat-contiguous-row-major"),
