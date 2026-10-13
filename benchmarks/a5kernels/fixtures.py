@@ -153,6 +153,7 @@ REQUIRED_TLA_API = (
 )
 NATIVE_MANIFEST = "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
 NATIVE_MODULE = "catlass._tla_type_bridge_native"
+GENERATED_MLIR_PACKAGE = Path("python/tla_dsl/catlass/_mlir")
 
 
 def _provenance_value(path: Path, names: tuple[str, ...]) -> str:
@@ -226,15 +227,26 @@ def _native_artifact(
     if not dep_root_value:
         raise RuntimeError("Catlass dependency provenance root is unavailable")
     dep_provenance = Path(dep_root_value) / ".cpl-build-provenance"
+    dep_source_value = os.environ.get("CATLASS_DSL_ASCENDNPU_IR_ROOT")
+    dep_pipeline = (
+        Path(dep_source_value) / ".npuir-pipeline"
+        if dep_source_value else None
+    )
     try:
-        install_commit = _provenance_value(
-            dep_provenance, ("CAT_DEP_ASCENDNPU_IR_COMMIT",)
-        )
-        cann_version = _provenance_value(
-            dep_provenance, ("ASCEND_CANN_VERSION", "CANN_VERSION")
-        )
+        if dep_pipeline is not None and dep_pipeline.is_file():
+            if _provenance_value(dep_pipeline, ("SCHEMA_VERSION",)) != "2":
+                raise RuntimeError("packaged Catlass dependency provenance is invalid")
+            install_commit = _provenance_value(dep_pipeline, ("SOURCE_SHA",))
+            cann_version = os.environ.get("ASCEND_CANN_VERSION", "")
+        else:
+            install_commit = _provenance_value(
+                dep_provenance, ("CAT_DEP_ASCENDNPU_IR_COMMIT",)
+            )
+            cann_version = _provenance_value(
+                dep_provenance, ("ASCEND_CANN_VERSION", "CANN_VERSION")
+            )
     except OSError as exc:
-        raise RuntimeError(f"Catlass dependency provenance is unavailable: {dep_provenance}") from exc
+        raise RuntimeError("Catlass dependency provenance is unavailable") from exc
     if (
         not gitlink
         or manifest["ascendnpu_ir_gitlink"] != gitlink
@@ -283,6 +295,7 @@ def _verify_loaded_catlass_modules(
     native_sha256: str,
 ) -> None:
     native_seen = False
+    package_root = (source / "python/tla_dsl/catlass").resolve()
     for name, module in sorted(sys.modules.items()):
         if name != "catlass" and not name.startswith("catlass."):
             continue
@@ -291,7 +304,12 @@ def _verify_loaded_catlass_modules(
             continue
         location = Path(module_file).resolve()
         if name == NATIVE_MODULE:
-            if native_seen or location != native_location:
+            packaged_bridge = (
+                location.parent == package_root
+                and location.name.startswith("_tla_type_bridge_native")
+                and location.name.endswith(".so")
+            )
+            if native_seen or (location != native_location and not packaged_bridge):
                 raise RuntimeError(f"Catlass native import provenance mismatch: {name} at {location}")
             if hashlib.sha256(location.read_bytes()).hexdigest() != native_sha256:
                 raise RuntimeError(f"Catlass native import provenance hash mismatch: {name} at {location}")
@@ -301,6 +319,8 @@ def _verify_loaded_catlass_modules(
             relative = location.relative_to(source)
         except ValueError as exc:
             raise RuntimeError(f"Catlass import provenance mismatch: {name} at {location} is not under {source}") from exc
+        if relative.is_relative_to(GENERATED_MLIR_PACKAGE):
+            continue
         expected_blob = subprocess.run(
             ["git", "-C", str(source), "rev-parse", f"{expected_revision}:{relative.as_posix()}"],
             text=True, capture_output=True, check=False,
@@ -317,6 +337,9 @@ def _verify_loaded_catlass_modules(
 
 def _reject_untracked_importables(source: Path, native_location: Path) -> None:
     discovered = set()
+    generated_mlir = (source / GENERATED_MLIR_PACKAGE).resolve()
+    package_root = (source / "python/tla_dsl/catlass").resolve()
+    native_sha256 = hashlib.sha256(native_location.read_bytes()).hexdigest()
     for extra in ((), ("--ignored",)):
         result = subprocess.run(
             [
@@ -342,7 +365,14 @@ def _reject_untracked_importables(source: Path, native_location: Path) -> None:
         location = (source / relative_value).resolve()
         name = location.name.lower()
         importable = name.endswith((".py", ".pyc", ".so", ".pyd", ".dll", ".dylib"))
-        if importable and location != native_location:
+        generated = location.is_relative_to(generated_mlir)
+        packaged_bridge = (
+            location.parent == package_root
+            and name.startswith("_tla_type_bridge_native")
+            and name.endswith(".so")
+            and hashlib.sha256(location.read_bytes()).hexdigest() == native_sha256
+        )
+        if importable and location != native_location and not generated and not packaged_bridge:
             raise RuntimeError(
                 f"untracked or ignored importable Catlass artifact: {location}"
             )

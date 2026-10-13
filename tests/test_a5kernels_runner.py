@@ -124,13 +124,25 @@ def _write_native_manifest(root: Path, revision: str, *, digest: str | None = No
     )
 
 
-def _fake_runtime_env(root: Path):
-    return {
+def _fake_runtime_env(root: Path, *, packaged: bool = False):
+    environment = {
         **os.environ,
         "PYTHONPATH": str(root),
         "CATLASS_SRC": str(root),
         "CATLASS_DSL_ASCENDNPU_IR_INSTALL_DIR": str(root / "deps"),
     }
+    if packaged:
+        (root / "deps/.cpl-build-provenance").unlink()
+        source = root.parent / f"{root.name}-packaged-dependency"
+        source.mkdir()
+        (source / ".npuir-pipeline").write_text(
+            f"SCHEMA_VERSION=2\nSOURCE_SHA={'1' * 40}\n"
+        )
+        environment.update({
+            "CATLASS_DSL_ASCENDNPU_IR_ROOT": str(source),
+            "ASCEND_CANN_VERSION": "test-cann",
+        })
+    return environment
 
 
 def _driver_argv(root: Path, revision: str):
@@ -636,6 +648,28 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{OUTPUT_MARKER}[4.0,2.0]\n"
+
+
+def test_staged_host_driver_accepts_packaged_dependency_provenance(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "kernel.py").write_text(
+        "def run(a, b):\n    return [left + right for left, right in zip(a, b)]\n"
+    )
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision), cwd=tmp_path, text=True,
+        capture_output=True, check=False,
+        env=_fake_runtime_env(tmp_path, packaged=True),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{OUTPUT_MARKER}[3.0]\n"
 
 
 def test_host_driver_rejects_external_pycache_prefix_before_catlass_import(tmp_path):
