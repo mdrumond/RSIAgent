@@ -67,6 +67,7 @@ class Phase2ProductionConfig:
     tla_root: Path
     catlass_source: str
     device: int
+    runtime_catlass_revision: str | None = None
     bge_cache: Path | None = None
     kdb: Path | None = None
     collection: str | None = None
@@ -83,6 +84,11 @@ class Phase2ProductionConfig:
             raise ValueError("device must be a non-negative integer")
         if not isinstance(self.cell_id, str) or not self.cell_id:
             raise ValueError("cell_id must be non-empty")
+        if self.runtime_catlass_revision is not None and (
+            len(self.runtime_catlass_revision) != 40
+            or any(character not in "0123456789abcdef" for character in self.runtime_catlass_revision)
+        ):
+            raise ValueError("runtime_catlass_revision must be a lowercase 40-character SHA")
         if (self.phase2_guide_path is None) != (
             self.phase2_cpl_skills_revision is None
         ):
@@ -136,6 +142,7 @@ def _qualification_identity(config: Phase2ProductionConfig, cell, provenance):
         "cell_id": cell.cell_id,
         "catlass_source": config.catlass_source,
         "catlass_revision": cell.catlass_revision,
+        "runtime_catlass_revision": dict(provenance)["catlass_revision"],
         "runtime_provenance": [list(item) for item in provenance],
         "physical_device": config.device,
         "case": asdict(case),
@@ -347,7 +354,9 @@ def build_phase2_production(
             upload_wrapper=str(config.upload_wrapper),
             validation_wrapper=str(config.validation_wrapper),
             catlass_source=config.catlass_source,
-            catlass_revision=cell.catlass_revision,
+            catlass_revision=(
+                config.runtime_catlass_revision or cell.catlass_revision
+            ),
         )
     retained_provenance = _retained_qualification_provenance(config, cell)
     live_provenance = tuple(executor.runtime_provenance)
@@ -357,8 +366,11 @@ def build_phase2_production(
             "retained Phase 2 qualification runtime provenance changed"
         )
     provenance = live_provenance
-    if dict(provenance).get("catlass_revision") != cell.catlass_revision:
-        raise ValueError("runtime provenance changed the admitted Catlass revision")
+    expected_runtime_revision = (
+        config.runtime_catlass_revision or cell.catlass_revision
+    )
+    if dict(provenance).get("catlass_revision") != expected_runtime_revision:
+        raise ValueError("runtime provenance changed the configured Catlass revision")
     if dict(provenance).get("catlass_source") != config.catlass_source:
         raise ValueError("runtime provenance changed the retained Catlass source")
     if not is_resume:
