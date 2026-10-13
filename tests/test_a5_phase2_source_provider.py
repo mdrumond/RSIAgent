@@ -21,7 +21,7 @@ from benchmarks.a5kernels.phase1_experiments import (
 )
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_provider import DirectCompletion, DirectCompletionProvider
-from benchmarks.a5kernels.phase2_live import Phase2AttemptRequest
+from benchmarks.a5kernels.phase2_live import REPAIR_INSTRUCTION, Phase2AttemptRequest
 from benchmarks.a5kernels.phase2_memory import phase2_cells
 import benchmarks.a5kernels.phase2_source_provider as source_provider_module
 from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider
@@ -78,6 +78,28 @@ def _cell(model=MODEL_IDENTITIES[0], knowledge=KnowledgeMode.WITHOUT_KDB,
 
 
 def _request(cell, *, attempt=1):
+    prior_source = "previous source"
+    prior_sha256 = hashlib.sha256(prior_source.encode()).hexdigest()
+    phase2_memory = ({
+        "attempt": 1,
+        "candidate_sha256": prior_sha256,
+        "evidence_sha256": "5" * 64,
+        "passed": False,
+        "failed_cases": [{"case_id": "odd", "failure": "mismatch"}],
+        "entry_sha256": "6" * 64,
+    },) if attempt > 1 else ()
+    repair_context = ({
+        "instruction": REPAIR_INSTRUCTION,
+        "prior_attempt": 1,
+        "candidate_sha256": prior_sha256,
+        "evidence_sha256": "5" * 64,
+        "memory_entry_sha256": "6" * 64,
+        "host_evidence": phase2_memory[-1],
+        "candidate_source": prior_source,
+        "candidate_source_bytes": len(prior_source.encode()),
+        "candidate_source_truncated": False,
+        "candidate_context_sha256": prior_sha256,
+    } if attempt > 1 else None)
     return Phase2AttemptRequest(
         cell=cell,
         protocol_sha256="3" * 64,
@@ -88,14 +110,8 @@ def _request(cell, *, attempt=1):
             {"project": ordinal, "host_facts": ["observed"]}
             for ordinal in range(1, 9)
         ),
-        phase2_memory=({
-            "attempt": 1,
-            "candidate_sha256": "4" * 64,
-            "evidence_sha256": "5" * 64,
-            "passed": False,
-            "failed_cases": [{"case_id": "odd", "failure": "mismatch"}],
-            "entry_sha256": "6" * 64,
-        },) if attempt > 1 else (),
+        phase2_memory=phase2_memory,
+        repair_context=repair_context,
     )
 
 
@@ -221,6 +237,8 @@ def test_registered_models_receive_exact_host_context_and_emit_source(tmp_path, 
     }
     assert prompt["phase1_memory"] == list(request.phase1_memory)
     assert prompt["phase2_memory"] == list(request.phase2_memory)
+    assert prompt["repair_context"] == request.repair_context
+    assert "repair the preceding candidate" in prompt["repair_context"]["instruction"]
     manifest = json.loads((tmp_path / cell.cell_id / request.attempt_id / "provider.json").read_text())
     assert manifest["provider"]["profile_id"] == model.profile_id
     assert manifest["completion_tokens"] == 3
@@ -230,7 +248,36 @@ def test_registered_models_receive_exact_host_context_and_emit_source(tmp_path, 
     assert manifest["target_contract_sha256"] == hashlib.sha256(
         json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    assert manifest["repair_context_sha256"] == hashlib.sha256(
+        json.dumps(
+            request.repair_context, sort_keys=True, separators=(",", ":")
+        ).encode()
+    ).hexdigest()
     assert "passed" not in manifest and "correct" not in manifest
+
+
+def test_first_attempt_has_no_repair_context(tmp_path):
+    provider, calls = _provider(
+        tmp_path, ['{"candidate_source":{"source":"source"}}']
+    )
+    provider(_request(_cell()))
+
+    prompt = json.loads(calls[0]["request"]["messages"][1]["content"])
+    assert prompt["attempt"] == 1
+    assert "repair_context" not in prompt
+
+
+def test_retry_rejects_repair_context_not_bound_to_prior_evidence(tmp_path):
+    provider, calls = _provider(
+        tmp_path, ['{"candidate_source":{"source":"source"}}']
+    )
+    request = _request(_cell(), attempt=2)
+    changed = dict(request.repair_context)
+    changed["evidence_sha256"] = "9" * 64
+
+    with pytest.raises(ValueError, match="changed preceding evidence"):
+        provider(replace(request, repair_context=changed))
+    assert calls == []
 
 
 def test_kdb_query_is_agent_chosen_and_retains_validated_citations(tmp_path):

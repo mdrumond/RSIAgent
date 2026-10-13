@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import hashlib
 import json
 
 import pytest
@@ -89,7 +90,9 @@ def test_pass_is_host_owned_and_protocol_binds_full_treatment(tmp_path):
     assert terminal["status"] == "passed"
     assert terminal["completed_attempts"] == 1
     assert terminal["evidence_head_sha256"]
-    assert protocol["schema"] == "a5-catlass-phase2-live-protocol-v2"
+    assert protocol["schema"] == "a5-catlass-phase2-live-protocol-v3"
+    assert protocol["semantic_retry"]["preceding_attempt_only"] is True
+    assert protocol["semantic_retry"]["candidate_source_max_bytes"] == 256 * 1024
     assert protocol["identity"] == {
         "target_suite_sha256": destination.suite_sha256,
         "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
@@ -102,6 +105,7 @@ def test_pass_is_host_owned_and_protocol_binds_full_treatment(tmp_path):
     assert attempt["protocol_sha256"] == protocol["protocol_sha256"]
     assert calls[0].phase1_memory == snapshot.memory_entries()
     assert calls[0].phase2_memory == ()
+    assert calls[0].repair_context is None
     assert len(backend.calls) == 4
 
 
@@ -121,6 +125,19 @@ def test_failed_host_receipt_advances_memory_and_next_attempt(tmp_path):
     assert terminal["completed_attempts"] == 2
     assert len(source_calls) == 2
     assert source_calls[1].phase2_memory[0]["passed"] is False
+    repair = source_calls[1].repair_context
+    assert repair is not None
+    assert repair["prior_attempt"] == 1
+    assert repair["candidate_source"] == SOURCE + "\n# attempt 1\n"
+    assert repair["candidate_source_truncated"] is False
+    assert repair["candidate_sha256"] == source_calls[1].phase2_memory[0][
+        "candidate_sha256"
+    ]
+    assert repair["evidence_sha256"] == source_calls[1].phase2_memory[0][
+        "evidence_sha256"
+    ]
+    assert repair["host_evidence"] == source_calls[1].phase2_memory[0]
+    assert "repair the preceding candidate" in repair["instruction"]
     failed_case = source_calls[1].phase2_memory[0]["failed_cases"][0]
     assert failed_case == {
         "case_id": failed_case["case_id"],
@@ -173,6 +190,45 @@ def test_long_host_diagnostic_head_and_tail_reach_next_attempt(tmp_path):
     assert "\n...[truncated]...\n" in diagnostic
     assert diagnostic.endswith("dynamic loop value escaped its scope")
     assert len(diagnostic.encode("utf-8")) <= 512
+
+
+def test_retry_candidate_source_is_bounded_and_digest_bound(tmp_path):
+    _composition, _source, _destination, snapshot = _snapshot(tmp_path)
+    source_calls = []
+    backend = _Backend((False, True))
+    verifier = AttentionTargetVerifier(backend)
+    oversized = SOURCE + "\n# " + "x" * (300 * 1024)
+
+    def source(request):
+        source_calls.append(request)
+        try:
+            backend.passed = next(backend.outcomes)
+        except StopIteration:
+            pass
+        return oversized if request.attempt == 1 else SOURCE
+
+    dependencies = Phase2Dependencies(
+        snapshot.destination,
+        source,
+        lambda candidate, request, attempt, workdir: verifier.verify(
+            candidate, request_id=request, attempt_id=attempt,
+            execution_profile="bz-a5", workdir=workdir,
+        ),
+    )
+    terminal = Phase2LiveRunner(
+        phase2_root=tmp_path / "phase2", snapshot=snapshot,
+        dependencies=dependencies,
+    ).run()
+
+    assert terminal["status"] == "passed"
+    repair = source_calls[1].repair_context
+    assert repair is not None
+    assert repair["candidate_source_truncated"] is True
+    assert len(repair["candidate_source"].encode("utf-8")) <= 256 * 1024
+    assert repair["candidate_source_bytes"] == len(oversized.encode("utf-8"))
+    assert repair["candidate_context_sha256"] == hashlib.sha256(
+        repair["candidate_source"].encode("utf-8")
+    ).hexdigest()
 
 
 def test_exhausted_semantic_attempts_emit_failed_terminal(tmp_path):
