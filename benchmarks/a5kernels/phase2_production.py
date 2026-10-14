@@ -44,14 +44,12 @@ from benchmarks.a5kernels.phase2_attention_bz import (
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies
 from benchmarks.a5kernels.phase2_memory import (
     A5Phase1Snapshot,
+    QUALIFICATION_SCHEMA,
     admit_phase1_snapshot,
     phase2_cells,
 )
 from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider
 from benchmarks.a5kernels.production import _probe_knowledge_query, _transformers_cache
-
-
-QUALIFICATION_SCHEMA = "a5-catlass-phase2-transport-qualification-v1"
 
 
 @dataclass(frozen=True)

@@ -4,16 +4,50 @@ import json
 
 import pytest
 
-from benchmarks.a5kernels.evidence import canonical_bytes
+from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel
 from benchmarks.a5kernels.phase2_live import MAX_ATTEMPTS, Phase2LiveRunner
-from benchmarks.a5kernels.phase2_memory import phase2_cells
+from benchmarks.a5kernels.phase2_memory import QUALIFICATION_SCHEMA, phase2_cells
 from benchmarks.a5kernels.phase3_core import admit_phase2_lineage
 from tests.test_a5_phase2_live import _Backend, _deps
 from tests.test_a5_phase2_memory import _snapshot
 
 
-def _phase2(tmp_path, outcomes=(True,)):
+def _write_qualification(root, cell, runtime_revision="b" * 40):
+    provenance = [
+        ["catlass_revision", runtime_revision],
+        ["catlass_source", "/remote/catlass"],
+        ["execution_profile", "bz-a5"],
+        ["manifest_sha256", "a" * 64],
+    ]
+    case = {"case_id": "copy-v", "seed": 7}
+    output = [1.0, 2.0]
+    body = {
+        "schema": QUALIFICATION_SCHEMA,
+        "cell_id": cell.cell_id,
+        "catlass_source": "/remote/catlass",
+        "catlass_revision": cell.catlass_revision,
+        "runtime_catlass_revision": runtime_revision,
+        "runtime_provenance": provenance,
+        "physical_device": 3,
+        "case": case,
+        "case_sha256": canonical_digest(case),
+        "candidate_sha256": "c" * 64,
+        "input_sha256": "d" * 64,
+        "status": "transport-qualified",
+        "exit_code": 0,
+        "session_handle": "bz-a5:qualification",
+        "output": output,
+        "output_sha256": canonical_digest(output),
+        "metadata": [["result_exit_code", "0"]],
+    }
+    value = {**body, "record_sha256": canonical_digest(body)}
+    path = root / "cells" / cell.cell_id / "qualification.json"
+    path.write_bytes(canonical_bytes(value) + b"\n")
+    return path
+
+
+def _phase2(tmp_path, outcomes=(True,), runtime_revision="b" * 40):
     tmp_path.mkdir(parents=True, exist_ok=True)
     _composition, _source, _destination, snapshot = _snapshot(tmp_path)
     root = tmp_path / "phase2"
@@ -23,6 +57,7 @@ def _phase2(tmp_path, outcomes=(True,)):
         dependencies=_deps(snapshot, _Backend(outcomes), []),
     )
     terminal = runner.run()
+    _write_qualification(root, snapshot.destination, runtime_revision)
     return root, snapshot.destination, runner, terminal
 
 
@@ -37,6 +72,17 @@ def test_admission_freezes_only_authenticated_actor_visible_memory(tmp_path):
     assert frozen.manifest["phase2_status"] == "passed"
     assert frozen.manifest["phase1_entries"] == 8
     assert frozen.manifest["phase2_entries"] == 1
+    assert frozen.manifest["runtime_catlass_revision"] == "b" * 40
+    assert frozen.manifest["runtime_catlass_revision"] != cell.catlass_revision
+    assert dict(frozen.manifest["runtime_provenance"])["catlass_revision"] == (
+        "b" * 40
+    )
+    qualification = json.loads(
+        (root / "cells" / cell.cell_id / "qualification.json").read_text()
+    )
+    assert frozen.manifest["transport_qualification_sha256"] == (
+        qualification["record_sha256"]
+    )
     memory = frozen.actor_memory()
     assert memory["phase1"]
     assert memory["phase2"][0]["passed"] is True
@@ -48,6 +94,8 @@ def test_admission_freezes_only_authenticated_actor_visible_memory(tmp_path):
         memory["phase1"][0]["new"] = "mutation"
     with pytest.raises(TypeError):
         frozen.manifest["new"] = "mutation"
+    with pytest.raises(TypeError):
+        frozen.manifest["runtime_provenance"][0][1] = "mutation"
 
     reopened = type(frozen).open(frozen.root, cell)
     assert reopened.snapshot_id == frozen.snapshot_id
@@ -84,6 +132,39 @@ def test_admission_rejects_failed_and_non_openai_phase2(tmp_path):
     )
     with pytest.raises(ValueError, match="OpenAI"):
         admit_phase2_lineage(root, deepseek, tmp_path / "deepseek-p3")
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "rehash"),
+    [
+        ("record_sha256", "0" * 64, False),
+        ("cell_id", "a5-phase2-cell-0000000000000000", True),
+        ("runtime_catlass_revision", "c" * 40, True),
+        ("catlass_source", "/different/catlass", True),
+    ],
+)
+def test_admission_rejects_tampered_qualification(
+    tmp_path, field, replacement, rehash,
+):
+    root, cell, _runner, _terminal = _phase2(tmp_path)
+    path = root / "cells" / cell.cell_id / "qualification.json"
+    value = json.loads(path.read_text())
+    value[field] = replacement
+    if rehash:
+        body = {key: item for key, item in value.items() if key != "record_sha256"}
+        value["record_sha256"] = canonical_digest(body)
+    path.write_bytes(canonical_bytes(value) + b"\n")
+
+    with pytest.raises(ValueError, match="qualification"):
+        admit_phase2_lineage(root, cell, tmp_path / "phase3")
+
+
+def test_admission_rejects_missing_qualification(tmp_path):
+    root, cell, _runner, _terminal = _phase2(tmp_path)
+    (root / "cells" / cell.cell_id / "qualification.json").unlink()
+
+    with pytest.raises(ValueError, match="qualification"):
+        admit_phase2_lineage(root, cell, tmp_path / "phase3")
 
 
 @pytest.mark.parametrize("artifact", ["protocol", "memory", "candidate", "evidence"])

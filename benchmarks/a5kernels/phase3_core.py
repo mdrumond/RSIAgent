@@ -7,17 +7,24 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from types import MappingProxyType
 from typing import Mapping
 
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies, Phase2LiveRunner
-from benchmarks.a5kernels.phase2_memory import A5Phase1Snapshot, A5Phase2Cell
+from benchmarks.a5kernels.phase2_memory import (
+    A5Phase1Snapshot,
+    A5Phase2Cell,
+    QUALIFICATION_SCHEMA,
+)
 
 
 FROZEN_SCHEMA = "a5-catlass-phase3-frozen-memory-v1"
 MANIFEST_SCHEMA = "a5-catlass-phase3-frozen-manifest-v1"
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_REVISION = re.compile(r"[0-9a-f]{40}")
 
 
 def _sha256(value: bytes) -> str:
@@ -60,6 +67,86 @@ def _read_object(path: Path, label: str) -> dict[str, object]:
     return value
 
 
+def _qualification_provenance(
+    path: Path, cell: A5Phase2Cell,
+) -> tuple[str, bytes, tuple[tuple[str, str], ...]]:
+    """Validate the retained transport record without exposing its payload."""
+
+    try:
+        payload = path.read_bytes()
+        value = json.loads(payload)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid Phase 2 transport qualification") from exc
+    if not isinstance(value, dict):
+        raise ValueError("invalid Phase 2 transport qualification")
+    body = dict(value)
+    record_sha256 = body.pop("record_sha256", None)
+    required = {
+        "schema", "cell_id", "catlass_source", "catlass_revision",
+        "runtime_catlass_revision", "runtime_provenance", "physical_device",
+        "case", "case_sha256", "candidate_sha256", "input_sha256", "status",
+        "exit_code", "session_handle", "output", "output_sha256", "metadata",
+    }
+    legacy = required - {"runtime_catlass_revision"}
+    try:
+        provenance = tuple(tuple(item) for item in body["runtime_provenance"])
+        provenance_map = dict(provenance)
+        calculated_record_sha256 = canonical_digest(body)
+        output_sha256 = canonical_digest(body["output"])
+        case_sha256 = canonical_digest(body["case"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid Phase 2 transport qualification") from exc
+    runtime_revision = body.get(
+        "runtime_catlass_revision", body.get("catlass_revision")
+    )
+    metadata = body.get("metadata")
+    digests = (
+        record_sha256, body.get("case_sha256"), body.get("candidate_sha256"),
+        body.get("input_sha256"), body.get("output_sha256"),
+    )
+    if (
+        set(body) not in (required, legacy)
+        or body.get("schema") != QUALIFICATION_SCHEMA
+        or record_sha256 != calculated_record_sha256
+        or body.get("cell_id") != cell.cell_id
+        or body.get("catlass_revision") != cell.catlass_revision
+        or not isinstance(runtime_revision, str)
+        or _REVISION.fullmatch(runtime_revision) is None
+        or provenance_map.get("catlass_revision") != runtime_revision
+        or provenance_map.get("catlass_source") != body.get("catlass_source")
+        or provenance_map.get("execution_profile") != "bz-a5"
+        or len(provenance_map) != len(provenance)
+        or any(
+            len(item) != 2 or not all(isinstance(part, str) and part for part in item)
+            for item in provenance
+        )
+        or not isinstance(body.get("catlass_source"), str)
+        or not body["catlass_source"].startswith("/")
+        or isinstance(body.get("physical_device"), bool)
+        or not isinstance(body.get("physical_device"), int)
+        or body["physical_device"] < 0
+        or body.get("status") != "transport-qualified"
+        or body.get("exit_code") != 0
+        or not isinstance(body.get("session_handle"), str)
+        or not body["session_handle"].startswith("bz-a5:")
+        or not isinstance(body.get("case"), dict)
+        or body.get("case_sha256") != case_sha256
+        or not isinstance(body.get("output"), list)
+        or body.get("output_sha256") != output_sha256
+        or any(not isinstance(item, str) or _SHA256.fullmatch(item) is None
+               for item in digests)
+        or not isinstance(metadata, list)
+        or any(
+            not isinstance(item, list) or len(item) != 2
+            or not all(isinstance(part, str) for part in item)
+            for item in metadata
+        )
+    ):
+        raise ValueError("invalid Phase 2 transport qualification")
+    assert isinstance(record_sha256, str)
+    return record_sha256, payload, provenance
+
+
 @dataclass(frozen=True)
 class Phase3FrozenMemory:
     """Immutable, Actor-visible memory copied from one passed Phase 2 cell."""
@@ -87,7 +174,9 @@ class Phase3FrozenMemory:
             "schema", "source_cell", "phase2_status", "phase1_entries",
             "phase2_entries", "actor_memory_sha256", "source_snapshot_id",
             "source_protocol_sha256", "source_terminal_sha256",
-            "source_memory_sha256",
+            "source_memory_sha256", "transport_qualification_sha256",
+            "qualification_artifact_sha256", "runtime_catlass_revision",
+            "runtime_provenance",
         }
         if (
             set(body) != required
@@ -159,6 +248,12 @@ def admit_phase2_lineage(
     if terminal is None or terminal.get("status") != "passed":
         raise ValueError("Phase 3 requires an authenticated passed Phase 2 terminal")
 
+    qualification_sha256, qualification_bytes, provenance = (
+        _qualification_provenance(
+            cell_root / "qualification.json", cell
+        )
+    )
+
     protocol_bytes = runner.protocol_path.read_bytes()
     memory_bytes = runner.memory_path.read_bytes()
     terminal_bytes = runner.terminal_path.read_bytes()
@@ -187,6 +282,10 @@ def admit_phase2_lineage(
         "source_protocol_sha256": _sha256(protocol_bytes),
         "source_terminal_sha256": _sha256(terminal_bytes),
         "source_memory_sha256": _sha256(memory_bytes),
+        "transport_qualification_sha256": qualification_sha256,
+        "qualification_artifact_sha256": _sha256(qualification_bytes),
+        "runtime_catlass_revision": dict(provenance)["catlass_revision"],
+        "runtime_provenance": provenance,
     }
     manifest = {**body, "snapshot_id": canonical_digest(body)}
     root = Path(phase3_root).resolve() / "lineages" / cell.cell_id
