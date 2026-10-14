@@ -50,7 +50,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    *,
+    builder=build_adaptive_phase1,
+    environment_loader=load_direct_environment,
+    embedding_factory=PinnedBGEEmbeddings,
+) -> None:
     args = _parser().parse_args(argv)
     guide = admit_programming_guide(
         args.guide,
@@ -67,10 +73,10 @@ def main(argv: list[str] | None = None) -> None:
     if cell.knowledge is KnowledgeMode.WITH_KDB:
         if args.bge_cache is None:
             raise ValueError("KDB-on CLI requires --bge-cache")
-        embeddings = PinnedBGEEmbeddings(
+        embeddings = embedding_factory(
             cache_dir=_transformers_cache(args.bge_cache)
         )
-    campaign = build_adaptive_phase1(
+    campaign = builder(
         cell=cell,
         paths=AdaptiveProductionPaths(
             args.root,
@@ -83,7 +89,8 @@ def main(argv: list[str] | None = None) -> None:
         ),
         objective=args.objective,
         initial_memory=args.initial_memory.read_bytes(),
-        environment=load_direct_environment(env_file=args.env_file),
+        guide_bytes=args.guide.read_bytes(),
+        environment=environment_loader(env_file=args.env_file),
         embeddings=embeddings,
         max_parallel=args.max_parallel,
     )

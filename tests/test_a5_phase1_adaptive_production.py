@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +16,8 @@ from benchmarks.a5kernels.phase1_adaptive_production import (
     AdaptiveProductionPaths,
     build_adaptive_phase1,
 )
+import benchmarks.a5kernels.phase1_adaptive_production as production
+from benchmarks.a5kernels.phase1_adaptive_cli import main as cli_main
 from benchmarks.a5kernels.phase1_experiments import (
     KnowledgeMode,
     ProfilingGuidance,
@@ -21,6 +26,9 @@ from benchmarks.a5kernels.phase1_experiments import (
 )
 from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend
 from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletion
+
+
+GUIDE_BYTES = b"Pinned Catlass DSL programming guide.\n"
 
 
 class FakeCommandExecutor:
@@ -46,7 +54,8 @@ class FakeEmbeddings:
 
 def _guide():
     return ProgrammingGuideIdentity(
-        "catlass-dsl-programming-guide-v1", "b" * 64, "c" * 40,
+        "catlass-dsl-programming-guide-v1", hashlib.sha256(GUIDE_BYTES).hexdigest(),
+        "c" * 40,
         "9a6ac627b5f4078060287844189730cf0d184800",
     )
 
@@ -80,10 +89,11 @@ def _build(tmp_path, cell, **kwargs):
         cell=cell,
         paths=_paths(tmp_path, **kwargs.pop("path_changes", {})),
         objective="Learn one generic elementwise Catlass capability.",
-        initial_memory=b"",
+        initial_memory=kwargs.pop("initial_memory", b""),
+        guide_bytes=kwargs.pop("guide_bytes", GUIDE_BYTES),
         environment={"OPENAI_API_KEY": "x", "DEEPSEEK_API_KEY": "y"},
         provider_transport=_provider_transport,
-        command_executor=FakeCommandExecutor(),
+        command_executor=kwargs.pop("command_executor", FakeCommandExecutor()),
         **kwargs,
     )
 
@@ -109,7 +119,7 @@ def test_selected_model_uses_its_registered_direct_provider_route(tmp_path):
 
     campaign = build_adaptive_phase1(
         cell=_cell(), paths=_paths(tmp_path), objective="Learn one project.",
-        initial_memory=b"", environment={
+        initial_memory=b"", guide_bytes=GUIDE_BYTES, environment={
             "OPENAI_API_KEY": "openai-secret", "DEEPSEEK_API_KEY": "deepseek-secret",
         }, provider_transport=transport, command_executor=FakeCommandExecutor(),
     )
@@ -119,6 +129,128 @@ def test_selected_model_uses_its_registered_direct_provider_route(tmp_path):
     assert calls[0]["base_url"] == "https://api.openai.com/v1"
     assert calls[0]["request"]["model"] == "gpt-5.6-sol"
     assert calls[0]["api_key"] == "openai-secret"
+
+
+def _checked_wrappers(tmp_path):
+    paths = _paths(tmp_path)
+    for wrapper in (
+        paths.validation_wrapper, paths.upload_wrapper, paths.session_wrapper,
+    ):
+        wrapper.parent.mkdir(parents=True, exist_ok=True)
+        wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+        wrapper.chmod(0o755)
+    return paths
+
+
+def test_default_backend_proves_provenance_then_device_before_provider(tmp_path, monkeypatch):
+    events = []
+    paths = _checked_wrappers(tmp_path)
+
+    class Checked(FakeCommandExecutor):
+        def __init__(self, **_kwargs):
+            events.append("construct-command")
+
+        @property
+        def runtime_provenance(self):
+            events.append("provenance")
+            return (
+                ("catlass_revision", paths.catlass_revision),
+                ("catlass_source", paths.catlass_source),
+                ("execution_profile", "bz-a5"),
+            )
+
+        def probe_device(self, device):
+            events.append(("device", device))
+
+    real_provider = production.DirectCompletionProvider
+
+    class Provider(real_provider):
+        def __init__(self, *args, **kwargs):
+            events.append("provider")
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(production, "CatlassValidationExecutor", Checked)
+    monkeypatch.setattr(production, "DirectCompletionProvider", Provider)
+
+    build_adaptive_phase1(
+        cell=_cell(), paths=paths, objective="Learn.", initial_memory=b"",
+        guide_bytes=GUIDE_BYTES,
+        environment={"OPENAI_API_KEY": "x", "DEEPSEEK_API_KEY": "y"},
+        provider_transport=_provider_transport,
+    )
+
+    assert events == [
+        "construct-command", "provenance", ("device", 2), "provider",
+    ]
+
+
+def test_default_backend_rejects_mismatched_provenance_before_provider(tmp_path, monkeypatch):
+    paths = _checked_wrappers(tmp_path)
+
+    class Mismatched(FakeCommandExecutor):
+        def __init__(self, **_kwargs):
+            pass
+
+        runtime_provenance = (
+            ("catlass_revision", "f" * 40),
+            ("catlass_source", "/wrong/source"),
+            ("execution_profile", "bz-a5"),
+        )
+
+        def probe_device(self, _device):
+            raise AssertionError("mismatched provenance must fail before device probe")
+
+    monkeypatch.setattr(production, "CatlassValidationExecutor", Mismatched)
+    monkeypatch.setattr(
+        production, "DirectCompletionProvider",
+        lambda *_args, **_kwargs: pytest.fail("provider constructed before preflight"),
+    )
+
+    with pytest.raises(RuntimeError, match="does not match"):
+        build_adaptive_phase1(
+            cell=_cell(), paths=paths, objective="Learn.", initial_memory=b"",
+            guide_bytes=GUIDE_BYTES,
+            environment={"OPENAI_API_KEY": "x", "DEEPSEEK_API_KEY": "y"},
+        )
+
+
+def test_injected_command_executor_is_not_preflighted(tmp_path):
+    class Injected(FakeCommandExecutor):
+        @property
+        def runtime_provenance(self):
+            raise AssertionError("injected seam must remain lazy")
+
+        def probe_device(self, _device):
+            raise AssertionError("injected seam must not be probed")
+
+    _build(tmp_path, _cell(), command_executor=Injected())
+
+
+def test_initial_context_binds_exact_guide_user_memory_and_guidance(tmp_path):
+    user_memory = b'{"prior":"host-owned"}'
+    control = _build(tmp_path / "control", _cell(), initial_memory=user_memory)
+    treatment = _build(
+        tmp_path / "treatment",
+        _cell(profiling=ProfilingGuidance.WITH_GUIDANCE),
+        initial_memory=user_memory,
+    )
+    control_context = json.loads(control.coordinator.initial_memory)
+    treatment_context = json.loads(treatment.coordinator.initial_memory)
+
+    assert control_context["programming_guide"] == treatment_context["programming_guide"]
+    assert base64.b64decode(control_context["programming_guide"]["base64"]) == GUIDE_BYTES
+    assert control_context["programming_guide"]["text"].encode() == GUIDE_BYTES
+    assert control_context["programming_guide"]["sha256"] == _guide().guide_sha256
+    assert base64.b64decode(control_context["user_initial_memory"]["base64"]) == user_memory
+    assert control_context["profiling_guidance"] is None
+    assert treatment_context["profiling_guidance"] == A5_PROFILING_GUIDANCE
+    assert control.project_actor.immutable_context == control.coordinator.initial_memory
+    assert treatment.project_actor.immutable_context == treatment.coordinator.initial_memory
+
+
+def test_guide_identity_mismatch_fails_before_composition(tmp_path):
+    with pytest.raises(ValueError, match="guide bytes"):
+        _build(tmp_path, _cell(), guide_bytes=b"different guide")
 
 
 def test_control_treatments_are_explicitly_disabled(tmp_path):
@@ -211,3 +343,48 @@ def test_resume_and_report_delegate_to_same_retained_coordinator(tmp_path, monke
     assert campaign.resume() == expected
     assert campaign.report() == expected
     assert calls == ["resume", "report"]
+
+
+@pytest.mark.parametrize("action", ["run", "resume", "report"])
+def test_cli_wires_each_action_to_the_production_factory(
+    tmp_path, capsys, action,
+):
+    guide_path = tmp_path / "guide.md"
+    guide_path.write_bytes(GUIDE_BYTES)
+    memory_path = tmp_path / "memory.json"
+    memory_path.write_bytes(b'{"prior":1}')
+    captured = {}
+
+    class Campaign:
+        def __getattr__(self, name):
+            return lambda: {"action": name, "status": "ok"}
+
+    def builder(**kwargs):
+        captured.update(kwargs)
+        return Campaign()
+
+    cli_main([
+        action,
+        "--root", str(tmp_path / "results"),
+        "--objective", "Learn exactly one generic project.",
+        "--initial-memory", str(memory_path),
+        "--guide", str(guide_path),
+        "--cpl-skills-revision", "c" * 40,
+        "--tla-root", str(tmp_path),
+        "--catlass-source", "/opt/catlass",
+        "--catlass-revision", "9a6ac627b5f4078060287844189730cf0d184800",
+        "--model", "openai/gpt-5.6-sol",
+        "--knowledge", "without-kdb",
+        "--profiling", "with-profiling-guidance",
+        "--device", "3",
+        "--max-parallel", "2",
+        "--env-file", str(tmp_path / ".env"),
+    ], builder=builder, environment_loader=lambda **_kwargs: {"loaded": "env"})
+
+    assert json.loads(capsys.readouterr().out) == {"action": action, "status": "ok"}
+    assert captured["guide_bytes"] == GUIDE_BYTES
+    assert captured["initial_memory"] == b'{"prior":1}'
+    assert captured["environment"] == {"loaded": "env"}
+    assert captured["cell"].profiling is ProfilingGuidance.WITH_GUIDANCE
+    assert captured["paths"].device == 3
+    assert captured["max_parallel"] == 2

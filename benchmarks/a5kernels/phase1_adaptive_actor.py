@@ -365,6 +365,7 @@ class AdaptiveActorProjectExecutor:
         *, max_actions: int = 40, max_source_bytes: int = 128_000,
         query_knowledge: ActionDependency | None = None,
         request_profile: ActionDependency | None = None,
+        immutable_context: bytes = b"",
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
@@ -372,6 +373,12 @@ class AdaptiveActorProjectExecutor:
             raise ValueError("max_actions must be in [1, 40]")
         if type(max_source_bytes) is not int or max_source_bytes < 1:
             raise ValueError("max_source_bytes must be positive")
+        if not isinstance(immutable_context, bytes):
+            raise TypeError("immutable context must be bytes")
+        try:
+            immutable_context.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("immutable context must be UTF-8") from exc
         self.executor = executor
         self.actor = actor
         self.profile = profile
@@ -383,6 +390,7 @@ class AdaptiveActorProjectExecutor:
         self.request_profile = (
             disabled_profile_action if request_profile is None else request_profile
         )
+        self.immutable_context = immutable_context
         if not callable(self.query_knowledge) or not callable(self.request_profile):
             raise TypeError("adaptive action dependencies must be callable")
 
@@ -409,6 +417,11 @@ class AdaptiveActorProjectExecutor:
             "sha256": memory_sha256,
             "base64": base64.b64encode(request.pre_wave_memory).decode("ascii"),
         }, sort_keys=True, separators=(",", ":"))
+        if self.immutable_context:
+            opening += (
+                "\nProduction context (immutable, identical for every project): "
+                + self.immutable_context.decode("utf-8")
+            )
         outcome = self.actor(
             opening, profile=self.profile, workspace=root / "actor",
             context=artifacts.objects / memory_sha256[:2] / memory_sha256[2:],
