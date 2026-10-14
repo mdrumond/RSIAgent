@@ -173,6 +173,9 @@ def test_factory_binds_registered_direct_actor_checked_backend_and_coordinator(t
     assert isinstance(campaign.coordinator, AdaptivePhase1Coordinator)
     assert campaign.coordinator.max_parallel == 1
     assert campaign.backend._device == 2
+    assert str(_paths(tmp_path).collection_wrapper).endswith(
+        ".agents/skills/ascend-profiling/scripts/collect_profile.sh"
+    )
     assert campaign.coordinator.execute_project is campaign.project_actor
     assert campaign.coordinator.curriculum.unavailable_capabilities == ()
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
 import os
 from pathlib import Path
@@ -67,10 +67,14 @@ class AdaptiveProductionPaths:
     device: int = 0
     kdb: Path | None = None
     collection: str | None = None
+    profiling_skill_root: Path = field(
+        default_factory=lambda: Path.home() / ".agents/skills/ascend-profiling",
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", Path(self.root))
         object.__setattr__(self, "tla_root", Path(self.tla_root))
+        object.__setattr__(self, "profiling_skill_root", Path(self.profiling_skill_root))
         if self.kdb is not None:
             object.__setattr__(self, "kdb", Path(self.kdb))
         if not self.catlass_source.startswith("/"):
@@ -91,6 +95,10 @@ class AdaptiveProductionPaths:
     @property
     def session_wrapper(self) -> Path:
         return self.tla_root / "execution-profiles/bz-a5/session.sh"
+
+    @property
+    def collection_wrapper(self) -> Path:
+        return self.profiling_skill_root / "scripts/collect_profile.sh"
 
 
 @dataclass(frozen=True)
@@ -355,7 +363,7 @@ def build_adaptive_phase1(
         BZProfileBackend(
             validation_wrapper=str(paths.validation_wrapper),
             session_wrapper=str(paths.session_wrapper),
-            collection_wrapper=str(paths.tla_root / "execution-profiles/bz-a5/collect_profile.sh"),
+            collection_wrapper=str(paths.collection_wrapper),
             catlass_source=paths.catlass_source,
             evidence_directory=str(paths.root / "measurement-evidence"),
         ),
