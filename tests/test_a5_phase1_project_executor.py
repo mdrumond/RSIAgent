@@ -126,6 +126,10 @@ def test_executor_materializes_each_generic_family_without_benchmark_adapter(
     assert prepared.abi.signature in prepared.instruction
     assert spec.project_id in prepared.instruction
     assert "host-owned oracle" in prepared.instruction
+    assert "tensor.origin_shape is the PHYSICAL shape" in prepared.instruction
+    assert "LOGICAL_INPUT_SHAPES and LOGICAL_OUTPUT_SHAPE for computation bounds" in prepared.instruction
+    assert "output padding must be zero" in prepared.instruction
+    assert "Input padding contains nonzero sentinels" in prepared.instruction
     assert "expected_values" not in prepared.instruction
     assert "bsa" not in prepared.instruction.lower()
     assert "gdm" not in prepared.instruction.lower()
