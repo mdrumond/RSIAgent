@@ -258,7 +258,7 @@ class Phase2SourceProvider:
                     transcript.append(summary)
                     self._commit(
                         root, source, binding, profile.identity.as_dict(),
-                        tokens, transcript, queries,
+                        tokens, transcript, queries, messages,
                     )
                     return source
 
@@ -410,6 +410,7 @@ class Phase2SourceProvider:
         root: Path, source: str, binding: Mapping[str, object],
         provider_identity: Mapping[str, object], tokens: int,
         transcript: list[dict[str, object]], queries: list[dict[str, object]],
+        messages: list[dict[str, str]],
     ) -> None:
         source_bytes = source.encode("utf-8")
         body = {
@@ -420,6 +421,7 @@ class Phase2SourceProvider:
             "turns": len(transcript),
             "knowledge_queries": queries,
             "transcript": transcript,
+            "messages": messages,
             "candidate_sha256": _sha256(source_bytes),
         }
         manifest = {**body, "record_sha256": canonical_digest(body)}
@@ -461,6 +463,24 @@ class Phase2SourceProvider:
         ):
             raise ValueError("completed provider evidence changed")
         return source
+
+    def conversation(self, cell_id: str, attempt_id: str) -> tuple[Mapping[str, str], ...]:
+        """Read the exact retained provider conversation for SFT trace capture."""
+        manifest = json.loads(
+            (self.evidence_root / cell_id / attempt_id / "provider.json").read_bytes()
+        )
+        messages = manifest.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("provider conversation is unavailable")
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"role", "content"}
+            or item["role"] not in {"system", "user", "assistant"}
+            or not isinstance(item["content"], str)
+            for item in messages
+        ):
+            raise ValueError("provider conversation is invalid")
+        return tuple(dict(item) for item in messages)
 
 
 __all__ = ["PROVIDER_SCHEMA", "Phase2SourceProvider"]

@@ -245,7 +245,10 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(t
         '{"submit":{}}',
         NO_NEW_DISTILLATION,
     ], calls)
-    actor = DirectActorDriver(provider)
+    trace_events = []
+    actor = DirectActorDriver(
+        provider, trace_event=lambda kind, payload: trace_events.append((kind, payload))
+    )
     seen = []
 
     def execute(action):
@@ -273,6 +276,15 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(t
     assert seen == ["write", "submit"]
     assert outcome.iterations == 3
     assert outcome.tokens == 6
+    assert trace_events[0] == (
+        "message", {"role": "system", "content": _SYSTEM_PROMPT}
+    )
+    assert trace_events[1] == (
+        "message", {"role": "user", "content": "instruction"}
+    )
+    assert trace_events[-1] == (
+        "terminal", {"status": "done", "admitted_artifacts": {}}
+    )
     second_request = calls[1]["request"]["messages"]
     assert json.loads(second_request[-1]["content"])["host"]["event"] == "invalid-action"
     assert calls[2]["request"]["messages"][-1] == {
@@ -433,7 +445,7 @@ def test_distillation_correction_stops_after_three_invalid_responses():
      "distillation response", "compile"),
     (_distillation(evidence="b" * 64), "admitted artifact", "compile"),
     (_distillation(category="correctness"), "correctness", "compile"),
-    (_distillation(category="performance"), "performance", "profiling"),
+    (_distillation(category="performance"), "performance", "compile"),
 ])
 def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match, role):
     # The last case deliberately admits only compile evidence, which cannot

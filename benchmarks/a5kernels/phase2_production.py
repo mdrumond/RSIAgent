@@ -48,6 +48,7 @@ from benchmarks.a5kernels.phase2_memory import (
     phase2_cells,
 )
 from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider
+from benchmarks.a5kernels.sft_dataset import SourceManifest, TraceRecorder
 from benchmarks.a5kernels.production import _probe_knowledge_query, _transformers_cache
 
 
@@ -403,6 +404,31 @@ def build_phase2_production(
         profiling_guidance=guidance,
     )
     verifier = AttentionTargetVerifier(backend)
+    source_manifest = SourceManifest.load(
+        Path(__file__).parents[2] / "config/a5/sft-source-manifest.json"
+    )
+
+    def retain_sft_trace(request, candidate, evidence):
+        recorder = TraceRecorder(
+            config.phase2_root.resolve() / "sft-traces" / f"{request.attempt_id}.jsonl",
+            trace_id=request.attempt_id,
+            phase="phase2",
+            round_id=f"p2-{snapshot.snapshot_id[:16]}",
+            operator_family="attention",
+            model=cell.model.profile_id,
+            source_manifest_sha256=source_manifest.sha256,
+        )
+        for message in source.conversation(cell.cell_id, request.attempt_id):
+            recorder.message(message["role"], message["content"])
+        recorder.candidate(candidate, candidate_id=request.attempt_id)
+        recorder.validation(
+            candidate_id=request.attempt_id,
+            validator="bz-a5-attention-suite",
+            status="passed" if evidence.passed else "failed",
+            evidence_sha256=evidence.evidence_sha256,
+        )
+        recorder.finish()
+
     return snapshot, Phase2Dependencies(
         cell,
         source,
@@ -413,6 +439,7 @@ def build_phase2_production(
             execution_profile="bz-a5",
             workdir=workdir,
         ),
+        retain_sft_trace,
     )
 
 
