@@ -9,6 +9,7 @@ from benchmarks.a5kernels.phase1_curriculum_selector import (
     CurriculumAgent,
     CurriculumContext,
     CurriculumSession,
+    ProjectInformation,
     PriorOutcome,
     TerminalDecision,
     WaveDecision,
@@ -31,9 +32,31 @@ def project(project_id="movement", capabilities=None, **updates):
         "timing_lengths": [],
         "profile_metric": None,
         "hypothesis": "Host evidence will test one reusable Catlass behavior.",
+        "graph": {
+            "inputs": [{"name": "x", "shape": [257]}],
+            "nodes": [
+                {"name": "y", "op": "copy", "operands": ["x"], "axis": None},
+            ],
+            "output": "y",
+        },
     }
     value.update(updates)
     return value
+
+
+def with_shape(item, shape):
+    item = dict(item)
+    item["shape"] = list(shape)
+    item["graph"] = {
+        "inputs": [{"name": "x", "shape": list(shape)}],
+        "nodes": [{"name": "y", "op": "copy", "operands": ["x"], "axis": None}],
+        "output": "y",
+    }
+    return item
+
+
+def outcome(item, project_id="old"):
+    return PriorOutcome(project_id, ProjectInformation.from_project(item), True, "verified")
 
 
 def wave(projects, *, coverage=(), memory=MEMORY, wave_id="wave-001"):
@@ -60,7 +83,7 @@ def context(**updates):
 def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_grammar():
     prior_spec = project("prior")
     prior = PriorOutcome(
-        "prior", project_information_sha256(prior_spec), True,
+        "prior", ProjectInformation.from_project(prior_spec), True,
         "Movement passed host verification.",
     )
     calls = []
@@ -76,7 +99,8 @@ def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_gr
     assert isinstance(decision, TerminalDecision)
     assert all(term in prompt for term in (
         "Learn reusable Catlass", "gm-ub-movement", "Movement passed",
-        "timing_lengths", "DECISION: WAVE", "DECISION: SATURATED",
+        "timing_lengths", '"graph"', '"copy"',
+        "DECISION: WAVE", "DECISION: SATURATED",
     ))
     assert all(term not in prompt.lower() for term in (
         "openai", "deepseek", "temperature", "api_key",
@@ -101,9 +125,7 @@ def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
     next_context = context(
         wave_index=2,
         pre_wave_coverage=(Capability.GM_UB_MOVEMENT,),
-        prior_outcomes=(PriorOutcome(
-            "movement", project_information_sha256(project()), True, "verified",
-        ),),
+        prior_outcomes=(outcome(project(), "movement"),),
     )
     second, session = agent.select(next_context, session)
     assert isinstance(second, TerminalDecision)
@@ -136,28 +158,94 @@ def test_held_out_names_and_unsupported_payloads_are_rejected(bad_project):
 
 def test_rejects_repeats_no_information_and_sibling_dependencies():
     item = project()
-    prior = PriorOutcome("old", project_information_sha256(item), True, "verified")
+    prior = outcome(item)
     with pytest.raises(ValueError, match="repeats prior information"):
         CurriculumAgent(lambda _: wave([item])).select(context(prior_outcomes=(prior,)))
 
-    with pytest.raises(ValueError, match="new coverage"):
-        CurriculumAgent(lambda _: wave([project(
-            capabilities=["gm-ub-movement"], shape=[513]
-        )], coverage=["gm-ub-movement"])).select(context(
-            pre_wave_coverage=(Capability.GM_UB_MOVEMENT,)
+    no_information = project("retuned", block_count=2)
+    with pytest.raises(ValueError, match="repeats prior information"):
+        CurriculumAgent(lambda _: wave([no_information], coverage=[
+            "gm-ub-movement"
+        ])).select(context(
+            pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), prior_outcomes=(prior,)
         ))
 
     response = json.loads(wave([project()]).split("\n", 1)[1])
     response["projects"].append({
-        "spec": project("consumer", ["simt-mask"]),
+        "spec": project("consumer", ["simt-mask"], graph={
+            "inputs": [{"name": "x", "shape": [257]}],
+            "nodes": [{
+                "name": "y", "op": "mask-positive", "operands": ["x"], "axis": None,
+            }],
+            "output": "y",
+        }),
         "requires": ["gm-ub-movement"],
     })
     with pytest.raises(ValueError, match="pre-wave coverage"):
         CurriculumAgent(lambda _: "DECISION: WAVE\n" + json.dumps(response)).select(context())
 
 
+@pytest.mark.parametrize("item", [
+    with_shape(project("new-shape"), [513]),
+    project("new-dtype", dtype="float16"),
+    project(
+        "new-operation", ["simd-vector"],
+        graph={
+            "inputs": [{"name": "x", "shape": [257]}],
+            "nodes": [{"name": "y", "op": "relu", "operands": ["x"], "axis": None}],
+            "output": "y",
+        },
+    ),
+    project(
+        "new-failure", ["gm-ub-movement", "failure-repair"],
+        failure_mode="compile",
+    ),
+    project(
+        "new-profile", ["gm-ub-movement", "profiling"],
+        profile_metric="timeline",
+    ),
+    project(
+        "new-timing-shapes", ["gm-ub-movement", "timing-sweep"],
+        timing_lengths=[64, 128],
+    ),
+])
+def test_information_gain_uses_executable_dimensions_not_capability_names(item):
+    prior = outcome(project())
+    decision, _ = CurriculumAgent(lambda _: wave([item], coverage=[
+        "gm-ub-movement"
+    ])).select(context(
+        pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), prior_outcomes=(prior,)
+    ))
+    assert isinstance(decision, WaveDecision)
+
+
+def test_missing_or_invalid_graph_is_rejected_without_compatibility_default():
+    missing = project()
+    missing.pop("graph")
+    invalid = project(graph={
+        "inputs": [{"name": "x", "shape": [257]}],
+        "nodes": [{"name": "y", "op": "unknown", "operands": ["x"], "axis": None}],
+        "output": "y",
+    })
+    for item in (missing, invalid):
+        with pytest.raises(ValueError):
+            CurriculumAgent(lambda _, item=item: wave([item])).select(context())
+
+
 def test_host_private_held_out_signature_is_rejected_without_entering_prompt():
-    item = project("generic-cube", ["cube-tiling"], shape=[64, 64])
+    item = project(
+        "generic-cube", ["cube-tiling"], shape=[64, 64],
+        graph={
+            "inputs": [
+                {"name": "a", "shape": [64, 64]},
+                {"name": "b", "shape": [64, 64]},
+            ],
+            "nodes": [
+                {"name": "c", "op": "matmul", "operands": ["a", "b"], "axis": None},
+            ],
+            "output": "c",
+        },
+    )
     signature = project_information_sha256(item)
     seen = []
 
@@ -173,7 +261,7 @@ def test_host_private_held_out_signature_is_rejected_without_entering_prompt():
 def test_scripted_multi_wave_proof_grows_coverage_then_saturates():
     replies = iter([
         wave([project()]),
-        wave([project("tail", ["padded-tail"], shape=[259])],
+        wave([with_shape(project("new-shape"), [259])],
              coverage=["gm-ub-movement"], wave_id="wave-002"),
         "DECISION: SATURATED\n" + json.dumps({"reason": "requested coverage achieved"}),
     ])
@@ -190,15 +278,15 @@ def test_scripted_multi_wave_proof_grows_coverage_then_saturates():
         learned = decision.wave.projects[0].spec.capabilities[-1]
         ctx = context(
             wave_index=ctx.wave_index + 1,
-            pre_wave_coverage=ctx.pre_wave_coverage + (learned,),
+            pre_wave_coverage=tuple(dict.fromkeys(ctx.pre_wave_coverage + (learned,))),
             prior_outcomes=ctx.prior_outcomes + (PriorOutcome(
                 decision.wave.projects[0].spec.project_id,
-                project_information_sha256(decision.wave.projects[0].spec),
+                ProjectInformation.from_project(decision.wave.projects[0].spec),
                 True, "host-verified synthetic proof outcome",
             ),),
         )
     assert observed == [(), (Capability.GM_UB_MOVEMENT,)]
     assert ctx.pre_wave_coverage == (
-        Capability.GM_UB_MOVEMENT, Capability.PADDED_TAIL,
+        Capability.GM_UB_MOVEMENT,
     )
     assert session.turns == 3

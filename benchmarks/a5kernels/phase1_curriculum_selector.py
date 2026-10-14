@@ -21,6 +21,7 @@ from benchmarks.a5kernels.phase1_curriculum import (
     ProjectSpec,
     WaveSpec,
 )
+from benchmarks.a5kernels.phase1_project import ProjectOp
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -38,26 +39,88 @@ def _digest(value: object, field: str) -> str:
 
 
 def project_information_sha256(value: ProjectSpec | Mapping[str, object]) -> str:
-    """Identify executable information while ignoring labels and prose."""
+    """Identify the admitted information dimensions, not labels or tuning."""
 
-    spec = value if isinstance(value, ProjectSpec) else ProjectSpec.from_mapping(value)
-    body = spec.as_dict()
-    body.pop("project_id")
-    body.pop("hypothesis")
-    return canonical_digest(body)
+    return canonical_digest(ProjectInformation.from_project(value).as_dict())
+
+
+@dataclass(frozen=True)
+class ProjectInformation:
+    """Dimensions on which a project can add reusable curriculum coverage."""
+
+    operations: tuple[ProjectOp, ...]
+    shapes: tuple[tuple[int, ...], ...]
+    dtype: DType
+    failure_mode: FailureMode
+    profile_metric: ProfileMetric | None
+
+    @classmethod
+    def from_project(
+        cls, value: ProjectSpec | Mapping[str, object],
+    ) -> "ProjectInformation":
+        spec = value if isinstance(value, ProjectSpec) else ProjectSpec.from_mapping(value)
+        return cls(
+            tuple(sorted({node.op for node in spec.graph.nodes}, key=lambda item: item.value)),
+            tuple(sorted({
+                spec.shape,
+                *(item.shape for item in spec.graph.inputs),
+                spec.graph.output_shape,
+                *((length,) for length in spec.timing_lengths),
+            })),
+            spec.dtype,
+            spec.failure_mode,
+            spec.profile_metric,
+        )
+
+    def __post_init__(self) -> None:
+        if not self.operations or any(
+            not isinstance(item, ProjectOp) for item in self.operations
+        ) or tuple(sorted(set(self.operations), key=lambda item: item.value)) != self.operations:
+            raise ValueError("information operations must be unique and canonical")
+        if not self.shapes or tuple(sorted(set(self.shapes))) != self.shapes:
+            raise ValueError("information shapes must be unique and canonical")
+        if not isinstance(self.dtype, DType) or not isinstance(
+            self.failure_mode, FailureMode
+        ) or self.profile_metric is not None and not isinstance(
+            self.profile_metric, ProfileMetric
+        ):
+            raise ValueError("information dimensions must use registered values")
+
+    @property
+    def tokens(self) -> frozenset[tuple[str, str]]:
+        rows = {
+            *(('operation', item.value) for item in self.operations),
+            *(('shape', 'x'.join(map(str, item))) for item in self.shapes),
+            ('dtype', self.dtype.value),
+            ('failure', self.failure_mode.value),
+            ('profile', 'none' if self.profile_metric is None else self.profile_metric.value),
+        }
+        return frozenset(rows)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "operations": [item.value for item in self.operations],
+            "shapes": [list(item) for item in self.shapes],
+            "dtype": self.dtype.value,
+            "failure_mode": self.failure_mode.value,
+            "profile_metric": (
+                None if self.profile_metric is None else self.profile_metric.value
+            ),
+        }
 
 
 @dataclass(frozen=True)
 class PriorOutcome:
     project_id: str
-    information_sha256: str
+    information: ProjectInformation
     verified: bool
     summary: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.project_id, str) or not self.project_id:
             raise ValueError("prior project_id must be non-empty")
-        _digest(self.information_sha256, "prior information identity")
+        if not isinstance(self.information, ProjectInformation):
+            raise ValueError("prior information must contain admitted dimensions")
         if type(self.verified) is not bool:
             raise ValueError("prior verified must be boolean")
         if (
@@ -73,7 +136,12 @@ class PriorOutcome:
             "project_id": self.project_id,
             "verified": self.verified,
             "summary": self.summary,
+            "information": self.information.as_dict(),
         }
+
+    @property
+    def information_sha256(self) -> str:
+        return canonical_digest(self.information.as_dict())
 
 
 @dataclass(frozen=True)
@@ -153,12 +221,19 @@ def _grammar() -> dict[str, object]:
         "project_fields_exactly": [
             "project_id", "capabilities", "shape", "dtype", "block_count",
             "padding_multiple", "failure_mode", "timing_lengths",
-            "profile_metric", "hypothesis",
+            "profile_metric", "hypothesis", "graph",
         ],
         "capabilities": [item.value for item in Capability],
         "dtypes": [item.value for item in DType],
         "failure_modes": [item.value for item in FailureMode],
         "profile_metrics": [item.value for item in ProfileMetric],
+        "graph": {
+            "fields_exactly": ["inputs", "nodes", "output"],
+            "input_fields_exactly": ["name", "shape"],
+            "node_fields_exactly": ["name", "op", "operands", "axis"],
+            "operations": [item.value for item in ProjectOp],
+            "bounds": "1-3 inputs, 1-12 topological nodes, 1-3 dimensions",
+        },
         "wave_project_fields_exactly": ["spec", "requires"],
         "wave_fields_exactly": [
             "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage", "projects",
@@ -176,8 +251,9 @@ def curriculum_prompt(context: CurriculumContext) -> str:
         "bounded_project_grammar": _grammar(),
     }
     instructions = (
-        "Choose DECISION: WAVE only when it adds at least one uncovered capability "
-        "and no project repeats prior executable information. Copy the supplied "
+        "Choose DECISION: WAVE only when every project adds operation, shape, dtype, "
+        "failure, or profile information not covered by prior outcomes. Capability "
+        "labels alone are not information gain. Copy the supplied "
         "wave ID, memory identity, and coverage exactly. Otherwise choose SATURATED "
         "when the objective is covered, or STALLED when useful work is blocked.\n"
         "Allowed wire forms:\n"
@@ -243,9 +319,13 @@ class CurriculumAgent:
             if set(value) != {"reason"}:
                 raise ValueError("terminal decision fields must be exactly reason")
             return TerminalDecision(status, value["reason"])
-        if _HELD_OUT_WORDS.search(text):
-            raise ValueError("wave exposes a held-out benchmark")
         wave = WaveSpec.from_mapping(value)
+        if any(
+            _HELD_OUT_WORDS.search(item.spec.project_id)
+            or _HELD_OUT_WORDS.search(item.spec.hypothesis)
+            for item in wave.projects
+        ):
+            raise ValueError("wave exposes a held-out benchmark name")
         expected_id = f"wave-{context.wave_index:03d}"
         if wave.wave_id != expected_id:
             raise ValueError("wave ID does not match curriculum context")
@@ -255,8 +335,16 @@ class CurriculumAgent:
             raise ValueError("wave coverage does not match curriculum context")
         prior_ids = {item.project_id for item in context.prior_outcomes}
         prior_information = {item.information_sha256 for item in context.prior_outcomes}
+        covered_dimensions = frozenset(
+            token
+            for item in context.prior_outcomes
+            for token in item.information.tokens
+        )
+        information = tuple(
+            ProjectInformation.from_project(item.spec) for item in wave.projects
+        )
         signatures = tuple(
-            project_information_sha256(item.spec) for item in wave.projects
+            canonical_digest(item.as_dict()) for item in information
         )
         if any(item.spec.project_id in prior_ids for item in wave.projects):
             raise ValueError("wave repeats a prior project ID")
@@ -266,16 +354,16 @@ class CurriculumAgent:
             raise ValueError("wave repeats prior information")
         if self._held_out.intersection(signatures):
             raise ValueError("wave matches a held-out contract or shape")
-        selected = {
-            capability for item in wave.projects for capability in item.spec.capabilities
-        }
-        if selected <= set(context.pre_wave_coverage):
-            raise ValueError("wave must add new coverage")
+        if any(not item.tokens - covered_dimensions for item in information):
+            raise ValueError(
+                "every project must add operation/shape/dtype/failure/profile information"
+            )
         return WaveDecision(wave)
 
 
 __all__ = [
     "CurriculumAgent", "CurriculumContext", "CurriculumDecision",
-    "CurriculumSession", "PriorOutcome", "TerminalDecision", "WaveDecision",
+    "CurriculumSession", "PriorOutcome", "ProjectInformation",
+    "TerminalDecision", "WaveDecision",
     "curriculum_prompt", "project_information_sha256",
 ]
