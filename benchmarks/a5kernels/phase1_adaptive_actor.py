@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+import re
 from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
@@ -19,6 +20,7 @@ from benchmarks.a5kernels.phase1_memory import (
     HostFact,
     Phase1ProjectMemory,
 )
+from benchmarks.a5kernels.knowledge_agent import Citation
 from benchmarks.a5kernels.phase1_project_executor import (
     PreparedProject,
     ProjectCompileResult,
@@ -54,29 +56,91 @@ class AdaptiveActionContext:
     prepared: PreparedProject
     source: str | None
     latest_execution: ProjectExecutionResult | None
+    artifacts: ContentAddressedArtifacts
+
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+@dataclass(frozen=True)
+class AdaptiveActionResult:
+    """Durable treatment output kept separate from execution authority."""
+
+    observation: Mapping[str, object]
+    citations: tuple[Citation, ...] = ()
+    host_facts: tuple[HostFact, ...] = ()
+    admitted_artifacts: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.observation, Mapping):
+            raise TypeError("adaptive action observation must be a mapping")
+        canonical_bytes(self.observation)
+        if type(self.citations) is not tuple or not all(
+            isinstance(item, Citation) for item in self.citations
+        ):
+            raise TypeError("adaptive action citations must contain Citation values")
+        if any(
+            not isinstance(citation.collection, str)
+            or not citation.collection
+            or not isinstance(citation.path, str)
+            or not citation.path
+            or type(citation.start_line) is not int
+            or type(citation.end_line) is not int
+            or citation.start_line < 1
+            or citation.end_line < citation.start_line
+            or not isinstance(citation.chunk_hash, str)
+            or _SHA256.fullmatch(citation.chunk_hash) is None
+            for citation in self.citations
+        ):
+            raise ValueError("adaptive action citations must retain exact locations")
+        if type(self.host_facts) is not tuple or not all(
+            isinstance(item, HostFact) for item in self.host_facts
+        ):
+            raise TypeError("adaptive action host facts must contain HostFact values")
+        admitted = self.admitted_artifacts
+        if not isinstance(admitted, Mapping) or any(
+            not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+            or not isinstance(role, str)
+            or not role.strip()
+            or role != role.strip()
+            for digest, role in admitted.items()
+        ):
+            raise ValueError("adaptive action admissions must map SHA-256 to roles")
+        missing = {
+            fact.evidence_sha256 for fact in self.host_facts
+        } - set(admitted)
+        if missing:
+            raise ValueError("adaptive action host facts require admitted evidence")
+        if any(
+            admitted[fact.evidence_sha256] != fact.category
+            for fact in self.host_facts
+        ):
+            raise ValueError("adaptive action host fact role must match its category")
+        object.__setattr__(self, "admitted_artifacts", dict(admitted))
 
 
 ActionDependency = Callable[
-    [Mapping[str, object], AdaptiveActionContext], Mapping[str, object]
+    [Mapping[str, object], AdaptiveActionContext], AdaptiveActionResult
 ]
 
 
 def disabled_knowledge_action(
     _payload: Mapping[str, object], _context: AdaptiveActionContext,
-) -> Mapping[str, object]:
-    return {
+) -> AdaptiveActionResult:
+    return AdaptiveActionResult({
         "event": "knowledge-query", "available": False,
         "reason": "disabled-by-treatment",
-    }
+    })
 
 
 def disabled_profile_action(
     _payload: Mapping[str, object], _context: AdaptiveActionContext,
-) -> Mapping[str, object]:
-    return {
+) -> AdaptiveActionResult:
+    return AdaptiveActionResult({
         "event": "profile", "available": False,
         "reason": "disabled-by-treatment",
-    }
+    })
 
 
 def _same_prepared(left: PreparedProject, right: PreparedProject) -> bool:
@@ -118,6 +182,8 @@ class _ProjectActions:
         self.latest: ProjectExecutionResult | None = None
         self.latest_source_sha256: str | None = None
         self.admitted: dict[str, str] = {}
+        self.citations: list[Citation] = []
+        self.host_facts: list[HostFact] = []
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
@@ -215,11 +281,21 @@ class _ProjectActions:
         self, dependency: ActionDependency, payload: Mapping[str, object],
     ) -> ActionOutcome:
         result = dependency(payload, AdaptiveActionContext(
-            self.request, self.prepared, self.source, self.latest,
+            self.request, self.prepared, self.source, self.latest, self.artifacts,
         ))
-        if not isinstance(result, Mapping):
-            raise TypeError("adaptive action dependency must return a mapping")
-        return self._observation(result)
+        if not isinstance(result, AdaptiveActionResult):
+            raise TypeError("adaptive action dependency must return AdaptiveActionResult")
+        for digest, role in result.admitted_artifacts.items():
+            self.artifacts.read_bytes(digest)
+            existing = self.admitted.get(digest)
+            if existing is not None and existing != role:
+                raise ValueError("adaptive action changed an admitted artifact role")
+            self.admitted[digest] = role
+        for citation in result.citations:
+            if citation not in self.citations:
+                self.citations.append(citation)
+        self.host_facts.extend(result.host_facts)
+        return self._observation(result.observation)
 
     def _submit(self) -> ActionOutcome:
         if (
@@ -312,10 +388,10 @@ class AdaptiveActorProjectExecutor:
             or actions.latest_source_sha256 != actions.source_sha256
         ):
             raise RuntimeError("Actor ended without host-verified current source")
-        facts = (HostFact(
+        facts = (*actions.host_facts, HostFact(
             "host-verification", result.evidence.detail,
             result.artifact_sha256["classification"],
-        ),)
+        ))
         learned = self.actor.distill(
             outcome, admitted_artifacts=actions.admitted,
             host_summaries=tuple(asdict(fact) for fact in facts),
@@ -329,6 +405,7 @@ class AdaptiveActorProjectExecutor:
         assert actions.source_sha256 is not None
         memory = Phase1ProjectMemory(
             request.spec, actions.source_sha256, tuple(actions.actions), facts,
+            kdb_citations=tuple(actions.citations),
             lessons=distillation.lessons,
             no_new_knowledge=distillation.no_new_knowledge,
             admitted_artifact_sha256=distillation.admitted_artifact_sha256,
@@ -347,7 +424,8 @@ class AdaptiveActorProjectExecutor:
 
 
 __all__ = [
-    "ActionDependency", "AdaptiveActionContext", "AdaptiveActorDriver",
+    "ActionDependency", "AdaptiveActionContext", "AdaptiveActionResult",
+    "AdaptiveActorDriver",
     "AdaptiveActorProjectExecutor",
     "disabled_knowledge_action", "disabled_profile_action",
 ]

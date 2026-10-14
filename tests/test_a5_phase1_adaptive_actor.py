@@ -9,9 +9,13 @@ import pytest
 
 from benchmarks.a5kernels.evidence import EvidenceLedger, canonical_digest
 from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
-from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
+from benchmarks.a5kernels.knowledge_agent import Citation
+from benchmarks.a5kernels.phase1_adaptive_actor import (
+    AdaptiveActionResult,
+    AdaptiveActorProjectExecutor,
+)
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
+from benchmarks.a5kernels.phase1_memory import HostFact, parse_agent_distillation
 from benchmarks.a5kernels.phase1_project import EvidenceClassification, ProjectGraph
 from benchmarks.a5kernels.phase1_project_executor import (
     CompileObservation,
@@ -309,13 +313,29 @@ def test_optional_treatment_actions_use_injected_narrow_dependencies(tmp_path):
     executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
     calls = []
 
+    knowledge_digest = canonical_digest({"knowledge": "fact"})
+    profile_digest = canonical_digest({"profile": 7})
+    citation = Citation("catlass", "guide.md", 4, 9, knowledge_digest)
+
     def knowledge(payload, context):
         calls.append(("knowledge", dict(payload), context))
-        return {"event": "knowledge-query", "available": True, "results": ["fact"]}
+        assert context.artifacts.put_json({"knowledge": "fact"}) == knowledge_digest
+        return AdaptiveActionResult(
+            {"event": "knowledge-query", "available": True, "results": ["fact"]},
+            citations=(citation,),
+            admitted_artifacts={knowledge_digest: "knowledge"},
+        )
 
     def profile(payload, context):
         calls.append(("profile", dict(payload), context))
-        return {"event": "profile", "available": True, "metric": 7}
+        assert context.artifacts.put_json({"profile": 7}) == profile_digest
+        return AdaptiveActionResult(
+            {"event": "profile", "available": True, "metric": 7},
+            host_facts=(HostFact(
+                "profiling", "profile metric captured", profile_digest,
+            ),),
+            admitted_artifacts={profile_digest: "profiling"},
+        )
 
     actor = ScriptedActor((
         '{"query-knowledge":{"query":"vector movement","limit":3}}',
@@ -325,7 +345,7 @@ def test_optional_treatment_actions_use_injected_narrow_dependencies(tmp_path):
         '{"submit":{}}',
     ))
 
-    AdaptiveActorProjectExecutor(
+    result = AdaptiveActorProjectExecutor(
         executor, actor, object(),
         query_knowledge=knowledge, request_profile=profile,
     )(_request(tmp_path, executor))
@@ -340,3 +360,12 @@ def test_optional_treatment_actions_use_injected_narrow_dependencies(tmp_path):
     assert calls[1][2].latest_execution.evidence.verified
     assert actor.observations[0]["results"] == ["fact"]
     assert actor.observations[3]["metric"] == 7
+    assert result.memory.kdb_citations == (citation,)
+    assert result.memory.host_facts[0] == HostFact(
+        "profiling", "profile metric captured", profile_digest,
+    )
+    assert knowledge_digest in result.memory.admitted_artifact_sha256
+    assert profile_digest in result.memory.admitted_artifact_sha256
+    distill_admitted = actor.distill_calls[0][1]
+    assert distill_admitted[knowledge_digest] == "knowledge"
+    assert distill_admitted[profile_digest] == "profiling"
