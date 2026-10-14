@@ -333,6 +333,20 @@ class DirectActorDriver:
             else:
                 outcome = action_executor(action)
                 observation = outcome.observation
+                try:
+                    host = json.loads(observation).get("host", {})
+                except (AttributeError, json.JSONDecodeError):
+                    host = {}
+                failed = (
+                    host.get("passed") is False
+                    or host.get("status") in {"failed", "error"}
+                    or "fail" in str(host.get("event", "")).lower()
+                )
+                self._trace("tool", {
+                    "name": action.kind,
+                    "status": "failed" if failed else "observed",
+                    "observation": observation,
+                })
                 if outcome.terminal:
                     messages.append({"role": "user", "content": observation})
                     self._trace("message", messages[-1])

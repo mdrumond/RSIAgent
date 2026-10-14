@@ -417,6 +417,24 @@ def test_resume_rejects_changed_request_context(tmp_path):
         provider(changed)
 
 
+def test_legacy_provider_record_without_messages_resumes_and_skips_trace(tmp_path):
+    request = _request(_cell())
+    provider, calls = _provider(
+        tmp_path, ['{"candidate_source":{"source":"legacy-source"}}']
+    )
+    assert provider(request) == "legacy-source"
+    manifest_path = next(tmp_path.rglob("provider.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest.pop("record_sha256")
+    manifest.pop("messages")
+    manifest["record_sha256"] = source_provider_module.canonical_digest(manifest)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n")
+
+    assert provider(request) == "legacy-source"
+    assert provider.conversation(request.cell.cell_id, request.attempt_id) is None
+    assert len(calls) == 1
+
+
 def test_resume_rejects_changed_host_target_contract(tmp_path, monkeypatch):
     request = _request(_cell())
     provider, _calls = _provider(

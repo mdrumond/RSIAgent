@@ -409,6 +409,9 @@ def build_phase2_production(
     )
 
     def retain_sft_trace(request, candidate, evidence):
+        conversation = source.conversation(cell.cell_id, request.attempt_id)
+        if conversation is None:
+            return
         recorder = TraceRecorder(
             config.phase2_root.resolve() / "sft-traces" / f"{request.attempt_id}.jsonl",
             trace_id=request.attempt_id,
@@ -418,14 +421,28 @@ def build_phase2_production(
             model=cell.model.profile_id,
             source_manifest_sha256=source_manifest.sha256,
         )
-        for message in source.conversation(cell.cell_id, request.attempt_id):
+        for message in conversation:
             recorder.message(message["role"], message["content"])
+        for previous in request.phase2_memory:
+            if previous.get("passed") is False:
+                recorder.tool_event("previous-host-validation", {
+                    "status": "failed",
+                    "candidate_sha256": previous.get("candidate_sha256"),
+                    "evidence_sha256": previous.get("evidence_sha256"),
+                    "failed_cases": previous.get("failed_cases", []),
+                })
+        recorder.message(
+            "user",
+            "Return the exact host-verified candidate source as the supervised answer.",
+        )
+        recorder.message("assistant", candidate)
         recorder.candidate(candidate, candidate_id=request.attempt_id)
         recorder.validation(
             candidate_id=request.attempt_id,
             validator="bz-a5-attention-suite",
             status="passed" if evidence.passed else "failed",
             evidence_sha256=evidence.evidence_sha256,
+            candidate_sha256=evidence.candidate_sha256,
         )
         recorder.finish()
 

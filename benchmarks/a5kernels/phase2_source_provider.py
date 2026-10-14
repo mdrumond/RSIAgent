@@ -464,14 +464,18 @@ class Phase2SourceProvider:
             raise ValueError("completed provider evidence changed")
         return source
 
-    def conversation(self, cell_id: str, attempt_id: str) -> tuple[Mapping[str, str], ...]:
+    def conversation(
+        self, cell_id: str, attempt_id: str,
+    ) -> tuple[Mapping[str, str], ...] | None:
         """Read the exact retained provider conversation for SFT trace capture."""
         manifest = json.loads(
             (self.evidence_root / cell_id / attempt_id / "provider.json").read_bytes()
         )
         messages = manifest.get("messages")
+        if messages is None:
+            return None
         if not isinstance(messages, list) or not messages:
-            raise ValueError("provider conversation is unavailable")
+            raise ValueError("provider conversation is invalid")
         if any(
             not isinstance(item, dict)
             or set(item) != {"role", "content"}

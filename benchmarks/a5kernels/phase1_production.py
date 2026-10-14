@@ -257,14 +257,24 @@ class ProductionProjectExecutor:
             source_manifest_sha256=self.source_manifest.sha256,
         )
         for kind, payload in events:
+            if kind == "terminal":
+                break
             if kind == "message":
                 recorder.message(str(payload["role"]), str(payload["content"]))
+            elif kind == "tool":
+                recorder.tool_event(str(payload["name"]), payload)
+        recorder.message(
+            "user",
+            "Return the exact host-verified candidate source as the supervised answer.",
+        )
+        recorder.message("assistant", source)
         recorder.candidate(source, candidate_id=trace_id)
         recorder.validation(
             candidate_id=trace_id,
             validator="bz-a5-phase1-host-verification",
             status="passed",
             evidence_sha256=trial.verified.evidence_sha256,
+            candidate_sha256=trial.run.candidate_source_sha256,
         )
         recorder.finish()
 

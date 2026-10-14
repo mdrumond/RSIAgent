@@ -36,15 +36,18 @@ def _trace(
     *,
     failed_first: bool = False,
     passed: bool = True,
+    round_id: str = "round-01",
+    model: str = "deepseek-v4-flash",
+    source_manifest_sha256: str = "a" * 64,
 ) -> Path:
     recorder = TraceRecorder(
         root / f"{trace_id}.jsonl",
         trace_id=trace_id,
         phase="phase2",
-        round_id="round-01",
+        round_id=round_id,
         operator_family=family,
-        model="deepseek-v4-flash",
-        source_manifest_sha256="a" * 64,
+        model=model,
+        source_manifest_sha256=source_manifest_sha256,
     )
     recorder.message("system", "Write a Catlass kernel.")
     recorder.message("user", f"Implement {family}")
@@ -59,6 +62,7 @@ def _trace(
         validator="bz-a5-fixture",
         status="passed" if passed else "failed",
         evidence_sha256="b" * 64,
+        candidate_sha256=hashlib.sha256(source.encode()).hexdigest(),
     )
     return recorder.finish()
 
@@ -103,6 +107,7 @@ def test_trace_is_lossless_canonical_and_redacts_secrets(tmp_path):
         validator="fixture",
         status="passed",
         evidence_sha256="b" * 64,
+        candidate_sha256=hashlib.sha256(b"def kernel():\n    return 1\n").hexdigest(),
     )
     recorder.finish()
 
@@ -114,6 +119,52 @@ def test_trace_is_lossless_canonical_and_redacts_secrets(tmp_path):
     assert rows[-1]["kind"] == "terminal"
     assert rows[-1]["payload"]["event_count"] == len(rows) - 1
     assert all(len(row["record_sha256"]) == 64 for row in rows)
+
+
+def test_candidate_bytes_are_exact_and_actual_secrets_fail_closed(tmp_path):
+    source = "def kernel(token = 0):\n    return token\n"
+    path = _trace(tmp_path, "exact-source", "vector", source)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    candidate = next(row["payload"] for row in rows if row["kind"] == "candidate")
+    assert candidate["source"] == source
+    assert candidate["source_sha256"] == hashlib.sha256(source.encode()).hexdigest()
+
+    recorder = TraceRecorder(
+        tmp_path / "secret.jsonl", trace_id="secret", phase="phase1",
+        round_id="round-01", operator_family="vector", model="model",
+        source_manifest_sha256="a" * 64,
+    )
+    with pytest.raises(ValueError, match="secret"):
+        recorder.candidate(
+            'API_KEY = "sk-live-abcdefghijklmnopqrstuvwxyz"', candidate_id="bad"
+        )
+
+
+def test_export_rejects_verified_candidate_digest_mismatch(tmp_path):
+    path = _trace(tmp_path, "digest", "vector", "source")
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    validation = next(row for row in rows if row["kind"] == "validation")
+    validation["payload"]["candidate_sha256"] = "c" * 64
+    previous = None
+    for row in rows:
+        row["previous_sha256"] = previous
+        body = {key: value for key, value in row.items() if key != "record_sha256"}
+        row["record_sha256"] = hashlib.sha256(
+            json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        previous = row["record_sha256"]
+    terminal = rows[-1]
+    terminal["payload"]["events_sha256"] = hashlib.sha256(json.dumps(
+        [row["record_sha256"] for row in rows[:-1]],
+        sort_keys=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    terminal_body = {key: value for key, value in terminal.items() if key != "record_sha256"}
+    terminal["record_sha256"] = hashlib.sha256(json.dumps(
+        terminal_body, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows))
+    with pytest.raises(ValueError, match="verified candidate digest"):
+        build_dataset(tmp_path, tmp_path / "dataset")
 
 
 def test_dataset_admits_verified_finals_and_successful_repairs_only(tmp_path):
@@ -169,6 +220,7 @@ def test_fireworks_export_preserves_tools_and_masks_repair_history(tmp_path):
     recorder.validation(
         candidate_id="final", validator="fixture", status="passed",
         evidence_sha256="b" * 64,
+        candidate_sha256=hashlib.sha256(b"good source").hexdigest(),
     )
     recorder.finish()
     build_dataset(path.parent, tmp_path / "dataset")
@@ -219,3 +271,35 @@ def test_saturation_requires_three_rounds_and_stops_below_ten_percent():
     assert saturation_decision([20, 5, 4, 3, 2], [4, 3, 2, 1, 1]) == {
         "stop": True, "reason": "maximum-rounds"
     }
+
+
+def test_dataset_provenance_rejects_mixed_manifests_and_persists_round_metrics(tmp_path):
+    traces = tmp_path / "traces"
+    traces.mkdir()
+    _trace(traces, "r1", "attention", "source one", round_id="round-01")
+    _trace(
+        traces, "r2", "attention", "source two", round_id="round-02",
+        failed_first=True,
+    )
+    _trace(traces, "r3", "attention", "source three", round_id="round-03")
+    manifest = build_dataset(traces, tmp_path / "dataset")
+    assert manifest["phases"] == ["phase2"]
+    assert manifest["models"] == ["deepseek-v4-flash"]
+    assert manifest["source_manifest_sha256"] == "a" * 64
+    assert manifest["rounds"] == [
+        {"round_id": "round-01", "novel_verified_examples": 1, "novel_repair_patterns": 0},
+        {"round_id": "round-02", "novel_verified_examples": 1, "novel_repair_patterns": 1},
+        {"round_id": "round-03", "novel_verified_examples": 1, "novel_repair_patterns": 0},
+    ]
+    assert manifest["saturation"] == {"stop": False, "reason": "continue"}
+    assert all(
+        {"phase", "model", "source_manifest_sha256"} <= set(example)
+        for example in manifest["examples"]
+    )
+
+    _trace(
+        traces, "mixed", "attention", "source four", round_id="round-03",
+        source_manifest_sha256="d" * 64,
+    )
+    with pytest.raises(ValueError, match="mixed source manifests"):
+        build_dataset(traces, tmp_path / "mixed-dataset")

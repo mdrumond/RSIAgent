@@ -28,6 +28,11 @@ _SECRET_VALUE = re.compile(
     r"(?i)(?:(?:api[_-]?key|password|secret|token)\s*[=:]\s*)\S+|"
     r"Bearer\s+[A-Za-z0-9._~+/-]+|AKIA[0-9A-Z]{16}"
 )
+_CANDIDATE_SECRET = re.compile(
+    r"(?i)(?:Bearer\s+[A-Za-z0-9._~+/-]{16,}|AKIA[0-9A-Z]{16}|"
+    r"(?:api[_-]?key|password|secret)\s*=\s*['\"][^'\"]{16,}['\"]|"
+    r"['\"]sk-[A-Za-z0-9_-]{16,}['\"])"
+)
 
 
 def _canonical(value: object) -> bytes:
@@ -135,12 +140,12 @@ class TraceRecorder:
             "tools": list(tools),
         })
 
-    def _append(self, kind: str, payload: object) -> None:
+    def _append(self, kind: str, payload: object, *, redact: bool = True) -> None:
         if self._sealed:
             raise ValueError("trace is already sealed")
         body = {
             "schema": TRACE_SCHEMA, "sequence": len(self._rows), "kind": kind,
-            "payload": _redact(payload),
+            "payload": _redact(payload) if redact else payload,
             "previous_sha256": self._rows[-1]["record_sha256"] if self._rows else None,
         }
         self._rows.append({**body, "record_sha256": _digest(body)})
@@ -178,22 +183,26 @@ class TraceRecorder:
     def candidate(self, source: str, *, candidate_id: str) -> None:
         if not _SAFE_ID.fullmatch(candidate_id) or not source.strip():
             raise ValueError("candidate requires an id and source")
+        if _CANDIDATE_SECRET.search(source):
+            raise ValueError("candidate contains a high-confidence secret")
         self._append("candidate", {
             "candidate_id": candidate_id, "source": source,
             "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
-        })
+        }, redact=False)
 
     def validation(
         self, *, candidate_id: str, validator: str, status: str,
-        evidence_sha256: str, details: Mapping[str, object] | None = None,
+        evidence_sha256: str, candidate_sha256: str,
+        details: Mapping[str, object] | None = None,
     ) -> None:
         if status not in {"passed", "failed", "infrastructure-failure"}:
             raise ValueError("invalid validation status")
-        if not _SHA256.fullmatch(evidence_sha256):
-            raise ValueError("invalid evidence digest")
+        if not _SHA256.fullmatch(evidence_sha256) or not _SHA256.fullmatch(candidate_sha256):
+            raise ValueError("invalid evidence or candidate digest")
         self._append("validation", {
             "candidate_id": candidate_id, "validator": validator, "status": status,
             "evidence_sha256": evidence_sha256, "details": dict(details or {}),
+            "candidate_sha256": candidate_sha256,
         })
 
     def finish(self) -> Path:
@@ -238,6 +247,32 @@ def _is_near_duplicate(value: str, retained: Sequence[str]) -> bool:
     return any(SequenceMatcher(None, value, item).ratio() >= 0.985 for item in retained)
 
 
+def _repair_pattern(rows: Sequence[Mapping[str, object]]) -> str | None:
+    def stable(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): stable(item)
+                for key, item in sorted(value.items())
+                if "sha256" not in str(key) and str(key) not in {"candidate_id"}
+            }
+        if isinstance(value, list):
+            return [stable(item) for item in value]
+        if isinstance(value, str) and _SHA256.fullmatch(value):
+            return "[DIGEST]"
+        return value
+
+    failures = [
+        {"kind": row["kind"], "payload": stable(row["payload"])}
+        for row in rows
+        if (
+            row["kind"] == "tool" and row["payload"].get("status") == "failed"
+        ) or (
+            row["kind"] == "validation" and row["payload"].get("status") == "failed"
+        )
+    ]
+    return _digest(failures) if failures else None
+
+
 def _example(rows: list[dict[str, object]]) -> tuple[dict[str, object], dict[str, object]] | None:
     header = rows[0]["payload"]
     validations = [row["payload"] for row in rows if row["kind"] == "validation"]
@@ -247,13 +282,16 @@ def _example(rows: list[dict[str, object]]) -> tuple[dict[str, object], dict[str
     final = candidates[-1]
     if validations[-1]["candidate_id"] != final["candidate_id"]:
         return None
+    if validations[-1].get("candidate_sha256") != final["source_sha256"]:
+        raise ValueError("verified candidate digest does not match retained source")
     messages = [dict(row["payload"]) for row in rows if row["kind"] == "message"]
     assistants = [index for index, message in enumerate(messages) if message["role"] == "assistant"]
     if not assistants:
         return None
     for index in assistants:
         messages[index]["weight"] = 0
-    messages[assistants[-1]]["content"] = final["source"]
+    if messages[assistants[-1]]["content"] != final["source"]:
+        raise ValueError("terminal assistant answer is not the verified candidate")
     messages[assistants[-1]]["weight"] = 1
     example: dict[str, object] = {"messages": messages}
     if header.get("tools"):
@@ -261,6 +299,8 @@ def _example(rows: list[dict[str, object]]) -> tuple[dict[str, object], dict[str
     metadata = {
         "trace_id": header["trace_id"], "round_id": header["round_id"],
         "operator_family": header["operator_family"],
+        "phase": header["phase"], "model": header["model"],
+        "source_manifest_sha256": header["source_manifest_sha256"],
         "candidate_sha256": final["source_sha256"],
         "repair": (
             any(item["status"] == "failed" for item in validations[:-1])
@@ -272,6 +312,7 @@ def _example(rows: list[dict[str, object]]) -> tuple[dict[str, object], dict[str
         "terminal_evidence_sha256": validations[-1]["evidence_sha256"],
         "normalized": _normalized_candidate(final["source"]),
     }
+    metadata["repair_pattern_sha256"] = _repair_pattern(rows)
     return example, metadata
 
 
@@ -284,17 +325,22 @@ def build_dataset(
     rejected = 0
     duplicates = 0
     seen: set[str] = set()
+    observed_manifests: set[str] = set()
     for path in sorted(Path(traces).glob("*.jsonl")):
         candidate = _example(_read_trace(path))
         if candidate is None:
             rejected += 1
             continue
+        observed_manifests.add(str(candidate[1]["source_manifest_sha256"]))
         normalized = candidate[1]["normalized"]
         if normalized in seen or _is_near_duplicate(normalized, tuple(seen)):
             duplicates += 1
             continue
         seen.add(normalized)
         eligible.append(candidate)
+    source_manifests = sorted(observed_manifests)
+    if len(source_manifests) > 1:
+        raise ValueError("mixed source manifests are not eligible for one dataset")
     groups: dict[str, list[tuple[dict[str, object], dict[str, object]]]] = {}
     for item in eligible:
         groups.setdefault(str(item[1]["operator_family"]), []).append(item)
@@ -323,11 +369,30 @@ def build_dataset(
         "train_sha256": hashlib.sha256(train_bytes).hexdigest(),
         "validation_sha256": hashlib.sha256(validation_bytes).hexdigest(),
         "split_counts_by_operator": {"train": counts(train), "validation": counts(validation)},
+        "phases": sorted({str(item[1]["phase"]) for item in eligible}),
+        "models": sorted({str(item[1]["model"]) for item in eligible}),
+        "source_manifest_sha256": source_manifests[0] if source_manifests else None,
         "examples": [
             {k: v for k, v in item[1].items() if k != "normalized"}
             for item in train + validation
         ],
     }
+    rounds = []
+    for round_id in sorted({str(item[1]["round_id"]) for item in eligible}):
+        items = [item for item in eligible if item[1]["round_id"] == round_id]
+        rounds.append({
+            "round_id": round_id,
+            "novel_verified_examples": len(items),
+            "novel_repair_patterns": len({
+                item[1]["repair_pattern_sha256"] for item in items
+                if item[1]["repair_pattern_sha256"] is not None
+            }),
+        })
+    body["rounds"] = rounds
+    body["saturation"] = saturation_decision(
+        [int(item["novel_verified_examples"]) for item in rounds],
+        [int(item["novel_repair_patterns"]) for item in rounds],
+    )
     manifest = {**body, "dataset_sha256": _digest(body)}
     _publish(output / "manifest.json", _canonical(manifest) + b"\n")
     return manifest

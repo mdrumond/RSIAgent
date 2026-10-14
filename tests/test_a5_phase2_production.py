@@ -18,12 +18,15 @@ from benchmarks.a5kernels.phase1_provider import DirectCompletion
 from benchmarks.a5kernels.phase2_attention import (
     AttentionInfrastructureError,
     AttentionReceipt,
+    attention_reference,
 )
+from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
 from benchmarks.a5kernels.phase2_production import (
     Phase2ProductionConfig,
     build_phase2_production,
 )
 from benchmarks.a5kernels.phase2_memory import phase2_cell_pairs
+from benchmarks.a5kernels.sft_dataset import build_dataset
 from tests.test_a5_phase1_composition import (
     FakeEmbeddings,
     _dependencies as phase1_dependencies,
@@ -128,6 +131,53 @@ def _treatment_config(tmp_path, knowledge, profiling, **changes):
 
 def _transport(**_kwargs):
     return DirectCompletion('{"candidate_source":{"source":"source"}}', 1)
+
+
+class RepairBackend(CopyVBackend):
+    def execute(self, source, execution, workdir):
+        self.calls.append((source, execution, workdir))
+        if "qualification" in str(workdir):
+            output = execution.v
+        else:
+            output = attention_reference(execution)
+            if "attempt-01" in str(workdir):
+                output = (output[0] + 1.0, *output[1:])
+        return AttentionReceipt(0, output, session_handle="bz-a5:repair-test")
+
+
+def test_production_trace_and_dataset_classify_successful_repair(tmp_path):
+    _composition, destination, config = _config(tmp_path)
+    backend = RepairBackend()
+    snapshot, dependencies = build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=FakeExecutor(destination.catlass_revision), backend=backend,
+    )
+    terminal = Phase2LiveRunner(
+        phase2_root=config.phase2_root,
+        snapshot=snapshot,
+        dependencies=dependencies,
+    ).run()
+    assert terminal["status"] == "passed"
+    assert terminal["completed_attempts"] == 2
+
+    traces = config.phase2_root / "sft-traces"
+    passed_trace = next(
+        path for path in traces.glob("*.jsonl")
+        if any(
+            row["kind"] == "validation" and row["payload"]["status"] == "passed"
+            for row in map(json.loads, path.read_text().splitlines())
+        )
+    )
+    rows = [json.loads(line) for line in passed_trace.read_text().splitlines()]
+    failed = [row for row in rows if row["kind"] == "tool" and row["payload"]["status"] == "failed"]
+    assert failed and failed[0]["payload"]["failed_cases"]
+
+    manifest = build_dataset(traces, tmp_path / "dataset")
+    assert manifest["eligible"] == 1
+    example = manifest["examples"][0]
+    assert example["repair"] is True
+    assert len(example["repair_pattern_sha256"]) == 64
+    assert manifest["rounds"][0]["novel_repair_patterns"] == 1
 
 
 def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
