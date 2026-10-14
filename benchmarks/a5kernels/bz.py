@@ -233,7 +233,9 @@ class CatlassValidationExecutor(ProfileCommandExecutor):
                 "--",
                 "env",
                 f"BZ_A5_PROFILE_PHYSICAL_DEVICE={device}",
+                "PYTHONDONTWRITEBYTECODE=1",
                 "python",
+                "-B",
                 "-c",
                 (
                     "import os, torch, torch_npu; "

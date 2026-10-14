@@ -1413,7 +1413,7 @@ def test_catlass_executor_probes_exact_device_through_checked_profile():
             "--device", "3",
             "--timeout", "600", "--",
             "env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=3",
-            "python", "-c", calls[0][-1],
+            "PYTHONDONTWRITEBYTECODE=1", "python", "-B", "-c", calls[0][-1],
         )
     ]
     assert "torch.npu.set_device(0)" in calls[0][-1]
