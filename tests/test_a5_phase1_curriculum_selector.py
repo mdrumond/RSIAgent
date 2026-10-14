@@ -105,6 +105,11 @@ def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_gr
     assert all(term not in prompt.lower() for term in (
         "openai", "deepseek", "temperature", "api_key",
     ))
+    grammar = json.loads(prompt.splitlines()[-1])["bounded_project_grammar"]
+    assert grammar["padding_multiples"] == [1, 16, 32, 64, 128, 256]
+    assert grammar["block_count_bounds"] == [1, 32]
+    assert "[1, 16384]" in grammar["shape"]
+    assert "one-dimensional" in grammar["timing_lengths"]
 
 
 def test_strict_parser_accepts_wave_and_preserves_context_across_turns():

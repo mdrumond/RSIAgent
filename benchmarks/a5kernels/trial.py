@@ -28,7 +28,7 @@ from benchmarks.a5kernels.model_profile import A5ModelProfile, load_a5_model_pro
 from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult
 
 
-_EMPTY_ACTIONS = {"compile", "run", "request-profile", "submit"}
+_EMPTY_ACTIONS = {"compile", "run", "request-profile", "request-timing", "submit"}
 _SOURCE_PATHS = {
     "catlass-dsl": "kernel.py",
     "ascend-c": "kernel.cpp",
@@ -216,11 +216,11 @@ class CoreAttemptDriver:
 _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON object:
 {"propose":{"text":"..."}}, {"write":{"slot":"kernel","content":"..."}},
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
-{"request-profile":{}}, or {"submit":{}}.
+{"request-profile":{}}, {"request-timing":{}}, or {"submit":{}}.
 You cannot choose paths or commands and cannot report a score or authoritative result."""
 
 _ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
-compile, run, query-knowledge, request-profile, or submit. Use the object shape shown
+compile, run, query-knowledge, request-profile, request-timing, or submit. Use the object shape shown
 in the system instructions and no surrounding prose."""
 
 

@@ -344,6 +344,13 @@ class ProjectExecutor:
         return ProjectExecutionResult(prepared, evidence, artifacts, hashes)
 
     @staticmethod
+    def request(
+        prepared: PreparedProject, candidate_source: str,
+    ) -> ProjectExecutionRequest:
+        """Bind a candidate to already prepared host inputs and oracle."""
+        return ProjectExecutor._request(prepared, candidate_source)
+
+    @staticmethod
     def _request(
         prepared: PreparedProject, candidate_source: str
     ) -> ProjectExecutionRequest:

@@ -27,10 +27,10 @@ from benchmarks.a5kernels.phase1_adaptive_actor import (
     AdaptiveActionResult,
     AdaptiveActorProjectExecutor,
     disabled_knowledge_action,
-    disabled_profile_action,
 )
 from benchmarks.a5kernels.phase1_composition import A5_PROFILING_GUIDANCE
-from benchmarks.a5kernels.phase1_curriculum import Capability
+from benchmarks.a5kernels.phase1_memory import HostFact
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_experiments import (
     A5Phase1Cell,
@@ -40,6 +40,7 @@ from benchmarks.a5kernels.phase1_experiments import (
 )
 from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.phase1_provider import (
     DirectActorDriver,
     DirectCompletionProvider,
@@ -102,6 +103,7 @@ class AdaptivePhase1Production:
     backend: CatlassProjectBackend
     query_knowledge: ActionDependency
     request_profile: ActionDependency
+    request_timing: ActionDependency
     project_actor: AdaptiveActorProjectExecutor
     coordinator: AdaptivePhase1Coordinator
 
@@ -169,15 +171,55 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
     return query
 
 
-def _guidance_action(
-    _payload: Mapping[str, object], _context: AdaptiveActionContext,
-) -> AdaptiveActionResult:
-    return AdaptiveActionResult({
-        "event": "profiling-guidance",
-        "available": True,
-        "guidance": A5_PROFILING_GUIDANCE,
-        "measurement_available": False,
-    })
+def _measurement_action(measurements, *, profiling: bool) -> ActionDependency:
+    role = "profiling" if profiling else "performance-study"
+
+    def measure(payload, context):
+        if payload:
+            return AdaptiveActionResult({"error": "measurement action accepts an empty object"})
+        if context.source is None or context.latest_execution is None or (
+            not context.latest_execution.evidence.verified
+        ):
+            return AdaptiveActionResult({
+                "error": "measurement requires HOST_VERIFIED current source; run first",
+            })
+        request = ProjectExecutor.request(context.prepared, context.source)
+        try:
+            if profiling:
+                metric = context.request.spec.profile_metric
+                if metric is None:
+                    return AdaptiveActionResult({"error": "project has no profiling metric"})
+                result = measurements.profile(request, metric=metric)
+            else:
+                if not context.request.spec.timing_lengths:
+                    return AdaptiveActionResult({"error": "project has no timing lengths"})
+                result = measurements.timing(request)
+        except InfrastructureFailure:
+            raise
+        except (ValueError, RuntimeError) as exc:
+            return AdaptiveActionResult({
+                "event": role, "passed": False, "diagnostic": str(exc),
+                "next_action": "inspect diagnostics, repair source if needed, run, then retry measurement",
+            })
+        retained = {}
+        for digest, artifact in result["artifact_payloads"].items():
+            if context.artifacts.put_json(artifact) != digest:
+                raise ValueError("measurement artifact hash does not match payload")
+            retained[digest] = role
+        evidence = tuple(result["evidence_sha256"])
+        if not evidence or set(evidence) - set(retained):
+            raise ValueError("measurement result omitted retained evidence")
+        summary = result["summary"]
+        return AdaptiveActionResult(
+            {"event": role, "passed": True, "summary": summary,
+             "evidence_sha256": evidence, "artifacts": result["artifact_payloads"]},
+            host_facts=tuple(HostFact(
+                role, canonical_bytes(summary).decode("ascii"), digest,
+            ) for digest in evidence),
+            admitted_artifacts=retained,
+        )
+
+    return measure
 
 
 def _checked_command(paths: AdaptiveProductionPaths) -> BZCommandExecutor:
@@ -291,11 +333,6 @@ def build_adaptive_phase1(
         query_knowledge = disabled_knowledge_action
     else:
         query_knowledge = _knowledge_action(paths, embeddings)
-    request_profile = (
-        _guidance_action
-        if admitted.profiling is ProfilingGuidance.WITH_GUIDANCE
-        else disabled_profile_action
-    )
     command = _checked_command(paths) if command_executor is None else command_executor
     provider = DirectCompletionProvider(
         os.environ if environment is None else environment,
@@ -312,35 +349,38 @@ def build_adaptive_phase1(
     executor = ProjectExecutor(
         backend, EvidenceLedger(paths.root / "project-evidence.jsonl")
     )
+    from benchmarks.a5kernels.phase1_project_measurements import ProjectMeasurementBackend
+    measurements = ProjectMeasurementBackend(
+        backend,
+        BZProfileBackend(
+            validation_wrapper=str(paths.validation_wrapper),
+            session_wrapper=str(paths.session_wrapper),
+            collection_wrapper=str(paths.tla_root / "execution-profiles/bz-a5/collect_profile.sh"),
+            catlass_source=paths.catlass_source,
+            evidence_directory=str(paths.root / "measurement-evidence"),
+        ),
+    )
+    request_profile = _measurement_action(measurements, profiling=True)
+    request_timing = _measurement_action(measurements, profiling=False)
     project_actor = AdaptiveActorProjectExecutor(
         executor,
         actor,
         profile,
         query_knowledge=query_knowledge,
         request_profile=request_profile,
+        request_timing=request_timing,
         immutable_context=actor_context,
     )
     curriculum = CurriculumAgent(
         lambda messages: provider.complete(profile, messages).text,
-        unavailable_capabilities=(
-            Capability.TIMING_SWEEP,
-            Capability.PROFILING,
-        ),
     )
-
-    def execute_supported_project(request):
-        if request.spec.timing_lengths or request.spec.profile_metric is not None:
-            raise ValueError(
-                "adaptive production does not support performance or profiling projects"
-            )
-        return project_actor(request)
 
     coordinator = AdaptivePhase1Coordinator(
         paths.root,
         objective,
         initial_memory,
         curriculum,
-        execute_supported_project,
+        project_actor,
         max_parallel=max_parallel,
     )
     return AdaptivePhase1Production(
@@ -350,6 +390,7 @@ def build_adaptive_phase1(
         backend,
         query_knowledge,
         request_profile,
+        request_timing,
         project_actor,
         coordinator,
     )
