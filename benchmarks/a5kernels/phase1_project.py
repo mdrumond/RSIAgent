@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 import math
 import re
+import struct
 from typing import Mapping, Sequence, TYPE_CHECKING
 
 from benchmarks.a5kernels.evidence import canonical_digest
@@ -15,6 +16,8 @@ if TYPE_CHECKING:
 
 
 _NAME = re.compile(r"[a-z][a-z0-9]{0,15}\Z")
+_MAX_TENSOR_ELEMENTS = 65536
+_DTYPES = {"float16", "bfloat16", "float32"}
 
 
 class ProjectOp(str, Enum):
@@ -33,8 +36,10 @@ def _shape(value: object) -> tuple[int, ...]:
     result = tuple(value)
     if any(type(item) is not int or not 1 <= item <= 4096 for item in result):
         raise ValueError("tensor shape dimensions must be integers in [1, 4096]")
-    if math.prod(result) > 65536:
-        raise ValueError("tensor shape may contain at most 65536 logical elements")
+    if math.prod(result) > _MAX_TENSOR_ELEMENTS:
+        raise ValueError(
+            f"tensor shape may contain at most {_MAX_TENSOR_ELEMENTS} logical elements"
+        )
     return result
 
 
@@ -125,7 +130,12 @@ def _infer(node: GraphNode, shapes: Mapping[str, tuple[int, ...]]) -> tuple[int,
         raise ValueError("matmul requires compatible rank-two tensors")
     if left[0] * left[1] * right[1] > 2_000_000:
         raise ValueError("matmul host reference work exceeds the bound")
-    return left[0], right[1]
+    result = (left[0], right[1])
+    if math.prod(result) > _MAX_TENSOR_ELEMENTS:
+        raise ValueError(
+            f"inferred tensor may contain at most {_MAX_TENSOR_ELEMENTS} logical elements"
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,21 @@ class ProjectGraph:
             shapes[node.name] = _infer(node, shapes)
         if self.output not in {node.name for node in self.nodes}:
             raise ValueError("graph output must name a computed node")
+        node_by_name = {node.name: node for node in self.nodes}
+        reachable = {self.output}
+        pending = [self.output]
+        while pending:
+            name = pending.pop()
+            node = node_by_name.get(name)
+            if node is None:
+                continue
+            for operand in node.operands:
+                if operand in node_by_name and operand not in reachable:
+                    reachable.add(operand)
+                    pending.append(operand)
+        dead = set(node_by_name) - reachable
+        if dead:
+            raise ValueError("every graph node must be reachable from the output")
         object.__setattr__(self, "output_shape", shapes[self.output])
 
     @classmethod
@@ -215,14 +240,24 @@ class HostTensor:
 
 @dataclass(frozen=True)
 class ReferenceOutput:
+    """Host oracle output.
+
+    Elementwise nodes round to ``dtype`` after every node. Reductions and
+    matrix multiplication use float32 accumulation and round their outputs to
+    ``dtype``, matching the Catlass execution contract given to candidates.
+    """
+
     shape: tuple[int, ...]
     values: tuple[float, ...]
     physical_shape: tuple[int, ...] | None = None
     storage: tuple[float, ...] | None = None
+    dtype: str = "float32"
 
     def __post_init__(self) -> None:
         if len(self.values) != math.prod(self.shape):
             raise ValueError("reference values do not match the logical shape")
+        if self.dtype not in _DTYPES:
+            raise ValueError("reference dtype must be registered")
         physical = self.shape if self.physical_shape is None else self.physical_shape
         storage = self.values if self.storage is None else self.storage
         if len(physical) != len(self.shape) or any(
@@ -253,16 +288,61 @@ def materialize_inputs(spec: "ProjectSpec") -> tuple[HostTensor, ...]:
     return tuple(result)
 
 
-def _apply(node: GraphNode, operands: tuple[ReferenceOutput, ...]) -> ReferenceOutput:
+def _quantize(value: float, dtype: str) -> float:
+    """Round one scalar using the project's declared storage arithmetic."""
+
+    value = float(value)
+    if dtype == "bfloat16":
+        try:
+            bits = struct.unpack(">I", struct.pack(">f", value))[0]
+        except OverflowError:
+            return math.copysign(math.inf, value)
+        exponent = bits & 0x7F800000
+        if exponent != 0x7F800000:
+            bits += 0x7FFF + ((bits >> 16) & 1)
+        return struct.unpack(">f", struct.pack(">I", bits & 0xFFFF0000))[0]
+    code = "e" if dtype == "float16" else "f"
+    try:
+        return struct.unpack(">" + code, struct.pack(">" + code, value))[0]
+    except OverflowError:
+        return math.copysign(math.inf, value)
+
+
+def _apply(
+    node: GraphNode,
+    operands: tuple[ReferenceOutput, ...],
+    dtype: str,
+) -> ReferenceOutput:
     if node.op is ProjectOp.COPY:
-        return operands[0]
+        return ReferenceOutput(
+            operands[0].shape,
+            tuple(_quantize(value, dtype) for value in operands[0].values),
+            dtype=dtype,
+        )
     if node.op is ProjectOp.RELU:
-        return ReferenceOutput(operands[0].shape, tuple(max(value, 0.0) for value in operands[0].values))
+        return ReferenceOutput(
+            operands[0].shape,
+            tuple(_quantize(max(value, 0.0), dtype) for value in operands[0].values),
+            dtype=dtype,
+        )
     if node.op is ProjectOp.MASK_POSITIVE:
-        return ReferenceOutput(operands[0].shape, tuple(float(value > 0.0) for value in operands[0].values))
+        return ReferenceOutput(
+            operands[0].shape,
+            tuple(_quantize(float(value > 0.0), dtype) for value in operands[0].values),
+            dtype=dtype,
+        )
     if node.op in {ProjectOp.ADD, ProjectOp.MULTIPLY}:
         fn = (lambda a, b: a + b) if node.op is ProjectOp.ADD else (lambda a, b: a * b)
-        return ReferenceOutput(operands[0].shape, tuple(fn(a, b) for a, b in zip(operands[0].values, operands[1].values, strict=True)))
+        return ReferenceOutput(
+            operands[0].shape,
+            tuple(
+                _quantize(fn(a, b), dtype)
+                for a, b in zip(
+                    operands[0].values, operands[1].values, strict=True
+                )
+            ),
+            dtype=dtype,
+        )
     if node.op is ProjectOp.REDUCE_SUM:
         source = operands[0]
         shape = source.shape[:node.axis] + source.shape[node.axis + 1:] or (1,)
@@ -270,16 +350,31 @@ def _apply(node: GraphNode, operands: tuple[ReferenceOutput, ...]) -> ReferenceO
         for index, value in enumerate(source.values):
             coords = _coords(index, source.shape)
             target = coords[:node.axis] + coords[node.axis + 1:] or (0,)
-            values[_flat(target, shape)] += value
-        return ReferenceOutput(shape, tuple(values))
+            target_index = _flat(target, shape)
+            values[target_index] = _quantize(
+                values[target_index] + value, "float32"
+            )
+        return ReferenceOutput(
+            shape,
+            tuple(_quantize(value, dtype) for value in values),
+            dtype=dtype,
+        )
     left, right = operands
     m, k = left.shape
     _, n = right.shape
-    values = tuple(
-        sum(left.values[row * k + inner] * right.values[inner * n + col] for inner in range(k))
-        for row in range(m) for col in range(n)
-    )
-    return ReferenceOutput((m, n), values)
+    values = []
+    for row in range(m):
+        for col in range(n):
+            accumulator = 0.0
+            for inner in range(k):
+                product = _quantize(
+                    left.values[row * k + inner]
+                    * right.values[inner * n + col],
+                    "float32",
+                )
+                accumulator = _quantize(accumulator + product, "float32")
+            values.append(_quantize(accumulator, dtype))
+    return ReferenceOutput((m, n), tuple(values), dtype=dtype)
 
 
 def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> ReferenceOutput:
@@ -289,9 +384,17 @@ def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> Ref
     for contract, tensor in zip(spec.graph.inputs, inputs, strict=True):
         if tensor.shape != contract.shape:
             raise ValueError("host input shape does not match the graph")
-        values[contract.name] = ReferenceOutput(tensor.shape, tensor.logical_values)
+        values[contract.name] = ReferenceOutput(
+            tensor.shape,
+            tuple(_quantize(value, spec.dtype.value) for value in tensor.logical_values),
+            dtype=spec.dtype.value,
+        )
     for node in spec.graph.nodes:
-        values[node.name] = _apply(node, tuple(values[name] for name in node.operands))
+        values[node.name] = _apply(
+            node,
+            tuple(values[name] for name in node.operands),
+            spec.dtype.value,
+        )
     output = values[spec.graph.output]
     if not any(item.value == "padded-tail" for item in spec.capabilities):
         return output
@@ -300,7 +403,13 @@ def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> Ref
     storage = [0.0] * math.prod(physical)
     for index, value in enumerate(output.values):
         storage[_flat(_coords(index, output.shape), physical)] = value
-    return ReferenceOutput(output.shape, output.values, physical, tuple(storage))
+    return ReferenceOutput(
+        output.shape,
+        output.values,
+        physical,
+        tuple(storage),
+        dtype=spec.dtype.value,
+    )
 
 
 class EvidenceClassification(str, Enum):
@@ -326,8 +435,8 @@ def classify_execution(
     compile_succeeded: bool,
     runtime_error: str | None = None,
     actual: Sequence[float] | None = None,
-    atol: float = 1e-3,
-    rtol: float = 1e-3,
+    atol: float | None = None,
+    rtol: float | None = None,
 ) -> ExecutionEvidence:
     """Classify observed evidence; source or compilation alone cannot verify output."""
 
@@ -343,6 +452,13 @@ def classify_execution(
         observed = tuple(float(value) for value in actual)
     except (TypeError, ValueError) as exc:
         raise ValueError("actual output must be numeric") from exc
+    default_tolerance = {
+        "float16": 1e-2,
+        "bfloat16": 2e-2,
+        "float32": 1e-5,
+    }[expected.dtype]
+    atol = default_tolerance if atol is None else atol
+    rtol = default_tolerance if rtol is None else rtol
     if len(observed) != len(expected.storage) or any(
         not math.isclose(got, want, abs_tol=atol, rel_tol=rtol)
         for got, want in zip(observed, expected.storage)

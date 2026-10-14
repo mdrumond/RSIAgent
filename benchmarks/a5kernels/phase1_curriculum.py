@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 import re
 from typing import Mapping, Sequence
 
@@ -152,6 +153,18 @@ class ProjectSpec:
                 raise ValueError(
                     f"{capability.value} capability must agree with graph operations"
                 )
+        if ProjectOp.MATMUL in operations:
+            if len(self.shape) != 3:
+                raise ValueError("cube project shape must be (m, k, n)")
+            m, k, n = self.shape
+            expected_inputs = ((m, k), (k, n))
+            actual_inputs = tuple(item.shape for item in self.graph.inputs)
+            if actual_inputs != expected_inputs or self.graph.output_shape != (m, n):
+                raise ValueError(
+                    "cube project shape must agree with graph inputs and output"
+                )
+        elif any(item.shape != self.shape for item in self.graph.inputs):
+            raise ValueError("project shape must agree with every graph input")
         repairs = Capability.FAILURE_REPAIR in capabilities
         if repairs != (self.failure_mode is not FailureMode.NONE):
             raise ValueError("failure-repair capability and failure mode must agree")
@@ -163,13 +176,25 @@ class ProjectSpec:
         profiling = Capability.PROFILING in capabilities
         if profiling != (self.profile_metric is not None):
             raise ValueError("profiling capability and profile metric must agree")
-        if Capability.CUBE_TILING in capabilities and len(self.shape) < 2:
-            raise ValueError("cube-tiling requires a matrix-shaped project")
         if (
             Capability.PADDED_TAIL in capabilities
-            and self.shape[-1] % self.padding_multiple == 0
+            and self.graph.output_shape[-1] % self.padding_multiple == 0
         ):
             raise ValueError("padded-tail requires a non-aligned logical extent")
+        if Capability.PADDED_TAIL in capabilities:
+            shapes = tuple(item.shape for item in self.graph.inputs) + (
+                self.graph.output_shape,
+            )
+            for shape in shapes:
+                padded_last = (
+                    (shape[-1] + self.padding_multiple - 1)
+                    // self.padding_multiple
+                    * self.padding_multiple
+                )
+                if math.prod(shape[:-1]) * padded_last > 65536:
+                    raise ValueError(
+                        "padded physical tensor may contain at most 65536 elements"
+                    )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "ProjectSpec":
