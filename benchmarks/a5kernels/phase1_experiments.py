@@ -135,8 +135,10 @@ class ProgrammingGuideIdentity:
             self.cpl_skills_revision
         ) is None:
             raise ValueError("cpl_skills_revision must be a full lowercase Git revision")
-        if self.catlass_revision != PINNED_CATLASS_REVISION:
-            raise ValueError("Catlass revision does not match the Phase 1 pin")
+        if not isinstance(self.catlass_revision, str) or _GIT_REVISION.fullmatch(
+            self.catlass_revision
+        ) is None:
+            raise ValueError("catlass_revision must be a full lowercase Git revision")
 
     def as_dict(self) -> dict[str, str]:
         return {

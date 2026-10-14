@@ -75,13 +75,29 @@ def test_guide_admission_requires_full_lowercase_cpl_revision(tmp_path, revision
         )
 
 
-def test_guide_admission_rejects_catlass_revision_drift(tmp_path):
-    with pytest.raises(ValueError, match="Catlass revision"):
+@pytest.mark.parametrize("revision", ["", "1" * 39, "A" * 40, "g" * 40, None])
+def test_guide_admission_requires_full_lowercase_catlass_revision(tmp_path, revision):
+    with pytest.raises(ValueError, match="catlass_revision"):
         admit_programming_guide(
             write_guide(tmp_path / "guide.md"),
             cpl_skills_revision=CPL_REVISION,
-            catlass_revision="2" * 40,
+            catlass_revision=revision,
         )
+
+
+def test_explicit_current_catlass_revision_is_admitted_and_changes_treatment_identity(tmp_path):
+    path = write_guide(tmp_path / "guide.md")
+    legacy = admit_programming_guide(path, cpl_skills_revision=CPL_REVISION)
+    current_revision = "698379e0d4b1b94d12728e7181df2cf83a958e8f"
+    current = admit_programming_guide(
+        path, cpl_skills_revision=CPL_REVISION, catlass_revision=current_revision
+    )
+
+    assert legacy.catlass_revision == PINNED_CATLASS_REVISION
+    assert current.catlass_revision == current_revision
+    assert {cell.cell_id for cell in build_cells(legacy)}.isdisjoint(
+        {cell.cell_id for cell in build_cells(current)}
+    )
 
 
 @pytest.mark.parametrize("condition", ["missing", "empty", "binary"])
