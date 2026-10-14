@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 from types import SimpleNamespace
@@ -226,7 +225,7 @@ def test_injected_command_executor_is_not_preflighted(tmp_path):
     _build(tmp_path, _cell(), command_executor=Injected())
 
 
-def test_initial_context_binds_exact_guide_user_memory_and_guidance(tmp_path):
+def test_actor_context_binds_guide_and_guidance_without_wrapping_memory(tmp_path):
     user_memory = b'{"prior":"host-owned"}'
     control = _build(tmp_path / "control", _cell(), initial_memory=user_memory)
     treatment = _build(
@@ -234,18 +233,20 @@ def test_initial_context_binds_exact_guide_user_memory_and_guidance(tmp_path):
         _cell(profiling=ProfilingGuidance.WITH_GUIDANCE),
         initial_memory=user_memory,
     )
-    control_context = json.loads(control.coordinator.initial_memory)
-    treatment_context = json.loads(treatment.coordinator.initial_memory)
+    control_context = json.loads(control.project_actor.immutable_context)
+    treatment_context = json.loads(treatment.project_actor.immutable_context)
 
     assert control_context["programming_guide"] == treatment_context["programming_guide"]
-    assert base64.b64decode(control_context["programming_guide"]["base64"]) == GUIDE_BYTES
     assert control_context["programming_guide"]["text"].encode() == GUIDE_BYTES
     assert control_context["programming_guide"]["sha256"] == _guide().guide_sha256
-    assert base64.b64decode(control_context["user_initial_memory"]["base64"]) == user_memory
+    assert control.coordinator.initial_memory == user_memory
+    assert treatment.coordinator.initial_memory == user_memory
+    assert user_memory not in control.project_actor.immutable_context
+    assert control.project_actor.immutable_context.decode().count(
+        GUIDE_BYTES.decode().rstrip()
+    ) == 1
     assert control_context["profiling_guidance"] is None
     assert treatment_context["profiling_guidance"] == A5_PROFILING_GUIDANCE
-    assert control.project_actor.immutable_context == control.coordinator.initial_memory
-    assert treatment.project_actor.immutable_context == treatment.coordinator.initial_memory
 
 
 def test_guide_identity_mismatch_fails_before_composition(tmp_path):

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 from dataclasses import asdict, dataclass
 import hashlib
 import os
@@ -206,9 +205,7 @@ def _checked_command(paths: AdaptiveProductionPaths) -> BZCommandExecutor:
     return command
 
 
-def _initial_context(
-    cell: A5Phase1Cell, guide_bytes: bytes, user_memory: bytes,
-) -> bytes:
+def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes) -> bytes:
     if not isinstance(guide_bytes, bytes) or not guide_bytes:
         raise TypeError("programming guide must be non-empty immutable bytes")
     if hashlib.sha256(guide_bytes).hexdigest() != cell.guide.guide_sha256:
@@ -217,8 +214,6 @@ def _initial_context(
         guide_text = guide_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("programming guide must be UTF-8") from exc
-    if not isinstance(user_memory, bytes):
-        raise TypeError("initial memory must be immutable bytes")
     guidance = (
         A5_PROFILING_GUIDANCE
         if cell.profiling is ProfilingGuidance.WITH_GUIDANCE
@@ -228,12 +223,7 @@ def _initial_context(
         "schema": _INITIAL_CONTEXT_SCHEMA,
         "programming_guide": {
             "sha256": cell.guide.guide_sha256,
-            "base64": base64.b64encode(guide_bytes).decode("ascii"),
             "text": guide_text,
-        },
-        "user_initial_memory": {
-            "sha256": hashlib.sha256(user_memory).hexdigest(),
-            "base64": base64.b64encode(user_memory).decode("ascii"),
         },
         "profiling_guidance": guidance,
     })
@@ -255,7 +245,9 @@ def build_adaptive_phase1(
     """Bind one registered treatment cell without fallback routes."""
 
     admitted = admit_runnable_cell(cell)
-    composed_memory = _initial_context(admitted, guide_bytes, initial_memory)
+    if not isinstance(initial_memory, bytes):
+        raise TypeError("initial memory must be immutable bytes")
+    actor_context = _actor_context(admitted, guide_bytes)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
             raise ValueError("KDB-off treatment must not receive KDB dependencies")
@@ -289,7 +281,7 @@ def build_adaptive_phase1(
         profile,
         query_knowledge=query_knowledge,
         request_profile=request_profile,
-        immutable_context=composed_memory,
+        immutable_context=actor_context,
     )
     curriculum = CurriculumAgent(
         lambda messages: provider.complete(profile, messages).text
@@ -297,7 +289,7 @@ def build_adaptive_phase1(
     coordinator = AdaptivePhase1Coordinator(
         paths.root,
         objective,
-        composed_memory,
+        initial_memory,
         curriculum,
         project_actor,
         max_parallel=max_parallel,

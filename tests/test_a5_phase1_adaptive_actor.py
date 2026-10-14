@@ -212,7 +212,7 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     encoded_memory = base64.b64encode(b'{"prior":"memory"}').decode("ascii")
     assert encoded_memory in actor.instruction
     assert 'Production context (immutable' in actor.instruction
-    assert '{"guide":"exact"}' in actor.instruction
+    assert actor.instruction.count('{"guide":"exact"}') == 1
     assert executor.prepare(_spec()).instruction in actor.instruction
     assert len(backend.requests) == 4
     assert len(backend.run_requests) == 3
