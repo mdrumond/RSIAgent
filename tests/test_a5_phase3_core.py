@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -118,6 +119,29 @@ def test_frozen_copy_rejects_memory_and_manifest_tampering(tmp_path):
         type(second).open(second.root, cell)
 
 
+def test_actor_memory_parses_the_same_bytes_it_authenticates(tmp_path, monkeypatch):
+    root, cell, _runner, _terminal = _phase2(tmp_path)
+    frozen = admit_phase2_lineage(root, cell, tmp_path / "phase3")
+    trusted = frozen.memory_path.read_bytes()
+    changed = json.loads(trusted)
+    changed["phase2"][0]["passed"] = False
+    changed_bytes = canonical_bytes(changed) + b"\n"
+    real_read_bytes = Path.read_bytes
+    reads = 0
+
+    def changing_read(path):
+        nonlocal reads
+        if path == frozen.memory_path:
+            reads += 1
+            return trusted if reads == 1 else changed_bytes
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", changing_read)
+
+    assert frozen.actor_memory()["phase2"][0]["passed"] is True
+    assert reads == 1
+
+
 def test_admission_rejects_failed_and_non_openai_phase2(tmp_path):
     root, cell, _runner, terminal = _phase2(
         tmp_path / "failed", (False,) * MAX_ATTEMPTS
@@ -164,6 +188,30 @@ def test_admission_rejects_missing_qualification(tmp_path):
     (root / "cells" / cell.cell_id / "qualification.json").unlink()
 
     with pytest.raises(ValueError, match="qualification"):
+        admit_phase2_lineage(root, cell, tmp_path / "phase3")
+
+
+@pytest.mark.parametrize("artifact", ["protocol", "memory", "terminal"])
+def test_admission_rejects_source_changed_after_authentication(
+    tmp_path, monkeypatch, artifact,
+):
+    root, cell, _runner, _terminal = _phase2(tmp_path)
+    real_load_terminal = Phase2LiveRunner.load_terminal
+
+    def load_then_change(runner):
+        terminal = real_load_terminal(runner)
+        path = {
+            "protocol": runner.protocol_path,
+            "memory": runner.memory_path,
+            "terminal": runner.terminal_path,
+        }[artifact]
+        payload = path.read_bytes()
+        path.write_bytes(payload.rstrip(b"\n") + b" \n")
+        return terminal
+
+    monkeypatch.setattr(Phase2LiveRunner, "load_terminal", load_then_change)
+
+    with pytest.raises(ValueError, match="changed during authentication"):
         admit_phase2_lineage(root, cell, tmp_path / "phase3")
 
 

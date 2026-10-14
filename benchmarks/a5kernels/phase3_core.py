@@ -167,7 +167,7 @@ class Phase3FrozenMemory:
     def snapshot_id(self) -> str:
         return str(self.manifest["snapshot_id"])
 
-    def verify(self) -> None:
+    def _verified_actor_memory(self) -> dict[str, object]:
         body = dict(self.manifest)
         snapshot_id = body.pop("snapshot_id", None)
         required = {
@@ -192,9 +192,13 @@ class Phase3FrozenMemory:
             raise ValueError("Phase 3 frozen memory is incomplete") from exc
         if _sha256(payload) != body["actor_memory_sha256"]:
             raise ValueError("Phase 3 frozen memory bytes changed")
-        value = _read_object(self.memory_path, "Phase 3 Actor memory")
+        try:
+            value = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid Phase 3 Actor memory") from exc
         if (
-            set(value) != {"schema", "phase1", "phase2"}
+            not isinstance(value, dict)
+            or set(value) != {"schema", "phase1", "phase2"}
             or value.get("schema") != FROZEN_SCHEMA
             or not isinstance(value.get("phase1"), list)
             or not isinstance(value.get("phase2"), list)
@@ -202,10 +206,13 @@ class Phase3FrozenMemory:
             or len(value["phase2"]) != body["phase2_entries"]
         ):
             raise ValueError("invalid Phase 3 Actor memory")
+        return value
+
+    def verify(self) -> None:
+        self._verified_actor_memory()
 
     def actor_memory(self) -> Mapping[str, object]:
-        self.verify()
-        return _deep_freeze(_read_object(self.memory_path, "Phase 3 Actor memory"))
+        return _deep_freeze(self._verified_actor_memory())
 
     @classmethod
     def open(cls, root: str | Path, cell: A5Phase2Cell) -> "Phase3FrozenMemory":
@@ -241,10 +248,17 @@ def admit_phase2_lineage(
         snapshot=snapshot,
         dependencies=Phase2Dependencies(cell, forbidden, forbidden),
     )
+    source_paths = (
+        runner.protocol_path, runner.memory_path, runner.terminal_path,
+    )
     try:
+        captured = tuple(path.read_bytes() for path in source_paths)
         terminal = runner.load_terminal()
-    except ValueError as exc:
+        rechecked = tuple(path.read_bytes() for path in source_paths)
+    except (OSError, ValueError) as exc:
         raise ValueError("invalid authenticated Phase 2 lineage") from exc
+    if captured != rechecked:
+        raise ValueError("Phase 2 source changed during authentication")
     if terminal is None or terminal.get("status") != "passed":
         raise ValueError("Phase 3 requires an authenticated passed Phase 2 terminal")
 
@@ -254,9 +268,7 @@ def admit_phase2_lineage(
         )
     )
 
-    protocol_bytes = runner.protocol_path.read_bytes()
-    memory_bytes = runner.memory_path.read_bytes()
-    terminal_bytes = runner.terminal_path.read_bytes()
+    protocol_bytes, memory_bytes, terminal_bytes = captured
     phase2_entries = [json.loads(line) for line in memory_bytes.splitlines()]
     visible_fields = (
         "attempt", "candidate_sha256", "evidence_sha256", "passed",
