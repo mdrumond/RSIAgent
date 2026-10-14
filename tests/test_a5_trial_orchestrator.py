@@ -92,6 +92,17 @@ class FakeProfile:
         return {"duration_us": 12.5, "kernel_name": run.kernel_name}
 
 
+def test_legacy_executor_reports_timing_unavailable_without_crashing(tmp_path):
+    executor = _executor(tmp_path, FakeBackend())
+    outcome = executor(parse_trial_action('{"request-timing":{}}'))
+    host = json.loads(outcome.observation)["host"]
+    assert host["event"] == "timing"
+    assert host["available"] is False
+    assert "adaptive Phase 1" in host["reason"]
+    assert outcome.terminal is False
+    assert executor.backend.runs == []
+
+
 class ScriptedActor:
     def __init__(self, replies):
         self.replies = replies

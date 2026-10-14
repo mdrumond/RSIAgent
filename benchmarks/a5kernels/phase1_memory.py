@@ -42,7 +42,7 @@ class HostFact:
     evidence_sha256: str
 
     def __post_init__(self) -> None:
-        if self.category not in {"compile", "runtime", "host-verification", "profiling"}:
+        if self.category not in {"compile", "runtime", "host-verification", "profiling", "performance-study"}:
             raise ValueError("host fact category is not recognized")
         if not isinstance(self.statement, str) or not self.statement.strip():
             raise ValueError("host fact statement must be non-empty")
@@ -168,9 +168,9 @@ def parse_agent_distillation(
                             for digest in lesson.evidence_artifact_sha256)):
             raise ValueError("correctness requires host-verification evidence")
         if (lesson.category == "performance"
-                and not any(admitted_artifacts[digest] == "performance-study"
+                and not any(admitted_artifacts[digest] in {"performance-study", "profiling"}
                             for digest in lesson.evidence_artifact_sha256)):
-            raise ValueError("performance requires retained performance-study evidence")
+            raise ValueError("performance requires retained timing or profiling evidence")
         lessons.append(lesson)
     if no_new != (not lessons):
         raise ValueError("no_new_knowledge must be true exactly when lessons are empty")

@@ -17,7 +17,6 @@ from benchmarks.a5kernels.phase1_adaptive_production import (
 )
 import benchmarks.a5kernels.phase1_adaptive_production as production
 from benchmarks.a5kernels.phase1_adaptive_cli import main as cli_main
-from benchmarks.a5kernels.phase1_curriculum import Capability
 from benchmarks.a5kernels.phase1_experiments import (
     KnowledgeMode,
     ProfilingGuidance,
@@ -26,9 +25,104 @@ from benchmarks.a5kernels.phase1_experiments import (
 )
 from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend
 from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletion
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 
 
 GUIDE_BYTES = b"Pinned Catlass DSL programming guide.\n"
+
+
+@pytest.mark.parametrize("profiling", [False, True])
+def test_measurement_action_retains_backend_reports_and_exact_prepared_contract(tmp_path, profiling):
+    from test_a5_phase1_adaptive_actor import SourceBackend, _special_spec
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    spec = _special_spec(timing=not profiling, profiling=profiling)
+    prepared = executor.prepare(spec)
+    latest = executor.execute(spec, "fixed source")
+    source_digest = hashlib.sha256(b"fixed source").hexdigest()
+    report = {"candidate_sha256": source_digest, "project": spec.as_dict(), "median_us": 4}
+    digest = canonical_digest(report)
+    calls = []
+
+    class Measurements:
+        def timing(self, request):
+            calls.append((request, None))
+            return {"summary": report, "artifact_payloads": {digest: report}, "evidence_sha256": (digest,)}
+
+        def profile(self, request, metric):
+            calls.append((request, metric))
+            return {"summary": report, "artifact_payloads": {digest: report}, "evidence_sha256": (digest,)}
+
+    artifacts = ContentAddressedArtifacts(tmp_path / "artifacts")
+    context = AdaptiveActionContext(
+        AdaptiveProjectRequest(spec, 1, b"", tmp_path, prepared.inputs, prepared.expected),
+        prepared, "fixed source", latest, artifacts,
+    )
+    result = production._measurement_action(Measurements(), profiling=profiling)({}, context)
+    request, metric = calls[0]
+    assert request.inputs is prepared.inputs
+    assert request.expected is prepared.expected
+    assert request.candidate_source == "fixed source"
+    assert metric == (spec.profile_metric if profiling else None)
+    assert result.observation["summary"] == report
+    assert "artifacts" not in result.observation
+    role = "profiling" if profiling else "performance-study"
+    assert result.admitted_artifacts == {digest: role}
+    assert result.host_facts[0].category == role
+    assert artifacts.read_bytes(digest).rstrip() == production.canonical_bytes(report)
+
+
+@pytest.mark.parametrize("error_type", [ValueError, production.InfrastructureFailure, production.ProjectInfrastructureError])
+def test_measurement_failure_is_actionable_and_does_not_admit_evidence(tmp_path, error_type):
+    from test_a5_phase1_adaptive_actor import SourceBackend, _special_spec
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    spec = _special_spec(timing=True)
+    prepared = executor.prepare(spec)
+
+    class Measurements:
+        def timing(self, request):
+            raise error_type("sweep length 17 failed host verification")
+
+    context = AdaptiveActionContext(
+        AdaptiveProjectRequest(spec, 1, b"", tmp_path, prepared.inputs, prepared.expected),
+        prepared, "fixed source", executor.execute(spec, "fixed source"),
+        ContentAddressedArtifacts(tmp_path / "artifacts"),
+    )
+    action = production._measurement_action(Measurements(), profiling=False)
+    if error_type is not ValueError:
+        with pytest.raises(error_type, match="length 17"):
+            action({}, context)
+        return
+    result = action({}, context)
+    assert result.observation["passed"] is False
+    assert "length 17" in result.observation["diagnostic"]
+    assert result.host_facts == ()
+    assert result.admitted_artifacts == {}
+
+
+def test_measurement_factory_rejects_parallel_projects_before_campaign_creation(tmp_path):
+    with pytest.raises(ValueError, match="max_parallel=1"):
+        _build(tmp_path, _cell(), max_parallel=2)
+    assert not _paths(tmp_path).root.exists()
+
+
+def test_performance_lesson_accepts_retained_profiling_evidence():
+    from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
+    digest = "a" * 64
+    text = json.dumps({"distillation": {"no_new_knowledge": False, "lessons": [{
+        "category": "performance", "claim": "Pipe counters identify the active pipeline.",
+        "applicability": "This measured kernel and shape.",
+        "preconditions": "Host correctness passed before capture.",
+        "limitations": "Counter capture is not an uninstrumented latency measurement.",
+        "evidence_artifact_sha256": [digest], "failure_signature": None,
+        "repair": None, "confidence": "medium",
+    }]}})
+    lesson = parse_agent_distillation(text, {digest: "profiling"}).lessons[0]
+    assert lesson.category == "performance"
 
 
 class FakeCommandExecutor:
@@ -107,10 +201,11 @@ def test_factory_binds_registered_direct_actor_checked_backend_and_coordinator(t
     assert isinstance(campaign.coordinator, AdaptivePhase1Coordinator)
     assert campaign.coordinator.max_parallel == 1
     assert campaign.backend._device == 2
-    assert campaign.coordinator.execute_project is not campaign.project_actor
-    assert campaign.coordinator.curriculum.unavailable_capabilities == (
-        Capability.TIMING_SWEEP, Capability.PROFILING,
+    assert str(_paths(tmp_path).collection_wrapper).endswith(
+        ".agents/skills/ascend-profiling/scripts/collect_profile.sh"
     )
+    assert campaign.coordinator.execute_project is campaign.project_actor
+    assert campaign.coordinator.curriculum.unavailable_capabilities == ()
 
 
 def test_selected_model_uses_its_registered_direct_provider_route(tmp_path):
@@ -302,31 +397,26 @@ def test_changed_cell_and_legacy_state_fail_before_external_probes(tmp_path, mon
         _build(legacy, _cell())
 
 
-def test_control_treatments_are_explicitly_disabled(tmp_path):
+def test_knowledge_control_remains_explicitly_disabled(tmp_path):
     campaign = _build(tmp_path, _cell())
     context = object()
 
     knowledge = campaign.query_knowledge({"query": "movement"}, context)
-    profile = campaign.request_profile({}, context)
 
     assert knowledge.observation["available"] is False
     assert knowledge.observation["reason"] == "disabled-by-treatment"
-    assert profile.observation["available"] is False
-    assert profile.observation["reason"] == "disabled-by-treatment"
 
 
-def test_guidance_treatment_returns_guidance_without_claiming_measurement(tmp_path):
+@pytest.mark.parametrize("profiling", [ProfilingGuidance.WITH_GUIDANCE, ProfilingGuidance.WITHOUT_GUIDANCE])
+def test_measurements_are_bound_independently_of_guidance(tmp_path, profiling):
     campaign = _build(
-        tmp_path, _cell(profiling=ProfilingGuidance.WITH_GUIDANCE)
+        tmp_path, _cell(profiling=profiling)
     )
 
-    result = campaign.request_profile({}, object())
+    result = campaign.request_profile({}, SimpleNamespace(source=None))
 
     assert result.observation == {
-        "event": "profiling-guidance",
-        "available": True,
-        "guidance": A5_PROFILING_GUIDANCE,
-        "measurement_available": False,
+        "error": "measurement requires HOST_VERIFIED current source; run first",
     }
     assert result.host_facts == ()
     assert result.admitted_artifacts == {}
@@ -390,20 +480,6 @@ def test_kdb_manifest_must_match_supplied_embedding_backend(tmp_path):
             embeddings=WrongEmbeddings(),
             path_changes={"kdb": kdb, "collection": "catlass"},
         )
-
-
-@pytest.mark.parametrize(
-    "spec",
-    [
-        SimpleNamespace(timing_lengths=(64, 128), profile_metric=None),
-        SimpleNamespace(timing_lengths=(), profile_metric="timeline"),
-    ],
-)
-def test_unsupported_measurement_projects_stop_before_actor(tmp_path, spec):
-    campaign = _build(tmp_path, _cell())
-
-    with pytest.raises(ValueError, match="does not support"):
-        campaign.coordinator.execute_project(SimpleNamespace(spec=spec))
 
 
 @pytest.mark.parametrize(

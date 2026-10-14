@@ -165,6 +165,43 @@ def _request(tmp_path, executor, spec=None):
     )
 
 
+def test_measurement_requires_verified_current_source_and_discards_stale_facts(tmp_path):
+    from benchmarks.a5kernels.trial import parse_trial_action
+    assert parse_trial_action('{"request-timing":{}}').kind == "request-timing"
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    calls = []
+
+    def timing(payload, context):
+        calls.append(context.source)
+        digest = context.artifacts.put_json({"timing": context.source})
+        return AdaptiveActionResult(
+            {"event": "timing", "median_us": 3},
+            host_facts=(HostFact("performance-study", "Measured current source", digest),),
+            admitted_artifacts={digest: "performance-study"},
+        )
+
+    actor = ScriptedActor((
+        '{"request-timing":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"compile":{}}', '{"request-timing":{}}',
+        '{"run":{}}', '{"request-timing":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source\\n"}}',
+        '{"request-timing":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+        '{"request-timing":{}}', '{"submit":{}}',
+    ))
+    result = AdaptiveActorProjectExecutor(
+        executor, actor, object(), request_timing=timing,
+    )(_request(tmp_path, executor, _special_spec(timing=True)))
+    assert calls == ["fixed source", "fixed source"]
+    assert "HOST_VERIFIED" in actor.observations[0]["error"]
+    assert "HOST_VERIFIED" in actor.observations[3]["error"]
+    assert "HOST_VERIFIED" in actor.observations[7]["error"]
+    assert actor.observations[10]["missing"] == ["performance-study"]
+    assert len([f for f in result.memory.host_facts if f.category == "performance-study"]) == 1
+
+
 def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     backend = SourceBackend()
     executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
@@ -325,8 +362,7 @@ def test_optional_treatment_actions_have_deterministic_disabled_observations(tmp
             "reason": "disabled-by-treatment",
         },
         {
-            "event": "profile", "available": False,
-            "reason": "disabled-by-treatment",
+            "error": "measurement requires HOST_VERIFIED evidence for current source; run first",
         },
     ]
 

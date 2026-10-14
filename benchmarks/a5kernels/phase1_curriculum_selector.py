@@ -243,6 +243,11 @@ def _grammar() -> dict[str, object]:
         "dtypes": [item.value for item in DType],
         "failure_modes": [item.value for item in FailureMode],
         "profile_metrics": [item.value for item in ProfileMetric],
+        "padding_multiples": [1, 16, 32, 64, 128, 256],
+        "block_count_bounds": [1, 32],
+        "shape": "1-3 dimensions, each integer in [1, 4096]; graph inputs must match shape except matmul shape [m,k,n] with inputs [m,k] and [k,n]; each graph tensor may contain at most 65536 elements",
+        "timing_lengths": "0-8 unique ascending integers in [1, 4096]; timing-sweep requires at least two lengths and one-dimensional inputs",
+        "composition": "capabilities must agree with graph operations; failure-repair requires a non-none failure_mode; profiling requires profile_metric; padded-tail requires non-aligned output extent and physical tensors no larger than 65536 elements",
         "graph": {
             "fields_exactly": ["inputs", "nodes", "output"],
             "input_fields_exactly": ["name", "shape"],

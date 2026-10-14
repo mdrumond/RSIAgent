@@ -225,7 +225,15 @@ def _instruction(
         "candidate for this generic learning "
         "project. Preserve logical shapes and padded physical storage. The host binds "
         "LOGICAL_INPUT_SHAPES, PHYSICAL_INPUT_SHAPES, LOGICAL_OUTPUT_SHAPE, "
-        "PHYSICAL_OUTPUT_SHAPE, and DTYPE as read-only compile-time globals. The host "
+        "PHYSICAL_OUTPUT_SHAPE, and DTYPE as read-only compile-time globals. "
+        "Tensor arguments expose full physical padded storage: tensor.origin_shape "
+        "is the PHYSICAL shape here, not the logical data extent. Use "
+        "LOGICAL_INPUT_SHAPES and LOGICAL_OUTPUT_SHAPE for computation bounds; "
+        "use PHYSICAL_INPUT_SHAPES and PHYSICAL_OUTPUT_SHAPE for allocation and "
+        "storage bounds. Input padding contains nonzero sentinels, not data or "
+        "implicit zeros. Every physical output element must be written; output "
+        "padding must be zero. For logical length 65 padded to 128, compute only "
+        "elements 0..64 and explicitly zero elements 65..127. The host "
         "owns compilation, launch, synchronization, and the host-owned oracle; "
         "do not claim correctness from source or compilation. Project contract: "
         f"{canonical_bytes(contract).decode('ascii')}"
@@ -342,6 +350,13 @@ class ProjectExecutor:
                 "payload": payload,
             })
         return ProjectExecutionResult(prepared, evidence, artifacts, hashes)
+
+    @staticmethod
+    def request(
+        prepared: PreparedProject, candidate_source: str,
+    ) -> ProjectExecutionRequest:
+        """Bind a candidate to already prepared host inputs and oracle."""
+        return ProjectExecutor._request(prepared, candidate_source)
 
     @staticmethod
     def _request(
