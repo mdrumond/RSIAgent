@@ -236,3 +236,22 @@ def test_timeline_normalization_recovers_same_retained_operation(tmp_path):
     logs = next(x for x in calls if 'logs' in x)
     assert logs[logs.index('--name') + 1] == operation
     assert len([x for x in calls if '--operation' in x]) == 1
+
+
+def test_adaptive_timing_masks_physical_device_but_profile_is_direct(tmp_path):
+    from benchmarks.a5kernels.profiling import ProfileRequest
+    from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+    backend = BZProfileBackend(validation_wrapper='/profiles/catlass-validation.sh',
+                               collection_wrapper='/skills/collect_profile.sh',
+                               catlass_source='/catlass', evidence_directory=str(tmp_path))
+    backend._bound_workload_argv = lambda request: ('python', 'host.py')
+    plan = ProjectBackend().measurement_plan(_candidate(tmp_path))
+    plan = replace(plan, environment=plan.environment.with_binding('A5PROJECT_MASKED_TIMING', '1'))
+    request = ProfileRequest(plan, 'catlass-dsl', 'kernel', 3)
+    timing = backend._adapter_argv('timing', 'run', request)
+    prefix = timing[:timing.index('--')]
+    assert prefix[prefix.index('--device') + 1] == '3'
+    assert 'A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE=1' not in timing
+    profile = backend._adapter_argv('profile', 'profile', request)
+    assert '--device' not in profile[:profile.index('--')]
+    assert 'A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE=1' in profile
