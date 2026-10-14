@@ -149,6 +149,7 @@ def test_compile_failure_is_a_real_backend_result_and_never_launches(tmp_path):
         "source that is forwarded without source heuristics"
     )
     assert backend.compile_requests[0].abi.signature.endswith("gm_output: tla.Tensor) -> None")
+    assert backend.compile_requests[0].expected == result.prepared.expected
     assert backend.run_requests == []
     assert set(result.artifact_sha256) == {
         "inputs", "expected", "observed", "classification",
