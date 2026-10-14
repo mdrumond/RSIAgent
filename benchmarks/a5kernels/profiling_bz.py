@@ -243,8 +243,7 @@ class BZProfileBackend:
             _raise_replay_failure(upload.returncode, "timeline helpers upload failed")
         script = (
             "import pathlib,subprocess,sys; root=pathlib.Path(sys.argv[1]); "
-            "paths=[p for p in root.rglob('*.json') if 'pipetimeline' in "
-            "str(p).lower().replace('_','').replace('-','')]; "
+            "paths=sorted(p for p in root.rglob('trace.json') if p.stat().st_size); "
             "assert len(paths)==1, 'expected one native PipeTimeline JSON trace'; "
             "subprocess.run([sys.executable,sys.argv[2],'--pipe-timeline',str(paths[0]),"
             "'--output',str(root/'adaptive-timeline')],check=True); "

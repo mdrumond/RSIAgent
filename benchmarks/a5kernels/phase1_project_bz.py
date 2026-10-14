@@ -425,7 +425,8 @@ def _main():
     tensors = [torch.tensor(item["storage"], dtype=dtype, device="npu").reshape(
                tuple(item["physical_shape"])) for item in manifest["inputs"]]
     output_shape = tuple(manifest["output"]["physical_shape"])
-    output = torch.full(output_shape, -991.0, dtype=dtype, device="npu")
+    # Avoid device FillD/Cast helpers polluting BasicInfo kernel discovery.
+    output = torch.full(output_shape, -991.0, dtype=dtype).to("npu")
     try:
         kernel = _load_kernel(sys.argv[1])
         _verify_loaded_catlass_modules(
@@ -454,7 +455,7 @@ def _main():
     try:
         artifact(*tla_inputs, tla_output, block_num=manifest["block_count"])
         torch.npu.synchronize()
-        values = output.float().cpu().reshape(-1).tolist()
+        values = output.cpu().float().reshape(-1).tolist()
         if len(values) != manifest["output"]["storage_elements"] or not all(
             math.isfinite(value) for value in values
         ):

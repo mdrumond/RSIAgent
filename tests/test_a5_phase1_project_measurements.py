@@ -255,3 +255,76 @@ def test_adaptive_timing_masks_physical_device_but_profile_is_direct(tmp_path):
     profile = backend._adapter_argv('profile', 'profile', request)
     assert '--device' not in profile[:profile.index('--')]
     assert 'A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE=1' in profile
+
+
+def test_native_vendor_trace_is_discovered_and_actually_normalized(tmp_path):
+    import json
+    import subprocess
+    from pathlib import Path
+    from benchmarks.a5kernels.profiling import CampaignKind, CaptureCommand, ProfileMetric, ProfileRequest
+    from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+    raw = tmp_path / 'PROF_00001' / 'device_4' / 'output'
+    raw.mkdir(parents=True)
+    (raw / 'trace.json').write_text(json.dumps({'traceEvents': [
+        {'ph': 'X', 'ts': 1, 'dur': 4, 'cat': 'vector', 'name': 'vec'},
+        {'ph': 'X', 'ts': 2, 'dur': 3, 'cat': 'mte2', 'name': 'copy'},
+    ]}))
+    helper = Path.home() / '.agents/skills/ascend-profiling/scripts/summarize_timelines.py'
+    if not helper.is_file():
+        pytest.skip('user-wide ascend-profiling skill is not installed on this test host')
+    # Execute the actual discovery payload against a vendor-shaped tree; only
+    # transport staging is replaced. This catches filename-contract regressions.
+    def runner(argv, **kwargs):
+        if '--operation' not in argv:
+            return subprocess.CompletedProcess(argv, 0, '', '')
+        index = argv.index('--') + 1
+        payload = list(argv[index:])
+        payload[-1] = str(helper)
+        return subprocess.run(payload, **kwargs)
+    backend = BZProfileBackend(validation_wrapper='/profiles/catlass-validation.sh',
+                               collection_wrapper='/skills/scripts/collect_profile.sh',
+                               catlass_source='/catlass', evidence_directory=str(tmp_path),
+                               process_runner=runner)
+    plan = ProjectBackend().measurement_plan(_candidate(tmp_path))
+    request = ProfileRequest(plan, 'catlass-dsl', 'kernel', 3)
+    backend._normalize_timeline(CaptureCommand(CampaignKind.INTERMEDIATE, request,
+                                              ProfileMetric.PIPE_TIMELINE, 'native', 'kernel'),
+                                str(tmp_path / 'PROF_00001'))
+    summary = json.loads((tmp_path / 'PROF_00001' / 'adaptive-timeline' /
+                          'timeline-summary.json').read_text())
+    assert summary['pipe_timeline']['pipes'] == ['mte2', 'vector']
+    assert summary['pipe_timeline']['overlap_duration']['mte2:vector'] == 3
+
+
+def test_profile_driver_initialization_and_conversion_do_not_launch_helper_kernels():
+    import ast
+    from benchmarks.a5kernels.phase1_project_bz import _PROJECT_DRIVER
+    calls = []
+    class Tensor:
+        device = 'cpu'
+        def to(self, device):
+            calls.append(('transfer', device))
+            self.device = device
+            return self
+        def cpu(self):
+            return self.to('cpu')
+        def float(self):
+            assert self.device == 'cpu', 'device Cast would pollute BasicInfo'
+            calls.append(('cast', self.device))
+            return self
+        def reshape(self, shape):
+            return self
+        def tolist(self):
+            return [1.]
+    class Torch:
+        def full(self, shape, value, *, dtype, device='cpu'):
+            assert device == 'cpu', 'device FillD would pollute BasicInfo'
+            calls.append(('fill', device))
+            return Tensor()
+    namespace = {'torch': Torch(), 'output_shape': (1,), 'dtype': 'float16'}
+    assignments = {node.targets[0].id: node for node in ast.walk(ast.parse(_PROJECT_DRIVER))
+                   if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)}
+    for name in ('output', 'values'):
+        module = ast.Module(body=[assignments[name]], type_ignores=[])
+        exec(compile(module, '<project-driver>', 'exec'), namespace)
+    assert calls == [('fill', 'cpu'), ('transfer', 'npu'), ('transfer', 'cpu'), ('cast', 'cpu')]
