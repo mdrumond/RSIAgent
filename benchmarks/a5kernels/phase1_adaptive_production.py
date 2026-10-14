@@ -30,6 +30,7 @@ from benchmarks.a5kernels.phase1_adaptive_actor import (
     disabled_profile_action,
 )
 from benchmarks.a5kernels.phase1_composition import A5_PROFILING_GUIDANCE
+from benchmarks.a5kernels.phase1_curriculum import Capability
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_experiments import (
     A5Phase1Cell,
@@ -121,7 +122,12 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
         raise ValueError("KDB-on treatment requires a pinned embedding backend")
     # Opening once here validates the selected manifest before any provider call.
     with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
-        database.manifest(paths.collection)
+        manifest = database.manifest(paths.collection)
+        if (
+            manifest.embedding_model != embeddings.model
+            or manifest.embedding_revision != embeddings.revision
+        ):
+            raise ValueError("KDB manifest does not match the embedding backend")
 
     def query(
         payload: Mapping[str, object], context: AdaptiveActionContext,
@@ -273,6 +279,8 @@ def build_adaptive_phase1(
     """Bind one registered treatment cell without fallback routes."""
 
     admitted = admit_runnable_cell(cell)
+    if paths.catlass_revision != admitted.guide.catlass_revision:
+        raise ValueError("runtime Catlass revision does not match the admitted guide")
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
     actor_context = _actor_context(admitted, guide_bytes)
@@ -313,14 +321,26 @@ def build_adaptive_phase1(
         immutable_context=actor_context,
     )
     curriculum = CurriculumAgent(
-        lambda messages: provider.complete(profile, messages).text
+        lambda messages: provider.complete(profile, messages).text,
+        unavailable_capabilities=(
+            Capability.TIMING_SWEEP,
+            Capability.PROFILING,
+        ),
     )
+
+    def execute_supported_project(request):
+        if request.spec.timing_lengths or request.spec.profile_metric is not None:
+            raise ValueError(
+                "adaptive production does not support performance or profiling projects"
+            )
+        return project_actor(request)
+
     coordinator = AdaptivePhase1Coordinator(
         paths.root,
         objective,
         initial_memory,
         curriculum,
-        project_actor,
+        execute_supported_project,
         max_parallel=max_parallel,
     )
     return AdaptivePhase1Production(

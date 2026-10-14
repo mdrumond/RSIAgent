@@ -17,6 +17,7 @@ from benchmarks.a5kernels.phase1_adaptive_production import (
 )
 import benchmarks.a5kernels.phase1_adaptive_production as production
 from benchmarks.a5kernels.phase1_adaptive_cli import main as cli_main
+from benchmarks.a5kernels.phase1_curriculum import Capability
 from benchmarks.a5kernels.phase1_experiments import (
     KnowledgeMode,
     ProfilingGuidance,
@@ -72,7 +73,7 @@ def _paths(tmp_path, **changes):
         "root": tmp_path / "campaign",
         "tla_root": tmp_path,
         "catlass_source": "/opt/catlass",
-        "catlass_revision": "a" * 40,
+        "catlass_revision": "9a6ac627b5f4078060287844189730cf0d184800",
         "device": 2,
     }
     values.update(changes)
@@ -106,7 +107,10 @@ def test_factory_binds_registered_direct_actor_checked_backend_and_coordinator(t
     assert isinstance(campaign.coordinator, AdaptivePhase1Coordinator)
     assert campaign.coordinator.max_parallel == 1
     assert campaign.backend._device == 2
-    assert campaign.coordinator.execute_project is campaign.project_actor
+    assert campaign.coordinator.execute_project is not campaign.project_actor
+    assert campaign.coordinator.curriculum.unavailable_capabilities == (
+        Capability.TIMING_SWEEP, Capability.PROFILING,
+    )
 
 
 def test_selected_model_uses_its_registered_direct_provider_route(tmp_path):
@@ -254,6 +258,15 @@ def test_guide_identity_mismatch_fails_before_composition(tmp_path):
         _build(tmp_path, _cell(), guide_bytes=b"different guide")
 
 
+def test_runtime_revision_must_match_admitted_guide_before_external_work(tmp_path):
+    with pytest.raises(ValueError, match="runtime Catlass revision"):
+        _build(
+            tmp_path,
+            _cell(),
+            path_changes={"catlass_revision": "a" * 40},
+        )
+
+
 def test_campaign_identity_is_persisted_and_unchanged_reconstruction_works(tmp_path):
     first = _build(tmp_path, _cell())
     identity_path = first.coordinator.root / "campaign-identity.json"
@@ -354,6 +367,43 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path)
     digest = retained["artifact_sha256"]
     assert context.artifacts.read_bytes(digest).decode() == retained["text"]
     assert result.admitted_artifacts == {digest: "knowledge"}
+
+
+def test_kdb_manifest_must_match_supplied_embedding_backend(tmp_path):
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+
+    source = tmp_path / "sources"
+    source.mkdir()
+    guide = source / "guide.md"
+    guide.write_text("movement guidance\n", encoding="utf-8")
+    kdb = tmp_path / "knowledge.sqlite"
+    with KnowledgeDB(kdb, FakeEmbeddings()) as database:
+        database.index(source, [guide], collection="catlass", language="catlass-dsl")
+
+    class WrongEmbeddings(FakeEmbeddings):
+        revision = "wrong-revision"
+
+    with pytest.raises(ValueError, match="manifest"):
+        _build(
+            tmp_path,
+            _cell(knowledge=KnowledgeMode.WITH_KDB),
+            embeddings=WrongEmbeddings(),
+            path_changes={"kdb": kdb, "collection": "catlass"},
+        )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        SimpleNamespace(timing_lengths=(64, 128), profile_metric=None),
+        SimpleNamespace(timing_lengths=(), profile_metric="timeline"),
+    ],
+)
+def test_unsupported_measurement_projects_stop_before_actor(tmp_path, spec):
+    campaign = _build(tmp_path, _cell())
+
+    with pytest.raises(ValueError, match="does not support"):
+        campaign.coordinator.execute_project(SimpleNamespace(spec=spec))
 
 
 @pytest.mark.parametrize(
