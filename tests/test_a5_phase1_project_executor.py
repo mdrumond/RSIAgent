@@ -256,16 +256,21 @@ def test_non_finite_kernel_output_is_retained_and_classified_as_mismatch(
     assert len(ledger.entries) == 4
 
 
-def test_failure_repair_project_is_rejected_until_a_repair_loop_owns_it(tmp_path):
+def test_failure_repair_project_materializes_for_the_adapter_repair_loop(tmp_path):
     mapping = _spec("movement").as_dict()
     mapping["capabilities"].append("failure-repair")
     mapping["failure_mode"] = "compile"
     repair = ProjectSpec.from_mapping(mapping)
 
-    with pytest.raises(NotImplementedError, match="repair-loop coordinator"):
-        ProjectExecutor(
-            FakeBackend(_compile()), EvidenceLedger(tmp_path / "evidence.jsonl")
-        ).prepare(repair)
+    backend = FakeBackend(_compile(passed=False))
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+
+    prepared = executor.prepare(repair)
+    result = executor.execute(repair, "intentionally failing candidate")
+
+    assert prepared.spec == repair
+    assert result.prepared == prepared
+    assert result.evidence.classification is EvidenceClassification.COMPILE_FAILURE
 
 
 def test_backend_cannot_claim_compile_or_runtime_success_without_evidence(tmp_path):

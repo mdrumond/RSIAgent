@@ -137,8 +137,27 @@ class ScriptedActor:
         )
 
 
-def _request(tmp_path, executor):
-    spec = _spec()
+def _special_spec(*, failure="none", timing=False, profiling=False):
+    value = _spec().as_dict()
+    suffix = []
+    if failure != "none":
+        value["capabilities"].append("failure-repair")
+        value["failure_mode"] = failure
+        suffix.append(failure)
+    if timing:
+        value["capabilities"].append("timing-sweep")
+        value["timing_lengths"] = [5, 17]
+        suffix.append("timing")
+    if profiling:
+        value["capabilities"].append("profiling")
+        value["profile_metric"] = "timeline"
+        suffix.append("profile")
+    value["project_id"] = "repair-" + "-".join(suffix or ["relu"])
+    return ProjectSpec.from_mapping(value)
+
+
+def _request(tmp_path, executor, spec=None):
+    spec = _spec() if spec is None else spec
     prepared = executor.prepare(spec)
     return AdaptiveProjectRequest(
         spec, 1, b'{"prior":"memory"}', tmp_path / "branch",
@@ -369,3 +388,122 @@ def test_optional_treatment_actions_use_injected_narrow_dependencies(tmp_path):
     distill_admitted = actor.distill_calls[0][1]
     assert distill_admitted[knowledge_digest] == "knowledge"
     assert distill_admitted[profile_digest] == "profiling"
+
+
+@pytest.mark.parametrize(
+    ("failure", "bad_source", "bad_action", "classification"),
+    [
+        ("compile", "compile failure", "compile", None),
+        ("host-mismatch", "broken source", "run", "host-mismatch"),
+    ],
+)
+def test_failure_repair_requires_observed_failure_then_verified_source(
+    tmp_path, failure, bad_source, bad_action, classification,
+):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    spec = _special_spec(failure=failure)
+    actor = ScriptedActor((
+        json.dumps({"write": {"slot": "kernel", "content": bad_source}}),
+        json.dumps({bad_action: {}}),
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+
+    result = AdaptiveActorProjectExecutor(executor, actor, object())(
+        _request(tmp_path, executor, spec)
+    )
+
+    assert result.memory.project_spec == spec
+    if classification is None:
+        assert actor.observations[1]["passed"] is False
+    else:
+        assert actor.observations[1]["classification"] == classification
+
+
+@pytest.mark.parametrize("failure", ["compile", "host-mismatch"])
+def test_failure_repair_denies_correctness_when_requested_failure_was_not_seen(
+    tmp_path, failure,
+):
+    executor = ProjectExecutor(
+        SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl")
+    )
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+
+    with pytest.raises(RuntimeError, match="without host-verified current source"):
+        AdaptiveActorProjectExecutor(executor, actor, object())(
+            _request(tmp_path, executor, _special_spec(failure=failure))
+        )
+
+    assert actor.observations[-1]["missing"] == [f"observed-{failure}"]
+    assert actor.distill_calls == []
+
+
+@pytest.mark.parametrize(
+    ("spec", "missing"),
+    [
+        (_special_spec(timing=True), "performance-study"),
+        (_special_spec(profiling=True), "profiling"),
+    ],
+)
+def test_correctness_alone_cannot_complete_treatment_projects(tmp_path, spec, missing):
+    executor = ProjectExecutor(
+        SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl")
+    )
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+
+    with pytest.raises(RuntimeError, match="without host-verified current source"):
+        AdaptiveActorProjectExecutor(executor, actor, object())(
+            _request(tmp_path, executor, spec)
+        )
+
+    assert actor.observations[-1]["missing"] == [missing]
+
+
+def test_retained_performance_and_profile_evidence_complete_treatment_project(
+    tmp_path,
+):
+    executor = ProjectExecutor(
+        SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl")
+    )
+    performance = canonical_digest({"timings": [4.0, 7.0]})
+    profiling = canonical_digest({"timeline": "captured"})
+
+    def treatment(_payload, context):
+        assert context.latest_execution.evidence.verified
+        assert context.artifacts.put_json({"timings": [4.0, 7.0]}) == performance
+        assert context.artifacts.put_json({"timeline": "captured"}) == profiling
+        return AdaptiveActionResult(
+            {"event": "profile", "available": True},
+            host_facts=(HostFact("profiling", "timeline retained", profiling),),
+            admitted_artifacts={
+                performance: "performance-study", profiling: "profiling",
+            },
+        )
+
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"request-profile":{}}',
+        '{"submit":{}}',
+    ))
+    spec = _special_spec(timing=True, profiling=True)
+
+    result = AdaptiveActorProjectExecutor(
+        executor, actor, object(), request_profile=treatment,
+    )(_request(tmp_path, executor, spec))
+
+    assert result.memory.project_spec == spec
+    assert performance in result.memory.admitted_artifact_sha256
+    assert HostFact("profiling", "timeline retained", profiling) in (
+        result.memory.host_facts
+    )

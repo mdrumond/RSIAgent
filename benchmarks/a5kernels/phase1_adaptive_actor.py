@@ -15,6 +15,7 @@ from benchmarks.a5kernels.phase1_adaptive import (
     AdaptiveProjectRequest,
     AdaptiveProjectResult,
 )
+from benchmarks.a5kernels.phase1_curriculum import FailureMode
 from benchmarks.a5kernels.phase1_memory import (
     AgentDistillation,
     HostFact,
@@ -27,6 +28,7 @@ from benchmarks.a5kernels.phase1_project_executor import (
     ProjectExecutionResult,
     ProjectExecutor,
 )
+from benchmarks.a5kernels.phase1_project import EvidenceClassification
 from benchmarks.a5kernels.trial import (
     ActionOutcome,
     ActorOutcome,
@@ -184,6 +186,8 @@ class _ProjectActions:
         self.admitted: dict[str, str] = {}
         self.citations: list[Citation] = []
         self.host_facts: list[HostFact] = []
+        self.observed_failures: dict[FailureMode, int] = {}
+        self.latest_run_at: int | None = None
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
@@ -242,6 +246,8 @@ class _ProjectActions:
         if digest != result.artifact_sha256:
             raise ValueError("compile artifact hash does not match its payload")
         self.admitted[digest] = "compile"
+        if not result.observation.passed:
+            self.observed_failures[FailureMode.COMPILE] = len(self.actions)
         return self._observation({
             "event": "host-compile", "source_sha256": self.source_sha256,
             "passed": result.observation.passed,
@@ -257,6 +263,11 @@ class _ProjectActions:
             raise ValueError("execution rematerialized different project inputs or oracle")
         self.latest = result
         self.latest_source_sha256 = self.source_sha256
+        self.latest_run_at = len(self.actions)
+        if result.evidence.classification is EvidenceClassification.COMPILE_FAILURE:
+            self.observed_failures[FailureMode.COMPILE] = self.latest_run_at
+        elif result.evidence.classification is EvidenceClassification.HOST_MISMATCH:
+            self.observed_failures[FailureMode.HOST_MISMATCH] = self.latest_run_at
         retained = {}
         for name, payload in result.artifacts.items():
             digest = self.artifacts.put_json(payload)
@@ -305,6 +316,30 @@ class _ProjectActions:
         ):
             return self._observation({
                 "error": "submit requires HOST_VERIFIED evidence for current source"
+            })
+        missing = []
+        mode = self.request.spec.failure_mode
+        if mode is not FailureMode.NONE and (
+            mode not in self.observed_failures
+            or self.latest_run_at is None
+            or self.latest_run_at <= self.observed_failures[mode]
+        ):
+            missing.append(f"observed-{mode.value}")
+        if (
+            self.request.spec.timing_lengths
+            and "performance-study" not in self.admitted.values()
+        ):
+            missing.append("performance-study")
+        if self.request.spec.profile_metric is not None and not any(
+            fact.category == "profiling"
+            and self.admitted.get(fact.evidence_sha256) == "profiling"
+            for fact in self.host_facts
+        ):
+            missing.append("profiling")
+        if missing:
+            return self._observation({
+                "error": "submit requires retained project evidence",
+                "missing": missing,
             })
         return self._observation({
             "event": "host-verified-submit",

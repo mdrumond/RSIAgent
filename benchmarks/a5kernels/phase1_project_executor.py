@@ -14,7 +14,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_bytes,
     canonical_digest,
 )
-from benchmarks.a5kernels.phase1_curriculum import FailureMode, ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.a5kernels.phase1_project import (
     ExecutionEvidence,
     HostTensor,
@@ -242,10 +242,6 @@ class ProjectExecutor:
     def prepare(self, spec: ProjectSpec) -> PreparedProject:
         if not isinstance(spec, ProjectSpec):
             raise TypeError("project must be a validated ProjectSpec")
-        if spec.failure_mode is not FailureMode.NONE:
-            raise NotImplementedError(
-                "failure-repair projects require a repair-loop coordinator"
-            )
         inputs = materialize_inputs(spec)
         expected = evaluate_reference(spec, inputs)
         family = _family(spec)
