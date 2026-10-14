@@ -257,7 +257,10 @@ def _grammar() -> dict[str, object]:
     }
 
 
-def curriculum_prompt(context: CurriculumContext) -> str:
+def curriculum_prompt(
+    context: CurriculumContext,
+    unavailable_capabilities: tuple[Capability, ...] = (),
+) -> str:
     payload = {
         "objective": context.objective,
         "next_wave_id": f"wave-{context.wave_index:03d}",
@@ -266,6 +269,10 @@ def curriculum_prompt(context: CurriculumContext) -> str:
         "prior_outcomes": [item.prompt_dict() for item in context.prior_outcomes],
         "bounded_project_grammar": _grammar(),
     }
+    if unavailable_capabilities:
+        payload["unavailable_capabilities"] = [
+            item.value for item in unavailable_capabilities
+        ]
     instructions = (
         "Choose DECISION: WAVE only when every project adds operation, shape, dtype, "
         "failure, or profile information not covered by prior outcomes. Capability "
@@ -277,6 +284,11 @@ def curriculum_prompt(context: CurriculumContext) -> str:
         "DECISION: SATURATED\n{\"reason\":\"...\"}\n"
         "DECISION: STALLED\n{\"reason\":\"...\"}\n"
     )
+    if unavailable_capabilities:
+        instructions += (
+            "Do not select unavailable capabilities or their associated project "
+            "fields; this execution factory cannot collect their required evidence.\n"
+        )
     return instructions + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -288,6 +300,7 @@ class CurriculumAgent:
         complete: Completion,
         *,
         held_out_information_sha256: Sequence[str] = (),
+        unavailable_capabilities: Sequence[Capability] = (),
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
@@ -296,6 +309,12 @@ class CurriculumAgent:
             _digest(item, "held-out information identity")
             for item in held_out_information_sha256
         )
+        self.unavailable_capabilities = tuple(unavailable_capabilities)
+        if (
+            any(not isinstance(item, Capability) for item in self.unavailable_capabilities)
+            or len(set(self.unavailable_capabilities)) != len(self.unavailable_capabilities)
+        ):
+            raise ValueError("unavailable capabilities must be registered and unique")
 
     def select(
         self,
@@ -310,7 +329,10 @@ class CurriculumAgent:
         history = list(current.messages) if current.messages else [
             {"role": "system", "content": _SYSTEM}
         ]
-        history.append({"role": "user", "content": curriculum_prompt(context)})
+        history.append({
+            "role": "user",
+            "content": curriculum_prompt(context, self.unavailable_capabilities),
+        })
         completion = self._complete(tuple(dict(item) for item in history))
         if not isinstance(completion, str):
             raise TypeError("curriculum completion must be text")
@@ -345,6 +367,9 @@ class CurriculumAgent:
                 raise ValueError("stall requires an observed prior attempt")
             return terminal
         wave = WaveSpec.from_mapping(value)
+        unavailable = set(self.unavailable_capabilities)
+        if any(unavailable.intersection(item.spec.capabilities) for item in wave.projects):
+            raise ValueError("wave selects a capability unavailable in this factory")
         if any(
             _HELD_OUT_WORDS.search(item.spec.project_id)
             or _HELD_OUT_WORDS.search(item.spec.hypothesis)

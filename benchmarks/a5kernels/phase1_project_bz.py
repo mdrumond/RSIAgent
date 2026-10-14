@@ -7,6 +7,7 @@ import json
 import math
 import os
 from pathlib import Path
+import secrets
 import tempfile
 
 from benchmarks.a5kernels.bz import BZCommandExecutor, CommandInvocation, CommandResult
@@ -23,6 +24,7 @@ from benchmarks.a5kernels.protocol import SourceFile
 PROJECT_RESULT_MARKER = "A5PROJECT_RESULT="
 _BASE_EVIDENCE_BYTES = 1024 * 1024
 _EVIDENCE_BYTES_PER_OUTPUT = 32
+_SESSION_IDENTITY_CHARS = 12
 
 
 class ProjectInfrastructureError(RuntimeError):
@@ -52,6 +54,7 @@ class CatlassProjectBackend:
         self._root = Path(evidence_root)
         self._device = device
         self._timeout = observe_timeout
+        self._session_namespace = secrets.token_hex(8)
 
     def compile(self, request: ProjectExecutionRequest) -> CompileObservation:
         identity, files = self._bundle(request)
@@ -173,7 +176,10 @@ class CatlassProjectBackend:
         output_elements: int,
     ) -> tuple[dict[str, object], str]:
         attempt = self._reserve_attempt(identity, mode)
-        session = f"codex-a5project-{mode}-{identity[:24]}-{attempt:06d}"
+        session = (
+            f"codex-a5project-{mode}-{identity[:_SESSION_IDENTITY_CHARS]}-"
+            f"{self._session_namespace}-{attempt:06d}"
+        )
         remote = f".a5kernels/projects/{identity}"
         command = (
             "env", "-u", "PYTHONPYCACHEPREFIX",

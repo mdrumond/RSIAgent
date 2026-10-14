@@ -219,6 +219,41 @@ def test_information_gain_uses_executable_dimensions_not_capability_names(item):
     assert isinstance(decision, WaveDecision)
 
 
+@pytest.mark.parametrize(
+    ("item", "capability"),
+    [
+        (
+            project(
+                "timing", ["gm-ub-movement", "timing-sweep"],
+                timing_lengths=[64, 128],
+            ),
+            Capability.TIMING_SWEEP,
+        ),
+        (
+            project(
+                "profile", ["gm-ub-movement", "profiling"],
+                profile_metric="timeline",
+            ),
+            Capability.PROFILING,
+        ),
+    ],
+)
+def test_unavailable_factory_capabilities_are_prompted_and_rejected(item, capability):
+    prompts = []
+
+    def complete(messages):
+        prompts.append(messages[-1]["content"])
+        return wave([item])
+
+    with pytest.raises(ValueError, match="unavailable"):
+        CurriculumAgent(
+            complete, unavailable_capabilities=(capability,),
+        ).select(context())
+
+    assert '"unavailable_capabilities"' in prompts[0]
+    assert capability.value in prompts[0]
+
+
 def test_missing_or_invalid_graph_is_rejected_without_compatibility_default():
     missing = project()
     missing.pop("graph")
