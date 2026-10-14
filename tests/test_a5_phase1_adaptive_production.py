@@ -67,6 +67,7 @@ def test_measurement_action_retains_backend_reports_and_exact_prepared_contract(
     assert request.candidate_source == "fixed source"
     assert metric == (spec.profile_metric if profiling else None)
     assert result.observation["summary"] == report
+    assert "artifacts" not in result.observation
     role = "profiling" if profiling else "performance-study"
     assert result.admitted_artifacts == {digest: role}
     assert result.host_facts[0].category == role
@@ -101,6 +102,27 @@ def test_measurement_failure_is_actionable_and_does_not_admit_evidence(tmp_path,
     assert "length 17" in result.observation["diagnostic"]
     assert result.host_facts == ()
     assert result.admitted_artifacts == {}
+
+
+def test_measurement_factory_rejects_parallel_projects_before_campaign_creation(tmp_path):
+    with pytest.raises(ValueError, match="max_parallel=1"):
+        _build(tmp_path, _cell(), max_parallel=2)
+    assert not _paths(tmp_path).root.exists()
+
+
+def test_performance_lesson_accepts_retained_profiling_evidence():
+    from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
+    digest = "a" * 64
+    text = json.dumps({"distillation": {"no_new_knowledge": False, "lessons": [{
+        "category": "performance", "claim": "Pipe counters identify the active pipeline.",
+        "applicability": "This measured kernel and shape.",
+        "preconditions": "Host correctness passed before capture.",
+        "limitations": "Counter capture is not an uninstrumented latency measurement.",
+        "evidence_artifact_sha256": [digest], "failure_signature": None,
+        "repair": None, "confidence": "medium",
+    }]}})
+    lesson = parse_agent_distillation(text, {digest: "profiling"}).lessons[0]
+    assert lesson.category == "performance"
 
 
 class FakeCommandExecutor:

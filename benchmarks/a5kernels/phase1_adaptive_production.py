@@ -220,7 +220,7 @@ def _measurement_action(measurements, *, profiling: bool) -> ActionDependency:
         summary = result["summary"]
         return AdaptiveActionResult(
             {"event": role, "passed": True, "summary": summary,
-             "evidence_sha256": evidence, "artifacts": result["artifact_payloads"]},
+             "evidence_sha256": evidence},
             host_facts=tuple(HostFact(
                 role, canonical_bytes(summary).decode("ascii"), digest,
             ) for digest in evidence),
@@ -328,6 +328,8 @@ def build_adaptive_phase1(
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 
+    if max_parallel != 1:
+        raise ValueError("measurement-enabled production requires max_parallel=1 on its single device")
     admitted = admit_runnable_cell(cell)
     if paths.catlass_revision != admitted.guide.catlass_revision:
         raise ValueError("runtime Catlass revision does not match the admitted guide")
