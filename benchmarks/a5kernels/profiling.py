@@ -23,6 +23,8 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 class ProfileMetric(str, Enum):
     BASIC_INFO = "BasicInfo"
     PIPE_UTILIZATION = "PipeUtilization"
+    MEMORY = "Memory"
+    PIPE_TIMELINE = "PipeTimeline"
 
 
 class CampaignKind(str, Enum):
