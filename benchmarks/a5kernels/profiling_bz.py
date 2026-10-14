@@ -341,6 +341,11 @@ class BZProfileBackend:
                 "A5KERNEL_LAUNCH_COUNT", str(request.launch_count)
             )
         workload = environment.render(workload)
+        device_options = (
+            ("--device", str(request.device))
+            if action == "run" and dict(environment.bindings).get("A5PROJECT_MASKED_TIMING") == "1"
+            else ()
+        )
         return (
             self._validation,
             "--profile",
@@ -352,6 +357,7 @@ class BZProfileBackend:
             self._catlass_source,
             "--timeout",
             str(self._timeout),
+            *device_options,
             "--",
             *workload,
         )
