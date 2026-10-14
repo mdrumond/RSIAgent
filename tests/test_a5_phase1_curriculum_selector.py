@@ -112,6 +112,13 @@ def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_gr
     assert "65536" in grammar["shape"]
     assert "[1, 4096]" in grammar["timing_lengths"]
     assert "one-dimensional" in grammar["timing_lengths"]
+    rules = grammar["capability_operation_rules"]
+    assert "if and only if" in rules["rule"]
+    assert rules["simd-vector"] == ["add", "multiply", "relu"]
+    assert rules["simt-reduction"] == ["reduce-sum"]
+    assert rules["simt-mask"] == ["mask-positive"]
+    assert rules["cube-tiling"] == ["matmul"]
+    assert "copy alone does not require" in rules["gm-ub-movement"]
 
 
 def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
@@ -138,6 +145,60 @@ def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
     assert isinstance(second, TerminalDecision)
     assert session.turns == 2
     assert calls[1][:3] == calls[0] + ({"role": "assistant", "content": wave([project()])},)
+
+
+@pytest.mark.parametrize("invalid", [
+    "DECISION: WAVE\n{broken",
+    wave([project(capabilities=["gm-ub-movement", "simd-vector"])]),
+])
+def test_invalid_selection_is_corrected_with_full_session_history(invalid):
+    calls = []
+    valid = wave([project()])
+
+    def complete(messages):
+        calls.append(messages)
+        return invalid if len(calls) == 1 else valid
+
+    decision, session = CurriculumAgent(complete).select(context())
+    assert isinstance(decision, WaveDecision)
+    assert len(calls) == 2
+    assert calls[1][:-1] == calls[0] + ({"role": "assistant", "content": invalid},)
+    assert "validation" in calls[1][-1]["content"]
+    assert "unchanged" in calls[1][-1]["content"]
+    assert session.turns == 2
+    assert len(session.messages) == 5
+    assert session.messages[-1]["content"] == valid
+    CurriculumSession(session.messages, session.turns)
+    _, next_session = CurriculumAgent(lambda _: valid).select(context(), session)
+    assert next_session.messages[:5] == session.messages
+    assert next_session.turns == 3
+
+
+def test_selection_validation_exhaustion_is_bounded_and_diagnostic():
+    calls = []
+
+    def complete(messages):
+        calls.append(messages)
+        return wave([project(capabilities=["simd-vector"])])
+
+    with pytest.raises(ValueError, match="3 attempts.*simd-vector"):
+        CurriculumAgent(complete).select(context())
+    assert len(calls) == 3
+    assert [len(messages) for messages in calls] == [2, 4, 6]
+
+
+def test_provider_value_error_is_not_retried_as_proposal_validation():
+    calls = []
+    failure = ValueError("provider refused request")
+
+    def complete(messages):
+        calls.append(messages)
+        raise failure
+
+    with pytest.raises(ValueError) as caught:
+        CurriculumAgent(complete).select(context())
+    assert caught.value is failure
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("reply", [
