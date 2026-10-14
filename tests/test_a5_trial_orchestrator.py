@@ -183,6 +183,13 @@ def test_end_to_end_result_is_host_owned_and_treatments_off_do_not_leak(tmp_path
     }
     assert result.workspace.parent.joinpath("memory", "knowledge.jsonl").is_file()
     assert len(result.evidence_sha256) == 64
+    artifacts = ContentAddressedArtifacts(result.artifacts)
+    retained = [entry.payload for entry in EvidenceLedger(
+        result.workspace.parent / "evidence.jsonl"
+    ).entries if entry.kind == EvidenceKind.ARTIFACT.value]
+    by_role = {entry["role"]: entry["sha256"] for entry in retained}
+    assert artifacts.read_bytes(by_role["final-source"]) == b"agent source"
+    assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
 
 
 def test_enabled_treatments_are_explicitly_routed(tmp_path):

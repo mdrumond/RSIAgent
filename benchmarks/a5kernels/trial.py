@@ -478,6 +478,31 @@ class TrialResult:
         return self.run.verified
 
 
+def _retain_final_artifacts(
+    *, workspace: Path, language: str, executor: TrialActionExecutor,
+    artifacts: ContentAddressedArtifacts, ledger: EvidenceLedger,
+    outcome: ActorOutcome,
+) -> None:
+    """Bind final host-verified state into the trial's content-addressed store."""
+
+    final_source = (workspace / _SOURCE_PATHS[language]).read_bytes()
+    source_ref = artifacts.put_bytes(final_source)
+    if source_ref != executor.final_run.candidate_source_sha256:
+        raise RuntimeError("retained final source does not match verified candidate")
+    ledger.append(EvidenceKind.ARTIFACT, {
+        "role": "final-source", "sha256": source_ref,
+    })
+    profile_ref = artifacts.put_json(executor.final_profile)
+    ledger.append(EvidenceKind.ARTIFACT, {
+        "role": "final-profile", "sha256": profile_ref,
+    })
+    if outcome.terminal_response is not None:
+        response_ref = artifacts.put_bytes(outcome.terminal_response.encode("utf-8"))
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "post-terminal-response", "sha256": response_ref,
+        })
+
+
 class TrialOrchestrator:
     def __init__(self, root: Path, capabilities: RuntimeCapabilities,
                  backend: KernelTrialBackend, actor: ActorDriver,
@@ -540,6 +565,11 @@ class TrialOrchestrator:
                 turn_parser=parse_trial_action, action_executor=executor)
             if executor.final_run is None or executor.final_profile is None:
                 raise RuntimeError("Actor ended without a host-verified submit action")
+            _retain_final_artifacts(
+                workspace=workspace, language=cell.language.value,
+                executor=executor, artifacts=artifacts, ledger=ledger,
+                outcome=outcome,
+            )
             return TrialResult(outcome, executor.final_run, executor.final_profile,
                                workspace, memory, context, ledger.head_sha256,
                                artifacts.root)
@@ -609,22 +639,10 @@ class TrialOrchestrator:
         )
         if executor.final_run is None or executor.final_profile is None:
             raise RuntimeError("Actor ended without a host-verified submit action")
-        final_source = (workspace / _SOURCE_PATHS[language]).read_bytes()
-        source_ref = artifacts.put_bytes(final_source)
-        if source_ref != executor.final_run.candidate_source_sha256:
-            raise RuntimeError("retained final source does not match verified candidate")
-        ledger.append(EvidenceKind.ARTIFACT, {
-            "role": "final-source", "sha256": source_ref,
-        })
-        profile_ref = artifacts.put_json(executor.final_profile)
-        ledger.append(EvidenceKind.ARTIFACT, {
-            "role": "final-profile", "sha256": profile_ref,
-        })
-        if outcome.terminal_response is not None:
-            response_ref = artifacts.put_bytes(outcome.terminal_response.encode("utf-8"))
-            ledger.append(EvidenceKind.ARTIFACT, {
-                "role": "post-terminal-response", "sha256": response_ref,
-            })
+        _retain_final_artifacts(
+            workspace=workspace, language=language, executor=executor,
+            artifacts=artifacts, ledger=ledger, outcome=outcome,
+        )
         return TrialResult(
             outcome,
             executor.final_run,

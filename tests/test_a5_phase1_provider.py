@@ -215,7 +215,7 @@ def test_openai_sdk_transport_failures_use_infrastructure_signal(
         provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
 
 
-def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations():
+def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(tmp_path):
     calls = []
     provider = _scripted_provider([
         "not-json",
@@ -237,11 +237,13 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
 
     from benchmarks.a5kernels.trial import parse_trial_action
 
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
     outcome = actor(
         "instruction",
         profile=direct_profile(MODEL_IDENTITIES[0]),
-        workspace=None,
-        context=None,
+        workspace=workspace,
+        context=tmp_path / "trial/context",
         turn_parser=parse_trial_action,
         action_executor=execute,
     )
@@ -255,9 +257,18 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
         "role": "user",
         "content": json.dumps({"host": {"event": "write"}}),
     }
+    ledger = EvidenceLedger(tmp_path / "trial/evidence.jsonl")
+    artifacts = ContentAddressedArtifacts(tmp_path / "trial/artifacts")
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    assert [entry["role"] for entry in retained].count("provider-request") == 4
+    assert [entry["role"] for entry in retained].count("provider-response") == 4
+    responses = [artifacts.read_bytes(entry["sha256"]).decode()
+                 for entry in retained if entry["role"] == "provider-response"]
+    assert responses[0] == "not-json"
 
 
-def test_direct_actor_delivers_terminal_host_observation_before_returning():
+def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_path):
     calls = []
     provider = _scripted_provider([
         '{"submit":{}}',
@@ -268,11 +279,13 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning():
     from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
 
     terminal = json.dumps({"host": {"event": "submitted", "passed": True}})
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
     outcome = actor(
         "instruction",
         profile=direct_profile(MODEL_IDENTITIES[0]),
-        workspace=None,
-        context=None,
+        workspace=workspace,
+        context=tmp_path / "trial/context",
         turn_parser=parse_trial_action,
         action_executor=lambda _action: ActionOutcome(terminal, terminal=True),
     )
@@ -283,6 +296,41 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning():
     }
     assert outcome.terminal_response == '{"distillation":"host result received"}'
     assert outcome.tokens == 4
+
+
+def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
+    calls = 0
+
+    def transport(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return DirectCompletion('{"submit":{}}', 2)
+        raise ConnectionError("provider unavailable after host completion")
+
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport)
+    actor = DirectActorDriver(provider, max_turns=1)
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=workspace, context=tmp_path / "trial/context",
+        turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            '{"host":{"event":"submitted","passed":true}}', terminal=True,
+        ),
+    )
+
+    assert outcome.status == "done"
+    assert outcome.terminal_response is None
+    ledger = EvidenceLedger(tmp_path / "trial/evidence.jsonl")
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    assert [entry["role"] for entry in retained][-2:] == [
+        "provider-request", "provider-response-failure",
+    ]
 
 
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
