@@ -10,7 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import json
 import math
+import re
 from typing import Callable, Iterable
 
 
@@ -40,8 +42,10 @@ def _model_id(value: object, field: str) -> str:
 
 def _content_id(value: object, field: str) -> str:
     result = _model_id(value, field)
-    if not result.startswith("sha256:"):
-        raise ValueError(f"{field} must be immutable (use sha256:...)")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", result) is None:
+        raise ValueError(
+            f"{field} must be immutable (use sha256: plus exactly 64 lowercase hex chars)"
+        )
     return result
 
 
@@ -87,10 +91,24 @@ class StudyConfig:
         if top_p > 1:
             raise ValueError("top_p must be <= 1")
 
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            field: getattr(self, field)
+            for field in (
+                "base_model_id", "adapter_model_id", "frozen_memory_id", "seeds",
+                "max_tokens", "max_tool_calls", "temperature", "top_p",
+            )
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
 
 @dataclass(frozen=True)
 class StudyCell:
     cell_id: str
+    study_fingerprint: str
+    study_seeds: tuple[int, int, int]
     arm: Arm
     mode: BenchmarkMode
     track: ContractTrack
@@ -102,6 +120,35 @@ class StudyCell:
     max_tool_calls: int
     temperature: float
     top_p: float
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"[0-9a-f]{64}", self.study_fingerprint) is None:
+            raise ValueError("study_fingerprint must be 64 lowercase hex chars")
+        if (
+            not isinstance(self.study_seeds, tuple)
+            or len(self.study_seeds) != 3
+            or len(set(self.study_seeds)) != 3
+            or self.seed not in self.study_seeds
+        ):
+            raise ValueError("study cell must use one of exactly three study seeds")
+        expected = {
+            Arm.BASE: (False, False),
+            Arm.H: (False, True),
+            Arm.W: (True, False),
+            Arm.W_H: (True, True),
+        }[self.arm]
+        actual = (self.adapter_model_id is not None, self.memory_id is not None)
+        if self.arm is Arm.BASE and actual != (False, False):
+            raise ValueError("base arm must not use adapter or memory treatments")
+        if actual != expected:
+            raise ValueError(
+                f"{self.arm.value} arm must not use unassigned treatments and must use assigned treatments"
+            )
+
+
+def _cell_id(fingerprint: str, arm: Arm, mode: BenchmarkMode, track: ContractTrack, seed: int) -> str:
+    dimensions = f"{fingerprint}:{arm.value}:{mode.value}:{track.value}:{seed}"
+    return "sft-" + hashlib.sha256(dimensions.encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -118,11 +165,11 @@ def build_matrix(config: StudyConfig) -> StudyMatrix:
         for mode in BenchmarkMode:
             for track in ContractTrack:
                 for seed in config.seeds:
-                    dimensions = f"{arm.value}:{mode.value}:{track.value}:{seed}"
-                    cell_id = "sft-" + hashlib.sha256(dimensions.encode()).hexdigest()[:16]
                     cells.append(
                         StudyCell(
-                            cell_id=cell_id,
+                            cell_id=_cell_id(config.fingerprint, arm, mode, track, seed),
+                            study_fingerprint=config.fingerprint,
+                            study_seeds=config.seeds,
                             arm=arm,
                             mode=mode,
                             track=track,
@@ -255,6 +302,7 @@ class RunMetric:
     cost_usd: float
     regressed: bool
     repairs: int
+    public_baseline_id: str | None = None
     public_baseline_hap: float | None = None
 
     def __post_init__(self) -> None:
@@ -270,15 +318,84 @@ class RunMetric:
         if type(self.repairs) is not int or self.repairs < 0:
             raise ValueError("repairs must be a non-negative integer")
         if self.cell.mode is BenchmarkMode.OPTIMIZE_PUBLIC_BASELINE:
+            if not isinstance(self.public_baseline_id, str) or not self.public_baseline_id:
+                raise ValueError("optimization runs require public_baseline_id")
             if self.public_baseline_hap is None:
                 raise ValueError("optimization runs require public_baseline_hap")
             _finite(self.public_baseline_hap, "public_baseline_hap")
-        elif self.public_baseline_hap is not None:
-            raise ValueError("spec-generation runs cannot have public_baseline_hap")
+        elif self.public_baseline_id is not None or self.public_baseline_hap is not None:
+            raise ValueError("spec-generation runs cannot have a public baseline")
 
 
-def _run_key(row: RunMetric) -> tuple[str, str, int, str]:
-    return (row.cell.mode.value, row.cell.track.value, row.cell.seed, row.task_id)
+def _run_key(row: RunMetric) -> tuple[str, str, str, int, str]:
+    return (
+        row.cell.study_fingerprint,
+        row.cell.mode.value,
+        row.cell.track.value,
+        row.cell.seed,
+        row.task_id,
+    )
+
+
+def _validate_study(rows: tuple[RunMetric, ...]) -> None:
+    if not rows:
+        raise ValueError("matrix requires rows")
+    fields = (
+        "study_fingerprint", "study_seeds", "base_model_id", "max_tokens",
+        "max_tool_calls", "temperature", "top_p",
+    )
+    if any(len({getattr(row.cell, field) for row in rows}) != 1 for field in fields):
+        raise ValueError("study configuration drift across matrix cells")
+    adapters = {row.cell.adapter_model_id for row in rows if row.cell.adapter_model_id}
+    memories = {row.cell.memory_id for row in rows if row.cell.memory_id}
+    if len(adapters) != 1 or len(memories) != 1:
+        raise ValueError("study configuration drift across adapter or memory treatments")
+
+    first = rows[0].cell
+    config = StudyConfig(
+        base_model_id=first.base_model_id,
+        adapter_model_id=next(iter(adapters)),
+        frozen_memory_id=next(iter(memories)),
+        seeds=first.study_seeds,
+        max_tokens=first.max_tokens,
+        max_tool_calls=first.max_tool_calls,
+        temperature=first.temperature,
+        top_p=first.top_p,
+    )
+    if config.fingerprint != first.study_fingerprint:
+        raise ValueError("study configuration drift from declared fingerprint")
+    for row in rows:
+        expected_id = _cell_id(
+            config.fingerprint, row.cell.arm, row.cell.mode, row.cell.track, row.cell.seed
+        )
+        if row.cell.cell_id != expected_id:
+            raise ValueError("study cell identity does not match its configuration")
+
+    expected = {
+        (arm, mode, track, seed)
+        for arm in Arm
+        for mode in BenchmarkMode
+        for track in ContractTrack
+        for seed in config.seeds
+    }
+    for task_id in {row.task_id for row in rows}:
+        task_rows = tuple(row for row in rows if row.task_id == task_id)
+        actual = {
+            (row.cell.arm, row.cell.mode, row.cell.track, row.cell.seed)
+            for row in task_rows
+        }
+        if actual != expected or len(task_rows) != len(expected):
+            raise ValueError("every task requires the complete factorial matrix")
+
+    optimization_groups: dict[tuple[str, str, int, str], set[tuple[str, float]]] = {}
+    for row in rows:
+        if row.cell.mode is BenchmarkMode.OPTIMIZE_PUBLIC_BASELINE:
+            key = (row.cell.mode.value, row.cell.track.value, row.cell.seed, row.task_id)
+            optimization_groups.setdefault(key, set()).add(
+                (str(row.public_baseline_id), float(row.public_baseline_hap))
+            )
+    if any(len(values) != 1 for values in optimization_groups.values()):
+        raise ValueError("matched optimization arms require the same public baseline identity and value")
 
 
 def _mean(rows: tuple[RunMetric, ...], field: str) -> float:
@@ -354,6 +471,7 @@ def aggregate_matrix(metrics: Iterable[RunMetric]) -> dict[str, object]:
     """Aggregate matched arms overall and within every mode and track."""
 
     rows = tuple(metrics)
+    _validate_study(rows)
     report = _aggregate_matched(rows)
     report["by_mode"] = {
         mode.value: _aggregate_matched(tuple(row for row in rows if row.cell.mode is mode))
@@ -366,8 +484,8 @@ def aggregate_matrix(metrics: Iterable[RunMetric]) -> dict[str, object]:
     return report
 
 
-def fixture_metrics(matrix: StudyMatrix, *, task_id: str) -> tuple[RunMetric, ...]:
-    """Return deterministic evidence that exercises all matrix dimensions."""
+def synthetic_demo_metrics(matrix: StudyMatrix, *, task_id: str) -> tuple[RunMetric, ...]:
+    """Return synthetic numbers for plumbing demos, never execution evidence."""
 
     hap_by_arm = {Arm.BASE: 10.0, Arm.H: 11.0, Arm.W: 12.0, Arm.W_H: 13.0}
     return tuple(
@@ -381,6 +499,10 @@ def fixture_metrics(matrix: StudyMatrix, *, task_id: str) -> tuple[RunMetric, ..
             cost_usd=0.01 * (1 + list(Arm).index(cell.arm)),
             regressed=False,
             repairs=list(Arm).index(cell.arm),
+            public_baseline_id=(
+                "synthetic-public-baseline"
+                if cell.mode is BenchmarkMode.OPTIMIZE_PUBLIC_BASELINE else None
+            ),
             public_baseline_hap=(
                 9.0 if cell.mode is BenchmarkMode.OPTIMIZE_PUBLIC_BASELINE else None
             ),

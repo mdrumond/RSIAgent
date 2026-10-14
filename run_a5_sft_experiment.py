@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan or prove the standalone Fireworks SFT experiment matrix."""
+"""Plan the Fireworks SFT matrix or emit a clearly synthetic plumbing demo."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from benchmarks.a5kernels.sft_experiment import (
     StudyConfig,
     aggregate_matrix,
     build_matrix,
-    fixture_metrics,
+    synthetic_demo_metrics,
 )
 
 
@@ -25,7 +25,7 @@ def _json_default(value: object) -> object:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "fixture"))
+    parser.add_argument("command", choices=("plan", "synthetic-demo"))
     parser.add_argument("--base-model-id", required=True)
     parser.add_argument("--adapter-model-id", required=True)
     parser.add_argument("--memory-id", required=True)
@@ -48,7 +48,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     payload = (
         {"config": asdict(config), "cells": [asdict(cell) for cell in matrix.cells]}
         if args.command == "plan"
-        else aggregate_matrix(fixture_metrics(matrix, task_id="fixture-vector-add"))
+        else {
+            "evidence_kind": "synthetic-demo-not-execution-evidence",
+            "executed": False,
+            **aggregate_matrix(
+                synthetic_demo_metrics(matrix, task_id="synthetic-vector-add")
+            ),
+        }
     )
     print(json.dumps(payload, indent=2, sort_keys=True, default=_json_default))
     return 0
