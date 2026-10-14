@@ -248,6 +248,14 @@ def _grammar() -> dict[str, object]:
         "shape": "1-3 dimensions, each integer in [1, 4096]; graph inputs must match shape except matmul shape [m,k,n] with inputs [m,k] and [k,n]; each graph tensor may contain at most 65536 elements",
         "timing_lengths": "0-8 unique ascending integers in [1, 4096]; timing-sweep requires at least two lengths and one-dimensional inputs",
         "composition": "capabilities must agree with graph operations; failure-repair requires a non-none failure_mode; profiling requires profile_metric; padded-tail requires non-aligned output extent and physical tensors no larger than 65536 elements",
+        "capability_operation_rules": {
+            "rule": "Each listed capability must be present if and only if the graph contains at least one of its listed operations; inspect every node, not just the output. These are RSI metadata rules, not Catlass API restrictions.",
+            "simd-vector": ["add", "multiply", "relu"],
+            "simt-reduction": ["reduce-sum"],
+            "simt-mask": ["mask-positive"],
+            "cube-tiling": ["matmul"],
+            "gm-ub-movement": "No operation equivalence is enforced; copy alone does not require simd-vector.",
+        },
         "graph": {
             "fields_exactly": ["inputs", "nodes", "output"],
             "input_fields_exactly": ["name", "shape"],
@@ -338,12 +346,32 @@ class CurriculumAgent:
             "role": "user",
             "content": curriculum_prompt(context, self.unavailable_capabilities),
         })
-        completion = self._complete(tuple(dict(item) for item in history))
-        if not isinstance(completion, str):
-            raise TypeError("curriculum completion must be text")
-        decision = self._parse_and_validate(completion, context)
-        history.append({"role": "assistant", "content": completion})
-        return decision, CurriculumSession(tuple(history), current.turns + 1)
+        for attempt in range(1, 4):
+            # Provider failures are not proposal-validation failures. Let the
+            # caller's existing infrastructure handling observe them unchanged.
+            completion = self._complete(tuple(dict(item) for item in history))
+            if not isinstance(completion, str):
+                raise TypeError("curriculum completion must be text")
+            history.append({"role": "assistant", "content": completion})
+            try:
+                decision = self._parse_and_validate(completion, context)
+            except ValueError as exc:
+                if attempt == 3:
+                    raise ValueError(
+                        f"curriculum selection failed validation after 3 attempts: {exc}"
+                    ) from exc
+                history.append({
+                    "role": "user",
+                    "content": (
+                        f"Proposal validation failed: {exc}. Correct your proposal "
+                        "and return one exact decision wire form. The curriculum "
+                        "context, wave identity, memory, coverage, and grammar "
+                        "are unchanged; no project has been admitted."
+                    ),
+                })
+                continue
+            return decision, CurriculumSession(tuple(history), current.turns + attempt)
+        raise AssertionError("unreachable selection attempt")
 
     def _parse_and_validate(
         self, text: str, context: CurriculumContext,

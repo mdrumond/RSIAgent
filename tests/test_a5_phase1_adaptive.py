@@ -97,6 +97,80 @@ def _result(spec, verified, summary):
     return AdaptiveProjectResult(_memory(spec), evidence, payload, summary)
 
 
+def test_invalid_curriculum_selection_is_corrected_before_execution_and_publication(tmp_path):
+    calls = []
+    executed = []
+
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            invalid = _project("invalid-metadata", "simd-vector")
+            invalid["graph"]["nodes"][0]["op"] = "copy"
+            invalid["graph"]["nodes"][0]["operands"] = ["lhs"]
+            return _wave(messages[-1]["content"], [invalid])
+        if len(calls) == 2:
+            assert "simd-vector" in messages[-1]["content"]
+            return _wave(messages[1]["content"], [
+                _project("valid-copy", "gm-ub-movement"),
+            ])
+        return 'DECISION: SATURATED\n{"reason":"requested coverage complete"}'
+
+    def execute(request):
+        executed.append(request.spec.project_id)
+        return _result(request.spec, True, "verified corrected project")
+
+    result = AdaptivePhase1Coordinator(
+        tmp_path / "correction", "Learn bounded skills.", SEED,
+        CurriculumAgent(complete), execute, max_parallel=1,
+    ).run()
+    assert result["status"] == "SATURATED"
+    assert executed == ["valid-copy"]
+    assert result["published_projects"] == ["valid-copy"]
+    assert len(calls) == 3
+
+
+def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
+    calls = []
+    stop_after_first = False
+
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return _wave(messages[-1]["content"], [
+                _project("published", "gm-ub-movement"),
+            ])
+        if not stop_after_first:
+            return "DECISION: WAVE\n{broken"
+        return 'DECISION: SATURATED\n{"reason":"requested coverage complete"}'
+
+    executions = []
+
+    def execute(request):
+        executions.append(request.spec.project_id)
+        return _result(request.spec, True, "verified before selection failure")
+
+    root = tmp_path / "exhaustion"
+    coordinator = AdaptivePhase1Coordinator(
+        root, "Learn bounded skills.", SEED,
+        CurriculumAgent(complete), execute, max_parallel=1,
+    )
+    with pytest.raises(ValueError, match="3 attempts"):
+        coordinator.run()
+    before = json.loads((root / "state.json").read_text())
+    assert coordinator.report()["published_projects"] == ["published"]
+    assert len(calls) == 4
+    stop_after_first = True
+    resumed = AdaptivePhase1Coordinator(
+        root, "Learn bounded skills.", SEED,
+        CurriculumAgent(complete), execute, max_parallel=1,
+    ).resume()
+    assert resumed["status"] == "SATURATED"
+    assert resumed["published_projects"] == ["published"]
+    assert executions == ["published"]
+    after = json.loads((root / "state.json").read_text())
+    assert after["memory_bytes_base64"] == before["memory_bytes_base64"]
+
+
 def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_path):
     selection_prompts = []
 
