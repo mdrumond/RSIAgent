@@ -77,7 +77,9 @@ def _request(tmp_path: Path, family: str):
 
 
 @pytest.mark.parametrize("family", ["movement", "simt", "cube"])
-def test_bundle_and_checked_command_are_deterministic_for_every_family(tmp_path, family):
+def test_bundle_is_deterministic_but_independent_backends_use_fresh_sessions(
+    tmp_path, family,
+):
     request = _request(tmp_path, family)
     outcomes = [{"status": "compiled", "diagnostic": "compiled"}] * 2
     first_executor, second_executor = FakeExecutor(outcomes[:1]), FakeExecutor(outcomes[1:])
@@ -87,7 +89,11 @@ def test_bundle_and_checked_command_are_deterministic_for_every_family(tmp_path,
     one, two = first_executor.invocations[0], second_executor.invocations[0]
     assert first.artifact_id == second.artifact_id
     assert first.artifact_id.startswith("bundle:")
-    assert one.argv == two.argv
+    assert one.argv[:2] == two.argv[:2]
+    assert one.argv[3:] == two.argv[3:]
+    assert one.argv[2] != two.argv[2]
+    assert one.argv[2].endswith("-000001")
+    assert two.argv[2].endswith("-000001")
     assert one.remote_directory == two.remote_directory
     assert one.physical_device == two.physical_device == 3
     assert tuple((item.relative_path, item.content) for item in one.files) == tuple(
@@ -205,17 +211,23 @@ def test_confirmed_retries_use_distinct_attempts_but_uncertain_dispatch_reattach
     assert sessions[1].endswith("-000002")
     assert sessions[0] != sessions[1]
 
-    uncertain = FakeExecutor([outcome])
-    expected_session = sessions[0]
-    uncertain.dispatch_result = CommandResult(
-        75,
-        "\n".join((
-            "CATLASS_VALIDATION_STATE=observation-unavailable",
-            f"CATLASS_VALIDATION_HANDLE=bz-a5:{expected_session}",
-        )),
-        session_handle=f"bz-a5:{expected_session}",
-    )
+    class UncertainExecutor(FakeExecutor):
+        def run(self, invocation):
+            self.invocations.append(invocation)
+            self._outcome = self.outcomes.pop(0)
+            session = invocation.argv[2]
+            return CommandResult(
+                75,
+                "\n".join((
+                    "CATLASS_VALIDATION_STATE=observation-unavailable",
+                    f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}",
+                )),
+                session_handle=f"bz-a5:{session}",
+            )
+
+    uncertain = UncertainExecutor([outcome])
     _backend(tmp_path / "reattach", uncertain).compile(request)
+    expected_session = uncertain.invocations[0].argv[2]
     assert uncertain.observations == [f"bz-a5:{expected_session}"]
 
 
