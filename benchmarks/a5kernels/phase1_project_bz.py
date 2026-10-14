@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 
-from benchmarks.a5kernels.bz import BZCommandExecutor, CommandInvocation
-from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.bz import BZCommandExecutor, CommandInvocation, CommandResult
+from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.fixtures import _CATLASS_DRIVER
 from benchmarks.a5kernels.phase1_project_executor import (
     CompileObservation,
@@ -19,7 +21,8 @@ from benchmarks.a5kernels.protocol import SourceFile
 
 
 PROJECT_RESULT_MARKER = "A5PROJECT_RESULT="
-MAX_OBSERVED_BYTES = 4 * 1024 * 1024
+_BASE_EVIDENCE_BYTES = 1024 * 1024
+_EVIDENCE_BYTES_PER_OUTPUT = 32
 
 
 class ProjectInfrastructureError(RuntimeError):
@@ -52,22 +55,29 @@ class CatlassProjectBackend:
 
     def compile(self, request: ProjectExecutionRequest) -> CompileObservation:
         identity, files = self._bundle(request)
-        record, evidence = self._execute(identity, files, "compile")
+        record, evidence = self._execute(identity, files, "compile", 0)
         if record["status"] == "infrastructure-failure":
             raise ProjectInfrastructureError(record["diagnostic"])
         if record["status"] == "compile-failure":
             return CompileObservation(False, evidence, record["diagnostic"], None)
         if record["status"] != "compiled":
             raise ProjectInfrastructureError("compile returned an invalid host status")
-        return CompileObservation(True, evidence, record["diagnostic"], identity)
+        return CompileObservation(
+            True,
+            evidence,
+            record["diagnostic"] + "; run performs a fresh exact-bundle compilation",
+            f"bundle:{identity}",
+        )
 
     def run(
         self, request: ProjectExecutionRequest, compilation: CompileObservation
     ) -> RuntimeObservation:
         identity, files = self._bundle(request)
-        if not compilation.passed or compilation.artifact_id != identity:
+        if not compilation.passed or compilation.artifact_id != f"bundle:{identity}":
             raise ValueError("compilation does not match the immutable project bundle")
-        record, evidence = self._execute(identity, files, "run")
+        record, evidence = self._execute(
+            identity, files, "run", math.prod(request.expected.physical_shape)
+        )
         status = record["status"]
         if status in {"infrastructure-failure", "compile-failure"}:
             raise ProjectInfrastructureError(record["diagnostic"])
@@ -156,9 +166,14 @@ class CatlassProjectBackend:
             ) from exc
 
     def _execute(
-        self, identity: str, files: tuple[SourceFile, ...], mode: str
+        self,
+        identity: str,
+        files: tuple[SourceFile, ...],
+        mode: str,
+        output_elements: int,
     ) -> tuple[dict[str, object], str]:
-        session = f"codex-a5project-{mode}-{identity[:24]}"
+        attempt = self._reserve_attempt(identity, mode)
+        session = f"codex-a5project-{mode}-{identity[:24]}-{attempt:06d}"
         remote = f".a5kernels/projects/{identity}"
         command = (
             "env", "-u", "PYTHONPYCACHEPREFIX",
@@ -178,9 +193,26 @@ class CatlassProjectBackend:
         )
         try:
             dispatch = self._executor.run(invocation)
+            handle = f"bz-a5:{session}"
+            if dispatch.session_handle not in {None, handle}:
+                raise ProjectInfrastructureError(
+                    "BZ-A5 project dispatch returned a mismatched retained handle"
+                )
+            if _observation_uncertain(dispatch, session):
+                self._observe_terminal(handle, session)
+            elif dispatch.exit_code != 0:
+                raise ProjectInfrastructureError(
+                    "BZ-A5 project dispatch failed before a current session was confirmed"
+                )
             logs = self._executor.inspect((self._wrapper, "--name", session, "logs"))
             result = self._executor.inspect((self._wrapper, "--name", session, "result"))
+            if _inspection_uncertain(logs, session) or _inspection_uncertain(result, session):
+                self._observe_terminal(handle, session)
+                logs = self._executor.inspect((self._wrapper, "--name", session, "logs"))
+                result = self._executor.inspect((self._wrapper, "--name", session, "result"))
         except Exception as exc:
+            if isinstance(exc, ProjectInfrastructureError):
+                raise
             raise ProjectInfrastructureError("BZ-A5 project operation unavailable") from exc
         if logs.exit_code != 0 or not _completed(result, session):
             raise ProjectInfrastructureError("BZ-A5 project result is unavailable")
@@ -188,7 +220,8 @@ class CatlassProjectBackend:
             item.rstrip("\n") for item in (dispatch.stdout, logs.stdout, dispatch.stderr,
                                              logs.stderr, result.stderr) if item
         )
-        if len(observed.encode("utf-8")) > MAX_OBSERVED_BYTES:
+        maximum = _BASE_EVIDENCE_BYTES + output_elements * _EVIDENCE_BYTES_PER_OUTPUT
+        if len(observed.encode("utf-8")) > maximum:
             raise ProjectInfrastructureError("BZ-A5 project evidence exceeded its bound")
         records = [
             line.removeprefix(PROJECT_RESULT_MARKER)
@@ -208,14 +241,72 @@ class CatlassProjectBackend:
             or not record["diagnostic"]
         ):
             raise ProjectInfrastructureError("host driver returned an invalid record")
-        evidence = canonical_digest({
+        retained = {
+            "schema": "a5-phase1-project-observation-v1",
             "identity": identity,
             "mode": mode,
+            "attempt": attempt,
             "record": record,
-            "observed": observed,
-            "handle": dispatch.session_handle or f"bz-a5:{session}",
-        })
+            "handle": handle,
+            "command_results": {
+                "dispatch": _command_result_payload(dispatch),
+                "logs": _command_result_payload(logs),
+                "result": _command_result_payload(result),
+            },
+        }
+        evidence = self._retain_evidence(retained)
         return record, evidence
+
+    def _reserve_attempt(self, identity: str, mode: str) -> int:
+        """Reserve a fresh identity after a confirmed operation is retried."""
+
+        attempts = self._root / identity / "attempts"
+        try:
+            attempts.mkdir(parents=True, exist_ok=True)
+            for ordinal in range(1, 1_000_000):
+                try:
+                    (attempts / f"{mode}-{ordinal:06d}").mkdir()
+                except FileExistsError:
+                    continue
+                return ordinal
+        except OSError as exc:
+            raise ProjectInfrastructureError("project attempt could not be retained") from exc
+        raise ProjectInfrastructureError("project attempt space is exhausted")
+
+    def _observe_terminal(self, handle: str, session: str) -> None:
+        observe = getattr(self._executor, "observe", None)
+        if observe is None:
+            raise ProjectInfrastructureError(
+                "BZ-A5 project retained observation is unavailable"
+            )
+        observed = observe(handle)
+        if not _terminal_observation(observed, session):
+            raise ProjectInfrastructureError(
+                "BZ-A5 project retained observation returned no terminal state"
+            )
+
+    def _retain_evidence(self, payload: dict[str, object]) -> str:
+        """Store reconstructible raw command evidence in a local content-addressed store."""
+
+        content = canonical_bytes(payload)
+        digest = hashlib.sha256(content).hexdigest()
+        directory = self._root / "cas" / digest[:2]
+        destination = directory / f"{digest}.json"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if destination.read_bytes() != content:
+                    raise ProjectInfrastructureError("retained evidence CAS conflicts")
+                return digest
+            with tempfile.NamedTemporaryFile(dir=directory, delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        except OSError as exc:
+            raise ProjectInfrastructureError("project evidence could not be retained") from exc
+        return digest
 
 
 def _completed(result, session: str) -> bool:
@@ -223,6 +314,47 @@ def _completed(result, session: str) -> bool:
     values = [line.removeprefix(prefix).split()[0] for line in result.stdout.splitlines()
               if line.startswith(prefix)]
     return result.exit_code == 0 and values == ["0"]
+
+
+def _observation_uncertain(result: CommandResult, session: str) -> bool:
+    lines = result.stdout.splitlines()
+    return (
+        "CATLASS_VALIDATION_STATE=observation-unavailable" in lines
+        and f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}" in lines
+    )
+
+
+def _inspection_uncertain(result: CommandResult, session: str) -> bool:
+    if result.exit_code in {75, 255}:
+        return True
+    states = {"running", "reconnecting", "observation-unavailable", "missing"}
+    return any(
+        line in {f"REMOTE_STATE={state}" for state in states}
+        or any(
+            line == f"SESSION_STATE={state} session={session}"
+            or line.startswith(f"SESSION_STATE={state} session={session} ")
+            for state in states
+        )
+        for line in result.stdout.splitlines()
+    )
+
+
+def _terminal_observation(result: CommandResult, session: str) -> bool:
+    lines = result.stdout.splitlines()
+    return (
+        f"CATLASS_VALIDATION_HANDLE=bz-a5:{session}" in lines
+        and any(f"CATLASS_VALIDATION_STATE={state}" in lines
+                for state in ("completed", "failed"))
+    )
+
+
+def _command_result_payload(result: CommandResult) -> dict[str, object]:
+    return {
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "session_handle": result.session_handle,
+    }
 
 
 _DRIVER_PREFIX, _SEPARATOR, _UNUSED = _CATLASS_DRIVER.partition("def _numbers")

@@ -24,13 +24,17 @@ class FakeExecutor:
         self.invocations = []
         self.inspections = []
         self._outcome = None
+        self.dispatch_result = None
+        self.observations = []
 
     def run(self, invocation):
         self.invocations.append(invocation)
         self._outcome = self.outcomes.pop(0)
         if isinstance(self._outcome, Exception):
             raise self._outcome
-        return CommandResult(0, "dispatch accepted", session_handle=None)
+        return self.dispatch_result or CommandResult(
+            0, "dispatch accepted", session_handle=None
+        )
 
     def inspect(self, argv):
         self.inspections.append(argv)
@@ -41,6 +45,18 @@ class FakeExecutor:
             )
         return CommandResult(
             0, f"SESSION_STATE=completed session={session} exit=0"
+        )
+
+    def observe(self, handle):
+        self.observations.append(handle)
+        session = handle.removeprefix("bz-a5:")
+        return CommandResult(
+            0,
+            "\n".join((
+                handle.replace("bz-a5:", "CATLASS_VALIDATION_HANDLE=bz-a5:"),
+                "CATLASS_VALIDATION_STATE=completed",
+            )),
+            session_handle=f"bz-a5:{session}",
         )
 
 
@@ -70,6 +86,7 @@ def test_bundle_and_checked_command_are_deterministic_for_every_family(tmp_path,
 
     one, two = first_executor.invocations[0], second_executor.invocations[0]
     assert first.artifact_id == second.artifact_id
+    assert first.artifact_id.startswith("bundle:")
     assert one.argv == two.argv
     assert one.remote_directory == two.remote_directory
     assert one.physical_device == two.physical_device == 3
@@ -106,7 +123,10 @@ def test_launch_returns_the_complete_physical_storage_and_retains_bundle(tmp_pat
     assert runtime.passed is True
     assert runtime.output == tuple(physical)
     assert len(runtime.output) == len(request.expected.storage)
-    retained = tmp_path / "retained" / compilation.artifact_id
+    retained = (
+        tmp_path / "retained" /
+        compilation.artifact_id.removeprefix("bundle:")
+    )
     assert (retained / "kernel.py").read_bytes() == request.candidate_source.encode()
     assert json.loads((retained / "manifest.json").read_text())["output"][
         "storage_elements"
@@ -114,6 +134,19 @@ def test_launch_returns_the_complete_physical_storage_and_retains_bundle(tmp_pat
     assert len(executor.invocations) == 2
     assert executor.invocations[0].files == executor.invocations[1].files
     assert executor.invocations[1].argv != executor.invocations[0].argv
+    compile_session = executor.invocations[0].argv[2]
+    run_session = executor.invocations[1].argv[2]
+    assert compile_session.endswith("-000001")
+    assert run_session.endswith("-000001")
+    for digest in (compilation.evidence_sha256, runtime.evidence_sha256):
+        evidence_path = tmp_path / "retained" / "cas" / digest[:2] / f"{digest}.json"
+        retained_evidence = json.loads(evidence_path.read_text())
+        assert retained_evidence["identity"] == compilation.artifact_id.removeprefix(
+            "bundle:"
+        )
+        assert set(retained_evidence["command_results"]) == {
+            "dispatch", "logs", "result",
+        }
 
 
 def test_candidate_failures_are_observations_not_infrastructure(tmp_path):
@@ -143,6 +176,63 @@ def test_transport_and_host_infrastructure_fail_separately(tmp_path, outcome):
     request = _request(tmp_path, "cube")
     with pytest.raises(ProjectInfrastructureError):
         _backend(tmp_path, FakeExecutor([outcome])).compile(request)
+
+
+def test_failed_current_dispatch_cannot_reuse_stale_deterministic_logs(tmp_path):
+    request = _request(tmp_path, "movement")
+    executor = FakeExecutor([
+        {"status": "compiled", "diagnostic": "stale prior result"}
+    ])
+    executor.dispatch_result = CommandResult(1, "", "upload failed")
+
+    with pytest.raises(ProjectInfrastructureError, match="current session"):
+        _backend(tmp_path, executor).compile(request)
+
+    assert executor.inspections == []
+
+
+def test_confirmed_retries_use_distinct_attempts_but_uncertain_dispatch_reattaches(tmp_path):
+    request = _request(tmp_path, "movement")
+    outcome = {"status": "compiled", "diagnostic": "compiled"}
+    executor = FakeExecutor([outcome, outcome])
+    backend = _backend(tmp_path, executor)
+
+    backend.compile(request)
+    backend.compile(request)
+
+    sessions = [invocation.argv[2] for invocation in executor.invocations]
+    assert sessions[0].endswith("-000001")
+    assert sessions[1].endswith("-000002")
+    assert sessions[0] != sessions[1]
+
+    uncertain = FakeExecutor([outcome])
+    expected_session = sessions[0]
+    uncertain.dispatch_result = CommandResult(
+        75,
+        "\n".join((
+            "CATLASS_VALIDATION_STATE=observation-unavailable",
+            f"CATLASS_VALIDATION_HANDLE=bz-a5:{expected_session}",
+        )),
+        session_handle=f"bz-a5:{expected_session}",
+    )
+    _backend(tmp_path / "reattach", uncertain).compile(request)
+    assert uncertain.observations == [f"bz-a5:{expected_session}"]
+
+
+def test_evidence_bound_scales_for_admitted_large_padded_outputs(tmp_path):
+    request = _request(tmp_path, "movement")
+    large_record = "x" * (4 * 1024 * 1024 + 1)
+    executor = FakeExecutor([
+        {"status": "completed", "diagnostic": large_record,
+         "output": list(request.expected.storage)}
+    ])
+    backend = _backend(tmp_path, executor)
+    identity, files = backend._bundle(request)
+    record, evidence = backend._execute(
+        identity, files, "run", 200_000
+    )
+    assert record["status"] == "completed"
+    assert len(evidence) == 64
 
 
 def test_backend_rejects_non_checked_session_wrapper(tmp_path):
