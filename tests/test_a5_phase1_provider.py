@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, ProgressiveMemoryJournal
 from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
@@ -22,7 +23,7 @@ from benchmarks.a5kernels.phase1_provider import (
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.protocol import ExecutionPlan, SourceFile, VerifiedResult
-from benchmarks.a5kernels.trial import CandidateRun, TrialOrchestrator
+from benchmarks.a5kernels.trial import CandidateRun, TrialOrchestrator, _SYSTEM_PROMPT
 
 
 ENVIRONMENT = {
@@ -220,6 +221,7 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
         "not-json",
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
         '{"submit":{}}',
+        '{"distillation":"done"}',
     ], calls)
     actor = DirectActorDriver(provider)
     seen = []
@@ -246,13 +248,41 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
 
     assert seen == ["write", "submit"]
     assert outcome.iterations == 3
-    assert outcome.tokens == 6
+    assert outcome.tokens == 8
     second_request = calls[1]["request"]["messages"]
     assert json.loads(second_request[-1]["content"])["host"]["event"] == "invalid-action"
     assert calls[2]["request"]["messages"][-1] == {
         "role": "user",
         "content": json.dumps({"host": {"event": "write"}}),
     }
+
+
+def test_direct_actor_delivers_terminal_host_observation_before_returning():
+    calls = []
+    provider = _scripted_provider([
+        '{"submit":{}}',
+        '{"distillation":"host result received"}',
+    ], calls)
+    actor = DirectActorDriver(provider, max_turns=1)
+
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+
+    terminal = json.dumps({"host": {"event": "submitted", "passed": True}})
+    outcome = actor(
+        "instruction",
+        profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=None,
+        context=None,
+        turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(terminal, terminal=True),
+    )
+
+    assert len(calls) == 2
+    assert calls[-1]["request"]["messages"][-1] == {
+        "role": "user", "content": terminal,
+    }
+    assert outcome.terminal_response == '{"distillation":"host result received"}'
+    assert outcome.tokens == 4
 
 
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
@@ -265,6 +295,7 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
         '{"run":{}}',
         '{"submit":{}}',
+        '{"distillation":"done"}',
     ], calls)
     backend = FakeBackend()
     knowledge = KnowledgeAgent(
@@ -293,10 +324,29 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     )
 
     assert result.verified.passed
-    assert result.outcome.tokens == 6
+    assert result.outcome.tokens == 8
     assert len(backend.runs) == 2
     assert result.final_profile["kernel"] == "vector_add_generated"
     assert result.workspace.joinpath("kernel.py").read_text() == SOURCE
+    artifacts = ContentAddressedArtifacts(result.artifacts)
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    by_role = {entry["role"]: entry["sha256"] for entry in retained}
+    assert artifacts.read_bytes(by_role["actor-instruction"]).decode() == (
+        f"execute registered {proposal.family.value}"
+    )
+    assert artifacts.read_bytes(by_role["actor-system-prompt"]).decode() == _SYSTEM_PROMPT
+    assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
+    assert artifacts.read_bytes(by_role["candidate-source"]).decode() == SOURCE
+    assert artifacts.read_bytes(by_role["final-source"]).decode() == SOURCE
+    assert artifacts.read_bytes(by_role["post-terminal-response"]).decode() == (
+        '{"distillation":"done"}'
+    )
+    assert artifacts.verify()
+    retained_bytes = b"".join(path.read_bytes()
+                              for path in artifacts.objects.glob("*/*"))
+    assert ENVIRONMENT["OPENAI_API_KEY"].encode() not in retained_bytes
+    assert ENVIRONMENT["DEEPSEEK_API_KEY"].encode() not in retained_bytes
     request_entries = [
         entry for entry in ledger.entries if entry.kind == EvidenceKind.REQUEST.value
     ]

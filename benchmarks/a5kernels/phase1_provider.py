@@ -226,7 +226,13 @@ class DirectActorDriver:
                 outcome = action_executor(action)
                 observation = outcome.observation
                 if outcome.terminal:
-                    return ActorOutcome(outcome.status, turn, tokens)
+                    messages.append({"role": "user", "content": observation})
+                    terminal = self.provider.complete(profile, messages)
+                    tokens += terminal.completion_tokens
+                    return ActorOutcome(
+                        outcome.status, turn, tokens,
+                        terminal_response=terminal.text,
+                    )
             messages.append({"role": "user", "content": observation})
         return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
 

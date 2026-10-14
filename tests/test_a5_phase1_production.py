@@ -216,6 +216,7 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         '{"run":{}}',
         '{"request-profile":{}}',
         '{"submit":{}}',
+        '{"distillation":"done"}',
     ])
     provider_calls = []
 
