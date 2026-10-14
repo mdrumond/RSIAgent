@@ -22,7 +22,11 @@ from benchmarks.a5kernels.phase1_curriculum_selector import (
     WaveDecision,
 )
 from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
-from benchmarks.a5kernels.phase1_project import HostTensor, ReferenceOutput
+from benchmarks.a5kernels.phase1_project import (
+    ExecutionEvidence,
+    HostTensor,
+    ReferenceOutput,
+)
 from benchmarks.a5kernels.phase1_wave_runtime import (
     LiveWaveCoordinator,
     WaveProjectRequest,
@@ -34,6 +38,17 @@ STATE_SCHEMA = "a5-phase1-adaptive-state-v2"
 PENDING_SCHEMA = "a5-phase1-adaptive-pending-v1"
 MEMORY_SCHEMA = "a5-phase1-adaptive-memory-v1"
 DELTA_SCHEMA = "a5-phase1-adaptive-memory-delta-v1"
+
+
+def _validated_summary(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or value != value.strip()
+        or len(value) > 500
+    ):
+        raise ValueError("adaptive result summary must be trimmed and bounded")
+    return value
 
 
 @dataclass(frozen=True)
@@ -53,21 +68,18 @@ class AdaptiveProjectResult:
     """One evidence-layered project result before wave publication."""
 
     memory: Phase1ProjectMemory
-    verified: bool
+    evidence: ExecutionEvidence
+    evidence_payload: bytes
     summary: str
 
     def __post_init__(self) -> None:
         if not isinstance(self.memory, Phase1ProjectMemory):
             raise TypeError("adaptive result memory must be Phase1ProjectMemory")
-        if type(self.verified) is not bool:
-            raise TypeError("adaptive result verified must be boolean")
-        if (
-            not isinstance(self.summary, str)
-            or not self.summary.strip()
-            or self.summary != self.summary.strip()
-            or len(self.summary) > 500
-        ):
-            raise ValueError("adaptive result summary must be trimmed and bounded")
+        if not isinstance(self.evidence, ExecutionEvidence):
+            raise TypeError("adaptive result evidence must be ExecutionEvidence")
+        if not isinstance(self.evidence_payload, bytes) or not self.evidence_payload:
+            raise TypeError("adaptive result evidence payload must be non-empty bytes")
+        _validated_summary(self.summary)
 
 
 AdaptiveProjectExecutor = Callable[[AdaptiveProjectRequest], AdaptiveProjectResult]
@@ -168,6 +180,8 @@ class AdaptivePhase1Coordinator:
         ))
         if not isinstance(result, AdaptiveProjectResult):
             raise TypeError("project adapter must return AdaptiveProjectResult")
+        if result.memory.project_spec != request.assignment.spec:
+            raise ValueError("adaptive result memory must retain the executed project spec")
         delta = canonical_bytes({
             "schema": DELTA_SCHEMA,
             "project_id": request.assignment.project_id,
@@ -176,7 +190,7 @@ class AdaptivePhase1Coordinator:
                 canonical_bytes(result.memory.as_dict())
             ).decode("ascii"),
         })
-        return WaveProjectResult(delta, result.verified)
+        return WaveProjectResult(delta, result.evidence, result.evidence_payload)
 
     def _publish(self, state, wave, pending, deltas):
         memories = list(state["memory_bytes_base64"])
@@ -220,10 +234,9 @@ class AdaptivePhase1Coordinator:
             raise ValueError("verified project memory bytes are invalid") from exc
         if canonical_bytes(memory.as_dict()) != memory_bytes:
             raise ValueError("verified project memory bytes are not canonical")
-        result = AdaptiveProjectResult(memory, True, value["summary"])
         return {
             "memory_base64": base64.b64encode(memory_bytes).decode("ascii"),
-            "summary": result.summary,
+            "summary": _validated_summary(value["summary"]),
         }
 
     def _context(self, state, snapshot):

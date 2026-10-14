@@ -19,8 +19,11 @@ from benchmarks.a5kernels.phase1_memory import (
     HostFact,
     Phase1ProjectMemory,
 )
-from benchmarks.a5kernels.phase1_project import evaluate_reference
-from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
+from benchmarks.a5kernels.phase1_project import (
+    EvidenceClassification,
+    ExecutionEvidence,
+    evaluate_reference,
+)
 
 
 SEED = b'{"existing":"published knowledge"}'
@@ -28,7 +31,7 @@ SEED = b'{"existing":"published knowledge"}'
 
 def _project(project_id, capability):
     operation = "add" if capability == "simd-vector" else "copy"
-    shape = [259] if capability == "padded-tail" else [257]
+    shape = [1025] if capability == "padded-tail" else [257]
     inputs = [{"name": "lhs", "shape": shape}]
     operands = ["lhs"]
     if operation == "add":
@@ -66,19 +69,33 @@ def _wave(prompt, projects):
     })
 
 
-def _memory(ordinal, project_id):
-    evidence = canonical_digest({"project": project_id})
+def _memory(spec):
+    evidence = canonical_digest({"project": spec.project_id})
     lesson = AgentLesson(
-        "data-movement", f"lesson {project_id}", "A5 Catlass projects",
+        "data-movement", f"lesson {spec.project_id}", "A5 Catlass projects",
         "Host verification passes", "Only the measured shape", (evidence,),
         None, None, "high",
     )
     return Phase1ProjectMemory(
-        DEFAULT_PROPOSALS[ordinal - 1], f"source-{project_id}", ("run",),
+        spec, f"source-{spec.project_id}", ("run",),
         (HostFact("host-verification", "host PASS", evidence),),
         lessons=(lesson,), no_new_knowledge=False,
         admitted_artifact_sha256=(evidence,),
     )
+
+
+def _result(spec, verified, summary):
+    classification = (
+        EvidenceClassification.HOST_VERIFIED
+        if verified else EvidenceClassification.HOST_MISMATCH
+    )
+    evidence = ExecutionEvidence(classification, summary)
+    payload = canonical_bytes({
+        "classification": classification.value,
+        "project_id": spec.project_id,
+        "summary": summary,
+    })
+    return AdaptiveProjectResult(_memory(spec), evidence, payload, summary)
 
 
 def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_path):
@@ -115,9 +132,8 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         with lock:
             completion_order.append(request.spec.project_id)
         verified = not (request.spec.project_id == "second" and fail_second)
-        ordinal = {"first": 1, "second": 2, "third": 3}[request.spec.project_id]
-        return AdaptiveProjectResult(
-            _memory(ordinal, request.spec.project_id), verified,
+        return _result(
+            request.spec, verified,
             f"{request.spec.project_id} host verification {'passed' if verified else 'failed'}",
         )
 
@@ -155,6 +171,9 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
     assert [row["source_revision"] for row in result["memory"]] == [
         "source-first", "source-second", "source-third",
     ]
+    assert [row["project_spec"]["project_id"] for row in result["memory"]] == [
+        "first", "second", "third",
+    ]
     state = json.loads((root / "state.json").read_text())
     assert [base64.b64decode(value) for value in state["memory_bytes_base64"]] == [
         canonical_bytes(memory) for memory in result["memory"]
@@ -169,15 +188,21 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
 
 
 @pytest.mark.parametrize("terminal", ["SATURATED", "STALLED"])
-def test_terminal_decisions_are_durable_without_project_execution(tmp_path, terminal):
-    calls = []
+def test_terminal_decisions_are_durable_after_verified_project(tmp_path, terminal):
+    selection_calls = []
+    project_calls = []
 
-    def complete(_messages):
-        calls.append("select")
+    def complete(messages):
+        selection_calls.append("select")
+        if len(selection_calls) == 1:
+            return _wave(messages[-1]["content"], [
+                _project("first", "gm-ub-movement"),
+            ])
         return f'DECISION: {terminal}\n{{"reason":"bounded stop"}}'
 
-    def execute(_request):
-        pytest.fail("a terminal selector decision must not execute a project")
+    def execute(request):
+        project_calls.append(request.spec.project_id)
+        return _result(request.spec, True, "first host verification passed")
 
     coordinator = AdaptivePhase1Coordinator(
         tmp_path, "Learn bounded skills.", SEED,
@@ -185,7 +210,8 @@ def test_terminal_decisions_are_durable_without_project_execution(tmp_path, term
     )
     assert coordinator.run()["status"] == terminal
     assert coordinator.resume()["status"] == terminal
-    assert calls == ["select"]
+    assert selection_calls == ["select", "select"]
+    assert project_calls == ["first"]
 
 
 def test_initial_memory_identity_is_checked_on_resume(tmp_path):
@@ -195,7 +221,7 @@ def test_initial_memory_identity_is_checked_on_resume(tmp_path):
     AdaptivePhase1Coordinator(
         tmp_path, "Learn bounded skills.", SEED, agent,
         lambda _: None, max_parallel=1,
-    ).run()
+    ).report()
 
     with pytest.raises(ValueError, match="initial memory"):
         AdaptivePhase1Coordinator(
@@ -217,8 +243,8 @@ def test_cli_uses_explicit_production_factory_and_reports_json(tmp_path, capsys)
         return lambda args: coordinator if args.root == tmp_path else None
 
     assert run_a5_phase1_adaptive.main(
-        ["run", "--root", str(tmp_path), "--factory", "binding:build"],
+        ["report", "--root", str(tmp_path), "--factory", "binding:build"],
         factory_loader=loader,
     ) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "STALLED"
+    assert json.loads(capsys.readouterr().out)["status"] == "RUNNING"
     assert seen == ["binding:build"]
