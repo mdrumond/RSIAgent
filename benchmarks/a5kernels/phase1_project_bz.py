@@ -19,6 +19,7 @@ from benchmarks.a5kernels.phase1_project_executor import (
     RuntimeObservation,
 )
 from benchmarks.a5kernels.protocol import SourceFile
+from benchmarks.a5kernels.protocol import ExecutionEnvironment, ExecutionPlan
 
 
 PROJECT_RESULT_MARKER = "A5PROJECT_RESULT="
@@ -159,6 +160,29 @@ class CatlassProjectBackend:
         except OSError as exc:
             raise ProjectInfrastructureError("project bundle could not be retained") from exc
         return identity, files
+
+    def measurement_plan(self, request: ProjectExecutionRequest) -> ExecutionPlan:
+        """Bind a replay to the exact bundle already staged by correctness execution."""
+        identity, files = self._bundle(request)
+        remote = f".a5kernels/projects/{identity}"
+        return ExecutionPlan(
+            identity, f"measure-{secrets.token_hex(8)}", "catlass-dsl", files,
+            ("python", "-B", f"{remote}/host_driver.py", f"{remote}/kernel.py",
+             f"{remote}/manifest.json", "run"), (), (), self._provenance(),
+            ExecutionEnvironment(bindings=(("A5PROJECT_MASKED_TIMING", "1"),),
+                                 unset=("PYTHONPYCACHEPREFIX",)),
+        )
+
+    def observation_payload(self, digest: str) -> dict[str, object]:
+        path = self._root / "cas" / digest[:2] / f"{digest}.json"
+        data = path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ProjectInfrastructureError("project observation hash mismatch")
+        return json.loads(data)
+
+    @property
+    def device(self) -> int:
+        return self._device
 
     def _provenance(self) -> tuple[tuple[str, str], ...]:
         try:
@@ -369,6 +393,8 @@ if not _SEPARATOR:  # pragma: no cover
 
 _PROJECT_DRIVER = _DRIVER_PREFIX + f'''\
 import math
+import os
+import time
 
 RESULT_MARKER = {PROJECT_RESULT_MARKER!r}
 
@@ -389,7 +415,9 @@ def _main():
     import torch
     import torch_npu
     from catlass.tla.runtime import from_dlpack
-    torch.npu.set_device(0)
+    device = int(os.environ["BZ_A5_PROFILE_PHYSICAL_DEVICE"]) if os.environ.get(
+        "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE") == "1" else 0
+    torch.npu.set_device(device)
     dtype = {{"float16": torch.float16, "bfloat16": torch.bfloat16,
              "float32": torch.float32}}[manifest["dtype"]]
     tla_dtype = {{"float16": tla.Float16, "bfloat16": tla.BFloat16,
@@ -397,7 +425,8 @@ def _main():
     tensors = [torch.tensor(item["storage"], dtype=dtype, device="npu").reshape(
                tuple(item["physical_shape"])) for item in manifest["inputs"]]
     output_shape = tuple(manifest["output"]["physical_shape"])
-    output = torch.full(output_shape, -991.0, dtype=dtype, device="npu")
+    # Avoid device FillD/Cast helpers polluting BasicInfo kernel discovery.
+    output = torch.full(output_shape, -991.0, dtype=dtype).to("npu")
     try:
         kernel = _load_kernel(sys.argv[1])
         _verify_loaded_catlass_modules(
@@ -426,7 +455,7 @@ def _main():
     try:
         artifact(*tla_inputs, tla_output, block_num=manifest["block_count"])
         torch.npu.synchronize()
-        values = output.float().cpu().reshape(-1).tolist()
+        values = output.cpu().float().reshape(-1).tolist()
         if len(values) != manifest["output"]["storage_elements"] or not all(
             math.isfinite(value) for value in values
         ):
@@ -434,6 +463,18 @@ def _main():
     except Exception as exc:
         _emit("runtime-failure", f"{{type(exc).__name__}}: {{exc}}")
         return 0
+    if os.environ.get("A5KERNEL_EMIT_TIMING") == "1":
+        warmups = int(os.environ["A5KERNEL_WARM_UP"])
+        launches = int(os.environ["A5KERNEL_LAUNCH_COUNT"])
+        for _ in range(warmups):
+            artifact(*tla_inputs, tla_output, block_num=manifest["block_count"])
+            torch.npu.synchronize()
+        start = time.perf_counter_ns()
+        for _ in range(launches):
+            artifact(*tla_inputs, tla_output, block_num=manifest["block_count"])
+            torch.npu.synchronize()
+        duration_us = (time.perf_counter_ns() - start) / launches / 1000
+        print("A5KERNEL_TIMING_US=" + str(duration_us))
     _emit("completed", "launch synchronized", values)
     return 0
 
