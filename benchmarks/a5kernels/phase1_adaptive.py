@@ -323,19 +323,51 @@ class AdaptivePhase1Coordinator:
     def _report(self, state):
         snapshot = self._memory_snapshot(state)
         terminal = state["terminal"]
+        pending = self._pending_report(state)
         memory = [
             json.loads(base64.b64decode(value, validate=True))
             for value in state["memory_bytes_base64"]
         ]
         return {
-            "status": "RUNNING" if terminal is None else terminal["status"],
+            "status": (
+                "RECOVERY_REQUIRED" if pending is not None
+                else "RUNNING" if terminal is None
+                else terminal["status"]
+            ),
             "reason": None if terminal is None else terminal["reason"],
             "wave_index": state["wave_index"],
             "coverage": list(state["coverage"]),
             "published_projects": [row["project_id"] for row in state["prior_outcomes"]],
             "memory": memory,
             "memory_sha256": hashlib.sha256(snapshot).hexdigest(),
+            "pending_wave": pending,
         }
+
+    def _pending_report(self, state):
+        pending = self._load_pending(state)
+        if pending is None:
+            return None
+        wave = WaveSpec.from_mapping(pending["wave"])
+        projects = []
+        for project in wave.projects:
+            path = (
+                self.root / "waves" / wave.wave_id / "branches"
+                / project.spec.project_id / "outcome.json"
+            )
+            status = "unfinished"
+            if path.exists():
+                outcome = self._read_json(path)
+                if (
+                    outcome.get("project_id") != project.spec.project_id
+                    or type(outcome.get("verified")) is not bool
+                ):
+                    raise ValueError("pending project outcome is invalid")
+                status = "verified" if outcome["verified"] else "unverified"
+            projects.append({
+                "project_id": project.spec.project_id,
+                "status": status,
+            })
+        return {"wave_id": wave.wave_id, "projects": projects}
 
     @staticmethod
     def _read_json(path):

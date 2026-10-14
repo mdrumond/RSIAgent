@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import threading
-import time
 
 import pytest
 
@@ -120,6 +119,9 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
     observed_oracles = []
     fail_second = True
     lock = threading.Lock()
+    first_attempt = threading.Barrier(3)
+    third_done = threading.Event()
+    second_done = threading.Event()
 
     def execute(request):
         nonlocal fail_second
@@ -127,10 +129,20 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
             calls.append(request.spec.project_id)
             snapshots.append(request.pre_wave_memory)
             observed_oracles.append(request.oracle)
+            attempt = calls.count(request.spec.project_id)
         assert request.oracle == evaluate_reference(request.spec, request.inputs)
-        time.sleep({"first": .04, "second": .02, "third": 0}[request.spec.project_id])
+        if attempt == 1:
+            first_attempt.wait()
+            if request.spec.project_id == "first":
+                second_done.wait()
+            elif request.spec.project_id == "second":
+                third_done.wait()
         with lock:
             completion_order.append(request.spec.project_id)
+        if attempt == 1 and request.spec.project_id == "third":
+            third_done.set()
+        elif attempt == 1 and request.spec.project_id == "second":
+            second_done.set()
         verified = not (request.spec.project_id == "second" and fail_second)
         return _result(
             request.spec, verified,
@@ -150,7 +162,17 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
     assert completion_order == ["third", "second", "first"]
     assert len(set(snapshots)) == 1
     assert len(observed_oracles) == 3
-    assert first.report()["published_projects"] == []
+    failed_report = first.report()
+    assert failed_report["status"] == "RECOVERY_REQUIRED"
+    assert failed_report["published_projects"] == []
+    assert failed_report["pending_wave"] == {
+        "wave_id": "wave-001",
+        "projects": [
+            {"project_id": "first", "status": "verified"},
+            {"project_id": "second", "status": "unverified"},
+            {"project_id": "third", "status": "verified"},
+        ],
+    }
     assert len(selection_prompts) == 1
 
     fail_second = False
@@ -185,6 +207,63 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         ["copy"], ["add"], ["copy"],
     ]
     assert not (root / "pending.json").exists()
+
+
+@pytest.mark.parametrize("crash_point", ["before-state", "before-pending-removal"])
+def test_resume_across_adaptive_publication_crash_boundaries(
+    tmp_path, monkeypatch, crash_point,
+):
+    selections = []
+    executions = []
+
+    def complete(messages):
+        selections.append("select")
+        if len(selections) == 1:
+            return _wave(messages[-1]["content"], [
+                _project("first", "gm-ub-movement"),
+            ])
+        return 'DECISION: SATURATED\n{"reason":"coverage complete"}'
+
+    def execute(request):
+        executions.append(request.spec.project_id)
+        return _result(request.spec, True, "first host verification passed")
+
+    root = tmp_path / crash_point
+    coordinator = AdaptivePhase1Coordinator(
+        root, "Learn bounded skills.", SEED,
+        CurriculumAgent(complete), execute, max_parallel=1,
+    )
+    if crash_point == "before-state":
+        atomic_json = coordinator._atomic_json
+
+        def fail_before_state(path, value):
+            if path.name == "state.json" and value.get("wave_index") == 2:
+                raise RuntimeError("injected before adaptive state publication")
+            atomic_json(path, value)
+
+        monkeypatch.setattr(coordinator, "_atomic_json", fail_before_state)
+    else:
+        unlink = type(root).unlink
+
+        def fail_before_pending_removal(path, *args, **kwargs):
+            if path == root / "pending.json":
+                raise RuntimeError("injected before pending removal")
+            return unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(type(root), "unlink", fail_before_pending_removal)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        coordinator.run()
+    monkeypatch.undo()
+
+    resumed = AdaptivePhase1Coordinator(
+        root, "Learn bounded skills.", SEED,
+        CurriculumAgent(complete), execute, max_parallel=1,
+    ).resume()
+    assert resumed["status"] == "SATURATED"
+    assert resumed["published_projects"] == ["first"]
+    assert [row["project_spec"]["project_id"] for row in resumed["memory"]] == ["first"]
+    assert executions == ["first"]
 
 
 @pytest.mark.parametrize("terminal", ["SATURATED", "STALLED"])
