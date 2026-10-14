@@ -23,15 +23,15 @@ def specialize_timing(spec):
         raise ValueError("timing sweeps support one-dimensional projects only")
     if not spec.timing_lengths:
         raise ValueError("project has no timing lengths")
-    return tuple(replace(
-        spec, shape=(length,),
-        capabilities=tuple(item for item in spec.capabilities if
-                           item is not Capability.PADDED_TAIL or
-                           length % spec.padding_multiple != 0),
-        graph=ProjectGraph(tuple(replace(item, shape=(length,))
-                                 for item in spec.graph.inputs),
-                           spec.graph.nodes, spec.graph.output),
-    ) for length in spec.timing_lengths)
+    variants = []
+    for length in spec.timing_lengths:
+        graph = ProjectGraph(tuple(replace(item, shape=(length,)) for item in spec.graph.inputs),
+                             spec.graph.nodes, spec.graph.output)
+        capabilities = tuple(item for item in spec.capabilities if
+                             item is not Capability.PADDED_TAIL or
+                             graph.output_shape[-1] % spec.padding_multiple != 0)
+        variants.append(replace(spec, shape=(length,), graph=graph, capabilities=capabilities))
+    return tuple(variants)
 
 
 def timing_summary(samples):

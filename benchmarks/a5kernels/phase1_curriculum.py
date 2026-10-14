@@ -118,10 +118,10 @@ class ProjectSpec:
         if not isinstance(self.failure_mode, FailureMode):
             raise ValueError("failure mode must be registered")
         if any(
-            type(item) is not int or not 1 <= item <= 16384
+            type(item) is not int or not 1 <= item <= 4096
             for item in self.timing_lengths
         ) or tuple(sorted(set(self.timing_lengths))) != self.timing_lengths:
-            raise ValueError("timing lengths must be unique ascending bounded integers")
+            raise ValueError("timing lengths must be unique ascending integers in [1, 4096]")
         if self.profile_metric is not None and not isinstance(
             self.profile_metric, ProfileMetric
         ):
