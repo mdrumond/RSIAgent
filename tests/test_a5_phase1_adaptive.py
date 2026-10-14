@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import threading
 import time
@@ -7,7 +8,7 @@ import time
 import pytest
 
 import run_a5_phase1_adaptive
-from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_adaptive import (
     AdaptivePhase1Coordinator,
     AdaptiveProjectResult,
@@ -18,6 +19,7 @@ from benchmarks.a5kernels.phase1_memory import (
     HostFact,
     Phase1ProjectMemory,
 )
+from benchmarks.a5kernels.phase1_project import evaluate_reference
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 
 
@@ -25,10 +27,17 @@ SEED = b'{"existing":"published knowledge"}'
 
 
 def _project(project_id, capability):
+    operation = "add" if capability == "simd-vector" else "copy"
+    shape = [259] if capability == "padded-tail" else [257]
+    inputs = [{"name": "lhs", "shape": shape}]
+    operands = ["lhs"]
+    if operation == "add":
+        inputs.append({"name": "rhs", "shape": shape})
+        operands.append("rhs")
     return {
         "project_id": project_id,
         "capabilities": [capability],
-        "shape": [257],
+        "shape": shape,
         "dtype": "float32",
         "block_count": 1,
         "padding_multiple": 64,
@@ -36,6 +45,14 @@ def _project(project_id, capability):
         "timing_lengths": [],
         "profile_metric": None,
         "hypothesis": f"Host evidence tests {project_id}.",
+        "graph": {
+            "inputs": inputs,
+            "nodes": [{
+                "name": "output", "op": operation,
+                "operands": operands, "axis": None,
+            }],
+            "output": "output",
+        },
     }
 
 
@@ -83,6 +100,7 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
     calls = []
     snapshots = []
     completion_order = []
+    observed_oracles = []
     fail_second = True
     lock = threading.Lock()
 
@@ -91,6 +109,8 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         with lock:
             calls.append(request.spec.project_id)
             snapshots.append(request.pre_wave_memory)
+            observed_oracles.append(request.oracle)
+        assert request.oracle == evaluate_reference(request.spec, request.inputs)
         time.sleep({"first": .04, "second": .02, "third": 0}[request.spec.project_id])
         with lock:
             completion_order.append(request.spec.project_id)
@@ -113,6 +133,7 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
     assert len(calls) == 3
     assert completion_order == ["third", "second", "first"]
     assert len(set(snapshots)) == 1
+    assert len(observed_oracles) == 3
     assert first.report()["published_projects"] == []
     assert len(selection_prompts) == 1
 
@@ -134,9 +155,16 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
     assert [row["source_revision"] for row in result["memory"]] == [
         "source-first", "source-second", "source-third",
     ]
+    state = json.loads((root / "state.json").read_text())
+    assert [base64.b64decode(value) for value in state["memory_bytes_base64"]] == [
+        canonical_bytes(memory) for memory in result["memory"]
+    ]
     prompt = json.loads(selection_prompts[1].rsplit("\n", 1)[-1])
     assert prompt["pre_wave_coverage"] == result["coverage"]
     assert prompt["pre_wave_memory_sha256"] == result["memory_sha256"]
+    assert [row["information"]["operations"] for row in prompt["prior_outcomes"]] == [
+        ["copy"], ["add"], ["copy"],
+    ]
     assert not (root / "pending.json").exists()
 
 

@@ -17,11 +17,12 @@ from benchmarks.a5kernels.phase1_curriculum_selector import (
     CurriculumContext,
     CurriculumSession,
     PriorOutcome,
+    ProjectInformation,
     TerminalDecision,
     WaveDecision,
-    project_information_sha256,
 )
 from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+from benchmarks.a5kernels.phase1_project import HostTensor, ReferenceOutput
 from benchmarks.a5kernels.phase1_wave_runtime import (
     LiveWaveCoordinator,
     WaveProjectRequest,
@@ -29,7 +30,7 @@ from benchmarks.a5kernels.phase1_wave_runtime import (
 )
 
 
-STATE_SCHEMA = "a5-phase1-adaptive-state-v1"
+STATE_SCHEMA = "a5-phase1-adaptive-state-v2"
 PENDING_SCHEMA = "a5-phase1-adaptive-pending-v1"
 MEMORY_SCHEMA = "a5-phase1-adaptive-memory-v1"
 DELTA_SCHEMA = "a5-phase1-adaptive-memory-delta-v1"
@@ -43,6 +44,8 @@ class AdaptiveProjectRequest:
     authored_ordinal: int
     pre_wave_memory: bytes
     branch_root: Path
+    inputs: tuple[HostTensor, ...]
+    oracle: ReferenceOutput
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,8 @@ class AdaptivePhase1Coordinator:
             request.assignment.authored_ordinal,
             request.pre_wave_memory,
             request.branch_root,
+            request.inputs,
+            request.oracle,
         ))
         if not isinstance(result, AdaptiveProjectResult):
             raise TypeError("project adapter must return AdaptiveProjectResult")
@@ -167,19 +172,21 @@ class AdaptivePhase1Coordinator:
             "schema": DELTA_SCHEMA,
             "project_id": request.assignment.project_id,
             "summary": result.summary,
-            "memory": result.memory.as_dict(),
+            "memory_base64": base64.b64encode(
+                canonical_bytes(result.memory.as_dict())
+            ).decode("ascii"),
         })
         return WaveProjectResult(delta, result.verified)
 
     def _publish(self, state, wave, pending, deltas):
-        memories = list(state["memory"])
+        memories = list(state["memory_bytes_base64"])
         outcomes = list(state["prior_outcomes"])
         coverage = list(state["coverage"])
         for project, delta in zip(wave.projects, deltas, strict=True):
-            memories.append(delta["memory"])
+            memories.append(delta["memory_base64"])
             outcomes.append({
                 "project_id": project.spec.project_id,
-                "information_sha256": project_information_sha256(project.spec),
+                "spec": project.spec.as_dict(),
                 "verified": True,
                 "summary": delta["summary"],
             })
@@ -191,7 +198,7 @@ class AdaptivePhase1Coordinator:
             "wave_index": state["wave_index"] + 1,
             "coverage": coverage,
             "prior_outcomes": outcomes,
-            "memory": memories,
+            "memory_bytes_base64": memories,
             "session": pending["session"],
             "completed_waves": [*state["completed_waves"], wave.wave_id],
         }
@@ -203,12 +210,21 @@ class AdaptivePhase1Coordinator:
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("verified project memory delta is unavailable") from exc
         if not isinstance(value, Mapping) or set(value) != {
-            "schema", "project_id", "summary", "memory",
+            "schema", "project_id", "summary", "memory_base64",
         } or value["schema"] != DELTA_SCHEMA or value["project_id"] != project_id:
             raise ValueError("verified project memory delta is invalid")
-        memory = Phase1ProjectMemory.from_mapping(value["memory"])
+        try:
+            memory_bytes = base64.b64decode(value["memory_base64"], validate=True)
+            memory = Phase1ProjectMemory.from_mapping(json.loads(memory_bytes))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("verified project memory bytes are invalid") from exc
+        if canonical_bytes(memory.as_dict()) != memory_bytes:
+            raise ValueError("verified project memory bytes are not canonical")
         result = AdaptiveProjectResult(memory, True, value["summary"])
-        return {"memory": result.memory.as_dict(), "summary": result.summary}
+        return {
+            "memory_base64": base64.b64encode(memory_bytes).decode("ascii"),
+            "summary": result.summary,
+        }
 
     def _context(self, state, snapshot):
         return CurriculumContext(
@@ -216,7 +232,15 @@ class AdaptivePhase1Coordinator:
             state["wave_index"],
             hashlib.sha256(snapshot).hexdigest(),
             tuple(self._capability(value) for value in state["coverage"]),
-            tuple(PriorOutcome(**value) for value in state["prior_outcomes"]),
+            tuple(
+                PriorOutcome(
+                    value["project_id"],
+                    ProjectInformation.from_project(value["spec"]),
+                    value["verified"],
+                    value["summary"],
+                )
+                for value in state["prior_outcomes"]
+            ),
         )
 
     @staticmethod
@@ -229,7 +253,7 @@ class AdaptivePhase1Coordinator:
         return canonical_bytes({
             "schema": MEMORY_SCHEMA,
             "initial_memory_base64": base64.b64encode(self.initial_memory).decode("ascii"),
-            "projects": state["memory"],
+            "project_memory_base64": state["memory_bytes_base64"],
         })
 
     def _load_state(self) -> dict[str, object]:
@@ -242,7 +266,7 @@ class AdaptivePhase1Coordinator:
                 "wave_index": 1,
                 "coverage": [],
                 "prior_outcomes": [],
-                "memory": [],
+                "memory_bytes_base64": [],
                 "session": self._session_dict(CurriculumSession()),
                 "completed_waves": [],
                 "terminal": None,
@@ -286,13 +310,17 @@ class AdaptivePhase1Coordinator:
     def _report(self, state):
         snapshot = self._memory_snapshot(state)
         terminal = state["terminal"]
+        memory = [
+            json.loads(base64.b64decode(value, validate=True))
+            for value in state["memory_bytes_base64"]
+        ]
         return {
             "status": "RUNNING" if terminal is None else terminal["status"],
             "reason": None if terminal is None else terminal["reason"],
             "wave_index": state["wave_index"],
             "coverage": list(state["coverage"]),
             "published_projects": [row["project_id"] for row in state["prior_outcomes"]],
-            "memory": list(state["memory"]),
+            "memory": memory,
             "memory_sha256": hashlib.sha256(snapshot).hexdigest(),
         }
 
