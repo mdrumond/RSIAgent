@@ -1,0 +1,320 @@
+"""Adaptive A5 Phase-1 selection, wave execution, and atomic learning."""
+
+from __future__ import annotations
+
+import base64
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+from typing import Callable, Mapping
+
+from benchmarks.a5kernels.evidence import canonical_bytes
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveSpec
+from benchmarks.a5kernels.phase1_curriculum_selector import (
+    CurriculumAgent,
+    CurriculumContext,
+    CurriculumSession,
+    PriorOutcome,
+    TerminalDecision,
+    WaveDecision,
+    project_information_sha256,
+)
+from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+from benchmarks.a5kernels.phase1_wave_runtime import (
+    LiveWaveCoordinator,
+    WaveProjectRequest,
+    WaveProjectResult,
+)
+
+
+STATE_SCHEMA = "a5-phase1-adaptive-state-v1"
+PENDING_SCHEMA = "a5-phase1-adaptive-pending-v1"
+MEMORY_SCHEMA = "a5-phase1-adaptive-memory-v1"
+DELTA_SCHEMA = "a5-phase1-adaptive-memory-delta-v1"
+
+
+@dataclass(frozen=True)
+class AdaptiveProjectRequest:
+    """Explicit adapter input for one Production project execution."""
+
+    spec: ProjectSpec
+    authored_ordinal: int
+    pre_wave_memory: bytes
+    branch_root: Path
+
+
+@dataclass(frozen=True)
+class AdaptiveProjectResult:
+    """One evidence-layered project result before wave publication."""
+
+    memory: Phase1ProjectMemory
+    verified: bool
+    summary: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.memory, Phase1ProjectMemory):
+            raise TypeError("adaptive result memory must be Phase1ProjectMemory")
+        if type(self.verified) is not bool:
+            raise TypeError("adaptive result verified must be boolean")
+        if (
+            not isinstance(self.summary, str)
+            or not self.summary.strip()
+            or self.summary != self.summary.strip()
+            or len(self.summary) > 500
+        ):
+            raise ValueError("adaptive result summary must be trimmed and bounded")
+
+
+AdaptiveProjectExecutor = Callable[[AdaptiveProjectRequest], AdaptiveProjectResult]
+
+
+class AdaptivePhase1Coordinator:
+    """Select waves from published memory and atomically publish verified deltas."""
+
+    def __init__(
+        self,
+        root: Path,
+        objective: str,
+        initial_memory: bytes,
+        curriculum: CurriculumAgent,
+        execute_project: AdaptiveProjectExecutor,
+        *,
+        max_parallel: int,
+    ) -> None:
+        if not isinstance(objective, str) or not objective.strip():
+            raise ValueError("objective must be non-empty")
+        if not isinstance(initial_memory, bytes):
+            raise TypeError("initial memory must be immutable bytes")
+        if not isinstance(curriculum, CurriculumAgent):
+            raise TypeError("curriculum must be CurriculumAgent")
+        if not callable(execute_project):
+            raise TypeError("project executor must be callable")
+        if type(max_parallel) is not int or max_parallel < 1:
+            raise ValueError("max_parallel must be positive")
+        self.root = Path(root)
+        self.objective = objective.strip()
+        self.initial_memory = initial_memory
+        self.curriculum = curriculum
+        self.execute_project = execute_project
+        self.max_parallel = max_parallel
+
+    def run(self) -> dict[str, object]:
+        state = self._load_state()
+        while True:
+            if state["terminal"] is not None:
+                return self._report(state)
+            snapshot = self._memory_snapshot(state)
+            pending = self._load_pending(state)
+            if pending is None:
+                decision, session = self.curriculum.select(
+                    self._context(state, snapshot), self._session(state),
+                )
+                if isinstance(decision, TerminalDecision):
+                    state = {
+                        **state,
+                        "session": self._session_dict(session),
+                        "terminal": {
+                            "status": decision.status,
+                            "reason": decision.reason,
+                        },
+                    }
+                    self._atomic_json(self.root / "state.json", state)
+                    return self._report(state)
+                assert isinstance(decision, WaveDecision)
+                pending = {
+                    "schema": PENDING_SCHEMA,
+                    "base_wave_index": state["wave_index"],
+                    "base_memory_sha256": hashlib.sha256(snapshot).hexdigest(),
+                    "wave": decision.wave.as_dict(),
+                    "session": self._session_dict(session),
+                }
+                self._atomic_json(self.root / "pending.json", pending)
+            wave = WaveSpec.from_mapping(pending["wave"])
+            coordinator = LiveWaveCoordinator(
+                self.root / "waves" / wave.wave_id,
+                wave,
+                snapshot,
+                self._execute,
+                self.max_parallel,
+            )
+            consolidation = coordinator.resume()
+            deltas = tuple(
+                self._read_delta(wave.wave_id, commit.project_id)
+                for commit in consolidation.commits
+            )
+            state = self._publish(state, wave, pending, deltas)
+            self._atomic_json(self.root / "state.json", state)
+            (self.root / "pending.json").unlink(missing_ok=True)
+
+    def resume(self) -> dict[str, object]:
+        return self.run()
+
+    def report(self) -> dict[str, object]:
+        return self._report(self._load_state())
+
+    def _execute(self, request: WaveProjectRequest) -> WaveProjectResult:
+        result = self.execute_project(AdaptiveProjectRequest(
+            request.assignment.spec,
+            request.assignment.authored_ordinal,
+            request.pre_wave_memory,
+            request.branch_root,
+        ))
+        if not isinstance(result, AdaptiveProjectResult):
+            raise TypeError("project adapter must return AdaptiveProjectResult")
+        delta = canonical_bytes({
+            "schema": DELTA_SCHEMA,
+            "project_id": request.assignment.project_id,
+            "summary": result.summary,
+            "memory": result.memory.as_dict(),
+        })
+        return WaveProjectResult(delta, result.verified)
+
+    def _publish(self, state, wave, pending, deltas):
+        memories = list(state["memory"])
+        outcomes = list(state["prior_outcomes"])
+        coverage = list(state["coverage"])
+        for project, delta in zip(wave.projects, deltas, strict=True):
+            memories.append(delta["memory"])
+            outcomes.append({
+                "project_id": project.spec.project_id,
+                "information_sha256": project_information_sha256(project.spec),
+                "verified": True,
+                "summary": delta["summary"],
+            })
+            for capability in project.spec.capabilities:
+                if capability.value not in coverage:
+                    coverage.append(capability.value)
+        return {
+            **state,
+            "wave_index": state["wave_index"] + 1,
+            "coverage": coverage,
+            "prior_outcomes": outcomes,
+            "memory": memories,
+            "session": pending["session"],
+            "completed_waves": [*state["completed_waves"], wave.wave_id],
+        }
+
+    def _read_delta(self, wave_id: str, project_id: str) -> dict[str, object]:
+        path = self.root / "waves" / wave_id / "branches" / project_id / "memory-delta.bin"
+        try:
+            value = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("verified project memory delta is unavailable") from exc
+        if not isinstance(value, Mapping) or set(value) != {
+            "schema", "project_id", "summary", "memory",
+        } or value["schema"] != DELTA_SCHEMA or value["project_id"] != project_id:
+            raise ValueError("verified project memory delta is invalid")
+        memory = Phase1ProjectMemory.from_mapping(value["memory"])
+        result = AdaptiveProjectResult(memory, True, value["summary"])
+        return {"memory": result.memory.as_dict(), "summary": result.summary}
+
+    def _context(self, state, snapshot):
+        return CurriculumContext(
+            self.objective,
+            state["wave_index"],
+            hashlib.sha256(snapshot).hexdigest(),
+            tuple(self._capability(value) for value in state["coverage"]),
+            tuple(PriorOutcome(**value) for value in state["prior_outcomes"]),
+        )
+
+    @staticmethod
+    def _capability(value):
+        from benchmarks.a5kernels.phase1_curriculum import Capability
+
+        return Capability(value)
+
+    def _memory_snapshot(self, state) -> bytes:
+        return canonical_bytes({
+            "schema": MEMORY_SCHEMA,
+            "initial_memory_base64": base64.b64encode(self.initial_memory).decode("ascii"),
+            "projects": state["memory"],
+        })
+
+    def _load_state(self) -> dict[str, object]:
+        path = self.root / "state.json"
+        if not path.exists():
+            state = {
+                "schema": STATE_SCHEMA,
+                "objective": self.objective,
+                "initial_memory_sha256": hashlib.sha256(self.initial_memory).hexdigest(),
+                "wave_index": 1,
+                "coverage": [],
+                "prior_outcomes": [],
+                "memory": [],
+                "session": self._session_dict(CurriculumSession()),
+                "completed_waves": [],
+                "terminal": None,
+            }
+            self._atomic_json(path, state)
+            return state
+        state = self._read_json(path)
+        if state.get("schema") != STATE_SCHEMA or state.get("objective") != self.objective:
+            raise ValueError("adaptive state does not match objective")
+        if state.get("initial_memory_sha256") != hashlib.sha256(self.initial_memory).hexdigest():
+            raise ValueError("adaptive state initial memory does not match")
+        return state
+
+    def _load_pending(self, state):
+        path = self.root / "pending.json"
+        if not path.exists():
+            return None
+        pending = self._read_json(path)
+        if pending.get("schema") != PENDING_SCHEMA:
+            raise ValueError("invalid pending adaptive wave")
+        if pending.get("base_wave_index") < state["wave_index"]:
+            path.unlink()
+            return None
+        snapshot = self._memory_snapshot(state)
+        if (
+            pending.get("base_wave_index") != state["wave_index"]
+            or pending.get("base_memory_sha256") != hashlib.sha256(snapshot).hexdigest()
+        ):
+            raise ValueError("pending wave does not match published memory")
+        return pending
+
+    @staticmethod
+    def _session(state):
+        value = state["session"]
+        return CurriculumSession(tuple(value["messages"]), value["turns"])
+
+    @staticmethod
+    def _session_dict(session):
+        return {"messages": [dict(item) for item in session.messages], "turns": session.turns}
+
+    def _report(self, state):
+        snapshot = self._memory_snapshot(state)
+        terminal = state["terminal"]
+        return {
+            "status": "RUNNING" if terminal is None else terminal["status"],
+            "reason": None if terminal is None else terminal["reason"],
+            "wave_index": state["wave_index"],
+            "coverage": list(state["coverage"]),
+            "published_projects": [row["project_id"] for row in state["prior_outcomes"]],
+            "memory": list(state["memory"]),
+            "memory_sha256": hashlib.sha256(snapshot).hexdigest(),
+        }
+
+    @staticmethod
+    def _read_json(path):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"unable to read adaptive state: {path.name}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"adaptive state is not an object: {path.name}")
+        return value
+
+    @staticmethod
+    def _atomic_json(path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_bytes(canonical_bytes(value) + b"\n")
+        os.replace(temporary, path)
+
+
+__all__ = [
+    "AdaptivePhase1Coordinator", "AdaptiveProjectExecutor",
+    "AdaptiveProjectRequest", "AdaptiveProjectResult",
+]
