@@ -59,7 +59,9 @@ daemon or scheduler is installed by this release.
 The A5 weight-update track uses only
 `accounts/fireworks/models/deepseek-v4-flash`. Its checked profile calls the
 direct OpenAI-compatible Fireworks endpoint, with `FIREWORKS_API_KEY` supplied
-only through the environment. The managed training contract is fixed at LoRA
+only through the environment. The CLI loads the configured RSIAgent `.env`
+before resolving `FIREWORKS_ACCOUNT_ID`, the API key, or the paid-training
+opt-in. The managed training contract is fixed at LoRA
 rank 32, one epoch, learning rate `1e-5`, and 32K context. Study seed 42 is
 retained in provenance; Fireworks managed SFT currently has no seed request
 field, so the client does not pretend to enforce it remotely.
@@ -80,6 +82,23 @@ dataset, creates the SFT job, observes it to a terminal state, verifies the
 provider's echoed contract, resolves the exact output model, and writes a
 non-secret provenance record. It never silently changes to another model or
 training configuration.
+
+Before upload, the command writes a content-addressed snapshot beside the
+provenance file and uploads those immutable validated bytes. Immediately after
+job creation it persists provisional job, dataset, output-model, and contract
+identity. If polling is interrupted, resume the existing paid job without any
+dataset or POST request:
+
+```bash
+python run_a5_fireworks_sft.py --observe-existing \
+  --account-id <account> --job-id rsi-a5-v1 \
+  --output-model-id rsi-a5-v1 \
+  --provenance results/fireworks/rsi-a5-v1.json
+```
+
+Resume validates the retained dataset snapshot and fixed SFT contract before
+polling. Ordinary GET timeouts, rate limits, and server errors receive bounded
+backoff; terminal provider job states are never retried or hidden.
 
 For phase-level inspection, use `python -m benchmarks.osworld.pipeline --help`.
 The internal `phase1`, `phase2`, and `task` modules live in the same package;
