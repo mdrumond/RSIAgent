@@ -37,6 +37,16 @@ def test_multidimensional_sweep_is_actionable():
         specialize_timing(spec)
 
 
+@pytest.mark.parametrize('metric_name', ['PIPE_UTILIZATION', 'MEMORY', 'PIPE_TIMELINE'])
+def test_nonbasic_capture_requires_kernel_before_remote_dispatch(tmp_path, metric_name):
+    from benchmarks.a5kernels.profiling import CampaignKind, CaptureCommand, ProfileMetric, ProfileRequest
+    plan = ProjectBackend().measurement_plan(_candidate(tmp_path))
+    request = ProfileRequest(plan, 'catlass-dsl', 'kernel', 3)
+    metric = ProfileMetric[metric_name]
+    with pytest.raises(ValueError, match=f'{metric.value} requires an exact kernel name'):
+        CaptureCommand(CampaignKind.INTERMEDIATE, request, metric, 'replay')
+
+
 def test_timing_summary_preserves_raw_values_and_labels():
     result = timing_summary([1., 3., 2.])
     assert result['samples_us'] == [1., 3., 2.]
