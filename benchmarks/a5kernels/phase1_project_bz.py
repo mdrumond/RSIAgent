@@ -169,7 +169,8 @@ class CatlassProjectBackend:
             identity, f"measure-{secrets.token_hex(8)}", "catlass-dsl", files,
             ("python", "-B", f"{remote}/host_driver.py", f"{remote}/kernel.py",
              f"{remote}/manifest.json", "run"), (), (), self._provenance(),
-            ExecutionEnvironment(bindings=(("A5PROJECT_MASKED_TIMING", "1"),),
+            ExecutionEnvironment(bindings=(("A5PROJECT_MASKED_TIMING", "1"),
+                                           ("PYTHONDONTWRITEBYTECODE", "1")),
                                  unset=("PYTHONPYCACHEPREFIX",)),
         )
 
@@ -208,6 +209,7 @@ class CatlassProjectBackend:
         command = (
             "env", "-u", "PYTHONPYCACHEPREFIX",
             f"BZ_A5_PROFILE_PHYSICAL_DEVICE={self._device}",
+            "PYTHONDONTWRITEBYTECODE=1",
             "python", "-B", f"{remote}/host_driver.py",
             f"{remote}/kernel.py", f"{remote}/manifest.json", mode,
         )

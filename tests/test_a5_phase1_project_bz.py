@@ -76,6 +76,29 @@ def _request(tmp_path: Path, family: str):
     return project._request(prepared, "# exact candidate bytes\n")
 
 
+def test_project_python_children_inherit_no_bytecode_for_profiling(tmp_path):
+    import os
+    import subprocess
+    import sys
+    executor = FakeExecutor([{"status": "compiled", "diagnostic": "compiled"}])
+    backend = _backend(tmp_path, executor)
+    request = _request(tmp_path, "movement")
+    plan = backend.measurement_plan(request)
+    # -B alone is not inherited by a nested interpreter launched by tooling.
+    module = tmp_path / "cache_probe.py"
+    module.write_text("VALUE = 1\n", encoding="utf-8")
+    environment = dict(os.environ)
+    environment.update(dict(plan.environment.bindings))
+    environment["PYTHONPATH"] = str(tmp_path)
+    subprocess.run([
+        sys.executable, "-B", "-c",
+        "import subprocess,sys; subprocess.run([sys.executable,'-c','import cache_probe'],check=True)",
+    ], env=environment, check=True)
+    assert not (tmp_path / "__pycache__").exists()
+    backend.compile(request)
+    assert "PYTHONDONTWRITEBYTECODE=1" in executor.invocations[0].argv
+
+
 @pytest.mark.parametrize("family", ["movement", "simt", "cube"])
 def test_bundle_is_deterministic_but_independent_backends_use_fresh_sessions(
     tmp_path, family,
