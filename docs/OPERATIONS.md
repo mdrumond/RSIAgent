@@ -54,6 +54,33 @@ official scores.
 The wrapper performs no unattended recovery. It exits on failure. No monitoring
 daemon or scheduler is installed by this release.
 
+### Fireworks DeepSeek V4 Flash SFT
+
+The A5 weight-update track uses only
+`accounts/fireworks/models/deepseek-v4-flash`. Its checked profile calls the
+direct OpenAI-compatible Fireworks endpoint, with `FIREWORKS_API_KEY` supplied
+only through the environment. The managed training contract is fixed at LoRA
+rank 32, one epoch, learning rate `1e-5`, and 32K context. Study seed 42 is
+retained in provenance; Fireworks managed SFT currently has no seed request
+field, so the client does not pretend to enforce it remotely.
+
+Validate an existing OpenAI chat JSONL without provider calls or filesystem
+outputs:
+
+```bash
+python run_a5_fireworks_sft.py training.jsonl \
+  --dataset-id rsi-a5-v1 --output-model-id rsi-a5-v1 \
+  --job-id rsi-a5-v1 --provenance results/fireworks/rsi-a5-v1.json
+```
+
+A paid submission additionally requires `--submit`, `FIREWORKS_API_KEY`, an
+account from `--account-id` or `FIREWORKS_ACCOUNT_ID`, and the independent
+`RSI_ALLOW_FIREWORKS_SFT=1` safeguard. The command creates and uploads the
+dataset, creates the SFT job, observes it to a terminal state, verifies the
+provider's echoed contract, resolves the exact output model, and writes a
+non-secret provenance record. It never silently changes to another model or
+training configuration.
+
 For phase-level inspection, use `python -m benchmarks.osworld.pipeline --help`.
 The internal `phase1`, `phase2`, and `task` modules live in the same package;
 they are also invoked with `python -m benchmarks.osworld.<module>` from the
