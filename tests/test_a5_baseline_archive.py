@@ -23,11 +23,23 @@ def spec(tmp_path: Path) -> dict[str, object]:
     memory = {
         "memory": {
             "agent_interpretations": [],
-            "host_facts": [{"statement": "host pass"}],
+            "host_facts": [{
+                "statement": "host pass",
+                "evidence_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            }],
         }
     }
     write(phase1 / "cells/a/memory.jsonl", json.dumps(memory).encode() + b"\n")
-    write(phase1 / "cells/a/evidence.jsonl", b'{"kind":"result"}\n')
+    write(
+        phase1 / "cells/a/evidence.jsonl",
+        b'{"kind":"action","payload":{"action":"compile"},'
+        b'"entry_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n',
+    )
+    write(phase1 / "cells/a/agent-prompt.json", b'{"system_prompt":"write a kernel"}\n')
+    write(
+        phase1 / "cells/a/knowledge.jsonl",
+        b'{"kind":"knowledge_query","citations":[{"path":"guide.md"}]}\n',
+    )
     write(phase2 / "cells/b/candidate.py", b"def kernel():\n    pass\n")
     write(phase2 / "cells/b/profile.json", b'{"metric":"pipe"}\n')
     write(phase2 / "duplicate.txt", b"shared")
@@ -87,7 +99,7 @@ def test_archive_is_deterministic_content_addressed_and_source_immutable(tmp_pat
     shared = [item for item in inventory if item["path"] == "duplicate.txt"]
     assert len(shared) == 2 and shared[0]["sha256"] == shared[1]["sha256"]
     objects = list((tmp_path / "archive-a/raw/objects/sha256").rglob("*"))
-    assert len([item for item in objects if item.is_file()]) == 5
+    assert len([item for item in objects if item.is_file()]) == 7
 
 
 def test_audit_is_symmetric_and_declares_missing_historical_material(tmp_path):
@@ -102,7 +114,7 @@ def test_audit_is_symmetric_and_declares_missing_historical_material(tmp_path):
         "candidate_sources": 0,
         "evidence_records": 1,
         "interpretations": 0,
-        "json_records": 2,
+        "json_records": 4,
         "memory_records": 1,
         "profile_artifacts": 0,
     }
@@ -111,6 +123,59 @@ def test_audit_is_symmetric_and_declares_missing_historical_material(tmp_path):
     assert audit["known_missing"] == result["known_missing"]
     encoded = json.dumps(audit)
     assert str(tmp_path) not in encoded
+
+
+def test_review_describes_retained_layers_links_claims_and_information_loss(tmp_path):
+    value = spec(tmp_path)
+    phase1 = Path(value["campaigns"][1]["root"])
+    write(
+        phase1 / "cells/a/memory-claims.jsonl",
+        b'{"statement":"kernel output is correct"}\n'
+        b'{"statement":"profile latency is lower",'
+        b'"evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n',
+    )
+
+    archive_baselines(load_archive_spec(value), tmp_path / "archive")
+    review = json.loads((tmp_path / "archive/derived/review.json").read_text())
+
+    assert review["schema"] == "a5-baseline-content-review-v1"
+    campaigns = {item["campaign_id"]: item for item in review["campaigns"]}
+    phase1_review = campaigns["phase1-deepseek-profile"]
+    layers = phase1_review["retained_layers"]
+    assert layers["prompts"]["file_count"] == 1
+    assert layers["actions"]["record_count"] == 1
+    assert layers["host_observations"]["record_count"] == 1
+    assert layers["knowledge_queries"]["record_count"] == 1
+    assert layers["memory"]["file_count"] == 2
+    assert phase1_review["evidence_linkage"]["reference_count"] == 2
+    assert phase1_review["evidence_linkage"]["archive_resolved_count"] == 1
+    assert phase1_review["claims"]["with_evidence_reference"] == {
+        "correctness": 1,
+        "performance": 1,
+    }
+    assert phase1_review["claims"]["unsupported"] == {
+        "correctness": 1,
+        "performance": 0,
+    }
+    assert phase1_review["claims"]["unsupported_findings"][0]["path"].endswith(
+        "memory-claims.jsonl"
+    )
+    assert "text" not in phase1_review["claims"]["unsupported_findings"][0]
+    assert phase1_review["information_loss"]["declared"][0]["artifact"] == (
+        "provider completion text"
+    )
+    assert "source" in phase1_review["information_loss"]["absent_layers"]
+
+
+def test_content_review_is_deterministic_and_does_not_embed_source_roots(tmp_path):
+    value = spec(tmp_path)
+    archive_baselines(load_archive_spec(value), tmp_path / "archive-a")
+    archive_baselines(load_archive_spec(value), tmp_path / "archive-b")
+
+    first = (tmp_path / "archive-a/derived/review.json").read_bytes()
+    second = (tmp_path / "archive-b/derived/review.json").read_bytes()
+    assert first == second
+    assert str(tmp_path).encode() not in first
 
 
 @pytest.mark.parametrize(
@@ -160,6 +225,6 @@ def test_cli_reads_spec_and_reports_only_archive_identity(tmp_path, capsys):
 
     output = json.loads(capsys.readouterr().out)
     assert output["campaigns"] == 2
-    assert output["files"] == 6
+    assert output["files"] == 8
     assert len(output["manifest_sha256"]) == 64
     assert str(tmp_path) not in json.dumps(output)

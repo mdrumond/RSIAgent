@@ -174,6 +174,129 @@ def _interpretation_count(value: object) -> int:
     return 0
 
 
+_CLAIM_FIELDS = {"claim", "conclusion", "interpretation", "lesson", "statement", "summary"}
+_CLAIM_WORDS = {
+    "correctness": re.compile(r"\b(?:correct|match|pass(?:ed|es)?|verif(?:y|ied))\b", re.I),
+    "performance": re.compile(
+        r"\b(?:bandwidth|faster|latency|performance|speedup|throughput)\b", re.I
+    ),
+}
+
+
+def _walk(value: object, pointer: str = ""):
+    if isinstance(value, Mapping):
+        yield pointer or "/", value
+        for key, item in value.items():
+            yield from _walk(item, f"{pointer}/{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _walk(item, f"{pointer}/{index}")
+
+
+def _content_review(
+    campaign: Campaign,
+    files: list[tuple[str, bytes, os.stat_result]],
+    inventory: list[dict[str, object]],
+    known_missing: tuple[MissingArtifact, ...],
+) -> dict[str, object]:
+    names = (
+        "prompts", "actions", "host_observations", "source", "profile",
+        "memory", "knowledge_queries",
+    )
+    paths = {name: set() for name in names}
+    records = {name: 0 for name in names}
+    definitions = {item["sha256"] for item in inventory}
+    references: list[str] = []
+    referenced = {name: 0 for name in _CLAIM_WORDS}
+    unsupported = {name: 0 for name in _CLAIM_WORDS}
+    findings = []
+    for relative, data, _stat in files:
+        lower = relative.lower()
+        base = PurePosixPath(lower).name
+        if base.endswith((".py", ".cpp", ".cc", ".c", ".h", ".hpp")):
+            paths["source"].add(relative)
+        if "profile" in lower or "timing" in base or "msprof" in lower:
+            paths["profile"].add(relative)
+        if "memory" in base:
+            paths["memory"].add(relative)
+        for record_index, value in enumerate(_json_values(relative, data)):
+            matched = set()
+            for pointer, node in _walk(value):
+                for key, item in node.items():
+                    if key in {"entry_sha256", "record_sha256"} and isinstance(item, str):
+                        definitions.add(item)
+                    if key.endswith("evidence_sha256") and isinstance(item, str):
+                        references.append(item)
+                    if key in {"prompt", "system_prompt", "instructions"}:
+                        records["prompts"] += 1
+                        matched.add("prompts")
+                    if key == "action" and isinstance(item, str):
+                        records["actions"] += 1
+                        matched.add("actions")
+                    if key == "actions" and isinstance(item, list):
+                        records["actions"] += len(item)
+                        matched.add("actions")
+                    if key == "host_facts" and isinstance(item, list):
+                        records["host_observations"] += len(item)
+                        matched.add("host_observations")
+                    if key == "kind" and item == "knowledge_query":
+                        records["knowledge_queries"] += 1
+                        matched.add("knowledge_queries")
+                    if key not in _CLAIM_FIELDS or not isinstance(item, str):
+                        continue
+                    evidence_count = sum(
+                        isinstance(v, str) for k, v in node.items()
+                        if k.endswith("evidence_sha256")
+                    )
+                    for category, pattern in _CLAIM_WORDS.items():
+                        if not pattern.search(item):
+                            continue
+                        target = referenced if evidence_count else unsupported
+                        target[category] += 1
+                        if not evidence_count:
+                            findings.append({
+                                "category": category,
+                                "json_pointer": pointer + "/" + key,
+                                "json_record": record_index,
+                                "path": relative,
+                                "statement_sha256": hashlib.sha256(item.encode()).hexdigest(),
+                            })
+            for name in matched:
+                paths[name].add(relative)
+    layers = {
+        name: {
+            "example_paths": sorted(paths[name])[:3],
+            "file_count": len(paths[name]),
+            "record_count": records[name],
+        }
+        for name in names
+    }
+    scoped_missing = [
+        item.__dict__ for item in known_missing
+        if item.scope in {"all", campaign.campaign_id}
+    ]
+    return {
+        "campaign_id": campaign.campaign_id,
+        "claims": {
+            "with_evidence_reference": referenced,
+            "unsupported": unsupported,
+            "unsupported_findings": sorted(
+                findings, key=lambda item: (item["path"], item["json_record"], item["json_pointer"])
+            ),
+        },
+        "evidence_linkage": {
+            "archive_resolved_count": sum(item in definitions for item in references),
+            "reference_count": len(references),
+            "unresolved_count": sum(item not in definitions for item in references),
+        },
+        "information_loss": {
+            "absent_layers": [name for name in names if not paths[name]],
+            "declared": scoped_missing,
+        },
+        "retained_layers": layers,
+    }
+
+
 def archive_baselines(spec: ArchiveSpec, destination: Path) -> dict[str, object]:
     """Create raw content objects plus a separate model-neutral derived audit."""
 
@@ -244,11 +367,30 @@ def archive_baselines(spec: ArchiveSpec, destination: Path) -> dict[str, object]
         "campaigns": audits,
         "known_missing": missing,
     }
+    reviews = []
+    for campaign, files in captured:
+        campaign_inventory = [
+            item for item in inventory if item["campaign_id"] == campaign.campaign_id
+        ]
+        reviews.append(_content_review(campaign, files, campaign_inventory, spec.known_missing))
+    review = {
+        "schema": "a5-baseline-content-review-v1",
+        "method": {
+            "claims": "keyword-bearing claim fields; unsupported means no adjacent evidence_sha256",
+            "evidence_linkage": "references resolve only to hashes retained in this archive",
+            "information_loss": "declared losses plus structurally absent retained layers",
+        },
+        "campaigns": reviews,
+    }
     for digest, data in sorted(objects.items()):
         target = destination / "raw/objects/sha256" / digest[:2] / digest[2:]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-    for relative, value in (("raw/manifest.json", manifest), ("derived/audit.json", audit)):
+    for relative, value in (
+        ("raw/manifest.json", manifest),
+        ("derived/audit.json", audit),
+        ("derived/review.json", review),
+    ):
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(canonical_bytes(value) + b"\n")
