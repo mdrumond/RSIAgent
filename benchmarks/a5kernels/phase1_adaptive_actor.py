@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 import json
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes
@@ -21,6 +21,7 @@ from benchmarks.a5kernels.phase1_memory import (
 )
 from benchmarks.a5kernels.phase1_project_executor import (
     PreparedProject,
+    ProjectCompileResult,
     ProjectExecutionResult,
     ProjectExecutor,
 )
@@ -47,6 +48,37 @@ class AdaptiveActorDriver(Protocol):
     ) -> ActorOutcome: ...
 
 
+@dataclass(frozen=True)
+class AdaptiveActionContext:
+    request: AdaptiveProjectRequest
+    prepared: PreparedProject
+    source: str | None
+    latest_execution: ProjectExecutionResult | None
+
+
+ActionDependency = Callable[
+    [Mapping[str, object], AdaptiveActionContext], Mapping[str, object]
+]
+
+
+def disabled_knowledge_action(
+    _payload: Mapping[str, object], _context: AdaptiveActionContext,
+) -> Mapping[str, object]:
+    return {
+        "event": "knowledge-query", "available": False,
+        "reason": "disabled-by-treatment",
+    }
+
+
+def disabled_profile_action(
+    _payload: Mapping[str, object], _context: AdaptiveActionContext,
+) -> Mapping[str, object]:
+    return {
+        "event": "profile", "available": False,
+        "reason": "disabled-by-treatment",
+    }
+
+
 def _same_prepared(left: PreparedProject, right: PreparedProject) -> bool:
     return (
         left.spec == right.spec
@@ -68,6 +100,8 @@ class _ProjectActions:
         *,
         max_actions: int,
         max_source_bytes: int,
+        query_knowledge: ActionDependency,
+        request_profile: ActionDependency,
     ) -> None:
         self.executor = executor
         self.request = request
@@ -75,7 +109,10 @@ class _ProjectActions:
         self.artifacts = artifacts
         self.max_actions = max_actions
         self.max_source_bytes = max_source_bytes
+        self.query_knowledge = query_knowledge
+        self.request_profile = request_profile
         self.actions: list[str] = []
+        self.metered_actions = 0
         self.source: str | None = None
         self.source_sha256: str | None = None
         self.latest: ProjectExecutionResult | None = None
@@ -86,14 +123,24 @@ class _ProjectActions:
         if not isinstance(action, TrialAction):
             raise TypeError("adaptive projects accept only TrialAction values")
         self.actions.append(action.kind)
-        if len(self.actions) > self.max_actions:
-            return self._observation({"error": "action budget exhausted"}, True, "budget")
+        if action.kind != "compile":
+            self.metered_actions += 1
+            if self.metered_actions > self.max_actions:
+                return self._observation(
+                    {"error": "action budget exhausted"}, True, "budget"
+                )
         if action.kind == "propose":
             return self._observation({"event": "proposal-recorded"})
         if action.kind == "write":
             return self._write(action)
-        if action.kind in {"compile", "run"}:
-            return self._evaluate(action.kind)
+        if action.kind == "compile":
+            return self._compile()
+        if action.kind == "run":
+            return self._run()
+        if action.kind == "query-knowledge":
+            return self._dependency(self.query_knowledge, action.payload)
+        if action.kind == "request-profile":
+            return self._dependency(self.request_profile, action.payload)
         if action.kind == "submit":
             return self._submit()
         return self._observation({
@@ -117,7 +164,26 @@ class _ProjectActions:
             "event": "candidate-written", "source_sha256": self.source_sha256,
         })
 
-    def _evaluate(self, action: str) -> ActionOutcome:
+    def _compile(self) -> ActionOutcome:
+        if self.source is None:
+            return self._observation({"error": "write candidate source first"})
+        result: ProjectCompileResult = self.executor.compile(
+            self.request.spec, self.source
+        )
+        if not _same_prepared(result.prepared, self.prepared):
+            raise ValueError("compilation rematerialized different project inputs or oracle")
+        digest = self.artifacts.put_json(result.artifact)
+        if digest != result.artifact_sha256:
+            raise ValueError("compile artifact hash does not match its payload")
+        self.admitted[digest] = "compile"
+        return self._observation({
+            "event": "host-compile", "source_sha256": self.source_sha256,
+            "passed": result.observation.passed,
+            "diagnostic": result.observation.diagnostic,
+            "artifact": {"sha256": digest, "payload": result.artifact},
+        })
+
+    def _run(self) -> ActionOutcome:
         if self.source is None:
             return self._observation({"error": "write candidate source first"})
         result = self.executor.execute(self.request.spec, self.source)
@@ -138,12 +204,22 @@ class _ProjectActions:
             self.admitted[digest] = role
             retained[name] = {"sha256": digest, "payload": payload}
         return self._observation({
-            "event": "host-execution", "requested_action": action,
+            "event": "host-execution", "requested_action": "run",
             "source_sha256": self.source_sha256,
             "classification": result.evidence.classification.value,
             "detail": result.evidence.detail,
             "artifacts": retained,
         })
+
+    def _dependency(
+        self, dependency: ActionDependency, payload: Mapping[str, object],
+    ) -> ActionOutcome:
+        result = dependency(payload, AdaptiveActionContext(
+            self.request, self.prepared, self.source, self.latest,
+        ))
+        if not isinstance(result, Mapping):
+            raise TypeError("adaptive action dependency must return a mapping")
+        return self._observation(result)
 
     def _submit(self) -> ActionOutcome:
         if (
@@ -176,6 +252,8 @@ class AdaptiveActorProjectExecutor:
     def __init__(
         self, executor: ProjectExecutor, actor: AdaptiveActorDriver, profile: object,
         *, max_actions: int = 40, max_source_bytes: int = 128_000,
+        query_knowledge: ActionDependency | None = None,
+        request_profile: ActionDependency | None = None,
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
@@ -188,6 +266,14 @@ class AdaptiveActorProjectExecutor:
         self.profile = profile
         self.max_actions = max_actions
         self.max_source_bytes = max_source_bytes
+        self.query_knowledge = (
+            disabled_knowledge_action if query_knowledge is None else query_knowledge
+        )
+        self.request_profile = (
+            disabled_profile_action if request_profile is None else request_profile
+        )
+        if not callable(self.query_knowledge) or not callable(self.request_profile):
+            raise TypeError("adaptive action dependencies must be callable")
 
     def __call__(self, request: AdaptiveProjectRequest) -> AdaptiveProjectResult:
         if not isinstance(request, AdaptiveProjectRequest):
@@ -205,6 +291,8 @@ class AdaptiveActorProjectExecutor:
         actions = _ProjectActions(
             self.executor, request, prepared, artifacts,
             max_actions=self.max_actions, max_source_bytes=self.max_source_bytes,
+            query_knowledge=self.query_knowledge,
+            request_profile=self.request_profile,
         )
         opening = prepared.instruction + "\nPre-wave memory (immutable): " + json.dumps({
             "sha256": memory_sha256,
@@ -258,4 +346,8 @@ class AdaptiveActorProjectExecutor:
         )
 
 
-__all__ = ["AdaptiveActorDriver", "AdaptiveActorProjectExecutor"]
+__all__ = [
+    "ActionDependency", "AdaptiveActionContext", "AdaptiveActorDriver",
+    "AdaptiveActorProjectExecutor",
+    "disabled_knowledge_action", "disabled_profile_action",
+]

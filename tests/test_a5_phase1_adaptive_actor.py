@@ -47,6 +47,7 @@ def _spec() -> ProjectSpec:
 class SourceBackend:
     def __init__(self):
         self.requests = []
+        self.run_requests = []
 
     def compile(self, request):
         self.requests.append(request)
@@ -59,6 +60,7 @@ class SourceBackend:
 
     def run(self, request, compilation):
         del compilation
+        self.run_requests.append(request)
         if request.candidate_source == "runtime failure":
             return RuntimeObservation(
                 False, canonical_digest({"runtime": request.candidate_source}),
@@ -152,7 +154,7 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
         '{"run":{}}',
         '{"submit":{}}',
         '{"write":{"slot":"kernel","content":"fixed source"}}',
-        '{"compile":{}}',
+        '{"run":{}}',
         '{"submit":{}}',
     ))
 
@@ -165,12 +167,13 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert result.memory.source_revision == hashlib.sha256(b"fixed source").hexdigest()
     assert result.memory.actions == (
         "write", "compile", "write", "run", "write", "run", "submit",
-        "write", "compile", "submit",
+        "write", "run", "submit",
     )
     assert result.memory.lessons[0].category == "failure-repair"
     assert actor.distill_calls[0][2][0]["category"] == "host-verification"
-    assert actor.observations[1]["classification"] == "compile-failure"
-    assert actor.observations[1]["artifacts"]["observed"]["payload"][
+    assert actor.observations[1]["event"] == "host-compile"
+    assert actor.observations[1]["passed"] is False
+    assert actor.observations[1]["artifact"]["payload"][
         "compile_diagnostic"
     ] == "frontend rejected source"
     assert actor.observations[3]["classification"] == "runtime-failure"
@@ -185,6 +188,7 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert encoded_memory in actor.instruction
     assert executor.prepare(_spec()).instruction in actor.instruction
     assert len(backend.requests) == 4
+    assert len(backend.run_requests) == 3
     assert (tmp_path / "branch" / "artifacts").is_dir()
 
 
@@ -249,3 +253,90 @@ def test_adapter_fails_closed_if_execution_rematerializes_a_new_contract(tmp_pat
         )
 
     assert actor.distill_calls == []
+
+
+def test_compile_probe_never_runs_authorizes_submit_or_consumes_action_budget(tmp_path):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    compile_probes = ('{"compile":{}}',) * 5
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        *compile_probes,
+        '{"submit":{}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+
+    result = AdaptiveActorProjectExecutor(
+        executor, actor, object(), max_actions=4,
+    )(_request(tmp_path, executor))
+
+    assert result.evidence.verified
+    assert len(backend.requests) == 6
+    assert len(backend.run_requests) == 1
+    assert all(item["event"] == "host-compile" for item in actor.observations[1:6])
+    assert all(item["passed"] is True for item in actor.observations[1:6])
+    assert actor.observations[6]["error"].startswith("submit requires")
+
+
+def test_optional_treatment_actions_have_deterministic_disabled_observations(tmp_path):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = ScriptedActor((
+        '{"query-knowledge":{"query":"vector movement","limit":3}}',
+        '{"request-profile":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+
+    AdaptiveActorProjectExecutor(executor, actor, object())(_request(tmp_path, executor))
+
+    assert actor.observations[:2] == [
+        {
+            "event": "knowledge-query", "available": False,
+            "reason": "disabled-by-treatment",
+        },
+        {
+            "event": "profile", "available": False,
+            "reason": "disabled-by-treatment",
+        },
+    ]
+
+
+def test_optional_treatment_actions_use_injected_narrow_dependencies(tmp_path):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    calls = []
+
+    def knowledge(payload, context):
+        calls.append(("knowledge", dict(payload), context))
+        return {"event": "knowledge-query", "available": True, "results": ["fact"]}
+
+    def profile(payload, context):
+        calls.append(("profile", dict(payload), context))
+        return {"event": "profile", "available": True, "metric": 7}
+
+    actor = ScriptedActor((
+        '{"query-knowledge":{"query":"vector movement","limit":3}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"request-profile":{}}',
+        '{"submit":{}}',
+    ))
+
+    AdaptiveActorProjectExecutor(
+        executor, actor, object(),
+        query_knowledge=knowledge, request_profile=profile,
+    )(_request(tmp_path, executor))
+
+    assert calls[0][0:2] == (
+        "knowledge", {"query": "vector movement", "limit": 3},
+    )
+    assert calls[0][2].request.spec == _spec()
+    assert calls[0][2].source is None
+    assert calls[1][0:2] == ("profile", {})
+    assert calls[1][2].source == "fixed source"
+    assert calls[1][2].latest_execution.evidence.verified
+    assert actor.observations[0]["results"] == ["fact"]
+    assert actor.observations[3]["metric"] == 7

@@ -164,6 +164,32 @@ def test_compile_failure_is_a_real_backend_result_and_never_launches(tmp_path):
         )
 
 
+@pytest.mark.parametrize("passed", [False, True])
+def test_compile_only_returns_exact_evidence_without_running_or_verifying(
+    tmp_path, passed,
+):
+    backend = FakeBackend(_compile(passed=passed), _runtime((1.0,)))
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+
+    result = ProjectExecutor(backend, ledger).compile(
+        _spec("movement"), "compile probe source"
+    )
+
+    assert result.observation.passed is passed
+    assert result.artifact == {
+        "compile_passed": passed,
+        "compile_diagnostic": (
+            "compiled" if passed else "frontend rejected candidate"
+        ),
+        "compile_evidence_sha256": result.observation.evidence_sha256,
+        "compiled_artifact_id": "compiled-object" if passed else None,
+    }
+    assert result.artifact_sha256 == canonical_digest(result.artifact)
+    assert backend.compile_requests[0].candidate_source == "compile probe source"
+    assert backend.run_requests == []
+    assert ledger.entries[-1].payload["event"] == "phase1-project-compile-artifact"
+
+
 def test_runtime_failure_requires_an_actual_runtime_observation(tmp_path):
     backend = FakeBackend(_compile(), _runtime(passed=False))
     result = ProjectExecutor(
