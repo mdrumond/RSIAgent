@@ -241,6 +241,13 @@ class _ProviderEvidenceRecorder:
         })
 
 
+@dataclass(frozen=True)
+class _DirectActorContinuation:
+    profile: DirectModelProfile
+    messages: tuple[Mapping[str, str], ...]
+    recorder: _ProviderEvidenceRecorder
+
+
 class DirectActorDriver:
     """Run the existing restricted A5 action protocol over one direct profile."""
 
@@ -284,31 +291,57 @@ class DirectActorDriver:
                 observation = outcome.observation
                 if outcome.terminal:
                     messages.append({"role": "user", "content": observation})
-                    messages.append({
-                        "role": "user",
-                        "content": DISTILLATION_PROMPT + "\n" + json.dumps(
-                            dict(outcome.admitted_artifacts),
-                            sort_keys=True, separators=(",", ":"),
-                        ),
-                    })
-                    recorder.request(profile, messages, stage="distillation", turn=turn)
-                    try:
-                        terminal = self.provider.complete(profile, messages)
-                    except Exception as exc:
-                        recorder.failure(exc, stage="distillation", turn=turn)
-                        return ActorOutcome(outcome.status, turn, tokens)
-                    recorder.response(terminal.text, stage="distillation", turn=turn)
-                    tokens += terminal.completion_tokens
-                    distillation = parse_agent_distillation(
-                        terminal.text, outcome.admitted_artifacts
-                    )
                     return ActorOutcome(
                         outcome.status, turn, tokens,
-                        terminal_response=terminal.text,
-                        distillation=distillation,
+                        admitted_artifacts=dict(outcome.admitted_artifacts),
+                        continuation=_DirectActorContinuation(
+                            profile, tuple(dict(item) for item in messages), recorder
+                        ),
                     )
             messages.append({"role": "user", "content": observation})
         return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
+
+    def distill(
+        self,
+        outcome: ActorOutcome,
+        *,
+        admitted_artifacts: Mapping[str, str] | None = None,
+    ) -> ActorOutcome:
+        """Resume the exact terminal Actor history after all host work completes."""
+
+        continuation = outcome.continuation
+        if (not isinstance(continuation, _DirectActorContinuation)
+                or outcome.distillation is not None):
+            raise ValueError("Actor outcome is not awaiting terminal distillation")
+        admitted = dict(outcome.admitted_artifacts)
+        if admitted_artifacts is not None:
+            admitted.update(admitted_artifacts)
+        messages = [dict(item) for item in continuation.messages]
+        messages.append({
+            "role": "user",
+            "content": DISTILLATION_PROMPT + "\n" + json.dumps(
+                admitted, sort_keys=True, separators=(",", ":")
+            ),
+        })
+        continuation.recorder.request(
+            continuation.profile, messages,
+            stage="distillation", turn=outcome.iterations,
+        )
+        completion = self.provider.complete(continuation.profile, messages)
+        continuation.recorder.response(
+            completion.text, stage="distillation", turn=outcome.iterations,
+        )
+        distillation = parse_agent_distillation(completion.text, admitted)
+        return ActorOutcome(
+            outcome.status,
+            outcome.iterations,
+            (outcome.tokens or 0) + completion.completion_tokens,
+            outcome.wall_time_s,
+            completion.text,
+            distillation,
+            admitted,
+            None,
+        )
 
 
 __all__ = [

@@ -272,7 +272,7 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(t
 
     assert seen == ["write", "submit"]
     assert outcome.iterations == 3
-    assert outcome.tokens == 8
+    assert outcome.tokens == 6
     second_request = calls[1]["request"]["messages"]
     assert json.loads(second_request[-1]["content"])["host"]["event"] == "invalid-action"
     assert calls[2]["request"]["messages"][-1] == {
@@ -321,6 +321,9 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_pa
         ),
     )
 
+    assert len(calls) == 1
+    assert outcome.distillation is None
+    outcome = actor.distill(outcome)
     assert len(calls) == 2
     assert calls[-1]["request"]["messages"][-2] == {
         "role": "user", "content": terminal,
@@ -368,28 +371,30 @@ def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("response,match", [
+@pytest.mark.parametrize("response,match,role", [
     ('{"distillation":{"no_new_knowledge":true,"lessons":[],"extra":1}}',
-     "distillation response"),
-    (_distillation(evidence="b" * 64), "admitted artifact"),
-    (_distillation(category="correctness"), "correctness"),
+     "distillation response", "compile"),
+    (_distillation(evidence="b" * 64), "admitted artifact", "compile"),
+    (_distillation(category="correctness"), "correctness", "compile"),
+    (_distillation(category="performance"), "performance", "profiling"),
 ])
-def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match):
+def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match, role):
     # The last case deliberately admits only compile evidence, which cannot
     # establish correctness even when its digest is genuine.
     provider = _scripted_provider(['{"submit":{}}', response], [])
     actor = DirectActorDriver(provider, max_turns=1)
     from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
 
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=None, context=None, turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            '{"host":{"event":"submitted","passed":true}}',
+            terminal=True, admitted_artifacts={ADMITTED: role},
+        ),
+    )
     with pytest.raises(ValueError, match=match):
-        actor(
-            "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
-            workspace=None, context=None, turn_parser=parse_trial_action,
-            action_executor=lambda _action: ActionOutcome(
-                '{"host":{"event":"submitted","passed":true}}',
-                terminal=True, admitted_artifacts={ADMITTED: "compile"},
-            ),
-        )
+        actor.distill(outcome)
 
 
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
@@ -402,7 +407,6 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
         '{"run":{}}',
         '{"submit":{}}',
-        NO_NEW_DISTILLATION,
     ], calls)
     backend = FakeBackend()
     knowledge = KnowledgeAgent(
@@ -431,7 +435,8 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     )
 
     assert result.verified.passed
-    assert result.outcome.tokens == 8
+    assert result.outcome.tokens == 6
+    assert result.outcome.distillation is None
     assert len(backend.runs) == 2
     assert result.final_profile["kernel"] == "vector_add_generated"
     assert result.workspace.joinpath("kernel.py").read_text() == SOURCE
@@ -446,9 +451,7 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
     assert artifacts.read_bytes(by_role["candidate-source"]).decode() == SOURCE
     assert artifacts.read_bytes(by_role["final-source"]).decode() == SOURCE
-    assert artifacts.read_bytes(by_role["agent-distillation"]).decode() == (
-        NO_NEW_DISTILLATION
-    )
+    assert "agent-distillation" not in by_role
     assert artifacts.verify()
     retained_bytes = b"".join(path.read_bytes()
                               for path in artifacts.objects.glob("*/*"))

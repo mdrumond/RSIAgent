@@ -152,6 +152,8 @@ class ActorOutcome:
     wall_time_s: float = 0.0
     terminal_response: str | None = None
     distillation: object | None = None
+    admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
+    continuation: object | None = None
 
 
 class ActorDriver(Protocol):
@@ -655,10 +657,21 @@ class TrialOrchestrator:
         )
         if executor.final_run is None or executor.final_profile is None:
             raise RuntimeError("Actor ended without a host-verified submit action")
-        _retain_final_artifacts(
-            workspace=workspace, language=language, executor=executor,
-            artifacts=artifacts, ledger=ledger, outcome=outcome,
-        )
+        final_source = (workspace / _SOURCE_PATHS[language]).read_bytes()
+        source_ref = artifacts.put_bytes(final_source)
+        if source_ref != executor.final_run.candidate_source_sha256:
+            raise RuntimeError("retained final source does not match verified candidate")
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "final-source", "sha256": source_ref,
+        })
+        profile_ref = artifacts.put_json(executor.final_profile)
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "final-profile", "sha256": profile_ref,
+        })
+        admitted = dict(outcome.admitted_artifacts)
+        admitted[source_ref] = "source"
+        admitted[profile_ref] = "profiling"
+        outcome = replace(outcome, admitted_artifacts=admitted)
         return TrialResult(
             outcome,
             executor.final_run,

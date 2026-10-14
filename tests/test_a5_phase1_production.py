@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import run_a5_phase1
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, KnowledgeQuery, ProgressiveMemoryJournal
 from benchmarks.a5kernels.phase1_composition import A5_PROFILING_GUIDANCE, LiveProjectRequest
@@ -192,14 +193,18 @@ def test_dependency_builder_fails_closed_then_wires_read_only_kdb(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "model,profiling,guidance,expected_commands",
+    "model,profiling,guidance,proposal,expected_commands",
     [
-        (MODEL_IDENTITIES[0], ProfilingGuidance.WITHOUT_GUIDANCE, None, 3),
-        (MODEL_IDENTITIES[1], ProfilingGuidance.WITH_GUIDANCE, A5_PROFILING_GUIDANCE, 5),
+        (MODEL_IDENTITIES[0], ProfilingGuidance.WITHOUT_GUIDANCE, None,
+         DEFAULT_PROPOSALS[0], 3),
+        (MODEL_IDENTITIES[1], ProfilingGuidance.WITH_GUIDANCE,
+         A5_PROFILING_GUIDANCE,
+         next(item for item in DEFAULT_PROPOSALS
+              if item.evidence_preset.value == "correctness-timing"), 8),
     ],
 )
 def test_executor_binds_direct_model_and_profiling_treatment(
-    tmp_path, model, profiling, guidance, expected_commands,
+    tmp_path, model, profiling, guidance, proposal, expected_commands,
 ):
     gate_root = tmp_path / "gate"
     gate_root.mkdir()
@@ -226,15 +231,17 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         except StopIteration:
             prompt = kwargs["request"]["messages"][-1]["content"]
             admitted = json.loads(prompt.rsplit("\n", 1)[-1])
-            evidence = next(
+            performance = [digest for digest, role in admitted.items()
+                           if role == "performance-study"]
+            category = "performance" if performance else "correctness"
+            evidence = performance[0] if performance else next(
                 digest for digest, role in admitted.items()
-                if role == "host-verification"
-            )
+                if role == "host-verification")
             response = json.dumps({"distillation": {
                 "no_new_knowledge": False,
                 "lessons": [{
-                    "category": "correctness",
-                    "claim": "The submitted source passed the registered host oracle.",
+                    "category": category,
+                    "claim": "The retained study supports this bounded lesson.",
                     "applicability": "The exact registered vector-add dimensions.",
                     "preconditions": "Use the retained source and host contract.",
                     "limitations": "This does not generalize to other shapes.",
@@ -253,7 +260,6 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         DirectCompletionProvider(ENVIRONMENT, transport=transport),
         device=0,
     )
-    proposal = DEFAULT_PROPOSALS[0]
     memory_path = tmp_path / "memory"
     memory_path.mkdir()
     request = LiveProjectRequest(
@@ -277,7 +283,11 @@ def test_executor_binds_direct_model_and_profiling_treatment(
 
     assert memory.host_facts[0].category == "host-verification"
     assert memory.no_new_knowledge is False
-    assert memory.lessons[0].category == "correctness"
+    expected_category = (
+        "performance" if proposal.evidence_preset.value == "correctness-timing"
+        else "correctness"
+    )
+    assert memory.lessons[0].category == expected_category
     assert memory.lessons[0].evidence_artifact_sha256[0] in (
         memory.admitted_artifact_sha256
     )
@@ -286,6 +296,23 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     instruction = provider_calls[0]["request"]["messages"][1]["content"]
     assert ("Profiling guidance:" in instruction) == (guidance is not None)
     assert "previous-project-action" not in memory.actions
+    distillation_messages = provider_calls[-1]["request"]["messages"]
+    prior_messages = provider_calls[-2]["request"]["messages"]
+    assert distillation_messages[:len(prior_messages)] == prior_messages
+    assert distillation_messages[len(prior_messages)]["content"] == '{"submit":{}}'
+    assert json.loads(
+        distillation_messages[len(prior_messages) + 1]["content"]
+    )["host"]["event"] == "submitted"
+    if expected_category == "performance":
+        study = next(
+            digest for digest in memory.admitted_artifact_sha256
+            if digest in distillation_messages[-1]["content"]
+            and memory.lessons[0].evidence_artifact_sha256 == (digest,)
+        )
+        retained = ContentAddressedArtifacts(
+            next(memory_path.glob("provider-attempts/attempt-*/artifacts"))
+        )
+        assert retained.read_json(study)["timing"]
 
 
 def test_project_instruction_uses_registered_runtime_dimensions():

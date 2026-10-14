@@ -156,6 +156,10 @@ def parse_agent_distillation(
                 and not any(admitted_artifacts[digest] == "host-verification"
                             for digest in lesson.evidence_artifact_sha256)):
             raise ValueError("correctness requires host-verification evidence")
+        if (lesson.category == "performance"
+                and not any(admitted_artifacts[digest] == "performance-study"
+                            for digest in lesson.evidence_artifact_sha256)):
+            raise ValueError("performance requires retained performance-study evidence")
         lessons.append(lesson)
     if no_new != (not lessons):
         raise ValueError("no_new_knowledge must be true exactly when lessons are empty")
