@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
 import pytest
 
@@ -129,6 +130,8 @@ def test_executor_materializes_each_generic_family_without_benchmark_adapter(
     assert "bsa" not in prepared.instruction.lower()
     assert "gdm" not in prepared.instruction.lower()
     assert "benchmark" not in prepared.instruction.lower()
+    assert '"accumulator_dtype":"float32"' in prepared.instruction
+    assert f'"output_dtype":"{spec.dtype.value}"' in prepared.instruction
     assert len(prepared.inputs) == len(spec.graph.inputs)
     assert prepared.expected.shape == spec.graph.output_shape
 
@@ -197,6 +200,45 @@ def test_host_mismatch_and_verified_results_retain_exact_observations(tmp_path):
     assert verified.artifacts["observed"]["output"] == list(probe.expected.storage)
     assert verified.artifacts["expected"]["storage"] == list(probe.expected.storage)
     assert verified.artifact_sha256["observed"] != mismatch.artifact_sha256["observed"]
+
+
+@pytest.mark.parametrize(
+    ("bad_value", "retained"),
+    [(math.nan, "NaN"), (math.inf, "+Infinity"), (-math.inf, "-Infinity")],
+)
+def test_non_finite_kernel_output_is_retained_and_classified_as_mismatch(
+    tmp_path, bad_value, retained,
+):
+    spec = _spec("movement")
+    probe = ProjectExecutor(
+        FakeBackend(_compile()), EvidenceLedger(tmp_path / "probe.jsonl")
+    ).prepare(spec)
+    output = list(probe.expected.storage)
+    output[0] = bad_value
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+
+    result = ProjectExecutor(
+        FakeBackend(_compile(), _runtime(output)), ledger
+    ).execute(spec, "candidate")
+
+    assert result.evidence.classification is EvidenceClassification.HOST_MISMATCH
+    assert result.artifacts["observed"]["output"][0] == retained
+    assert result.artifacts["observed"]["output_encoding"] == (
+        "json-number-or-ieee754-symbol"
+    )
+    assert len(ledger.entries) == 4
+
+
+def test_failure_repair_project_is_rejected_until_a_repair_loop_owns_it(tmp_path):
+    mapping = _spec("movement").as_dict()
+    mapping["capabilities"].append("failure-repair")
+    mapping["failure_mode"] = "compile"
+    repair = ProjectSpec.from_mapping(mapping)
+
+    with pytest.raises(NotImplementedError, match="repair-loop coordinator"):
+        ProjectExecutor(
+            FakeBackend(_compile()), EvidenceLedger(tmp_path / "evidence.jsonl")
+        ).prepare(repair)
 
 
 def test_backend_cannot_claim_compile_or_runtime_success_without_evidence(tmp_path):

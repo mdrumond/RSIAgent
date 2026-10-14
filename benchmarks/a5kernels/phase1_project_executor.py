@@ -14,7 +14,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_bytes,
     canonical_digest,
 )
-from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import FailureMode, ProjectSpec
 from benchmarks.a5kernels.phase1_project import (
     ExecutionEvidence,
     HostTensor,
@@ -108,11 +108,10 @@ class RuntimeObservation:
             or any(
                 isinstance(value, bool)
                 or not isinstance(value, (int, float))
-                or not math.isfinite(value)
                 for value in self.output
             )
         ):
-            raise ValueError("runtime output must be a finite numeric tuple")
+            raise ValueError("runtime output must be a numeric tuple")
 
 
 @dataclass(frozen=True)
@@ -173,8 +172,19 @@ def _tensor_payload(tensor: HostTensor) -> dict[str, object]:
     }
 
 
+def _evidence_number(value: float) -> float | str:
+    """Encode IEEE-754 specials without weakening canonical JSON evidence."""
+
+    if math.isnan(value):
+        return "NaN"
+    if math.isinf(value):
+        return "+Infinity" if value > 0 else "-Infinity"
+    return value
+
+
 def _expected_payload(expected: ReferenceOutput) -> dict[str, object]:
     return {
+        "dtype": expected.dtype,
         "shape": list(expected.shape),
         "physical_shape": list(expected.physical_shape),
         "storage": list(expected.storage),
@@ -193,6 +203,11 @@ def _instruction(
         "kernel_abi": abi.as_dict(),
         "inputs_sha256": inputs_sha256,
         "output_shape": list(spec.graph.output_shape),
+        "reference_semantics": {
+            "elementwise_dtype": spec.dtype.value,
+            "accumulator_dtype": "float32",
+            "output_dtype": spec.dtype.value,
+        },
     }
     return (
         f"Implement `@tla.kernel def {abi.signature}` as the complete Catlass DSL "
@@ -214,6 +229,10 @@ class ProjectExecutor:
     def prepare(self, spec: ProjectSpec) -> PreparedProject:
         if not isinstance(spec, ProjectSpec):
             raise TypeError("project must be a validated ProjectSpec")
+        if spec.failure_mode is not FailureMode.NONE:
+            raise NotImplementedError(
+                "failure-repair projects require a repair-loop coordinator"
+            )
         inputs = materialize_inputs(spec)
         expected = evaluate_reference(spec, inputs)
         family = _family(spec)
@@ -260,6 +279,9 @@ class ProjectExecutor:
             if not isinstance(runtime, RuntimeObservation):
                 raise TypeError("backend run must return RuntimeObservation")
         evidence = self._classify(prepared.expected, compilation, runtime)
+        output = None
+        if runtime is not None and runtime.output is not None:
+            output = [_evidence_number(value) for value in runtime.output]
         observed_payload = {
             "compile_passed": compilation.passed,
             "compile_diagnostic": compilation.diagnostic,
@@ -270,7 +292,8 @@ class ProjectExecutor:
             "runtime_evidence_sha256": (
                 None if runtime is None else runtime.evidence_sha256
             ),
-            "output": None if runtime is None or runtime.output is None else list(runtime.output),
+            "output_encoding": "json-number-or-ieee754-symbol",
+            "output": output,
         }
         artifacts: dict[str, Mapping[str, object]] = {
             "inputs": inputs_payload,
