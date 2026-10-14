@@ -93,6 +93,18 @@ from benchmarks.a5kernels.model_profile import (
     complete_a5,
     load_a5_model_profile,
 )
+from benchmarks.a5kernels.fireworks import (
+    FIREWORKS_BASE_MODEL,
+    DatasetIdentity,
+    FireworksCompletion,
+    FireworksHTTPTransport,
+    FireworksInferenceProfile,
+    FireworksManagedSFT,
+    FireworksSFTContract,
+    complete_fireworks,
+    load_fireworks_profile,
+    validate_chat_jsonl,
+)
 from benchmarks.a5kernels.phase1_registry import (
     PHASE1_BRIEF,
     PROJECT_REGISTRY,
@@ -141,6 +153,13 @@ __all__ = [
     "A5Completion",
     "A5ModelProfile",
     "A5RunProvenance",
+    "FIREWORKS_BASE_MODEL",
+    "DatasetIdentity",
+    "FireworksCompletion",
+    "FireworksHTTPTransport",
+    "FireworksInferenceProfile",
+    "FireworksManagedSFT",
+    "FireworksSFTContract",
     "ATTENTION_CASES",
     "ATTENTION_CANDIDATE_FIXTURE",
     "AccessClass",
@@ -243,5 +262,8 @@ __all__ = [
     "validate_contract_source",
     "write_result",
     "complete_a5",
+    "complete_fireworks",
     "load_a5_model_profile",
+    "load_fireworks_profile",
+    "validate_chat_jsonl",
 ]
