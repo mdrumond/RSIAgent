@@ -164,6 +164,32 @@ def test_compile_failure_is_a_real_backend_result_and_never_launches(tmp_path):
         )
 
 
+@pytest.mark.parametrize("passed", [False, True])
+def test_compile_only_returns_exact_evidence_without_running_or_verifying(
+    tmp_path, passed,
+):
+    backend = FakeBackend(_compile(passed=passed), _runtime((1.0,)))
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+
+    result = ProjectExecutor(backend, ledger).compile(
+        _spec("movement"), "compile probe source"
+    )
+
+    assert result.observation.passed is passed
+    assert result.artifact == {
+        "compile_passed": passed,
+        "compile_diagnostic": (
+            "compiled" if passed else "frontend rejected candidate"
+        ),
+        "compile_evidence_sha256": result.observation.evidence_sha256,
+        "compiled_artifact_id": "compiled-object" if passed else None,
+    }
+    assert result.artifact_sha256 == canonical_digest(result.artifact)
+    assert backend.compile_requests[0].candidate_source == "compile probe source"
+    assert backend.run_requests == []
+    assert ledger.entries[-1].payload["event"] == "phase1-project-compile-artifact"
+
+
 def test_runtime_failure_requires_an_actual_runtime_observation(tmp_path):
     backend = FakeBackend(_compile(), _runtime(passed=False))
     result = ProjectExecutor(
@@ -230,16 +256,21 @@ def test_non_finite_kernel_output_is_retained_and_classified_as_mismatch(
     assert len(ledger.entries) == 4
 
 
-def test_failure_repair_project_is_rejected_until_a_repair_loop_owns_it(tmp_path):
+def test_failure_repair_project_materializes_for_the_adapter_repair_loop(tmp_path):
     mapping = _spec("movement").as_dict()
     mapping["capabilities"].append("failure-repair")
     mapping["failure_mode"] = "compile"
     repair = ProjectSpec.from_mapping(mapping)
 
-    with pytest.raises(NotImplementedError, match="repair-loop coordinator"):
-        ProjectExecutor(
-            FakeBackend(_compile()), EvidenceLedger(tmp_path / "evidence.jsonl")
-        ).prepare(repair)
+    backend = FakeBackend(_compile(passed=False))
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+
+    prepared = executor.prepare(repair)
+    result = executor.execute(repair, "intentionally failing candidate")
+
+    assert prepared.spec == repair
+    assert result.prepared == prepared
+    assert result.evidence.classification is EvidenceClassification.COMPILE_FAILURE
 
 
 def test_backend_cannot_claim_compile_or_runtime_success_without_evidence(tmp_path):

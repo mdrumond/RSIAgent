@@ -14,7 +14,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_bytes,
     canonical_digest,
 )
-from benchmarks.a5kernels.phase1_curriculum import FailureMode, ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.a5kernels.phase1_project import (
     ExecutionEvidence,
     HostTensor,
@@ -156,6 +156,16 @@ class ProjectExecutionResult:
     artifact_sha256: Mapping[str, str]
 
 
+@dataclass(frozen=True)
+class ProjectCompileResult:
+    """Compile-only observation that carries no runtime correctness authority."""
+
+    prepared: PreparedProject
+    observation: CompileObservation
+    artifact: Mapping[str, object]
+    artifact_sha256: str
+
+
 def _family(spec: ProjectSpec) -> ProjectExecutionFamily:
     operations = {node.op for node in spec.graph.nodes}
     if ProjectOp.MATMUL in operations:
@@ -232,10 +242,6 @@ class ProjectExecutor:
     def prepare(self, spec: ProjectSpec) -> PreparedProject:
         if not isinstance(spec, ProjectSpec):
             raise TypeError("project must be a validated ProjectSpec")
-        if spec.failure_mode is not FailureMode.NONE:
-            raise NotImplementedError(
-                "failure-repair projects require a repair-loop coordinator"
-            )
         inputs = materialize_inputs(spec)
         expected = evaluate_reference(spec, inputs)
         family = _family(spec)
@@ -255,6 +261,31 @@ class ProjectExecutor:
             inputs,
             expected,
         )
+
+    def compile(self, spec: ProjectSpec, candidate_source: str) -> ProjectCompileResult:
+        """Compile a candidate without launching it or classifying correctness."""
+
+        if not isinstance(candidate_source, str) or not candidate_source.strip():
+            raise ValueError("candidate source must be non-empty")
+        prepared = self.prepare(spec)
+        compilation = self._backend.compile(self._request(prepared, candidate_source))
+        if not isinstance(compilation, CompileObservation):
+            raise TypeError("backend compile must return CompileObservation")
+        artifact = {
+            "compile_passed": compilation.passed,
+            "compile_diagnostic": compilation.diagnostic,
+            "compile_evidence_sha256": compilation.evidence_sha256,
+            "compiled_artifact_id": compilation.artifact_id,
+        }
+        digest = canonical_digest(artifact)
+        self._ledger.append(EvidenceKind.ARTIFACT, {
+            "event": "phase1-project-compile-artifact",
+            "project_id": spec.project_id,
+            "artifact_kind": "compile",
+            "artifact_sha256": digest,
+            "payload": artifact,
+        })
+        return ProjectCompileResult(prepared, compilation, artifact, digest)
 
     def execute(self, spec: ProjectSpec, candidate_source: str) -> ProjectExecutionResult:
         if not isinstance(candidate_source, str) or not candidate_source.strip():
@@ -355,6 +386,7 @@ class ProjectExecutor:
 __all__ = [
     "CompileObservation",
     "PreparedProject",
+    "ProjectCompileResult",
     "ProjectExecutionBackend",
     "ProjectExecutionFamily",
     "ProjectKernelABI",
