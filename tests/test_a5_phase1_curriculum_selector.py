@@ -186,7 +186,7 @@ def test_rejects_repeats_no_information_and_sibling_dependencies():
 
 
 @pytest.mark.parametrize("item", [
-    with_shape(project("new-shape"), [513]),
+    with_shape(project("new-shape"), [1025]),
     project("new-dtype", dtype="float16"),
     project(
         "new-operation", ["simd-vector"],
@@ -234,7 +234,7 @@ def test_missing_or_invalid_graph_is_rejected_without_compatibility_default():
 
 def test_host_private_held_out_signature_is_rejected_without_entering_prompt():
     item = project(
-        "generic-cube", ["cube-tiling"], shape=[64, 64],
+        "generic-cube", ["cube-tiling"], shape=[64, 64, 64],
         graph={
             "inputs": [
                 {"name": "a", "shape": [64, 64]},
@@ -261,7 +261,7 @@ def test_host_private_held_out_signature_is_rejected_without_entering_prompt():
 def test_scripted_multi_wave_proof_grows_coverage_then_saturates():
     replies = iter([
         wave([project()]),
-        wave([with_shape(project("new-shape"), [259])],
+        wave([with_shape(project("new-shape"), [4096])],
              coverage=["gm-ub-movement"], wave_id="wave-002"),
         "DECISION: SATURATED\n" + json.dumps({"reason": "requested coverage achieved"}),
     ])
@@ -290,3 +290,44 @@ def test_scripted_multi_wave_proof_grows_coverage_then_saturates():
         Capability.GM_UB_MOVEMENT,
     )
     assert session.turns == 3
+
+
+def test_terminal_decisions_require_host_observations_and_hide_held_out_names():
+    for reply in (
+        "DECISION: SATURATED\n" + json.dumps({"reason": "looks done"}),
+        "DECISION: STALLED\n" + json.dumps({"reason": "nothing to do"}),
+        "DECISION: SATURATED\n" + json.dumps({"reason": "GDN is covered"}),
+    ):
+        with pytest.raises(ValueError):
+            CurriculumAgent(lambda _, reply=reply: reply).select(context())
+
+
+def test_unverified_prior_can_be_retried_and_does_not_count_as_coverage():
+    item = project()
+    failed = PriorOutcome(
+        "movement", ProjectInformation.from_project(item), False,
+        "candidate failed host verification",
+    )
+    decision, _ = CurriculumAgent(lambda _: wave([item])).select(
+        context(prior_outcomes=(failed,))
+    )
+    assert isinstance(decision, WaveDecision)
+
+
+def test_siblings_need_marginal_semantic_gain_not_exact_shape_variation():
+    first = project("first")
+    second = with_shape(project("second"), [259])
+    with pytest.raises(ValueError, match="marginal"):
+        CurriculumAgent(lambda _: wave([first, second])).select(context())
+
+
+def test_held_out_names_are_rejected_in_graph_identifiers():
+    item = project(graph={
+        "inputs": [{"name": "gdn", "shape": [257]}],
+        "nodes": [{
+            "name": "y", "op": "copy", "operands": ["gdn"], "axis": None,
+        }],
+        "output": "y",
+    })
+    with pytest.raises(ValueError, match="held-out"):
+        CurriculumAgent(lambda _: wave([item])).select(context())

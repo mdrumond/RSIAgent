@@ -32,6 +32,22 @@ _HELD_OUT_WORDS = re.compile(
 )
 
 
+def _shape_class(shape: tuple[int, ...]) -> str:
+    """Map exact extents to reusable rank/scale/alignment information."""
+
+    largest = max(shape)
+    scale = next(
+        label for bound, label in (
+            (64, "tiny"), (256, "small"), (1024, "medium"),
+            (4096, "large"), (16384, "xlarge"),
+        ) if largest <= bound
+    )
+    alignment = "aligned-256" if all(item % 256 == 0 for item in shape) else (
+        "aligned-16" if all(item % 16 == 0 for item in shape) else "tail"
+    )
+    return f"rank-{len(shape)}:{scale}:{alignment}"
+
+
 def _digest(value: object, field: str) -> str:
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise ValueError(f"{field} must be a SHA-256 digest")
@@ -90,7 +106,7 @@ class ProjectInformation:
     def tokens(self) -> frozenset[tuple[str, str]]:
         rows = {
             *(('operation', item.value) for item in self.operations),
-            *(('shape', 'x'.join(map(str, item))) for item in self.shapes),
+            *(('shape-class', _shape_class(item)) for item in self.shapes),
             ('dtype', self.dtype.value),
             ('failure', self.failure_mode.value),
             ('profile', 'none' if self.profile_metric is None else self.profile_metric.value),
@@ -318,11 +334,28 @@ class CurriculumAgent:
         if status != "WAVE":
             if set(value) != {"reason"}:
                 raise ValueError("terminal decision fields must be exactly reason")
-            return TerminalDecision(status, value["reason"])
+            terminal = TerminalDecision(status, value["reason"])
+            if _HELD_OUT_WORDS.search(terminal.reason):
+                raise ValueError("terminal decision exposes a held-out benchmark name")
+            if status == "SATURATED" and not any(
+                item.verified for item in context.prior_outcomes
+            ):
+                raise ValueError("saturation requires host-verified prior evidence")
+            if status == "STALLED" and not context.prior_outcomes:
+                raise ValueError("stall requires an observed prior attempt")
+            return terminal
         wave = WaveSpec.from_mapping(value)
         if any(
             _HELD_OUT_WORDS.search(item.spec.project_id)
             or _HELD_OUT_WORDS.search(item.spec.hypothesis)
+            or any(
+                _HELD_OUT_WORDS.search(name)
+                for name in (
+                    *(graph_input.name for graph_input in item.spec.graph.inputs),
+                    *(node.name for node in item.spec.graph.nodes),
+                    item.spec.graph.output,
+                )
+            )
             for item in wave.projects
         ):
             raise ValueError("wave exposes a held-out benchmark name")
@@ -333,11 +366,14 @@ class CurriculumAgent:
             raise ValueError("wave memory does not match curriculum context")
         if wave.pre_wave_coverage != context.pre_wave_coverage:
             raise ValueError("wave coverage does not match curriculum context")
-        prior_ids = {item.project_id for item in context.prior_outcomes}
-        prior_information = {item.information_sha256 for item in context.prior_outcomes}
+        verified_outcomes = tuple(
+            item for item in context.prior_outcomes if item.verified
+        )
+        prior_ids = {item.project_id for item in verified_outcomes}
+        prior_information = {item.information_sha256 for item in verified_outcomes}
         covered_dimensions = frozenset(
             token
-            for item in context.prior_outcomes
+            for item in verified_outcomes
             for token in item.information.tokens
         )
         information = tuple(
@@ -354,10 +390,14 @@ class CurriculumAgent:
             raise ValueError("wave repeats prior information")
         if self._held_out.intersection(signatures):
             raise ValueError("wave matches a held-out contract or shape")
-        if any(not item.tokens - covered_dimensions for item in information):
-            raise ValueError(
-                "every project must add operation/shape/dtype/failure/profile information"
-            )
+        marginal_coverage = set(covered_dimensions)
+        for item in information:
+            if not item.tokens - marginal_coverage:
+                raise ValueError(
+                    "every project must add marginal operation/shape-class/dtype/"
+                    "failure/profile information"
+                )
+            marginal_coverage.update(item.tokens)
         return WaveDecision(wave)
 
 
