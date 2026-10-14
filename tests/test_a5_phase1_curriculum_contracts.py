@@ -141,17 +141,33 @@ def test_consolidation_is_all_or_nothing_and_authored_sequential():
         "wave-001", MEMORY, (),
         (WaveProject(project("alpha")), WaveProject(project("beta"))),
     )
+    assignments = {item.project_id: item for item in wave.assignments()}
+
+    def outcome(project_id, digest, *, verified=True, fingerprint=None, ordinal=None):
+        assignment = assignments[project_id]
+        return ProjectOutcome(
+            project_id, digest,
+            fingerprint or assignment.wave_fingerprint,
+            ordinal or assignment.authored_ordinal,
+            verified=verified,
+        )
+
     with pytest.raises(ValueError, match="complete wave"):
-        consolidate_wave(wave, (ProjectOutcome("alpha", "1" * 64),))
+        consolidate_wave(wave, (outcome("alpha", "1" * 64),))
     with pytest.raises(ValueError, match="verified"):
         consolidate_wave(wave, (
-            ProjectOutcome("alpha", "1" * 64),
-            ProjectOutcome("beta", "2" * 64, verified=False),
+            outcome("alpha", "1" * 64),
+            outcome("beta", "2" * 64, verified=False),
+        ))
+    with pytest.raises(ValueError, match="current wave assignments"):
+        consolidate_wave(wave, (
+            outcome("alpha", "1" * 64, fingerprint="f" * 64),
+            outcome("beta", "2" * 64),
         ))
 
     metadata = consolidate_wave(wave, (
-        ProjectOutcome("beta", "2" * 64),
-        ProjectOutcome("alpha", "1" * 64),
+        outcome("beta", "2" * 64),
+        outcome("alpha", "1" * 64),
     ))
     assert metadata.pre_wave_memory_sha256 == MEMORY
     assert [item.project_id for item in metadata.commits] == ["alpha", "beta"]
@@ -165,3 +181,10 @@ def test_contract_round_trip_is_deterministic():
     )
     assert WaveSpec.from_mapping(wave.as_dict()) == wave
     assert wave.fingerprint == WaveSpec.from_mapping(wave.as_dict()).fingerprint
+
+
+def test_wave_requires_immutable_project_tuple_and_integer_padding():
+    with pytest.raises(ValueError, match="immutable tuple"):
+        WaveSpec("wave-001", MEMORY, (), [WaveProject(project("alpha"))])
+    with pytest.raises(ValueError, match="registered alignment"):
+        project("invalid", padding_multiple=True)
