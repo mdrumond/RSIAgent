@@ -279,6 +279,8 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(t
         "role": "user",
         "content": json.dumps({"host": {"event": "write"}}),
     }
+    outcome = actor.distill(outcome)
+    assert outcome.tokens == 8
     ledger = EvidenceLedger(tmp_path / "trial/evidence.jsonl")
     artifacts = ContentAddressedArtifacts(tmp_path / "trial/artifacts")
     retained = [entry.payload for entry in ledger.entries
@@ -360,6 +362,7 @@ def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
             '{"host":{"event":"submitted","passed":true}}', terminal=True,
         ),
     )
+    outcome = actor.distill(outcome)
 
     assert outcome.status == "done"
     assert outcome.terminal_response is None
@@ -369,6 +372,60 @@ def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
     assert [entry["role"] for entry in retained][-2:] == [
         "provider-request", "provider-response-failure",
     ]
+
+
+def test_distillation_correction_is_bounded_and_does_not_rerun_actions(tmp_path):
+    calls = []
+    provider = _scripted_provider([
+        '{"submit":{}}',
+        "not-json",
+        _distillation(),
+    ], calls)
+    actor = DirectActorDriver(provider, max_turns=1)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    actions = []
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
+
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=workspace, context=tmp_path / "trial/context",
+        turn_parser=parse_trial_action,
+        action_executor=lambda action: (
+            actions.append(action.kind)
+            or ActionOutcome(
+                '{"host":{"event":"submitted","passed":true}}',
+                terminal=True, admitted_artifacts={ADMITTED: "host-verification"},
+            )
+        ),
+    )
+    learned = actor.distill(outcome)
+
+    assert actions == ["submit"]
+    assert learned.distillation is not None
+    assert len(calls) == 3
+    assert "invalid structured distillation response" in (
+        calls[-1]["request"]["messages"][-1]["content"]
+    )
+
+
+def test_distillation_correction_stops_after_three_invalid_responses():
+    provider = _scripted_provider([
+        '{"submit":{}}', "bad-1", "bad-2", "bad-3",
+    ], [])
+    actor = DirectActorDriver(provider, max_turns=1)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=None, context=None, turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            '{"host":{"event":"submitted","passed":true}}', terminal=True,
+            admitted_artifacts={ADMITTED: "host-verification"},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid structured distillation"):
+        actor.distill(outcome)
 
 
 @pytest.mark.parametrize("response,match,role", [
@@ -381,7 +438,7 @@ def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
 def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match, role):
     # The last case deliberately admits only compile evidence, which cannot
     # establish correctness even when its digest is genuine.
-    provider = _scripted_provider(['{"submit":{}}', response], [])
+    provider = _scripted_provider(['{"submit":{}}', response, response, response], [])
     actor = DirectActorDriver(provider, max_turns=1)
     from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
 

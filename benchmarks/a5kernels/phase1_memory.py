@@ -8,7 +8,7 @@ import json
 import os
 import re
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from .knowledge_agent import Citation
@@ -72,6 +72,9 @@ _LESSON_CATEGORIES = {
     "failure-repair", "correctness", "unknown",
 }
 _CONFIDENCE = {"low", "medium", "high"}
+_MAX_LESSON_TEXT = 2_000
+_MAX_LESSONS = 8
+_MAX_LESSON_EVIDENCE = 8
 
 
 @dataclass(frozen=True)
@@ -95,8 +98,12 @@ class AgentLesson:
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"agent lesson {name} must be non-empty")
+            if len(value) > _MAX_LESSON_TEXT:
+                raise ValueError(f"agent lesson {name} must be at most 2000 characters")
         if type(self.evidence_artifact_sha256) is not tuple or not self.evidence_artifact_sha256:
             raise TypeError("agent lesson evidence must be a non-empty tuple")
+        if len(self.evidence_artifact_sha256) > _MAX_LESSON_EVIDENCE:
+            raise ValueError("agent lesson may cite at most 8 artifacts")
         if any(not isinstance(item, str) or not _SHA256.fullmatch(item)
                for item in self.evidence_artifact_sha256):
             raise ValueError("agent lesson evidence must contain artifact SHA-256 values")
@@ -104,6 +111,8 @@ class AgentLesson:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ValueError(f"agent lesson {name} must be null or non-empty")
+            if value is not None and len(value) > _MAX_LESSON_TEXT:
+                raise ValueError(f"agent lesson {name} must be at most 2000 characters")
         if self.confidence not in _CONFIDENCE:
             raise ValueError("agent lesson confidence is not recognized")
 
@@ -131,7 +140,8 @@ def parse_agent_distillation(
         raise ValueError("invalid structured distillation response")
     no_new = body["no_new_knowledge"]
     raw_lessons = body["lessons"]
-    if type(no_new) is not bool or not isinstance(raw_lessons, list) or len(raw_lessons) > 16:
+    if (type(no_new) is not bool or not isinstance(raw_lessons, list)
+            or len(raw_lessons) > _MAX_LESSONS):
         raise ValueError("invalid structured distillation response")
     fields = {
         "category", "claim", "applicability", "preconditions", "limitations",
@@ -179,6 +189,7 @@ class Phase1ProjectMemory:
     lessons: tuple[AgentLesson, ...] = ()
     no_new_knowledge: bool = True
     admitted_artifact_sha256: tuple[str, ...] = ()
+    artifact_store: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.proposal, CurriculumProposal):
@@ -210,6 +221,16 @@ class Phase1ProjectMemory:
             for item in self.admitted_artifact_sha256
         ):
             raise TypeError("admitted artifacts must be a tuple of SHA-256 values")
+        if self.artifact_store is not None:
+            if not isinstance(self.artifact_store, str) or not self.artifact_store:
+                raise ValueError("artifact_store must be a normalized relative artifact store")
+            store = PurePosixPath(self.artifact_store)
+            if (
+                store.is_absolute()
+                or ".." in store.parts
+                or store.as_posix() != self.artifact_store
+            ):
+                raise ValueError("artifact_store must be a normalized relative artifact store")
         admitted = set(self.admitted_artifact_sha256)
         if any(set(item.evidence_artifact_sha256) - admitted for item in self.lessons):
             raise ValueError("agent lessons may cite only admitted project artifacts")
@@ -248,6 +269,7 @@ class Phase1ProjectMemory:
             } for item in self.lessons],
             "no_new_knowledge": self.no_new_knowledge,
             "admitted_artifact_sha256": list(self.admitted_artifact_sha256),
+            "artifact_store": self.artifact_store,
         }
 
     @classmethod
@@ -256,11 +278,16 @@ class Phase1ProjectMemory:
             "proposal", "source_revision", "actions", "host_facts",
             "agent_interpretations", "kdb_citations",
         }
-        layered = {
+        legacy_layered = {
             "agent_lessons", "no_new_knowledge", "admitted_artifact_sha256",
         }
+        layered = legacy_layered | {"artifact_store"}
+        fields = frozenset(value) if isinstance(value, Mapping) else frozenset()
         if (not isinstance(value, Mapping)
-                or frozenset(value) not in {frozenset(required), frozenset(required | layered)}):
+                or fields not in {
+                    frozenset(required), frozenset(required | legacy_layered),
+                    frozenset(required | layered),
+                }):
             raise ValueError("invalid Phase 1 project memory fields")
         try:
             actions = value["actions"]
@@ -301,6 +328,7 @@ class Phase1ProjectMemory:
                 lessons=lessons,
                 no_new_knowledge=value.get("no_new_knowledge", True),
                 admitted_artifact_sha256=tuple(admitted),
+                artifact_store=value.get("artifact_store"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid Phase 1 project memory payload") from exc

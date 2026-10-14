@@ -49,6 +49,12 @@ _DIRECT_VALUES = {
 }
 
 _PROVIDER_TIMEOUT_SECONDS = 120
+_MAX_DISTILLATION_ATTEMPTS = 3
+_MAX_DISTILLATION_ARTIFACT_BYTES = 64_000
+_MAX_DISTILLATION_SINGLE_ARTIFACT_BYTES = 32_000
+_DISTILLATION_PAYLOAD_ROLES = {
+    "host-verification", "performance-study", "profiling",
+}
 
 DISTILLATION_PROMPT = """The host has now returned the terminal result. Distill only
 reusable knowledge supported by the admitted artifacts below. Respond with exactly
@@ -240,6 +246,31 @@ class _ProviderEvidenceRecorder:
             "role": role, "sha256": digest, **fields,
         })
 
+    def bounded_payloads(self, admitted: Mapping[str, str]) -> dict[str, object]:
+        if not self.enabled:
+            return {}
+        remaining = _MAX_DISTILLATION_ARTIFACT_BYTES
+        payloads = {}
+        for digest, role in sorted(admitted.items()):
+            if role not in _DISTILLATION_PAYLOAD_ROLES:
+                continue
+            try:
+                content = self.artifacts.read_bytes(digest)
+            except (FileNotFoundError, ValueError):
+                payloads[digest] = {"role": role, "retained": False}
+                continue
+            entry = {"role": role, "size_bytes": len(content), "retained": True}
+            if len(content) > _MAX_DISTILLATION_SINGLE_ARTIFACT_BYTES or len(content) > remaining:
+                entry["payload_omitted"] = "bounded-context-limit"
+            else:
+                try:
+                    entry["payload"] = json.loads(content)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    entry["payload"] = content.decode("utf-8", errors="replace")
+                remaining -= len(content)
+            payloads[digest] = entry
+        return payloads
+
 
 @dataclass(frozen=True)
 class _DirectActorContinuation:
@@ -306,6 +337,7 @@ class DirectActorDriver:
         outcome: ActorOutcome,
         *,
         admitted_artifacts: Mapping[str, str] | None = None,
+        host_summaries: Sequence[Mapping[str, object]] = (),
     ) -> ActorOutcome:
         """Resume the exact terminal Actor history after all host work completes."""
 
@@ -317,31 +349,54 @@ class DirectActorDriver:
         if admitted_artifacts is not None:
             admitted.update(admitted_artifacts)
         messages = [dict(item) for item in continuation.messages]
+        context = {
+            "admitted_artifacts": admitted,
+            "artifact_payloads": continuation.recorder.bounded_payloads(admitted),
+            "host_summaries": [dict(item) for item in host_summaries[:16]],
+            "terminal_host_observation": continuation.messages[-1]["content"],
+        }
         messages.append({
             "role": "user",
             "content": DISTILLATION_PROMPT + "\n" + json.dumps(
-                admitted, sort_keys=True, separators=(",", ":")
+                context, sort_keys=True, separators=(",", ":")
             ),
         })
-        continuation.recorder.request(
-            continuation.profile, messages,
-            stage="distillation", turn=outcome.iterations,
-        )
-        completion = self.provider.complete(continuation.profile, messages)
-        continuation.recorder.response(
-            completion.text, stage="distillation", turn=outcome.iterations,
-        )
-        distillation = parse_agent_distillation(completion.text, admitted)
-        return ActorOutcome(
-            outcome.status,
-            outcome.iterations,
-            (outcome.tokens or 0) + completion.completion_tokens,
-            outcome.wall_time_s,
-            completion.text,
-            distillation,
-            admitted,
-            None,
-        )
+        tokens = outcome.tokens or 0
+        for correction in range(_MAX_DISTILLATION_ATTEMPTS):
+            turn = outcome.iterations + correction + 1
+            continuation.recorder.request(
+                continuation.profile, messages, stage="distillation", turn=turn,
+            )
+            try:
+                completion = self.provider.complete(continuation.profile, messages)
+            except InfrastructureFailure as exc:
+                continuation.recorder.failure(
+                    exc, stage="distillation", turn=turn,
+                )
+                return outcome
+            continuation.recorder.response(
+                completion.text, stage="distillation", turn=turn,
+            )
+            tokens += completion.completion_tokens
+            try:
+                distillation = parse_agent_distillation(completion.text, admitted)
+            except ValueError as exc:
+                if correction + 1 == _MAX_DISTILLATION_ATTEMPTS:
+                    raise
+                messages.extend((
+                    {"role": "assistant", "content": completion.text},
+                    {"role": "user", "content": (
+                        "The previous distillation was invalid: " + str(exc) + ". "
+                        "Correct only the structured distillation JSON. Do not propose "
+                        "or rerun kernel actions."
+                    )},
+                ))
+                continue
+            return ActorOutcome(
+                outcome.status, outcome.iterations, tokens, outcome.wall_time_s,
+                completion.text, distillation, admitted, None,
+            )
+        raise AssertionError("bounded distillation loop did not terminate")
 
 
 __all__ = [

@@ -230,7 +230,8 @@ def test_executor_binds_direct_model_and_profiling_treatment(
             response = next(replies)
         except StopIteration:
             prompt = kwargs["request"]["messages"][-1]["content"]
-            admitted = json.loads(prompt.rsplit("\n", 1)[-1])
+            context = json.loads(prompt.rsplit("\n", 1)[-1])
+            admitted = context["admitted_artifacts"]
             performance = [digest for digest, role in admitted.items()
                            if role == "performance-study"]
             category = "performance" if performance else "correctness"
@@ -291,6 +292,8 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert memory.lessons[0].evidence_artifact_sha256[0] in (
         memory.admitted_artifact_sha256
     )
+    assert memory.artifact_store.startswith("provider-attempts/attempt-")
+    assert (memory_path / memory.artifact_store / "objects").is_dir()
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     instruction = provider_calls[0]["request"]["messages"][1]["content"]
@@ -312,7 +315,11 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         retained = ContentAddressedArtifacts(
             next(memory_path.glob("provider-attempts/attempt-*/artifacts"))
         )
-        assert retained.read_json(study)["timing"]
+        study_payload = retained.read_json(study)
+        assert study_payload["timing"]
+        context = json.loads(distillation_messages[-1]["content"].rsplit("\n", 1)[-1])
+        assert context["artifact_payloads"][study]["payload"] == study_payload
+        assert context["host_summaries"][0]["category"] == "host-verification"
 
 
 def test_project_instruction_uses_registered_runtime_dimensions():

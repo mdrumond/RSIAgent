@@ -205,7 +205,9 @@ class ProductionProjectExecutor:
             })
             additional_artifacts[recovery_sha256] = "recovery-evidence"
         learned = self.actor.distill(
-            trial.outcome, admitted_artifacts=additional_artifacts
+            trial.outcome,
+            admitted_artifacts=additional_artifacts,
+            host_summaries=tuple(asdict(fact) for fact in facts),
         )
         distillation = learned.distillation
         if not isinstance(distillation, AgentDistillation):
@@ -226,6 +228,7 @@ class ProductionProjectExecutor:
             lessons=distillation.lessons,
             no_new_knowledge=distillation.no_new_knowledge,
             admitted_artifact_sha256=distillation.admitted_artifact_sha256,
+            artifact_store=trial.artifacts.relative_to(request.memory_path).as_posix(),
         )
 
     def _run_recovery_starter(self, request, runtime, backend, ledger) -> str | None:

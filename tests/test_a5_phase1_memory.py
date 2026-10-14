@@ -330,12 +330,45 @@ def test_structured_lesson_round_trips_with_explicit_no_new_knowledge():
         (HostFact("compile", "compile failed", EVIDENCE),),
         lessons=(lesson,), no_new_knowledge=False,
         admitted_artifact_sha256=(EVIDENCE,),
+        artifact_store="provider-attempts/attempt-01/artifacts",
     )
 
     encoded = project.as_dict()
     assert encoded["no_new_knowledge"] is False
     assert encoded["agent_lessons"][0]["repair"].startswith("Initialize")
+    assert encoded["artifact_store"] == "provider-attempts/attempt-01/artifacts"
     assert Phase1ProjectMemory.from_mapping(encoded) == project
+
+
+@pytest.mark.parametrize("field", [
+    "claim", "applicability", "preconditions", "limitations",
+    "failure_signature", "repair",
+])
+def test_structured_lesson_caps_compact_text_fields(field):
+    values = {
+        "category": "failure-repair",
+        "claim": "bounded claim",
+        "applicability": "bounded applicability",
+        "preconditions": "bounded preconditions",
+        "limitations": "bounded limitations",
+        "evidence_artifact_sha256": (EVIDENCE,),
+        "failure_signature": "bounded signature",
+        "repair": "bounded repair",
+        "confidence": "medium",
+    }
+    values[field] = "x" * 2001
+
+    with pytest.raises(ValueError, match="at most 2000 characters"):
+        AgentLesson(**values)
+
+
+def test_project_memory_rejects_nonrelative_artifact_store():
+    with pytest.raises(ValueError, match="relative artifact store"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", (),
+            (HostFact("compile", "compiled", EVIDENCE),),
+            artifact_store="../other-attempt/artifacts",
+        )
 
 
 def test_no_new_knowledge_is_explicit_and_mutually_exclusive_with_lessons():
