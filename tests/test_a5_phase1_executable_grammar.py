@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
@@ -64,6 +66,29 @@ def test_graph_is_bounded_topological_and_round_trips():
             {"name": f"n{i}", "op": "copy", "operands": ["lhs"], "axis": None}
             for i in range(13)
         ], output="n12")
+
+
+def test_graph_rejects_dead_nodes_and_oversized_inferred_tensors():
+    with pytest.raises(ValueError, match="reachable"):
+        graph(
+            nodes=[
+                {"name": "dead", "op": "copy", "operands": ["lhs"], "axis": None},
+                {"name": "out", "op": "copy", "operands": ["rhs"], "axis": None},
+            ],
+            output="out",
+        )
+
+    with pytest.raises(ValueError, match="65536 logical elements"):
+        ProjectGraph.from_mapping({
+            "inputs": [
+                {"name": "lhs", "shape": [500, 1]},
+                {"name": "rhs", "shape": [1, 4000]},
+            ],
+            "nodes": [
+                {"name": "out", "op": "matmul", "operands": ["lhs", "rhs"], "axis": None},
+            ],
+            "output": "out",
+        })
 
 
 @pytest.mark.parametrize(
@@ -148,6 +173,56 @@ def test_pure_reference_evaluates_vector_mask_reduction_and_cube():
     assert len(result.values) == 4
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [("float16", math.inf), ("bfloat16", 344.0), ("float32", 343.0)],
+)
+def test_reference_evaluates_each_operation_in_the_declared_dtype(dtype, expected):
+    if dtype == "float16":
+        nodes = [
+            {"name": f"n{index}", "op": "multiply", "operands": [
+                "x" if index == 0 else f"n{index - 1}", "x",
+            ], "axis": None}
+            for index in range(6)
+        ]
+        input_shape = [1]
+    else:
+        nodes = [
+            {"name": "square", "op": "multiply", "operands": ["x", "x"], "axis": None},
+            {"name": "cube", "op": "multiply", "operands": ["square", "x"], "axis": None},
+        ]
+        input_shape = [1]
+    typed_graph = ProjectGraph.from_mapping({
+        "inputs": [{"name": "x", "shape": input_shape}],
+        "nodes": nodes,
+        "output": nodes[-1]["name"],
+    })
+    spec = project(
+        typed_graph,
+        shape=input_shape,
+        dtype=dtype,
+        capabilities=["gm-ub-movement", "simd-vector"],
+    )
+    inputs = materialize_inputs(spec)
+    value = 8.0 if dtype == "float16" else 7.0
+    inputs = (type(inputs[0])((1,), (1,), (value,)),)
+    result = evaluate_reference(spec, inputs)
+
+    assert result.dtype == dtype
+    assert result.values == (expected,)
+
+
+def test_dtype_aware_host_comparison_accepts_representable_low_precision_result():
+    expected = evaluate_reference(
+        project(graph(), dtype="bfloat16"),
+        materialize_inputs(project(graph(), dtype="bfloat16")),
+    )
+    perturbed = tuple(value + 0.01 for value in expected.storage)
+    assert classify_execution(
+        expected, compile_succeeded=True, actual=perturbed
+    ).classification is EvidenceClassification.HOST_VERIFIED
+
+
 def test_evidence_never_claims_correctness_without_host_comparison():
     spec = project(graph())
     expected = evaluate_reference(spec, materialize_inputs(spec))
@@ -187,3 +262,51 @@ def test_capability_claims_must_agree_with_executable_operations():
     })
     with pytest.raises(ValueError, match="cube-tiling.*agree"):
         project(cube)
+
+
+def test_project_shape_and_family_must_match_the_executable_graph():
+    with pytest.raises(ValueError, match="project shape"):
+        project(graph(), shape=[2, 4])
+
+    cube = ProjectGraph.from_mapping({
+        "inputs": [{"name": "a", "shape": [2, 3]}, {"name": "b", "shape": [3, 2]}],
+        "nodes": [{"name": "c", "op": "matmul", "operands": ["a", "b"], "axis": None}],
+        "output": "c",
+    })
+    with pytest.raises(ValueError, match="cube project shape"):
+        project(cube, capabilities=["cube-tiling"], shape=[2, 4, 2])
+
+    aligned_graph = ProjectGraph.from_mapping({
+        "inputs": [{"name": "x", "shape": [2, 16]}],
+        "nodes": [{"name": "y", "op": "copy", "operands": ["x"], "axis": None}],
+        "output": "y",
+    })
+    with pytest.raises(ValueError, match="project shape"):
+        project(
+            aligned_graph,
+            capabilities=["gm-ub-movement", "padded-tail"],
+            shape=[2, 15],
+            padding_multiple=16,
+        )
+    with pytest.raises(ValueError, match="padded-tail"):
+        project(
+            aligned_graph,
+            capabilities=["gm-ub-movement", "padded-tail"],
+            shape=[2, 16],
+            padding_multiple=16,
+        )
+
+
+def test_padded_physical_tensors_stay_within_the_transport_bound():
+    large = ProjectGraph.from_mapping({
+        "inputs": [{"name": "x", "shape": [17, 3855]}],
+        "nodes": [{"name": "y", "op": "copy", "operands": ["x"], "axis": None}],
+        "output": "y",
+    })
+    with pytest.raises(ValueError, match="physical tensor"):
+        project(
+            large,
+            capabilities=["gm-ub-movement", "padded-tail"],
+            shape=[17, 3855],
+            padding_multiple=256,
+        )
