@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
 from .knowledge_agent import Citation
+from .phase1_curriculum import ProjectSpec
 from .phase1_registry import (
     CHECKPOINTS,
     CurriculumProposal,
@@ -180,7 +181,7 @@ def parse_agent_distillation(
 class Phase1ProjectMemory:
     """One completed project's durable, evidence-labelled learning payload."""
 
-    proposal: CurriculumProposal
+    proposal: CurriculumProposal | ProjectSpec
     source_revision: str
     actions: tuple[str, ...]
     host_facts: tuple[HostFact, ...]
@@ -192,8 +193,8 @@ class Phase1ProjectMemory:
     artifact_store: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.proposal, CurriculumProposal):
-            raise TypeError("proposal must be a CurriculumProposal")
+        if not isinstance(self.proposal, (CurriculumProposal, ProjectSpec)):
+            raise TypeError("project identity must be a CurriculumProposal or ProjectSpec")
         if not isinstance(self.source_revision, str) or not self.source_revision.strip():
             raise ValueError("source_revision must be non-empty")
         if type(self.host_facts) is not tuple:
@@ -255,13 +256,42 @@ class Phase1ProjectMemory:
         if any(set(item.supports) - evidence for item in self.interpretations):
             raise ValueError("interpretations may cite only this project's host evidence")
 
+    @property
+    def project_identity(self) -> CurriculumProposal | ProjectSpec:
+        """Return the exact legacy proposal or adaptive executable project."""
+
+        return self.proposal
+
+    @property
+    def legacy_proposal(self) -> CurriculumProposal | None:
+        """Expose the old identity without manufacturing one for adaptive projects."""
+
+        if isinstance(self.proposal, CurriculumProposal):
+            return self.proposal
+        return None
+
+    @property
+    def project_spec(self) -> ProjectSpec | None:
+        """Expose the executable identity when this is an adaptive project."""
+
+        if isinstance(self.proposal, ProjectSpec):
+            return self.proposal
+        return None
+
     def as_dict(self) -> dict[str, object]:
+        identity = (
+            {"proposal": self.proposal.as_dict()}
+            if isinstance(self.proposal, CurriculumProposal)
+            else {"project_spec": self.proposal.as_dict()}
+        )
         return {
-            "proposal": self.proposal.as_dict(),
+            **identity,
             "source_revision": self.source_revision,
             "actions": list(self.actions),
             "host_facts": [asdict(item) for item in self.host_facts],
-            "agent_interpretations": [asdict(item) for item in self.interpretations],
+            "agent_interpretations": [{
+                **asdict(item), "supports": list(item.supports),
+            } for item in self.interpretations],
             "kdb_citations": [asdict(item) for item in self.kdb_citations],
             "agent_lessons": [{
                 **asdict(item),
@@ -274,20 +304,21 @@ class Phase1ProjectMemory:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "Phase1ProjectMemory":
-        required = {
-            "proposal", "source_revision", "actions", "host_facts",
+        common = {
+            "source_revision", "actions", "host_facts",
             "agent_interpretations", "kdb_citations",
         }
         legacy_layered = {
             "agent_lessons", "no_new_knowledge", "admitted_artifact_sha256",
         }
         layered = legacy_layered | {"artifact_store"}
-        fields = frozenset(value) if isinstance(value, Mapping) else frozenset()
-        if (not isinstance(value, Mapping)
-                or fields not in {
-                    frozenset(required), frozenset(required | legacy_layered),
-                    frozenset(required | layered),
-                }):
+        identities = ({"proposal"}, {"project_spec"})
+        valid_fields = {
+            frozenset(common | identity | optional)
+            for identity in identities
+            for optional in (set(), legacy_layered, layered)
+        }
+        if not isinstance(value, Mapping) or frozenset(value) not in valid_fields:
             raise ValueError("invalid Phase 1 project memory fields")
         try:
             actions = value["actions"]
@@ -312,8 +343,13 @@ class Phase1ProjectMemory:
             lessons = tuple(AgentLesson(**{
                 **item, "evidence_artifact_sha256": tuple(item["evidence_artifact_sha256"]),
             }) for item in raw_lessons)
+            project = (
+                CurriculumProposal.from_mapping(value["proposal"])
+                if "proposal" in value
+                else ProjectSpec.from_mapping(value["project_spec"])
+            )
             return cls(
-                proposal=CurriculumProposal.from_mapping(value["proposal"]),
+                proposal=project,
                 source_revision=value["source_revision"],
                 actions=tuple(actions),
                 host_facts=tuple(HostFact(**item) for item in facts),
