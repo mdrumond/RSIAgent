@@ -16,6 +16,8 @@ from benchmarks.a5kernels.phase1_curriculum import (
     WaveSpec,
 )
 from benchmarks.a5kernels.phase1_project import (
+    EvidenceClassification,
+    ExecutionEvidence,
     ProjectGraph,
     evaluate_reference,
     materialize_inputs,
@@ -27,6 +29,18 @@ from benchmarks.a5kernels.phase1_wave_runtime import (
 
 
 MEMORY = b"immutable pre-wave memory"
+
+
+def wave_result(delta: bytes, verified: bool = True) -> WaveProjectResult:
+    classification = (
+        EvidenceClassification.HOST_VERIFIED
+        if verified else EvidenceClassification.HOST_MISMATCH
+    )
+    return WaveProjectResult(
+        delta,
+        ExecutionEvidence(classification, "host-owned test observation"),
+        b'{"synchronized":true}',
+    )
 
 
 def graph(operation: str = "copy") -> ProjectGraph:
@@ -97,10 +111,7 @@ def test_siblings_run_concurrently_from_identical_memory_and_publish_in_authored
         with lock:
             active -= 1
             completion_order.append(request.assignment.project_id)
-        return WaveProjectResult(
-            memory_delta=f"lesson:{request.assignment.project_id}".encode(),
-            verified=True,
-        )
+        return wave_result(f"lesson:{request.assignment.project_id}".encode())
 
     coordinator = LiveWaveCoordinator(
         tmp_path, wave("first", "second", "third"), MEMORY, execute,
@@ -119,6 +130,9 @@ def test_siblings_run_concurrently_from_identical_memory_and_publish_in_authored
     assert [item["project_id"] for item in published["commits"]] == [
         "first", "second", "third",
     ]
+    memory = coordinator.read_published_memory()
+    assert hashlib.sha256(memory).hexdigest() == published["consolidated_memory_sha256"]
+    assert json.loads(memory)["deltas"][0]["project_id"] == "first"
 
 
 def test_sibling_graphs_receive_isolated_host_owned_inputs_and_oracles(tmp_path):
@@ -139,7 +153,7 @@ def test_sibling_graphs_receive_isolated_host_owned_inputs_and_oracles(tmp_path)
             observed[request.assignment.project_id] = (
                 request.inputs, request.oracle, expected_inputs, expected_oracle,
             )
-        return WaveProjectResult(request.assignment.project_id.encode(), True)
+        return wave_result(request.assignment.project_id.encode())
 
     LiveWaveCoordinator(tmp_path, spec, MEMORY, execute, 2).run()
 
@@ -153,9 +167,9 @@ def test_sibling_graphs_receive_isolated_host_owned_inputs_and_oracles(tmp_path)
 
 def test_failure_retains_isolated_success_but_publishes_nothing(tmp_path):
     def execute(request):
-        return WaveProjectResult(
-            memory_delta=request.assignment.project_id.encode(),
-            verified=request.assignment.project_id != "bad",
+        return wave_result(
+            request.assignment.project_id.encode(),
+            request.assignment.project_id != "bad",
         )
 
     coordinator = LiveWaveCoordinator(
@@ -177,7 +191,7 @@ def test_executor_exception_waits_for_and_retains_successful_sibling(tmp_path):
             raise OSError("provider disconnected")
         time.sleep(0.02)
         sibling_finished.set()
-        return WaveProjectResult(b"retained", True)
+        return wave_result(b"retained")
 
     with pytest.raises(RuntimeError, match="broken"):
         LiveWaveCoordinator(
@@ -194,9 +208,9 @@ def test_resume_reuses_verified_branches_and_retries_failed_branch(tmp_path):
 
     def first_attempt(request):
         calls.append(request.assignment.project_id)
-        return WaveProjectResult(
-            memory_delta=request.assignment.project_id.encode(),
-            verified=request.assignment.project_id != "retry",
+        return wave_result(
+            request.assignment.project_id.encode(),
+            request.assignment.project_id != "retry",
         )
 
     spec = wave("done", "retry", "also-done")
@@ -210,7 +224,7 @@ def test_resume_reuses_verified_branches_and_retries_failed_branch(tmp_path):
 
     def second_attempt(request):
         resumed.append(request.assignment.project_id)
-        return WaveProjectResult(memory_delta=b"fixed", verified=True)
+        return wave_result(b"fixed")
 
     result = LiveWaveCoordinator(
         tmp_path, spec, MEMORY, second_attempt, max_parallel=1,
@@ -229,7 +243,7 @@ def test_plan_and_memory_identity_must_match_on_resume(tmp_path):
     spec = wave("only")
     runner = LiveWaveCoordinator(
         tmp_path, spec, MEMORY,
-        lambda _: WaveProjectResult(b"lesson", True),
+        lambda _: wave_result(b"lesson"),
         max_parallel=1,
     )
     runner.run()
@@ -241,5 +255,35 @@ def test_plan_and_memory_identity_must_match_on_resume(tmp_path):
     )
     with pytest.raises(ValueError, match="plan"):
         LiveWaveCoordinator(
-            tmp_path, changed, MEMORY, lambda _: WaveProjectResult(b"x", True), 1,
+            tmp_path, changed, MEMORY, lambda _: wave_result(b"x"), 1,
         ).resume()
+
+
+def test_interrupted_retry_invalidates_stale_outcome_and_remains_resumable(
+    tmp_path, monkeypatch,
+):
+    spec = wave("retry")
+    with pytest.raises(RuntimeError, match="not verified"):
+        LiveWaveCoordinator(
+            tmp_path, spec, MEMORY, lambda _: wave_result(b"bad", False), 1,
+        ).run()
+
+    interrupted = LiveWaveCoordinator(
+        tmp_path, spec, MEMORY, lambda _: wave_result(b"partial"), 1,
+    )
+    original = interrupted._atomic_bytes
+
+    def fail_after_delta(path, value):
+        if path.name == "execution-evidence.bin":
+            raise OSError("simulated interruption")
+        original(path, value)
+
+    monkeypatch.setattr(interrupted, "_atomic_bytes", fail_after_delta)
+    with pytest.raises(RuntimeError, match="failed before verification"):
+        interrupted.resume()
+    assert not (tmp_path / "branches/retry/outcome.json").exists()
+
+    resumed = LiveWaveCoordinator(
+        tmp_path, spec, MEMORY, lambda _: wave_result(b"fixed"), 1,
+    ).resume()
+    assert resumed.commits[0].project_id == "retry"

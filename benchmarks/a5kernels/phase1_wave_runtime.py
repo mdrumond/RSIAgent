@@ -20,6 +20,7 @@ from benchmarks.a5kernels.phase1_curriculum import (
     consolidate_wave,
 )
 from benchmarks.a5kernels.phase1_project import (
+    ExecutionEvidence,
     HostTensor,
     ReferenceOutput,
     evaluate_reference,
@@ -48,13 +49,20 @@ class WaveProjectResult:
     """Host-verifiable output returned by a project executor."""
 
     memory_delta: bytes
-    verified: bool
+    evidence: ExecutionEvidence
+    evidence_payload: bytes
 
     def __post_init__(self) -> None:
         if not isinstance(self.memory_delta, bytes):
             raise TypeError("memory_delta must be immutable bytes")
-        if type(self.verified) is not bool:
-            raise TypeError("verified must be boolean")
+        if not isinstance(self.evidence, ExecutionEvidence):
+            raise TypeError("evidence must be a host execution classification")
+        if not isinstance(self.evidence_payload, bytes) or not self.evidence_payload:
+            raise TypeError("evidence_payload must be non-empty immutable bytes")
+
+    @property
+    def verified(self) -> bool:
+        return self.evidence.verified
 
 
 WaveProjectExecutor = Callable[[WaveProjectRequest], WaveProjectResult]
@@ -150,7 +158,12 @@ class LiveWaveCoordinator:
         if not isinstance(result, WaveProjectResult):
             raise TypeError("project executor must return WaveProjectResult")
         delta_sha256 = hashlib.sha256(result.memory_delta).hexdigest()
+        evidence_sha256 = hashlib.sha256(result.evidence_payload).hexdigest()
+        # Invalidate the previous generation first.  A crash after this point is
+        # an unfinished retry, not a mismatched old outcome/new delta pair.
+        (branch_root / "outcome.json").unlink(missing_ok=True)
         self._atomic_bytes(branch_root / "memory-delta.bin", result.memory_delta)
+        self._atomic_bytes(branch_root / "execution-evidence.bin", result.evidence_payload)
         body = {
             "schema": OUTCOME_SCHEMA,
             "wave_fingerprint": self.wave.fingerprint,
@@ -158,10 +171,18 @@ class LiveWaveCoordinator:
             "authored_ordinal": assignment.authored_ordinal,
             "pre_wave_memory_sha256": assignment.pre_wave_memory_sha256,
             "memory_delta_sha256": delta_sha256,
+            "evidence_sha256": evidence_sha256,
+            "classification": result.evidence.classification.value,
             "verified": result.verified,
         }
         self._atomic_json(branch_root / "outcome.json", body)
-        return ProjectOutcome(assignment.project_id, delta_sha256, result.verified)
+        return ProjectOutcome(
+            assignment.project_id,
+            delta_sha256,
+            assignment.wave_fingerprint,
+            assignment.authored_ordinal,
+            result.verified,
+        )
 
     def _load_outcome(self, assignment: ProjectAssignment) -> ProjectOutcome | None:
         branch_root = self.root / "branches" / assignment.project_id
@@ -171,7 +192,8 @@ class LiveWaveCoordinator:
         value = self._read_json(path)
         expected = {
             "schema", "wave_fingerprint", "project_id", "authored_ordinal",
-            "pre_wave_memory_sha256", "memory_delta_sha256", "verified",
+            "pre_wave_memory_sha256", "memory_delta_sha256", "evidence_sha256",
+            "classification", "verified",
         }
         if set(value) != expected or any((
             value["schema"] != OUTCOME_SCHEMA,
@@ -188,9 +210,20 @@ class LiveWaveCoordinator:
             raise ValueError("retained branch memory delta is unavailable") from exc
         if delta_sha256 != value["memory_delta_sha256"]:
             raise ValueError("retained branch memory delta does not match outcome")
+        evidence_path = branch_root / "execution-evidence.bin"
+        try:
+            evidence_sha256 = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise ValueError("retained execution evidence is unavailable") from exc
+        if evidence_sha256 != value["evidence_sha256"]:
+            raise ValueError("retained execution evidence does not match outcome")
+        if value["verified"] != (value["classification"] == "host-verified"):
+            raise ValueError("retained verification is not derived from classification")
         return ProjectOutcome(
             assignment.project_id,
             value["memory_delta_sha256"],
+            assignment.wave_fingerprint,
+            assignment.authored_ordinal,
             value["verified"],
         )
 
@@ -209,11 +242,27 @@ class LiveWaveCoordinator:
         self._atomic_json(path, expected)
 
     def _publish(self, consolidation: WaveConsolidation) -> None:
+        memory = canonical_bytes({
+            "schema": "a5-phase1-consolidated-memory-v1",
+            "pre_wave_memory_sha256": self.wave.pre_wave_memory_sha256,
+            "deltas": [
+                {
+                    "project_id": commit.project_id,
+                    "memory_delta_hex": (
+                        self.root / "branches" / commit.project_id / "memory-delta.bin"
+                    ).read_bytes().hex(),
+                }
+                for commit in consolidation.commits
+            ],
+        }) + b"\n"
+        memory_sha256 = hashlib.sha256(memory).hexdigest()
+        self._atomic_bytes(self.root / "consolidated-memory.json", memory)
         value = {
             "schema": PUBLICATION_SCHEMA,
             "wave_id": consolidation.wave_id,
             "wave_fingerprint": self.wave.fingerprint,
             "pre_wave_memory_sha256": consolidation.pre_wave_memory_sha256,
+            "consolidated_memory_sha256": memory_sha256,
             "commits": [
                 {
                     "project_id": item.project_id,
@@ -235,6 +284,7 @@ class LiveWaveCoordinator:
             set(value) != {
                 "schema", "wave_id", "wave_fingerprint",
                 "pre_wave_memory_sha256", "commits",
+                "consolidated_memory_sha256",
             }
             or value["schema"] != PUBLICATION_SCHEMA
             or value["wave_id"] != self.wave.wave_id
@@ -257,7 +307,20 @@ class LiveWaveCoordinator:
         )
         if loaded != expected:
             raise ValueError("published wave does not match retained branch outcomes")
+        try:
+            memory = (self.root / "consolidated-memory.json").read_bytes()
+        except OSError as exc:
+            raise ValueError("published consolidated memory is unavailable") from exc
+        if hashlib.sha256(memory).hexdigest() != value["consolidated_memory_sha256"]:
+            raise ValueError("published consolidated memory does not match publication")
         return loaded
+
+    def read_published_memory(self) -> bytes:
+        """Return the exact next-wave memory snapshot after verified publication."""
+
+        if self._load_publication() is None:
+            raise ValueError("wave has not been published")
+        return (self.root / "consolidated-memory.json").read_bytes()
 
     @staticmethod
     def _read_json(path: Path) -> dict[str, object]:
