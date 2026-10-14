@@ -44,6 +44,7 @@ class Phase2AttemptRequest:
 
 SourceProvider = Callable[[Phase2AttemptRequest], str]
 TargetVerifier = Callable[[str, str, str, Path], AttentionTargetEvidence]
+TraceSink = Callable[[Phase2AttemptRequest, str, AttentionTargetEvidence], None]
 
 
 @dataclass(frozen=True)
@@ -53,12 +54,15 @@ class Phase2Dependencies:
     cell: A5Phase2Cell
     source: SourceProvider
     verify: TargetVerifier
+    trace: TraceSink | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.cell, A5Phase2Cell):
             raise TypeError("Phase 2 dependencies require an A5Phase2Cell")
         if not callable(self.source) or not callable(self.verify):
             raise TypeError("Phase 2 source and verifier must be callable")
+        if self.trace is not None and not callable(self.trace):
+            raise TypeError("Phase 2 trace sink must be callable")
 
 
 def _publish_exact(path: Path, value: bytes) -> None:
@@ -235,6 +239,8 @@ class Phase2LiveRunner:
             _publish_exact(evidence_path, canonical_bytes(asdict(evidence)) + b"\n")
             evidence = AttentionTargetEvidence.read(evidence_path)
         self._validate_evidence(evidence, source, request)
+        if self.dependencies.trace is not None:
+            self.dependencies.trace(request, source, evidence)
         return evidence
 
     @staticmethod

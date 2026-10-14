@@ -282,11 +282,21 @@ class _DirectActorContinuation:
 class DirectActorDriver:
     """Run the existing restricted A5 action protocol over one direct profile."""
 
-    def __init__(self, provider: DirectCompletionProvider, *, max_turns: int = 40):
+    def __init__(
+        self, provider: DirectCompletionProvider, *, max_turns: int = 40,
+        trace_event: Callable[[str, Mapping[str, object]], None] | None = None,
+    ):
         if type(max_turns) is not int or not 1 <= max_turns <= 40:
             raise ValueError("max_turns must be in [1, 40]")
         self.provider = provider
         self.max_turns = max_turns
+        if trace_event is not None and not callable(trace_event):
+            raise TypeError("trace_event must be callable")
+        self.trace_event = trace_event
+
+    def _trace(self, kind: str, payload: Mapping[str, object]) -> None:
+        if self.trace_event is not None:
+            self.trace_event(kind, dict(payload))
 
     def __call__(
         self,
@@ -304,6 +314,8 @@ class DirectActorDriver:
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
         ]
+        for message in messages:
+            self._trace("message", message)
         tokens = 0
         for turn in range(1, self.max_turns + 1):
             recorder.request(profile, messages, stage="action", turn=turn)
@@ -311,6 +323,7 @@ class DirectActorDriver:
             recorder.response(completion.text, stage="action", turn=turn)
             tokens += completion.completion_tokens
             messages.append({"role": "assistant", "content": completion.text})
+            self._trace("message", messages[-1])
             action = turn_parser(completion.text)
             if action is None:
                 observation = json.dumps({
@@ -320,8 +333,27 @@ class DirectActorDriver:
             else:
                 outcome = action_executor(action)
                 observation = outcome.observation
+                try:
+                    host = json.loads(observation).get("host", {})
+                except (AttributeError, json.JSONDecodeError):
+                    host = {}
+                failed = (
+                    host.get("passed") is False
+                    or host.get("status") in {"failed", "error"}
+                    or "fail" in str(host.get("event", "")).lower()
+                )
+                self._trace("tool", {
+                    "name": action.kind,
+                    "status": "failed" if failed else "observed",
+                    "observation": observation,
+                })
                 if outcome.terminal:
                     messages.append({"role": "user", "content": observation})
+                    self._trace("message", messages[-1])
+                    self._trace("terminal", {
+                        "status": outcome.status,
+                        "admitted_artifacts": dict(outcome.admitted_artifacts),
+                    })
                     return ActorOutcome(
                         outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
@@ -330,6 +362,8 @@ class DirectActorDriver:
                         ),
                     )
             messages.append({"role": "user", "content": observation})
+            self._trace("message", messages[-1])
+        self._trace("terminal", {"status": "turn-budget-exhausted"})
         return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
 
     def distill(
@@ -361,6 +395,7 @@ class DirectActorDriver:
                 context, sort_keys=True, separators=(",", ":")
             ),
         })
+        self._trace("message", messages[-1])
         tokens = outcome.tokens or 0
         for correction in range(_MAX_DISTILLATION_ATTEMPTS):
             turn = outcome.iterations + correction + 1
@@ -377,6 +412,7 @@ class DirectActorDriver:
             continuation.recorder.response(
                 completion.text, stage="distillation", turn=turn,
             )
+            self._trace("message", {"role": "assistant", "content": completion.text})
             tokens += completion.completion_tokens
             try:
                 distillation = parse_agent_distillation(completion.text, admitted)

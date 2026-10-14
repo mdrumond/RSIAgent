@@ -293,6 +293,17 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         memory.admitted_artifact_sha256
     )
     assert memory.artifact_store.startswith("provider-attempts/attempt-")
+    traces = list((memory_path / "sft-traces").glob("*.jsonl"))
+    assert len(traces) == 1
+    trace_rows = [json.loads(line) for line in traces[0].read_text().splitlines()]
+    trace_messages = [row["payload"] for row in trace_rows if row["kind"] == "message"]
+    assert trace_messages[-2]["role"] == "user"
+    assert "verified candidate" in trace_messages[-2]["content"]
+    assert trace_messages[-1] == {"role": "assistant", "content": SOURCE}
+    assert any(row["kind"] == "tool" for row in trace_rows)
+    assert trace_rows[-2]["kind"] == "validation"
+    assert trace_rows[-2]["payload"]["status"] == "passed"
+    assert trace_rows[-2]["payload"]["evidence_sha256"] == memory.host_facts[0].evidence_sha256
     assert (memory_path / memory.artifact_store / "objects").is_dir()
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}

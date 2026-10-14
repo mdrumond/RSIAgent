@@ -50,6 +50,7 @@ from benchmarks.a5kernels.phase1_runtime import (
     Phase1ProjectRuntime,
     RecoveryEvidence,
 )
+from benchmarks.a5kernels.sft_dataset import SourceManifest, TraceRecorder
 from benchmarks.a5kernels.production import (
     ProductionPaths,
     _probe_knowledge_query,
@@ -122,8 +123,11 @@ class ProductionProjectExecutor:
     def __init__(self, execution_backend, profile_backend, provider, *, device: int):
         self.execution_backend = execution_backend
         self.profile_backend = profile_backend
-        self.actor = DirectActorDriver(provider)
+        self.provider = provider
         self.device = device
+        self.source_manifest = SourceManifest.load(
+            Path(__file__).parents[2] / "config/a5/sft-source-manifest.json"
+        )
 
     def __call__(
         self,
@@ -133,6 +137,11 @@ class ProductionProjectExecutor:
         profiling_guidance: str | None,
         ledger: EvidenceLedger,
     ) -> Phase1ProjectMemory:
+        trace_events: list[tuple[str, Mapping[str, object]]] = []
+        actor = DirectActorDriver(
+            self.provider,
+            trace_event=lambda kind, payload: trace_events.append((kind, payload)),
+        )
         project_entry_start = len(ledger.entries)
         backend = runtime.backend(self.execution_backend, device=self.device)
         recovery = self._run_recovery_starter(request, runtime, backend, ledger)
@@ -161,7 +170,7 @@ class ProductionProjectExecutor:
             instruction=instruction,
             profile=direct_profile(request.cell.model),
             backend=backend,
-            actor=self.actor,
+            actor=actor,
             knowledge=knowledge,
             profiling=profiling,
             profiling_guidance=profiling_guidance is not None,
@@ -204,7 +213,7 @@ class ProductionProjectExecutor:
                 "role": "recovery-evidence", "sha256": recovery_sha256,
             })
             additional_artifacts[recovery_sha256] = "recovery-evidence"
-        learned = self.actor.distill(
+        learned = actor.distill(
             trial.outcome,
             admitted_artifacts=additional_artifacts,
             host_summaries=tuple(asdict(fact) for fact in facts),
@@ -219,6 +228,8 @@ class ProductionProjectExecutor:
         ledger.append(EvidenceKind.ARTIFACT, {
             "role": "agent-distillation", "sha256": response_sha256,
         })
+        self._retain_sft_trace(request, trial, source.decode("utf-8"), trace_events)
+        trace_events.clear()
         return Phase1ProjectMemory(
             request.proposal,
             source_revision=hashlib.sha256(source).hexdigest(),
@@ -230,6 +241,42 @@ class ProductionProjectExecutor:
             admitted_artifact_sha256=distillation.admitted_artifact_sha256,
             artifact_store=trial.artifacts.relative_to(request.memory_path).as_posix(),
         )
+
+    def _retain_sft_trace(self, request, trial, source, events) -> None:
+        trace_id = (
+            f"p1-{request.cell.cell_id[:32]}-p{request.ordinal}-"
+            f"{trial.verified.evidence_sha256[:12]}"
+        )
+        recorder = TraceRecorder(
+            request.memory_path / "sft-traces" / f"{trace_id}.jsonl",
+            trace_id=trace_id,
+            phase="phase1",
+            round_id=f"p1-{request.qualification_sha256[:16]}",
+            operator_family=request.proposal.family.value,
+            model=request.cell.model.profile_id,
+            source_manifest_sha256=self.source_manifest.sha256,
+        )
+        for kind, payload in events:
+            if kind == "terminal":
+                break
+            if kind == "message":
+                recorder.message(str(payload["role"]), str(payload["content"]))
+            elif kind == "tool":
+                recorder.tool_event(str(payload["name"]), payload)
+        recorder.message(
+            "user",
+            "Return the exact host-verified candidate source as the supervised answer.",
+        )
+        recorder.message("assistant", source)
+        recorder.candidate(source, candidate_id=trace_id)
+        recorder.validation(
+            candidate_id=trace_id,
+            validator="bz-a5-phase1-host-verification",
+            status="passed",
+            evidence_sha256=trial.verified.evidence_sha256,
+            candidate_sha256=trial.run.candidate_source_sha256,
+        )
+        recorder.finish()
 
     def _run_recovery_starter(self, request, runtime, backend, ledger) -> str | None:
         recovery = runtime.recovery
