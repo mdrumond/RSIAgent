@@ -111,7 +111,9 @@ class ProjectSpec:
             raise ValueError("dtype must be registered")
         if type(self.block_count) is not int or not 1 <= self.block_count <= 32:
             raise ValueError("block_count must be in [1, 32]")
-        if self.padding_multiple not in {1, 16, 32, 64, 128, 256}:
+        if type(self.padding_multiple) is not int or self.padding_multiple not in {
+            1, 16, 32, 64, 128, 256,
+        }:
             raise ValueError("padding_multiple must be a registered alignment")
         if not isinstance(self.failure_mode, FailureMode):
             raise ValueError("failure mode must be registered")
@@ -275,6 +277,7 @@ class ProjectAssignment:
     project_id: str
     authored_ordinal: int
     pre_wave_memory_sha256: str
+    wave_fingerprint: str
     spec: ProjectSpec
 
 
@@ -298,10 +301,10 @@ class WaveSpec:
             not isinstance(item, Capability) for item in self.pre_wave_coverage
         ) or len(set(self.pre_wave_coverage)) != len(self.pre_wave_coverage):
             raise ValueError("pre-wave coverage must contain unique capabilities")
-        if not self.projects or any(
+        if type(self.projects) is not tuple or not self.projects or any(
             not isinstance(item, WaveProject) for item in self.projects
         ):
-            raise ValueError("wave must contain authored projects")
+            raise ValueError("wave must contain an immutable tuple of authored projects")
         ids = tuple(item.spec.project_id for item in self.projects)
         if len(set(ids)) != len(ids):
             raise ValueError("project IDs must be unique within a wave")
@@ -321,7 +324,8 @@ class WaveSpec:
     def assignments(self) -> tuple[ProjectAssignment, ...]:
         return tuple(
             ProjectAssignment(
-                item.spec.project_id, ordinal, self.pre_wave_memory_sha256, item.spec
+                item.spec.project_id, ordinal, self.pre_wave_memory_sha256,
+                self.fingerprint, item.spec,
             )
             for ordinal, item in enumerate(self.projects, 1)
         )
@@ -384,7 +388,9 @@ class WaveSpec:
 class ProjectOutcome:
     project_id: str
     memory_delta_sha256: str
-    verified: bool = True
+    wave_fingerprint: str
+    authored_ordinal: int
+    verified: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.project_id, str) or not _ID.fullmatch(self.project_id):
@@ -393,6 +399,12 @@ class ProjectOutcome:
             self.memory_delta_sha256
         ):
             raise ValueError("memory delta identity must be a SHA-256 digest")
+        if not isinstance(self.wave_fingerprint, str) or not _SHA256.fullmatch(
+            self.wave_fingerprint
+        ):
+            raise ValueError("outcome wave fingerprint must be a SHA-256 digest")
+        if type(self.authored_ordinal) is not int or self.authored_ordinal < 1:
+            raise ValueError("outcome authored ordinal must be a positive integer")
         if type(self.verified) is not bool:
             raise ValueError("verified must be boolean")
 
@@ -429,6 +441,13 @@ def consolidate_wave(
     ):
         raise ValueError("memory publication requires a complete wave")
     by_id = {item.project_id: item for item in rows}
+    assignments = {item.project_id: item for item in wave.assignments()}
+    if any(
+        by_id[project_id].wave_fingerprint != assignments[project_id].wave_fingerprint
+        or by_id[project_id].authored_ordinal != assignments[project_id].authored_ordinal
+        for project_id in expected
+    ):
+        raise ValueError("project outcomes must match the current wave assignments")
     if any(not by_id[project_id].verified for project_id in expected):
         raise ValueError("every project must be verified before memory publication")
     commits = tuple(
