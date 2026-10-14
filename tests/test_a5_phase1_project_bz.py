@@ -92,6 +92,10 @@ def test_bundle_is_deterministic_but_independent_backends_use_fresh_sessions(
     assert one.argv[:2] == two.argv[:2]
     assert one.argv[3:] == two.argv[3:]
     assert one.argv[2] != two.argv[2]
+    assert len(one.argv[2]) <= 63
+    assert len(two.argv[2]) <= 63
+    assert len(one.argv[2].rsplit("-", 2)[-2]) == 16
+    assert len(two.argv[2].rsplit("-", 2)[-2]) == 16
     assert one.argv[2].endswith("-000001")
     assert two.argv[2].endswith("-000001")
     assert one.remote_directory == two.remote_directory
@@ -142,6 +146,7 @@ def test_launch_returns_the_complete_physical_storage_and_retains_bundle(tmp_pat
     assert executor.invocations[1].argv != executor.invocations[0].argv
     compile_session = executor.invocations[0].argv[2]
     run_session = executor.invocations[1].argv[2]
+    assert max(map(len, (compile_session, run_session))) <= 63
     assert compile_session.endswith("-000001")
     assert run_session.endswith("-000001")
     for digest in (compilation.evidence_sha256, runtime.evidence_sha256):

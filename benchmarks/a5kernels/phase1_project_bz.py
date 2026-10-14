@@ -24,6 +24,7 @@ from benchmarks.a5kernels.protocol import SourceFile
 PROJECT_RESULT_MARKER = "A5PROJECT_RESULT="
 _BASE_EVIDENCE_BYTES = 1024 * 1024
 _EVIDENCE_BYTES_PER_OUTPUT = 32
+_SESSION_IDENTITY_CHARS = 12
 
 
 class ProjectInfrastructureError(RuntimeError):
@@ -176,7 +177,7 @@ class CatlassProjectBackend:
     ) -> tuple[dict[str, object], str]:
         attempt = self._reserve_attempt(identity, mode)
         session = (
-            f"codex-a5project-{mode}-{identity[:20]}-"
+            f"codex-a5project-{mode}-{identity[:_SESSION_IDENTITY_CHARS]}-"
             f"{self._session_namespace}-{attempt:06d}"
         )
         remote = f".a5kernels/projects/{identity}"
