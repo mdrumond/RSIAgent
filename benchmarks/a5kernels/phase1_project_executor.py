@@ -124,6 +124,7 @@ class ProjectExecutionRequest:
     instruction: str
     candidate_source: str
     inputs: tuple[HostTensor, ...]
+    expected: ReferenceOutput
     inputs_sha256: str
 
 
@@ -212,7 +213,9 @@ def _instruction(
     return (
         f"Implement `@tla.kernel def {abi.signature}` as the complete Catlass DSL "
         "candidate for this generic learning "
-        "project. Preserve logical shapes and padded physical storage. The host "
+        "project. Preserve logical shapes and padded physical storage. The host binds "
+        "LOGICAL_INPUT_SHAPES, PHYSICAL_INPUT_SHAPES, LOGICAL_OUTPUT_SHAPE, "
+        "PHYSICAL_OUTPUT_SHAPE, and DTYPE as read-only compile-time globals. The host "
         "owns compilation, launch, synchronization, and the host-owned oracle; "
         "do not claim correctness from source or compilation. Project contract: "
         f"{canonical_bytes(contract).decode('ascii')}"
@@ -257,19 +260,9 @@ class ProjectExecutor:
         if not isinstance(candidate_source, str) or not candidate_source.strip():
             raise ValueError("candidate source must be non-empty")
         prepared = self.prepare(spec)
-        inputs_payload = {
-            "tensors": [_tensor_payload(tensor) for tensor in prepared.inputs]
-        }
+        inputs_payload = {"tensors": [_tensor_payload(tensor) for tensor in prepared.inputs]}
         expected_payload = _expected_payload(prepared.expected)
-        request = ProjectExecutionRequest(
-            spec=spec,
-            family=prepared.family,
-            abi=prepared.abi,
-            instruction=prepared.instruction,
-            candidate_source=candidate_source,
-            inputs=prepared.inputs,
-            inputs_sha256=canonical_digest(inputs_payload),
-        )
+        request = self._request(prepared, candidate_source)
         compilation = self._backend.compile(request)
         if not isinstance(compilation, CompileObservation):
             raise TypeError("backend compile must return CompileObservation")
@@ -318,6 +311,22 @@ class ProjectExecutor:
                 "payload": payload,
             })
         return ProjectExecutionResult(prepared, evidence, artifacts, hashes)
+
+    @staticmethod
+    def _request(
+        prepared: PreparedProject, candidate_source: str
+    ) -> ProjectExecutionRequest:
+        inputs_payload = {"tensors": [_tensor_payload(item) for item in prepared.inputs]}
+        return ProjectExecutionRequest(
+            spec=prepared.spec,
+            family=prepared.family,
+            abi=prepared.abi,
+            instruction=prepared.instruction,
+            candidate_source=candidate_source,
+            inputs=prepared.inputs,
+            expected=prepared.expected,
+            inputs_sha256=canonical_digest(inputs_payload),
+        )
 
     @staticmethod
     def _classify(

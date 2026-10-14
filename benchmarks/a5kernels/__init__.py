@@ -112,6 +112,10 @@ from benchmarks.a5kernels.phase1_runtime import (
     RecoveryEvidence,
     RecoveryStarter,
 )
+from benchmarks.a5kernels.phase1_project_bz import (
+    CatlassProjectBackend,
+    ProjectInfrastructureError,
+)
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
     CANDIDATE_ABI_SHA256 as PHASE2_ATTENTION_CANDIDATE_ABI_SHA256,
@@ -157,6 +161,7 @@ __all__ = [
     "CatlassCandidateBackend",
     "CatlassAttentionBackend",
     "CatlassContractHarness",
+    "CatlassProjectBackend",
     "CATLASS_REVISION",
     "CompileDiagnostics",
     "Citation",
@@ -193,6 +198,7 @@ __all__ = [
     "ProfileEvaluation",
     "ProfileRequest",
     "ProfilingTreatmentController",
+    "ProjectInfrastructureError",
     "PROJECT_REGISTRY",
     "PHASE1_BRIEF",
     "PHASE2_ATTENTION_CANDIDATE_ABI_SHA256",
