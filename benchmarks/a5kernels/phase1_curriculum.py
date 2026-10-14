@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 import re
 from typing import Mapping, Sequence
 
 from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.phase1_project import ProjectGraph, ProjectOp
 
 
 _ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
@@ -22,6 +24,7 @@ _PROJECT_FIELDS = {
     "project_id", "capabilities", "shape", "dtype", "block_count",
     "padding_multiple", "failure_mode", "timing_lengths", "profile_metric",
     "hypothesis",
+    "graph",
 }
 
 
@@ -89,6 +92,7 @@ class ProjectSpec:
     timing_lengths: tuple[int, ...]
     profile_metric: ProfileMetric | None
     hypothesis: str
+    graph: ProjectGraph
 
     def __post_init__(self) -> None:
         if not isinstance(self.project_id, str) or not _ID.fullmatch(self.project_id):
@@ -129,10 +133,38 @@ class ProjectSpec:
             or len(self.hypothesis) > 500
         ):
             raise ValueError("hypothesis must be a trimmed 1-500 character string")
+        if not isinstance(self.graph, ProjectGraph):
+            raise ValueError("graph must be a bounded ProjectGraph")
         self._validate_composition()
 
     def _validate_composition(self) -> None:
         capabilities = set(self.capabilities)
+        operations = {node.op for node in self.graph.nodes}
+        required_operations = {
+            Capability.CUBE_TILING: {ProjectOp.MATMUL},
+            Capability.SIMT_REDUCTION: {ProjectOp.REDUCE_SUM},
+            Capability.SIMT_MASK: {ProjectOp.MASK_POSITIVE},
+            Capability.SIMD_VECTOR: {
+                ProjectOp.ADD, ProjectOp.MULTIPLY, ProjectOp.RELU,
+            },
+        }
+        for capability, supported in required_operations.items():
+            if (capability in capabilities) != bool(operations & supported):
+                raise ValueError(
+                    f"{capability.value} capability must agree with graph operations"
+                )
+        if ProjectOp.MATMUL in operations:
+            if len(self.shape) != 3:
+                raise ValueError("cube project shape must be (m, k, n)")
+            m, k, n = self.shape
+            expected_inputs = ((m, k), (k, n))
+            actual_inputs = tuple(item.shape for item in self.graph.inputs)
+            if actual_inputs != expected_inputs or self.graph.output_shape != (m, n):
+                raise ValueError(
+                    "cube project shape must agree with graph inputs and output"
+                )
+        elif any(item.shape != self.shape for item in self.graph.inputs):
+            raise ValueError("project shape must agree with every graph input")
         repairs = Capability.FAILURE_REPAIR in capabilities
         if repairs != (self.failure_mode is not FailureMode.NONE):
             raise ValueError("failure-repair capability and failure mode must agree")
@@ -144,13 +176,25 @@ class ProjectSpec:
         profiling = Capability.PROFILING in capabilities
         if profiling != (self.profile_metric is not None):
             raise ValueError("profiling capability and profile metric must agree")
-        if Capability.CUBE_TILING in capabilities and len(self.shape) < 2:
-            raise ValueError("cube-tiling requires a matrix-shaped project")
         if (
             Capability.PADDED_TAIL in capabilities
-            and self.shape[-1] % self.padding_multiple == 0
+            and self.graph.output_shape[-1] % self.padding_multiple == 0
         ):
             raise ValueError("padded-tail requires a non-aligned logical extent")
+        if Capability.PADDED_TAIL in capabilities:
+            shapes = tuple(item.shape for item in self.graph.inputs) + (
+                self.graph.output_shape,
+            )
+            for shape in shapes:
+                padded_last = (
+                    (shape[-1] + self.padding_multiple - 1)
+                    // self.padding_multiple
+                    * self.padding_multiple
+                )
+                if math.prod(shape[:-1]) * padded_last > 65536:
+                    raise ValueError(
+                        "padded physical tensor may contain at most 65536 elements"
+                    )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "ProjectSpec":
@@ -185,6 +229,7 @@ class ProjectSpec:
                 None if metric is None else _enum(metric, ProfileMetric, "profile metric")
             ),
             hypothesis=value["hypothesis"],
+            graph=ProjectGraph.from_mapping(value["graph"]),
         )
 
     def as_dict(self) -> dict[str, object]:
@@ -201,6 +246,7 @@ class ProjectSpec:
                 None if self.profile_metric is None else self.profile_metric.value
             ),
             "hypothesis": self.hypothesis,
+            "graph": self.graph.as_dict(),
         }
 
 
