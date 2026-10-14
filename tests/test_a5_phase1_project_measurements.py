@@ -29,6 +29,28 @@ def test_aligned_sweep_variant_does_not_claim_padded_tail():
     assert Capability.PADDED_TAIL in padded.capabilities
 
 
+def test_aligned_reduction_inputs_preserve_padded_output_capability():
+    from benchmarks.a5kernels.phase1_project import GraphInput, GraphNode, ProjectOp, materialize_inputs, evaluate_reference
+    spec = _single_spec()
+    graph = ProjectGraph((GraphInput('x', (64,)),),
+                         (GraphNode('out', ProjectOp.REDUCE_SUM, ('x',), 0),), 'out')
+    spec = replace(spec, shape=(64,), graph=graph, padding_multiple=64,
+                   capabilities=(Capability.SIMT_REDUCTION, Capability.PADDED_TAIL,
+                                 Capability.TIMING_SWEEP), timing_lengths=(64, 128))
+    for variant in specialize_timing(spec):
+        assert Capability.PADDED_TAIL in variant.capabilities
+        expected = evaluate_reference(variant, materialize_inputs(variant))
+        assert expected.shape == (1,)
+        assert expected.physical_shape == (64,)
+
+
+def test_timing_bound_matches_executable_graph_dimensions():
+    spec = replace(_single_spec(), timing_lengths=(64, 4096))
+    assert specialize_timing(spec)[-1].shape == (4096,)
+    with pytest.raises(ValueError, match=r'\[1, 4096\]'):
+        replace(spec, timing_lengths=(64, 4097))
+
+
 def test_multidimensional_sweep_is_actionable():
     spec = replace(_spec('movement'),
                    capabilities=(*_spec('movement').capabilities, Capability.TIMING_SWEEP),
