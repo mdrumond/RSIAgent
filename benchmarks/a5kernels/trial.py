@@ -417,6 +417,12 @@ class TrialActionExecutor:
         ]}}
         return ActionOutcome(json.dumps(response, sort_keys=True, separators=(",", ":")))
 
+    def _request_timing(self, _payload) -> ActionOutcome:
+        return self._observation(
+            "timing", available=False,
+            reason="timing-sweep measurements are supported by adaptive Phase 1 only",
+        )
+
     def _request_profile(self, _payload) -> ActionOutcome:
         if not self.profiling_guidance:
             return self._observation("profile", available=False)
