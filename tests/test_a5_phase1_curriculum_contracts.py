@@ -32,15 +32,17 @@ def project(project_id: str, **overrides: object) -> ProjectSpec:
     value.update(overrides)
     capabilities = set(value["capabilities"])
     op = "relu" if "simd-vector" in capabilities else "copy"
+    shape = value["shape"]
     nodes = [{"name": "y", "op": op, "operands": ["x"], "axis": None}]
-    inputs = [{"name": "x", "shape": [4]}]
+    inputs = [{"name": "x", "shape": shape}]
     if "simt-mask" in capabilities:
         nodes = [{"name": "mask", "op": "mask-positive", "operands": ["x"], "axis": None}]
     if "simt-reduction" in capabilities:
         prior = nodes[-1]["name"]
         nodes.append({"name": "total", "op": "reduce-sum", "operands": [prior], "axis": 0})
-    if "cube-tiling" in capabilities:
-        inputs = [{"name": "x", "shape": [2, 3]}, {"name": "z", "shape": [3, 2]}]
+    if "cube-tiling" in capabilities and len(shape) == 3:
+        m, k, n = shape
+        inputs = [{"name": "x", "shape": [m, k]}, {"name": "z", "shape": [k, n]}]
         nodes = [{"name": "y", "op": "matmul", "operands": ["x", "z"], "axis": None}]
     value.setdefault("graph", {"inputs": inputs, "nodes": nodes, "output": nodes[-1]["name"]})
     return ProjectSpec.from_mapping(value)
