@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Mapping
 
 from benchmarks.a5kernels.bz import BZSessionAdapter, CatlassValidationExecutor
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.candidate import (
     CandidateProfileEvaluation,
 )
@@ -256,10 +257,18 @@ class ProductionProjectExecutor:
         if result is None:
             raise RuntimeError("registered performance project produced no study")
         payload = asdict(result)
+        artifacts = ContentAddressedArtifacts(trial.artifacts)
+        artifact_sha256 = artifacts.put_json(payload)
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "performance-study",
+            "sha256": artifact_sha256,
+            "proposal_family": request.proposal.family.value,
+        })
         ledger.append(EvidenceKind.RESULT, {
             "event": "registered-performance-study",
             "proposal": request.proposal.as_dict(),
             "result": payload,
+            "artifact_sha256": artifact_sha256,
         })
         evidence = []
         for timing in result.timing:

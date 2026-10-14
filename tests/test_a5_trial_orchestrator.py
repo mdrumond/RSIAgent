@@ -8,8 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.fixtures import Language
-from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, ProgressiveMemoryJournal
+from benchmarks.a5kernels.knowledge_agent import (
+    Citation, KnowledgeAgent, KnowledgeResult, ProgressiveMemoryJournal,
+)
 from benchmarks.a5kernels.matrix import (
     CapabilityUnavailableError,
     KnowledgeMode,
@@ -180,6 +183,13 @@ def test_end_to_end_result_is_host_owned_and_treatments_off_do_not_leak(tmp_path
     }
     assert result.workspace.parent.joinpath("memory", "knowledge.jsonl").is_file()
     assert len(result.evidence_sha256) == 64
+    artifacts = ContentAddressedArtifacts(result.artifacts)
+    retained = [entry.payload for entry in EvidenceLedger(
+        result.workspace.parent / "evidence.jsonl"
+    ).entries if entry.kind == EvidenceKind.ARTIFACT.value]
+    by_role = {entry["role"]: entry["sha256"] for entry in retained}
+    assert artifacts.read_bytes(by_role["final-source"]) == b"agent source"
+    assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
 
 
 def test_enabled_treatments_are_explicitly_routed(tmp_path):
@@ -483,6 +493,65 @@ def test_nonfinite_error_is_a_valid_explicit_json_observation(tmp_path):
         "error_status": "non-finite-max-abs-error",
     }
     assert "Infinity" not in outcome.observation
+
+
+def test_trial_retains_exact_actions_sources_diffs_and_host_observations(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+    artifacts = ContentAddressedArtifacts(tmp_path / "artifacts")
+    class Knowledge:
+        enabled = True
+
+        def query(self, _query):
+            return (KnowledgeResult(
+                Citation("refs", "guide.md", 3, 4, "c" * 64),
+                "use padded vector movement", 0.9,
+            ),)
+
+    executor = TrialActionExecutor(
+        workspace=workspace, language="catlass-dsl",
+        workload=Workload.SMOKE_VECTOR_ADD, backend=FakeBackend(True),
+        ledger=ledger,
+        knowledge=Knowledge(),
+        profiling=FakeProfile(), profiling_guidance=True,
+        artifacts=artifacts,
+    )
+    actions = (
+        '{"propose":{"text":"measure padded movement"}}',
+        '{"write":{"slot":"kernel","content":"first source"}}',
+        '{"compile":{}}',
+        '{"write":{"slot":"kernel","content":"agent source"}}',
+        '{"query-knowledge":{"query":"padded movement","limit":1}}',
+        '{"run":{}}',
+        '{"request-profile":{}}',
+        '{"submit":{}}',
+    )
+    observations = [executor(parse_trial_action(text)).observation for text in actions]
+
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    roles = [payload["role"] for payload in retained]
+    assert roles.count("action-payload") == len(actions)
+    assert roles.count("host-observation") == len(actions)
+    assert roles.count("candidate-source") == 2
+    assert roles.count("candidate-diff") == 2
+    proposal = next(payload for payload in retained
+                    if payload["role"] == "action-payload" and payload["ordinal"] == 1)
+    assert artifacts.read_json(proposal["sha256"]) == {
+        "kind": "propose", "payload": {"text": "measure padded movement"}
+    }
+    source_refs = [payload["sha256"] for payload in retained
+                   if payload["role"] == "candidate-source"]
+    assert [artifacts.read_bytes(ref).decode() for ref in source_refs] == [
+        "first source", "agent source"
+    ]
+    observation_refs = [payload["sha256"] for payload in retained
+                        if payload["role"] == "host-observation"]
+    assert [artifacts.read_bytes(ref).decode() for ref in observation_refs] == observations
+    assert any("use padded vector movement" in value for value in observations)
+    assert any('"pipe":"balanced"' in value for value in observations)
+    assert artifacts.verify()
 
 
 @pytest.mark.parametrize("passed, exit_code, status", [

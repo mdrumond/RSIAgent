@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel, A5ModelIdentity
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.trial import (
@@ -188,6 +191,47 @@ class DirectCompletionProvider:
         return result
 
 
+class _ProviderEvidenceRecorder:
+    """Persist secret-free exact requests and raw provider text for one trial."""
+
+    def __init__(self, workspace) -> None:
+        self.enabled = workspace is not None
+        if not self.enabled:
+            return
+        root = Path(workspace).parent
+        self.artifacts = ContentAddressedArtifacts(root / "artifacts")
+        self.ledger_path = root / "evidence.jsonl"
+
+    def request(self, profile, messages, *, stage: str, turn: int) -> None:
+        if not self.enabled:
+            return
+        digest = self.artifacts.put_json(profile.request(messages))
+        self._append("provider-request", digest, stage=stage, turn=turn)
+
+    def response(self, text: str, *, stage: str, turn: int) -> None:
+        if not self.enabled:
+            return
+        digest = self.artifacts.put_bytes(text.encode("utf-8"))
+        self._append("provider-response", digest, stage=stage, turn=turn)
+
+    def failure(self, exc: Exception, *, stage: str, turn: int) -> None:
+        if not self.enabled:
+            return
+        digest = self.artifacts.put_json({"exception_type": type(exc).__name__})
+        self._append("provider-response-failure", digest, stage=stage, turn=turn)
+
+    def observation(self, text: str, *, turn: int) -> None:
+        if not self.enabled:
+            return
+        digest = self.artifacts.put_bytes(text.encode("utf-8"))
+        self._append("host-observation", digest, origin="actor", turn=turn)
+
+    def _append(self, role: str, digest: str, **fields: object) -> None:
+        EvidenceLedger(self.ledger_path).append(EvidenceKind.ARTIFACT, {
+            "role": role, "sha256": digest, **fields,
+        })
+
+
 class DirectActorDriver:
     """Run the existing restricted A5 action protocol over one direct profile."""
 
@@ -207,14 +251,17 @@ class DirectActorDriver:
         turn_parser: Callable[[str], TrialAction | None],
         action_executor: Callable[[TrialAction], ActionOutcome],
     ) -> ActorOutcome:
-        del workspace, context
+        del context
+        recorder = _ProviderEvidenceRecorder(workspace)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": instruction},
         ]
         tokens = 0
         for turn in range(1, self.max_turns + 1):
+            recorder.request(profile, messages, stage="action", turn=turn)
             completion = self.provider.complete(profile, messages)
+            recorder.response(completion.text, stage="action", turn=turn)
             tokens += completion.completion_tokens
             messages.append({"role": "assistant", "content": completion.text})
             action = turn_parser(completion.text)
@@ -222,11 +269,26 @@ class DirectActorDriver:
                 observation = json.dumps({
                     "host": {"event": "invalid-action", "required": _ACTION_NUDGE}
                 }, sort_keys=True, separators=(",", ":"))
+                recorder.observation(observation, turn=turn)
             else:
                 outcome = action_executor(action)
                 observation = outcome.observation
                 if outcome.terminal:
-                    return ActorOutcome(outcome.status, turn, tokens)
+                    messages.append({"role": "user", "content": observation})
+                    recorder.request(profile, messages, stage="post-terminal", turn=turn)
+                    try:
+                        terminal = self.provider.complete(profile, messages)
+                    except Exception as exc:
+                        recorder.failure(exc, stage="post-terminal", turn=turn)
+                        return ActorOutcome(outcome.status, turn, tokens)
+                    recorder.response(
+                        terminal.text, stage="post-terminal", turn=turn,
+                    )
+                    tokens += terminal.completion_tokens
+                    return ActorOutcome(
+                        outcome.status, turn, tokens,
+                        terminal_response=terminal.text,
+                    )
             messages.append({"role": "user", "content": observation})
         return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
 
