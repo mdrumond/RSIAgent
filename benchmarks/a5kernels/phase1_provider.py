@@ -220,6 +220,12 @@ class _ProviderEvidenceRecorder:
         digest = self.artifacts.put_json({"exception_type": type(exc).__name__})
         self._append("provider-response-failure", digest, stage=stage, turn=turn)
 
+    def observation(self, text: str, *, turn: int) -> None:
+        if not self.enabled:
+            return
+        digest = self.artifacts.put_bytes(text.encode("utf-8"))
+        self._append("host-observation", digest, origin="actor", turn=turn)
+
     def _append(self, role: str, digest: str, **fields: object) -> None:
         EvidenceLedger(self.ledger_path).append(EvidenceKind.ARTIFACT, {
             "role": role, "sha256": digest, **fields,
@@ -263,6 +269,7 @@ class DirectActorDriver:
                 observation = json.dumps({
                     "host": {"event": "invalid-action", "required": _ACTION_NUDGE}
                 }, sort_keys=True, separators=(",", ":"))
+                recorder.observation(observation, turn=turn)
             else:
                 outcome = action_executor(action)
                 observation = outcome.observation

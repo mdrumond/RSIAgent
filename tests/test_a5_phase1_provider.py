@@ -266,6 +266,12 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(t
     responses = [artifacts.read_bytes(entry["sha256"]).decode()
                  for entry in retained if entry["role"] == "provider-response"]
     assert responses[0] == "not-json"
+    actor_observations = [entry for entry in retained
+                          if entry["role"] == "host-observation"
+                          and entry.get("origin") == "actor"]
+    assert json.loads(artifacts.read_bytes(
+        actor_observations[0]["sha256"]
+    ))["host"]["event"] == "invalid-action"
 
 
 def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_path):
