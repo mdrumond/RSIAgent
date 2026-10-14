@@ -275,6 +275,64 @@ def test_invalid_metadata_is_rejected_without_leaking_values(tmp_path):
         load_archive_spec(value)
 
 
+@pytest.mark.parametrize(
+    "location",
+    ["model", "treatment", "missing-reason"],
+)
+def test_secret_metadata_values_fail_before_destination_creation(tmp_path, location):
+    value = spec(tmp_path)
+    secret = "OPENAI_API_KEY=sk-" + "x" * 32
+    if location == "model":
+        value["campaigns"][0]["model"] = secret
+    elif location == "treatment":
+        value["campaigns"][0]["treatments"]["kdb"] = secret
+    else:
+        value["known_missing"][0]["reason"] = secret
+    destination = tmp_path / "archive"
+
+    with pytest.raises(ValueError, match="secret-like metadata"):
+        archive_baselines(load_archive_spec(value), destination)
+
+    assert not destination.exists()
+
+
+def test_malformed_jsonl_line_does_not_hide_valid_surrounding_records(tmp_path):
+    value = spec(tmp_path)
+    root = Path(value["campaigns"][1]["root"])
+    write(
+        root / "cells/a/mixed.jsonl",
+        b'{"action":"compile"}\nnot-json\n'
+        b'{"action":"run","summary":"kernel output passed"}\n',
+    )
+
+    archive_baselines(load_archive_spec(value), tmp_path / "archive")
+    review = json.loads((tmp_path / "archive/derived/review.json").read_text())
+    campaign = next(
+        item for item in review["campaigns"]
+        if item["campaign_id"] == "phase1-deepseek-profile"
+    )
+
+    assert campaign["retained_layers"]["actions"]["record_count"] == 3
+    assert campaign["claims"]["unsupported"]["correctness"] == 1
+
+
+def test_cli_counts_validated_empty_campaigns(tmp_path, capsys):
+    root = tmp_path / "empty"
+    root.mkdir()
+    value = {
+        "campaigns": [{
+            "id": "empty-phase1", "phase": "phase1", "root": str(root),
+            "model": "openai", "treatments": {},
+        }],
+        "known_missing": [],
+    }
+    path = tmp_path / "spec.json"
+    path.write_text(json.dumps(value))
+
+    assert main(["--spec", str(path), "--destination", str(tmp_path / "archive")]) == 0
+    assert json.loads(capsys.readouterr().out)["campaigns"] == 1
+
+
 def test_cli_reads_spec_and_reports_only_archive_identity(tmp_path, capsys):
     path = tmp_path / "spec.json"
     path.write_text(json.dumps(spec(tmp_path)))

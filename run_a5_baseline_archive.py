@@ -22,9 +22,10 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     value = json.loads(args.spec.read_text(encoding="utf-8"))
-    manifest = archive_baselines(load_archive_spec(value), args.destination)
+    spec = load_archive_spec(value)
+    manifest = archive_baselines(spec, args.destination)
     summary = {
-        "campaigns": len({item["campaign_id"] for item in manifest["inventory"]}),
+        "campaigns": len(spec.campaigns),
         "files": len(manifest["inventory"]),
         "manifest_sha256": hashlib.sha256(
             (args.destination / "raw/manifest.json").read_bytes()

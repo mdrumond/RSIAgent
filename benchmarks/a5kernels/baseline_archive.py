@@ -58,6 +58,14 @@ def _text(value: object, field: str) -> str:
     return value.strip()
 
 
+def _metadata_text(value: object, field: str) -> str:
+    text = _text(value, field)
+    encoded = text.encode("utf-8")
+    if any(pattern.search(encoded) for pattern in _SECRET_CONTENT):
+        raise ValueError(f"{field} contains secret-like metadata")
+    return text
+
+
 def load_archive_spec(value: Mapping[str, object]) -> ArchiveSpec:
     """Validate an untrusted JSON-like archive request."""
 
@@ -74,9 +82,9 @@ def load_archive_spec(value: Mapping[str, object]) -> ArchiveSpec:
         required = {"id", "phase", "root", "model", "treatments"}
         if not isinstance(item, Mapping) or set(item) != required:
             raise ValueError("each campaign must use the documented fields")
-        campaign_id = _text(item["id"], "campaign id")
+        campaign_id = _metadata_text(item["id"], "campaign id")
         phase = _text(item["phase"], "phase")
-        model = _text(item["model"], "model")
+        model = _metadata_text(item["model"], "model")
         if not _ID.fullmatch(campaign_id) or phase not in {"phase1", "phase2"}:
             raise ValueError("campaign id or phase is invalid")
         treatments = item["treatments"]
@@ -90,7 +98,9 @@ def load_archive_spec(value: Mapping[str, object]) -> ArchiveSpec:
                 or any(word in key.lower() for word in _SENSITIVE_WORDS)
             ):
                 raise ValueError("treatment name is invalid or sensitive")
-            normalized.append((key, _text(treatment_value, "treatment value")))
+            normalized.append((
+                key, _metadata_text(treatment_value, "treatment value")
+            ))
         campaigns.append(Campaign(
             campaign_id, phase, Path(_text(item["root"], "campaign root")).resolve(),
             model, tuple(sorted(normalized)),
@@ -103,7 +113,7 @@ def load_archive_spec(value: Mapping[str, object]) -> ArchiveSpec:
         if not isinstance(item, Mapping) or set(item) != {"scope", "artifact", "reason"}:
             raise ValueError("known-missing declarations use scope, artifact, and reason")
         declaration = MissingArtifact(*(
-            _text(item[field], f"known-missing {field}")
+            _metadata_text(item[field], f"known-missing {field}")
             for field in ("scope", "artifact", "reason")
         ))
         if declaration.scope != "all" and declaration.scope not in ids:
@@ -151,9 +161,17 @@ def _read_campaign(campaign: Campaign) -> list[tuple[str, bytes, os.stat_result]
 
 
 def _json_values(path: str, data: bytes) -> list[object]:
+    if path.endswith(".jsonl"):
+        values = []
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            try:
+                values.append(json.loads(line))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        return values
     try:
-        if path.endswith(".jsonl"):
-            return [json.loads(line) for line in data.splitlines() if line.strip()]
         if path.endswith(".json"):
             return [json.loads(data)]
     except (UnicodeDecodeError, json.JSONDecodeError):
