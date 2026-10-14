@@ -176,6 +176,8 @@ class Phase1GateRunner:
                  source_provider: SourceProvider, *, sleep=time.sleep):
         if not isinstance(guide, ProgrammingGuideIdentity):
             raise ValueError("guide must be an admitted programming guide")
+        if guide.catlass_revision != CATLASS_REVISION:
+            raise ValueError("legacy qualification requires the historical Catlass revision")
         self.guide = guide
         self.harness = harness
         self.source_provider = source_provider
@@ -284,6 +286,8 @@ def dry_run_manifest(guide: ProgrammingGuideIdentity) -> dict[str, object]:
 
 
 def require_gate(report: GateReport, guide: ProgrammingGuideIdentity) -> None:
+    if guide.catlass_revision != CATLASS_REVISION:
+        raise ValueError("legacy qualification requires the historical Catlass revision")
     expected = qualification_tasks()
     if report.schema != GATE_SCHEMA or report.ready is not True:
         raise ValueError("Phase 1 qualification gate is not ready")

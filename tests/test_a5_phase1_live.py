@@ -76,6 +76,31 @@ def provider(agent, contract, revision, feedback):
     return f"# {agent.agent_id} {contract.value} revision {revision}\n"
 
 
+def test_legacy_gate_rejects_other_revision_before_provider_or_host_calls():
+    guide = replace(GUIDE, catlass_revision="2" * 40)
+    harness = PassingHarness()
+
+    def forbidden_provider(*args):
+        pytest.fail("legacy gate must reject the revision before paid calls")
+
+    with pytest.raises(ValueError, match="historical Catlass revision"):
+        Phase1GateRunner(guide, harness, forbidden_provider).run()
+    assert harness.calls == []
+
+
+def test_legacy_gate_rejects_report_relabelled_with_other_guide_revision(tmp_path):
+    report = Phase1GateRunner(GUIDE, PassingHarness(), provider).run()
+    other_guide = replace(GUIDE, catlass_revision="2" * 40)
+    relabelled = replace(report, guide=other_guide)
+    relabelled = replace(relabelled, report_sha256=canonical_hash(relabelled.body()))
+    with pytest.raises(ValueError, match="historical Catlass revision"):
+        require_gate(relabelled, other_guide)
+    path = tmp_path / "qualification.json"
+    path.write_text(json.dumps(relabelled.as_dict()))
+    with pytest.raises(ValueError, match="historical Catlass revision"):
+        load_gate_report(path)
+
+
 def test_registry_has_six_independent_agents_and_eighteen_contract_tasks():
     agents = qualification_agents()
     tasks = qualification_tasks()
