@@ -73,7 +73,8 @@ def test_measurement_action_retains_backend_reports_and_exact_prepared_contract(
     assert artifacts.read_bytes(digest).rstrip() == production.canonical_bytes(report)
 
 
-def test_measurement_failure_is_actionable_and_does_not_admit_evidence(tmp_path):
+@pytest.mark.parametrize("error_type", [ValueError, production.InfrastructureFailure, production.ProjectInfrastructureError])
+def test_measurement_failure_is_actionable_and_does_not_admit_evidence(tmp_path, error_type):
     from test_a5_phase1_adaptive_actor import SourceBackend, _special_spec
     from benchmarks.a5kernels.evidence import EvidenceLedger
     from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
@@ -83,14 +84,19 @@ def test_measurement_failure_is_actionable_and_does_not_admit_evidence(tmp_path)
 
     class Measurements:
         def timing(self, request):
-            raise ValueError("sweep length 17 failed host verification")
+            raise error_type("sweep length 17 failed host verification")
 
     context = AdaptiveActionContext(
         AdaptiveProjectRequest(spec, 1, b"", tmp_path, prepared.inputs, prepared.expected),
         prepared, "fixed source", executor.execute(spec, "fixed source"),
         ContentAddressedArtifacts(tmp_path / "artifacts"),
     )
-    result = production._measurement_action(Measurements(), profiling=False)({}, context)
+    action = production._measurement_action(Measurements(), profiling=False)
+    if error_type is not ValueError:
+        with pytest.raises(error_type, match="length 17"):
+            action({}, context)
+        return
+    result = action({}, context)
     assert result.observation["passed"] is False
     assert "length 17" in result.observation["diagnostic"]
     assert result.host_facts == ()

@@ -38,7 +38,7 @@ from benchmarks.a5kernels.phase1_experiments import (
     ProfilingGuidance,
     admit_runnable_cell,
 )
-from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend
+from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend, ProjectInfrastructureError
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.phase1_provider import (
@@ -202,7 +202,7 @@ def _measurement_action(measurements, *, profiling: bool) -> ActionDependency:
                 if not context.request.spec.timing_lengths:
                     return AdaptiveActionResult({"error": "project has no timing lengths"})
                 result = measurements.timing(request)
-        except InfrastructureFailure:
+        except (InfrastructureFailure, ProjectInfrastructureError):
             raise
         except (ValueError, RuntimeError) as exc:
             return AdaptiveActionResult({
