@@ -19,6 +19,12 @@ from benchmarks.a5kernels.phase1_curriculum import (
     WaveSpec,
     consolidate_wave,
 )
+from benchmarks.a5kernels.phase1_project import (
+    HostTensor,
+    ReferenceOutput,
+    evaluate_reference,
+    materialize_inputs,
+)
 
 
 PLAN_SCHEMA = "a5-phase1-live-wave-plan-v1"
@@ -33,6 +39,8 @@ class WaveProjectRequest:
     assignment: ProjectAssignment
     pre_wave_memory: bytes
     branch_root: Path
+    inputs: tuple[HostTensor, ...]
+    oracle: ReferenceOutput
 
 
 @dataclass(frozen=True)
@@ -131,10 +139,13 @@ class LiveWaveCoordinator:
     def _execute_one(self, assignment: ProjectAssignment) -> ProjectOutcome:
         branch_root = self.root / "branches" / assignment.project_id
         branch_root.mkdir(parents=True, exist_ok=True)
+        inputs = materialize_inputs(assignment.spec)
         result = self.execute(WaveProjectRequest(
             assignment=assignment,
             pre_wave_memory=self.pre_wave_memory,
             branch_root=branch_root,
+            inputs=inputs,
+            oracle=evaluate_reference(assignment.spec, inputs),
         ))
         if not isinstance(result, WaveProjectResult):
             raise TypeError("project executor must return WaveProjectResult")

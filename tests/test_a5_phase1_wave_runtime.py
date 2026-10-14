@@ -15,6 +15,11 @@ from benchmarks.a5kernels.phase1_curriculum import (
     WaveProject,
     WaveSpec,
 )
+from benchmarks.a5kernels.phase1_project import (
+    ProjectGraph,
+    evaluate_reference,
+    materialize_inputs,
+)
 from benchmarks.a5kernels.phase1_wave_runtime import (
     LiveWaveCoordinator,
     WaveProjectResult,
@@ -24,10 +29,30 @@ from benchmarks.a5kernels.phase1_wave_runtime import (
 MEMORY = b"immutable pre-wave memory"
 
 
-def project(project_id: str) -> ProjectSpec:
+def graph(operation: str = "copy") -> ProjectGraph:
+    inputs = [{"name": "lhs", "shape": [257]}]
+    operands = ["lhs"]
+    if operation in {"add", "multiply"}:
+        inputs.append({"name": "rhs", "shape": [257]})
+        operands.append("rhs")
+    return ProjectGraph.from_mapping({
+        "inputs": inputs,
+        "nodes": [{
+            "name": "output", "op": operation,
+            "operands": operands, "axis": None,
+        }],
+        "output": "output",
+    })
+
+
+def project(project_id: str, operation: str = "copy") -> ProjectSpec:
     return ProjectSpec(
         project_id=project_id,
-        capabilities=(Capability.GM_UB_MOVEMENT,),
+        capabilities=(
+            (Capability.GM_UB_MOVEMENT, Capability.SIMD_VECTOR)
+            if operation in {"add", "multiply"}
+            else (Capability.GM_UB_MOVEMENT,)
+        ),
         shape=(257,),
         dtype=DType.FLOAT32,
         block_count=1,
@@ -36,6 +61,7 @@ def project(project_id: str) -> ProjectSpec:
         timing_lengths=(),
         profile_metric=None,
         hypothesis="Host verification determines whether the project worked.",
+        graph=graph(operation),
     )
 
 
@@ -93,6 +119,36 @@ def test_siblings_run_concurrently_from_identical_memory_and_publish_in_authored
     assert [item["project_id"] for item in published["commits"]] == [
         "first", "second", "third",
     ]
+
+
+def test_sibling_graphs_receive_isolated_host_owned_inputs_and_oracles(tmp_path):
+    specs = (project("add-project", "add"), project("multiply-project", "multiply"))
+    spec = WaveSpec(
+        "wave-graphs", hashlib.sha256(MEMORY).hexdigest(), (),
+        tuple(WaveProject(item) for item in specs),
+    )
+    observed = {}
+    lock = threading.Lock()
+
+    def execute(request):
+        with pytest.raises(TypeError):
+            request.inputs[0].storage[0] = 123.0
+        expected_inputs = materialize_inputs(request.assignment.spec)
+        expected_oracle = evaluate_reference(request.assignment.spec, expected_inputs)
+        with lock:
+            observed[request.assignment.project_id] = (
+                request.inputs, request.oracle, expected_inputs, expected_oracle,
+            )
+        return WaveProjectResult(request.assignment.project_id.encode(), True)
+
+    LiveWaveCoordinator(tmp_path, spec, MEMORY, execute, 2).run()
+
+    assert set(observed) == {"add-project", "multiply-project"}
+    for inputs, oracle, expected_inputs, expected_oracle in observed.values():
+        assert inputs == expected_inputs
+        assert oracle == expected_oracle
+    assert observed["add-project"][0] is not observed["multiply-project"][0]
+    assert observed["add-project"][1] != observed["multiply-project"][1]
 
 
 def test_failure_retains_isolated_success_but_publishes_nothing(tmp_path):
