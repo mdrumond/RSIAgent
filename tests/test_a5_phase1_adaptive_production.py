@@ -254,6 +254,41 @@ def test_guide_identity_mismatch_fails_before_composition(tmp_path):
         _build(tmp_path, _cell(), guide_bytes=b"different guide")
 
 
+def test_campaign_identity_is_persisted_and_unchanged_reconstruction_works(tmp_path):
+    first = _build(tmp_path, _cell())
+    identity_path = first.coordinator.root / "campaign-identity.json"
+    identity = json.loads(identity_path.read_text())
+
+    second = _build(tmp_path, _cell())
+
+    assert identity == {
+        "schema": "a5-phase1-production-identity-v1",
+        "cell": first.cell.as_dict(),
+    }
+    assert second.cell == first.cell
+    assert identity_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_changed_cell_and_legacy_state_fail_before_external_probes(tmp_path, monkeypatch):
+    _build(tmp_path, _cell())
+    monkeypatch.setattr(
+        production, "_checked_command",
+        lambda _paths: pytest.fail("remote probe ran before identity rejection"),
+    )
+    with pytest.raises(ValueError, match="different treatment cell"):
+        _build(
+            tmp_path,
+            _cell(profiling=ProfilingGuidance.WITH_GUIDANCE),
+            command_executor=None,
+        )
+
+    legacy = tmp_path / "legacy"
+    (legacy / "campaign").mkdir(parents=True)
+    (legacy / "campaign" / "state.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="legacy adaptive state"):
+        _build(legacy, _cell())
+
+
 def test_control_treatments_are_explicitly_disabled(tmp_path):
     campaign = _build(tmp_path, _cell())
     context = object()
@@ -346,7 +381,7 @@ def test_resume_and_report_delegate_to_same_retained_coordinator(tmp_path, monke
     assert calls == ["resume", "report"]
 
 
-@pytest.mark.parametrize("action", ["run", "resume", "report"])
+@pytest.mark.parametrize("action", ["run", "resume"])
 def test_cli_wires_each_action_to_the_production_factory(
     tmp_path, capsys, action,
 ):
@@ -389,3 +424,22 @@ def test_cli_wires_each_action_to_the_production_factory(
     assert captured["cell"].profiling is ProfilingGuidance.WITH_GUIDANCE
     assert captured["paths"].device == 3
     assert captured["max_parallel"] == 2
+
+
+def test_cli_report_reads_retained_state_without_live_dependencies(tmp_path, capsys):
+    memory_path = tmp_path / "memory.json"
+    memory_path.write_bytes(b'{"prior":1}')
+    campaign = _build(tmp_path, _cell(), initial_memory=memory_path.read_bytes())
+    expected = campaign.coordinator.report()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("offline report constructed a live dependency")
+
+    cli_main([
+        "report",
+        "--root", str(campaign.coordinator.root),
+        "--objective", "Learn one generic elementwise Catlass capability.",
+        "--initial-memory", str(memory_path),
+    ], builder=forbidden, environment_loader=forbidden, embedding_factory=forbidden)
+
+    assert json.loads(capsys.readouterr().out) == expected

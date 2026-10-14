@@ -51,6 +51,7 @@ from benchmarks.a5kernels.phase1_provider import (
 
 _REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _INITIAL_CONTEXT_SCHEMA = "a5-phase1-production-context-v1"
+_CAMPAIGN_IDENTITY_SCHEMA = "a5-phase1-production-identity-v1"
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,33 @@ def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes) -> bytes:
     })
 
 
+def _bind_campaign_identity(root: Path, cell: A5Phase1Cell) -> None:
+    root = Path(root)
+    path = root / "campaign-identity.json"
+    expected = canonical_bytes({
+        "schema": _CAMPAIGN_IDENTITY_SCHEMA,
+        "cell": cell.as_dict(),
+    }) + b"\n"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if not path.exists() and (root / "state.json").exists():
+            raise ValueError("legacy adaptive state has no campaign identity")
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            if path.read_bytes() != expected:
+                raise ValueError("campaign root belongs to a different treatment cell")
+            return
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(expected)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("campaign identity could not be retained") from exc
+
+
 def build_adaptive_phase1(
     *,
     cell: A5Phase1Cell,
@@ -248,6 +276,7 @@ def build_adaptive_phase1(
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
     actor_context = _actor_context(admitted, guide_bytes)
+    _bind_campaign_identity(paths.root, admitted)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
             raise ValueError("KDB-off treatment must not receive KDB dependencies")

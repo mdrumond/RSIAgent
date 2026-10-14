@@ -169,6 +169,27 @@ class AdaptivePhase1Coordinator:
     def report(self) -> dict[str, object]:
         return self._report(self._load_state())
 
+    @classmethod
+    def read_retained_report(
+        cls, root: Path, objective: str, initial_memory: bytes,
+    ) -> dict[str, object]:
+        """Read an existing campaign without constructing live dependencies."""
+
+        if not isinstance(objective, str) or not objective.strip():
+            raise ValueError("objective must be non-empty")
+        if not isinstance(initial_memory, bytes):
+            raise TypeError("initial memory must be immutable bytes")
+        reader = object.__new__(cls)
+        reader.root = Path(root)
+        reader.objective = objective.strip()
+        reader.initial_memory = initial_memory
+        path = reader.root / "state.json"
+        if not path.is_file():
+            raise ValueError("retained adaptive state does not exist")
+        state = reader._read_json(path)
+        reader._validate_state(state)
+        return reader._report(state)
+
     def _execute(self, request: WaveProjectRequest) -> WaveProjectResult:
         result = self.execute_project(AdaptiveProjectRequest(
             request.assignment.spec,
@@ -287,11 +308,14 @@ class AdaptivePhase1Coordinator:
             self._atomic_json(path, state)
             return state
         state = self._read_json(path)
+        self._validate_state(state)
+        return state
+
+    def _validate_state(self, state) -> None:
         if state.get("schema") != STATE_SCHEMA or state.get("objective") != self.objective:
             raise ValueError("adaptive state does not match objective")
         if state.get("initial_memory_sha256") != hashlib.sha256(self.initial_memory).hexdigest():
             raise ValueError("adaptive state initial memory does not match")
-        return state
 
     def _load_pending(self, state):
         path = self.root / "pending.json"

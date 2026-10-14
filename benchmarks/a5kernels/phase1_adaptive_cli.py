@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 
 from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_adaptive_production import (
     AdaptiveProductionPaths,
     build_adaptive_phase1,
@@ -33,14 +34,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--objective", required=True)
     parser.add_argument("--initial-memory", type=Path, required=True)
-    parser.add_argument("--guide", type=Path, required=True)
-    parser.add_argument("--cpl-skills-revision", required=True)
-    parser.add_argument("--tla-root", type=Path, required=True)
-    parser.add_argument("--catlass-source", required=True)
-    parser.add_argument("--catlass-revision", required=True)
-    parser.add_argument("--model", choices=[item.value for item in A5BackendModel], required=True)
-    parser.add_argument("--knowledge", choices=[item.value for item in KnowledgeMode], required=True)
-    parser.add_argument("--profiling", choices=[item.value for item in ProfilingGuidance], required=True)
+    parser.add_argument("--guide", type=Path)
+    parser.add_argument("--cpl-skills-revision")
+    parser.add_argument("--tla-root", type=Path)
+    parser.add_argument("--catlass-source")
+    parser.add_argument("--catlass-revision")
+    parser.add_argument("--model", choices=[item.value for item in A5BackendModel])
+    parser.add_argument("--knowledge", choices=[item.value for item in KnowledgeMode])
+    parser.add_argument("--profiling", choices=[item.value for item in ProfilingGuidance])
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-parallel", type=int, default=1)
     parser.add_argument("--kdb", type=Path)
@@ -54,10 +55,29 @@ def main(
     argv: list[str] | None = None,
     *,
     builder=build_adaptive_phase1,
+    reporter=AdaptivePhase1Coordinator.read_retained_report,
     environment_loader=load_direct_environment,
     embedding_factory=PinnedBGEEmbeddings,
 ) -> None:
     args = _parser().parse_args(argv)
+    initial_memory = args.initial_memory.read_bytes()
+    if args.action == "report":
+        result = reporter(args.root, args.objective, initial_memory)
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return
+    required = {
+        "--guide": args.guide,
+        "--cpl-skills-revision": args.cpl_skills_revision,
+        "--tla-root": args.tla_root,
+        "--catlass-source": args.catlass_source,
+        "--catlass-revision": args.catlass_revision,
+        "--model": args.model,
+        "--knowledge": args.knowledge,
+        "--profiling": args.profiling,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError("live actions require " + ", ".join(missing))
     guide = admit_programming_guide(
         args.guide,
         cpl_skills_revision=args.cpl_skills_revision,
@@ -88,7 +108,7 @@ def main(
             args.collection,
         ),
         objective=args.objective,
-        initial_memory=args.initial_memory.read_bytes(),
+        initial_memory=initial_memory,
         guide_bytes=args.guide.read_bytes(),
         environment=environment_loader(env_file=args.env_file),
         embeddings=embeddings,
