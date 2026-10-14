@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field as dataclass_field, replace
 import difflib
 import hashlib
 import json
@@ -50,6 +50,7 @@ class ActionOutcome:
     observation: str
     terminal: bool = False
     status: str = "done"
+    admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
 
 
 def parse_trial_action(text: str) -> TrialAction | None:
@@ -150,6 +151,9 @@ class ActorOutcome:
     tokens: int | None = None
     wall_time_s: float = 0.0
     terminal_response: str | None = None
+    distillation: object | None = None
+    admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
+    continuation: object | None = None
 
 
 class ActorDriver(Protocol):
@@ -302,6 +306,7 @@ class TrialActionExecutor:
         self.latest_run: CandidateRun | None = None
         self.final_run: CandidateRun | None = None
         self.final_profile: Mapping[str, object] | None = None
+        self.admitted_artifacts: dict[str, str] = {}
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
@@ -324,11 +329,22 @@ class TrialActionExecutor:
         self.ledger.append(EvidenceKind.ACTION, action_evidence)
         if action_ref is not None:
             self._artifact("action-payload", action_ref, ordinal=self.actions)
+            self.admitted_artifacts[action_ref] = "action"
         outcome = handler(action.payload)
         if self.artifacts is not None:
             observation_ref = self.artifacts.put_bytes(outcome.observation.encode("utf-8"))
             self._artifact("host-observation", observation_ref, ordinal=self.actions)
-        return outcome
+            evidence_kind = action.kind
+            try:
+                host = json.loads(outcome.observation).get("host", {})
+            except (AttributeError, json.JSONDecodeError):
+                host = {}
+            if action.kind in {"run", "submit"} and host.get("passed") is True:
+                evidence_kind = "host-verification"
+            elif action.kind == "request-profile":
+                evidence_kind = "profiling"
+            self.admitted_artifacts[observation_ref] = evidence_kind
+        return replace(outcome, admitted_artifacts=dict(self.admitted_artifacts))
 
     def _propose(self, payload) -> ActionOutcome:
         return self._observation("proposal-recorded", chars=len(payload["text"]))
@@ -350,6 +366,8 @@ class TrialActionExecutor:
             self._artifact("candidate-source", source_ref, ordinal=self.actions)
             self._artifact("candidate-diff", diff_ref, ordinal=self.actions,
                            source_sha256=source_ref)
+            self.admitted_artifacts[source_ref] = "source"
+            self.admitted_artifacts[diff_ref] = "diff"
         self.latest_run = None
         return self._observation("written", slot="kernel", sha256=hashlib.sha256(
             content.encode()).hexdigest())
@@ -639,10 +657,21 @@ class TrialOrchestrator:
         )
         if executor.final_run is None or executor.final_profile is None:
             raise RuntimeError("Actor ended without a host-verified submit action")
-        _retain_final_artifacts(
-            workspace=workspace, language=language, executor=executor,
-            artifacts=artifacts, ledger=ledger, outcome=outcome,
-        )
+        final_source = (workspace / _SOURCE_PATHS[language]).read_bytes()
+        source_ref = artifacts.put_bytes(final_source)
+        if source_ref != executor.final_run.candidate_source_sha256:
+            raise RuntimeError("retained final source does not match verified candidate")
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "final-source", "sha256": source_ref,
+        })
+        profile_ref = artifacts.put_json(executor.final_profile)
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "final-profile", "sha256": profile_ref,
+        })
+        admitted = dict(outcome.admitted_artifacts)
+        admitted[source_ref] = "source"
+        admitted[profile_ref] = "profiling"
+        outcome = replace(outcome, admitted_artifacts=admitted)
         return TrialResult(
             outcome,
             executor.final_run,

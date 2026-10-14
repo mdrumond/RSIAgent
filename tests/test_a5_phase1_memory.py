@@ -7,6 +7,7 @@ import pytest
 import benchmarks.a5kernels.phase1_memory as phase1_memory
 from benchmarks.a5kernels.knowledge_agent import Citation
 from benchmarks.a5kernels.phase1_memory import (
+    AgentLesson,
     AgentInterpretation,
     HostFact,
     Phase1LearningJournal,
@@ -310,6 +311,73 @@ def test_durable_sequence_accepts_ordinary_integer(tmp_path):
 def test_interpretation_supports_requires_exact_tuple(supports):
     with pytest.raises(TypeError, match="must be a tuple"):
         AgentInterpretation("Interpretation", supports)
+
+
+def test_structured_lesson_round_trips_with_explicit_no_new_knowledge():
+    lesson = AgentLesson(
+        category="failure-repair",
+        claim="Initialize branch-local values before dynamic control flow.",
+        applicability="Catlass DSL dynamic branches.",
+        preconditions="A value is consumed after the branch.",
+        limitations="Does not establish kernel correctness.",
+        evidence_artifact_sha256=(EVIDENCE,),
+        failure_signature="dynamic branch variable is uninitialized",
+        repair="Initialize the value before branching.",
+        confidence="high",
+    )
+    project = Phase1ProjectMemory(
+        DEFAULT_PROPOSALS[0], "source", ("compile",),
+        (HostFact("compile", "compile failed", EVIDENCE),),
+        lessons=(lesson,), no_new_knowledge=False,
+        admitted_artifact_sha256=(EVIDENCE,),
+        artifact_store="provider-attempts/attempt-01/artifacts",
+    )
+
+    encoded = project.as_dict()
+    assert encoded["no_new_knowledge"] is False
+    assert encoded["agent_lessons"][0]["repair"].startswith("Initialize")
+    assert encoded["artifact_store"] == "provider-attempts/attempt-01/artifacts"
+    assert Phase1ProjectMemory.from_mapping(encoded) == project
+
+
+@pytest.mark.parametrize("field", [
+    "claim", "applicability", "preconditions", "limitations",
+    "failure_signature", "repair",
+])
+def test_structured_lesson_caps_compact_text_fields(field):
+    values = {
+        "category": "failure-repair",
+        "claim": "bounded claim",
+        "applicability": "bounded applicability",
+        "preconditions": "bounded preconditions",
+        "limitations": "bounded limitations",
+        "evidence_artifact_sha256": (EVIDENCE,),
+        "failure_signature": "bounded signature",
+        "repair": "bounded repair",
+        "confidence": "medium",
+    }
+    values[field] = "x" * 2001
+
+    with pytest.raises(ValueError, match="at most 2000 characters"):
+        AgentLesson(**values)
+
+
+def test_project_memory_rejects_nonrelative_artifact_store():
+    with pytest.raises(ValueError, match="relative artifact store"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", (),
+            (HostFact("compile", "compiled", EVIDENCE),),
+            artifact_store="../other-attempt/artifacts",
+        )
+
+
+def test_no_new_knowledge_is_explicit_and_mutually_exclusive_with_lessons():
+    fact = (HostFact("compile", "compiled", EVIDENCE),)
+    with pytest.raises(ValueError, match="no_new_knowledge"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", ("compile",), fact,
+            no_new_knowledge=False, admitted_artifact_sha256=(EVIDENCE,),
+        )
 
 
 @pytest.mark.parametrize("supports", [EVIDENCE, {EVIDENCE: True}])

@@ -33,7 +33,11 @@ from benchmarks.a5kernels.phase1_live import (
     MAX_INFRASTRUCTURE_RETRIES,
     InfrastructureFailure,
 )
-from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
+from benchmarks.a5kernels.phase1_memory import (
+    AgentDistillation,
+    HostFact,
+    Phase1ProjectMemory,
+)
 from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.phase1_provider import (
     DirectActorDriver,
@@ -181,7 +185,10 @@ class ProductionProjectExecutor:
             )
             for manifest in manifests
         )
-        facts.extend(self._performance_facts(request, runtime, trial, ledger))
+        performance_facts, performance_artifacts = self._performance_facts(
+            request, runtime, trial, ledger
+        )
+        facts.extend(performance_facts)
         source = (trial.workspace / "kernel.py").read_bytes()
         actions = tuple(
             entry.payload["action"] for entry in ledger.entries[project_entry_start:]
@@ -189,12 +196,39 @@ class ProductionProjectExecutor:
             and isinstance(entry.payload.get("action"), str)
         )
         citations = self._citations(knowledge)
+        additional_artifacts = dict(performance_artifacts)
+        if recovery is not None:
+            artifacts = ContentAddressedArtifacts(trial.artifacts)
+            recovery_sha256 = artifacts.put_bytes(recovery.encode("utf-8"))
+            ledger.append(EvidenceKind.ARTIFACT, {
+                "role": "recovery-evidence", "sha256": recovery_sha256,
+            })
+            additional_artifacts[recovery_sha256] = "recovery-evidence"
+        learned = self.actor.distill(
+            trial.outcome,
+            admitted_artifacts=additional_artifacts,
+            host_summaries=tuple(asdict(fact) for fact in facts),
+        )
+        distillation = learned.distillation
+        if not isinstance(distillation, AgentDistillation):
+            raise RuntimeError("terminal project omitted structured distillation")
+        if learned.terminal_response is None:
+            raise RuntimeError("terminal project omitted exact distillation response")
+        artifacts = ContentAddressedArtifacts(trial.artifacts)
+        response_sha256 = artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "agent-distillation", "sha256": response_sha256,
+        })
         return Phase1ProjectMemory(
             request.proposal,
             source_revision=hashlib.sha256(source).hexdigest(),
             actions=actions,
             host_facts=tuple(facts),
             kdb_citations=citations,
+            lessons=distillation.lessons,
+            no_new_knowledge=distillation.no_new_knowledge,
+            admitted_artifact_sha256=distillation.admitted_artifact_sha256,
+            artifact_store=trial.artifacts.relative_to(request.memory_path).as_posix(),
         )
 
     def _run_recovery_starter(self, request, runtime, backend, ledger) -> str | None:
@@ -243,7 +277,7 @@ class ProductionProjectExecutor:
         if request.proposal.evidence_preset.value not in {
             "correctness-timing", "msprof-guided",
         }:
-            return []
+            return [], {}
         variant = runtime.run_study(
             self.execution_backend,
             trial.workspace,
@@ -274,13 +308,14 @@ class ProductionProjectExecutor:
         for timing in result.timing:
             evidence.extend(timing.evidence_sha256)
         evidence.extend(metric.evidence_manifest_sha256 for metric in result.metrics)
-        return [
+        facts = [
             HostFact("profiling", "registered performance study completed", digest)
             for digest in evidence
         ] or [HostFact(
             "profiling", "registered performance study completed",
             canonical_digest(payload),
         )]
+        return facts, {artifact_sha256: "performance-study"}
 
     @staticmethod
     def _study_attempt_id(request: LiveProjectRequest, trial) -> str:
