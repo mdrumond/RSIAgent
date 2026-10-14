@@ -11,6 +11,7 @@ from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel, A5ModelIdentity
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
+from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
 from benchmarks.a5kernels.trial import (
     _ACTION_NUDGE,
     _SYSTEM_PROMPT,
@@ -48,6 +49,14 @@ _DIRECT_VALUES = {
 }
 
 _PROVIDER_TIMEOUT_SECONDS = 120
+
+DISTILLATION_PROMPT = """The host has now returned the terminal result. Distill only
+reusable knowledge supported by the admitted artifacts below. Respond with exactly
+one JSON object and no prose:
+{"distillation":{"no_new_knowledge":false,"lessons":[{"category":"api|shape|control-flow|data-movement|performance|failure-repair|correctness|unknown","claim":"...","applicability":"...","preconditions":"...","limitations":"...","evidence_artifact_sha256":["lowercase sha256"],"failure_signature":null,"repair":null,"confidence":"low|medium|high"}]}}
+Set no_new_knowledge to true and lessons to [] when the project established no new
+reusable knowledge. Host facts remain host-owned. Compilation and profiling alone
+do not establish correctness. Cite only hashes in this admitted artifact map:"""
 
 
 @dataclass(frozen=True)
@@ -275,19 +284,28 @@ class DirectActorDriver:
                 observation = outcome.observation
                 if outcome.terminal:
                     messages.append({"role": "user", "content": observation})
-                    recorder.request(profile, messages, stage="post-terminal", turn=turn)
+                    messages.append({
+                        "role": "user",
+                        "content": DISTILLATION_PROMPT + "\n" + json.dumps(
+                            dict(outcome.admitted_artifacts),
+                            sort_keys=True, separators=(",", ":"),
+                        ),
+                    })
+                    recorder.request(profile, messages, stage="distillation", turn=turn)
                     try:
                         terminal = self.provider.complete(profile, messages)
                     except Exception as exc:
-                        recorder.failure(exc, stage="post-terminal", turn=turn)
+                        recorder.failure(exc, stage="distillation", turn=turn)
                         return ActorOutcome(outcome.status, turn, tokens)
-                    recorder.response(
-                        terminal.text, stage="post-terminal", turn=turn,
-                    )
+                    recorder.response(terminal.text, stage="distillation", turn=turn)
                     tokens += terminal.completion_tokens
+                    distillation = parse_agent_distillation(
+                        terminal.text, outcome.admitted_artifacts
+                    )
                     return ActorOutcome(
                         outcome.status, turn, tokens,
                         terminal_response=terminal.text,
+                        distillation=distillation,
                     )
             messages.append({"role": "user", "content": observation})
         return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
@@ -295,6 +313,7 @@ class DirectActorDriver:
 
 __all__ = [
     "DirectActorDriver",
+    "DISTILLATION_PROMPT",
     "DirectCompletion",
     "DirectCompletionProvider",
     "DirectModelProfile",

@@ -33,7 +33,11 @@ from benchmarks.a5kernels.phase1_live import (
     MAX_INFRASTRUCTURE_RETRIES,
     InfrastructureFailure,
 )
-from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
+from benchmarks.a5kernels.phase1_memory import (
+    AgentDistillation,
+    HostFact,
+    Phase1ProjectMemory,
+)
 from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.phase1_provider import (
     DirectActorDriver,
@@ -189,12 +193,18 @@ class ProductionProjectExecutor:
             and isinstance(entry.payload.get("action"), str)
         )
         citations = self._citations(knowledge)
+        distillation = trial.outcome.distillation
+        if not isinstance(distillation, AgentDistillation):
+            raise RuntimeError("terminal project omitted structured distillation")
         return Phase1ProjectMemory(
             request.proposal,
             source_revision=hashlib.sha256(source).hexdigest(),
             actions=actions,
             host_facts=tuple(facts),
             kdb_citations=citations,
+            lessons=distillation.lessons,
+            no_new_knowledge=distillation.no_new_knowledge,
+            admitted_artifact_sha256=distillation.admitted_artifact_sha256,
         )
 
     def _run_recovery_starter(self, request, runtime, backend, ledger) -> str | None:

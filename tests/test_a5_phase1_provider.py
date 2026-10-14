@@ -14,6 +14,7 @@ from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_provider import (
+    DISTILLATION_PROMPT,
     DirectActorDriver,
     DirectCompletion,
     DirectCompletionProvider,
@@ -31,6 +32,27 @@ ENVIRONMENT = {
     "DEEPSEEK_API_KEY": "deepseek-secret",
 }
 SOURCE = "agent source"
+ADMITTED = "a" * 64
+NO_NEW_DISTILLATION = (
+    '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
+)
+
+
+def _distillation(*, evidence=ADMITTED, category="correctness"):
+    return json.dumps({"distillation": {
+        "no_new_knowledge": False,
+        "lessons": [{
+            "category": category,
+            "claim": "The submitted padded vector add passed host verification.",
+            "applicability": "This exact registered padded vector-add contract.",
+            "preconditions": "The host uses the retained source and dimensions.",
+            "limitations": "No claim is made for other shapes.",
+            "evidence_artifact_sha256": [evidence],
+            "failure_signature": None,
+            "repair": None,
+            "confidence": "high",
+        }],
+    }}, sort_keys=True, separators=(",", ":"))
 
 
 def test_openai_transport_bounds_each_attempt_and_disables_sdk_retries(monkeypatch):
@@ -221,7 +243,7 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(t
         "not-json",
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
         '{"submit":{}}',
-        '{"distillation":"done"}',
+        NO_NEW_DISTILLATION,
     ], calls)
     actor = DirectActorDriver(provider)
     seen = []
@@ -278,7 +300,7 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_pa
     calls = []
     provider = _scripted_provider([
         '{"submit":{}}',
-        '{"distillation":"host result received"}',
+        _distillation(),
     ], calls)
     actor = DirectActorDriver(provider, max_turns=1)
 
@@ -293,14 +315,21 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_pa
         workspace=workspace,
         context=tmp_path / "trial/context",
         turn_parser=parse_trial_action,
-        action_executor=lambda _action: ActionOutcome(terminal, terminal=True),
+        action_executor=lambda _action: ActionOutcome(
+            terminal, terminal=True,
+            admitted_artifacts={ADMITTED: "host-verification"},
+        ),
     )
 
     assert len(calls) == 2
-    assert calls[-1]["request"]["messages"][-1] == {
+    assert calls[-1]["request"]["messages"][-2] == {
         "role": "user", "content": terminal,
     }
-    assert outcome.terminal_response == '{"distillation":"host result received"}'
+    prompt = calls[-1]["request"]["messages"][-1]
+    assert prompt["role"] == "user"
+    assert DISTILLATION_PROMPT in prompt["content"]
+    assert ADMITTED in prompt["content"]
+    assert outcome.terminal_response == _distillation()
     assert outcome.tokens == 4
 
 
@@ -339,6 +368,30 @@ def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("response,match", [
+    ('{"distillation":{"no_new_knowledge":true,"lessons":[],"extra":1}}',
+     "distillation response"),
+    (_distillation(evidence="b" * 64), "admitted artifact"),
+    (_distillation(category="correctness"), "correctness"),
+])
+def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match):
+    # The last case deliberately admits only compile evidence, which cannot
+    # establish correctness even when its digest is genuine.
+    provider = _scripted_provider(['{"submit":{}}', response], [])
+    actor = DirectActorDriver(provider, max_turns=1)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+
+    with pytest.raises(ValueError, match=match):
+        actor(
+            "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+            workspace=None, context=None, turn_parser=parse_trial_action,
+            action_executor=lambda _action: ActionOutcome(
+                '{"host":{"event":"submitted","passed":true}}',
+                terminal=True, admitted_artifacts={ADMITTED: "compile"},
+            ),
+        )
+
+
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
 def test_every_registered_project_family_can_use_the_bound_trial_executor(
     tmp_path, proposal
@@ -349,7 +402,7 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
         '{"run":{}}',
         '{"submit":{}}',
-        '{"distillation":"done"}',
+        NO_NEW_DISTILLATION,
     ], calls)
     backend = FakeBackend()
     knowledge = KnowledgeAgent(
@@ -393,8 +446,8 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
     assert artifacts.read_bytes(by_role["candidate-source"]).decode() == SOURCE
     assert artifacts.read_bytes(by_role["final-source"]).decode() == SOURCE
-    assert artifacts.read_bytes(by_role["post-terminal-response"]).decode() == (
-        '{"distillation":"done"}'
+    assert artifacts.read_bytes(by_role["agent-distillation"]).decode() == (
+        NO_NEW_DISTILLATION
     )
     assert artifacts.verify()
     retained_bytes = b"".join(path.read_bytes()

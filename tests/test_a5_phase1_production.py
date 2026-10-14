@@ -216,13 +216,35 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         '{"run":{}}',
         '{"request-profile":{}}',
         '{"submit":{}}',
-        '{"distillation":"done"}',
     ])
     provider_calls = []
 
     def transport(**kwargs):
         provider_calls.append(kwargs)
-        return DirectCompletion(next(replies), 2)
+        try:
+            response = next(replies)
+        except StopIteration:
+            prompt = kwargs["request"]["messages"][-1]["content"]
+            admitted = json.loads(prompt.rsplit("\n", 1)[-1])
+            evidence = next(
+                digest for digest, role in admitted.items()
+                if role == "host-verification"
+            )
+            response = json.dumps({"distillation": {
+                "no_new_knowledge": False,
+                "lessons": [{
+                    "category": "correctness",
+                    "claim": "The submitted source passed the registered host oracle.",
+                    "applicability": "The exact registered vector-add dimensions.",
+                    "preconditions": "Use the retained source and host contract.",
+                    "limitations": "This does not generalize to other shapes.",
+                    "evidence_artifact_sha256": [evidence],
+                    "failure_signature": None,
+                    "repair": None,
+                    "confidence": "high",
+                }],
+            }})
+        return DirectCompletion(response, 2)
 
     profile_backend = TrialProfileBackend()
     executor = ProductionProjectExecutor(
@@ -254,6 +276,11 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     )
 
     assert memory.host_facts[0].category == "host-verification"
+    assert memory.no_new_knowledge is False
+    assert memory.lessons[0].category == "correctness"
+    assert memory.lessons[0].evidence_artifact_sha256[0] in (
+        memory.admitted_artifact_sha256
+    )
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     instruction = provider_calls[0]["request"]["messages"][1]["content"]

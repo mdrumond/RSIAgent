@@ -67,6 +67,101 @@ class AgentInterpretation:
             raise ValueError("interpretation supports must be evidence SHA-256 values")
 
 
+_LESSON_CATEGORIES = {
+    "api", "shape", "control-flow", "data-movement", "performance",
+    "failure-repair", "correctness", "unknown",
+}
+_CONFIDENCE = {"low", "medium", "high"}
+
+
+@dataclass(frozen=True)
+class AgentLesson:
+    """Compact agent inference whose exact evidence remains in artifact storage."""
+
+    category: str
+    claim: str
+    applicability: str
+    preconditions: str
+    limitations: str
+    evidence_artifact_sha256: tuple[str, ...]
+    failure_signature: str | None
+    repair: str | None
+    confidence: str
+
+    def __post_init__(self) -> None:
+        if self.category not in _LESSON_CATEGORIES:
+            raise ValueError("agent lesson category is not recognized")
+        for name in ("claim", "applicability", "preconditions", "limitations"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"agent lesson {name} must be non-empty")
+        if type(self.evidence_artifact_sha256) is not tuple or not self.evidence_artifact_sha256:
+            raise TypeError("agent lesson evidence must be a non-empty tuple")
+        if any(not isinstance(item, str) or not _SHA256.fullmatch(item)
+               for item in self.evidence_artifact_sha256):
+            raise ValueError("agent lesson evidence must contain artifact SHA-256 values")
+        for name in ("failure_signature", "repair"):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"agent lesson {name} must be null or non-empty")
+        if self.confidence not in _CONFIDENCE:
+            raise ValueError("agent lesson confidence is not recognized")
+
+
+@dataclass(frozen=True)
+class AgentDistillation:
+    no_new_knowledge: bool
+    lessons: tuple[AgentLesson, ...]
+    admitted_artifact_sha256: tuple[str, ...]
+
+
+def parse_agent_distillation(
+    text: str, admitted_artifacts: Mapping[str, str]
+) -> AgentDistillation:
+    """Parse one exact terminal-learning response against host admissions."""
+
+    try:
+        value = json.loads(text)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid structured distillation response") from exc
+    if not isinstance(value, Mapping) or set(value) != {"distillation"}:
+        raise ValueError("invalid structured distillation response")
+    body = value["distillation"]
+    if not isinstance(body, Mapping) or set(body) != {"no_new_knowledge", "lessons"}:
+        raise ValueError("invalid structured distillation response")
+    no_new = body["no_new_knowledge"]
+    raw_lessons = body["lessons"]
+    if type(no_new) is not bool or not isinstance(raw_lessons, list) or len(raw_lessons) > 16:
+        raise ValueError("invalid structured distillation response")
+    fields = {
+        "category", "claim", "applicability", "preconditions", "limitations",
+        "evidence_artifact_sha256", "failure_signature", "repair", "confidence",
+    }
+    lessons = []
+    for item in raw_lessons:
+        if (not isinstance(item, Mapping) or set(item) != fields
+                or not isinstance(item["evidence_artifact_sha256"], list)):
+            raise ValueError("invalid structured distillation response")
+        try:
+            lesson = AgentLesson(**{
+                **item,
+                "evidence_artifact_sha256": tuple(item["evidence_artifact_sha256"]),
+            })
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid structured distillation response") from exc
+        unsupported = set(lesson.evidence_artifact_sha256) - set(admitted_artifacts)
+        if unsupported:
+            raise ValueError("agent lesson cites an unadmitted artifact")
+        if (lesson.category == "correctness"
+                and not any(admitted_artifacts[digest] == "host-verification"
+                            for digest in lesson.evidence_artifact_sha256)):
+            raise ValueError("correctness requires host-verification evidence")
+        lessons.append(lesson)
+    if no_new != (not lessons):
+        raise ValueError("no_new_knowledge must be true exactly when lessons are empty")
+    return AgentDistillation(no_new, tuple(lessons), tuple(sorted(admitted_artifacts)))
+
+
 @dataclass(frozen=True)
 class Phase1ProjectMemory:
     """One completed project's durable, evidence-labelled learning payload."""
@@ -77,6 +172,9 @@ class Phase1ProjectMemory:
     host_facts: tuple[HostFact, ...]
     interpretations: tuple[AgentInterpretation, ...] = ()
     kdb_citations: tuple[Citation, ...] = ()
+    lessons: tuple[AgentLesson, ...] = ()
+    no_new_knowledge: bool = True
+    admitted_artifact_sha256: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.proposal, CurriculumProposal):
@@ -97,6 +195,20 @@ class Phase1ProjectMemory:
             raise TypeError("interpretations must be a tuple")
         if not all(isinstance(item, AgentInterpretation) for item in self.interpretations):
             raise TypeError("interpretations must contain AgentInterpretation values")
+        if type(self.lessons) is not tuple or not all(
+            isinstance(item, AgentLesson) for item in self.lessons
+        ):
+            raise TypeError("lessons must contain AgentLesson values in a tuple")
+        if type(self.no_new_knowledge) is not bool or self.no_new_knowledge != (not self.lessons):
+            raise ValueError("no_new_knowledge must be explicit and match agent lessons")
+        if type(self.admitted_artifact_sha256) is not tuple or any(
+            not isinstance(item, str) or not _SHA256.fullmatch(item)
+            for item in self.admitted_artifact_sha256
+        ):
+            raise TypeError("admitted artifacts must be a tuple of SHA-256 values")
+        admitted = set(self.admitted_artifact_sha256)
+        if any(set(item.evidence_artifact_sha256) - admitted for item in self.lessons):
+            raise ValueError("agent lessons may cite only admitted project artifacts")
         if type(self.kdb_citations) is not tuple:
             raise TypeError("kdb_citations must be a tuple")
         if not all(isinstance(item, Citation) for item in self.kdb_citations):
@@ -126,6 +238,12 @@ class Phase1ProjectMemory:
             "host_facts": [asdict(item) for item in self.host_facts],
             "agent_interpretations": [asdict(item) for item in self.interpretations],
             "kdb_citations": [asdict(item) for item in self.kdb_citations],
+            "agent_lessons": [{
+                **asdict(item),
+                "evidence_artifact_sha256": list(item.evidence_artifact_sha256),
+            } for item in self.lessons],
+            "no_new_knowledge": self.no_new_knowledge,
+            "admitted_artifact_sha256": list(self.admitted_artifact_sha256),
         }
 
     @classmethod
@@ -134,7 +252,11 @@ class Phase1ProjectMemory:
             "proposal", "source_revision", "actions", "host_facts",
             "agent_interpretations", "kdb_citations",
         }
-        if not isinstance(value, Mapping) or set(value) != required:
+        layered = {
+            "agent_lessons", "no_new_knowledge", "admitted_artifact_sha256",
+        }
+        if (not isinstance(value, Mapping)
+                or frozenset(value) not in {frozenset(required), frozenset(required | layered)}):
             raise ValueError("invalid Phase 1 project memory fields")
         try:
             actions = value["actions"]
@@ -152,6 +274,13 @@ class Phase1ProjectMemory:
                 for item in interpretations
             ):
                 raise TypeError("interpretation supports must be a JSON array")
+            raw_lessons = value.get("agent_lessons", [])
+            admitted = value.get("admitted_artifact_sha256", [])
+            if not isinstance(raw_lessons, list) or not isinstance(admitted, list):
+                raise TypeError("layered project memory collections must be JSON arrays")
+            lessons = tuple(AgentLesson(**{
+                **item, "evidence_artifact_sha256": tuple(item["evidence_artifact_sha256"]),
+            }) for item in raw_lessons)
             return cls(
                 proposal=CurriculumProposal.from_mapping(value["proposal"]),
                 source_revision=value["source_revision"],
@@ -165,6 +294,9 @@ class Phase1ProjectMemory:
                     for item in interpretations
                 ),
                 kdb_citations=tuple(Citation(**item) for item in citations),
+                lessons=lessons,
+                no_new_knowledge=value.get("no_new_knowledge", True),
+                admitted_artifact_sha256=tuple(admitted),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("invalid Phase 1 project memory payload") from exc
