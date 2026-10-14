@@ -182,6 +182,25 @@ _CLAIM_WORDS = {
     ),
 }
 
+_ARTIFACT_LAYER_BY_ROLE = {
+    "actor-instruction": "prompts",
+    "actor-system-prompt": "prompts",
+    "action-payload": "actions",
+    "host-observation": "host_observations",
+    "candidate-source": "source",
+    "final-source": "source",
+    "candidate-diff": "source",
+    "final-profile": "profile",
+    "performance-study": "profile",
+    "agent-distillation": "memory",
+    "knowledge-query": "knowledge_queries",
+}
+
+_ARTIFACT_LAYER_BY_FIELD = {
+    "instruction_artifact_sha256": "prompts",
+    "payload_artifact_sha256": "actions",
+}
+
 
 def _walk(value: object, pointer: str = ""):
     if isinstance(value, Mapping):
@@ -222,11 +241,29 @@ def _content_review(
         for record_index, value in enumerate(_json_values(relative, data)):
             matched = set()
             for pointer, node in _walk(value):
+                role = node.get("role")
+                role_digest = node.get("sha256")
+                if (
+                    isinstance(role, str)
+                    and isinstance(role_digest, str)
+                    and (layer := _ARTIFACT_LAYER_BY_ROLE.get(role)) is not None
+                ):
+                    references.append(role_digest)
+                    records[layer] += 1
+                    matched.add(layer)
                 for key, item in node.items():
                     if key in {"entry_sha256", "record_sha256"} and isinstance(item, str):
                         definitions.add(item)
-                    if key.endswith("evidence_sha256") and isinstance(item, str):
+                    if (
+                        isinstance(item, str)
+                        and key != "sha256"
+                        and (key.endswith("evidence_sha256")
+                             or key.endswith("artifact_sha256"))
+                    ):
                         references.append(item)
+                        if (layer := _ARTIFACT_LAYER_BY_FIELD.get(key)) is not None:
+                            records[layer] += 1
+                            matched.add(layer)
                     if key in {"prompt", "system_prompt", "instructions"}:
                         records["prompts"] += 1
                         matched.add("prompts")
@@ -343,7 +380,7 @@ def archive_baselines(spec: ArchiveSpec, destination: Path) -> dict[str, object]
             if "evidence" in base and relative.endswith((".json", ".jsonl")):
                 signals["evidence_records"] += len(values)
             signals["interpretations"] += sum(_interpretation_count(v) for v in values)
-            signals["candidate_sources"] += base == "candidate.py"
+            signals["candidate_sources"] += base in {"candidate.py", "kernel.py"}
             signals["profile_artifacts"] += "profile" in base
         audits.append({
             "campaign_id": campaign.campaign_id,

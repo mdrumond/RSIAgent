@@ -102,6 +102,64 @@ def test_archive_is_deterministic_content_addressed_and_source_immutable(tmp_pat
     assert len([item for item in objects if item.is_file()]) == 7
 
 
+def test_review_resolves_content_addressed_roles_and_kernel_source_names(tmp_path):
+    root = tmp_path / "inputs" / "p1"
+    instruction = b"write a kernel"
+    source = b"import catlass.tla as tla\n"
+    observation = b'{"host":{"event":"submitted","passed":true}}'
+    refs = {
+        "instruction": hashlib.sha256(instruction).hexdigest(),
+        "source": hashlib.sha256(source).hexdigest(),
+        "observation": hashlib.sha256(observation).hexdigest(),
+    }
+    for name, content in (
+        (refs["instruction"], instruction),
+        (refs["source"], source),
+        (refs["observation"], observation),
+    ):
+        write(root / "artifacts/objects" / name[:2] / name[2:], content)
+    records = [
+        {"kind": "request", "payload": {
+            "instruction_artifact_sha256": refs["instruction"],
+        }},
+        {"kind": "artifact", "payload": {
+            "role": "final-source", "sha256": refs["source"],
+        }},
+        {"kind": "artifact", "payload": {
+            "role": "host-observation", "sha256": refs["observation"],
+        }},
+    ]
+    write(root / "evidence.jsonl", b"".join(
+        json.dumps(record, sort_keys=True).encode() + b"\n" for record in records
+    ))
+    write(root / "workspace/kernel.py", source)
+    value = {
+        "campaigns": [{
+            "id": "phase1-cas", "phase": "phase1", "root": str(root),
+            "model": "openai", "treatments": {"kdb": "disabled"},
+        }],
+        "known_missing": [],
+    }
+
+    archive_baselines(load_archive_spec(value), tmp_path / "archive")
+    review = json.loads(
+        (tmp_path / "archive/derived/review.json").read_text(encoding="utf-8")
+    )["campaigns"][0]
+    audit = json.loads(
+        (tmp_path / "archive/derived/audit.json").read_text(encoding="utf-8")
+    )["campaigns"][0]
+
+    assert review["evidence_linkage"] == {
+        "archive_resolved_count": 3,
+        "reference_count": 3,
+        "unresolved_count": 0,
+    }
+    assert review["retained_layers"]["prompts"]["record_count"] == 1
+    assert review["retained_layers"]["source"]["record_count"] == 1
+    assert review["retained_layers"]["host_observations"]["record_count"] == 1
+    assert audit["signals"]["candidate_sources"] == 1
+
+
 def test_audit_is_symmetric_and_declares_missing_historical_material(tmp_path):
     result = archive_baselines(load_archive_spec(spec(tmp_path)), tmp_path / "archive")
     audit = json.loads((tmp_path / "archive/derived/audit.json").read_text())
