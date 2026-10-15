@@ -1,5 +1,6 @@
 import io
 import json
+from pathlib import Path
 import zipfile
 
 import pytest
@@ -72,6 +73,15 @@ def test_ranked_fallback_pagination_and_code_deduplication(tmp_path):
     assert len(result["skipped"]) == 2
     assert "Duplicate" in result["skipped"][1]["reason"]
     assert result["sources"][0]["license_files"] == ["LICENSE"]
+    for item in result["sources"]:
+        assert item["status"] == "complete"
+        assert item["licenses"] == ["LICENSE"]
+        assert item["kernel_languages"] == ["common"]
+        assert len(item["revision"]) == 64
+        for record in item["files"]:
+            data = (Path(item["root"]) / record["path"]).read_bytes()
+            assert record["bytes"] == len(data)
+            assert record["sha256"] == source.digest(data)
     assert (tmp_path / "sources/exp/rank-2-job1/kernel.py").read_text() == "first"
 
 
@@ -112,3 +122,13 @@ def test_only_published_source_pointers_are_followed():
     assert source.candidate_urls({"submission_download_url": "/download",
                                   "submission": {"download_url": "/download"}}) == [
                                       source.BASE + "/download"]
+
+
+@pytest.mark.parametrize(("code", "expected"), [
+    ('#include "kernel_operator.h"\nAscendC::DataCopy(x,y,n);', ["ascend-c"]),
+    ("import triton\n@triton.jit\ndef kernel(): pass", ["triton"]),
+    ("from catlass import tla\n@tla.kernel()\ndef kernel(): pass", ["catlass-dsl"]),
+    ("from pypto import jit\n@jit\ndef kernel(): pass", ["common"]),
+])
+def test_kernel_language_is_derived_from_code_not_a3_label(code, expected):
+    assert source.kernel_languages({"kernel.py": code.encode()}) == expected

@@ -21,7 +21,11 @@ Unrelated public implementations are not substituted for ranked submissions.
 `inventory.json` contains integration-ready `sources` and operator coverage.
 Each source records rank, published score, job/submission identity, original
 download URL, bundle digest, extracted-file hashes, local root, and any bundled
-license files. An absent license is reported as an empty list, not an inferred
+license files. Available sources declare `status: complete`, each file includes
+its byte length, and `licenses` lists retained license paths (`license_files`
+is a compatibility alias). Kernel languages are inferred from explicit code
+markers, defaulting to `common` when unknown, never from the A3 target alone.
+An absent license is reported as an empty list, not an inferred
 license grant. `revision` is the downloaded archive SHA-256, not a Git commit.
 Text wrappers, headers, and licenses remain with kernel code. Duplicate code
 for the selected operator does not fill another of its three slots.

@@ -100,6 +100,19 @@ def candidate_urls(job: dict) -> list[str]:
     return list(dict.fromkeys(result))
 
 
+def kernel_languages(files: dict[str, bytes]) -> list[str]:
+    """Classify from implementation markers, not benchmark target or filenames."""
+    text = "\n".join(value.decode("utf-8") for name, value in files.items()
+                     if Path(name).suffix.lower() in CODE)
+    markers = {
+        "ascend-c": r"\bAscendC::|#\s*include\s*[<\"]kernel_operator\.h[>\"]",
+        "triton": r"(?m)^\s*(?:from\s+triton(?:\.|\s)|import\s+triton\b)|@triton\.jit\b",
+        "catlass-dsl": r"(?m)^\s*(?:from\s+catlass(?:\.|\s)|import\s+catlass\b)|@tla\.kernel\b",
+    }
+    return sorted(language for language, pattern in markers.items()
+                  if re.search(pattern, text)) or ["common"]
+
+
 def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], str]:
     """Retain text wrappers and licenses; identify this operator's code."""
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -192,15 +205,19 @@ def acquire_operator(operator: dict, archive: PublicArchive, root: Path,
                 path = destination / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
-                file_records.append({"path": relative, "sha256": digest(content)})
+                file_records.append({"path": relative, "sha256": digest(content),
+                                     "bytes": len(content)})
+            licenses = [f["path"] for f in file_records
+                        if Path(f["path"]).name.upper().startswith(("LICENSE", "COPYING"))]
             source = {"name": f"cannbench-{name}-{job_id}", "repository": url,
+                      "status": "complete", "document_language": "mixed",
+                      "kernel_languages": kernel_languages(files),
                       "revision": response["sha256"], "root": str(destination.resolve()),
                       "files": file_records, "operator": name, "rank": rank,
                       "score": entry.get("score"), "job_id": job_id,
                       "submission_id": job.get("submission_id"),
                       "implementation_sha256": identity, "reference_exposed": True,
-                      "license_files": [f["path"] for f in file_records
-                                        if Path(f["path"]).name.upper().startswith(("LICENSE", "COPYING"))]}
+                      "licenses": licenses, "license_files": licenses}
             save_json(destination / "source-manifest.json", source)
             accepted.append(source)
             break
