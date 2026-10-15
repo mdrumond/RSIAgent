@@ -504,9 +504,11 @@ class KnowledgeDB:
         fts_table = self._fts_table_name(collection)
         if collection_row["fts_table"] != fts_table:
             raise RuntimeError(f"invalid FTS metadata for collection {collection!r}")
+        # FTS must drive this join: a chunks-first plan repeats MATCH once per
+        # source chunk and becomes prohibitively slow on full repositories.
         lexical_rows = [] if lexical_query is None else self.connection.execute(
             f"""SELECT c.*, bm25({fts_table}) AS lexical_score
-               FROM {fts_table} JOIN chunks c ON c.rowid = {fts_table}.rowid
+               FROM {fts_table} CROSS JOIN chunks c ON c.rowid = {fts_table}.rowid
                WHERE {fts_table} MATCH ? AND c.collection = ?
                ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?""",
             (lexical_query, collection, candidate_limit),
