@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import re
 from typing import Mapping
+from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
 
 
 PLAN_SCHEMA = "a5-catlass-phase1-experiment-plan-v2"
@@ -194,6 +195,7 @@ class A5Phase1Cell:
     guide: ProgrammingGuideIdentity
     target: A5Target = A5Target.A5
     language: A5Language = A5Language.CATLASS_DSL
+    profiling_guide: ProfilingGuidanceIdentity | None = None
 
     def __post_init__(self) -> None:
         typed = (
@@ -208,11 +210,16 @@ class A5Phase1Cell:
             raise ValueError("cell dimensions must use registered A5 types")
         if self.model != _MODEL_BY_BACKEND.get(self.model.backend_model):
             raise ValueError("cell model must use a registered A5 profile")
+        if self.profiling_guide is not None and (
+            self.profiling is not ProfilingGuidance.NEW
+            or not isinstance(self.profiling_guide, ProfilingGuidanceIdentity)
+        ):
+            raise ValueError("explicit profiling guide belongs only to the new treatment")
         if self.cell_id != _cell_id(self.identity_values()):
             raise ValueError("cell_id does not match its A5 Phase 1 dimensions")
 
     def identity_values(self) -> dict[str, object]:
-        return {
+        values = {
             "target": self.target.value,
             "language": self.language.value,
             "model": self.model.as_dict(),
@@ -220,9 +227,14 @@ class A5Phase1Cell:
             "profiling": self.profiling.value,
             "guide": self.guide.as_dict(),
         }
+        if self.profiling_guide is not None:
+            values["profiling_guide"] = self.profiling_guide.as_dict()
+        return values
 
     @property
     def status(self) -> TreatmentStatus:
+        if self.profiling is ProfilingGuidance.NEW and self.profiling_guide is not None:
+            return TreatmentStatus.READY
         return _PROFILING_STATUS[self.profiling]
 
     @property
@@ -296,7 +308,7 @@ class A5Phase1Plan:
         return tuple(cell for cell in self.cells if not cell.runnable)
 
 
-def build_cells(guide: ProgrammingGuideIdentity) -> tuple[A5Phase1Cell, ...]:
+def build_cells(guide: ProgrammingGuideIdentity, *, profiling_guide: ProfilingGuidanceIdentity | None = None) -> tuple[A5Phase1Cell, ...]:
     if not isinstance(guide, ProgrammingGuideIdentity):
         raise ValueError("guide must be an admitted ProgrammingGuideIdentity")
     cells = []
@@ -311,9 +323,13 @@ def build_cells(guide: ProgrammingGuideIdentity) -> tuple[A5Phase1Cell, ...]:
                     "profiling": profiling.value,
                     "guide": guide.as_dict(),
                 }
+                admitted = profiling_guide if profiling is ProfilingGuidance.NEW else None
+                if admitted is not None:
+                    dimensions["profiling_guide"] = admitted.as_dict()
                 cells.append(
                     A5Phase1Cell(
-                        _cell_id(dimensions), model, knowledge, profiling, guide
+                        _cell_id(dimensions), model, knowledge, profiling, guide,
+                        profiling_guide=admitted,
                     )
                 )
     return tuple(cells)
