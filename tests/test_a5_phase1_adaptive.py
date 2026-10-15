@@ -401,3 +401,25 @@ def test_cli_uses_explicit_production_factory_and_reports_json(tmp_path, capsys)
     ) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "RUNNING"
     assert seen == ["binding:build"]
+
+
+def test_target_stops_and_resume_with_larger_target_preserves_memory(tmp_path):
+    counter = 0
+    def complete(messages):
+        nonlocal counter
+        counter += 1
+        item = _project(f"project-{counter}", "gm-ub-movement")
+        item["learning_focus"] = ["pipe-mte2" if counter == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [item])
+    def execute(request):
+        return _result(request.spec, True, "verified")
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    first = campaign(1).run()
+    assert first["status"] == "TARGET_REACHED"
+    second = campaign(2).resume()
+    assert second["successful_projects"] == 2
+    assert second["published_projects"][0] == first["published_projects"][0]
+    assert "pipe-mte2" not in second["coverage_gaps"]
+    assert "pipe-mte3" not in second["coverage_gaps"]

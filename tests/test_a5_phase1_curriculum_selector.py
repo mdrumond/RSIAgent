@@ -224,7 +224,6 @@ def test_decisions_are_strict(reply):
 @pytest.mark.parametrize("bad_project", [
     project("gdn-study"),
     project("bsa-study"),
-    project("matmul-study"),
     {**project(), "source": "kernel code"},
     {**project(), "command": "python run.py"},
 ])
@@ -443,3 +442,18 @@ def test_held_out_names_are_rejected_in_graph_identifiers():
     })
     with pytest.raises(ValueError, match="held-out"):
         CurriculumAgent(lambda _: wave([item])).select(context())
+
+
+def test_long_explanations_and_distinct_learning_focus_are_admitted():
+    first = project("matmul-study", hypothesis=("Question: matrix multiplication. " * 80).strip(),
+                    learning_focus=["sync-correctness"])
+    second = project("performance", learning_focus=["sync-performance"])
+    decision, _ = CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert len(decision.wave.projects) == 2
+    assert decision.wave.projects[0].spec.hypothesis == first["hypothesis"].strip()
+
+
+def test_wave_cannot_overshoot_remaining_target():
+    reply = wave([project(), project("second", learning_focus=["debug-print"])])
+    with pytest.raises(ValueError, match="remaining project target"):
+        CurriculumAgent(lambda _: reply).select(context(remaining_projects=1))

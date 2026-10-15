@@ -165,7 +165,7 @@ def _request(tmp_path, executor, spec=None):
     )
 
 
-def test_measurement_requires_verified_current_source_and_discards_stale_facts(tmp_path):
+def test_measurement_requires_verified_current_source_and_preserves_comparison_facts(tmp_path):
     from benchmarks.a5kernels.trial import parse_trial_action
     assert parse_trial_action('{"request-timing":{}}').kind == "request-timing"
     executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
@@ -547,3 +547,29 @@ def test_retained_performance_and_profile_evidence_complete_treatment_project(
     assert HostFact("profiling", "timeline retained", profiling) in (
         result.memory.host_facts
     )
+
+
+def test_two_correct_source_variants_retain_paired_measurements(tmp_path):
+    class CorrectVariants(SourceBackend):
+        def run(self, request, compilation):
+            return RuntimeObservation(True, canonical_digest({"run": request.candidate_source}),
+                                      "verified", request.expected.storage)
+    executor = ProjectExecutor(CorrectVariants(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    def timing(payload, context):
+        digest = context.artifacts.put_json({"source": context.source, "median_us": 3})
+        return AdaptiveActionResult({"passed": True},
+            host_facts=(HostFact("performance-study", context.source, digest),),
+            admitted_artifacts={digest: "performance-study"})
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"request-timing":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source variant"}}',
+        '{"run":{}}', '{"submit":{}}',
+        '{"request-timing":{}}', '{"submit":{}}',
+    ))
+    result = AdaptiveActorProjectExecutor(executor, actor, object(), request_timing=timing)(
+        _request(tmp_path, executor, _special_spec(timing=True)))
+    assert actor.observations[5]["missing"] == ["performance-study"]
+    facts = [fact for fact in result.memory.host_facts if fact.category == "performance-study"]
+    assert [fact.statement for fact in facts] == ["fixed source", "fixed source variant"]
+    assert all(fact.evidence_sha256 in result.memory.admitted_artifact_sha256 for fact in facts)

@@ -45,7 +45,6 @@ def _validated_summary(value: object) -> str:
         not isinstance(value, str)
         or not value.strip()
         or value != value.strip()
-        or len(value) > 500
     ):
         raise ValueError("adaptive result summary must be trimmed and bounded")
     return value
@@ -97,6 +96,7 @@ class AdaptivePhase1Coordinator:
         execute_project: AdaptiveProjectExecutor,
         *,
         max_parallel: int,
+        project_target: int = 64,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("objective must be non-empty")
@@ -108,6 +108,9 @@ class AdaptivePhase1Coordinator:
             raise TypeError("project executor must be callable")
         if type(max_parallel) is not int or max_parallel < 1:
             raise ValueError("max_parallel must be positive")
+        if type(project_target) is not int or project_target < 1:
+            raise ValueError("project_target must be positive")
+        self.project_target = project_target
         self.root = Path(root)
         self.objective = objective.strip()
         self.initial_memory = initial_memory
@@ -116,9 +119,12 @@ class AdaptivePhase1Coordinator:
         self.max_parallel = max_parallel
 
     def run(self) -> dict[str, object]:
-        state = self._load_state()
+        state = {**self._load_state(), "project_target": self.project_target}
+        self._atomic_json(self.root / "state.json", state)
         while True:
             if state["terminal"] is not None:
+                return self._report(state)
+            if len(state["prior_outcomes"]) >= self.project_target:
                 return self._report(state)
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
@@ -180,6 +186,7 @@ class AdaptivePhase1Coordinator:
         if not isinstance(initial_memory, bytes):
             raise TypeError("initial memory must be immutable bytes")
         reader = object.__new__(cls)
+        reader.project_target = 64
         reader.root = Path(root)
         reader.objective = objective.strip()
         reader.initial_memory = initial_memory
@@ -188,6 +195,7 @@ class AdaptivePhase1Coordinator:
             raise ValueError("retained adaptive state does not exist")
         state = reader._read_json(path)
         reader._validate_state(state)
+        reader.project_target = state.get("project_target", 64)
         return reader._report(state)
 
     def _execute(self, request: WaveProjectRequest) -> WaveProjectResult:
@@ -275,6 +283,7 @@ class AdaptivePhase1Coordinator:
                 )
                 for value in state["prior_outcomes"]
             ),
+            max(0, self.project_target - len(state["prior_outcomes"])),
         )
 
     @staticmethod
@@ -355,17 +364,29 @@ class AdaptivePhase1Coordinator:
         return {
             "status": (
                 "RECOVERY_REQUIRED" if pending is not None
+                else "TARGET_REACHED" if len(state["prior_outcomes"]) >= self.project_target
                 else "RUNNING" if terminal is None
                 else terminal["status"]
             ),
             "reason": None if terminal is None else terminal["reason"],
             "wave_index": state["wave_index"],
+            "project_target": self.project_target,
+            "successful_projects": len(state["prior_outcomes"]),
+            "unverified_projects": sum(row["status"] == "unverified" for row in pending["projects"]) if pending else 0,
+            "coverage_gaps": self._coverage_gaps(state),
             "coverage": list(state["coverage"]),
             "published_projects": [row["project_id"] for row in state["prior_outcomes"]],
             "memory": memory,
             "memory_sha256": hashlib.sha256(snapshot).hexdigest(),
             "pending_wave": pending,
         }
+
+    @staticmethod
+    def _coverage_gaps(state):
+        from benchmarks.a5kernels.phase1_curriculum import LEARNING_FOCI
+        covered = {focus for row in state["prior_outcomes"]
+                   for focus in row["spec"].get("learning_focus", ())}
+        return [focus for focus in LEARNING_FOCI if focus not in covered]
 
     def _pending_report(self, state):
         pending = self._load_pending(state)

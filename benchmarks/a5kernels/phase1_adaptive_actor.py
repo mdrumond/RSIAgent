@@ -247,12 +247,11 @@ class _ProjectActions:
         self.admitted[self.source_sha256] = "candidate-source"
         self.latest = None
         self.latest_source_sha256 = None
-        stale = {digest for digest, role in self.admitted.items()
-                 if role in {"performance-study", "profiling"}}
-        self.admitted = {digest: role for digest, role in self.admitted.items()
-                         if digest not in stale}
-        self.host_facts = [fact for fact in self.host_facts
-                           if fact.evidence_sha256 not in stale]
+        # Earlier verified variants remain available for paired comparisons, but
+        # cannot satisfy the final-source measurement gates.
+        for digest, role in tuple(self.admitted.items()):
+            if role in {"performance-study", "profiling"}:
+                self.admitted[digest] = "comparison-" + role
         return self._observation({
             "event": "candidate-written", "source_sha256": self.source_sha256,
         })
@@ -333,13 +332,15 @@ class _ProjectActions:
         for digest, role in result.admitted_artifacts.items():
             self.artifacts.read_bytes(digest)
             existing = self.admitted.get(digest)
-            if existing is not None and existing != role:
+            if existing is not None and existing not in {role, "comparison-" + role}:
                 raise ValueError("adaptive action changed an admitted artifact role")
             self.admitted[digest] = role
         for citation in result.citations:
             if citation not in self.citations:
                 self.citations.append(citation)
-        self.host_facts.extend(result.host_facts)
+        for fact in result.host_facts:
+            if fact not in self.host_facts:
+                self.host_facts.append(fact)
         return self._observation(result.observation)
 
     def _submit(self) -> ActionOutcome:
@@ -360,7 +361,7 @@ class _ProjectActions:
         ):
             missing.append(f"observed-{mode.value}")
         if (
-            self.request.spec.timing_lengths
+            (self.request.spec.timing_lengths or "sync-performance" in self.request.spec.learning_focus)
             and "performance-study" not in self.admitted.values()
         ):
             missing.append("performance-study")

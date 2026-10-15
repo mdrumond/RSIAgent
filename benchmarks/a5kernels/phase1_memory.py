@@ -168,7 +168,7 @@ def parse_agent_distillation(
                             for digest in lesson.evidence_artifact_sha256)):
             raise ValueError("correctness requires host-verification evidence")
         if (lesson.category == "performance"
-                and not any(admitted_artifacts[digest] in {"performance-study", "profiling"}
+                and not any(admitted_artifacts[digest] in {"performance-study", "profiling", "comparison-performance-study", "comparison-profiling"}
                             for digest in lesson.evidence_artifact_sha256)):
             raise ValueError("performance requires retained timing or profiling evidence")
         lessons.append(lesson)

@@ -199,8 +199,6 @@ def _measurement_action(measurements, *, profiling: bool) -> ActionDependency:
                     return AdaptiveActionResult({"error": "project has no profiling metric"})
                 result = measurements.profile(request, metric=metric)
             else:
-                if not context.request.spec.timing_lengths:
-                    return AdaptiveActionResult({"error": "project has no timing lengths"})
                 result = measurements.timing(request)
         except (InfrastructureFailure, ProjectInfrastructureError):
             raise
@@ -325,6 +323,7 @@ def build_adaptive_phase1(
     provider_transport: Transport = openai_compatible_transport,
     command_executor: BZCommandExecutor | None = None,
     max_parallel: int = 1,
+    project_target: int = 64,
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 
@@ -394,6 +393,7 @@ def build_adaptive_phase1(
         curriculum,
         project_actor,
         max_parallel=max_parallel,
+        project_target=project_target,
     )
     return AdaptivePhase1Production(
         admitted,
