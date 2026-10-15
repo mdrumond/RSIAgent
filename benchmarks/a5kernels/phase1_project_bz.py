@@ -142,6 +142,7 @@ class CatlassProjectBackend:
         files = (
             SourceFile("kernel.py", request.candidate_source),
             SourceFile("host_driver.py", _PROJECT_DRIVER),
+            SourceFile("project_diagnostics.py", _diagnostic_driver()),
             SourceFile("manifest.json", manifest_text),
         )
         identity = canonical_digest({
@@ -173,6 +174,22 @@ class CatlassProjectBackend:
                                            ("PYTHONDONTWRITEBYTECODE", "1")),
                                  unset=("PYTHONPYCACHEPREFIX",)),
         )
+
+    def diagnostic(self, request: ProjectExecutionRequest, *, tool: str) -> dict[str, object]:
+        """Run fixed diagnostic commands; their result never verifies the kernel."""
+        if tool not in {"msdebug", "memcheck", "racecheck", "initcheck", "synccheck"}:
+            raise ValueError("unsupported project diagnostic tool")
+        identity, files = self._bundle(request)
+        record, digest = self._execute(identity, files, "diagnostic-" + tool, 0)
+        if (record.get("status") != "diagnostic-observation"
+                or record.get("candidate_sha256") != hashlib.sha256(
+                    request.candidate_source.encode("utf-8")).hexdigest()
+                or type(record.get("available")) is not bool
+                or record.get("host_verified") is not False
+                or record.get("coverage") != "unconfirmed"):
+            raise ProjectInfrastructureError("host driver returned invalid diagnostic evidence")
+        return {"record": record, "evidence_sha256": digest,
+                "artifact": self.observation_payload(digest)}
 
     def observation_payload(self, digest: str) -> dict[str, object]:
         path = self._root / "cas" / digest[:2] / f"{digest}.json"
@@ -407,11 +424,17 @@ def _emit(status, diagnostic, output=None):
     print(RESULT_MARKER + json.dumps(record, separators=(",", ":"), allow_nan=False))
 
 def _main():
-    if len(sys.argv) != 10 or sys.argv[3] not in {{"compile", "run"}}:
+    if len(sys.argv) != 10 or (sys.argv[3] not in {{"compile", "run"}}
+                              and not sys.argv[3].startswith("diagnostic-")):
         raise RuntimeError("invalid project host-driver invocation")
     manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
     if manifest.get("schema") != "a5-phase1-project-v1":
         raise RuntimeError("invalid project manifest")
+    if sys.argv[3].startswith("diagnostic-"):
+        from project_diagnostics import diagnose
+        record = diagnose(sys.argv)
+        print(RESULT_MARKER + json.dumps(record, separators=(",", ":"), allow_nan=False))
+        return 0
     source, native_location, native_sha256, generated = _preflight_runtime(*sys.argv[4:])
     import catlass.tla as tla
     import torch
@@ -488,6 +511,10 @@ if __name__ == "__main__":
     except Exception as exc:
         _emit("infrastructure-failure", f"{{type(exc).__name__}}: {{exc}}")
 '''
+
+
+def _diagnostic_driver() -> str:
+    return Path(__file__).with_name("phase1_project_diagnostic_driver.py").read_text(encoding="utf-8")
 
 
 __all__ = [

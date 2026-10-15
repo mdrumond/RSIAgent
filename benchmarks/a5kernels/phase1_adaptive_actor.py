@@ -145,6 +145,11 @@ def disabled_profile_action(
     })
 
 
+def disabled_diagnostic_action(_payload, _context) -> AdaptiveActionResult:
+    return AdaptiveActionResult({"event": "diagnostic", "available": False,
+                                 "reason": "diagnostic-backend-not-bound"})
+
+
 def _same_prepared(left: PreparedProject, right: PreparedProject) -> bool:
     return (
         left.spec == right.spec
@@ -169,6 +174,7 @@ class _ProjectActions:
         query_knowledge: ActionDependency,
         request_profile: ActionDependency,
         request_timing: ActionDependency,
+        request_diagnostic: ActionDependency = disabled_diagnostic_action,
     ) -> None:
         self.executor = executor
         self.request = request
@@ -179,6 +185,7 @@ class _ProjectActions:
         self.query_knowledge = query_knowledge
         self.request_profile = request_profile
         self.request_timing = request_timing
+        self.request_diagnostic = request_diagnostic
         self.actions: list[str] = []
         self.metered_actions = 0
         self.source: str | None = None
@@ -215,6 +222,12 @@ class _ProjectActions:
             return self._measurement(self.request_profile, action.payload)
         if action.kind == "request-timing":
             return self._measurement(self.request_timing, action.payload)
+        if action.kind in {"request-debug", "request-sanitizer"}:
+            if self.source is None:
+                return self._observation({"error": "write candidate source first"})
+            return self._dependency(self.request_diagnostic, {
+                "kind": action.kind, **action.payload,
+            })
         if action.kind == "submit":
             return self._submit()
         return self._observation({
@@ -387,6 +400,7 @@ class AdaptiveActorProjectExecutor:
         query_knowledge: ActionDependency | None = None,
         request_profile: ActionDependency | None = None,
         request_timing: ActionDependency | None = None,
+        request_diagnostic: ActionDependency | None = None,
         immutable_context: bytes = b"",
     ) -> None:
         if not callable(actor):
@@ -415,9 +429,13 @@ class AdaptiveActorProjectExecutor:
         self.request_timing = (
             disabled_profile_action if request_timing is None else request_timing
         )
+        self.request_diagnostic = (
+            disabled_diagnostic_action if request_diagnostic is None else request_diagnostic
+        )
         self.immutable_context = immutable_context
         if not all(callable(action) for action in (
             self.query_knowledge, self.request_profile, self.request_timing,
+            self.request_diagnostic,
         )):
             raise TypeError("adaptive action dependencies must be callable")
 
@@ -440,8 +458,15 @@ class AdaptiveActorProjectExecutor:
             query_knowledge=self.query_knowledge,
             request_profile=self.request_profile,
             request_timing=self.request_timing,
+            request_diagnostic=self.request_diagnostic,
         )
-        opening = prepared.instruction + "\nPre-wave memory (immutable): " + json.dumps({
+        opening = ("Diagnostics: {\"request-debug\":{}} or "
+                   "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
+                   "(also racecheck/initcheck/synccheck). Available before verification. "
+                   "These retain diagnostics, never HOST_VERIFIED or timing. Tool exit zero "
+                   "does not establish Catlass instruction coverage; inspect raw report. "
+                   "Unavailable tools are reported explicitly. Do not deliberately run "
+                   "hanging kernels; bounded termination does not guarantee device recovery.\n") + prepared.instruction + "\nPre-wave memory (immutable): " + json.dumps({
             "sha256": memory_sha256,
             "base64": base64.b64encode(request.pre_wave_memory).decode("ascii"),
         }, sort_keys=True, separators=(",", ":"))
