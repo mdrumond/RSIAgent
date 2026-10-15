@@ -425,6 +425,15 @@ class TrialActionExecutor:
         ]}}
         return ActionOutcome(json.dumps(response, sort_keys=True, separators=(",", ":")))
 
+    def _request_debug(self, _payload) -> ActionOutcome:
+        return self._observation(
+            "diagnostic", available=False,
+            reason="debugger and sanitizer execution is supported by adaptive Phase 1 only",
+        )
+
+    def _request_sanitizer(self, payload) -> ActionOutcome:
+        return self._request_debug(payload)
+
     def _request_timing(self, _payload) -> ActionOutcome:
         return self._observation(
             "timing", available=False,

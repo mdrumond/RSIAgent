@@ -749,3 +749,24 @@ def test_no_kdb_catlass_opening_specifies_executable_contract():
 def test_unimplemented_trial_contracts_are_explicit(language, workload):
     with pytest.raises(CapabilityUnavailableError, match="no executable trial contract"):
         _trial_instruction(language, workload)
+
+
+@pytest.mark.parametrize("action", [
+    {"request-debug": {}},
+    {"request-sanitizer": {"tool": "memcheck"}},
+    {"request-sanitizer": {"tool": "synccheck"}},
+])
+def test_ordinary_trial_diagnostic_actions_report_unavailable_and_continue(tmp_path, action):
+    backend = FakeBackend()
+    executor = _executor(tmp_path, backend)
+    outcome = executor(parse_trial_action(json.dumps(action)))
+    assert not outcome.terminal
+    assert json.loads(outcome.observation)["host"] == {
+        "event": "diagnostic", "available": False,
+        "reason": "debugger and sanitizer execution is supported by adaptive Phase 1 only",
+    }
+    assert executor.latest_run is None and executor.final_run is None
+    # A supported ordinary action still works after the unavailable response.
+    followup = executor(parse_trial_action('{"propose":{"text":"continue trial"}}'))
+    assert not followup.terminal
+    assert json.loads(followup.observation)["host"]["event"] == "proposal-recorded"
