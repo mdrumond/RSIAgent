@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-import hashlib
 from importlib.resources import files
 import json
 import math
@@ -12,6 +11,7 @@ import random
 import re
 import subprocess
 from typing import Callable
+from .native_candidate import NativeCandidatePlan
 
 from benchmarks.a3kernels.phase1_protocol import (
     A3_EXECUTION_PROFILE,
@@ -132,7 +132,7 @@ def validate_candidate_source(source: str) -> None:
 
 @dataclass(frozen=True)
 class CandidateCompilation:
-    plan: ExecutionPlan
+    plan: ExecutionPlan | NativeCandidatePlan
     library_sha256: str
     stdout: str
     stderr: str

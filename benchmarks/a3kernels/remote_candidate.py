@@ -103,7 +103,7 @@ class GZA3RemoteCandidateBackend:
         self._max_polls = max_polls
         self._state_root = state_directory.resolve() if state_directory is not None else None
 
-    def build_bundle(self, plan: ExecutionPlan, destination: Path) -> CandidateBundle:
+    def build_bundle(self, plan: ExecutionPlan | NativeCandidatePlan, destination: Path) -> CandidateBundle:
         if not isinstance(plan, (ExecutionPlan, NativeCandidatePlan)):
             raise TypeError("plan must be an A3 ExecutionPlan")
         input_value = plan.input_payload if isinstance(plan, NativeCandidatePlan) else {
@@ -139,7 +139,7 @@ class GZA3RemoteCandidateBackend:
         )
 
     def compile(
-        self, plan: ExecutionPlan, local_directory: Path
+        self, plan: ExecutionPlan | NativeCandidatePlan, local_directory: Path
     ) -> CandidateCompilation | FailedEvidence:
         self._require_execution_profile(plan)
         self._bind_state_root(local_directory)
@@ -257,10 +257,12 @@ class GZA3RemoteCandidateBackend:
         return "RemoteExecutionError"
 
     def run(self, plan: ExecutionPlan, local_directory: Path) -> VerifiedResult | FailedEvidence:
+        if not isinstance(plan, ExecutionPlan):
+            raise TypeError("generic native candidates require compile and execute_receipt with a host oracle")
         compiled = self.compile(plan, local_directory)
         return compiled if isinstance(compiled, FailedEvidence) else self.execute(compiled)
 
-    def remote_candidate_directory(self, plan: ExecutionPlan) -> PurePosixPath:
+    def remote_candidate_directory(self, plan: ExecutionPlan | NativeCandidatePlan) -> PurePosixPath:
         """Return the retained directory consumed by the A3 profiling backend."""
 
         if not isinstance(plan, (ExecutionPlan, NativeCandidatePlan)):
