@@ -493,3 +493,5 @@ def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
     assert "1 if x > 0 else 0" in grammar["graph"]["mask-positive"]
     assert "input dtype by default" in grammar["output_dtype"]
     assert "matmul outputs float32" in grammar["output_dtype"]
+    assert "copy-only graphs preserve FP8" in grammar["output_dtype"]
+    assert "every non-copy FP8 graph computes intermediates and output in float32" in grammar["output_dtype"]

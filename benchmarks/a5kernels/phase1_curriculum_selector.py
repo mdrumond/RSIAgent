@@ -311,7 +311,7 @@ def _grammar() -> dict[str, object]:
         },
         "failure_modes": [item.value for item in FailureMode],
         "profile_metrics": [item.value for item in ProfileMetric],
-        "output_dtype": "input dtype by default; FP8/MXFP8 Cube matmul outputs float32",
+        "output_dtype": "input dtype by default; FP8 copy-only graphs preserve FP8; every non-copy FP8 graph computes intermediates and output in float32; MXFP8 matmul outputs float32",
         "padding_multiples": [1, 16, 32, 64, 128, 256],
         "block_count_bounds": [1, 32],
         "shape": "1-3 dimensions, each integer in [1, 4096]; graph inputs must match shape except matmul shape [m,k,n] with inputs [m,k] and [k,n]; each graph tensor may contain at most 65536 elements",

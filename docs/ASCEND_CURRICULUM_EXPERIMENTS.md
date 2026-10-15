@@ -119,7 +119,8 @@ not prerequisites. Every performance comparison verifies both sources first.
 
 MXFP8 supports only a single ordered matmul, without `padded-tail`; low-precision
 Cube outputs are FP32. Plain FP8 permits movement/vector graphs as well, with
-FP8 output outside Cube. Scale tensors are host-owned and excluded from the
+FP8 output only for copy-only graphs. Every non-copy FP8 graph widens operands,
+intermediates and output to FP32. Scale tensors are host-owned and excluded from the
 mathematical graph inputs. This strict project is accepted by the same parser
 used for curriculum waves:
 
