@@ -1,6 +1,7 @@
 """Stage a bounded three-input native probe; no remote access or builds here."""
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
@@ -56,6 +57,11 @@ def main():
     for item in plan.files:
         (args.stage / item.relative_path).write_text(item.content)
     (args.stage / "input.json").write_text(json.dumps(plan.input_payload))
+    manifest = dict(archive_schema="rsi-a3-candidate-v1", execution_id=plan.execution_id,
+                    source_fingerprint=plan.source_fingerprint,
+                    files={path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                           for path in args.stage.iterdir() if path.is_file()})
+    (args.stage / "manifest.json").write_text(json.dumps(manifest, sort_keys=True))
     # This is a separate host oracle, never supplied to the candidate runtime.
     expected = [sum(values) for values in zip(*(t.values for t in plan.inputs))]
     print(json.dumps({"execution_id": plan.execution_id, "expected_host_output": expected}))
