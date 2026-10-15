@@ -1,6 +1,8 @@
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.error import HTTPError
 import zipfile
 
 import pytest
@@ -132,3 +134,96 @@ def test_only_published_source_pointers_are_followed():
 ])
 def test_kernel_language_is_derived_from_code_not_a3_label(code, expected):
     assert source.kernel_languages({"kernel.py": code.encode()}) == expected
+
+
+@pytest.mark.parametrize("status", [408, 429])
+def test_transient_downloads_are_not_exhausted_and_retry_on_resume(tmp_path, monkeypatch, status):
+    class TransientArchive(FakeArchive):
+        def get(self, url):
+            if url.endswith("job0"):
+                return None, {"status": status, "url": url}
+            return super().get(url)
+    result = source.acquire_operator(OP, TransientArchive(), tmp_path, "1.1.2", 4)
+    assert result["retryable_failures"] == 1
+    assert not result["exhausted"]
+    calls = []
+    def failing_open(request, **kwargs):
+        calls.append(request.full_url)
+        raise HTTPError(request.full_url, status, "transient", {}, None)
+    monkeypatch.setattr(source, "urlopen", failing_open)
+    archive = source.PublicArchive(tmp_path / "responses")
+    archive.get("https://example.invalid/code.py")
+    archive.get("https://example.invalid/code.py")
+    assert len(calls) == 2
+
+
+def test_raw_public_source_is_downloadable_and_schema_ready(tmp_path):
+    class RawArchive(FakeArchive):
+        def json(self, url):
+            if "/api/jobs/" in url:
+                return {"job": {"source_url": "https://example.invalid/kernel.py"}}
+            return super().json(url)
+        def get(self, url):
+            data = b"import triton\n@triton.jit\ndef kernel(): pass"
+            return data, {"status": 200, "sha256": source.digest(data), "url": url}
+    result = source.acquire_operator(OP, RawArchive(), tmp_path, "1.1.2", 1)
+    item = result["sources"][0]
+    assert item["status"] == "complete"
+    assert item["kernel_languages"] == ["triton"]
+    assert item["files"][0]["path"] == "exp/kernel.py"
+    assert len(item["revision"]) == 64
+
+
+def test_unsupported_public_pointer_does_not_claim_exhaustion(tmp_path):
+    class HtmlArchive(FakeArchive):
+        def get(self, url):
+            if url.endswith("job0"):
+                data = b"<html>repository page</html>"
+                return data, {"status": 200, "sha256": source.digest(data), "url": url}
+            return super().get(url)
+    result = source.acquire_operator(OP, HtmlArchive(), tmp_path, "1.1.2", 4)
+    assert result["unsupported_sources"] == 1
+    assert not result["exhausted"]
+    assert "Unsupported" in result["skipped"][0]["attempts"][0]["source_error"]
+
+
+def test_other_operator_languages_and_upstream_manifest_are_preserved(tmp_path):
+    class MultiArchive(FakeArchive):
+        def get(self, url):
+            data = bundle({"exp/kernel.cpp": "AscendC::Exp(x,y,n);",
+                           "matmul/kernel.py": "import triton", "source-manifest.json": "upstream"})
+            return data, {"status": 200, "sha256": source.digest(data), "url": url}
+    result = source.acquire_operator(OP, MultiArchive(), tmp_path, "1.1.2", 1)
+    item = result["sources"][0]
+    assert item["kernel_languages"] == ["ascend-c"]
+    root = Path(item["root"])
+    assert (root / "source-manifest.json").read_text() == "upstream"
+    assert (root / "matmul/kernel.py").exists()
+    assert (tmp_path / "source-manifests/exp/rank-1-job0.json").exists()
+    for record in item["files"]:
+        data = (root / record["path"]).read_bytes()
+        assert record["sha256"] == source.digest(data)
+        assert record["bytes"] == len(data)
+
+
+@pytest.mark.parametrize("given_revision", [None, "a" * 40, "published-branch"])
+def test_published_https_git_source_freezes_commit_without_credentials(tmp_path, monkeypatch, given_revision):
+    calls = []
+    payload = bundle({"exp/kernel.cpp": "AscendC::Exp(x,y,n);", "LICENSE": "MIT"})
+    def git_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if "clone" in command:
+            Path(command[-1]).mkdir()
+        data = payload if "archive" in command else ("a" * 40 + "\n").encode()
+        return SimpleNamespace(stdout=data)
+    monkeypatch.setattr(source.subprocess, "run", git_run)
+    job = {"repository_url": "https://example.invalid/repo.git"}
+    if given_revision:
+        job["source_revision"] = given_revision
+    files, _, record = source.published_source(job["repository_url"], job, OP,
+                                              FakeArchive(), tmp_path)
+    assert record["revision"] == "a" * 40
+    assert "exp/kernel.cpp" in files
+    assert any("fetch" in command for command, _ in calls) == bool(given_revision)
+    assert all(kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0" for _, kwargs in calls)
+    assert all("credential.helper=" in command for command, _ in calls)

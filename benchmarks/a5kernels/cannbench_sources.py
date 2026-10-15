@@ -12,17 +12,20 @@ from datetime import datetime, timezone
 import hashlib
 import io
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 import threading
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 import zipfile
 
 BASE = "https://cannbench.com"
 CODE = {".py", ".cpp", ".cc", ".c", ".h", ".hpp", ".cuh", ".asc"}
 TEXT = CODE | {".md", ".txt", ".json", ".yaml", ".yml", ".sh", ".cmake"}
+REPOSITORY_LOCKS: dict[str, threading.Lock] = {}
 
 
 def digest(data: bytes) -> str:
@@ -113,6 +116,47 @@ def kernel_languages(files: dict[str, bytes]) -> list[str]:
                   if re.search(pattern, text)) or ["common"]
 
 
+def operator_code(files: dict[str, bytes], operator: dict, job: dict) -> dict[str, bytes]:
+    code = {name: value for name, value in files.items() if Path(name).suffix.lower() in CODE}
+    normalize = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
+    key = normalize(operator["function_name"])
+    own = {name: value for name, value in code.items()
+           if any(key == normalize(part.split(".")[0]) for part in PurePosixPath(name).parts)}
+    selected = job.get("selected_operators") or job.get("operator_names") or []
+    if not own and len(selected) == 1 and normalize(selected[0]) == key:
+        own = code
+    if not own:
+        raise ValueError("No code identifiable as the ranked operator")
+    return own
+
+
+def repository_source(url: str, job: dict, root: Path) -> tuple[bytes, dict]:
+    """Freeze a published public HTTPS Git repository without credentials."""
+    if urlparse(url).scheme != "https":
+        raise ValueError("Unsupported repository pointer: public HTTPS required")
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
+                       GIT_CONFIG_GLOBAL=os.devnull)
+    def git(*arguments):
+        return subprocess.run(["git", "-c", "credential.helper=", "-c", "core.askPass=", *arguments],
+                              check=True, capture_output=True, env=environment, timeout=120).stdout
+    destination = root / "repositories" / digest(url.encode())
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not destination.exists():
+        git("clone", "--bare", "--", url, str(destination))
+    reference = next((owner[field] for owner in (job, job.get("submission") or {})
+                      for field in ("source_revision", "repository_revision", "commit", "revision")
+                      if owner.get(field)), "HEAD")
+    if not isinstance(reference, str) or reference.startswith("-"):
+        raise ValueError("Unsupported repository revision pointer")
+    if reference != "HEAD":
+        git("-C", str(destination), "fetch", "origin", reference)
+        reference = "FETCH_HEAD"
+    revision = git("-C", str(destination), "rev-parse", f"{reference}^{{commit}}").decode().strip()
+    data = git("-C", str(destination), "archive", "--format=zip", revision)
+    return data, {"url": url, "status": 200, "sha256": digest(data), "revision": revision,
+                  "retrieved_at": datetime.now(timezone.utc).isoformat()}
+
+
 def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], str]:
     """Retain text wrappers and licenses; identify this operator's code."""
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -131,16 +175,7 @@ def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], st
             except UnicodeDecodeError:
                 continue
             files[str(path)] = value
-    code = {name: value for name, value in files.items() if Path(name).suffix.lower() in CODE}
-    normalize = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
-    key = normalize(operator["function_name"])
-    own = {name: value for name, value in code.items()
-           if any(key == normalize(part.split(".")[0]) for part in PurePosixPath(name).parts)}
-    selected = job.get("selected_operators") or job.get("operator_names") or []
-    if not own and len(selected) == 1 and normalize(selected[0]) == key:
-        own = code
-    if not own:
-        raise ValueError("No code identifiable as the ranked operator")
+    own = operator_code(files, operator, job)
     # Prefer explicit kernel code over launch/test wrappers for duplicate checks.
     kernels = {name: value for name, value in own.items()
                if any("kernel" in part.lower() for part in PurePosixPath(name).parts)}
@@ -148,11 +183,34 @@ def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], st
     return files, identity
 
 
+def published_source(url: str, job: dict, operator: dict, archive: PublicArchive,
+                     root: Path) -> tuple[dict[str, bytes] | None, str | None, dict]:
+    repositories = [owner.get("repository_url") for owner in (job, job.get("submission") or {})]
+    if url in repositories:
+        with REPOSITORY_LOCKS.setdefault(url, threading.Lock()):
+            data, response = repository_source(url, job, root)
+    else:
+        data, response = archive.get(url)
+    if data is None:
+        return None, None, response
+    if zipfile.is_zipfile(io.BytesIO(data)):
+        files, identity = unpack(data, operator, job)
+        return files, identity, response
+    filename = PurePosixPath(urlparse(url).path).name
+    if Path(filename).suffix.lower() not in CODE:
+        raise ValueError("Unsupported published source format (not ZIP or raw code)")
+    text = data.decode("utf-8")
+    if text.lstrip().lower().startswith(("<!doctype html", "<html")):
+        raise ValueError("Unsupported HTML source pointer; raw code URL required")
+    files = {f"{operator['function_name']}/{filename}": data}
+    return files, digest(data), response
+
+
 def acquire_operator(operator: dict, archive: PublicArchive, root: Path,
                      version: str, wanted: int) -> dict:
     name = operator["function_name"]
     offset, candidates, accepted, skipped, identities = 0, [], [], [], set()
-    retryable_failures = 0
+    retryable_failures = unsupported_sources = 0
     while True:
         query = urlencode(dict(benchmark_slug="official-tasks", operator=name,
                                hardware="910c", version=version, limit=100, offset=offset))
@@ -184,16 +242,20 @@ def acquire_operator(operator: dict, archive: PublicArchive, root: Path,
             skipped.append(record)
             continue
         for url in candidate_urls(job):
-            data, response = archive.get(url)
-            record["attempts"].append(response)
-            if data is None:
-                if response["status"] == 0 or response["status"] >= 500:
-                    retryable_failures += 1
-                continue
             try:
-                files, identity = unpack(data, operator, job)
-            except (zipfile.BadZipFile, ValueError, KeyError) as error:
-                response["source_error"] = str(error)
+                files, identity, response = published_source(url, job, operator, archive, root)
+            except (ValueError, UnicodeDecodeError, zipfile.BadZipFile) as error:
+                unsupported_sources += 1
+                record["attempts"].append({"url": url, "source_error": str(error)})
+                continue
+            except (subprocess.SubprocessError, OSError) as error:
+                retryable_failures += 1
+                record["attempts"].append({"url": url, "source_error": str(error)})
+                continue
+            record["attempts"].append(response)
+            if files is None:
+                if response["status"] in (0, 408, 429) or response["status"] >= 500:
+                    retryable_failures += 1
                 continue
             if identity in identities:
                 record["reason"] = "Duplicate operator implementation"
@@ -211,14 +273,15 @@ def acquire_operator(operator: dict, archive: PublicArchive, root: Path,
                         if Path(f["path"]).name.upper().startswith(("LICENSE", "COPYING"))]
             source = {"name": f"cannbench-{name}-{job_id}", "repository": url,
                       "status": "complete", "document_language": "mixed",
-                      "kernel_languages": kernel_languages(files),
-                      "revision": response["sha256"], "root": str(destination.resolve()),
+                      "kernel_languages": kernel_languages(operator_code(files, operator, job)),
+                      "revision": response.get("revision", response["sha256"]),
+                      "root": str(destination.resolve()),
                       "files": file_records, "operator": name, "rank": rank,
                       "score": entry.get("score"), "job_id": job_id,
                       "submission_id": job.get("submission_id"),
                       "implementation_sha256": identity, "reference_exposed": True,
                       "licenses": licenses, "license_files": licenses}
-            save_json(destination / "source-manifest.json", source)
+            save_json(root / "source-manifests" / name / f"rank-{rank}-{job_id}.json", source)
             accepted.append(source)
             break
         else:
@@ -229,7 +292,8 @@ def acquire_operator(operator: dict, archive: PublicArchive, root: Path,
             "examined_candidates": len(accepted) + len(skipped), "sources": accepted,
             "skipped": skipped, "shortfall": max(0, wanted - len(accepted)),
             "retryable_failures": retryable_failures,
-            "exhausted": len(accepted) < wanted and retryable_failures == 0}
+            "unsupported_sources": unsupported_sources,
+            "exhausted": len(accepted) < wanted and retryable_failures == unsupported_sources == 0}
 
 
 def acquire(root: Path, *, version: str = "1.1.2", wanted: int = 3,
