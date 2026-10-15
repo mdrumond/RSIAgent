@@ -59,7 +59,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--runtime-catlass-revision")
         command.add_argument("--bge-cache", type=Path)
         command.add_argument("--kdb", type=Path)
-        command.add_argument("--collection")
+        command.add_argument("--collection", action="append")
         command.add_argument("--device", type=int)
         command.add_argument("--env-file", type=Path)
     return parser
@@ -101,7 +101,8 @@ def _production_factory(
         device=args.device,
         bge_cache=args.bge_cache,
         kdb=args.kdb,
-        collection=args.collection,
+        collection=(args.collection[0] if len(args.collection) == 1 else tuple(args.collection))
+        if args.collection else None,
         env_file=args.env_file,
         phase2_guide_path=args.phase2_guide,
         phase2_cpl_skills_revision=args.phase2_cpl_skills_revision,

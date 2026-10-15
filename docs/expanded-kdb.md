@@ -63,7 +63,8 @@ Production Phase 1 and Phase 2 configuration `collection` accepts either the
 historical single string or a list/tuple of fixed collection names. Native A3
 configuration must include at least one explicitly Ascend C-capable collection;
 other selected collections may supply cross-language reference context. Repeat
-`--collection` in the A5 adaptive CLI to select multiple collections. A3's JSON
+`--collection` in the A5 adaptive, Phase 1, Phase 2, and pilot/preflight CLIs to
+select multiple collections. A3's JSON
 configuration accepts the same list directly. Single-string retained campaign
 identities remain unchanged; multi-collection native identities pin every
 selected manifest fingerprint through the Phase 2 handoff.

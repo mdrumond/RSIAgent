@@ -117,7 +117,7 @@ def main(
             args.device,
             args.kdb,
             (args.collection[0] if args.collection and len(args.collection) == 1
-             else args.collection),
+             else tuple(args.collection) if args.collection else None),
         ),
         objective=args.objective,
         initial_memory=initial_memory,
