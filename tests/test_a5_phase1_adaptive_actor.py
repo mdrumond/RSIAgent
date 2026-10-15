@@ -573,3 +573,34 @@ def test_two_correct_source_variants_retain_paired_measurements(tmp_path):
     facts = [fact for fact in result.memory.host_facts if fact.category == "performance-study"]
     assert [fact.statement for fact in facts] == ["fixed source", "fixed source variant"]
     assert all(fact.evidence_sha256 in result.memory.admitted_artifact_sha256 for fact in facts)
+
+
+@pytest.mark.parametrize("rewrite_same_source", [False, True])
+def test_sync_performance_rejects_one_source_and_same_source_rewrites(tmp_path, rewrite_same_source):
+    class CorrectVariants(SourceBackend):
+        def run(self, request, compilation):
+            return RuntimeObservation(True, canonical_digest({"run": request.candidate_source}),
+                                      "verified", request.expected.storage)
+    executor = ProjectExecutor(CorrectVariants(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    def measure(payload, context):
+        digest = context.artifacts.put_json({
+            "candidate_sha256": hashlib.sha256(context.source.encode()).hexdigest(),
+            "summary": {"median_us": 3}, "supporting_evidence": []})
+        return AdaptiveActionResult({"passed": True},
+            host_facts=(HostFact("performance-study", context.source, digest),),
+            admitted_artifacts={digest: "performance-study"})
+    replies = ['{"write":{"slot":"kernel","content":"fixed source"}}',
+               '{"run":{}}', '{"request-timing":{}}']
+    if rewrite_same_source:
+        replies += ['{"write":{"slot":"kernel","content":"fixed source"}}',
+                    '{"run":{}}', '{"request-timing":{}}']
+    replies += ['{"submit":{}}',
+                '{"write":{"slot":"kernel","content":"fixed source variant"}}',
+                '{"run":{}}', '{"request-timing":{}}', '{"submit":{}}']
+    actor = ScriptedActor(tuple(replies))
+    spec = replace(_special_spec(), learning_focus=("sync-performance",))
+    result = AdaptiveActorProjectExecutor(executor, actor, object(), request_timing=measure)(
+        _request(tmp_path, executor, spec))
+    rejected = actor.observations[6 if rewrite_same_source else 3]
+    assert "two distinct verified sources" in rejected["missing"][0]
+    assert result.evidence.verified

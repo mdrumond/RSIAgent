@@ -361,10 +361,28 @@ class _ProjectActions:
         ):
             missing.append(f"observed-{mode.value}")
         if (
-            (self.request.spec.timing_lengths or "sync-performance" in self.request.spec.learning_focus)
+            self.request.spec.timing_lengths
             and "performance-study" not in self.admitted.values()
         ):
             missing.append("performance-study")
+        if "sync-performance" in self.request.spec.learning_focus:
+            measured = {"current": set(), "comparison": set()}
+            for digest, role in self.admitted.items():
+                if role not in {"profiling", "performance-study",
+                                "comparison-profiling", "comparison-performance-study"}:
+                    continue
+                payload = self.artifacts.read_json(digest)
+                candidate = payload.get("candidate_sha256") if isinstance(payload, Mapping) else None
+                if not isinstance(candidate, str) or not _SHA256.fullmatch(candidate):
+                    continue
+                bucket = "comparison" if role.startswith("comparison-") else "current"
+                measured[bucket].add(candidate)
+            if (self.source_sha256 not in measured["current"]
+                    or not measured["comparison"] - {self.source_sha256}):
+                missing.append(
+                    "sync-performance requires measurements of two distinct verified sources: "
+                    "retain one comparison variant, then verify and measure the final source"
+                )
         if self.request.spec.profile_metric is not None and not any(
             fact.category == "profiling"
             and self.admitted.get(fact.evidence_sha256) == "profiling"
