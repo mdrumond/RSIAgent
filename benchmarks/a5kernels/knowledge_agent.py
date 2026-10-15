@@ -61,7 +61,7 @@ def validate_knowledge_hit(
     """Apply the Knowledge Agent's citation gate to one retrieved hit."""
 
     manifest = database.manifest(collection)
-    source = next(source for source in manifest.sources if source.path == hit.path)
+    source = database.source_fingerprint(collection, hit.path)
     citation = Citation(
         collection=collection,
         path=hit.path,

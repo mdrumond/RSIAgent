@@ -127,3 +127,21 @@ def test_reference_exposure_and_document_language_are_independent(tmp_path):
         assert manifest.kernel_languages == ("ascend-c",)
     hits = query(db_path, Embeddings(), "vector", tmp_path / "journal")
     assert hits["results"][0]["citation"]["reference_exposed"] is True
+
+
+def test_repeated_citation_checks_reuse_immutable_manifest(tmp_path):
+    path = inventory(tmp_path, names=("ops-nn",))
+    db_path = tmp_path / "kdb.sqlite3"
+    report = ingest(path, db_path, Embeddings())
+    collection = report["collections"][0]["collection"]
+    with KnowledgeDB.open_read_only(db_path, Embeddings()) as database:
+        statements = []
+        database.connection.set_trace_callback(statements.append)
+        hits = database.query(collection, "vector")
+        for _ in range(3):
+            for hit in hits:
+                database.validate_citation(collection, chunk_id=hit.chunk_id, path=hit.path,
+                                           start_line=hit.start_line, end_line=hit.end_line)
+        manifest_reads = [statement for statement in statements
+                          if statement.startswith("SELECT manifest_json FROM collections")]
+        assert len(manifest_reads) == 1

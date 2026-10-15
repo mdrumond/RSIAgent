@@ -232,6 +232,8 @@ class KnowledgeDB:
             raise ValueError("KnowledgeDB requires a file-backed database")
         self.path = path.resolve()
         self.embeddings = embeddings
+        self._manifest_cache = {}
+        self._source_cache = {}
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
@@ -249,6 +251,8 @@ class KnowledgeDB:
         view = object.__new__(cls)
         view.path = resolved
         view.embeddings = embeddings
+        view._manifest_cache = {}
+        view._source_cache = {}
         view.connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True)
         view.connection.row_factory = sqlite3.Row
         view.connection.execute("PRAGMA query_only = ON")
@@ -425,12 +429,24 @@ class KnowledgeDB:
         return manifest
 
     def manifest(self, collection: str) -> CollectionManifest:
+        if collection in self._manifest_cache:
+            return self._manifest_cache[collection]
         row = self.connection.execute(
             "SELECT manifest_json FROM collections WHERE name = ?", (collection,)
         ).fetchone()
         if not row:
             raise KeyError(collection)
-        return CollectionManifest.from_json(row["manifest_json"])
+        manifest = CollectionManifest.from_json(row["manifest_json"])
+        self._manifest_cache[collection] = manifest
+        self._source_cache[collection] = {source.path: source for source in manifest.sources}
+        return manifest
+
+    def source_fingerprint(self, collection: str, path: str) -> SourceFingerprint:
+        self.manifest(collection)
+        try:
+            return self._source_cache[collection][path]
+        except KeyError:
+            raise ValueError("citation path is absent from the collection manifest") from None
 
     def selected_manifests(self, selector: str | Sequence[str]) -> tuple[CollectionManifest, ...]:
         return tuple(self.manifest(name) for name in collection_names(selector))
@@ -461,8 +477,7 @@ class KnowledgeDB:
         expected = (row["path"], row["start_line"], row["end_line"])
         if expected != (path, start_line, end_line):
             raise ValueError("citation location does not match the indexed chunk")
-        if path not in {source.path for source in manifest.sources}:
-            raise ValueError("citation path is absent from the collection manifest")
+        self.source_fingerprint(collection, path)
         identity = f"{path}\0{start_line}\0{end_line}\0{row['text']}".encode()
         if _sha256(identity) != chunk_id:
             raise ValueError("citation chunk hash does not match indexed content")
@@ -475,7 +490,7 @@ class KnowledgeDB:
         ).fetchone()
         if not collection_row:
             raise KeyError(collection)
-        manifest = CollectionManifest.from_json(collection_row["manifest_json"])
+        manifest = self.manifest(collection)
         actual_embedding = (self.embeddings.model, self.embeddings.revision)
         expected_embedding = (manifest.embedding_model, manifest.embedding_revision)
         if actual_embedding != expected_embedding:
