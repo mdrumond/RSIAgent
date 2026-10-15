@@ -360,7 +360,10 @@ def test_profile_driver_initialization_and_conversion_do_not_launch_helper_kerne
             return Tensor()
     namespace = {'torch': Torch(), 'output_shape': (1,), 'output_dtype': 'float16',
                  'low_precision': False}
-    assignments = [node for node in ast.walk(ast.parse(_PROJECT_DRIVER))
+    main = next(node for node in ast.parse(_PROJECT_DRIVER).body
+                if isinstance(node, ast.FunctionDef) and node.name == '_main')
+    blocks = [main, *(node for node in main.body if isinstance(node, ast.Try))]
+    assignments = [node for block in blocks for node in block.body
                    if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)]
     # Execute every output initialization step in order, then CPU observation.
     # This catches accidental device Fill/Cast helpers without relying on one
