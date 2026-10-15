@@ -20,6 +20,7 @@ from .native_candidate import NativeCandidatePlan, NativeTensor
 from .phase1_evidence import A3_EXECUTION_PROFILES
 from .phase1_protocol import FailedEvidence
 from .remote_candidate import _PendingObservation
+from .native_candidate import native_infrastructure_failure
 
 
 TARGET_ID = "a3-phase2-dense-forward-attention-v1"
@@ -69,7 +70,7 @@ class NativeAttentionBackend:
         except (_PendingObservation, OSError) as exc:
             raise AttentionInfrastructureError(str(exc)) from exc
         if isinstance(result, FailedEvidence):
-            if result.stage == "prepare" or result.error_type == "AmbiguousRemoteOutcome":
+            if native_infrastructure_failure(result):
                 raise AttentionInfrastructureError(result.detail)
             return AttentionReceipt(1, (), stderr=f"{result.stage}: {result.detail}")
         return AttentionReceipt(result.exit_code, result.output, result.stdout, result.stderr,

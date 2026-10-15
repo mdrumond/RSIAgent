@@ -104,9 +104,14 @@ def test_native_timing_action_recompiles_each_shape_with_host_inputs(tmp_path):
     from benchmarks.a5kernels.phase1_curriculum import Capability
     from benchmarks.a5kernels.evidence import EvidenceLedger
     shapes = []
+    logical_shapes = []
     class Transport:
         def compile(self, plan, directory):
             shapes.append(plan.output.shape)
+            logical_shapes.append(plan.output.logical_shape)
+            wrapper = next(f.content for f in plan.files if f.relative_path == "host_wrapper.inc")
+            assert f"#define RSI_NATIVE_INPUT0_LOGICAL_NUMEL {plan.inputs[0].logical_shape[0]}" in wrapper
+            assert "#define RSI_NATIVE_INPUT0_NUMEL 16" in wrapper
             return CandidateCompilation(plan, "a" * 64, "compiled", "", "b" * 64)
         def remote_candidate_directory(self, plan):
             return PurePosixPath("/owned") / plan.execution_id
@@ -114,20 +119,22 @@ def test_native_timing_action_recompiles_each_shape_with_host_inputs(tmp_path):
         def __init__(self, **kwargs):
             self.plan = kwargs["compilation"].plan
         def timing(self, **kwargs):
-            payload = dict(shape=list(self.plan.output.shape))
+            payload = dict(shape=list(self.plan.output.shape), logical_shape=list(self.plan.output.logical_shape))
             digest = canonical_digest(payload)
             return dict(identity=dict(output=payload), summary=dict(median_us=1.0), artifact_payloads={digest: payload})
     backend = NativeProjectBackend(Transport(), tmp_path, target="actual-a3", arch="native-arch", profile="bz-a3-1")
     executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "ledger"), binding=NativeProjectBinding())
-    study = replace(spec(), capabilities=(Capability.GM_UB_MOVEMENT, Capability.TIMING_SWEEP), timing_lengths=(4, 8))
+    study = replace(spec(), capabilities=(Capability.GM_UB_MOVEMENT, Capability.PADDED_TAIL, Capability.TIMING_SWEEP),
+                    padding_multiple=16, timing_lengths=(3, 5))
     prepared = executor.prepare(study)
     request = executor.request(prepared, prepared.abi.signature + " {}")
     config = dict(environment_identity=dict(cann_version="cann", profiler_version="msprof"),
         cpl_remote="/tools/cpl-remote", validation_wrapper="/checked/catlass-validation.sh",
         execution_profile="bz-a3-1", physical_device=1)
     result = NativeProjectMeasurements(backend, config, tmp_path, factory=Measurement).timing(request)
-    assert shapes == [(4,), (8,)]
-    assert [item["shape"] for item in result["summary"]["timing"]] == [[4], [8]]
+    assert shapes == [(16,), (16,)]
+    assert logical_shapes == [(3,), (5,)]
+    assert [item["shape"] for item in result["summary"]["timing"]] == [[3], [5]]
 
 
 def test_native_runtime_config_fails_early_for_missing_version_identity(tmp_path):

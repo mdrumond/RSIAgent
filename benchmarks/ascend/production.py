@@ -6,7 +6,9 @@ import re
 
 from benchmarks.ascend.contracts import CompileObservation, RuntimeObservation
 from benchmarks.ascend.targets import a3_curriculum_policy
-from benchmarks.a3kernels.native_candidate import NativeCandidatePlan, NativeTensor
+from benchmarks.a3kernels.native_candidate import NativeCandidatePlan, NativeTensor, native_infrastructure_failure
+from benchmarks.a3kernels.remote_candidate import _PendingObservation
+from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_project import ProjectOp
@@ -196,6 +198,8 @@ class NativeProjectBinding:
             "then output. Shapes and dtype are fixed by the project contract, not runtime "
             "parameters. Host macros RSI_NATIVE_INPUT<i>_NUMEL, RSI_NATIVE_INPUT<i>_DIM<axis>, "
             "RSI_NATIVE_OUTPUT_NUMEL and RSI_NATIVE_OUTPUT_DIM<axis> describe physical extents. "
+            "The corresponding *_LOGICAL_NUMEL and *_LOGICAL_DIM<axis> macros describe "
+            "logical extents, excluding sentinel padding; use them for logical arithmetic. "
             "For timing sweeps use these macros rather than hardcoded lengths: the host "
             "recompiles the unchanged source for each requested shape. Round the last dimension "
             "up to padding_multiple to obtain physical "
@@ -223,10 +227,10 @@ class NativeProjectBackend:
         return NativeCandidatePlan(
             request.candidate_source, request.abi.kernel_name,
             tuple(NativeTensor(name, tensor.physical_shape, request.spec.dtype.value,
-                               tensor.storage) for name, tensor in
+                               tensor.storage, logical_shape=tensor.shape) for name, tensor in
                   zip(request.abi.input_arguments, request.inputs)),
             NativeTensor(request.abi.output_argument, request.expected.physical_shape,
-                         request.expected.dtype),
+                         request.expected.dtype, logical_shape=request.expected.shape),
             identity, identity, request.spec.project_id, self.profile,
             self.target, self.arch, request.spec.block_count,
         )
@@ -243,11 +247,13 @@ class NativeProjectBackend:
         except ValueError as exc:
             digest = self._retain({"stage": "source-admission", "diagnostic": str(exc)})
             return CompileObservation(False, digest, str(exc), None)
-        result = self.transport.compile(plan, self.root / plan.execution_id)
+        try:
+            result = self.transport.compile(plan, self.root / plan.execution_id)
+        except (_PendingObservation, OSError) as exc:
+            raise ProjectInfrastructureError(str(exc)) from exc
         if isinstance(result, FailedEvidence):
-            # Prepare/transport failures are not kernel compiler observations.
-            if result.stage == "prepare":
-                raise RuntimeError(result.detail)
+            if native_infrastructure_failure(result):
+                raise ProjectInfrastructureError(result.detail)
             digest = self._retain(result.attestation_payload())
             return CompileObservation(False, digest, result.detail, None)
         self._compilations[plan.execution_id] = result
@@ -259,8 +265,13 @@ class NativeProjectBackend:
         plan = self.plan(request)
         if plan.execution_id != compilation.artifact_id:
             raise ValueError("native runtime request differs from compiled candidate")
-        receipt = self.transport.execute_receipt(self._compilations[compilation.artifact_id])
+        try:
+            receipt = self.transport.execute_receipt(self._compilations[compilation.artifact_id])
+        except (_PendingObservation, OSError) as exc:
+            raise ProjectInfrastructureError(str(exc)) from exc
         if isinstance(receipt, FailedEvidence):
+            if native_infrastructure_failure(receipt):
+                raise ProjectInfrastructureError(receipt.detail)
             digest = self._retain(receipt.attestation_payload())
             return RuntimeObservation(False, digest, receipt.detail, None)
         payload = {"exit_code": receipt.exit_code, "stdout": receipt.stdout,

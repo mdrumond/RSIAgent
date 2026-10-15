@@ -10,6 +10,9 @@ import sys
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence
 from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
 from benchmarks.a3kernels.native_measurements import NativeMeasurementBackend
+from benchmarks.a3kernels.native_candidate import native_infrastructure_failure
+from benchmarks.a3kernels.remote_candidate import _PendingObservation
+from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from benchmarks.ascend.production import (
     NativeProductionConfig, NativeProjectBackend, build_native_adaptive_phase1,
 )
@@ -31,8 +34,13 @@ class NativeProjectMeasurements:
 
     def _measurement(self, request):
         plan = self.backend.plan(request)
-        compiled = self.backend.transport.compile(plan, self.root / plan.execution_id)
+        try:
+            compiled = self.backend.transport.compile(plan, self.root / plan.execution_id)
+        except (_PendingObservation, OSError) as exc:
+            raise ProjectInfrastructureError(str(exc)) from exc
         if isinstance(compiled, FailedEvidence):
+            if native_infrastructure_failure(compiled):
+                raise ProjectInfrastructureError(compiled.detail)
             raise ValueError("measurement compilation failed: " + compiled.detail)
         tolerance = {"float32": 1e-5, "float16": 1e-2, "bfloat16": 2e-2}[request.expected.dtype]
         return self.factory(
@@ -64,14 +72,21 @@ class NativeProjectMeasurements:
                 expected=evaluate_reference(spec, prepared_inputs),
                 inputs_sha256=canonical_digest({"tensors": [dict(shape=list(t.shape),
                     physical_shape=list(t.physical_shape), storage=list(t.storage)) for t in prepared_inputs]}))
-            results.append(self._measurement(prepared).timing(warm_up=5, launch_count=20))
+            try:
+                results.append(self._measurement(prepared).timing(warm_up=5, launch_count=20))
+            except (_PendingObservation, OSError) as exc:
+                raise ProjectInfrastructureError(str(exc)) from exc
         return self._combine(results, {"timing": [
-            {"shape": r["identity"]["output"]["shape"], **r["summary"]} for r in results]})
+            {"shape": r["identity"]["output"]["logical_shape"],
+             "physical_shape": r["identity"]["output"]["shape"], **r["summary"]} for r in results]})
 
     def profile(self, request, metric):
         if metric != "pipe-utilization":
             raise ValueError("native profiling metric unavailable; use pipe-utilization")
-        result = self._measurement(request).capture("PipeUtilization")
+        try:
+            result = self._measurement(request).capture("PipeUtilization")
+        except (_PendingObservation, OSError) as exc:
+            raise ProjectInfrastructureError(str(exc)) from exc
         return self._combine([result], result["summary"])
 
 

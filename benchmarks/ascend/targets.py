@@ -7,7 +7,7 @@ claim. The caller must validate its selected compiler/device independently.
 from copy import deepcopy
 from dataclasses import dataclass
 
-from benchmarks.a5kernels.phase1_curriculum import Capability, ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 
 
 _A3_CAPABILITIES = (
@@ -31,6 +31,8 @@ class CurriculumPolicy:
     guidance: str
 
     def admit(self, spec: ProjectSpec) -> None:
+        if self.target == "a3" and spec.profile_metric is not None and spec.profile_metric.value != "pipe-utilization":
+            raise ValueError("native profiling metric unavailable; only pipe-utilization is supported")
         if spec.dtype.value not in self.dtypes:
             raise ValueError(f"dtype unavailable for configured {self.target} curriculum")
         if any(item.value not in self.capabilities for item in spec.capabilities):
@@ -45,6 +47,8 @@ class CurriculumPolicy:
         grammar["optional_project_fields"] = {"learning_focus": list(self.learning_foci)}
         grammar.pop("low_precision_rules", None)
         grammar["output_dtype"] = "input dtype; host reference owns rounding and accumulation"
+        if self.target == "a3":
+            grammar["profile_metrics"] = ["pipe-utilization"]
         rules = grammar["capability_operation_rules"]
         rules["vector-reduction"] = rules.pop("simt-reduction")
         rules["vector-mask"] = rules.pop("simt-mask")

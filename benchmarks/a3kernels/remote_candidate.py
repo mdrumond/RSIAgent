@@ -168,8 +168,11 @@ class GZA3RemoteCandidateBackend:
                 plan, stage="compile", error_type="RuntimeError", detail=str(exc)
             )
         if completed.returncode != 0:
+            error_type = self._operation_error_type(completed)
+            if isinstance(plan, NativeCandidatePlan) and error_type == "RemoteExecutionError":
+                error_type = ("NativeCompileError" if self._markers(completed.stdout, "A3CANDIDATE_COMPILE_FAILED=") == ["1"] else "NativeHostError")
             return FailedEvidence.create(
-                plan, stage="compile", error_type=self._operation_error_type(completed),
+                plan, stage="compile", error_type=error_type,
                 detail=(completed.stderr or completed.stdout or "remote execution failed").strip(),
             )
         try:

@@ -7,7 +7,9 @@ import re
 from pathlib import PurePosixPath
 from statistics import median
 
-from .native_candidate import NativeCandidatePlan
+from .native_candidate import NativeCandidatePlan, native_infrastructure_failure
+from .phase1_protocol import FailedEvidence
+from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from .candidate import _parse_output
 from .phase1_evidence import canonical_digest
 from .phase1_protocol import ExecutionReceipt
@@ -42,6 +44,8 @@ class NativeMeasurementBackend(BZA3ProfilingBackend):
 
     def _verify(self):
         receipt = self._candidate_backend.execute_receipt(self._compilation)
+        if isinstance(receipt, FailedEvidence) and native_infrastructure_failure(receipt):
+            raise ProjectInfrastructureError(receipt.detail)
         if not isinstance(receipt, ExecutionReceipt) or receipt.exit_code != 0:
             raise ValueError("native measurement requires successful host verification")
         self._verify_values(receipt.output)
@@ -53,6 +57,15 @@ class NativeMeasurementBackend(BZA3ProfilingBackend):
             for actual, expected in zip(output, self._expected)
         ):
             raise ValueError("native measurement requires passing host verification")
+
+    def _call(self, argv):
+        try:
+            completed = super()._call(argv)
+        except RuntimeError as exc:
+            raise ProjectInfrastructureError(str(exc)) from exc
+        if "BZ_A3_JOB_STATE=transport-failed" in (completed.stdout + "\n" + completed.stderr).splitlines():
+            raise ProjectInfrastructureError("native measurement transport outcome unavailable")
+        return completed
 
     def timing(self, *, warm_up=5, launch_count=20, replay_id=None):
         return self._measure("timing", warm_up, launch_count, replay_id, None)
@@ -71,8 +84,8 @@ class NativeMeasurementBackend(BZA3ProfilingBackend):
             target=plan.target, arch=plan.arch, execution_profile=self._profile,
             physical_device=self._device, logical_device=0, block_count=plan.block_count,
             environment=self._environment,
-            inputs=[dict(name=t.name, shape=list(t.shape), dtype=t.dtype) for t in plan.inputs],
-            output=dict(shape=list(plan.output.shape), dtype=plan.output.dtype),
+            inputs=[dict(name=t.name, shape=list(t.shape), logical_shape=list(t.logical_shape), dtype=t.dtype) for t in plan.inputs],
+            output=dict(shape=list(plan.output.shape), logical_shape=list(plan.output.logical_shape), dtype=plan.output.dtype),
             warm_up=warm_up, launch_count=launch_count, mode=mode, metric=metric,
             host_reference_sha256=canonical_digest(self._expected), atol=self._atol, rtol=self._rtol)
         request_id = canonical_digest(identity)
@@ -88,7 +101,12 @@ class NativeMeasurementBackend(BZA3ProfilingBackend):
             "--warm-up", str(warm_up), "--launch-count", str(launch_count))
         if metric is not None:
             command += ("--metric", "ArithmeticUtilization" if metric == "Basic" else metric)
-        completed = self._run_or_observe(replay, request_id, mode, self._wrapper_argv(replay, command))
+        try:
+            completed = self._run_or_observe(replay, request_id, mode, self._wrapper_argv(replay, command))
+        except RuntimeError as exc:
+            if self._pending_path(replay).exists():
+                raise ProjectInfrastructureError(str(exc)) from exc
+            raise
         meta, handle, status = self._validated_output(completed, mode=mode)
         self._verify_values(_parse_output(completed.stdout, len(self._expected)))
         if mode == "timing":

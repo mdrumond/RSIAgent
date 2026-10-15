@@ -16,12 +16,20 @@ from .phase1_evidence import A3_EXECUTION_PROFILES, canonical_digest
 from .phase1_protocol import SourceFile
 
 
+def native_infrastructure_failure(failure):
+    """Wrapper/provenance failures are not observations about candidate code."""
+    return failure.stage == "prepare" or failure.error_type in {
+        "AmbiguousRemoteOutcome", "RuntimeError", "CompileOutputError", "NativeHostError",
+    }
+
+
 @dataclass(frozen=True)
 class NativeTensor:
     name: str
     shape: tuple[int, ...]
     dtype: str
     values: tuple[float, ...] | None = None
+    logical_shape: tuple[int, ...] | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "shape", tuple(self.shape))
@@ -29,6 +37,10 @@ class NativeTensor:
             raise ValueError("tensor name must be an identifier")
         if not self.shape or any(type(n) is not int or n < 1 for n in self.shape):
             raise ValueError("tensor shape must contain positive dimensions")
+        logical = self.shape if self.logical_shape is None else tuple(self.logical_shape)
+        if len(logical) != len(self.shape) or any(type(n) is not int or n < 1 or n > physical for n, physical in zip(logical, self.shape)):
+            raise ValueError("logical tensor shape must fit physical shape")
+        object.__setattr__(self, "logical_shape", logical)
         if self.dtype not in ("float16", "bfloat16", "float32"):
             raise ValueError("native tensor dtype must be float16, bfloat16 or float32")
         if self.values is not None:
@@ -80,6 +92,8 @@ class NativeCandidatePlan:
         pattern = r"\s*".join(re.escape(t) for t in re.findall(r'"[^"]*"|\w+|[^\w\s]', self.signature))
         if len(re.findall(pattern, self.source)) != 1:
             raise ValueError("candidate must define the declared native signature exactly once")
+        if re.search(r"\bTORCH_LIBRARY(?:_IMPL|_FRAGMENT)?\s*\(|\b(?:torch|at)::", self.source):
+            raise ValueError("candidate must contain Ascend C device code, not host Torch registration or framework computation")
         # Freeze staged host bytes when the plan is created, not when a later
         # replay happens to read installed resources after an update.
         self.files
@@ -124,6 +138,8 @@ class NativeCandidatePlan:
         for label, tensor in [(f"INPUT{i}", t) for i, t in enumerate(self.inputs)] + [("OUTPUT", self.output)]:
             macros.append(f"#define RSI_NATIVE_{label}_NUMEL {tensor.numel}")
             macros.extend(f"#define RSI_NATIVE_{label}_DIM{axis} {n}" for axis, n in enumerate(tensor.shape))
+            macros.append(f"#define RSI_NATIVE_{label}_LOGICAL_NUMEL {math.prod(tensor.logical_shape)}")
+            macros.extend(f"#define RSI_NATIVE_{label}_LOGICAL_DIM{axis} {n}" for axis, n in enumerate(tensor.logical_shape))
         types = {"float16": "torch::kFloat16", "bfloat16": "torch::kBFloat16", "float32": "torch::kFloat32"}
         allocations = []
         for i, tensor in enumerate(self.inputs):
