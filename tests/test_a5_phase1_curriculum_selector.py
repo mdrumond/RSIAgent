@@ -457,3 +457,14 @@ def test_wave_cannot_overshoot_remaining_target():
     reply = wave([project(), project("second", learning_focus=["debug-print"])])
     with pytest.raises(ValueError, match="remaining project target"):
         CurriculumAgent(lambda _: reply).select(context(remaining_projects=1))
+
+
+def test_documented_mxfp8_example_matches_published_grammar():
+    from pathlib import Path
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    text = Path("docs/ASCEND_CURRICULUM_EXPERIMENTS.md").read_text()
+    example = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
+    spec = ProjectSpec.from_mapping(example)
+    assert spec.dtype.value == "mxfp8_e4m3fn"
+    decision, _ = CurriculumAgent(lambda _: wave([example])).select(context())
+    assert decision.wave.projects[0].spec == spec

@@ -113,3 +113,32 @@ not prerequisites. Every performance comparison verifies both sources first.
 | 62 | MXFP8: MX E5M2 Cube tiles | mxfp8_e5m2 | two legal tile sizes, identical quantized values/scales | msprof + timing |
 | 63 | MXFP8: MX scale movement | mxfp8_e4m3fn | correct reload vs buffered scale-bearing loads | msprof PipeTimeline + timing |
 | 64 | MXFP8: MX scale synchronization | mxfp8_e5m2 | repair scale readiness then compare correct minimal/extra ordering | mssanitizer then separate msprof + timing |
+
+## Runnable MXFP8 project shape
+
+MXFP8 supports only a single ordered matmul, without `padded-tail`; low-precision
+Cube outputs are FP32. Plain FP8 permits movement/vector graphs as well, with
+FP8 output outside Cube. Scale tensors are host-owned and excluded from the
+mathematical graph inputs. This strict project is accepted by the same parser
+used for curriculum waves:
+
+```json
+{
+  "project_id": "mx-scale-movement",
+  "capabilities": ["cube-tiling", "profiling"],
+  "shape": [16, 64, 16],
+  "dtype": "mxfp8_e4m3fn",
+  "block_count": 1,
+  "padding_multiple": 1,
+  "failure_mode": "none",
+  "timing_lengths": [],
+  "profile_metric": "timeline",
+  "learning_focus": ["pipe-mte1", "pipe-cube"],
+  "hypothesis": "Question: do buffered scale-bearing loads reduce operand waits? Controlled change: compare correct reload and buffered-load sources at fixed shape and quantized inputs/scales. Tools: msprof timeline and request-timing. Measurements: host error and per-task instrumented device duration for both sources, explicit wait events when available. Expected lesson: whether scale movement limits this tile.",
+  "graph": {
+    "inputs": [{"name": "a", "shape": [16, 64]}, {"name": "b", "shape": [64, 16]}],
+    "nodes": [{"name": "out", "op": "matmul", "operands": ["a", "b"], "axis": null}],
+    "output": "out"
+  }
+}
+```
