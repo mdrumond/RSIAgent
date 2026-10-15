@@ -9,11 +9,13 @@ import pytest
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes
-from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA, STATE_SCHEMA
-from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_adaptive import DELTA_SCHEMA, MEMORY_SCHEMA, STATE_SCHEMA
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveProject, WaveSpec
 from benchmarks.a5kernels.phase1_experiments import build_cells
 from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
 from benchmarks.a5kernels.phase1_provider import DirectCompletion
+from benchmarks.a5kernels.phase1_project import EvidenceClassification, ExecutionEvidence
+from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
 from benchmarks.a5kernels.phase2_adaptive_memory import (
     REVIEW_SCHEMA, admit_adaptive_snapshot, adaptive_destination,
 )
@@ -44,6 +46,17 @@ def _source(tmp_path, *, new=False):
         admitted_artifact_sha256=(evidence,), artifact_store="artifacts",
     ).as_dict()
     encoded = base64.b64encode(canonical_bytes(memory)).decode()
+    pre_memory = canonical_bytes({
+        "schema": MEMORY_SCHEMA, "initial_memory_base64": "", "project_memory_base64": [],
+    })
+    wave = WaveSpec("wave-01", hashlib.sha256(pre_memory).hexdigest(), (), (WaveProject(spec),))
+    LiveWaveCoordinator(root / "waves/wave-01", wave, pre_memory, lambda _: WaveProjectResult(
+        canonical_bytes({"schema": DELTA_SCHEMA, "project_id": "copy", "summary": "host verified",
+                         "memory_base64": encoded}),
+        ExecutionEvidence(EvidenceClassification.HOST_VERIFIED, "test fixture"),
+        canonical_bytes({"classification": "host-verified", "source_sha256": source_sha,
+                         "artifacts": {"classification": evidence}}),
+    ), 1).run()
     state = {
         "schema": STATE_SCHEMA, "initial_memory_sha256": hashlib.sha256(b"").hexdigest(),
         "terminal": {"status": "SATURATED", "reason": "done"},
@@ -106,6 +119,19 @@ def test_project_limit_terminal_is_admitted(tmp_path):
     state["terminal"]["status"] = "PROJECT_LIMIT_REACHED"
     (root / "state.json").write_bytes(canonical_bytes(state))
     admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2").verify()
+
+
+@pytest.mark.parametrize("name", ["outcome.json", "memory-delta.bin", "execution-evidence.bin"])
+@pytest.mark.parametrize("mutation", ["missing", "stale"])
+def test_admission_requires_actual_published_branch_evidence(tmp_path, name, mutation):
+    root, source, review, _ = _source(tmp_path)
+    path = root / "waves/wave-01/branches/copy" / name
+    if mutation == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b'{}')
+    with pytest.raises(ValueError):
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
 
 
 def test_new_guidance_reaches_phase2_and_current_qualification_is_required(tmp_path):

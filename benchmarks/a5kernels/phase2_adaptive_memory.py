@@ -10,8 +10,10 @@ from pathlib import Path
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA, STATE_SCHEMA
+from benchmarks.a5kernels.phase1_curriculum import WaveSpec
 from benchmarks.a5kernels.phase1_experiments import build_cells
 from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator
 from benchmarks.a5kernels.phase2_memory import (
     ADAPTIVE_CELL_SCHEMA, A5Phase1Snapshot, A5Phase2Cell, _cell_id, _publish_exact,
 )
@@ -72,6 +74,42 @@ def adaptive_destination(source, review):
     )
 
 
+def _published_evidence(root, state, initial):
+    """Reuse the coordinator's read-only publication checks before handoff."""
+    files, published = {}, []
+    for wave_id in state["completed_waves"]:
+        wave_root = root / "waves" / wave_id
+        wave = WaveSpec.from_mapping(_read(wave_root / "plan.json")["wave"])
+        pre_memory = canonical_bytes({
+            "schema": MEMORY_SCHEMA,
+            "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
+            "project_memory_base64": published,
+        })
+        reader = LiveWaveCoordinator(wave_root, wave, pre_memory, lambda _: None, 1)
+        reader.read_published_memory()  # authenticates outcomes and both evidence digests
+        for name in ("plan.json", "published.json", "consolidated-memory.json"):
+            files[f"waves/{wave_id}/{name}"] = (wave_root / name).read_bytes()
+        for project in wave.projects:
+            branch = wave_root / "branches" / project.spec.project_id
+            delta = _read(branch / "memory-delta.bin")
+            memory = Phase1ProjectMemory.from_mapping(json.loads(base64.b64decode(delta["memory_base64"])))
+            evidence = _read(branch / "execution-evidence.bin")
+            if (delta.get("project_id") != project.spec.project_id
+                    or memory.project_spec != project.spec
+                    or evidence.get("classification") != "host-verified"
+                    or evidence.get("source_sha256") != memory.source_revision
+                    or evidence.get("artifacts", {}).get("classification") not in {
+                        fact.evidence_sha256 for fact in memory.host_facts
+                        if fact.category == "host-verification"}):
+                raise ValueError("published adaptive host evidence differs from memory")
+            published.append(delta["memory_base64"])
+            for name in ("outcome.json", "memory-delta.bin", "execution-evidence.bin"):
+                files[f"waves/{wave_id}/branches/{project.spec.project_id}/{name}"] = (branch / name).read_bytes()
+    if published != state["memory_bytes_base64"]:
+        raise ValueError("adaptive state differs from published branch memory")
+    return files
+
+
 class AdaptivePhase1Snapshot(A5Phase1Snapshot):
     """Snapshot understood by the existing bounded Phase 2 runner."""
 
@@ -86,6 +124,7 @@ class AdaptivePhase1Snapshot(A5Phase1Snapshot):
                 raise ValueError("adaptive snapshot bytes changed")
         state = _read(self.root / "state.json")
         memories, memory_sha = _memory(state, (self.root / "initial-memory.bin").read_bytes())
+        _published_evidence(self.root, state, (self.root / "initial-memory.bin").read_bytes())
         review = _read(self.root / "review.json")
         _review(review, memory_sha, self.destination.source_cell_id)
         if canonical_digest(review) != self.destination.qualification_sha256:
@@ -135,6 +174,7 @@ def admit_adaptive_snapshot(source_root, initial_memory, review_path, source, ph
         "campaign-identity.json": (source_root / "campaign-identity.json").read_bytes(),
         "phase1-memory.jsonl": b"".join(row + b"\n" for row in memories),
     }
+    files.update(_published_evidence(source_root, state, initial_memory))
     for payload in memories:
         memory = Phase1ProjectMemory.from_mapping(json.loads(payload))
         project_id = memory.project_spec.project_id
