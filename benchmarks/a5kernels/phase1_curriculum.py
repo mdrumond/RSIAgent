@@ -36,6 +36,8 @@ class Capability(str, Enum):
     PADDED_TAIL = "padded-tail"
     SIMT_REDUCTION = "simt-reduction"
     SIMT_MASK = "simt-mask"
+    VECTOR_REDUCTION = "vector-reduction"
+    VECTOR_MASK = "vector-mask"
     CUBE_TILING = "cube-tiling"
     FAILURE_REPAIR = "failure-repair"
     TIMING_SWEEP = "timing-sweep"
@@ -158,12 +160,17 @@ class ProjectSpec:
         operations = {node.op for node in self.graph.nodes}
         required_operations = {
             Capability.CUBE_TILING: {ProjectOp.MATMUL},
-            Capability.SIMT_REDUCTION: {ProjectOp.REDUCE_SUM},
-            Capability.SIMT_MASK: {ProjectOp.MASK_POSITIVE},
             Capability.SIMD_VECTOR: {
                 ProjectOp.ADD, ProjectOp.MULTIPLY, ProjectOp.RELU,
             },
         }
+        for operation, alternatives in (
+            (ProjectOp.REDUCE_SUM, {Capability.SIMT_REDUCTION, Capability.VECTOR_REDUCTION}),
+            (ProjectOp.MASK_POSITIVE, {Capability.SIMT_MASK, Capability.VECTOR_MASK}),
+        ):
+            selected = alternatives & capabilities
+            if len(selected) != int(operation in operations):
+                raise ValueError("exactly one reduction/mask capability must agree with graph operations")
         for capability, supported in required_operations.items():
             if (capability in capabilities) != bool(operations & supported):
                 raise ValueError(

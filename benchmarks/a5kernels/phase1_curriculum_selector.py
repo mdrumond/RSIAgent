@@ -12,6 +12,8 @@ import json
 import re
 from typing import Callable, Mapping, Sequence
 
+from benchmarks.ascend.targets import CurriculumPolicy
+
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_curriculum import (
     Capability,
@@ -303,7 +305,9 @@ def _grammar() -> dict[str, object]:
             "profile_metric", "hypothesis", "graph",
         ],
         "optional_project_fields": {"learning_focus": list(LEARNING_FOCI)},
-        "capabilities": [item.value for item in Capability],
+        "capabilities": [item.value for item in Capability if item not in {
+            Capability.VECTOR_REDUCTION, Capability.VECTOR_MASK,
+        }],
         "dtypes": [item.value for item in DType],
         "low_precision_rules": {
             "float8_e4m3fn/float8_e5m2": "movement/vector graphs allowed; Cube requires exactly one matmul node with operands equal to graph inputs in order, no padded-tail capability; copy-only graphs preserve FP8 output; every non-copy FP8 graph computes all intermediates and output in FP32",
@@ -345,6 +349,7 @@ def _grammar() -> dict[str, object]:
 def curriculum_prompt(
     context: CurriculumContext,
     unavailable_capabilities: tuple[Capability, ...] = (),
+    *, target_policy: "CurriculumPolicy | None" = None,
 ) -> str:
     payload = {
         "objective": context.objective,
@@ -354,7 +359,9 @@ def curriculum_prompt(
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
         "prior_outcomes": [item.prompt_dict() for item in context.prior_outcomes],
-        "bounded_project_grammar": _grammar(),
+        "bounded_project_grammar": (
+            _grammar() if target_policy is None else target_policy.grammar(_grammar())
+        ),
     }
     if unavailable_capabilities:
         payload["unavailable_capabilities"] = [
@@ -376,7 +383,8 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
-    return instructions + ASCEND_EXPERIMENT_GUIDANCE + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    guidance = ASCEND_EXPERIMENT_GUIDANCE if target_policy is None else target_policy.guidance
+    return instructions + guidance + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class CurriculumAgent:
@@ -388,10 +396,12 @@ class CurriculumAgent:
         *,
         held_out_information_sha256: Sequence[str] = (),
         unavailable_capabilities: Sequence[Capability] = (),
+        target_policy: "CurriculumPolicy | None" = None,
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
         self._complete = complete
+        self.target_policy = target_policy
         self._held_out = frozenset(
             _digest(item, "held-out information identity")
             for item in held_out_information_sha256
@@ -414,11 +424,15 @@ class CurriculumAgent:
         if not isinstance(current, CurriculumSession):
             raise TypeError("session must be CurriculumSession")
         history = list(current.messages) if current.messages else [
-            {"role": "system", "content": _SYSTEM}
+            {"role": "system", "content": (
+                _SYSTEM if self.target_policy is None else self.target_policy.system
+            )}
         ]
         history.append({
             "role": "user",
-            "content": curriculum_prompt(context, self.unavailable_capabilities),
+            "content": curriculum_prompt(
+                context, self.unavailable_capabilities, target_policy=self.target_policy,
+            ),
         })
         for attempt in range(1, 4):
             # Provider failures are not proposal-validation failures. Let the
@@ -474,6 +488,12 @@ class CurriculumAgent:
                 raise ValueError("stall requires an observed prior attempt")
             return terminal
         wave = WaveSpec.from_mapping(value)
+        for project in wave.projects:
+            if self.target_policy is not None:
+                self.target_policy.admit(project.spec)
+            elif any(item in {Capability.VECTOR_REDUCTION, Capability.VECTOR_MASK}
+                     for item in project.spec.capabilities):
+                raise ValueError("native vector capability requires an explicit target policy")
         if len(wave.projects) > min(8, context.remaining_projects):
             raise ValueError("wave exceeds eight-project wave limit or remaining project target")
         unavailable = set(self.unavailable_capabilities)
