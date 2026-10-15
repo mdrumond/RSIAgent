@@ -25,10 +25,14 @@ def diagnostic_action(backend):
         digest = context.artifacts.put_json(result["artifact"])
         if digest != result["evidence_sha256"]:
             raise ValueError("diagnostic artifact hash does not match payload")
+        record = result["record"]
+        observed = {"tool": record.get("tool", tool), "available": record["available"]}
+        if "execution" in record:
+            observed["execution"] = True
         return AdaptiveActionResult(
-            {"event": "diagnostic", **result["record"], "evidence_sha256": digest},
+            {"event": "diagnostic", **record, "evidence_sha256": digest},
             admitted_artifacts={digest: "diagnostic"},
-            host_facts=(HostFact("diagnostic", "tool-observation:" + json.dumps(result["record"], sort_keys=True), digest),),
+            host_facts=(HostFact("diagnostic", "tool-observation:" + json.dumps(observed, sort_keys=True), digest),),
         )
 
     return diagnose
