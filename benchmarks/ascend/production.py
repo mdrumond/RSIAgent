@@ -120,7 +120,7 @@ def build_native_adaptive_phase1(
             raise ValueError("native KDB requires explicit collection and embeddings")
         with KnowledgeDB.open_read_only(config.kdb, embeddings) as database:
             manifest = database.manifest(config.collection)
-            if manifest.language != "ascend-c":
+            if manifest.language != "ascend-c" and "ascend-c" not in manifest.kernel_languages:
                 raise ValueError("native KDB collection must use ascend-c language")
             identity["kdb_manifest"] = manifest.fingerprint
         query = _knowledge_action(config, embeddings)

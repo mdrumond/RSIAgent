@@ -7,9 +7,10 @@ import json
 import math
 import re
 import sqlite3
+from itertools import islice
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Protocol, Sequence
+from typing import Callable, Iterable, Protocol, Sequence
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_EMBEDDING_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
@@ -54,14 +55,24 @@ class CollectionManifest:
     fingerprint: str
     chunk_lines: int = CHUNK_LINES
     chunk_overlap: int = CHUNK_OVERLAP
+    # Optional provenance keeps historical manifests readable without migration.
+    repository: str | None = None
+    revision: str | None = None
+    kernel_languages: tuple[str, ...] = ()
+    reference_exposed: bool = False
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
+        value = asdict(self)
+        for key in ("repository", "revision", "kernel_languages", "reference_exposed"):
+            if not value[key]:
+                del value[key]
+        return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def from_json(cls, value: str) -> "CollectionManifest":
         raw = json.loads(value)
         raw["sources"] = tuple(SourceFingerprint(**item) for item in raw["sources"])
+        raw["kernel_languages"] = tuple(raw.get("kernel_languages", ()))
         return cls(**raw)
 
 
@@ -314,8 +325,16 @@ class KnowledgeDB:
         collection: str,
         language: str,
         manifest_path: Path | None = None,
+        batch_size: int = 32,
+        repository: str | None = None,
+        revision: str | None = None,
+        kernel_languages: tuple[str, ...] = (),
+        reference_exposed: bool = False,
+        progress: Callable[[int], None] | None = None,
     ) -> CollectionManifest:
         root = root.resolve()
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
         source_paths = tuple(dict.fromkeys(path.resolve() for path in paths))
         if not source_paths:
             raise ValueError("a collection must contain at least one source")
@@ -329,6 +348,13 @@ class KnowledgeDB:
             embedding_model=self.embeddings.model,
             embedding_revision=self.embeddings.revision,
         )
+        if repository or revision or kernel_languages or reference_exposed:
+            from dataclasses import replace
+            metadata = dict(repository=repository, revision=revision,
+                            kernel_languages=tuple(kernel_languages),
+                            reference_exposed=reference_exposed)
+            identity = manifest.fingerprint + json.dumps(metadata, sort_keys=True)
+            manifest = replace(manifest, **metadata, fingerprint=_sha256(identity.encode()))
         existing = self.connection.execute(
             "SELECT manifest_json FROM collections WHERE name = ?", (collection,)
         ).fetchone()
@@ -342,14 +368,11 @@ class KnowledgeDB:
                 manifest_path.write_text(current.to_json(), encoding="utf-8")
             return current
 
-        chunks = [
+        chunks = iter(
             chunk
             for snapshot in snapshots
             for chunk in chunk_source(snapshot.fingerprint.path, snapshot.data)
-        ]
-        vectors = self.embeddings.embed([chunk.text for chunk in chunks])
-        if len(vectors) != len(chunks):
-            raise ValueError("embedding backend returned the wrong number of vectors")
+        )
         with self.connection:
             fts_table = self._fts_table_name(collection)
             self.connection.execute(
@@ -359,7 +382,18 @@ class KnowledgeDB:
                 (collection, language, manifest.fingerprint, manifest.to_json(), fts_table),
             )
             self._ensure_fts_table(fts_table)
-            for chunk, vector in zip(chunks, vectors):
+            def encoded_chunks():
+                total = 0
+                while batch := list(islice(chunks, batch_size)):
+                    vectors = self.embeddings.embed([chunk.text for chunk in batch])
+                    if len(vectors) != len(batch):
+                        raise ValueError("embedding backend returned the wrong number of vectors")
+                    yield from zip(batch, vectors)
+                    total += len(batch)
+                    if progress:
+                        progress(total)
+
+            for chunk, vector in encoded_chunks():
                 cursor = self.connection.execute(
                     """INSERT INTO chunks
                        (collection, chunk_id, path, start_line, end_line, text, vector_json)
