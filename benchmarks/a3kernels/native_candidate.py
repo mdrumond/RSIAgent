@@ -6,6 +6,7 @@ to the shared project oracle, not this transport contract.
 """
 
 from dataclasses import asdict, dataclass
+from functools import cached_property
 from importlib.resources import files
 import json
 import math
@@ -79,6 +80,9 @@ class NativeCandidatePlan:
         pattern = r"\s*".join(re.escape(t) for t in re.findall(r'"[^"]*"|\w+|[^\w\s]', self.signature))
         if len(re.findall(pattern, self.source)) != 1:
             raise ValueError("candidate must define the declared native signature exactly once")
+        # Freeze staged host bytes when the plan is created, not when a later
+        # replay happens to read installed resources after an update.
+        self.files
 
     @property
     def signature(self):
@@ -93,16 +97,18 @@ class NativeCandidatePlan:
     def padded_length(self):
         return self.output.numel
 
-    @property
+    @cached_property
     def files(self):
         root = files("benchmarks.a3kernels.candidate_runtime")
-        build = dict(arch=self.arch, compiler="bisheng", output="a3_candidate.so", source="kernel.cpp", target=self.target)
+        build = dict(arch=self.arch, compiler="bisheng", output="a3_candidate.so", source="kernel.cpp", target=self.target, kernel_name=self.kernel_name)
         return tuple(sorted((
             SourceFile("candidate.cpp", self.source),
             SourceFile("build.json", json.dumps(build, sort_keys=True)),
             SourceFile("host_wrapper.inc", self._wrapper()),
             SourceFile("host_driver.py", root.joinpath("native_driver.py").read_text()),
             SourceFile("legacy_driver.py", root.joinpath("host_driver.py").read_text()),
+            SourceFile("a3_profile_driver.py", root.joinpath("a3_profile_driver.py").read_text()),
+            SourceFile("native_measurement_driver.py", root.joinpath("native_measurement_driver.py").read_text()),
         )))
 
     @property
