@@ -481,3 +481,15 @@ def test_small_adaptive_waves_are_bounded_by_remaining_target():
         with pytest.raises(ValueError, match="wave limit or remaining"):
             CurriculumAgent(lambda _: wave(projects)).select(
                 context(remaining_projects=remaining))
+
+
+def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    grammar = json.loads(curriculum_prompt(context()).rsplit("\n", 1)[-1])["bounded_project_grammar"]
+    assert "never project IDs" in grammar["requires"]
+    assert "[] for the initial wave" in grammar["requires"]
+    assert "zero-based axis" in grammar["graph"]["axis"]
+    assert "null for every non-reduction" in grammar["graph"]["axis"]
+    assert "1 if x > 0 else 0" in grammar["graph"]["mask-positive"]
+    assert "input dtype by default" in grammar["output_dtype"]
+    assert "matmul outputs float32" in grammar["output_dtype"]
