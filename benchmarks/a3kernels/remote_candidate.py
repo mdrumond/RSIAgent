@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 
 from .candidate import CandidateCompilation
+from .native_candidate import NativeCandidatePlan
 from .phase1_protocol import ExecutionPlan, ExecutionReceipt, FailedEvidence, VerifiedResult, attest
 
 
@@ -103,9 +104,9 @@ class GZA3RemoteCandidateBackend:
         self._state_root = state_directory.resolve() if state_directory is not None else None
 
     def build_bundle(self, plan: ExecutionPlan, destination: Path) -> CandidateBundle:
-        if not isinstance(plan, ExecutionPlan):
+        if not isinstance(plan, (ExecutionPlan, NativeCandidatePlan)):
             raise TypeError("plan must be an A3 ExecutionPlan")
-        input_value = {
+        input_value = plan.input_payload if isinstance(plan, NativeCandidatePlan) else {
             "input_a": plan.input_a, "input_b": plan.input_b,
             "logical_length": plan.logical_length, "padded_length": plan.padded_length,
             "block_count": plan.block_count,
@@ -195,6 +196,22 @@ class GZA3RemoteCandidateBackend:
     ) -> VerifiedResult | FailedEvidence:
         if not isinstance(compilation, CandidateCompilation):
             raise TypeError("execute requires a CandidateCompilation")
+        if not isinstance(compilation.plan, ExecutionPlan):
+            raise TypeError("generic native candidates require execute_receipt and a host oracle")
+        receipt = self.execute_receipt(compilation)
+        if isinstance(receipt, FailedEvidence):
+            return receipt
+        plan = compilation.plan
+        expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
+        maximum = max(abs(receipt.output[i] - expected[i]) for i in range(plan.logical_length))
+        return VerifiedResult.from_receipt(plan, receipt, max_abs_error=maximum)
+
+    def execute_receipt(
+        self, compilation: CandidateCompilation
+    ) -> ExecutionReceipt | FailedEvidence:
+        """Observe synchronized device output without asserting numerical correctness."""
+        if not isinstance(compilation, CandidateCompilation):
+            raise TypeError("execute requires a CandidateCompilation")
         plan = compilation.plan
         self._require_execution_profile(plan)
         directory = self.remote_candidate_directory(plan)
@@ -223,11 +240,6 @@ class GZA3RemoteCandidateBackend:
             return FailedEvidence.create(
                 plan, stage="verify", error_type="OutputError", detail=str(exc)
             )
-        expected = tuple(a + b for a, b in zip(plan.input_a, plan.input_b))
-        maximum = max(
-            abs(output[index] - expected[index])
-            for index in range(plan.logical_length)
-        )
         receipt = ExecutionReceipt(
             exit_code=0, output=output, stdout=completed.stdout,
             stderr=completed.stderr, job_handle=handle,
@@ -236,9 +248,8 @@ class GZA3RemoteCandidateBackend:
                 ("remote_candidate_directory", directory.as_posix()),
             ),
         )
-        result = VerifiedResult.from_receipt(plan, receipt, max_abs_error=maximum)
         self._pending_path(plan, "execute").unlink(missing_ok=True)
-        return result
+        return receipt
 
     def _operation_error_type(
         self, completed: subprocess.CompletedProcess[str],
@@ -252,7 +263,7 @@ class GZA3RemoteCandidateBackend:
     def remote_candidate_directory(self, plan: ExecutionPlan) -> PurePosixPath:
         """Return the retained directory consumed by the A3 profiling backend."""
 
-        if not isinstance(plan, ExecutionPlan):
+        if not isinstance(plan, (ExecutionPlan, NativeCandidatePlan)):
             raise TypeError("plan must be an A3 ExecutionPlan")
         return self._workspace / ".rsi-a3" / "candidates" / plan.execution_id
 
@@ -261,7 +272,7 @@ class GZA3RemoteCandidateBackend:
 
     @staticmethod
     def _require_execution_profile(plan: ExecutionPlan) -> None:
-        if not isinstance(plan, ExecutionPlan):
+        if not isinstance(plan, (ExecutionPlan, NativeCandidatePlan)):
             raise TypeError("plan must be an A3 ExecutionPlan")
         if plan.execution_profile != "gz-a3":
             raise ValueError("GZ-A3 backend requires a gz-a3 execution profile")
