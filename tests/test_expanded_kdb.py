@@ -94,6 +94,26 @@ def test_unverified_source_never_publishes_over_existing_index(tmp_path):
     assert db.read_bytes() == b"retained prior index"
 
 
+def test_source_change_between_verification_and_index_snapshot_never_publishes(tmp_path, monkeypatch):
+    path = inventory(tmp_path, names=("ops-nn",))
+    db = tmp_path / "published.sqlite3"
+    original = b"retained prior index"
+    db.write_bytes(original)
+    original_index = KnowledgeDB.index
+
+    def changed_index(database, root, paths, **kwargs):
+        (root / "kernel.cpp").write_text("changed vector kernel\n")
+        return original_index(database, root, paths, **kwargs)
+
+    monkeypatch.setattr(KnowledgeDB, "index", changed_index)
+    with pytest.raises(ValueError, match="changed after inventory verification.*new DB path"):
+        ingest(path, db, Embeddings())
+    assert db.read_bytes() == original
+    assert not db.with_suffix(".sqlite3.inventory.json").exists()
+    # Retain staging evidence; do not silently delete the mismatching collection.
+    assert db.with_suffix(".sqlite3.staging").exists()
+
+
 def test_failed_embedding_rolls_back_collection_and_resume_uses_completed_collection(tmp_path):
     path = inventory(tmp_path)
     db = tmp_path / "kdb.sqlite3"

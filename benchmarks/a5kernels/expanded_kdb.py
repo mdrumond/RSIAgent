@@ -76,6 +76,14 @@ def ingest(inventory_path: Path, database_path: Path, embeddings, *, batch_size=
                 progress=lambda count: print(f"{collection}: {count} chunks", file=sys.stderr,
                                              flush=True) if count % 1024 < batch_size else None,
             )
+            expected = {item["path"]: (item["sha256"], item["bytes"])
+                        for item in source["files"]}
+            indexed_sources = {item.path: (item.sha256, item.size) for item in manifest.sources}
+            if indexed_sources != expected:
+                raise ValueError(
+                    f"indexed source changed after inventory verification: {source['name']}; "
+                    "use a new DB path after restoring the pinned sources"
+                )
             completed.append({"collection": collection, "fingerprint": manifest.fingerprint,
                               "repository": manifest.repository, "revision": manifest.revision,
                               "files": len(manifest.sources)})
