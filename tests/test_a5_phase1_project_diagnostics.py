@@ -168,3 +168,23 @@ def test_diagnostic_sessions_fit_checked_wrapper_and_retries_stay_distinct(tmp_p
     ]
     assert [result["artifact"]["attempt"] for result in results] == [1, 2]
     assert all(result["artifact"]["mode"] == "diagnostic-" + tool for result in results)
+
+
+def test_disabled_host_debug_switch_reports_unavailable_even_when_tool_exits_zero(tmp_path, monkeypatch):
+    arguments = _arguments(tmp_path)
+    arguments[3] = "diagnostic-msdebug"
+    transcript = ('msdebug failed to initialize, please run "echo 1 > /proc/debug_switch" '
+                  'to turn on switch\nERROR 0x20102\nProcess stopped: SIGABRT')
+    monkeypatch.setattr("shutil.which", lambda name: "/tool/" + name)
+    captures = iter((
+        {"exit_code": 0, "termination": None, "output": "msdebug 26.2.0"},
+        {"exit_code": 0, "termination": None, "output": transcript},
+    ))
+    monkeypatch.setattr("benchmarks.a5kernels.phase1_project_diagnostic_driver._capture",
+                        lambda *args, **kwargs: next(captures))
+    record = diagnose(arguments)
+    assert record["available"] is False
+    assert record["diagnostic"] == "msdebug unavailable: host driver debug switch is disabled"
+    assert record["execution"]["output"] == transcript
+    assert record["coverage"] == "unconfirmed"
+    assert record["host_verified"] is False

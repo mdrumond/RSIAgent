@@ -103,6 +103,10 @@ def diagnose(arguments):
         if execution["termination"] else
         "inspect retained transcript; tool exit status does not prove instruction coverage"
     )
+    if (tool == "msdebug" and "msdebug failed to initialize" in execution["output"]
+            and "/proc/debug_switch" in execution["output"]):
+        record["available"] = False
+        record["diagnostic"] = "msdebug unavailable: host driver debug switch is disabled"
     # Instrumentation requirements differ by compiler and chip. Do not inject
     # older AscendC sanitizer/-O0 flags into A5 Catlass or claim a clean check.
     return record
