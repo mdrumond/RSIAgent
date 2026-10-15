@@ -120,6 +120,10 @@ class NativeCandidatePlan:
         return canonical_digest(dict(plan=asdict(self), source_fingerprint=self.source_fingerprint))
 
     def _wrapper(self):
+        macros = []
+        for label, tensor in [(f"INPUT{i}", t) for i, t in enumerate(self.inputs)] + [("OUTPUT", self.output)]:
+            macros.append(f"#define RSI_NATIVE_{label}_NUMEL {tensor.numel}")
+            macros.extend(f"#define RSI_NATIVE_{label}_DIM{axis} {n}" for axis, n in enumerate(tensor.shape))
         types = {"float16": "torch::kFloat16", "bfloat16": "torch::kBFloat16", "float32": "torch::kFloat32"}
         allocations = []
         for i, tensor in enumerate(self.inputs):
@@ -131,6 +135,7 @@ class NativeCandidatePlan:
 #include <torch/library.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
+''' + "\n".join(macros) + '''
 // RSI_A3_CANDIDATE_SOURCE_SLOT
 torch::Tensor NativeLaunch(const std::vector<torch::Tensor>& inputs) {
 ''' + "\n".join(allocations) + f'''
