@@ -55,6 +55,8 @@ class NativeProductionConfig:
     dtypes: tuple[str, ...] = ("float32",)
     kdb: Path | None = None
     collection: str | None = None
+    environment_identity: dict | None = None
+    profiling_mode: str | None = None
 
     def __post_init__(self):
         if self.execution_profile not in {"bz-a3-1", "bz-a3-2"}:
@@ -93,6 +95,9 @@ def build_native_adaptive_phase1(
     if hashlib.sha256(guide_bytes).hexdigest() != config.guide_sha256:
         raise ValueError("native programming guide identity mismatch")
     guide_text = guide_bytes.decode("utf-8")
+    profiling_mode = config.profiling_mode or ("new" if profiling_guidance is not None else "without-profiling-guidance")
+    if profiling_mode not in {"new", "without-profiling-guidance"} or ((profiling_mode == "new") != (profiling_guidance is not None)):
+        raise ValueError("native profiling mode and admitted guidance must agree")
     policy = a3_curriculum_policy(dtypes=config.dtypes)
     identity = {
         "schema": "ascend-native-adaptive-identity-v1", "target": config.target,
@@ -101,9 +106,11 @@ def build_native_adaptive_phase1(
         "cpl_skills_revision": config.cpl_skills_revision,
         "dtypes": config.dtypes, "model": profile.identity.as_dict(),
         "profiling_guidance": profiling_guidance,
+        "profiling_mode": profiling_mode,
         "measurement_actions": {"profiling": request_profile is not None,
                                 "timing": request_timing is not None},
         "kdb_collection": config.collection,
+        "environment_identity": config.environment_identity or {},
     }
     query = None
     if config.kdb is not None:
@@ -187,7 +194,11 @@ class NativeProjectBinding:
             "Include kernel_operator.h; host code owns compilation and launching. "
             "Arguments are contiguous physical padded tensor storage in graph input order "
             "then output. Shapes and dtype are fixed by the project contract, not runtime "
-            "parameters. Round the last dimension up to padding_multiple to obtain physical "
+            "parameters. Host macros RSI_NATIVE_INPUT<i>_NUMEL, RSI_NATIVE_INPUT<i>_DIM<axis>, "
+            "RSI_NATIVE_OUTPUT_NUMEL and RSI_NATIVE_OUTPUT_DIM<axis> describe physical extents. "
+            "For timing sweeps use these macros rather than hardcoded lengths: the host "
+            "recompiles the unchanged source for each requested shape. Round the last dimension "
+            "up to padding_multiple to obtain physical "
             "storage. Compute only logical elements; input padding contains nonzero sentinels. "
             "Write every physical output element, setting padding to zero. Use the declared "
             "block_count for disjoint work partitioning. Do not register Torch operators, "
