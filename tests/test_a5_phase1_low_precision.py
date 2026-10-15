@@ -4,9 +4,11 @@ import math
 
 import pytest
 
-from benchmarks.a5kernels.phase1_curriculum import DType, ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import Capability, DType, ProjectSpec
 from benchmarks.a5kernels.phase1_low_precision import mx_quantize, quantize_fp8
-from benchmarks.a5kernels.phase1_project import HostTensor, evaluate_reference, materialize_inputs
+from benchmarks.a5kernels.phase1_project import (
+    HostTensor, ProjectGraph, evaluate_reference, materialize_inputs,
+)
 from benchmarks.a5kernels.phase1_project_bz import _PROJECT_DRIVER
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 from tests.test_a5_phase1_project_bz import FakeExecutor, _backend
@@ -100,7 +102,34 @@ def test_mx_rejects_non_cube_graph():
 
 @pytest.mark.parametrize("dtype", [DType.FLOAT8_E4M3FN, DType.FLOAT8_E5M2])
 def test_fp8_copy_output_is_rounded_storage_dtype(dtype):
-    spec = replace(_spec("movement"), dtype=dtype)
+    original = _spec("movement")
+    graph = ProjectGraph(original.graph.inputs, original.graph.nodes[:1], "copy")
+    spec = replace(original, dtype=dtype, graph=graph,
+                   capabilities=tuple(c for c in original.capabilities if c is not Capability.SIMD_VECTOR))
     out = evaluate_reference(spec, materialize_inputs(spec))
     assert out.dtype == dtype.value
     assert all(value == quantize_fp8(value, dtype.value) for value in out.storage)
+
+
+@pytest.mark.parametrize("dtype", [DType.FLOAT8_E4M3FN, DType.FLOAT8_E5M2])
+def test_fp8_two_squares_widen_before_arithmetic_and_serialize(tmp_path, dtype):
+    graph = ProjectGraph.from_mapping({
+        "inputs": [{"name": "x", "shape": [1]}],
+        "nodes": [
+            {"name": "square", "op": "multiply", "operands": ["x", "x"], "axis": None},
+            {"name": "out", "op": "multiply", "operands": ["square", "square"], "axis": None},
+        ],
+        "output": "out",
+    })
+    spec = replace(_spec("movement"), dtype=dtype, shape=(1,), graph=graph,
+                   capabilities=(Capability.SIMD_VECTOR,))
+    out = evaluate_reference(spec, (HostTensor((1,), (1,), (8.0,)),))
+    assert out.dtype == "float32" and out.values == (4096.0,)
+    project = ProjectExecutor(FakeExecutor([]), EvidenceLedger(tmp_path / "ledger"))
+    prepared = project.prepare(spec)
+    request = project.request(prepared, "# candidate")
+    _, files = _backend(tmp_path, FakeExecutor([]))._bundle(request)
+    manifest = json.loads(next(item.content for item in files if item.relative_path == "manifest.json"))
+    assert manifest["output_dtype"] == "float32"
+    assert '"elementwise_dtype":"float32"' in prepared.instruction
+    assert all(math.isfinite(value) for value in prepared.expected.storage)

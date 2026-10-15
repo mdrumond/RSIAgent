@@ -382,13 +382,21 @@ def _apply(
     return ReferenceOutput((m, n), tuple(values), dtype=dtype)
 
 
+def project_output_dtype(spec: "ProjectSpec") -> str:
+    """FP8 movement preserves storage; computation widens inputs to FP32."""
+    if spec.dtype.value in MX_DTYPES or (
+        spec.dtype.value in FP8_DTYPES
+        and any(node.op is not ProjectOp.COPY for node in spec.graph.nodes)
+    ):
+        return "float32"
+    return spec.dtype.value
+
+
 def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> ReferenceOutput:
     if len(inputs) != len(spec.graph.inputs):
         raise ValueError("host inputs do not match the graph")
     values: dict[str, ReferenceOutput] = {}
-    cube_low_precision = spec.dtype.value in FP8_DTYPES | MX_DTYPES and any(
-        node.op is ProjectOp.MATMUL for node in spec.graph.nodes)
-    output_dtype = "float32" if cube_low_precision else spec.dtype.value
+    output_dtype = project_output_dtype(spec)
     for index, (contract, tensor) in enumerate(zip(spec.graph.inputs, inputs, strict=True)):
         if tensor.shape != contract.shape:
             raise ValueError("host input shape does not match the graph")

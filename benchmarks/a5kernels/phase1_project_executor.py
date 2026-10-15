@@ -15,7 +15,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_digest,
 )
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-from benchmarks.a5kernels.phase1_low_precision import FP8_DTYPES, MX_DTYPES, storage_dtype
+from benchmarks.a5kernels.phase1_low_precision import MX_DTYPES, storage_dtype
 from benchmarks.a5kernels.phase1_project import (
     ExecutionEvidence,
     HostTensor,
@@ -24,6 +24,7 @@ from benchmarks.a5kernels.phase1_project import (
     classify_execution,
     evaluate_reference,
     materialize_inputs,
+    project_output_dtype,
 )
 
 
@@ -216,10 +217,9 @@ def _instruction(
         "inputs_sha256": inputs_sha256,
         "output_shape": list(spec.graph.output_shape),
         "reference_semantics": {
-            "elementwise_dtype": spec.dtype.value,
+            "elementwise_dtype": project_output_dtype(spec),
             "accumulator_dtype": "float32",
-            "output_dtype": ("float32" if spec.dtype.value in FP8_DTYPES | MX_DTYPES
-                             and family is ProjectExecutionFamily.CUBE_MATMUL else spec.dtype.value),
+            "output_dtype": project_output_dtype(spec),
             "input_storage_dtype": storage_dtype(spec.dtype.value),
             "mx_scale_group": 32 if spec.dtype.value in MX_DTYPES else None,
         },
@@ -235,8 +235,10 @@ def _instruction(
         "B is ColumnMajor; scale tensors have logical shapes (M,G)/(G,N), "
         "RowMajorMxScaleA/ColMajorMxScaleB tags, and physical storage (M,G)/(N,G). "
         "Load scales with operands using tla.copy(..., scale=...) and tla.mmad_mx; "
-        "Cube FP8/MXFP8 output uses Float32. Plain FP8 conversion exercises may "
-        "convert registers to Float32 and back explicitly. "
+        "Plain FP8 copy-only graphs preserve FP8 storage; graphs with arithmetic, "
+        "masking, reduction, or matrix multiplication widen quantized inputs to "
+        "Float32 for all intermediate computation and output. MXFP8 output is Float32. "
+        "Conversion exercises must account for packed register lanes. "
         "Tensor arguments expose full physical padded storage: tensor.origin_shape "
         "is the PHYSICAL shape here, not the logical data extent. Use "
         "LOGICAL_INPUT_SHAPES and LOGICAL_OUTPUT_SHAPE for computation bounds; "

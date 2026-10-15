@@ -2,8 +2,12 @@
 
 The host supports `float8_e4m3fn`, `float8_e5m2`, `mxfp8_e4m3fn`, and
 `mxfp8_e5m2`, in addition to existing FP16/BF16/FP32 projects. INT8 is deferred.
-`DTYPE` is the underlying FP8 type. `OUTPUT_DTYPE` is FP32 for low-precision
-Cube projects and the declared dtype otherwise. Plain FP8 registers can convert
+`DTYPE` is the underlying FP8 type. `OUTPUT_DTYPE` preserves FP8 for copy-only graphs. For all other plain FP8
+graphs, quantized FP8 inputs are widened to FP32 before computation, all
+intermediates and outputs are FP32, including arithmetic, masking, reductions,
+and Cube. MXFP8 outputs are also FP32. This avoids overflowing FP8
+intermediates in ordinary arithmetic graphs. Existing FP16/BF16/FP32
+semantics remain unchanged. Plain FP8 registers can convert
 to FP32/FP16/BF16 and back with explicit width/packing selectors; no E8M0 vector conversion is assumed. Dense width-changing casts must account
 for `CastParams(reg_slot=...)` selecting packed lanes; a round trip alone
 cannot validate the packing. See the pinned `vector_ops/fp8_full_lanes.py`
