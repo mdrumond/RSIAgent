@@ -13,6 +13,9 @@ python -m benchmarks.a5kernels.source_acquisition \
 The inventory has schema version 1. Each completed source records its upstream
 URL, immutable Git revision, local root, UTF-8 file allowlist with SHA-256 and
 byte counts, license paths, language metadata, and excluded-file reasons.
+Hashes and indexed text come from canonical Git blobs, independent of checkout
+filters and line-ending conversion. Identical checkouts retain their paths;
+transformed checkouts get a separate raw-source export without modifying inputs.
 Local roots belong only in ignored inventories, not the checked configuration.
 Generated directories, symlinks/submodules, binary and non-UTF-8 files are not
 indexed. Clones retain upstream licensing and complete repository context.

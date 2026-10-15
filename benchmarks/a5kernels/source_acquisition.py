@@ -44,19 +44,43 @@ def selected(path: str) -> bool:
     )
 
 
+def tracked_blobs(root: Path, revision: str):
+    """Stream raw Git objects through one process, independent of checkout filters."""
+    entries = git("ls-tree", "-rz", revision, cwd=root).split("\0")
+    with subprocess.Popen(["git", "cat-file", "--batch"], cwd=root,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE) as process:
+        try:
+            for entry in sorted(filter(None, entries)):
+                metadata, relative = entry.split("\t", 1)
+                mode, kind, oid = metadata.split()
+                if not selected(relative) or kind != "blob" or mode == "120000":
+                    yield relative, None
+                    continue
+                process.stdin.write((oid + "\n").encode("ascii"))
+                process.stdin.flush()
+                header = process.stdout.readline().split()
+                if len(header) != 3 or header[1] != b"blob":
+                    raise ValueError("Git blob batch returned an invalid object")
+                data = process.stdout.read(int(header[2]))
+                if len(data) != int(header[2]) or process.stdout.read(1) != b"\n":
+                    raise ValueError("Git blob batch ended unexpectedly")
+                yield relative, data
+        finally:
+            process.stdin.close()
+        if process.wait() != 0:
+            raise ValueError("Git blob batch failed")
+
+
 def inventory_tree(root: Path, revision: str) -> tuple[list[dict], list[dict]]:
-    """Hash tracked UTF-8 text; classify every omitted tracked path explicitly."""
-    paths = git("ls-tree", "-rz", "--name-only", revision, cwd=root).split("\0")
+    """Hash canonical Git UTF-8 text; classify every omitted path explicitly."""
     files, omitted = [], []
-    for relative in sorted(filter(None, paths)):
-        path = root / relative
+    for relative, data in tracked_blobs(root, revision):
         reason = None
         if not selected(relative):
             reason = "excluded-generated-or-non-source"
-        elif path.is_symlink() or not path.is_file():
+        elif data is None:
             reason = "symlink-or-submodule"
         else:
-            data = path.read_bytes()
             try:
                 data.decode("utf-8")
             except UnicodeDecodeError:
@@ -68,7 +92,34 @@ def inventory_tree(root: Path, revision: str) -> tuple[list[dict], list[dict]]:
                     files.append({"path": relative, "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)})
         if reason:
             omitted.append({"path": relative, "reason": reason})
-    return files, omitted
+    return sorted(files, key=lambda item: item["path"]), sorted(omitted, key=lambda item: item["path"])
+
+
+def canonical_root(root: Path, revision: str, files: list[dict]) -> Path:
+    """Keep identical checkouts; otherwise export raw blobs beside the checkout."""
+    def matches(directory):
+        return all((directory / item["path"]).is_file() and
+                   hashlib.sha256((directory / item["path"]).read_bytes()).hexdigest() == item["sha256"]
+                   for item in files)
+
+    if matches(root):
+        return root
+    destination = root.with_name(revision + "-raw")
+    if destination.exists():
+        if not matches(destination):
+            raise ValueError("existing canonical export does not match pinned Git blobs")
+        return destination
+    allowed = {item["path"] for item in files}
+    with tempfile.TemporaryDirectory(prefix=".raw-", dir=root.parent) as staging:
+        sources = Path(staging) / "sources"
+        sources.mkdir()
+        for relative, data in tracked_blobs(root, revision):
+            if relative in allowed:
+                target = sources / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+        os.replace(sources, destination)
+    return destination
 
 
 def acquire_source(spec: dict, destination: Path, reuse: Path | None = None) -> dict:
@@ -109,6 +160,7 @@ def acquire_source(spec: dict, destination: Path, reuse: Path | None = None) -> 
     if git("status", "--porcelain", cwd=root):
         raise ValueError("source snapshot has local modifications")
     files, omitted = inventory_tree(root, revision)
+    root = canonical_root(root, revision, files)
     return {
         "name": name, "repository": repository, "revision": revision,
         "root": str(root.resolve()), "status": "complete", "files": files,

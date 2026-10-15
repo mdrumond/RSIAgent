@@ -96,3 +96,20 @@ def test_cli_publishes_inventory(upstream, tmp_path):
     config.write_text(json.dumps({"sources": [spec()]}))
     assert main(["--config", str(config), "--destination", str(tmp_path / "downloads"), "--inventory", str(output), "--reuse", f"kernel={upstream}"]) == 0
     assert json.loads(output.read_text())["sources"][0]["files"]
+
+
+def test_autocrlf_checkout_exports_canonical_blobs_without_changing_input(upstream, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.autocrlf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    original = (upstream / "kernel.py").read_bytes()
+    result = acquire_source(spec(), tmp_path / "artifacts", upstream)
+    root = Path(result["root"])
+    assert root.name == result["revision"] + "-raw"
+    checkout = root.with_name(result["revision"])
+    assert b"\r\n" in (checkout / "kernel.py").read_bytes()
+    assert (root / "kernel.py").read_bytes() == original
+    assert (upstream / "kernel.py").read_bytes() == original
+    assert git("status", "--porcelain", cwd=checkout) == ""
+    pinned = {**spec(), "revision": result["revision"]}
+    assert acquire_source(pinned, tmp_path / "artifacts")["root"] == str(root)
