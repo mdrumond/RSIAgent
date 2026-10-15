@@ -97,6 +97,7 @@ class AdaptivePhase1Coordinator:
         execute_project: AdaptiveProjectExecutor,
         *,
         max_parallel: int,
+        max_projects: int | None = None,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("objective must be non-empty")
@@ -114,6 +115,9 @@ class AdaptivePhase1Coordinator:
         self.curriculum = curriculum
         self.execute_project = execute_project
         self.max_parallel = max_parallel
+        if max_projects is not None and (type(max_projects) is not int or max_projects < 1):
+            raise ValueError("max_projects must be a positive integer or None")
+        self.max_projects = max_projects
 
     def run(self) -> dict[str, object]:
         state = self._load_state()
@@ -123,8 +127,16 @@ class AdaptivePhase1Coordinator:
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
             if pending is None:
+                if self.max_projects is not None and len(state["prior_outcomes"]) >= self.max_projects:
+                    state = {**state, "terminal": {
+                        "status": "PROJECT_LIMIT_REACHED",
+                        "reason": f"Published project limit {self.max_projects} reached; saturation was not evaluated.",
+                    }}
+                    self._atomic_json(self.root / "state.json", state)
+                    return self._report(state)
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
+                    **({"remaining_projects": self.max_projects - len(state["prior_outcomes"])} if self.max_projects is not None else {}),
                 )
                 if isinstance(decision, TerminalDecision):
                     state = {
@@ -138,6 +150,10 @@ class AdaptivePhase1Coordinator:
                     self._atomic_json(self.root / "state.json", state)
                     return self._report(state)
                 assert isinstance(decision, WaveDecision)
+                if self.max_projects is not None and (
+                    len(state["prior_outcomes"]) + len(decision.wave.projects) > self.max_projects
+                ):
+                    raise ValueError("selected wave exceeds remaining project limit; select a smaller wave")
                 pending = {
                     "schema": PENDING_SCHEMA,
                     "base_wave_index": state["wave_index"],
@@ -147,6 +163,8 @@ class AdaptivePhase1Coordinator:
                 }
                 self._atomic_json(self.root / "pending.json", pending)
             wave = WaveSpec.from_mapping(pending["wave"])
+            if self.max_projects is not None and len(state["prior_outcomes"]) + len(wave.projects) > self.max_projects:
+                raise ValueError("retained wave exceeds configured project limit")
             coordinator = LiveWaveCoordinator(
                 self.root / "waves" / wave.wave_id,
                 wave,
@@ -305,6 +323,8 @@ class AdaptivePhase1Coordinator:
                 "completed_waves": [],
                 "terminal": None,
             }
+            if self.max_projects is not None:
+                state["max_projects"] = self.max_projects
             self._atomic_json(path, state)
             return state
         state = self._read_json(path)
@@ -316,6 +336,8 @@ class AdaptivePhase1Coordinator:
             raise ValueError("adaptive state does not match objective")
         if state.get("initial_memory_sha256") != hashlib.sha256(self.initial_memory).hexdigest():
             raise ValueError("adaptive state initial memory does not match")
+        if hasattr(self, "max_projects") and state.get("max_projects") != self.max_projects:
+            raise ValueError("adaptive state project limit does not match")
 
     def _load_pending(self, state):
         path = self.root / "pending.json"
