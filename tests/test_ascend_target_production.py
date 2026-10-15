@@ -1,0 +1,88 @@
+from types import SimpleNamespace
+from dataclasses import replace
+import hashlib
+
+import pytest
+
+from benchmarks.ascend.production import NativeProjectBinding, NativeProjectBackend
+from benchmarks.ascend.production import NativeProductionConfig, build_native_adaptive_phase1
+from benchmarks.a5kernels.evidence import EvidenceLedger
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt
+
+
+def spec():
+    return ProjectSpec.from_mapping({
+        "project_id": "native-copy", "capabilities": ["gm-ub-movement"],
+        "shape": [4], "dtype": "float32", "block_count": 1,
+        "padding_multiple": 1, "failure_mode": "none", "timing_lengths": [],
+        "profile_metric": None, "hypothesis": "Learn a native copy.",
+        "graph": {"inputs": [{"name": "x", "shape": [4]}], "nodes": [{
+            "name": "out", "op": "copy", "operands": ["x"], "axis": None}],
+            "output": "out"},
+    })
+
+
+class NativeTransport:
+    def compile(self, plan, directory):
+        self.plan = plan
+        return SimpleNamespace(library_sha256="b" * 64, stdout="compiled", stderr="")
+
+    def execute_receipt(self, compilation):
+        return ExecutionReceipt(0, self.plan.inputs[0].values, "synchronized")
+
+
+def test_native_backend_uses_shared_host_oracle(tmp_path):
+    backend = NativeProjectBackend(
+        NativeTransport(), tmp_path / "bundles", target="Ascend910B4",
+        arch="dav-c220", profile="bz-a3-1",
+    )
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "ledger.jsonl"),
+                               binding=NativeProjectBinding())
+    prepared = executor.prepare(spec())
+    assert "tla" not in prepared.instruction
+    source = prepared.abi.signature + " {}"
+    assert executor.compile(spec(), source).observation.passed
+    assert executor.execute(spec(), source).evidence.verified
+
+
+def test_native_backend_rejects_source_error_without_device_launch(tmp_path):
+    transport = NativeTransport()
+    backend = NativeProjectBackend(transport, tmp_path, target="Ascend910B4",
+                                   arch="dav-c220", profile="bz-a3-1")
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "ledger.jsonl"),
+                               binding=NativeProjectBinding())
+    result = executor.compile(spec(), "wrong signature")
+    assert not result.observation.passed
+    assert not hasattr(transport, "plan")
+
+
+def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path):
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+    guide = b"Native Ascend C programming guide"
+    config = NativeProductionConfig(
+        tmp_path, "Ascend910B4", "dav-c220", "bz-a3-1",
+        hashlib.sha256(guide).hexdigest(), "a" * 40,
+    )
+    kwargs = dict(config=config, native_transport=NativeTransport(),
+                  profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=guide,
+                  objective="Learn native kernels", initial_memory=b"",
+                  environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"})
+    controller = build_native_adaptive_phase1(**kwargs)
+    assert controller.curriculum.target_policy.target == "a3"
+    assert controller.project_target == 64
+    assert "A3 Ascend C" in controller.execute_project.actor.system_prompt
+    assert build_native_adaptive_phase1(**kwargs).project_target == 64
+    with pytest.raises(ValueError, match="different native target"):
+        build_native_adaptive_phase1(**dict(kwargs, config=replace(config, arch="other")))
+    with pytest.raises(ValueError, match="guide identity"):
+        build_native_adaptive_phase1(**dict(kwargs, guide_bytes=b"other guide"))
+
+
+def test_native_binding_does_not_label_vector_reduction_as_simt():
+    value = spec().as_dict()
+    value["capabilities"] = ["vector-reduction"]
+    value["graph"]["nodes"][0].update(op="reduce-sum", axis=0)
+    assert NativeProjectBinding().family(ProjectSpec.from_mapping(value)).value == "vector-reduction-mask"

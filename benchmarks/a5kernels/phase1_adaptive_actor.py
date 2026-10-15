@@ -433,6 +433,7 @@ class AdaptiveActorProjectExecutor:
         request_timing: ActionDependency | None = None,
         request_diagnostic: ActionDependency | None = None,
         immutable_context: bytes = b"",
+        diagnostic_instructions: str | None = None,
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
@@ -464,6 +465,7 @@ class AdaptiveActorProjectExecutor:
             disabled_diagnostic_action if request_diagnostic is None else request_diagnostic
         )
         self.immutable_context = immutable_context
+        self.diagnostic_instructions = diagnostic_instructions
         if not all(callable(action) for action in (
             self.query_knowledge, self.request_profile, self.request_timing,
             self.request_diagnostic,
@@ -491,13 +493,15 @@ class AdaptiveActorProjectExecutor:
             request_timing=self.request_timing,
             request_diagnostic=self.request_diagnostic,
         )
-        opening = ("Diagnostics: {\"request-debug\":{}} or "
+        diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "
                    "These retain diagnostics, never HOST_VERIFIED or timing. Tool exit zero "
                    "does not establish Catlass instruction coverage; inspect raw report. "
                    "Unavailable tools are reported explicitly. Do not deliberately run "
-                   "hanging kernels; bounded termination does not guarantee device recovery.\n") + prepared.instruction + "\nPre-wave memory (immutable): " + json.dumps({
+                   "hanging kernels; bounded termination does not guarantee device recovery.\n")
+        opening = (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
+        opening += prepared.instruction + "\nPre-wave memory (immutable): " + json.dumps({
             "sha256": memory_sha256,
             "base64": base64.b64encode(request.pre_wave_memory).decode("ascii"),
         }, sort_keys=True, separators=(",", ":"))

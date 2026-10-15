@@ -285,6 +285,7 @@ class DirectActorDriver:
     def __init__(
         self, provider: DirectCompletionProvider, *, max_turns: int = 40,
         trace_event: Callable[[str, Mapping[str, object]], None] | None = None,
+        system_prompt: str = _SYSTEM_PROMPT,
     ):
         if type(max_turns) is not int or not 1 <= max_turns <= 40:
             raise ValueError("max_turns must be in [1, 40]")
@@ -293,6 +294,7 @@ class DirectActorDriver:
         if trace_event is not None and not callable(trace_event):
             raise TypeError("trace_event must be callable")
         self.trace_event = trace_event
+        self.system_prompt = system_prompt
 
     def _trace(self, kind: str, payload: Mapping[str, object]) -> None:
         if self.trace_event is not None:
@@ -311,7 +313,7 @@ class DirectActorDriver:
         del context
         recorder = _ProviderEvidenceRecorder(workspace)
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": instruction},
         ]
         for message in messages:

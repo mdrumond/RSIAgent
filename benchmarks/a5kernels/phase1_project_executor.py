@@ -35,6 +35,7 @@ class ProjectExecutionFamily(str, Enum):
     MOVEMENT_ELEMENTWISE = "movement-elementwise-padded-tail"
     SIMT_REDUCTION_MASK = "simt-reduction-mask"
     CUBE_MATMUL = "cube-matmul"
+    VECTOR_REDUCTION_MASK = "vector-reduction-mask"
 
 
 @dataclass(frozen=True)
@@ -251,7 +252,8 @@ class ProjectExecutor:
             raise TypeError("project must be a validated ProjectSpec")
         inputs = materialize_inputs(spec)
         expected = evaluate_reference(spec, inputs)
-        family = _family(spec)
+        family_selector = getattr(self._binding, "family", _family)
+        family = family_selector(spec)
         abi = self._binding.abi(spec, inputs)
         inputs_sha256 = canonical_digest({
             "tensors": [_tensor_payload(tensor) for tensor in inputs]

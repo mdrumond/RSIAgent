@@ -31,7 +31,6 @@ from benchmarks.a5kernels.phase1_adaptive_actor import (
 from benchmarks.a5kernels.phase1_composition import A5_PROFILING_GUIDANCE
 from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
-from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_experiments import (
     A5Phase1Cell,
     KnowledgeMode,
@@ -380,27 +379,16 @@ def build_adaptive_phase1(
     request_profile = _measurement_action(measurements, profiling=True)
     request_timing = _measurement_action(measurements, profiling=False)
     from benchmarks.a5kernels.phase1_project_diagnostics import diagnostic_action
-    project_actor = AdaptiveActorProjectExecutor(
-        executor,
-        actor,
-        profile,
+    from benchmarks.ascend.production import compose_adaptive_controller
+    project_actor, coordinator = compose_adaptive_controller(
+        root=paths.root, objective=objective, initial_memory=initial_memory,
+        executor=executor, actor=actor, profile=profile, provider=provider,
         query_knowledge=query_knowledge,
         request_profile=request_profile,
         request_timing=request_timing,
         request_diagnostic=diagnostic_action(backend),
         immutable_context=actor_context,
-    )
-    curriculum = CurriculumAgent(
-        lambda messages: provider.complete(profile, messages).text,
         profiling_guidance=profiling_guidance_text,
-    )
-
-    coordinator = AdaptivePhase1Coordinator(
-        paths.root,
-        objective,
-        initial_memory,
-        curriculum,
-        project_actor,
         max_parallel=max_parallel,
         project_target=project_target,
         max_projects=max_projects,
