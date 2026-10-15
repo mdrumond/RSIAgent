@@ -323,7 +323,7 @@ def build_adaptive_phase1(
     provider_transport: Transport = openai_compatible_transport,
     command_executor: BZCommandExecutor | None = None,
     max_parallel: int = 1,
-    project_target: int = 64,
+    project_target: int | None = None,
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 

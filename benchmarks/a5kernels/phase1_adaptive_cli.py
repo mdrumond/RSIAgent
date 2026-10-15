@@ -44,7 +44,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiling", choices=[item.value for item in ProfilingGuidance])
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-parallel", type=int, default=1)
-    parser.add_argument("--project-target", type=int, default=64)
+    parser.add_argument("--project-target", type=int)
     parser.add_argument("--kdb", type=Path)
     parser.add_argument("--collection")
     parser.add_argument("--bge-cache", type=Path)

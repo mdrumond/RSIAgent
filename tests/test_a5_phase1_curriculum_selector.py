@@ -495,3 +495,11 @@ def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
     assert "matmul outputs float32" in grammar["output_dtype"]
     assert "copy-only graphs preserve FP8" in grammar["output_dtype"]
     assert "every non-copy FP8 graph computes intermediates and output in float32" in grammar["output_dtype"]
+
+
+def test_learning_focus_cannot_bypass_held_out_executable_signature():
+    signature = project_information_sha256(project())
+    for focus in (["tool-msprof"], ["sync-performance", "pipe-mte2"], ["pipe-mte2", "sync-performance"]):
+        proposal = project(learning_focus=focus)
+        with pytest.raises(ValueError, match="held-out contract"):
+            CurriculumAgent(lambda _: wave([proposal]), held_out_information_sha256=[signature]).select(context())

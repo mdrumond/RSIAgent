@@ -423,3 +423,37 @@ def test_target_stops_and_resume_with_larger_target_preserves_memory(tmp_path):
     assert second["published_projects"][0] == first["published_projects"][0]
     assert "pipe-mte2" not in second["coverage_gaps"]
     assert "pipe-mte3" not in second["coverage_gaps"]
+
+
+def test_omitted_target_preserves_retained_override_and_new_default(tmp_path):
+    def create(root, target=None):
+        return AdaptivePhase1Coordinator(root, "Learn pipes", SEED,
+            CurriculumAgent(lambda _: 'DECISION: STALLED\n{"reason":"unneeded"}'),
+            lambda _: None, max_parallel=1, project_target=target)
+    assert create(tmp_path / "new").project_target == 64
+    retained = create(tmp_path / "retained", 128)
+    state = retained._load_state()
+    state["project_target"] = 128
+    retained._atomic_json(retained.root / "state.json", state)
+    assert create(retained.root).project_target == 128
+    assert create(retained.root, 256).project_target == 256
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
+    spec = _project("tools", "gm-ub-movement")
+    spec["learning_focus"] = ["tool-msprof", "tool-msdebug", "tool-mssanitizer", "debug-print"]
+    facts = [{"category": "host-verification", "statement": "verified"}]
+    if observed:
+        facts += [{"category": "profiling", "statement": "profiled"},
+                  {"category": "runtime", "statement": 'tool-observation:{"available":true,"tool":"msdebug","execution":{}}'},
+                  {"category": "runtime", "statement": 'tool-observation:{"available":true,"tool":"memcheck","execution":{}}'},
+                  {"category": "runtime", "statement": "verified-debug-print:source"}]
+    else:
+        facts += [{"category": "runtime", "statement": 'tool-observation:{"available":false,"tool":"memcheck"}'}]
+    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+        base64.b64encode(json.dumps({"host_facts": facts}).encode()).decode()]}
+    effective = AdaptivePhase1Coordinator._effective_outcomes(state)[0]["spec"]
+    assert effective.get("learning_focus", []) == (spec["learning_focus"] if observed else [])
+    gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
+    assert all((focus not in gaps) == observed for focus in spec["learning_focus"])

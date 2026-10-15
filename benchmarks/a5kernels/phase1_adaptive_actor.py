@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 from dataclasses import asdict, dataclass, field
 import json
@@ -302,6 +303,17 @@ class _ProjectActions:
             )
             self.admitted[digest] = role
             retained[name] = {"sha256": digest, "payload": payload}
+        if result.evidence.verified:
+            try:
+                printed = any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                              and isinstance(node.func.value, ast.Name)
+                              and node.func.value.id == "tla" and node.func.attr == "print"
+                              for node in ast.walk(ast.parse(self.source)))
+            except SyntaxError:
+                printed = False
+            if printed:
+                self.host_facts.append(HostFact("runtime", "verified-debug-print:" + self.source_sha256,
+                                                result.artifact_sha256["classification"]))
         return self._observation({
             "event": "host-execution", "requested_action": "run",
             "source_sha256": self.source_sha256,

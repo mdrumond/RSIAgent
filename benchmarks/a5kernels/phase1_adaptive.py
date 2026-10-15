@@ -96,7 +96,7 @@ class AdaptivePhase1Coordinator:
         execute_project: AdaptiveProjectExecutor,
         *,
         max_parallel: int,
-        project_target: int = 64,
+        project_target: int | None = None,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("objective must be non-empty")
@@ -108,15 +108,23 @@ class AdaptivePhase1Coordinator:
             raise TypeError("project executor must be callable")
         if type(max_parallel) is not int or max_parallel < 1:
             raise ValueError("max_parallel must be positive")
-        if type(project_target) is not int or project_target < 1:
+        if project_target is not None and (type(project_target) is not int or project_target < 1):
             raise ValueError("project_target must be positive")
         self.project_target = project_target
+        if project_target is None:
+            retained = self.root_state_target(root)
+            self.project_target = retained
         self.root = Path(root)
         self.objective = objective.strip()
         self.initial_memory = initial_memory
         self.curriculum = curriculum
         self.execute_project = execute_project
         self.max_parallel = max_parallel
+
+    @staticmethod
+    def root_state_target(root):
+        path = Path(root) / "state.json"
+        return json.loads(path.read_bytes()).get("project_target", 64) if path.exists() else 64
 
     def run(self) -> dict[str, object]:
         state = {**self._load_state(), "project_target": self.project_target}
@@ -281,7 +289,7 @@ class AdaptivePhase1Coordinator:
                     value["verified"],
                     value["summary"],
                 )
-                for value in state["prior_outcomes"]
+                for value in self._effective_outcomes(state)
             ),
             max(0, self.project_target - len(state["prior_outcomes"])),
         )
@@ -381,12 +389,39 @@ class AdaptivePhase1Coordinator:
             "pending_wave": pending,
         }
 
-    @staticmethod
-    def _coverage_gaps(state):
+    @classmethod
+    def _coverage_gaps(cls, state):
         from benchmarks.a5kernels.phase1_curriculum import LEARNING_FOCI
-        covered = {focus for row in state["prior_outcomes"]
+        covered = {focus for row in cls._effective_outcomes(state)
                    for focus in row["spec"].get("learning_focus", ())}
         return [focus for focus in LEARNING_FOCI if focus not in covered]
+
+    @staticmethod
+    def _effective_outcomes(state):
+        """Requested tools count only when retained host facts show their use."""
+        rows = []
+        for row, encoded in zip(state["prior_outcomes"], state["memory_bytes_base64"], strict=True):
+            memory = json.loads(base64.b64decode(encoded, validate=True))
+            observed = set()
+            for fact in memory["host_facts"]:
+                if fact["category"] == "profiling":
+                    observed.add("tool-msprof")
+                statement = fact["statement"]
+                if statement.startswith("tool-observation:"):
+                    record = json.loads(statement.removeprefix("tool-observation:"))
+                    if record.get("available") and "execution" in record:
+                        observed.add("tool-msdebug" if record.get("tool") == "msdebug" else "tool-mssanitizer")
+                if statement.startswith("verified-debug-print:"):
+                    observed.add("debug-print")
+            spec = dict(row["spec"])
+            focus = [item for item in spec.get("learning_focus", ())
+                     if not (item.startswith("tool-") or item == "debug-print") or item in observed]
+            if focus:
+                spec["learning_focus"] = focus
+            else:
+                spec.pop("learning_focus", None)
+            rows.append({**row, "spec": spec})
+        return rows
 
     def _pending_report(self, state):
         pending = self._load_pending(state)

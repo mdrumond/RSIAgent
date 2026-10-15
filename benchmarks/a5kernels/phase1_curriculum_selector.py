@@ -522,7 +522,12 @@ class CurriculumAgent:
             raise ValueError("wave repeats executable information between siblings")
         if prior_information.intersection(signatures):
             raise ValueError("wave repeats prior information")
-        if self._held_out.intersection(signatures):
+        executable_signatures = {
+            canonical_digest({key: value for key, value in item.as_dict().items()
+                              if key != "learning_focus"})
+            for item in information
+        }
+        if self._held_out.intersection(executable_signatures):
             raise ValueError("wave matches a held-out contract or shape")
         marginal_coverage = set(covered_dimensions)
         for item in information:

@@ -42,7 +42,7 @@ class HostFact:
     evidence_sha256: str
 
     def __post_init__(self) -> None:
-        if self.category not in {"compile", "runtime", "host-verification", "profiling", "performance-study"}:
+        if self.category not in {"compile", "runtime", "host-verification", "profiling", "performance-study", "diagnostic"}:
             raise ValueError("host fact category is not recognized")
         if not isinstance(self.statement, str) or not self.statement.strip():
             raise ValueError("host fact statement must be non-empty")
