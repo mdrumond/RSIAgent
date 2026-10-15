@@ -505,7 +505,7 @@ def _main():
                 shape = tuple(scale["shape"]) if index == 0 else tuple(reversed(scale["shape"]))
                 tag = tla.arch.RowMajorMxScaleA if index == 0 else tla.arch.ColMajorMxScaleB
                 tla_inputs.append(from_dlpack(scale_tensor, layout_tag=tag,
-                                  origin_shape=shape, element_type=tla.Float8E8M0))
+                                  origin_shape=shape, element_type=tla.Float8E8M0).mark_layout_dynamic())
         tla_output = (from_dlpack(output, layout_tag=tla.arch.RowMajor,
                                  element_type=tla_dtype) if output_name.startswith("float8_")
                       else as_tla(output))

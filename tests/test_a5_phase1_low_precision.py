@@ -133,3 +133,10 @@ def test_fp8_two_squares_widen_before_arithmetic_and_serialize(tmp_path, dtype):
     assert manifest["output_dtype"] == "float32"
     assert '"elementwise_dtype":"float32"' in prepared.instruction
     assert all(math.isfinite(value) for value in prepared.expected.storage)
+
+
+def test_mx_scale_entry_layout_is_dynamic_like_pinned_catlass_example():
+    # Special MX GM tags cannot be static entry layouts. Match the pinned
+    # MX example's dynamic descriptor ABI while retaining scale DMA tags.
+    assert "tag = tla.arch.RowMajorMxScaleA if index == 0 else tla.arch.ColMajorMxScaleB" in _PROJECT_DRIVER
+    assert "origin_shape=shape, element_type=tla.Float8E8M0).mark_layout_dynamic()" in _PROJECT_DRIVER
