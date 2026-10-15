@@ -312,8 +312,9 @@ class Phase2SourceProvider:
 
     def _validate_request(self, request: Phase2AttemptRequest) -> None:
         if request.cell.profiling is ProfilingGuidance.NEW:
-            raise ValueError("pending profiling treatment cannot enter source provider")
-        if request.cell.profiling is ProfilingGuidance.WITH_GUIDANCE:
+            from benchmarks.a5kernels.profiling_guidance import verify_profiling_guidance
+            verify_profiling_guidance(request.cell.profiling_guide, self.profiling_guidance)
+        if request.cell.profiling in {ProfilingGuidance.WITH_GUIDANCE, ProfilingGuidance.NEW}:
             if not isinstance(self.profiling_guidance, str) or not self.profiling_guidance.strip():
                 raise ValueError("profiling-guidance treatment requires non-empty guidance")
         elif self.profiling_guidance is not None:
@@ -329,7 +330,15 @@ class Phase2SourceProvider:
             for value in (request.request_id, request.attempt_id)
         ):
             raise ValueError("request and attempt IDs must be safe identifiers")
-        if len(request.phase1_memory) != 8:
+        from benchmarks.a5kernels.phase2_memory import ADAPTIVE_CELL_SCHEMA
+        if request.cell.schema == ADAPTIVE_CELL_SCHEMA:
+            from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+            if not request.phase1_memory:
+                raise ValueError("adaptive Phase 1 memory must contain published projects")
+            for entry in request.phase1_memory:
+                if Phase1ProjectMemory.from_mapping(entry).project_spec is None:
+                    raise ValueError("adaptive Phase 1 memory requires executable project identities")
+        elif len(request.phase1_memory) != 8:
             raise ValueError("Phase 1 memory must contain all eight projects")
         if len(request.phase2_memory) > 3:
             raise ValueError("Phase 2 memory exceeds the semantic-attempt bound")

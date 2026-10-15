@@ -48,6 +48,9 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--cell-id", action=_OneCell, required=True)
         command.add_argument("--phase1-root", type=Path)
         command.add_argument("--gate", type=Path)
+        command.add_argument("--adaptive-review", type=Path)
+        command.add_argument("--initial-memory", type=Path)
+        command.add_argument("--profiling-guidance", type=Path)
         command.add_argument("--guide", type=Path)
         command.add_argument("--phase2-guide", type=Path)
         command.add_argument("--phase2-cpl-skills-revision")
@@ -67,19 +70,24 @@ def _production_factory(
 ) -> tuple[A5Phase1Snapshot, Phase2Dependencies]:
     required = {
         "phase1_root": args.phase1_root,
-        "gate": args.gate,
         "guide": args.guide,
         "tla_root": args.tla_root,
         "catlass_source": args.catlass_source,
         "device": args.device,
     }
+    if args.adaptive_review is not None:
+        if args.gate is not None:
+            raise ValueError("choose adaptive-review or legacy gate, not both")
+        required["initial_memory"] = args.initial_memory
+    else:
+        required["gate"] = args.gate
     missing = [name.replace("_", "-") for name, value in required.items()
                if value is None]
     if missing:
         raise RuntimeError(
             "A5 Phase 2 production dependencies are missing: " + ", ".join(missing)
         )
-    gate = load_gate_report(args.gate)
+    gate = load_gate_report(args.gate) if args.gate else None
     return build_phase2_production(Phase2ProductionConfig(
         phase1_root=args.phase1_root,
         gate=gate,
@@ -97,6 +105,10 @@ def _production_factory(
         env_file=args.env_file,
         phase2_guide_path=args.phase2_guide,
         phase2_cpl_skills_revision=args.phase2_cpl_skills_revision,
+        adaptive_review=args.adaptive_review,
+        initial_memory=args.initial_memory,
+        profiling_guidance_text=(args.profiling_guidance.read_text(encoding="utf-8")
+                                 if args.profiling_guidance else None),
     ))
 
 

@@ -28,10 +28,12 @@ from benchmarks.a5kernels.phase1_experiments import (
 from benchmarks.a5kernels.phase1_memory import Phase1LearningJournal
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase2_attention import SUITE_SHA256
+from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
 
 
 CELL_SCHEMA = "a5-catlass-phase2-cell-v1"
 CELL_SCHEMA_V2 = "a5-catlass-phase2-cell-v2"
+ADAPTIVE_CELL_SCHEMA = "a5-catlass-phase2-adaptive-cell-v1"
 SNAPSHOT_SCHEMA = "a5-catlass-phase2-phase1-snapshot-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
@@ -62,6 +64,7 @@ class A5Phase2Cell:
     language: A5Language = A5Language.CATLASS_DSL
     schema: str = CELL_SCHEMA
     source_guide: ProgrammingGuideIdentity | None = None
+    profiling_guide: ProfilingGuidanceIdentity | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -84,14 +87,24 @@ class A5Phase2Cell:
                 raise ValueError(
                     "dual-guide Phase 2 cells require distinct source and destination guides"
                 )
+        elif self.schema == ADAPTIVE_CELL_SCHEMA:
+            if self.source_guide is not None:
+                raise ValueError("adaptive handoff retains its original programming guide")
         else:
             raise ValueError("Phase 2 cell schema does not match its guide identity")
-        if self.profiling is ProfilingGuidance.NEW:
+        if self.profiling is ProfilingGuidance.NEW and self.schema != ADAPTIVE_CELL_SCHEMA:
             raise ValueError("pending profiler treatments cannot enter Phase 2")
         _require_digest(self.qualification_sha256, "qualification_sha256")
         if self.suite_sha256 != SUITE_SHA256:
             raise ValueError("Phase 2 cell changed the host-owned attention suite")
-        source = _source_by_id(self.phase1_guide).get(self.source_cell_id)
+        if self.schema == ADAPTIVE_CELL_SCHEMA:
+            source = next((item for item in build_cells(
+                self.guide, profiling_guide=self.profiling_guide,
+            ) if item.cell_id == self.source_cell_id and item.runnable), None)
+        else:
+            if self.profiling_guide is not None:
+                raise ValueError("legacy Phase 2 cells cannot declare profiling guide")
+            source = _source_by_id(self.phase1_guide).get(self.source_cell_id)
         if source is None or (
             source.model,
             source.knowledge,
@@ -127,6 +140,8 @@ class A5Phase2Cell:
         }
         if self.source_guide is not None:
             identity["source_guide"] = self.source_guide.as_dict()
+        if self.profiling_guide is not None:
+            identity["profiling_guide"] = self.profiling_guide.as_dict()
         return identity
 
     def as_dict(self) -> dict[str, object]:

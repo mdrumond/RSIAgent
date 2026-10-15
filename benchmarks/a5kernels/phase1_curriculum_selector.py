@@ -397,11 +397,13 @@ class CurriculumAgent:
         held_out_information_sha256: Sequence[str] = (),
         unavailable_capabilities: Sequence[Capability] = (),
         target_policy: "CurriculumPolicy | None" = None,
+        profiling_guidance: str | None = None,
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
         self._complete = complete
         self.target_policy = target_policy
+        self.profiling_guidance = profiling_guidance
         self._held_out = frozenset(
             _digest(item, "held-out information identity")
             for item in held_out_information_sha256
@@ -417,6 +419,8 @@ class CurriculumAgent:
         self,
         context: CurriculumContext,
         session: CurriculumSession | None = None,
+        *,
+        remaining_projects: int | None = None,
     ) -> tuple[CurriculumDecision, CurriculumSession]:
         if not isinstance(context, CurriculumContext):
             raise TypeError("context must be CurriculumContext")
@@ -430,10 +434,17 @@ class CurriculumAgent:
         ]
         history.append({
             "role": "user",
-            "content": curriculum_prompt(
-                context, self.unavailable_capabilities, target_policy=self.target_policy,
-            ),
+            "content": (
+                "Profiling guidance:\n" + self.profiling_guidance + "\n"
+                if self.profiling_guidance is not None else ""
+            ) + curriculum_prompt(context, self.unavailable_capabilities,
+                                  target_policy=self.target_policy),
         })
+        if remaining_projects is not None:
+            history[-1]["content"] = (
+                f"Project budget: select no more than {remaining_projects} projects in this wave.\n"
+                + history[-1]["content"]
+            )
         for attempt in range(1, 4):
             # Provider failures are not proposal-validation failures. Let the
             # caller's existing infrastructure handling observe them unchanged.
@@ -443,6 +454,8 @@ class CurriculumAgent:
             history.append({"role": "assistant", "content": completion})
             try:
                 decision = self._parse_and_validate(completion, context)
+                if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
+                    raise ValueError("wave exceeds remaining project budget; select a smaller wave")
             except ValueError as exc:
                 if attempt == 3:
                     raise ValueError(
