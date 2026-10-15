@@ -49,7 +49,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-projects", type=int)
     parser.add_argument("--profiling-guidance-skill", type=Path)
     parser.add_argument("--kdb", type=Path)
-    parser.add_argument("--collection")
+    parser.add_argument("--collection", action="append")
     parser.add_argument("--bge-cache", type=Path)
     parser.add_argument("--env-file", type=Path)
     return parser
@@ -116,7 +116,8 @@ def main(
             args.catlass_revision,
             args.device,
             args.kdb,
-            args.collection,
+            (args.collection[0] if args.collection and len(args.collection) == 1
+             else args.collection),
         ),
         objective=args.objective,
         initial_memory=initial_memory,

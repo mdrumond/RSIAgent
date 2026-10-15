@@ -19,6 +19,14 @@ CHUNK_OVERLAP = 20
 RRF_K = 60
 
 
+def collection_names(value: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize a configured selector, keeping historical string inputs valid."""
+    names = (value,) if isinstance(value, str) else tuple(value)
+    if not names or any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("collection selector requires nonempty collection names")
+    return tuple(dict.fromkeys(names))
+
+
 class EmbeddingBackend(Protocol):
     """Minimal embedding interface; production loading stays outside the DB.
 
@@ -423,6 +431,9 @@ class KnowledgeDB:
         if not row:
             raise KeyError(collection)
         return CollectionManifest.from_json(row["manifest_json"])
+
+    def selected_manifests(self, selector: str | Sequence[str]) -> tuple[CollectionManifest, ...]:
+        return tuple(self.manifest(name) for name in collection_names(selector))
 
     def validate_citation(
         self,

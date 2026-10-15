@@ -32,8 +32,11 @@ def native_runner(args):
         embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(Path(config["bge_cache"])))
         database = KnowledgeDB.open_read_only(Path(config["kdb"]), embeddings)
         try:
-            manifest = database.manifest(config["collection"])
-            if manifest.language != "ascend-c" or manifest.fingerprint != identity["kdb_manifest"]:
+            manifests = database.selected_manifests(config["collection"])
+            fingerprint = (manifests[0].fingerprint if isinstance(config["collection"], str)
+                           else {manifest.collection: manifest.fingerprint for manifest in manifests})
+            if (not any(manifest.language == "ascend-c" or "ascend-c" in manifest.kernel_languages
+                        for manifest in manifests) or fingerprint != identity["kdb_manifest"]):
                 raise ValueError("native Phase2 KDB evidence changed")
         finally:
             database.close()

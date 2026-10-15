@@ -59,6 +59,15 @@ identities, and journals citations. Each result includes code text, exact
 repository/revision/path/lines, whole-source hash, chunk hash, and lexical/vector
 ranks. Agents can answer using this interface without repository access.
 
+Production Phase 1 and Phase 2 configuration `collection` accepts either the
+historical single string or a list/tuple of fixed collection names. Native A3
+configuration must include at least one explicitly Ascend C-capable collection;
+other selected collections may supply cross-language reference context. Repeat
+`--collection` in the A5 adaptive CLI to select multiple collections. A3's JSON
+configuration accepts the same list directly. Single-string retained campaign
+identities remain unchanged; multi-collection native identities pin every
+selected manifest fingerprint through the Phase 2 handoff.
+
 CANNBench solutions carry `reference_exposed: true`. Evaluations that consult
 these collections are reference-exposed, not clean held-out evaluations. Ranking
 scores remain upstream claims, not locally verified performance.

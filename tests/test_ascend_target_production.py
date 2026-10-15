@@ -58,7 +58,8 @@ def test_native_backend_rejects_source_error_without_device_launch(tmp_path):
     assert not hasattr(transport, "plan")
 
 
-def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path):
+@pytest.mark.parametrize("selector", [None, "native", ["native", "triton"]])
+def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, selector):
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
     from benchmarks.a5kernels.phase1_provider import direct_profile
     guide = b"Native Ascend C programming guide"
@@ -66,10 +67,25 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path):
         tmp_path, "Ascend910B4", "dav-c220", "bz-a3-1",
         hashlib.sha256(guide).hexdigest(), "a" * 40,
     )
+    embeddings = None
+    if selector:
+        from test_expanded_kdb import Embeddings
+        from benchmarks.a5kernels.knowledge import KnowledgeDB
+        embeddings = Embeddings()
+        source = tmp_path / "guide.cpp"
+        source.write_text("vector copy kernel")
+        kdb = tmp_path / "native.sqlite3"
+        with KnowledgeDB(kdb, embeddings) as database:
+            database.index(tmp_path, [source], collection="native", language="en",
+                           kernel_languages=("ascend-c",))
+            database.index(tmp_path, [source], collection="triton", language="mixed",
+                           kernel_languages=("triton",))
+        config = replace(config, kdb=kdb, collection=selector)
     kwargs = dict(config=config, native_transport=NativeTransport(),
                   profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=guide,
                   objective="Learn native kernels", initial_memory=b"",
-                  environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"})
+                  environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
+                  embeddings=embeddings)
     controller = build_native_adaptive_phase1(**kwargs)
     assert controller.curriculum.target_policy.target == "a3"
     assert controller.project_target == 64

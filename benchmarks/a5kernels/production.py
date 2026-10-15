@@ -35,7 +35,7 @@ class ProductionPaths:
     catlass_revision: str
     bge_cache: Path
     kdb: Path
-    collection: str
+    collection: str | tuple[str, ...] | list[str]
     results_root: Path
     device: int
 
@@ -44,8 +44,8 @@ class ProductionPaths:
             raise ValueError("catlass_source must be an absolute retained BZ path")
         if re.fullmatch(r"[0-9a-f]{40}", self.catlass_revision) is None:
             raise ValueError("catlass_revision must be a lowercase 40-character SHA")
-        if not self.collection.strip():
-            raise ValueError("collection must be non-empty")
+        from .knowledge import collection_names
+        collection_names(self.collection)
         if self.device < 0:
             raise ValueError("device must be non-negative")
 
@@ -147,10 +147,10 @@ def preflight(
             )
             database = KnowledgeDB.open_read_only(paths.kdb, embeddings)
             try:
-                manifest = database.manifest(paths.collection)
-                checks["kdb_manifest"] = (
+                checks["kdb_manifest"] = all(
                     manifest.embedding_model == embeddings.model
                     and manifest.embedding_revision == embeddings.revision
+                    for manifest in database.selected_manifests(paths.collection)
                 )
                 if checks["kdb_manifest"]:
                     try:
@@ -179,11 +179,17 @@ def preflight(
     }
 
 
-def _probe_knowledge_query(database, collection: str) -> None:
+def _probe_knowledge_query(database, collection) -> None:
     """Prove the selected read-only collection supports the production query path."""
 
     from benchmarks.a5kernels.knowledge import SearchHit
     from benchmarks.a5kernels.knowledge_agent import validate_knowledge_hit
+
+    if not isinstance(collection, str):
+        from benchmarks.a5kernels.knowledge import collection_names
+        for name in collection_names(collection):
+            _probe_knowledge_query(database, name)
+        return
 
     # This exercises current per-collection FTS metadata/table lookup, vector
     # decoding, query embeddings, and the same citation gate used before any hit

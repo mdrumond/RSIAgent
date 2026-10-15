@@ -422,7 +422,8 @@ def test_measurements_are_bound_independently_of_guidance(tmp_path, profiling):
     assert result.admitted_artifacts == {}
 
 
-def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path):
+@pytest.mark.parametrize("selector", ["catlass", ["catlass", "native"]])
+def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path, selector):
     from benchmarks.a5kernels.knowledge import KnowledgeDB
     source = tmp_path / "sources"
     source.mkdir()
@@ -431,11 +432,13 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path)
     kdb = tmp_path / "knowledge.sqlite"
     with KnowledgeDB(kdb, FakeEmbeddings()) as database:
         database.index(source, [guide], collection="catlass", language="catlass-dsl")
+        database.index(source, [guide], collection="native", language="mixed",
+                       kernel_languages=("ascend-c",))
     campaign = _build(
         tmp_path,
         _cell(knowledge=KnowledgeMode.WITH_KDB),
         embeddings=FakeEmbeddings(),
-        path_changes={"kdb": kdb, "collection": "catlass"},
+        path_changes={"kdb": kdb, "collection": selector},
     )
     artifact_root = tmp_path / "action-artifacts"
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
@@ -446,12 +449,12 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path)
     )
 
     result = campaign.query_knowledge(
-        {"query": "movement", "limit": 1}, context
+        {"query": "movement", "limit": 2}, context
     )
 
     assert result.observation["event"] == "knowledge-query"
     assert result.observation["available"] is True
-    assert len(result.citations) == 1
+    assert len(result.citations) == (1 if isinstance(selector, str) else 2)
     retained = result.observation["results"][0]
     assert retained["citation"]["path"].endswith("guide.md")
     digest = retained["artifact_sha256"]

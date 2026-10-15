@@ -66,7 +66,7 @@ class AdaptiveProductionPaths:
     catlass_revision: str
     device: int = 0
     kdb: Path | None = None
-    collection: str | None = None
+    collection: str | tuple[str, ...] | list[str] | None = None
     profiling_skill_root: Path = field(
         default_factory=lambda: Path.home() / ".agents/skills/ascend-profiling",
     )
@@ -132,11 +132,9 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
         raise ValueError("KDB-on treatment requires a pinned embedding backend")
     # Opening once here validates the selected manifest before any provider call.
     with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
-        manifest = database.manifest(paths.collection)
-        if (
-            manifest.embedding_model != embeddings.model
-            or manifest.embedding_revision != embeddings.revision
-        ):
+        if any(manifest.embedding_model != embeddings.model
+               or manifest.embedding_revision != embeddings.revision
+               for manifest in database.selected_manifests(paths.collection)):
             raise ValueError("KDB manifest does not match the embedding backend")
 
     def query(

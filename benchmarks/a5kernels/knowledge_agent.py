@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .knowledge import CollectionManifest, KnowledgeDB, SearchHit
+from .knowledge import CollectionManifest, KnowledgeDB, SearchHit, collection_names
 
 if TYPE_CHECKING:
     from core.loop import DomainActionResult
@@ -231,12 +231,12 @@ class KnowledgeAgent:
         enabled: bool,
         journal: ProgressiveMemoryJournal,
         database: KnowledgeDB | None = None,
-        collection: str | None = None,
+        collection: str | tuple[str, ...] | list[str] | None = None,
         collections: tuple[str, ...] = (),
     ):
         if collection and collections:
             raise ValueError("select collection or collections, not both")
-        selected = tuple(dict.fromkeys(collections or ((collection,) if collection else ())))
+        selected = collection_names(collections or collection) if (collections or collection) else ()
         if enabled and (database is None or not selected):
             raise ValueError("enabled Knowledge Agent requires a database and collection")
         if not enabled and (database is not None or selected):

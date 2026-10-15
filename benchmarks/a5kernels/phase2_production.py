@@ -71,7 +71,7 @@ class Phase2ProductionConfig:
     runtime_catlass_revision: str | None = None
     bge_cache: Path | None = None
     kdb: Path | None = None
-    collection: str | None = None
+    collection: str | tuple[str, ...] | list[str] | None = None
     env_file: Path | None = None
     phase2_guide_path: Path | None = None
     phase2_cpl_skills_revision: str | None = None
@@ -373,11 +373,9 @@ def build_phase2_production(
         embeddings.embed_query(["A5 Phase 2 preflight"])
         database = KnowledgeDB.open_read_only(config.kdb, embeddings)
         try:
-            manifest = database.manifest(config.collection)
-            if (
-                manifest.embedding_model != embeddings.model
-                or manifest.embedding_revision != embeddings.revision
-            ):
+            if any(manifest.embedding_model != embeddings.model
+                   or manifest.embedding_revision != embeddings.revision
+                   for manifest in database.selected_manifests(config.collection)):
                 raise ValueError("KDB manifest does not match pinned embeddings")
             _probe_knowledge_query(database, config.collection)
         finally:

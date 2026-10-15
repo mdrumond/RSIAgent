@@ -56,7 +56,7 @@ class NativeProductionConfig:
     cpl_skills_revision: str
     dtypes: tuple[str, ...] = ("float32",)
     kdb: Path | None = None
-    collection: str | None = None
+    collection: str | tuple[str, ...] | list[str] | None = None
     environment_identity: dict | None = None
     profiling_mode: str | None = None
 
@@ -119,10 +119,13 @@ def build_native_adaptive_phase1(
         if embeddings is None or not config.collection:
             raise ValueError("native KDB requires explicit collection and embeddings")
         with KnowledgeDB.open_read_only(config.kdb, embeddings) as database:
-            manifest = database.manifest(config.collection)
-            if manifest.language != "ascend-c" and "ascend-c" not in manifest.kernel_languages:
+            manifests = database.selected_manifests(config.collection)
+            if not any(manifest.language == "ascend-c" or "ascend-c" in manifest.kernel_languages
+                       for manifest in manifests):
                 raise ValueError("native KDB collection must use ascend-c language")
-            identity["kdb_manifest"] = manifest.fingerprint
+            identity["kdb_manifest"] = (manifests[0].fingerprint if isinstance(config.collection, str)
+                                        else {manifest.collection: manifest.fingerprint
+                                              for manifest in manifests})
         query = _knowledge_action(config, embeddings)
     elif config.collection is not None or embeddings is not None:
         raise ValueError("KDB-off native treatment cannot receive KDB dependencies")
