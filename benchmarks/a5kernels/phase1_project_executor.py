@@ -15,6 +15,7 @@ from benchmarks.a5kernels.evidence import (
     canonical_digest,
 )
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_low_precision import FP8_DTYPES, MX_DTYPES, storage_dtype
 from benchmarks.a5kernels.phase1_project import (
     ExecutionEvidence,
     HostTensor,
@@ -217,7 +218,10 @@ def _instruction(
         "reference_semantics": {
             "elementwise_dtype": spec.dtype.value,
             "accumulator_dtype": "float32",
-            "output_dtype": spec.dtype.value,
+            "output_dtype": ("float32" if spec.dtype.value in FP8_DTYPES | MX_DTYPES
+                             and family is ProjectExecutionFamily.CUBE_MATMUL else spec.dtype.value),
+            "input_storage_dtype": storage_dtype(spec.dtype.value),
+            "mx_scale_group": 32 if spec.dtype.value in MX_DTYPES else None,
         },
     }
     return (
@@ -225,7 +229,14 @@ def _instruction(
         "candidate for this generic learning "
         "project. Preserve logical shapes and padded physical storage. The host binds "
         "LOGICAL_INPUT_SHAPES, PHYSICAL_INPUT_SHAPES, LOGICAL_OUTPUT_SHAPE, "
-        "PHYSICAL_OUTPUT_SHAPE, and DTYPE as read-only compile-time globals. "
+        "PHYSICAL_OUTPUT_SHAPE, DTYPE (input storage), and OUTPUT_DTYPE as read-only globals. "
+        "For MXFP8, gm_scale0 and gm_scale1 precede the output; scales are E8M0, "
+        "one per32 K elements, with the group count padded even. A is RowMajor, "
+        "B is ColumnMajor; scale tensors have logical shapes (M,G)/(G,N), "
+        "RowMajorMxScaleA/ColMajorMxScaleB tags, and physical storage (M,G)/(N,G). "
+        "Load scales with operands using tla.copy(..., scale=...) and tla.mmad_mx; "
+        "Cube FP8/MXFP8 output uses Float32. Plain FP8 conversion exercises may "
+        "convert registers to Float32 and back explicitly. "
         "Tensor arguments expose full physical padded storage: tensor.origin_shape "
         "is the PHYSICAL shape here, not the logical data extent. Use "
         "LOGICAL_INPUT_SHAPES and LOGICAL_OUTPUT_SHAPE for computation bounds; "
@@ -255,7 +266,8 @@ class ProjectExecutor:
         family = _family(spec)
         abi = ProjectKernelABI(
             "project_kernel",
-            tuple(f"gm_input{index}" for index in range(len(inputs))),
+            tuple(f"gm_input{index}" for index in range(len(inputs)))
+            + (("gm_scale0", "gm_scale1") if spec.dtype.value in MX_DTYPES else ()),
             "gm_output",
         )
         inputs_sha256 = canonical_digest({

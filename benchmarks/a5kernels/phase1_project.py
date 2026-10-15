@@ -10,6 +10,7 @@ import struct
 from typing import Mapping, Sequence, TYPE_CHECKING
 
 from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.phase1_low_precision import FP8_DTYPES, MX_DTYPES, mx_quantize, quantize_fp8
 
 if TYPE_CHECKING:
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 _NAME = re.compile(r"[a-z][a-z0-9]{0,15}\Z")
 _MAX_TENSOR_ELEMENTS = 65536
-_DTYPES = {"float16", "bfloat16", "float32"}
+_DTYPES = {"float16", "bfloat16", "float32"} | FP8_DTYPES
 
 
 class ProjectOp(str, Enum):
@@ -283,6 +284,8 @@ def materialize_inputs(spec: "ProjectSpec") -> tuple[HostTensor, ...]:
         storage = [97.0] * math.prod(physical)
         for index in range(math.prod(item.shape)):
             value = float((digest[(index + input_index) % len(digest)] + index * 7) % 17 - 8)
+            if spec.dtype.value in FP8_DTYPES | MX_DTYPES:
+                value += ((index % 5) - 2) * 0.0625
             storage[_flat(_coords(index, item.shape), physical)] = value
         result.append(HostTensor(item.shape, physical, tuple(storage)))
     return tuple(result)
@@ -292,6 +295,8 @@ def _quantize(value: float, dtype: str) -> float:
     """Round one scalar using the project's declared storage arithmetic."""
 
     value = float(value)
+    if dtype in FP8_DTYPES:
+        return quantize_fp8(value, dtype)
     if dtype == "bfloat16":
         try:
             bits = struct.unpack(">I", struct.pack(">f", value))[0]
@@ -381,19 +386,23 @@ def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> Ref
     if len(inputs) != len(spec.graph.inputs):
         raise ValueError("host inputs do not match the graph")
     values: dict[str, ReferenceOutput] = {}
-    for contract, tensor in zip(spec.graph.inputs, inputs, strict=True):
+    cube_low_precision = spec.dtype.value in FP8_DTYPES | MX_DTYPES and any(
+        node.op is ProjectOp.MATMUL for node in spec.graph.nodes)
+    output_dtype = "float32" if cube_low_precision else spec.dtype.value
+    for index, (contract, tensor) in enumerate(zip(spec.graph.inputs, inputs, strict=True)):
         if tensor.shape != contract.shape:
             raise ValueError("host input shape does not match the graph")
-        values[contract.name] = ReferenceOutput(
-            tensor.shape,
-            tuple(_quantize(value, spec.dtype.value) for value in tensor.logical_values),
-            dtype=spec.dtype.value,
-        )
+        input_values = tensor.logical_values
+        if spec.dtype.value in MX_DTYPES:
+            _, _, input_values = mx_quantize(tensor.shape, input_values, spec.dtype.value, index)
+        else:
+            input_values = tuple(_quantize(value, spec.dtype.value) for value in input_values)
+        values[contract.name] = ReferenceOutput(tensor.shape, tuple(input_values), dtype="float32")
     for node in spec.graph.nodes:
         values[node.name] = _apply(
             node,
             tuple(values[name] for name in node.operands),
-            spec.dtype.value,
+            output_dtype,
         )
     output = values[spec.graph.output]
     if not any(item.value == "padded-tail" for item in spec.capabilities):
@@ -408,7 +417,7 @@ def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> Ref
         output.values,
         physical,
         tuple(storage),
-        dtype=spec.dtype.value,
+        dtype=output_dtype,
     )
 
 
@@ -456,6 +465,8 @@ def classify_execution(
         "float16": 1e-2,
         "bfloat16": 2e-2,
         "float32": 1e-5,
+        "float8_e4m3fn": 0.0,
+        "float8_e5m2": 0.0,
     }[expected.dtype]
     atol = default_tolerance if atol is None else atol
     rtol = default_tolerance if rtol is None else rtol
