@@ -269,6 +269,7 @@ class A5Phase1Plan:
     schema: str = PLAN_SCHEMA
     target: A5Target = A5Target.A5
     language: A5Language = A5Language.CATLASS_DSL
+    profiling_guide: ProfilingGuidanceIdentity | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -283,18 +284,21 @@ class A5Phase1Plan:
             raise ValueError("A5 Phase 1 requires twelve unique cells")
         if any(cell.guide != self.guide for cell in self.cells):
             raise ValueError("every Phase 1 cell must bind the admitted guide identity")
-        expected = build_cells(self.guide)
+        expected = build_cells(self.guide, profiling_guide=self.profiling_guide)
         if self.cells != expected:
             raise ValueError("plan must contain the complete ordered treatment registry")
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        values = {
             "schema": self.schema,
             "target": self.target.value,
             "language": self.language.value,
             "guide": self.guide.as_dict(),
             "cells": [cell.as_dict() for cell in self.cells],
         }
+        if self.profiling_guide is not None:
+            values["profiling_guide"] = self.profiling_guide.as_dict()
+        return values
 
     def to_json(self) -> str:
         return _canonical_json(self.as_dict()) + "\n"
@@ -340,13 +344,17 @@ def build_a5_phase1_plan(
     *,
     cpl_skills_revision: str,
     catlass_revision: str = PINNED_CATLASS_REVISION,
+    profiling_guide: ProfilingGuidanceIdentity | None = None,
 ) -> A5Phase1Plan:
     guide = admit_programming_guide(
         guide_path,
         cpl_skills_revision=cpl_skills_revision,
         catlass_revision=catlass_revision,
     )
-    return A5Phase1Plan(build_cells(guide), guide)
+    return A5Phase1Plan(
+        build_cells(guide, profiling_guide=profiling_guide), guide,
+        profiling_guide=profiling_guide,
+    )
 
 
 __all__ = [
