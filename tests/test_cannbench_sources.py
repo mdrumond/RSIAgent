@@ -25,7 +25,8 @@ def test_unpack_preserves_wrappers_and_license_and_rejects_unrelated_code():
     }), OP, {})
     assert set(files) == {"level1/exp/kernel.cpp", "utils.py", "LICENSE"}
     _, same_identity = source.unpack(bundle({
-        "other/exp/kernel.cpp": "void Exp() {}", "README.md": "changed",
+        "other/exp/kernel.cpp": "void Exp() {}", "other/exp/launch.py": "different wrapper",
+        "README.md": "changed",
     }), OP, {})
     assert identity == same_identity
     with pytest.raises(ValueError, match="ranked operator"):

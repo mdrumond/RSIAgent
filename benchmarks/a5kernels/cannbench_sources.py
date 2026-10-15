@@ -128,8 +128,10 @@ def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], st
         own = code
     if not own:
         raise ValueError("No code identifiable as the ranked operator")
-    # Ignore archive paths and documentation when detecting duplicate code.
-    identity = digest(b"\0".join(sorted(set(own.values()))))
+    # Prefer explicit kernel code over launch/test wrappers for duplicate checks.
+    kernels = {name: value for name, value in own.items()
+               if any("kernel" in part.lower() for part in PurePosixPath(name).parts)}
+    identity = digest(b"\0".join(sorted(set((kernels or own).values()))))
     return files, identity
 
 
