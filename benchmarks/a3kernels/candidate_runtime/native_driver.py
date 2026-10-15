@@ -6,6 +6,8 @@ import json
 import math
 from pathlib import Path
 import time
+import subprocess
+import sys
 
 from legacy_driver import _compile
 
@@ -30,7 +32,14 @@ def main(*, clock_ns=time.perf_counter_ns):
         if args.input:
             parser.error("compile-only does not accept runtime input")
         spec = json.loads((root / "build.json").read_text())
-        library = _compile(root, spec, torch, torch_npu)
+        try:
+            library = _compile(root, spec, torch, torch_npu)
+        except subprocess.CalledProcessError as exc:
+            # A compiler invocation actually ran and failed. Missing toolchains,
+            # wrapper errors and other host failures must not acquire this mark.
+            print("A3CANDIDATE_COMPILE_FAILED=1", flush=True)
+            print(str(exc), file=sys.stderr)
+            raise SystemExit(exc.returncode) from exc
         print("A3CANDIDATE_COMPILED=" + hashlib.sha256(library.read_bytes()).hexdigest())
         return
     if not args.input:

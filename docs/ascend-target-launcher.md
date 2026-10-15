@@ -43,6 +43,8 @@ launch-plus-synchronize samples, not instrumented kernel duration. Both initial
 and measured output must agree with the host oracle. Timing sweeps reuse source
 and recompile each shape; use `RSI_NATIVE_INPUT<i>_NUMEL`/`_DIM<axis>` and
 `RSI_NATIVE_OUTPUT_NUMEL`/`_DIM<axis>` macros instead of hardcoded extents.
+These describe physical allocations; corresponding `*_LOGICAL_NUMEL` and
+`*_LOGICAL_DIM<axis>` macros exclude sentinel padding and define arithmetic bounds.
 
 Campaign identities bind programming/profiling guide bytes, model, native target,
 compiler architecture, toolchain/profiler versions, KDB treatment, and measurement
