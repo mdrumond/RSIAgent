@@ -21,6 +21,7 @@ def native_source(tmp_path, *, profiling=False):
                     target="Ascend910_9382", arch="dav-c220", execution_profile="bz-a3-1",
                     guide_sha256=hashlib.sha256(GUIDE.encode()).hexdigest(), cpl_skills_revision="1" * 40,
                     model=source.model.as_dict(), dtypes=["float16", "bfloat16"],
+                    environment_identity=dict(cann_version="test-cann", profiler_version="test-profiler"),
                     profiling_guidance="Use the native profiler" if profiling else None,
                     profiling_mode="new" if profiling else "without-profiling-guidance",
                     measurement_actions={"profiling": profiling, "timing": False},
@@ -119,3 +120,30 @@ def test_cli_admit_and_injected_run(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["cell_id"].startswith("a3-phase2-cell-")
     args[2] = "run"
     assert main(args, runner_factory=lambda _: SimpleNamespace(run=lambda: {"status": "passed"})) == 0
+
+
+def test_cli_native_builder_reuses_shared_runtime_config(tmp_path, monkeypatch):
+    from benchmarks.ascend import phase1_cli, phase2_cli
+    from benchmarks.a5kernels import phase1_production
+    root, review, _ = native_source(tmp_path)
+    identity = json.loads((root / "campaign-identity.json").read_bytes())
+    guide = tmp_path / "native-guide.md"
+    guide.write_text(GUIDE)
+    initial = tmp_path / "initial.bin"
+    initial.write_bytes(b"")
+    config = {key: identity[key] for key in ("target", "arch", "execution_profile", "cpl_skills_revision", "environment_identity")}
+    config.update(guide=str(guide), cpl_remote="/tools/cpl-remote",
+                  validation_wrapper="/tools/catlass-validation.sh", remote_workspace="/owned", physical_device=1)
+    path = tmp_path / "runtime.json"
+    path.write_text(json.dumps(config))
+    args = SimpleNamespace(config=path, phase1_root=root, initial_memory=initial,
+                           review=review, root=tmp_path / "phase2", env_file=None)
+    monkeypatch.setattr(phase1_cli, "native_transport", lambda config, root: object())
+    monkeypatch.setattr(phase1_production, "load_direct_environment", lambda *_, **__: ENVIRONMENT)
+    runner = phase2_cli.native_runner(args)
+    assert runner.execution_profile == "bz-a3-1"
+    assert not hasattr(runner.dependencies.cell.guide, "catlass_revision")
+    config["environment_identity"]["cann_version"] = "changed"
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="environment differs"):
+        phase2_cli.native_runner(args)

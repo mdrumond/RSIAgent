@@ -49,3 +49,36 @@ compiler architecture, toolchain/profiler versions, KDB treatment, and measureme
 availability. Retained evidence additionally binds binary/source/input geometry,
 selected device, replay settings, raw output, and report hashes. Real target
 smokes are still required; fake-provider tests establish composition only.
+
+## Reviewed native Phase 2 handoff
+
+After a terminal native Phase1 run, a human/authorized reviewer supplies a review
+with schema `ascend-phase1-usefulness-review-v1`, `cell_id` computed by
+`benchmarks.ascend.phase2.source_cell_id(campaign_identity)`, and `memory_sha256`
+from the controller's canonical final memory snapshot. Require explicit true
+values for `accepted`, `useful`, `diverse`, `profiler_guidance_observed` and a
+nonempty `rationale`. This does not curate or rewrite Phase1 memory. Admission
+authenticates the actual published branch outcomes, source, and cited artifacts;
+an A5 identity or uncommitted/pending wave is not a native source.
+
+```bash
+python -m benchmarks.ascend.phase2_cli --target a3 admit \
+  --config /ignored/native-runtime.json --root /owned/phase2 \
+  --phase1-root /owned/phase1 --initial-memory /owned/initial-memory.bin \
+  --review /owned/review.json
+```
+
+Admission copies exact memory, source identity, publication records, and evidence
+into an immutable destination snapshot. Change `admit` to `run` (and optionally
+add `--env-file`) to execute the bounded three-attempt shared source/host-verifier
+loop. Native Phase2 uses the same runtime JSON as Phase1 and checks the frozen
+target/architecture, CANN/profiler identity, guide bytes, and KDB collection.
+It never requires an A5 Catlass checkout. It uses the shared four-case fp16/bf16
+attention suite; configuring those cases is not a claim the hardware passed.
+Candidate source is Ascend C, complete raw output is host-graded, and failed
+attempt diagnostics feed the next attempt. Committed evidence is reused on
+resume; infrastructure failures leave the current semantic attempt uncommitted.
+
+Omitting `--target` or selecting `a5` dispatches the existing A5 Phase2 CLI with
+its original arguments and defaults. Old A3 vector-add entrypoints remain
+separate compatibility targets.
