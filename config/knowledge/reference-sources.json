@@ -1,0 +1,12 @@
+{
+  "sources": [
+    {"name": "ops-nn", "repository": "https://gitcode.com/cann/ops-nn.git", "revision": "84bf2da40119e3b8114a6d2a9e7369190a0470d1", "kernel_languages": ["ascend-c"]},
+    {"name": "ops-math", "repository": "https://gitcode.com/cann/ops-math.git", "revision": "64322f6487162c0934ec0364af57ed2f51175a03", "kernel_languages": ["ascend-c"]},
+    {"name": "ops-cv", "repository": "https://gitcode.com/cann/ops-cv.git", "revision": "07662024c71331c2b7dd744b8ebcaf4971580615", "kernel_languages": ["ascend-c"]},
+    {"name": "ops-transformer", "repository": "https://gitcode.com/cann/ops-transformer.git", "revision": "8a8427a0b8ae67c2fc7caad6fa53cce71d149737", "kernel_languages": ["ascend-c"]},
+    {"name": "recsdk", "repository": "https://gitcode.com/Ascend/RecSDK.git", "revision": "1ffef5e6bd8e40189c211c155c7dcdf823ab5033", "kernel_languages": ["ascend-c"]},
+    {"name": "catlass", "repository": "https://gitcode.com/cann/catlass.git", "revision": "8f100557e4f9ed307c52b6369308732a332f6fb9", "kernel_languages": ["ascend-c", "catlass-dsl"]},
+    {"name": "triton-ascend-kernels", "repository": "https://gitcode.com/Ascend/triton-ascend-kernels.git", "revision": "b359dfbc1ec5eea609084afee1821ddf93fd5fe8", "kernel_languages": ["triton"]},
+    {"name": "triton-ascend", "repository": "https://gitcode.com/Ascend/triton-ascend.git", "revision": "865691e2e9b656bc58008170207b4108d92e8dd1", "kernel_languages": ["triton"]}
+  ]
+}
