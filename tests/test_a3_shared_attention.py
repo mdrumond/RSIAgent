@@ -9,6 +9,7 @@ from benchmarks.a3kernels.phase2_attention import (
     AttentionTargetEvidence, AttentionTargetVerifier, NativeAttentionBackend, build_plan, TARGET_ID,
 )
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence
+from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
 
 
 SOURCE = '''#include "kernel_operator.h"
@@ -40,7 +41,8 @@ def test_native_plan_binds_real_inputs_dtype_and_case_constants():
         assert f"#define CAUSAL {int(case.causal)}" in plan.source
 
 
-class NativeRuntime:
+class NativeRuntime(BZA3RemoteCandidateBackend):
+    """Stub transport only; inherit the real public legacy execute contract."""
     def __init__(self, *, wrong=False):
         self.plans = []
         self.wrong = wrong
@@ -49,7 +51,7 @@ class NativeRuntime:
         self.plans.append(plan)
         return plan
 
-    def execute(self, plan):
+    def execute_receipt(self, plan):
         case = next(c for c in shared.ATTENTION_CASES if c.case_id == plan.project_id)
         output = shared.attention_reference(shared.build_execution(case))
         if self.wrong:

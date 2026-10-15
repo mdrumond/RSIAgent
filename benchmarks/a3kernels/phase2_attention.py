@@ -65,7 +65,7 @@ class NativeAttentionBackend:
         try:
             result = self.runtime.compile(plan, workdir)
             if not isinstance(result, FailedEvidence):
-                result = self.runtime.execute(result)
+                result = self.runtime.execute_receipt(result)
         except (_PendingObservation, OSError) as exc:
             raise AttentionInfrastructureError(str(exc)) from exc
         if isinstance(result, FailedEvidence):
