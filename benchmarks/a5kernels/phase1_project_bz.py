@@ -218,8 +218,11 @@ class CatlassProjectBackend:
         output_elements: int,
     ) -> tuple[dict[str, object], str]:
         attempt = self._reserve_attempt(identity, mode)
+        # The checked session wrapper allows at most 63 characters. Diagnostic
+        # tool names already distinguish modes; omit their redundant prefix.
+        session_mode = mode.removeprefix("diagnostic-")
         session = (
-            f"codex-a5project-{mode}-{identity[:_SESSION_IDENTITY_CHARS]}-"
+            f"codex-a5project-{session_mode}-{identity[:_SESSION_IDENTITY_CHARS]}-"
             f"{self._session_namespace}-{attempt:06d}"
         )
         remote = f".a5kernels/projects/{identity}"

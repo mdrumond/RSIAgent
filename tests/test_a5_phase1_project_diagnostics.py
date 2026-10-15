@@ -145,3 +145,26 @@ def test_actor_can_debug_failed_source_but_must_run_verified_final_source(tmp_pa
     admitted = actor.distill_calls[0][1]
     assert "diagnostic" in admitted.values()
     assert "host-verification" in admitted.values()
+
+
+@pytest.mark.parametrize("tool", ["msdebug", "memcheck", "racecheck", "initcheck", "synccheck"])
+def test_diagnostic_sessions_fit_checked_wrapper_and_retries_stay_distinct(tmp_path, tool):
+    request = bz_request(tmp_path, "movement")
+    record = {
+        "status": "diagnostic-observation", "diagnostic": "tool unavailable",
+        "candidate_sha256": hashlib.sha256(request.candidate_source.encode()).hexdigest(),
+        "available": False, "host_verified": False, "coverage": "unconfirmed",
+    }
+    executor = FakeExecutor([record, record])
+    backend = _backend(tmp_path, executor)
+    results = [backend.diagnostic(request, tool=tool) for _ in range(2)]
+    sessions = [invocation.argv[2] for invocation in executor.invocations]
+    assert max(map(len, sessions)) <= 63
+    assert sessions[0] != sessions[1]
+    assert sessions[0].endswith("-000001")
+    assert sessions[1].endswith("-000002")
+    assert [result["artifact"]["handle"] for result in results] == [
+        "bz-a5:" + session for session in sessions
+    ]
+    assert [result["artifact"]["attempt"] for result in results] == [1, 2]
+    assert all(result["artifact"]["mode"] == "diagnostic-" + tool for result in results)
