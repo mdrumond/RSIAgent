@@ -241,6 +241,10 @@ def _grammar() -> dict[str, object]:
         ],
         "capabilities": [item.value for item in Capability],
         "dtypes": [item.value for item in DType],
+        "low_precision_rules": {
+            "float8_e4m3fn/float8_e5m2": "movement/vector graphs allowed; Cube requires exactly one matmul node with operands equal to graph inputs in order, no padded-tail capability; copy-only graphs preserve FP8 output; every non-copy FP8 graph computes all intermediates and output in FP32",
+            "mxfp8_e4m3fn/mxfp8_e5m2": "only one matmul node with operands equal to the two graph inputs in order; no padded-tail capability; shape [m,k,n], inputs [m,k] and [k,n], FP32 output; host supplies E8M0 scales per 32 K elements (even-padded group count) as gm_scale0 and gm_scale1 before gm_output",
+        },
         "failure_modes": [item.value for item in FailureMode],
         "profile_metrics": [item.value for item in ProfileMetric],
         "padding_multiples": [1, 16, 32, 64, 128, 256],
