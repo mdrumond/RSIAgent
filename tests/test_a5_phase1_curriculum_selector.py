@@ -468,3 +468,16 @@ def test_documented_mxfp8_example_matches_published_grammar():
     assert spec.dtype.value == "mxfp8_e4m3fn"
     decision, _ = CurriculumAgent(lambda _: wave([example])).select(context())
     assert decision.wave.projects[0].spec == spec
+
+
+def test_small_adaptive_waves_are_bounded_by_remaining_target():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    for remaining, maximum in ((3, 3), (64, 8), (128, 8)):
+        prompt = curriculum_prompt(context(remaining_projects=remaining))
+        payload = json.loads(prompt.rsplit("\n", 1)[-1])
+        assert payload["max_wave_projects"] == maximum
+        projects = [with_shape(project(f"item-{i}"), (i + 1,))
+                    for i in range(maximum + 1)]
+        with pytest.raises(ValueError, match="wave limit or remaining"):
+            CurriculumAgent(lambda _: wave(projects)).select(
+                context(remaining_projects=remaining))

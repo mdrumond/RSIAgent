@@ -2,7 +2,8 @@
 
 The adaptive curriculum starts with `--project-target 64`. Increase the target
 on `resume` to continue the same campaign; published memory and project identity
-remain intact. Every wave is bounded by the number of projects remaining. A failed
+remain intact. Every wave contains at most eight projects, bounded by the number remaining,
+so later waves can adapt to measured outcomes. A failed
 wave remains `RECOVERY_REQUIRED`: its unverified projects are reported, never
 published as successful lessons. `TARGET_REACHED` means the project count was
 reached, not that every requested topic was learned. Inspect `coverage_gaps`.

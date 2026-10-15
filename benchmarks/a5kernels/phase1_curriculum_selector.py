@@ -345,6 +345,7 @@ def curriculum_prompt(
     payload = {
         "objective": context.objective,
         "remaining_projects": context.remaining_projects,
+        "max_wave_projects": min(8, context.remaining_projects),
         "next_wave_id": f"wave-{context.wave_index:03d}",
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
@@ -357,7 +358,7 @@ def curriculum_prompt(
         ]
     instructions = (
         "Choose DECISION: WAVE only when every project adds operation, shape, dtype, "
-        "failure, profile, or learning-focus information not covered by prior outcomes. Select no more than remaining_projects. Capability "
+        "failure, profile, or learning-focus information not covered by prior outcomes. Select no more than max_wave_projects (at most eight), then adapt the next wave to observed results. Capability "
         "labels alone are not information gain. Copy the supplied "
         "wave ID, memory identity, and coverage exactly. Otherwise choose SATURATED "
         "when the objective is covered, or STALLED when useful work is blocked.\n"
@@ -469,8 +470,8 @@ class CurriculumAgent:
                 raise ValueError("stall requires an observed prior attempt")
             return terminal
         wave = WaveSpec.from_mapping(value)
-        if len(wave.projects) > context.remaining_projects:
-            raise ValueError("wave exceeds remaining project target")
+        if len(wave.projects) > min(8, context.remaining_projects):
+            raise ValueError("wave exceeds eight-project wave limit or remaining project target")
         unavailable = set(self.unavailable_capabilities)
         if any(unavailable.intersection(item.spec.capabilities) for item in wave.projects):
             raise ValueError("wave selects a capability unavailable in this factory")
