@@ -17,11 +17,26 @@ def write(root, path, value):
 
 @pytest.fixture
 def campaign(tmp_path):
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
+    from benchmarks.a5kernels.phase1_project import ExecutionEvidence, EvidenceClassification
+
     root = tmp_path / "campaign"
     write(root, "state.json", {"completed_waves": ["wave-001"],
                               "memory_bytes_base64": ["bGVzc29u"]})
     write(root, "campaign-identity.json", {"execution_profile": "test-profile"})
-    write(root, "waves/wave-001/published.json", {"commits": []})
+    memory = b"initial"
+    wave = WaveSpec.from_mapping({"wave_id": "wave-001", "pre_wave_coverage": [],
+        "pre_wave_memory_sha256": hashlib.sha256(memory).hexdigest(), "projects": [{
+            "requires": [], "spec": {"project_id": "project", "capabilities": ["gm-ub-movement"],
+            "shape": [32], "dtype": "float32", "block_count": 1, "padding_multiple": 1,
+            "failure_mode": "none", "timing_lengths": [], "profile_metric": None,
+            "hypothesis": "Verify a copy using the host reference.", "graph": {
+                "inputs": [{"name": "x", "shape": [32]}], "nodes": [{"name": "y",
+                "op": "copy", "operands": ["x"], "axis": None}], "output": "y"}}}]})
+    LiveWaveCoordinator(root / "waves/wave-001", wave, memory, lambda _: WaveProjectResult(
+        b"memory delta", ExecutionEvidence(EvidenceClassification.HOST_VERIFIED, "verified"),
+        b'{"host":"verified"}'), 1).run()
     branch = root / "waves/wave-001/branches/project"
     source = b"exact source version"
     digest = hashlib.sha256(source).hexdigest()
@@ -95,18 +110,60 @@ def test_raw_report_descriptor_and_verified_package(campaign, tmp_path):
     assert inventory_campaign(campaign, artifact_store=store)["remote_reports"][0]["status"] == "digest-mismatch"
 
 
-def test_phase2_uncommitted_attempt_is_pending(tmp_path):
+@pytest.mark.parametrize("artifact,mutation", [
+    ("candidate.cpp", "remove"), ("candidate.cpp", "corrupt"),
+    ("attempt.json", "remove"), ("attempt.json", "corrupt"),
+    ("evidence.json", "remove"), ("evidence.json", "corrupt"),
+    ("directory", "remove"),
+])
+def test_phase2_uncommitted_attempt_is_pending(tmp_path, artifact, mutation):
     root = tmp_path / "phase2"
     write(root, "cells/cell/protocol.json", {"schema": "phase2-protocol"})
-    write(root, "cells/cell/attempts/attempt-01/attempt.json", {
-        "attempt_id": "one", "attempt_sha256": "identity"})
+    attempt = {"attempt_id": "one"}
+    canonical = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    attempt["attempt_sha256"] = canonical(attempt)
+    write(root, "cells/cell/attempts/attempt-01/attempt.json", attempt)
     assert inventory_campaign(root)["boundary"]["pending"]
-    write(root, "cells/cell/attempts/attempt-01/evidence.json", {
-        "passed": False, "evidence_sha256": "evidence"})
+    source = root / "cells/cell/attempts/attempt-01/candidate.cpp"
+    source.write_text("source")
+    evidence = {"passed": False, "candidate_sha256": hashlib.sha256(b"source").hexdigest()}
+    evidence["evidence_sha256"] = canonical(evidence)
+    write(root, "cells/cell/attempts/attempt-01/evidence.json", evidence)
     assert inventory_campaign(root)["boundary"]["pending"]
     write(root, "cells/cell/memory.jsonl", {
-        "attempt_identity_sha256": "identity", "evidence_sha256": "evidence"})
+        "attempt": 1, "attempt_identity_sha256": attempt["attempt_sha256"],
+        "evidence_sha256": evidence["evidence_sha256"],
+        "candidate_sha256": evidence["candidate_sha256"], "passed": False})
     assert inventory_campaign(root)["complete"]
+    if artifact == "directory":
+        source.parent.rename(tmp_path / "removed-attempt")
+    else:
+        target = source.parent / artifact
+        if mutation == "remove":
+            target.unlink()
+        else:
+            target.write_text("corrupt" if artifact == "candidate.cpp" else '{"changed":true}')
+    assert "missing-or-corrupt-committed-attempt" in {i["kind"] for i in inventory_campaign(root)["issues"]}
+    with pytest.raises(ValueError, match="incomplete"):
+        package_campaign(root, tmp_path / "missing-commit.tar.gz")
+
+
+@pytest.mark.parametrize("artifact,mutation", [
+    ("branches/project/memory-delta.bin", "remove"),
+    ("branches/project/memory-delta.bin", "corrupt"),
+    ("branches/project/execution-evidence.bin", "remove"),
+    ("branches/project/execution-evidence.bin", "corrupt"),
+    ("consolidated-memory.json", "corrupt"),
+])
+def test_phase1_publication_authenticates_retained_commits(campaign, artifact, mutation):
+    target = campaign / "waves/wave-001" / artifact
+    if mutation == "remove":
+        target.unlink()
+    else:
+        target.write_text("corrupted retained evidence")
+    assert "invalid-wave-publication" in {i["kind"] for i in inventory_campaign(campaign)["issues"]}
+    with pytest.raises(ValueError, match="incomplete"):
+        package_campaign(campaign, campaign.parent / "incomplete.tar.gz")
 
 
 def test_inventory_is_read_only_and_uses_relative_paths(campaign):
