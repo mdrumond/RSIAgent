@@ -418,7 +418,11 @@ def test_target_stops_and_resume_with_larger_target_preserves_memory(tmp_path):
             CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
     first = campaign(1).run()
     assert first["status"] == "TARGET_REACHED"
-    second = campaign(2).resume()
+    with pytest.raises(ValueError, match="continue_campaign"):
+        campaign(2).resume()
+    continued = campaign(1)
+    continued.continue_campaign(2)
+    second = continued.resume()
     assert second["successful_projects"] == 2
     assert second["published_projects"][0] == first["published_projects"][0]
     assert "pipe-mte2" not in second["coverage_gaps"]
@@ -451,7 +455,7 @@ def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
                   {"category": "runtime", "statement": "verified-debug-print:source"}]
     else:
         facts += [{"category": "runtime", "statement": 'tool-observation:{"available":false,"tool":"memcheck"}'}]
-    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+    state = {"prior_outcomes": [{"spec": spec, "verified": True}], "memory_bytes_base64": [
         base64.b64encode(json.dumps({"host_facts": facts}).encode()).decode()]}
     effective = AdaptivePhase1Coordinator._effective_outcomes(state)[0]["spec"]
     assert effective.get("learning_focus", []) == (spec["learning_focus"] if observed else [])

@@ -67,6 +67,14 @@ def parse_trial_action(text: str) -> TrialAction | None:
         return TrialAction(kind, {}) if payload == {} else None
     if not isinstance(payload, dict):
         return None
+    if kind == "read-artifact" and set(payload) <= {"sha256", "offset", "limit"}:
+        digest = payload.get("sha256")
+        offset, limit = payload.get("offset", 0), payload.get("limit", 8192)
+        if (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)
+                and type(offset) is int and offset >= 0
+                and type(limit) is int and 1 <= limit <= 8192):
+            return TrialAction(kind, {"sha256": digest, "offset": offset, "limit": limit})
+        return None
     if kind == "request-sanitizer" and set(payload) == {"tool"}:
         if payload["tool"] in ("memcheck", "racecheck", "initcheck", "synccheck"):
             return TrialAction(kind, payload)
@@ -222,13 +230,15 @@ _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON obj
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
 {"request-profile":{}}, {"request-timing":{}}, {"request-debug":{}},
 {"request-sanitizer":{"tool":"memcheck"}}, or {"submit":{}}.
+Adaptive projects also support {"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}.
+Read full retained evidence in byte pages (maximum 8192 bytes); follow next_offset.
 Diagnostic actions are bound by adaptive projects; sanitizer tool can also be racecheck,
 initcheck, or synccheck. Diagnostic observations never establish correctness or timing.
 You cannot choose paths or commands and cannot report a score or authoritative result."""
 
 _ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
 compile, run, query-knowledge, request-profile, request-timing, request-debug,
-request-sanitizer, or submit. Use the object shape shown
+request-sanitizer, read-artifact (adaptive projects), or submit. Use the object shape shown
 in the system instructions and no surrounding prose."""
 
 
