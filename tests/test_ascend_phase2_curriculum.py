@@ -135,6 +135,27 @@ def test_infrastructure_exception_keeps_exact_pending_project(tmp_path):
     assert len(selections) == 1
 
 
+def test_recovers_empty_state_after_interrupted_phase2_initialization(tmp_path):
+    coordinator = AdaptivePhase2Coordinator(
+        tmp_path, "Learn", snapshot(),
+        CurriculumAgent(lambda messages: _wave(messages[-1]["content"], [project(1)])),
+        lambda req: _result(req.spec, True, "pass"), project_target=1)
+    intermediate = AdaptivePhase1Coordinator._load_state(coordinator)
+    assert "phase" not in intermediate
+    assert coordinator.resume()["successful_projects"] == 1
+    assert json.loads((tmp_path / "state.json").read_bytes())["phase"] == "adaptive-phase2"
+
+
+def test_does_not_upgrade_nonempty_state_without_phase2_identity(tmp_path):
+    coordinator = AdaptivePhase2Coordinator(
+        tmp_path, "Learn", snapshot(), CurriculumAgent(lambda _: None), lambda _: None)
+    state = AdaptivePhase1Coordinator._load_state(coordinator)
+    state["session"] = {"messages": [{"role": "system", "content": "started"}], "turns": 0}
+    coordinator._atomic_json(tmp_path / "state.json", state)
+    with pytest.raises(ValueError, match="not an adaptive Phase 2 lineage"):
+        coordinator.resume()
+
+
 @pytest.mark.parametrize("phase2", [False, True])
 @pytest.mark.parametrize("terminal", ["SATURATED", "STALLED"])
 def test_explicit_continuation_preserves_publications_and_terminal_history(tmp_path, phase2, terminal):

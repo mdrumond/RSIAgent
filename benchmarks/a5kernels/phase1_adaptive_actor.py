@@ -435,6 +435,7 @@ class AdaptiveActorProjectExecutor:
         immutable_context: bytes = b"",
         diagnostic_instructions: str | None = None,
         retain_semantic_failure: bool = False,
+        trace_recorder_factory=None,
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
@@ -468,6 +469,7 @@ class AdaptiveActorProjectExecutor:
         self.immutable_context = immutable_context
         self.diagnostic_instructions = diagnostic_instructions
         self.retain_semantic_failure = retain_semantic_failure
+        self.trace_recorder_factory = trace_recorder_factory
         if not all(callable(action) for action in (
             self.query_knowledge, self.request_profile, self.request_timing,
             self.request_diagnostic,
@@ -520,11 +522,58 @@ class AdaptiveActorProjectExecutor:
                 "\nProduction context (immutable, identical for every project): "
                 + self.immutable_context.decode("utf-8")
             )
-        outcome = self.actor(
-            opening, profile=self.profile, workspace=root / "actor",
-            context=artifacts.objects / memory_sha256[:2] / memory_sha256[2:],
-            turn_parser=parse_trial_action, action_executor=actions,
-        )
+        recorder = self.trace_recorder_factory(request) if self.trace_recorder_factory else None
+        actor = self.actor
+        execute_action = actions
+        if recorder is not None:
+            def observe(kind, payload):
+                if kind == "message":
+                    recorder.message(**payload)
+                elif kind == "tool":
+                    recorder.tool_event(str(payload["name"]), payload)
+
+            actor = actor.with_trace(observe)
+
+            def execute_action(action):
+                outcome = actions(action)
+                if action.kind == "write" and actions.source is not None:
+                    recorder.candidate(actions.source, candidate_id=actions.source_sha256)
+                if action.kind == "compile" and actions.source is not None:
+                    host = json.loads(outcome.observation)["host"]
+                    if "artifact" in host and not host["passed"]:
+                        recorder.validation(
+                            candidate_id=actions.source_sha256,
+                            validator="host-compile", status="failed",
+                            evidence_sha256=host["artifact"]["sha256"],
+                            candidate_sha256=actions.source_sha256,
+                            details={"compile_only": True},
+                        )
+                if action.kind == "run" and actions.latest is not None:
+                    result = actions.latest
+                    recorder.validation(
+                        candidate_id=actions.source_sha256, validator="host-execution",
+                        status="passed" if result.evidence.verified else "failed",
+                        evidence_sha256=result.artifact_sha256["classification"],
+                        candidate_sha256=actions.source_sha256,
+                        details={"classification": result.evidence.classification.value},
+                    )
+                return outcome
+        try:
+            outcome = actor(
+                opening, profile=self.profile, workspace=root / "actor",
+                context=artifacts.objects / memory_sha256[:2] / memory_sha256[2:],
+                turn_parser=parse_trial_action, action_executor=execute_action,
+            )
+        except Exception as exc:
+            if recorder is not None:
+                digest = artifacts.put_json({"exception": type(exc).__name__, "detail": str(exc)})
+                recorder.validation(
+                    candidate_id=actions.source_sha256 or "no-candidate", validator="actor-abort",
+                    status="infrastructure-failure", evidence_sha256=digest,
+                    candidate_sha256=actions.source_sha256 or "0" * 64,
+                )
+                recorder.finish()
+            raise
         result = actions.latest
         if (self.retain_semantic_failure and result is not None
                 and not result.evidence.verified
@@ -532,6 +581,8 @@ class AdaptiveActorProjectExecutor:
             # Retain host facts for selection, never distill or publish failed
             # candidates as successful knowledge. Infrastructure exceptions
             # escape the action loop before reaching this branch.
+            if recorder is not None:
+                recorder.finish()
             memory = Phase1ProjectMemory(
                 request.spec, actions.source_sha256, tuple(actions.actions),
                 (*actions.host_facts, HostFact("diagnostic", result.evidence.detail,
@@ -552,7 +603,20 @@ class AdaptiveActorProjectExecutor:
             or not result.evidence.verified
             or actions.latest_source_sha256 != actions.source_sha256
         ):
+            if recorder is not None:
+                if actions.latest is None or actions.latest.evidence.verified:
+                    digest = artifacts.put_json({"status": getattr(outcome, "status", "invalid-outcome")})
+                    recorder.validation(
+                        candidate_id=actions.source_sha256 or "no-candidate", validator="actor-terminal",
+                        status="infrastructure-failure", evidence_sha256=digest,
+                        candidate_sha256=actions.source_sha256 or "0" * 64,
+                        details={"incomplete_attempt": True},
+                    )
+                recorder.finish()
             raise RuntimeError("Actor ended without host-verified current source")
+        if recorder is not None:
+            recorder.supervised_source(actions.source)
+            recorder.finish()
         facts = (*actions.host_facts, HostFact(
             "host-verification", result.evidence.detail,
             result.artifact_sha256["classification"],

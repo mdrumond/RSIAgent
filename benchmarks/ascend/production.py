@@ -172,11 +172,11 @@ def build_native_adaptive_phase1(
         immutable_context=canonical_bytes({"identity": identity,
                                             "programming_guide": guide_text}),
         target_policy=policy, profiling_guidance=profiling_guidance,
+        trace_recorder_factory=trace_recorder_factory,
         query_knowledge=query, request_profile=request_profile, request_timing=request_timing,
         diagnostic_instructions="Debugger and sanitizer routes are unavailable in this native composition.\n",
         project_target=project_target, max_projects=max_projects,
         reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
-        trace_recorder_factory=trace_recorder_factory,
         unavailable_capabilities=tuple(capability for capability, action in (
             (Capability.PROFILING, request_profile), (Capability.TIMING_SWEEP, request_timing),
         ) if action is None),

@@ -67,9 +67,19 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
         self.snapshot.verify()
         exists = (self.root / "state.json").exists()
         state = super()._load_state()
-        if exists:
-            if state.get("phase") != "adaptive-phase2":
+        if exists and state.get("phase") != "adaptive-phase2":
+            # The parent initializer may have persisted its empty state before
+            # startup was interrupted. Its seed digest was authenticated above;
+            # only this untouched initial state can be upgraded in place.
+            if (state.get("phase") is not None or state.get("wave_index") != 1
+                    or any(state.get(key) for key in (
+                        "prior_outcomes", "memory_bytes_base64", "coverage",
+                        "completed_waves", "terminal"))
+                    or state.get("session") != {"messages": [], "turns": 0}
+                    or (self.root / "pending.json").exists()
+                    or (self.root / "waves").exists()):
                 raise ValueError("campaign root is not an adaptive Phase 2 lineage")
+        elif exists:
             # Recompute from the authenticated seed for campaigns retained before
             # observed-tool filtering was applied to Phase 1 outcomes.
             return {**state, "seed_outcomes": self.seed_outcomes}

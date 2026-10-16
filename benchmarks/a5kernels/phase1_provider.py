@@ -300,6 +300,11 @@ class DirectActorDriver:
         if self.trace_event is not None:
             self.trace_event(kind, dict(payload))
 
+    def with_trace(self, trace_event):
+        """Bind a project-local observer without mutating this shared driver."""
+        return type(self)(self.provider, max_turns=self.max_turns,
+                          trace_event=trace_event, system_prompt=self.system_prompt)
+
     def __call__(
         self,
         instruction: str,
