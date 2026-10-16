@@ -117,6 +117,16 @@ def test_inventory_is_read_only_and_uses_relative_paths(campaign):
     assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in campaign.rglob("*") if p.is_file()}
 
 
+def test_legacy_traces_and_launcher_provenance_are_retained(campaign):
+    write(campaign, "sft-traces/one.json", {"conversation": []})
+    write(campaign, "provider/one/provider.json", {"request_id": "one"})
+    write(campaign, "campaign-run.json", {"phase": "phase1"})
+    write(campaign, "collector-state.json", {"local_runtime": "excluded"})
+    names = {entry["path"] for entry in inventory_campaign(campaign)["files"]}
+    assert {"sft-traces/one.json", "provider/one/provider.json", "campaign-run.json"} <= names
+    assert "collector-state.json" not in names
+
+
 def test_concurrent_mutation_aborts_archive(campaign, tmp_path, monkeypatch):
     original = tarfile.TarFile.addfile
     changed = False

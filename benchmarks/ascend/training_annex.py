@@ -39,11 +39,13 @@ _EXCLUDED = {".git", "__pycache__", "reference_repos", "weights", "private",
              "profiles", "private-config", ".ssh", "credentials.json",
              "credentials", "secrets.json"}
 _ROOT_FILES = {"state.json", "pending.json", "campaign-identity.json",
+               "campaign-run.json",
                "project-evidence.jsonl", "initial-memory.bin", "memory.jsonl",
                "terminal.json", "protocol.json", "review.json", "snapshot.json",
                "phase1-memory.jsonl", "phase1-terminal.json"}
 _TREES = {"waves", "native-evidence", "measurements", "cells", "attempts",
-          "provider-evidence", "source-evidence", "artifacts", "traces", "snapshot"}
+          "provider", "provider-evidence", "source-evidence", "artifacts", "traces",
+          "sft-traces", "snapshot"}
 
 
 def _retained(root):
