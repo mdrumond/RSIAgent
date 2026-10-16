@@ -1,6 +1,8 @@
 import json
+import io
 import shutil
 import subprocess
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +14,34 @@ from benchmarks.ascend import campaign_cli as cli
 def write(path, value):
     path.write_text(json.dumps(value))
     return path
+
+
+def test_harness_revision_uses_checkout_or_real_export_substitution(tmp_path):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+    (checkout / ".gitattributes").write_text(".git_archival.txt export-subst\n")
+    (checkout / ".git_archival.txt").write_text("node: $Format:%H$\n")
+    subprocess.run(["git", "add", ".gitattributes", ".git_archival.txt"], cwd=checkout, check=True)
+    subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                    "commit", "-qm", "Source export fixture"], cwd=checkout, check=True)
+    expected = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+    assert cli._harness_revision(checkout) == expected
+    archive = subprocess.check_output(["git", "archive", "HEAD"], cwd=checkout)
+    exported = tmp_path / "exported"
+    exported.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+        (exported / ".git_archival.txt").write_bytes(tree.extractfile(".git_archival.txt").read())
+    assert not (exported / ".git").exists()
+    assert cli._harness_revision(exported) == expected
+
+
+@pytest.mark.parametrize("metadata", [None, "node: $Format:%H$\n", "node: unknown\n"])
+def test_unknown_harness_revision_is_not_fabricated(tmp_path, metadata):
+    if metadata is not None:
+        (tmp_path / ".git_archival.txt").write_text(metadata)
+    with pytest.raises(ValueError, match="Git checkout or git archive"):
+        cli._harness_revision(tmp_path)
 
 
 def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session"):

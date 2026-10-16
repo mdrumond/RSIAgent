@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
@@ -24,6 +25,24 @@ def _write(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def _harness_revision(root=None):
+    """Identify a checkout or git-exported source without inventing provenance."""
+    root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
+    revision = ""
+    if (root / ".git").exists():
+        try:
+            revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root,
+                                               text=True, stderr=subprocess.DEVNULL).strip()
+        except (OSError, subprocess.CalledProcessError):
+            pass
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        archival = root / ".git_archival.txt"
+        revision = archival.read_text().strip().removeprefix("node: ") if archival.is_file() else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError("harness revision unavailable: use a Git checkout or git archive with export-subst metadata")
+    return revision
 
 
 def _snapshot(job, options):
@@ -265,12 +284,12 @@ def main(argv=None, *, screen=start_screen):
             parser.error("phase1_arguments cannot override campaign identity/budget")
         source_path = Path(settings["source_manifest"])
         source = SourceManifest.load(source_path)
+        revision = _harness_revision()
         control.mkdir(parents=True, exist_ok=False)
         root.mkdir(parents=True, exist_ok=True)
         (root / "initial-memory.bin").write_bytes(args.initial_memory.read_bytes())
         (root / "source-evidence").mkdir()
         (root / "source-evidence" / "manifest.json").write_bytes(source_path.read_bytes())
-        revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parents[2], text=True).strip()
         public = {"schema": "ascend-campaign-run-v1", "target": args.target, "phase": args.phase,
                   "objective": args.objective, "project_target": args.project_target,
                   "model": settings["model"], "source_manifest_sha256": source.sha256,

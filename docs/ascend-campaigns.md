@@ -40,7 +40,14 @@ python run_ascend_campaign.py resume --control /local/campaign-control
 python run_ascend_campaign.py continue --control /local/campaign-control --project-target 96
 ```
 
-GNU Screen and Python must be installed on this local host. Two separately
+GNU Screen and Python must be installed on this local host.
+The harness can run from a Git checkout or a `git archive` source distribution.
+Keep the exported `.git_archival.txt` (expanded by `.gitattributes` export-subst)
+when deploying an archive: it records the exact harness commit without shipping
+Git metadata. Unversioned copies or unexpanded placeholders are rejected rather
+than assigned an invented revision.
+
+Two separately
 named Screen sessions retain compute and collection logs in the control
 directory. A downloader failure never stops or waits on compute. `resume`
 retries unfinished work without raising the target; `continue` explicitly raises
