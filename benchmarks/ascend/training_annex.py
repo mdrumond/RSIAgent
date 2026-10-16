@@ -61,6 +61,46 @@ def _retained(root):
             yield relative.as_posix(), path
 
 
+def _captures(value):
+    if isinstance(value, dict):
+        if isinstance(value.get("capture"), dict):
+            yield value["capture"]
+        for child in value.values():
+            yield from _captures(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _captures(child)
+
+
+def _report(target, remote_path, expected, origin, store):
+    descriptor = {"target": target, "remote_path": remote_path, "expected_sha256": expected}
+    descriptor["id"] = _sha(_json(descriptor))
+    descriptor.update(record_origin=origin, kind="directory",
+                      digest_algorithm="relative-path-sha256-v1",
+                      digest_origin="capture-time" if expected else "unavailable",
+                      status="missing" if expected else "digest-unavailable")
+    local = store / descriptor["id"] if store else None
+    if local and local.is_dir():
+        try:
+            actual = report_digest(local)
+            receipt_path = store / (descriptor["id"] + ".receipt.json")
+            if expected is None and receipt_path.is_file():
+                receipt = json.loads(receipt_path.read_text())
+                if (receipt.get("descriptor_id") == descriptor["id"]
+                        and receipt.get("digest_origin") == "collection-time"
+                        and receipt.get("source_sha256") == actual
+                        and receipt.get("downloaded_sha256") == actual):
+                    descriptor.update(resolved_sha256=actual, digest_origin="collection-time")
+                    expected = actual
+            if expected:
+                descriptor["status"] = "available" if actual == expected else "digest-mismatch"
+        except (ValueError, OSError):
+            descriptor["status"] = "digest-mismatch"
+    if not target:
+        descriptor["status"] = "incomplete-descriptor"
+    return descriptor
+
+
 def inventory_campaign(root, *, artifact_store=None):
     """Inventory every retained attempt, CAS object and measurement without writes.
 
@@ -73,16 +113,22 @@ def inventory_campaign(root, *, artifact_store=None):
     store = Path(artifact_store).resolve() if artifact_store is not None else None
     files, records, reports, issues = [], [], [], []
     documents = {}
+    identity_path = root / "campaign-identity.json"
+    campaign_identity = json.loads(identity_path.read_bytes()) if identity_path.is_file() else {}
+    fallback_target = (campaign_identity.get("execution_profile")
+                       or campaign_identity.get("cell", {}).get("execution_profile"))
     for relative, path in _retained(root):
         data = path.read_bytes()
         files.append({"path": relative, "sha256": _sha(data), "size": len(data)})
-        if path.suffix not in {".json", ".jsonl"}:
+        is_object = "objects" in path.parts
+        if path.suffix not in {".json", ".jsonl"} and not is_object:
             continue
         try:
             rows = ([json.loads(line) for line in data.splitlines() if line.strip()]
                     if path.suffix == ".jsonl" else [json.loads(data)])
         except (ValueError, UnicodeDecodeError):
-            issues.append({"kind": "invalid-record", "path": relative})
+            if not is_object:
+                issues.append({"kind": "invalid-record", "path": relative})
             continue
         documents[relative] = rows
         for index, row in enumerate(rows):
@@ -103,31 +149,23 @@ def inventory_campaign(root, *, artifact_store=None):
                     issues.append({"kind": "missing-or-corrupt-object", "origin": origin,
                                    "sha256": digest})
             evidence = row.get("evidence", {})
-            if not isinstance(evidence, dict) or not evidence.get("remote_report"):
-                continue
-            result = row.get("result", {})
-            identity = result.get("identity", {})
-            descriptor = {"target": evidence.get("profile") or identity.get("execution_profile"),
-                          "remote_path": evidence["remote_report"],
-                          "expected_sha256": result.get("summary", {}).get("report_sha256")}
-            descriptor["id"] = _sha(_json(descriptor))
-            descriptor.update(record_origin=origin, kind="directory",
-                              digest_algorithm="relative-path-sha256-v1")
-            local = store / descriptor["id"] if store else None
-            descriptor["status"] = "missing"
-            if local and local.is_dir():
-                try:
-                    actual = report_digest(local)
-                    descriptor["status"] = ("available" if actual == descriptor["expected_sha256"]
-                                            else "digest-mismatch")
-                except ValueError:
-                    descriptor["status"] = "digest-mismatch"
-            if not descriptor["target"] or not descriptor["expected_sha256"]:
-                descriptor["status"] = "incomplete-descriptor"
-            if descriptor["status"] != "available":
-                issues.append({"kind": "raw-report-" + descriptor["status"],
-                               "origin": origin, "id": descriptor["id"]})
-            reports.append(descriptor)
+            found = []
+            if isinstance(evidence, dict) and evidence.get("remote_report"):
+                result = row.get("result", {})
+                target = evidence.get("profile") or result.get("identity", {}).get("execution_profile")
+                found.append(_report(target, evidence["remote_report"],
+                                     result.get("summary", {}).get("report_sha256"), origin, store))
+            for capture in _captures(row):
+                archive = capture.get("evidence", {})
+                if archive.get("remote_tree"):
+                    target = (capture.get("execution_profile") or archive.get("execution_profile")
+                              or row.get("execution_profile") or fallback_target)
+                    found.append(_report(target, archive["remote_tree"], None, origin, store))
+            for descriptor in found:
+                if descriptor["status"] != "available":
+                    issues.append({"kind": "raw-report-" + descriptor["status"],
+                                   "origin": origin, "id": descriptor["id"]})
+                reports.append(descriptor)
 
     state = documents.get("state.json", [{}])[0]
     identity = documents.get("campaign-identity.json", [{}])[0]
@@ -206,9 +244,11 @@ def package_campaign(root, destination, *, artifact_store=None, allow_pending=Fa
                     raise ValueError("campaign changed during packaging")
                 add("campaign/" + entry["path"], data)
             raw_files = []
+            packaged_reports = set()
             for report in manifest["remote_reports"]:
-                if report["status"] != "available":
+                if report["status"] != "available" or report["id"] in packaged_reports:
                     continue
+                packaged_reports.add(report["id"])
                 local = Path(artifact_store) / report["id"]
                 captured_digest = hashlib.sha256()
                 for path in sorted(p for p in local.rglob("*") if p.is_file()):
@@ -218,8 +258,14 @@ def package_campaign(root, destination, *, artifact_store=None, allow_pending=Fa
                     name = "reports/" + report["id"] + "/" + path.relative_to(local).as_posix()
                     raw_files.append({"path": name, "sha256": _sha(data), "size": len(data)})
                     add(name, data)
-                if captured_digest.hexdigest() != report["expected_sha256"]:
+                if captured_digest.hexdigest() != (report["expected_sha256"] or report.get("resolved_sha256")):
                     raise ValueError("raw report changed during packaging")
+                if report["digest_origin"] == "collection-time":
+                    receipt = Path(artifact_store) / (report["id"] + ".receipt.json")
+                    data = receipt.read_bytes()
+                    name = "reports/" + receipt.name
+                    raw_files.append({"path": name, "sha256": _sha(data), "size": len(data)})
+                    add(name, data)
             current = inventory_campaign(root, artifact_store=artifact_store)
             if current != {k: v for k, v in manifest.items() if k != "package_kind"}:
                 raise ValueError("campaign changed during packaging")
