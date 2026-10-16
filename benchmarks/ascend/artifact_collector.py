@@ -19,13 +19,14 @@ _SOURCE_DIGEST = '''#!/usr/bin/env python3
 import hashlib, json
 from pathlib import Path
 root = Path(SOURCE_PATH)
-files = sorted(p for p in root.rglob("*") if p.is_file())
+paths = sorted(root.rglob("*"))
+if any(path.is_symlink() for path in paths):
+    raise RuntimeError("report contains symlink")
+files = [path for path in paths if path.is_file()]
 if not files:
     raise RuntimeError("empty raw report")
 digest = hashlib.sha256()
 for path in files:
-    if path.is_symlink():
-        raise RuntimeError("report contains symlink")
     digest.update(path.relative_to(root).as_posix().encode() + b"\\0")
     digest.update(hashlib.sha256(path.read_bytes()).digest())
 print(json.dumps({"source_sha256": digest.hexdigest()}))
@@ -244,6 +245,11 @@ class ArtifactCollector:
                         if not item.get("expected_sha256") and item.get("resolved_sha256"):
                             item["expected_sha256"] = item["resolved_sha256"]
                         entries[descriptor["id"]] = item
+                    elif (entries[descriptor["id"]]["status"] == "complete"
+                          and descriptor.get("status", "available") != "available"):
+                        # Cache cleanup or corruption can invalidate prior publication.
+                        entries[descriptor["id"]].update(status="pending", attempts=0,
+                                                         next_retry=now, handle=None)
                 state["next_discovery"] = now + 300
             self._save(state)
             low_disk = shutil.disk_usage(self.store).free < self.floor

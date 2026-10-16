@@ -2,6 +2,7 @@ import hashlib
 import fcntl
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -77,6 +78,16 @@ def test_digest_and_publish_deduplicate(setup):
     worker.collect_once(now=301)
     assert len(calls) == 1
     assert len(discovered) == 2
+
+
+def test_capture_time_digest_cache_deletion_requeues_without_hash_job(setup):
+    worker, descriptor, responses, calls, _ = setup
+    descriptor["status"] = "missing"
+    responses.extend(["success", "success"])
+    worker.collect_once(now=1)
+    shutil.rmtree(worker.store / descriptor["id"])
+    assert worker.collect_once(now=301)["counts"] == {"complete": 1}
+    assert [call[2] for call in calls] == ["download", "download"]
 
 
 def test_handle_disconnect_restart_and_fetch(setup):
@@ -308,8 +319,10 @@ def test_historical_a5_receipt_recovers_without_hash_roundtrip(setup):
     assert json.loads((worker.store / (descriptor["id"] + ".receipt.json")).read_text())["source_sha256"] == digest
 
 
-def test_historical_a5_collector_receipt_accepted_by_annex(setup, monkeypatch):
-    worker, descriptor, responses, _, _ = setup
+@pytest.mark.parametrize("cache_damage", [None, "deleted-tree", "corrupt-tree",
+                                         "deleted-receipt", "corrupt-receipt"])
+def test_historical_a5_collector_receipt_accepted_by_annex(setup, monkeypatch, cache_damage):
+    worker, descriptor, responses, calls, _ = setup
     source_digest = descriptor["expected_sha256"]
     (worker.root / "campaign-identity.json").write_text(json.dumps({"execution_profile": "configured-target"}))
     retained = worker.root / "measurements" / "record.json"
@@ -334,6 +347,39 @@ def test_historical_a5_collector_receipt_accepted_by_annex(setup, monkeypatch):
     assert report["expected_sha256"] is None
     assert report["resolved_sha256"] == source_digest
     assert report["digest_origin"] == "collection-time"
+    if cache_damage:
+        tree = worker.store / descriptor["id"]
+        receipt = worker.store / (descriptor["id"] + ".receipt.json")
+        if cache_damage == "deleted-tree":
+            shutil.rmtree(tree)
+        elif cache_damage == "corrupt-tree":
+            (tree / "subdir" / "raw.csv").write_text("corrupt")
+        elif cache_damage == "deleted-receipt":
+            receipt.unlink()
+        else:
+            receipt.write_text("invalid receipt")
+        worker.floor = 10**30
+        assert worker.collect_once(now=301)["counts"] == {"pending": 1}
+        worker.floor = 0
+        if cache_damage.endswith("tree"):
+            responses.append("success")
+        assert worker.collect_once(now=302)["counts"] == {"complete": 1}
+        repaired = inventory_campaign(worker.root, artifact_store=worker.store)["remote_reports"][0]
+        assert repaired["status"] == "available"
+        assert [c[2] for c in calls].count("run") == 1
+        assert [c[2] for c in calls].count("download") == (2 if cache_damage.endswith("tree") else 1)
+
+
+def test_source_digest_rejects_directory_symlink(tmp_path):
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "raw.csv").write_text("raw")
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "missing.csv").write_text("must not silently omit")
+    (report / "linked-directory").symlink_to(external, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="symlink"):
+        exec(compile(_SOURCE_DIGEST.replace("SOURCE_PATH", repr(str(report))), "hash-payload", "exec"))
 
 
 @pytest.mark.parametrize("persisted", [False, True])
