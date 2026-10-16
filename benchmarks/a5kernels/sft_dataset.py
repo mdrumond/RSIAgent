@@ -245,14 +245,29 @@ def _read_trace(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _native_candidate(source: str) -> bool:
+    return bool(re.search(
+        r'^\s*#\s*(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|pragma|error|line)\b'
+        r'|\b(?:__aicore__|__global__)\b|\bAscendC::|\bextern\s+"C"',
+        source, re.MULTILINE,
+    ))
+
+
 def _normalized_candidate(source: str) -> str:
+    # Native directives and case affect semantics; retain exact source for dedup.
+    if _native_candidate(source):
+        return source
     no_comments = re.sub(r"#.*", "", source)
     return " ".join(no_comments.lower().split())
 
 
 def _is_near_duplicate(value: str, retained: Sequence[str]) -> bool:
     """Collapse extremely close edits while retaining real kernel variants."""
-    return any(SequenceMatcher(None, value, item).ratio() >= 0.985 for item in retained)
+    if _native_candidate(value):
+        return False
+    return any(not _native_candidate(item)
+               and SequenceMatcher(None, value, item).ratio() >= 0.985
+               for item in retained)
 
 
 def _repair_pattern(rows: Sequence[Mapping[str, object]]) -> str | None:
