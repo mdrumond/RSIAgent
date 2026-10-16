@@ -20,7 +20,7 @@ import hashlib, json
 from pathlib import Path
 root = Path(SOURCE_PATH)
 paths = sorted(root.rglob("*"))
-if any(path.is_symlink() for path in paths):
+if root.is_symlink() or any(path.is_symlink() for path in paths):
     raise RuntimeError("report contains symlink")
 files = [path for path in paths if path.is_file()]
 if not files:
