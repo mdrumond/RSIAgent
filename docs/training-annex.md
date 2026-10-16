@@ -34,6 +34,21 @@ the binary SHA-256 of its contents. A tar file digest is not interchangeable.
 Descriptors retain their origin, even if several records reference one report.
 The annex performs no remote I/O and never chooses targets from product labels.
 
+A5 CAS and inline capture payloads retain a full `remote_tree` plus a compact
+archive SHA-256. The compact hash is never reused as a raw directory hash.
+Such descriptors initially have `expected_sha256=None`,
+`status="digest-unavailable"` and `digest_origin="unavailable"`. The collector
+may query the remote tree's current digest before transfer, verify the downloaded
+tree, then publish `report_store/<id>.receipt.json` with `descriptor_id`,
+`source_sha256`, `downloaded_sha256`, and `digest_origin="collection-time"`.
+Only when both receipt hashes match the local tree does inventory report it
+available, with `resolved_sha256` and `digest_origin="collection-time"`.
+The descriptor ID and absent capture-time digest remain unchanged; the receipt
+travels in the package. Native records with an original report digest retain
+`digest_origin="capture-time"`. A5 targets come from recorded execution profile
+metadata or the enclosing campaign identity; absent routing metadata remains a
+gap.
+
 Strict packaging rejects pending waves/attempts, missing publications, missing
 or corrupt referenced CAS/snapshot/source files, and uncollected or corrupt raw
 reports. A complete package describes a committed prefix; it need not mean the
