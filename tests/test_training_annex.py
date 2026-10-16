@@ -277,3 +277,52 @@ def test_native_and_standard_snapshot_explicit_digests(campaign, field, name, mu
     assert {"kind": "missing-or-corrupt-snapshot-file", "path": name} in inventory_campaign(campaign)["issues"]
     with pytest.raises(ValueError, match="incomplete"):
         package_campaign(campaign, campaign.parent / "corrupt-snapshot.tar.gz")
+
+
+def test_report_digest_rejects_directory_symlinks(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "metric.csv").write_text("retained")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "omitted.csv").write_text("must not be silently omitted")
+    (raw / "linked-directory").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        report_digest(raw)
+
+
+@pytest.mark.parametrize("mutation", [None, "missing-marker", "corrupt-marker", "missing-evidence", "corrupt-evidence", "pending"])
+def test_closed_failure_wave_is_complete_only_with_authenticated_evidence(campaign, tmp_path, mutation):
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
+    from benchmarks.a5kernels.phase1_project import ExecutionEvidence, EvidenceClassification
+
+    plan = json.loads((campaign / "waves/wave-001/plan.json").read_text())["wave"]
+    plan["wave_id"] = "wave-002"
+    wave = WaveSpec.from_mapping(plan)
+    failed = campaign / "waves/wave-002"
+    with pytest.raises(RuntimeError, match="not verified"):
+        LiveWaveCoordinator(failed, wave, b"initial", lambda _: WaveProjectResult(
+            b"retained failed experiment", ExecutionEvidence(EvidenceClassification.HOST_MISMATCH, "mismatch"),
+            b'{"host":"mismatch"}'), 1).run()
+    outcome = failed / "branches/project/outcome.json"
+    marker = write(failed, "closed-failure.json", {"wave_fingerprint": wave.fingerprint,
+        "outcome_sha256": hashlib.sha256(outcome.read_bytes()).hexdigest()})
+    evidence = failed / "branches/project/execution-evidence.bin"
+    if mutation == "missing-marker":
+        marker.unlink()
+    elif mutation == "corrupt-marker":
+        write(failed, "closed-failure.json", {"wave_fingerprint": wave.fingerprint, "outcome_sha256": "bad"})
+    elif mutation == "missing-evidence":
+        evidence.unlink()
+    elif mutation == "corrupt-evidence":
+        evidence.write_bytes(b"changed")
+    elif mutation == "pending":
+        write(campaign, "pending.json", {"wave_id": "wave-002"})
+    assert inventory_campaign(campaign)["complete"] is (mutation is None)
+    target = tmp_path / "failure.tar.gz"
+    if mutation:
+        with pytest.raises(ValueError, match="incomplete"):
+            package_campaign(campaign, target)
+    else:
+        assert package_campaign(campaign, target)["package_kind"] == "complete"

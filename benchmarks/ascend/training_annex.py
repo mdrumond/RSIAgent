@@ -24,7 +24,10 @@ def report_digest(root):
     """Digest a raw msprof directory using the native profiler's convention."""
     root = Path(root)
     digest = hashlib.sha256()
-    files = sorted(p for p in root.rglob("*") if p.is_file())
+    paths = sorted(root.rglob("*"))
+    if root.is_symlink() or any(path.is_symlink() for path in paths):
+        raise ValueError("report contains symlink")
+    files = [p for p in paths if p.is_file()]
     if not files:
         raise ValueError("empty raw report")
     for path in files:
@@ -101,13 +104,15 @@ def _report(target, remote_path, expected, origin, store):
     return descriptor
 
 
-def _verify_wave(root):
+def _verify_wave(root, *, closed_failure=False):
     from benchmarks.a5kernels.phase1_curriculum import (
         WaveSpec, ProjectOutcome, consolidate_wave,
     )
     read = lambda path: json.loads(path.read_bytes())
     wave = WaveSpec.from_mapping(read(root / "plan.json")["wave"])
-    publication = read(root / "published.json")
+    publication = read(root / ("closed-failure.json" if closed_failure else "published.json"))
+    if closed_failure and len(wave.projects) != 1:
+        raise ValueError("closed failure requires a single project")
     outcomes = []
     for assignment in wave.assignments():
         branch = root / "branches" / assignment.project_id
@@ -116,15 +121,20 @@ def _verify_wave(root):
                 or outcome["project_id"] != assignment.project_id
                 or outcome["authored_ordinal"] != assignment.authored_ordinal
                 or outcome["pre_wave_memory_sha256"] != wave.pre_wave_memory_sha256
-                or outcome["verified"] is not True
-                or outcome["classification"] != "host-verified"):
+                or outcome["verified"] is not (not closed_failure)
+                or outcome["verified"] != (outcome["classification"] == "host-verified")):
             raise ValueError("branch differs from committed wave")
         for name, field in (("memory-delta.bin", "memory_delta_sha256"),
                             ("execution-evidence.bin", "evidence_sha256")):
             if _sha((branch / name).read_bytes()) != outcome[field]:
                 raise ValueError("committed branch digest mismatch")
         outcomes.append(ProjectOutcome(assignment.project_id, outcome["memory_delta_sha256"],
-                                       wave.fingerprint, assignment.authored_ordinal, True))
+                                       wave.fingerprint, assignment.authored_ordinal, outcome["verified"]))
+    if closed_failure:
+        if (publication["wave_fingerprint"] != wave.fingerprint
+                or publication["outcome_sha256"] != _sha((branch / "outcome.json").read_bytes())):
+            raise ValueError("closed failure marker differs from retained outcome")
+        return
     consolidation = consolidate_wave(wave, tuple(outcomes))
     from dataclasses import asdict
     if (publication["wave_id"] != wave.wave_id
@@ -237,7 +247,14 @@ def inventory_campaign(root, *, artifact_store=None):
     for relative in documents:
         if relative.startswith("waves/") and relative.endswith("/plan.json"):
             if relative.split("/")[1] not in state.get("completed_waves", []):
-                pending.append(relative.rsplit("/", 1)[0])
+                wave_root = relative.rsplit("/", 1)[0]
+                if wave_root + "/closed-failure.json" in documents:
+                    try:
+                        _verify_wave(root / wave_root, closed_failure=True)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        issues.append({"kind": "invalid-closed-failure", "path": wave_root})
+                else:
+                    pending.append(wave_root)
     for relative in documents:
         if relative == "memory.jsonl" or relative.endswith("/memory.jsonl"):
             for memory in documents[relative]:
