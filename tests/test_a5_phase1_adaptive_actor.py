@@ -275,6 +275,22 @@ def test_exhausted_mismatch_never_distills_or_returns_publishable_memory(tmp_pat
     assert actor.distill_calls == []
 
 
+@pytest.mark.parametrize("source, classification", [
+    ("still broken", "host-mismatch"), ("compile failure", "compile-failure"),
+    ("runtime failure", "runtime-failure"),
+])
+def test_phase2_retains_semantic_failure_without_distilling(tmp_path, source, classification):
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = ScriptedActor((json.dumps({"write": {"slot": "kernel", "content": source}}),
+                           '{"run":{}}', '{"submit":{}}'))
+    result = AdaptiveActorProjectExecutor(executor, actor, object(),
+                                         retain_semantic_failure=True)(_request(tmp_path, executor))
+    assert result.evidence.classification.value == classification
+    assert not result.evidence.verified
+    assert result.memory.no_new_knowledge
+    assert actor.distill_calls == []
+
+
 def test_adapter_fails_closed_when_request_materialization_differs(tmp_path):
     executor = ProjectExecutor(
         SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl")

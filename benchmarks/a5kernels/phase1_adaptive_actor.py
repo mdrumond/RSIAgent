@@ -434,6 +434,7 @@ class AdaptiveActorProjectExecutor:
         request_diagnostic: ActionDependency | None = None,
         immutable_context: bytes = b"",
         diagnostic_instructions: str | None = None,
+        retain_semantic_failure: bool = False,
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
@@ -466,6 +467,7 @@ class AdaptiveActorProjectExecutor:
         )
         self.immutable_context = immutable_context
         self.diagnostic_instructions = diagnostic_instructions
+        self.retain_semantic_failure = retain_semantic_failure
         if not all(callable(action) for action in (
             self.query_knowledge, self.request_profile, self.request_timing,
             self.request_diagnostic,
@@ -524,6 +526,25 @@ class AdaptiveActorProjectExecutor:
             turn_parser=parse_trial_action, action_executor=actions,
         )
         result = actions.latest
+        if (self.retain_semantic_failure and result is not None
+                and not result.evidence.verified
+                and actions.latest_source_sha256 == actions.source_sha256):
+            # Retain host facts for selection, never distill or publish failed
+            # candidates as successful knowledge. Infrastructure exceptions
+            # escape the action loop before reaching this branch.
+            memory = Phase1ProjectMemory(
+                request.spec, actions.source_sha256, tuple(actions.actions),
+                (*actions.host_facts, HostFact("diagnostic", result.evidence.detail,
+                                              result.artifact_sha256["classification"])),
+                no_new_knowledge=True,
+                admitted_artifact_sha256=tuple(sorted(actions.admitted)),
+                artifact_store="artifacts",
+            )
+            return AdaptiveProjectResult(memory, result.evidence, canonical_bytes({
+                "classification": result.evidence.classification.value,
+                "detail": result.evidence.detail, "source_sha256": actions.source_sha256,
+                "artifacts": dict(result.artifact_sha256),
+            }), result.evidence.detail.strip() or "Host execution failed")
         if (
             not isinstance(outcome, ActorOutcome)
             or outcome.status != "host-verified"

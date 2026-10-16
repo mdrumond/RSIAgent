@@ -287,13 +287,18 @@ def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes, profiling_guidance_te
     })
 
 
-def _bind_campaign_identity(root: Path, cell: A5Phase1Cell) -> None:
+def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=None) -> None:
     root = Path(root)
     path = root / "campaign-identity.json"
-    expected = canonical_bytes({
+    identity = {
         "schema": _CAMPAIGN_IDENTITY_SCHEMA,
         "cell": cell.as_dict(),
-    }) + b"\n"
+    }
+    if reviewed_snapshot is not None:
+        reviewed_snapshot.verify()
+        identity.update(schema="ascend-catlass-adaptive-phase2-identity-v1",
+                        phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
+    expected = canonical_bytes(identity) + b"\n"
     try:
         root.mkdir(parents=True, exist_ok=True)
         if not path.exists() and (root / "state.json").exists():
@@ -329,6 +334,7 @@ def build_adaptive_phase1(
     project_target: int | None = None,
     max_projects: int | None = None,
     profiling_guidance_text: str | None = None,
+    reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 
@@ -340,7 +346,7 @@ def build_adaptive_phase1(
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
     actor_context = _actor_context(admitted, guide_bytes, profiling_guidance_text)
-    _bind_campaign_identity(paths.root, admitted)
+    _bind_campaign_identity(paths.root, admitted, reviewed_snapshot)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
             raise ValueError("KDB-off treatment must not receive KDB dependencies")
@@ -390,6 +396,8 @@ def build_adaptive_phase1(
         max_parallel=max_parallel,
         project_target=project_target,
         max_projects=max_projects,
+        reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
+        trace_recorder_factory=trace_recorder_factory,
     )
     return AdaptivePhase1Production(
         admitted,

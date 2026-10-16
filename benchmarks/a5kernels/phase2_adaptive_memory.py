@@ -28,10 +28,14 @@ def _read(path):
 
 
 def _memory(state, initial):
+    terminal = state.get("terminal")
+    target = state.get("project_target")
+    target_complete = (terminal is None and type(target) is int and target > 0
+                       and len(state.get("prior_outcomes", [])) >= target)
     if (state.get("schema") != STATE_SCHEMA
             or state.get("initial_memory_sha256") != hashlib.sha256(initial).hexdigest()
-            or not state.get("terminal")
-            or state["terminal"].get("status") not in {"SATURATED", "PROJECT_LIMIT_REACHED"}):
+            or not (target_complete or terminal and terminal.get("status") in {
+                "SATURATED", "PROJECT_LIMIT_REACHED"})):
         raise ValueError("adaptive Phase 1 must be complete with matching initial memory")
     memories = tuple(base64.b64decode(value, validate=True)
                      for value in state["memory_bytes_base64"])
