@@ -101,6 +101,58 @@ def _report(target, remote_path, expected, origin, store):
     return descriptor
 
 
+def _verify_wave(root):
+    from benchmarks.a5kernels.phase1_curriculum import (
+        WaveSpec, ProjectOutcome, consolidate_wave,
+    )
+    read = lambda path: json.loads(path.read_bytes())
+    wave = WaveSpec.from_mapping(read(root / "plan.json")["wave"])
+    publication = read(root / "published.json")
+    outcomes = []
+    for assignment in wave.assignments():
+        branch = root / "branches" / assignment.project_id
+        outcome = read(branch / "outcome.json")
+        if (outcome["wave_fingerprint"] != wave.fingerprint
+                or outcome["project_id"] != assignment.project_id
+                or outcome["authored_ordinal"] != assignment.authored_ordinal
+                or outcome["pre_wave_memory_sha256"] != wave.pre_wave_memory_sha256
+                or outcome["verified"] is not True
+                or outcome["classification"] != "host-verified"):
+            raise ValueError("branch differs from committed wave")
+        for name, field in (("memory-delta.bin", "memory_delta_sha256"),
+                            ("execution-evidence.bin", "evidence_sha256")):
+            if _sha((branch / name).read_bytes()) != outcome[field]:
+                raise ValueError("committed branch digest mismatch")
+        outcomes.append(ProjectOutcome(assignment.project_id, outcome["memory_delta_sha256"],
+                                       wave.fingerprint, assignment.authored_ordinal, True))
+    consolidation = consolidate_wave(wave, tuple(outcomes))
+    from dataclasses import asdict
+    if (publication["wave_id"] != wave.wave_id
+            or publication["wave_fingerprint"] != wave.fingerprint
+            or publication["pre_wave_memory_sha256"] != wave.pre_wave_memory_sha256
+            or publication["commits"] != [asdict(c) for c in consolidation.commits]
+            or publication["consolidated_memory_sha256"] != _sha(
+                (root / "consolidated-memory.json").read_bytes())):
+        raise ValueError("publication differs from retained committed evidence")
+
+
+def _verify_memory_attempt(root, relative, memory):
+    parent = Path(relative).parent / "attempts" / f"attempt-{memory['attempt']:02d}"
+    attempt = json.loads((root / parent / "attempt.json").read_bytes())
+    evidence = json.loads((root / parent / "evidence.json").read_bytes())
+    source = next(root / parent / name for name in ("candidate.py", "candidate.cpp")
+                  if (root / parent / name).is_file())
+    for record, field in ((attempt, "attempt_sha256"), (evidence, "evidence_sha256")):
+        if record[field] != _sha(_json({k: v for k, v in record.items() if k != field})):
+            raise ValueError("committed attempt record digest mismatch")
+    if (memory["attempt_identity_sha256"] != attempt["attempt_sha256"]
+            or memory["evidence_sha256"] != evidence["evidence_sha256"]
+            or memory["candidate_sha256"] != evidence["candidate_sha256"]
+            or memory["candidate_sha256"] != _sha(source.read_bytes())
+            or memory["passed"] is not evidence["passed"]):
+        raise ValueError("committed memory differs from retained attempt")
+
+
 def inventory_campaign(root, *, artifact_store=None):
     """Inventory every retained attempt, CAS object and measurement without writes.
 
@@ -176,11 +228,24 @@ def inventory_campaign(root, *, artifact_store=None):
     for wave in state.get("completed_waves", []):
         if f"waves/{wave}/published.json" not in documents:
             issues.append({"kind": "missing-wave-publication", "wave": wave})
+        else:
+            try:
+                _verify_wave(root / "waves" / wave)
+            except (OSError, ValueError, KeyError, TypeError):
+                issues.append({"kind": "invalid-wave-publication", "wave": wave})
     for relative in documents:
         if relative.startswith("waves/") and relative.endswith("/plan.json"):
             if relative.split("/")[1] not in state.get("completed_waves", []):
                 pending.append(relative.rsplit("/", 1)[0])
     for relative in documents:
+        if relative == "memory.jsonl" or relative.endswith("/memory.jsonl"):
+            for memory in documents[relative]:
+                if "attempt_identity_sha256" in memory:
+                    try:
+                        _verify_memory_attempt(root, relative, memory)
+                    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+                        issues.append({"kind": "missing-or-corrupt-committed-attempt",
+                                       "origin": relative, "attempt": memory.get("attempt")})
         if relative.endswith("attempt.json"):
             parent = relative.rsplit("/", 1)[0]
             cell = parent.split("/attempts/", 1)[0] if "/attempts/" in parent else ""
