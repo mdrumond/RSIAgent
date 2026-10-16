@@ -409,16 +409,28 @@ def test_exhausted_mismatch_never_distills_or_returns_publishable_memory(tmp_pat
     ("still broken", "host-mismatch"), ("compile failure", "compile-failure"),
     ("runtime failure", "runtime-failure"),
 ])
-def test_phase2_retains_semantic_failure_without_distilling(tmp_path, source, classification):
+@pytest.mark.parametrize("traced", [False, True])
+def test_phase2_retains_semantic_failure_without_distilling(tmp_path, source, classification, traced):
     executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
-    actor = ScriptedActor((json.dumps({"write": {"slot": "kernel", "content": source}}),
+    actor = (TracedScriptedActor if traced else ScriptedActor)((json.dumps({"write": {"slot": "kernel", "content": source}}),
                            '{"run":{}}', '{"submit":{}}'))
+    factory = None
+    if traced:
+        from benchmarks.ascend.training_traces import recorder_factory
+        factory = recorder_factory(phase="phase2", round_id="semantic-failure", model="fixture",
+                                   source_manifest_sha256="a" * 64)
+    request = _request(tmp_path, executor)
     result = AdaptiveActorProjectExecutor(executor, actor, object(),
-                                         retain_semantic_failure=True)(_request(tmp_path, executor))
+        trace_recorder_factory=factory, retain_semantic_failure=True)(request)
     assert result.evidence.classification.value == classification
     assert not result.evidence.verified
     assert result.memory.no_new_knowledge
     assert actor.distill_calls == []
+    if traced:
+        from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+        rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+        assert _example(rows) is None
+        assert any(row["kind"] == "validation" for row in rows)
 
 
 def test_adapter_fails_closed_when_request_materialization_differs(tmp_path):

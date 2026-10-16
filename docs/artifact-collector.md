@@ -26,6 +26,9 @@ the annex digest must match before atomic publication as `ARTIFACT_STORE/ID/`.
 Queue state, partial data, and the latest transport response survive restarts.
 Reports missing a target or remote path remain `incomplete-descriptor` in the
 queue for inspection while valid reports continue to transfer.
+Each inventory refresh also requeues completed entries whose local tree or
+receipt is missing or corrupt, repairing receipts from retained verified queue
+provenance and downloading raw trees again when needed.
 Completed trees that fail verification are retained under `.corrupt-*` names,
 allowing the next attempt to start with a clean tree.
 There is one transfer at a time, including across overlapping worker launches.

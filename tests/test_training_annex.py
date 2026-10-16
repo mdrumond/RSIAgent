@@ -87,20 +87,24 @@ def test_pending_requires_explicit_checkpoint_and_never_overwrites(campaign, tmp
         package_campaign(campaign, campaign / "archive.tar.gz", allow_pending=True)
 
 
-def test_raw_report_descriptor_and_verified_package(campaign, tmp_path):
+@pytest.mark.parametrize("direct_digest", [True, False])
+def test_raw_report_descriptor_and_verified_package(campaign, tmp_path, direct_digest):
     store = tmp_path / "reports"
     raw = tmp_path / "raw"
     raw.mkdir()
     (raw / "summary.csv").write_text("metric,value\npipe,3\n")
     digest = report_digest(raw)
     record = {"evidence": {"profile": "registry-target", "remote_report": "/runtime/report"},
-              "result": {"summary": {"report_sha256": digest}}}
+              "result": ({"report_sha256": digest} if direct_digest else
+                         {"summary": {"report_sha256": digest}})}
     write(campaign, "measurements/run/record.json", record)
     manifest = inventory_campaign(campaign, artifact_store=store)
     report = manifest["remote_reports"][0]
     assert report["target"] == "registry-target"
     assert report["record_origin"] == "measurements/run/record.json"
     assert report["status"] == "missing"
+    assert report["expected_sha256"] == digest
+    assert report["digest_origin"] == "capture-time"
     store.mkdir()
     raw.rename(store / report["id"])
     manifest = package_campaign(campaign, tmp_path / "raw.tar.gz", artifact_store=store)
@@ -251,3 +255,74 @@ def test_a5_cas_capture_uses_collection_receipt_not_compact_archive_hash(campaig
     receipt["source_sha256"] = "b" * 64
     write(store, report["id"] + ".receipt.json", receipt)
     assert inventory_campaign(campaign, artifact_store=store)["remote_reports"][0]["status"] == "digest-unavailable"
+
+
+@pytest.mark.parametrize("field,name", [
+    ("phase1_memory_sha256", "phase1-memory.jsonl"),
+    ("phase1_terminal_sha256", "phase1-terminal.json"),
+])
+@pytest.mark.parametrize("mutation", ["remove", "corrupt"])
+def test_native_and_standard_snapshot_explicit_digests(campaign, field, name, mutation):
+    snapshot = campaign / "cells/cell/snapshot"
+    memory = write(snapshot, "phase1-memory.jsonl", {"lesson": "retained"})
+    terminal = write(snapshot, "phase1-terminal.json", {"status": "complete"})
+    write(snapshot, "snapshot.json", {
+        "phase1_memory_sha256": hashlib.sha256(memory.read_bytes()).hexdigest(),
+        "phase1_terminal_sha256": hashlib.sha256(terminal.read_bytes()).hexdigest()})
+    assert inventory_campaign(campaign)["complete"]
+    if mutation == "remove":
+        (snapshot / name).unlink()
+    else:
+        (snapshot / name).write_text("changed retained snapshot bytes")
+    assert {"kind": "missing-or-corrupt-snapshot-file", "path": name} in inventory_campaign(campaign)["issues"]
+    with pytest.raises(ValueError, match="incomplete"):
+        package_campaign(campaign, campaign.parent / "corrupt-snapshot.tar.gz")
+
+
+def test_report_digest_rejects_directory_symlinks(tmp_path):
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    (raw / "metric.csv").write_text("retained")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "omitted.csv").write_text("must not be silently omitted")
+    (raw / "linked-directory").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        report_digest(raw)
+
+
+@pytest.mark.parametrize("mutation", [None, "missing-marker", "corrupt-marker", "missing-evidence", "corrupt-evidence", "pending"])
+def test_closed_failure_wave_is_complete_only_with_authenticated_evidence(campaign, tmp_path, mutation):
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
+    from benchmarks.a5kernels.phase1_project import ExecutionEvidence, EvidenceClassification
+
+    plan = json.loads((campaign / "waves/wave-001/plan.json").read_text())["wave"]
+    plan["wave_id"] = "wave-002"
+    wave = WaveSpec.from_mapping(plan)
+    failed = campaign / "waves/wave-002"
+    with pytest.raises(RuntimeError, match="not verified"):
+        LiveWaveCoordinator(failed, wave, b"initial", lambda _: WaveProjectResult(
+            b"retained failed experiment", ExecutionEvidence(EvidenceClassification.HOST_MISMATCH, "mismatch"),
+            b'{"host":"mismatch"}'), 1).run()
+    outcome = failed / "branches/project/outcome.json"
+    marker = write(failed, "closed-failure.json", {"wave_fingerprint": wave.fingerprint,
+        "outcome_sha256": hashlib.sha256(outcome.read_bytes()).hexdigest()})
+    evidence = failed / "branches/project/execution-evidence.bin"
+    if mutation == "missing-marker":
+        marker.unlink()
+    elif mutation == "corrupt-marker":
+        write(failed, "closed-failure.json", {"wave_fingerprint": wave.fingerprint, "outcome_sha256": "bad"})
+    elif mutation == "missing-evidence":
+        evidence.unlink()
+    elif mutation == "corrupt-evidence":
+        evidence.write_bytes(b"changed")
+    elif mutation == "pending":
+        write(campaign, "pending.json", {"wave_id": "wave-002"})
+    assert inventory_campaign(campaign)["complete"] is (mutation is None)
+    target = tmp_path / "failure.tar.gz"
+    if mutation:
+        with pytest.raises(ValueError, match="incomplete"):
+            package_campaign(campaign, target)
+    else:
+        assert package_campaign(campaign, target)["package_kind"] == "complete"

@@ -75,7 +75,9 @@ The builder accepts only a terminal host pass. A repair trace is eligible only
 when its final candidate passes. Earlier assistant turns receive `weight: 0`;
 the terminal verified source receives `weight: 1`. The Fireworks rows preserve
 the declared top-level `tools` and optional `reasoning_content`. Exact and
-formatting/comment-only candidate duplicates are removed, then each operator
+formatting/comment-only Python candidate duplicates are removed. Native sources
+with preprocessor directives or Ascend C markers use exact-source deduplication,
+preserving directive values, case and distinct near-identical kernels. Each operator
 family is deterministically split 90/10. `manifest.json` binds split hashes,
 phase/model/source-manifest provenance, counts, stable repair-pattern IDs, and
 validation evidence. A build rejects mixed source-manifest revisions; phases

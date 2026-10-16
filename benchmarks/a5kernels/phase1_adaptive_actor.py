@@ -436,6 +436,7 @@ class AdaptiveActorProjectExecutor:
         diagnostic_instructions: str | None = None,
         trace_recorder_factory=None,
         retain_semantic_failure: bool = False,
+        trace_recorder_factory=None,
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
@@ -470,6 +471,7 @@ class AdaptiveActorProjectExecutor:
         self.diagnostic_instructions = diagnostic_instructions
         self.trace_recorder_factory = trace_recorder_factory
         self.retain_semantic_failure = retain_semantic_failure
+        self.trace_recorder_factory = trace_recorder_factory
         if not all(callable(action) for action in (
             self.query_knowledge, self.request_profile, self.request_timing,
             self.request_diagnostic,

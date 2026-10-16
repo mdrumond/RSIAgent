@@ -1,6 +1,7 @@
 """Fresh-project adaptation and durable continuation across both phases."""
 import base64
 import json
+import hashlib
 from dataclasses import replace
 from copy import deepcopy
 from types import SimpleNamespace
@@ -47,6 +48,17 @@ def test_failed_project_focus_stays_in_selector_but_does_not_close_coverage_gaps
     report = coordinator.run()
     assert report["failed_projects"] == 1
     assert report["successful_projects"] == 0
+    failed_wave = tmp_path / "waves" / "wave-001"
+    plan = json.loads((failed_wave / "plan.json").read_bytes())
+    raw_outcome = (failed_wave / "branches" / "phase2-1" / "outcome.json").read_bytes()
+    assert json.loads((failed_wave / "closed-failure.json").read_bytes()) == {
+        "wave_fingerprint": plan["wave_fingerprint"],
+        "outcome_sha256": hashlib.sha256(raw_outcome).hexdigest(),
+    }
+    assert json.loads(raw_outcome)["verified"] is False
+    assert json.loads(raw_outcome)["classification"] == "host-mismatch"
+    assert not (failed_wave / "published.json").exists()
+    assert not (tmp_path / "pending.json").exists()
     assert {"tool-msprof", "pipe-vector"} <= set(report["coverage_gaps"])
     prior = contexts[1]["prior_outcomes"][-1]
     assert not prior["verified"]
@@ -130,9 +142,32 @@ def test_infrastructure_exception_keeps_exact_pending_project(tmp_path):
         coordinator.run()
     assert coordinator.report()["status"] == "RECOVERY_REQUIRED"
     assert coordinator.report()["failed_projects"] == 0
+    assert not list((tmp_path / "waves").glob("*/closed-failure.json"))
     assert coordinator.resume()["successful_projects"] == 1
+    assert not list((tmp_path / "waves").glob("*/closed-failure.json"))
     assert executions == ["phase2-1", "phase2-1"]
     assert len(selections) == 1
+
+
+def test_recovers_empty_state_after_interrupted_phase2_initialization(tmp_path):
+    coordinator = AdaptivePhase2Coordinator(
+        tmp_path, "Learn", snapshot(),
+        CurriculumAgent(lambda messages: _wave(messages[-1]["content"], [project(1)])),
+        lambda req: _result(req.spec, True, "pass"), project_target=1)
+    intermediate = AdaptivePhase1Coordinator._load_state(coordinator)
+    assert "phase" not in intermediate
+    assert coordinator.resume()["successful_projects"] == 1
+    assert json.loads((tmp_path / "state.json").read_bytes())["phase"] == "adaptive-phase2"
+
+
+def test_does_not_upgrade_nonempty_state_without_phase2_identity(tmp_path):
+    coordinator = AdaptivePhase2Coordinator(
+        tmp_path, "Learn", snapshot(), CurriculumAgent(lambda _: None), lambda _: None)
+    state = AdaptivePhase1Coordinator._load_state(coordinator)
+    state["session"] = {"messages": [{"role": "system", "content": "started"}], "turns": 0}
+    coordinator._atomic_json(tmp_path / "state.json", state)
+    with pytest.raises(ValueError, match="not an adaptive Phase 2 lineage"):
+        coordinator.resume()
 
 
 @pytest.mark.parametrize("phase2", [False, True])
