@@ -58,6 +58,21 @@ def test_optional_collector_start_failure_does_not_prevent_compute(tmp_path):
     assert calls == ["collector", "campaign"]
 
 
+@pytest.mark.parametrize("equals_form", [False, True])
+def test_collector_uses_same_native_transport_executable_as_compute(tmp_path, equals_form):
+    native = write(tmp_path / "native-config.json", {"cpl_remote": "/configured/transport/cpl-remote"})
+    arguments = [f"--config={native}"] if equals_form else ["--config", str(native)]
+    job = start(tmp_path, extra=["--model", "openai/gpt-5.6-sol", *arguments])
+    captured = []
+    class Downloader:
+        def __init__(self, *args, **kwargs):
+            captured.append(kwargs)
+        def collect_once(self):
+            return {"counts": {}}
+    cli.collector_worker(job, once=True, factory=Downloader)
+    assert captured == [{"cpl_remote": "/configured/transport/cpl-remote"}]
+
+
 def test_resume_does_not_extend_and_continue_is_explicit(tmp_path):
     job = start(tmp_path)
     control = Path(job["control"])

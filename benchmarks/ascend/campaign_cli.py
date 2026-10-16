@@ -150,7 +150,14 @@ def campaign_worker(job, *, builder=build_controller):
 def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time.sleep):
     """No dependency from compute to downloader, including unavailable transport."""
     control = Path(job["control"])
-    worker = factory(job["root"], control / "reports", control / "collector.json")
+    transport = {}
+    if job["target"] == "a3":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--config", type=Path)
+        native, _ = parser.parse_known_args(_read(job["config"])["phase1_arguments"])
+        if native.config is not None:
+            transport["cpl_remote"] = _read(native.config)["cpl_remote"]
+    worker = factory(job["root"], control / "reports", control / "collector.json", **transport)
     while True:
         try:
             result = worker.collect_once()
