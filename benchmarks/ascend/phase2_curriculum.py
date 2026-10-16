@@ -151,6 +151,14 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
             if outcome.verified:
                 state = self._publish(state, wave, pending, (delta,))
             else:
+                # This attempt is complete without a successful publication.
+                # Bind the closure to the authenticated raw branch outcome so
+                # archival can distinguish semantic failure from pending work.
+                outcome_path = runner.root / "branches" / project.project_id / "outcome.json"
+                self._atomic_json(runner.root / "closed-failure.json", {
+                    "wave_fingerprint": wave.fingerprint,
+                    "outcome_sha256": hashlib.sha256(outcome_path.read_bytes()).hexdigest(),
+                })
                 state = {**state, "wave_index": state["wave_index"] + 1,
                          "session": pending["session"], "failed_outcomes": [
                              *state["failed_outcomes"], {

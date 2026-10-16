@@ -1,6 +1,7 @@
 """Fresh-project adaptation and durable continuation across both phases."""
 import base64
 import json
+import hashlib
 from dataclasses import replace
 from copy import deepcopy
 from types import SimpleNamespace
@@ -47,6 +48,17 @@ def test_failed_project_focus_stays_in_selector_but_does_not_close_coverage_gaps
     report = coordinator.run()
     assert report["failed_projects"] == 1
     assert report["successful_projects"] == 0
+    failed_wave = tmp_path / "waves" / "wave-001"
+    plan = json.loads((failed_wave / "plan.json").read_bytes())
+    raw_outcome = (failed_wave / "branches" / "phase2-1" / "outcome.json").read_bytes()
+    assert json.loads((failed_wave / "closed-failure.json").read_bytes()) == {
+        "wave_fingerprint": plan["wave_fingerprint"],
+        "outcome_sha256": hashlib.sha256(raw_outcome).hexdigest(),
+    }
+    assert json.loads(raw_outcome)["verified"] is False
+    assert json.loads(raw_outcome)["classification"] == "host-mismatch"
+    assert not (failed_wave / "published.json").exists()
+    assert not (tmp_path / "pending.json").exists()
     assert {"tool-msprof", "pipe-vector"} <= set(report["coverage_gaps"])
     prior = contexts[1]["prior_outcomes"][-1]
     assert not prior["verified"]
@@ -130,7 +142,9 @@ def test_infrastructure_exception_keeps_exact_pending_project(tmp_path):
         coordinator.run()
     assert coordinator.report()["status"] == "RECOVERY_REQUIRED"
     assert coordinator.report()["failed_projects"] == 0
+    assert not list((tmp_path / "waves").glob("*/closed-failure.json"))
     assert coordinator.resume()["successful_projects"] == 1
+    assert not list((tmp_path / "waves").glob("*/closed-failure.json"))
     assert executions == ["phase2-1", "phase2-1"]
     assert len(selections) == 1
 
