@@ -380,6 +380,9 @@ def test_source_digest_rejects_directory_symlink(tmp_path):
     (report / "linked-directory").symlink_to(external, target_is_directory=True)
     with pytest.raises(RuntimeError, match="symlink"):
         exec(compile(_SOURCE_DIGEST.replace("SOURCE_PATH", repr(str(report))), "hash-payload", "exec"))
+    linked_root = report / "linked-directory"
+    with pytest.raises(RuntimeError, match="symlink"):
+        exec(compile(_SOURCE_DIGEST.replace("SOURCE_PATH", repr(str(linked_root))), "hash-payload", "exec"))
 
 
 @pytest.mark.parametrize("persisted", [False, True])
