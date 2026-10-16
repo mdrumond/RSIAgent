@@ -393,6 +393,7 @@ def build_adaptive_phase1(
         request_diagnostic=diagnostic_action(backend),
         immutable_context=actor_context,
         profiling_guidance=profiling_guidance_text,
+        trace_recorder_factory=trace_recorder_factory,
         max_parallel=max_parallel,
         project_target=project_target,
         max_projects=max_projects,

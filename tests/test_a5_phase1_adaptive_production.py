@@ -222,6 +222,17 @@ def test_phase2_factory_pins_seed_and_uses_distinct_identity(tmp_path):
         _build(tmp_path, _cell(), reviewed_snapshot=snapshot("changed-review"))
 
 
+def test_public_a5_builder_forwards_optional_trace_recorder_factory(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+
+    factory = recorder_factory(phase="phase1", round_id="builder-round",
+                               model="fixture", source_manifest_sha256="a" * 64)
+    campaign = _build(tmp_path, _cell(), trace_recorder_factory=factory)
+    assert campaign.project_actor.trace_recorder_factory is factory
+    assert campaign.coordinator.execute_project.trace_recorder_factory is factory
+    assert _build(tmp_path / "legacy", _cell()).project_actor.trace_recorder_factory is None
+
+
 def test_selected_model_uses_its_registered_direct_provider_route(tmp_path):
     calls = []
 

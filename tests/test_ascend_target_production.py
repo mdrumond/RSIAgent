@@ -101,6 +101,12 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, select
         assert identity["phase"] == "adaptive-phase2"
         assert identity["snapshot_id"] == "reviewed-seed"
     assert build_native_adaptive_phase1(**kwargs).project_target == 64
+    from benchmarks.ascend.training_traces import recorder_factory
+    factory = recorder_factory(phase="phase1", round_id="native-builder-round",
+                               model="fixture", source_manifest_sha256="b" * 64)
+    traced = build_native_adaptive_phase1(**kwargs, trace_recorder_factory=factory)
+    assert traced.execute_project.trace_recorder_factory is factory
+    assert controller.execute_project.trace_recorder_factory is None
     with pytest.raises(ValueError, match="different native target"):
         build_native_adaptive_phase1(**dict(kwargs, config=replace(config, arch="other")))
     with pytest.raises(ValueError, match="guide identity"):
