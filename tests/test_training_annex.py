@@ -151,3 +151,46 @@ def test_concurrent_mutation_aborts_archive(campaign, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="changed"):
         package_campaign(campaign, target)
     assert not target.exists()
+
+
+def test_a5_cas_capture_uses_collection_receipt_not_compact_archive_hash(campaign, tmp_path):
+    capture = {"capture": {"execution_id": "execution", "replay_id": "profile",
+                          "evidence": {"remote_tree": "/runtime/full-msprof",
+                                       "remote_tree_retained": True,
+                                       "archive_sha256": "a" * 64}},
+               "archive_encoding": "base64", "archive": "Y29tcGFjdA=="}
+    data = json.dumps(capture).encode()
+    digest = hashlib.sha256(data).hexdigest()
+    obj = campaign / "artifacts/objects" / digest[:2] / digest[2:]
+    obj.parent.mkdir(parents=True)
+    obj.write_bytes(data)
+    write(campaign, "measurements/inline/record.json", {"payload": capture})
+    store = tmp_path / "raw-store"
+    result = inventory_campaign(campaign, artifact_store=store)
+    report = result["remote_reports"][0]
+    assert len(result["remote_reports"]) == 2
+    assert result["remote_reports"][1]["id"] == report["id"]
+    assert report["target"] == "test-profile"
+    assert report["expected_sha256"] is None
+    assert report["status"] == "digest-unavailable"
+    raw = store / report["id"]
+    raw.mkdir(parents=True)
+    (raw / "full.csv").write_text("full raw report")
+    raw_digest = report_digest(raw)
+    receipt = {"descriptor_id": report["id"], "source_sha256": raw_digest,
+               "downloaded_sha256": raw_digest, "digest_origin": "collection-time"}
+    write(store, report["id"] + ".receipt.json", receipt)
+    collected = inventory_campaign(campaign, artifact_store=store)["remote_reports"][0]
+    assert collected["id"] == report["id"]
+    assert collected["expected_sha256"] is None
+    assert collected["resolved_sha256"] == raw_digest
+    assert collected["digest_origin"] == "collection-time"
+    assert collected["status"] == "available"
+    target = tmp_path / "a5.tar.gz"
+    package_campaign(campaign, target, artifact_store=store)
+    with tarfile.open(target) as archive:
+        assert json.load(archive.extractfile("reports/" + report["id"] + ".receipt.json")) == receipt
+        assert archive.getnames().count("reports/" + report["id"] + "/full.csv") == 1
+    receipt["source_sha256"] = "b" * 64
+    write(store, report["id"] + ".receipt.json", receipt)
+    assert inventory_campaign(campaign, artifact_store=store)["remote_reports"][0]["status"] == "digest-unavailable"
