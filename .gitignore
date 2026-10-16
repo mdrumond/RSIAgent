@@ -37,3 +37,8 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Pi microbenchmark: private connection state, generated scripts, and sessions
+.codex/local/
+node_modules/
+.pi/

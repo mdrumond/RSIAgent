@@ -1,0 +1,12 @@
+{
+  "name": "rsi-pi-coding-microbenchmark",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Pinned optional Pi runtime for the RSI coding microbenchmark",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.3.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

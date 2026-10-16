@@ -508,6 +508,7 @@ experiments with the pinned configuration.
 ## 📚 Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
+- [Pi versus RSI coding microbenchmark](docs/PI_CODING_EVALUATION.md)
 - [OSWorld operations and recovery](docs/OPERATIONS.md)
 - [ALE setup, batches, and reports](docs/ALE.md)
 - [Ascend campaign launcher](docs/ascend-campaigns.md) · [Target/runtime setup](docs/ascend-target-launcher.md)
