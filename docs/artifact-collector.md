@@ -24,6 +24,8 @@ entry. Downloads use only the installed user-wide `cpl-remote --json` interface,
 with stderr retained separately. Each transfer writes to a stable partial tree;
 the annex digest must match before atomic publication as `ARTIFACT_STORE/ID/`.
 Queue state, partial data, and the latest transport response survive restarts.
+Reports missing a target or remote path remain `incomplete-descriptor` in the
+queue for inspection while valid reports continue to transfer.
 Completed trees that fail verification are retained under `.corrupt-*` names,
 allowing the next attempt to start with a clean tree.
 There is one transfer at a time, including across overlapping worker launches.

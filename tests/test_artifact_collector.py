@@ -334,3 +334,21 @@ def test_historical_a5_collector_receipt_accepted_by_annex(setup, monkeypatch):
     assert report["expected_sha256"] is None
     assert report["resolved_sha256"] == source_digest
     assert report["digest_origin"] == "collection-time"
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_incomplete_descriptor_does_not_starve_valid_queue(setup, monkeypatch, persisted):
+    worker, descriptor, responses, calls, _ = setup
+    incomplete = dict(descriptor, id="b" * 64, target=None, status="incomplete-descriptor")
+    monkeypatch.setattr("benchmarks.ascend.training_annex.inventory_campaign",
+                        lambda *args, **kwargs: {"remote_reports": [incomplete, descriptor]})
+    if persisted:
+        # Repair queues created before incomplete descriptors were deferred.
+        worker._save({"entries": {incomplete["id"]: dict(incomplete, status="pending")}})
+    responses.append("success")
+    status = worker.collect_once(now=1)
+    assert status["counts"] == {"incomplete-descriptor": 1, "complete": 1}
+    assert len(calls) == 1
+    assert calls[0][3] == descriptor["target"]
+    state = json.loads(worker.path.read_text())
+    assert state["entries"][incomplete["id"]]["status"] == "incomplete-descriptor"

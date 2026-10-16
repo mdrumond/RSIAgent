@@ -82,6 +82,11 @@ class ArtifactCollector:
             temporary.replace(receipt)
         entry.update(status="complete", handle=None, error=None)
 
+    @staticmethod
+    def _descriptor_complete(entry):
+        return all(isinstance(entry.get(key), str) and entry[key].strip()
+                   for key in ("target", "remote_path"))
+
     def _result(self, state, entry, response, now):
         handle = response.get("handle")
         if handle:
@@ -244,6 +249,11 @@ class ArtifactCollector:
             low_disk = shutil.disk_usage(self.store).free < self.floor
             if not low_disk:
                 for entry in entries.values():
+                    if not self._descriptor_complete(entry):
+                        entry.update(status="incomplete-descriptor",
+                                     error="report target and remote_path must be nonempty strings")
+                        self._save(state)
+                        continue
                     if entry["status"] in {"complete", "uncertain"}:
                         continue
                     if entry.get("next_retry", 0) > now:
