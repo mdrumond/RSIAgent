@@ -7,12 +7,29 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import time
 
 from benchmarks.ascend.training_annex import report_digest
 
+
+_SOURCE_DIGEST = '''#!/usr/bin/env python3
+import hashlib, json
+from pathlib import Path
+root = Path(SOURCE_PATH)
+files = sorted(p for p in root.rglob("*") if p.is_file())
+if not files:
+    raise RuntimeError("empty raw report")
+digest = hashlib.sha256()
+for path in files:
+    if path.is_symlink():
+        raise RuntimeError("report contains symlink")
+    digest.update(path.relative_to(root).as_posix().encode() + b"\\0")
+    digest.update(hashlib.sha256(path.read_bytes()).digest())
+print(json.dumps({"source_sha256": digest.hexdigest()}))
+'''
 
 
 class ArtifactCollector:
@@ -54,6 +71,17 @@ class ArtifactCollector:
         if deferred:
             entry["attempts"] = 0
 
+    def _complete(self, entry):
+        if entry.get("digest_origin") == "collection-time":
+            receipt = self.store / (entry["id"] + ".receipt.json")
+            temporary = receipt.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"descriptor_id": entry["id"],
+                                            "source_sha256": entry["expected_sha256"],
+                                            "downloaded_sha256": entry["expected_sha256"],
+                                            "digest_origin": "collection-time"}))
+            temporary.replace(receipt)
+        entry.update(status="complete", handle=None, error=None)
+
     def _result(self, state, entry, response, now):
         handle = response.get("handle")
         if handle:
@@ -61,6 +89,32 @@ class ArtifactCollector:
         status = response.get("state")
         operation = entry["operation"]
         entry["operation"] = None
+        if operation.startswith("hash-"):
+            if handle:
+                entry["source_hash_handle"] = handle
+            if status in {"failed", "cancelled"}:
+                self._retry(entry, now, "source digest job " + status)
+            elif status == "completed" and operation == "hash-logs":
+                try:
+                    digest = json.loads(response["content"])["source_sha256"]
+                    if not isinstance(digest, str) or not re.fullmatch("[0-9a-f]{64}", digest):
+                        raise ValueError("invalid source digest")
+                except (KeyError, TypeError, ValueError) as error:
+                    retained = entry.get("handle")
+                    self._retry(entry, now, str(error))
+                    if retained:
+                        entry.update(status="hash-logs", handle=retained)
+                else:
+                    entry.update(expected_sha256=digest, digest_origin="collection-time",
+                                 status="pending", handle=None, next_retry=now)
+            elif status == "completed":
+                entry["status"] = "hash-logs" if entry.get("handle") else "uncertain"
+            elif entry.get("handle"):
+                entry.update(status="hash-observe", next_retry=now + 120)
+            else:
+                entry.update(status="uncertain", error="source digest job handle unavailable")
+            self._save(state)
+            return
         if status in {"failed", "cancelled"}:
             self._retry(entry, now, status)
         elif status == "completed":
@@ -74,7 +128,7 @@ class ArtifactCollector:
                     valid = False
                 if valid:
                     staging.replace(self.store / entry["id"])
-                    entry.update(status="complete", handle=None, error=None)
+                    self._complete(entry)
                 else:
                     # A completed but corrupt tree must not poison later fetches.
                     # Keep it for diagnosis; interrupted native partials stay put.
@@ -107,9 +161,17 @@ class ArtifactCollector:
                 return
         staging = self.store / (".partial-" + entry["id"])
         staging.mkdir(exist_ok=True)
-        operation = entry["status"] if entry["status"] in {"observe", "fetch"} else "download"
-        args = [self.command, "--json", operation]
-        if operation == "download":
+        operation = entry["status"] if entry["status"] in {
+            "observe", "fetch", "hash-observe", "hash-logs"} else "download"
+        if not entry.get("expected_sha256") and operation == "download":
+            operation = "hash-submit"
+        action = {"hash-submit": "run", "hash-observe": "observe", "hash-logs": "logs"}.get(operation, operation)
+        args = [self.command, "--json", action]
+        if operation == "hash-submit":
+            script = self.path.parent / (self.path.name + ".source-digest.py")
+            script.write_text(_SOURCE_DIGEST.replace("SOURCE_PATH", repr(entry["remote_path"])))
+            args += [entry["target"], "--file", str(script)]
+        elif operation == "download":
             args += [entry["target"], entry["remote_path"].rstrip("/") + "/",
                      str(staging), "--timeout", "120"]
         elif operation == "fetch":
@@ -132,7 +194,7 @@ class ArtifactCollector:
         except (OSError, ValueError) as error:
             if entry.get("handle"):
                 entry.update(status=operation, next_retry=now + 120, error=str(error))
-            elif entry.get("backend") == "ssh":
+            elif entry.get("backend") == "ssh" and operation == "download":
                 self._retry(entry, now, str(error))
             else:
                 entry.update(status="uncertain", error=str(error))
@@ -165,7 +227,7 @@ class ArtifactCollector:
                     except (OSError, ValueError):
                         if entry.get("handle"):
                             entry["status"] = entry["operation"]
-                        elif entry.get("backend") == "ssh":
+                        elif entry.get("backend") == "ssh" and entry["operation"] == "download":
                             self._retry(entry, now, "worker interrupted; resume native partial tree")
                         else:
                             entry["status"] = "uncertain"
@@ -173,7 +235,10 @@ class ArtifactCollector:
                 inventory = inventory_campaign(self.root, artifact_store=self.store)
                 for descriptor in inventory.get("remote_reports", []):
                     if descriptor["id"] not in entries:
-                        entries[descriptor["id"]] = dict(descriptor, status="pending", attempts=0)
+                        item = dict(descriptor, status="pending", attempts=0)
+                        if not item.get("expected_sha256") and item.get("resolved_sha256"):
+                            item["expected_sha256"] = item["resolved_sha256"]
+                        entries[descriptor["id"]] = item
                 state["next_discovery"] = now + 300
             self._save(state)
             low_disk = shutil.disk_usage(self.store).free < self.floor
@@ -191,10 +256,10 @@ class ArtifactCollector:
                         except (OSError, ValueError):
                             pass
                     if valid:
-                        entry["status"] = "complete"
+                        self._complete(entry)
                         self._save(state)
                     else:
-                        if destination.exists():
+                        if destination.exists() and entry.get("expected_sha256"):
                             destination.rename(self.store / (".corrupt-" + entry["id"] +
                                                              "-" + str(time.time_ns())))
                         self._transfer(state, entry, now)

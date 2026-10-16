@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.ascend.artifact_collector import ArtifactCollector, report_digest
+from benchmarks.ascend.artifact_collector import ArtifactCollector, _SOURCE_DIGEST, report_digest
+from benchmarks.ascend.training_annex import inventory_campaign
 
 
 @pytest.fixture
@@ -216,3 +217,120 @@ def test_digest_matches_relative_path_contract(tmp_path):
     (tmp_path / "x").write_bytes(b"payload")
     expected = hashlib.sha256(b"x\0" + hashlib.sha256(b"payload").digest()).hexdigest()
     assert report_digest(tmp_path) == expected
+
+
+def test_historical_a5_source_hash_handle_recovery_and_receipt(setup):
+    worker, descriptor, responses, calls, _ = setup
+    source_digest = descriptor["expected_sha256"]
+    descriptor["expected_sha256"] = None
+    job = "remote:configured-target:job:source-digest"
+    responses.extend([{"state": "running", "handle": job}, "disconnect",
+                      {"state": "completed", "handle": job}, "disconnect",
+                      {"state": "completed", "handle": job,
+                       "content": json.dumps({"source_sha256": source_digest})}, "success"])
+    worker.collect_once(now=1)
+    assert entry(worker)["source_hash_handle"] == job
+    # Submission runs only a stdlib hash script, never a device workload.
+    script = Path(calls[0][-1]).read_text()
+    assert "import hashlib, json" in script
+    assert "Path('/reports/raw')" in script
+    restarted = ArtifactCollector(worker.root, worker.store, worker.path,
+                                  cpl_remote="fake-cpl", free_floor_bytes=0)
+    restarted.collect_once(now=121)
+    restarted.collect_once(now=241)
+    restarted.collect_once(now=242)
+    restarted.collect_once(now=362)
+    restarted.collect_once(now=363)
+    assert [c[2] for c in calls] == ["run", "observe", "observe", "logs", "logs", "download"]
+    assert all(c[3] == job for c in calls[1:5])
+    assert entry(worker)["status"] == "complete"
+    receipt = json.loads((worker.store / (descriptor["id"] + ".receipt.json")).read_text())
+    assert receipt == {"descriptor_id": descriptor["id"], "source_sha256": source_digest,
+                       "downloaded_sha256": source_digest, "digest_origin": "collection-time"}
+    # Capture records remain unmodified: hydration belongs only to queue/receipt.
+    assert descriptor["expected_sha256"] is None
+
+
+def test_source_hash_uncertain_submission_never_resubmits_even_on_ssh(setup):
+    worker, descriptor, responses, calls, _ = setup
+    descriptor["expected_sha256"] = None
+    worker.floor = 10**30
+    worker.collect_once(now=1)
+    state = json.loads(worker.path.read_text())
+    item = next(iter(state["entries"].values()))
+    item["backend"] = "ssh"
+    worker._save(state)
+    worker.floor = 0
+    responses.append("disconnect")
+    worker.collect_once(now=2)
+    worker.collect_once(now=10000)
+    assert [c[2] for c in calls] == ["run"]
+    assert entry(worker)["status"] == "uncertain"
+
+
+def test_source_hash_inflight_journal_retains_job_handle(setup):
+    worker, descriptor, _, calls, _ = setup
+    descriptor["expected_sha256"] = None
+    worker.floor = 10**30
+    worker.collect_once(now=1)
+    state = json.loads(worker.path.read_text())
+    item = next(iter(state["entries"].values()))
+    item.update(status="inflight", operation="hash-submit")
+    worker._save(state)
+    job = "remote:configured-target:job:hash-recovered"
+    journal = worker.path.parent / (worker.path.name + ".transport.json")
+    journal.write_text(json.dumps({"state": "running", "handle": job}))
+    worker.collect_once(now=2)
+    assert entry(worker)["status"] == "hash-observe"
+    assert entry(worker)["source_hash_handle"] == job
+    assert calls == []
+
+
+def test_readonly_hash_payload_matches_report_digest(tmp_path, capsys):
+    source = tmp_path / "a 'quoted' report"
+    source.mkdir()
+    (source / "raw.csv").write_bytes(b"payload")
+    exec(compile(_SOURCE_DIGEST.replace("SOURCE_PATH", repr(str(source))), "hash-payload", "exec"))
+    assert json.loads(capsys.readouterr().out)["source_sha256"] == report_digest(source)
+    assert list(source.iterdir()) == [source / "raw.csv"]
+
+
+def test_historical_a5_receipt_recovers_without_hash_roundtrip(setup):
+    worker, descriptor, _, calls, _ = setup
+    digest = descriptor["expected_sha256"]
+    descriptor.update(expected_sha256=None, resolved_sha256=digest,
+                      digest_origin="collection-time")
+    destination = worker.store / descriptor["id"]
+    (destination / "subdir").mkdir(parents=True)
+    (destination / "subdir" / "raw.csv").write_text("raw profile")
+    assert worker.collect_once(now=1)["counts"] == {"complete": 1}
+    assert calls == []
+    assert json.loads((worker.store / (descriptor["id"] + ".receipt.json")).read_text())["source_sha256"] == digest
+
+
+def test_historical_a5_collector_receipt_accepted_by_annex(setup, monkeypatch):
+    worker, descriptor, responses, _, _ = setup
+    source_digest = descriptor["expected_sha256"]
+    (worker.root / "campaign-identity.json").write_text(json.dumps({"execution_profile": "configured-target"}))
+    retained = worker.root / "measurements" / "record.json"
+    retained.parent.mkdir()
+    retained.write_text(json.dumps({"capture": {"evidence": {
+        "remote_tree": "/reports/raw", "remote_tree_retained": True,
+        "archive_sha256": "b" * 64}}}))
+    monkeypatch.setattr("benchmarks.ascend.training_annex.inventory_campaign", inventory_campaign)
+    actual_descriptor = inventory_campaign(worker.root)["remote_reports"][0]
+    descriptor.clear()
+    descriptor.update(actual_descriptor)
+    job = "remote:configured-target:job:source-digest"
+    responses.extend([{"state": "completed", "handle": job},
+                      {"state": "completed", "handle": job,
+                       "content": json.dumps({"source_sha256": source_digest})}, "success"])
+    worker.collect_once(now=1)
+    worker.collect_once(now=2)
+    worker.collect_once(now=3)
+    report = inventory_campaign(worker.root, artifact_store=worker.store)["remote_reports"][0]
+    assert report["id"] == descriptor["id"]
+    assert report["status"] == "available"
+    assert report["expected_sha256"] is None
+    assert report["resolved_sha256"] == source_digest
+    assert report["digest_origin"] == "collection-time"

@@ -30,6 +30,17 @@ There is one transfer at a time, including across overlapping worker launches.
 Worker attempts back off 120 seconds; after three failures they defer 15 minutes.
 The registered transport may also apply its own native retry policy.
 
+Historical A5 raw trees sometimes have no capture-time digest. For these the
+worker first submits a read-only Python standard-library digest job through
+`cpl-remote run`, retains its job handle, and reads its result through the same
+handle's `observe` and `logs` operations. No NPU or compiler work is involved.
+After verified download it writes `ID.receipt.json` alongside the raw tree with
+`descriptor_id`, `source_sha256`, `downloaded_sha256`, and
+`digest_origin: collection-time`. This records collection-time integrity without
+claiming that a historical capture had its own digest. Reports with an existing
+capture-time digest need no hash job. Unknown job submissions remain uncertain
+even on SSH, since retained jobs can outlive the submitting client.
+
 Remote-agent handles are preserved across uncertain observations; completed
 handles are materialized using `fetch`, without submitting a replacement.
 The transfer subprocess inherits the worker lock, so a replacement worker waits
