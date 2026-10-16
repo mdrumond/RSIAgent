@@ -22,6 +22,7 @@ def compose_adaptive_controller(
     request_profile=None, request_timing=None, request_diagnostic=None,
     diagnostic_instructions=None,
     unavailable_capabilities=(),
+    trace_recorder_factory=None,
 ):
     """One action loop, curriculum and progressive-memory controller for both targets."""
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -33,6 +34,7 @@ def compose_adaptive_controller(
         request_profile=request_profile, request_timing=request_timing,
         request_diagnostic=request_diagnostic, immutable_context=immutable_context,
         diagnostic_instructions=diagnostic_instructions,
+        **({"trace_recorder_factory": trace_recorder_factory} if trace_recorder_factory is not None else {}),
     )
     curriculum = CurriculumAgent(
         lambda messages: provider.complete(profile, messages).text,
@@ -77,6 +79,7 @@ def build_native_adaptive_phase1(
     environment, provider_transport=None, embeddings=None, project_target=None,
     max_projects=None, request_profile=None, request_timing=None,
     profiling_guidance=None,
+    trace_recorder_factory=None,
 ):
     """Compose native A3 learning without a Catlass checkout requirement.
 
@@ -155,6 +158,7 @@ def build_native_adaptive_phase1(
         immutable_context=canonical_bytes({"identity": identity,
                                             "programming_guide": guide_text}),
         target_policy=policy, profiling_guidance=profiling_guidance,
+        trace_recorder_factory=trace_recorder_factory,
         query_knowledge=query, request_profile=request_profile, request_timing=request_timing,
         diagnostic_instructions="Debugger and sanitizer routes are unavailable in this native composition.\n",
         project_target=project_target, max_projects=max_projects,
