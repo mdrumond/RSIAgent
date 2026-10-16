@@ -1,0 +1,8 @@
+{
+  "access_helper": "/PATH/TO/remote-access/scripts/access.py",
+  "remote": "a2",
+  "cann_env": "/PATH/TO/CANN/set_env.sh",
+  "python": "/PATH/TO/NPU/PYTHON/bin/python",
+  "arch": "REPLACE_WITH_BOARD_ARCH",
+  "device": 0
+}
