@@ -117,14 +117,21 @@ def test_inventory_is_read_only_and_uses_relative_paths(campaign):
     assert before == {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in campaign.rglob("*") if p.is_file()}
 
 
-def test_legacy_traces_and_launcher_provenance_are_retained(campaign):
+def test_legacy_traces_and_launcher_provenance_are_retained(campaign, tmp_path):
     write(campaign, "sft-traces/one.json", {"conversation": []})
     write(campaign, "provider/one/provider.json", {"request_id": "one"})
     write(campaign, "campaign-run.json", {"phase": "phase1"})
     write(campaign, "collector-state.json", {"local_runtime": "excluded"})
+    write(campaign, ".env", {"private": "excluded"})
     names = {entry["path"] for entry in inventory_campaign(campaign)["files"]}
     assert {"sft-traces/one.json", "provider/one/provider.json", "campaign-run.json"} <= names
     assert "collector-state.json" not in names
+    target = tmp_path / "legacy.tar.gz"
+    package_campaign(campaign, target)
+    with tarfile.open(target) as archive:
+        for path in ("sft-traces/one.json", "provider/one/provider.json", "campaign-run.json"):
+            assert archive.extractfile("campaign/" + path).read() == (campaign / path).read_bytes()
+        assert "campaign/.env" not in archive.getnames()
 
 
 def test_concurrent_mutation_aborts_archive(campaign, tmp_path, monkeypatch):
