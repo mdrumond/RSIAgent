@@ -14,6 +14,12 @@ arbitrary 500-character cap. Model response budgets still apply. Optional
 `learning_focus` differentiates genuine experiments with the same mathematical
 graph; existing saved projects without it retain their identities.
 
+Coverage dimensions and coarse shape classes guide selection; they do not
+require each project to introduce a new coverage token. New exact shapes within
+a covered class and new combinations of known dimensions are allowed. Exact
+project-information repeats of verified prior projects or wave siblings remain
+rejected, including changes only to IDs, hypothesis wording, or launch tuning.
+
 For example, a copy graph can first investigate `pipe-mte2`, then a distinct
 `inter-pipe-sync`/`sync-performance` project can compare minimal correct ordering
 with correct redundant barriers. A `sync-correctness` project instead diagnoses

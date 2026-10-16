@@ -425,11 +425,50 @@ def test_unverified_prior_can_be_retried_and_does_not_count_as_coverage():
     assert isinstance(decision, WaveDecision)
 
 
-def test_siblings_need_marginal_semantic_gain_not_exact_shape_variation():
+def test_siblings_allow_exact_shape_variation_with_same_coverage_tokens():
     first = project("first")
     second = with_shape(project("second"), [259])
-    with pytest.raises(ValueError, match="marginal"):
-        CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert ProjectInformation.from_project(first).tokens == ProjectInformation.from_project(second).tokens
+    decision, _ = CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert len(decision.wave.projects) == 2
+
+
+@pytest.mark.parametrize("item", [
+    with_shape(project("new-shape"), [259]),
+    with_shape(project("new-combination", dtype="float16"), [257]),
+])
+def test_prior_coverage_allows_new_shapes_and_combinations(item):
+    priors = (
+        outcome(project("prior-f32"), "prior-f32"),
+        outcome(with_shape(project("prior-f16", dtype="float16"), [259]), "prior-f16"),
+    )
+    covered = frozenset().union(*(prior.information.tokens for prior in priors))
+    assert ProjectInformation.from_project(item).tokens <= covered
+    decision, _ = CurriculumAgent(lambda _: wave([item])).select(context(prior_outcomes=priors))
+    assert isinstance(decision, WaveDecision)
+
+
+def test_siblings_reject_identical_information_despite_label_or_tuning_changes():
+    second = project("second", block_count=2, hypothesis="A rewritten question.")
+    with pytest.raises(ValueError, match="repeats executable information between siblings"):
+        CurriculumAgent(lambda _: wave([project("first"), second])).select(context())
+
+
+def test_prior_project_id_still_rejected_for_a_new_exact_shape():
+    prior = outcome(project("old"))
+    proposal = with_shape(project("old"), [259])
+    with pytest.raises(ValueError, match="repeats a prior project ID"):
+        CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
+
+
+def test_prompt_describes_advisory_coverage_and_controlled_variations():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+
+    prompt = curriculum_prompt(context())
+    assert "Coverage dimensions are advisory" in prompt
+    assert "new exact shapes within a covered shape class" in prompt
+    assert "new combinations of covered dimensions are allowed" in prompt
+    assert "only when every project adds" not in prompt
 
 
 def test_held_out_names_are_rejected_in_graph_identifiers():

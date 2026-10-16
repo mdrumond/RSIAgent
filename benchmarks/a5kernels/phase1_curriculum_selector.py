@@ -109,6 +109,7 @@ class ProjectInformation:
 
     @property
     def tokens(self) -> frozenset[tuple[str, str]]:
+        """Coarse advisory coverage; token novelty is not an admission rule."""
         rows = {
             *(('operation', item.value) for item in self.operations),
             *(('shape-class', _shape_class(item)) for item in self.shapes),
@@ -368,8 +369,12 @@ def curriculum_prompt(
             item.value for item in unavailable_capabilities
         ]
     instructions = (
-        "Choose DECISION: WAVE only when every project adds operation, shape, dtype, "
-        "failure, profile, or learning-focus information not covered by prior outcomes. Select no more than max_wave_projects (at most eight), then adapt the next wave to observed results. Capability "
+        "Choose DECISION: WAVE for useful experiments informed by prior outcomes. "
+        "Coverage dimensions are advisory: new exact shapes within a covered shape "
+        "class and new combinations of covered dimensions are allowed. Avoid exact "
+        "repeats of verified prior or sibling project information; changing only "
+        "an ID, hypothesis, or launch tuning does not distinguish information. "
+        "Select no more than max_wave_projects (at most eight), then adapt the next wave to observed results. Capability "
         "labels alone are not information gain. Copy the supplied "
         "wave ID, memory identity, and coverage exactly. Otherwise choose SATURATED "
         "when the objective is covered, or STALLED when useful work is blocked.\n"
@@ -538,11 +543,6 @@ class CurriculumAgent:
         )
         prior_ids = {item.project_id for item in verified_outcomes}
         prior_information = {item.information_sha256 for item in verified_outcomes}
-        covered_dimensions = frozenset(
-            token
-            for item in verified_outcomes
-            for token in item.information.tokens
-        )
         information = tuple(
             ProjectInformation.from_project(item.spec) for item in wave.projects
         )
@@ -562,14 +562,6 @@ class CurriculumAgent:
         }
         if self._held_out.intersection(executable_signatures):
             raise ValueError("wave matches a held-out contract or shape")
-        marginal_coverage = set(covered_dimensions)
-        for item in information:
-            if not item.tokens - marginal_coverage:
-                raise ValueError(
-                    "every project must add marginal operation/shape-class/dtype/"
-                    "failure/profile/learning-focus information"
-                )
-            marginal_coverage.update(item.tokens)
         return WaveDecision(wave)
 
 
