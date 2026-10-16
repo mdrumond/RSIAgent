@@ -108,6 +108,29 @@ def test_nonfinite_and_length_mismatch_summary():
     canonical_bytes(view)
 
 
+@pytest.mark.parametrize("expected,observed,missing_side", [
+    ([1.0, 2.0, 3.0], [1.0], "observed"),
+    ([1.0], [1.0, 2.0, 3.0], "expected"),
+])
+def test_matching_prefix_length_mismatch_counts_and_samples_tail(expected, observed, missing_side):
+    view = mismatch_summary(expected, observed)
+    assert view["unequal_count"] == 2
+    assert [sample["index"] for sample in view["samples"]] == [1, 2]
+    for sample in view["samples"]:
+        assert sample["missing_side"] == missing_side
+        assert sample[missing_side] is None
+        assert sample["absolute_error"] is None
+    canonical_bytes(view)
+
+
+def test_tail_samples_share_eight_entry_budget_with_prefix_mismatches():
+    view = mismatch_summary([0] * 100, [1] * 6)
+    assert view["unequal_count"] == 100
+    assert len(view["samples"]) == 8
+    assert [sample["index"] for sample in view["samples"]] == list(range(8))
+    assert view["samples"][-1]["missing_side"] == "observed"
+
+
 def test_wide_diagnostic_stays_bounded_and_plain_initial_seed_is_visible(tmp_path):
     store = ContentAddressedArtifacts(tmp_path)
     payload = {"event": "host-compile", "source_sha256": "b" * 64,

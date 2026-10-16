@@ -86,6 +86,15 @@ def mismatch_summary(expected, observed):
             if len(samples) < 8:
                 samples.append({"index": index, "expected": want, "observed": got,
                                 "absolute_error": error if error is None or math.isfinite(error) else None})
+    unequal += abs(len(expected) - len(observed))
+    tail_start = min(len(expected), len(observed))
+    tail_end = min(max(len(expected), len(observed)), tail_start + 8 - len(samples))
+    for index in range(tail_start, tail_end):
+        missing_side = "expected" if index >= len(expected) else "observed"
+        samples.append({"index": index,
+                        "expected": expected[index] if index < len(expected) else None,
+                        "observed": observed[index] if index < len(observed) else None,
+                        "missing_side": missing_side, "absolute_error": None})
     return {"expected_count": len(expected), "observed_count": len(observed),
             "unequal_count": unequal, "max_finite_absolute_error": maximum,
             "samples": samples, "comparison": "exact differences, not host tolerance"}
