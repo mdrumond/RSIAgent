@@ -6,6 +6,9 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
+from benchmarks.ascend.agent_context import (
+    ContextBudget, ContextBudgetError, DEFAULT_CONTEXT_BUDGETS, WorkingContext, request_bytes,
+)
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
@@ -164,6 +167,7 @@ class DirectCompletionProvider:
         environment: Mapping[str, str],
         *,
         transport: Transport = openai_compatible_transport,
+        context_budgets: Mapping[str, ContextBudget] | None = None,
     ) -> None:
         credentials = {}
         for values in _DIRECT_VALUES.values():
@@ -174,6 +178,16 @@ class DirectCompletionProvider:
             credentials[name] = value
         self._credentials = credentials
         self._transport = transport
+        self.context_budgets = dict(DEFAULT_CONTEXT_BUDGETS)
+        if context_budgets is not None:
+            if set(context_budgets) - set(self.context_budgets) or not all(
+                isinstance(value, ContextBudget) for value in context_budgets.values()
+            ):
+                raise ValueError("context budgets must use registered model identities")
+            self.context_budgets.update(context_budgets)
+
+    def context_budget(self, profile):
+        return self.context_budgets[profile.identity.backend_model.value]
 
     def complete(
         self,
@@ -182,6 +196,8 @@ class DirectCompletionProvider:
     ) -> DirectCompletion:
         if profile != direct_profile(profile.identity):
             raise ValueError("provider profile is not canonical")
+        if request_bytes(profile.request(messages)) > self.context_budget(profile).hard:
+            raise ContextBudgetError("direct provider request exceeds context hard byte budget")
         try:
             result = self._transport(
                 base_url=profile.base_url,
@@ -246,10 +262,10 @@ class _ProviderEvidenceRecorder:
             "role": role, "sha256": digest, **fields,
         })
 
-    def bounded_payloads(self, admitted: Mapping[str, str]) -> dict[str, object]:
+    def bounded_payloads(self, admitted: Mapping[str, str], *, max_bytes=_MAX_DISTILLATION_ARTIFACT_BYTES) -> dict[str, object]:
         if not self.enabled:
             return {}
-        remaining = _MAX_DISTILLATION_ARTIFACT_BYTES
+        remaining = max_bytes
         payloads = {}
         for digest, role in sorted(admitted.items()):
             if role not in _DISTILLATION_PAYLOAD_ROLES:
@@ -277,6 +293,7 @@ class _DirectActorContinuation:
     profile: DirectModelProfile
     messages: tuple[Mapping[str, str], ...]
     recorder: _ProviderEvidenceRecorder
+    working_context: WorkingContext
 
 
 class DirectActorDriver:
@@ -305,6 +322,32 @@ class DirectActorDriver:
         return type(self)(self.provider, max_turns=self.max_turns,
                           trace_event=trace_event, system_prompt=self.system_prompt)
 
+    def _prepare_context(self, working, profile, recorder, *, turn):
+        tokens = 0
+
+        def summarize(messages):
+            nonlocal tokens
+            self._request(recorder, profile, messages, stage="compaction", turn=turn)
+            try:
+                completion = self.provider.complete(profile, messages)
+            except Exception as exc:
+                recorder.failure(exc, stage="compaction", turn=turn)
+                raise ContextBudgetError("work-log summarization failed; original evidence retained") from exc
+            recorder.response(completion.text, stage="compaction", turn=turn)
+            tokens += completion.completion_tokens
+            self._trace("tool", {"name": "context-compaction", "status": "observed",
+                "messages": messages, "work_log": completion.text,
+                "completion_tokens": completion.completion_tokens})
+            return completion.text
+
+        messages = working.prepare(profile, self.provider.context_budget(profile), summarize)
+        return messages, tokens
+
+    def _request(self, recorder, profile, messages, *, stage, turn):
+        recorder.request(profile, messages, stage=stage, turn=turn)
+        self._trace("tool", {"name": "provider-request", "stage": stage, "turn": turn,
+                             "request": profile.request(messages)})
+
     def __call__(
         self,
         instruction: str,
@@ -323,13 +366,17 @@ class DirectActorDriver:
         ]
         for message in messages:
             self._trace("message", message)
+        working = WorkingContext(messages)
         tokens = 0
         for turn in range(1, self.max_turns + 1):
-            recorder.request(profile, messages, stage="action", turn=turn)
+            messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
+            tokens += summary_tokens
+            self._request(recorder, profile, messages, stage="action", turn=turn)
             completion = self.provider.complete(profile, messages)
             recorder.response(completion.text, stage="action", turn=turn)
             tokens += completion.completion_tokens
             messages.append({"role": "assistant", "content": completion.text})
+            working.append(messages[-1])
             self._trace("message", messages[-1])
             action = turn_parser(completion.text)
             if action is None:
@@ -356,6 +403,7 @@ class DirectActorDriver:
                 })
                 if outcome.terminal:
                     messages.append({"role": "user", "content": observation})
+                    working.append(messages[-1])
                     self._trace("message", messages[-1])
                     self._trace("terminal", {
                         "status": outcome.status,
@@ -365,10 +413,11 @@ class DirectActorDriver:
                         outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
                         continuation=_DirectActorContinuation(
-                            profile, tuple(dict(item) for item in messages), recorder
+                            profile, tuple(dict(item) for item in messages), recorder, working
                         ),
                     )
             messages.append({"role": "user", "content": observation})
+            working.append(messages[-1])
             self._trace("message", messages[-1])
         self._trace("terminal", {"status": "turn-budget-exhausted"})
         return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
@@ -392,10 +441,20 @@ class DirectActorDriver:
         messages = [dict(item) for item in continuation.messages]
         context = {
             "admitted_artifacts": admitted,
-            "artifact_payloads": continuation.recorder.bounded_payloads(admitted),
+            "artifact_payloads": continuation.recorder.bounded_payloads(
+                admitted, max_bytes=self.provider.context_budget(continuation.profile).target // 4,
+            ),
             "host_summaries": [dict(item) for item in host_summaries[:16]],
             "terminal_host_observation": continuation.messages[-1]["content"],
         }
+        if continuation.recorder.enabled:
+            from benchmarks.ascend.agent_presentation import compact_observation
+            context["host_summaries"] = [compact_observation(dict(item), continuation.recorder.artifacts)
+                                         for item in host_summaries[:16]]
+            if request_bytes(context) > self.provider.context_budget(continuation.profile).target // 2:
+                context = compact_observation({"event": "terminal-distillation-context", **context},
+                                              continuation.recorder.artifacts)
+                context["admitted_artifacts"] = admitted
         messages.append({
             "role": "user",
             "content": DISTILLATION_PROMPT + "\n" + json.dumps(
@@ -403,10 +462,16 @@ class DirectActorDriver:
             ),
         })
         self._trace("message", messages[-1])
+        working = continuation.working_context
+        working.append(messages[-1])
         tokens = outcome.tokens or 0
         for correction in range(_MAX_DISTILLATION_ATTEMPTS):
             turn = outcome.iterations + correction + 1
-            continuation.recorder.request(
+            messages, summary_tokens = self._prepare_context(
+                working, continuation.profile, continuation.recorder, turn=turn,
+            )
+            tokens += summary_tokens
+            self._request(continuation.recorder,
                 continuation.profile, messages, stage="distillation", turn=turn,
             )
             try:
@@ -434,6 +499,9 @@ class DirectActorDriver:
                         "or rerun kernel actions."
                     )},
                 ))
+                for message in messages[-2:]:
+                    working.append(message)
+                self._trace("message", messages[-1])
                 continue
             return ActorOutcome(
                 outcome.status, outcome.iterations, tokens, outcome.wall_time_s,
