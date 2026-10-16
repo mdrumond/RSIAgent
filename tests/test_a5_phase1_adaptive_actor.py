@@ -4,6 +4,7 @@ import base64
 from dataclasses import replace
 import hashlib
 import json
+import copy
 
 import pytest
 
@@ -165,6 +166,99 @@ def _request(tmp_path, executor, spec=None):
     )
 
 
+class TracedScriptedActor(ScriptedActor):
+    def with_trace(self, callback):
+        result = copy.copy(self)
+        result.trace_event = callback
+        return result
+
+    def __call__(self, instruction, **kwargs):
+        self.trace_event("message", {"role": "user", "content": instruction})
+        original = kwargs["action_executor"]
+        replies = iter(self.replies)
+        def execute(action):
+            self.trace_event("message", {"role": "assistant", "content": next(replies)})
+            return original(action)
+        return super().__call__(instruction, **{**kwargs, "action_executor": execute})
+
+
+def test_adaptive_trace_retains_repair_but_excludes_distillation(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    actor = TracedScriptedActor([
+        '{"write":{"slot":"kernel","content":"broken source"}}',
+        '{"run":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+    ])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
+        phase="phase1", round_id="round-1", model="fixture", source_manifest_sha256="a" * 64,
+    ))
+    driver(request)
+    rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    example, metadata = _example(rows)
+    assert metadata["repair"]
+    assistants = [m for m in example["messages"] if m["role"] == "assistant"]
+    assert assistants[-1] == {"role": "assistant", "content": "fixed source", "weight": 1}
+    assert all(m["weight"] == 0 for m in assistants[:-1])
+    assert all("distillation" not in m["content"] for m in assistants)
+    assert not hasattr(actor, "trace_event")
+
+
+def test_adaptive_failed_trace_is_retained_without_positive_label(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"broken source"}}', '{"run":{}}'])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
+        phase="phase2", round_id="round-1", model="fixture", source_manifest_sha256="a" * 64,
+    ))
+    with pytest.raises(RuntimeError, match="without host-verified"):
+        driver(request)
+    rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    assert _example(rows) is None
+    assert any(row["kind"] == "validation" for row in rows)
+
+
+def test_parallel_project_traces_are_isolated_and_abort_evidence_is_retained(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+    actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
+                                '{"run":{}}', '{"submit":{}}'])
+    factory = recorder_factory(phase="phase2", round_id="round-2", model="fixture",
+                               source_manifest_sha256="a" * 64)
+    def run(index):
+        executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / str(index) / "evidence.jsonl"))
+        request = _request(tmp_path / str(index), executor)
+        request = replace(request, authored_ordinal=index + 1)
+        AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=factory)(request)
+        return next((request.branch_root / "sft-traces").glob("*.jsonl"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paths = list(pool.map(run, range(2)))
+    assert paths[0].name != paths[1].name
+    for path in paths:
+        assert _example(_read_trace(path))[0]["messages"][-1]["content"] == "fixed source"
+    assert not hasattr(actor, "trace_event")
+
+    class BrokenBackend(SourceBackend):
+        def compile(self, request):
+            raise OSError("retained infrastructure failure")
+    executor = ProjectExecutor(BrokenBackend(), EvidenceLedger(tmp_path / "abort-evidence.jsonl"))
+    request = _request(tmp_path / "abort", executor)
+    with pytest.raises(OSError):
+        AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=factory)(request)
+    rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    assert _example(rows) is None
+    validation = next(row["payload"] for row in rows if row["kind"] == "validation")
+    assert validation["status"] == "infrastructure-failure"
+    digest = validation["evidence_sha256"]
+    assert (request.branch_root / "artifacts" / "objects" / digest[:2] / digest[2:]).is_file()
+
+
 def test_measurement_requires_verified_current_source_and_preserves_comparison_facts(tmp_path):
     from benchmarks.a5kernels.trial import parse_trial_action
     assert parse_trial_action('{"request-timing":{}}').kind == "request-timing"
@@ -272,6 +366,22 @@ def test_exhausted_mismatch_never_distills_or_returns_publishable_memory(tmp_pat
         )
 
     assert actor.observations[1]["classification"] == "host-mismatch"
+    assert actor.distill_calls == []
+
+
+@pytest.mark.parametrize("source, classification", [
+    ("still broken", "host-mismatch"), ("compile failure", "compile-failure"),
+    ("runtime failure", "runtime-failure"),
+])
+def test_phase2_retains_semantic_failure_without_distilling(tmp_path, source, classification):
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = ScriptedActor((json.dumps({"write": {"slot": "kernel", "content": source}}),
+                           '{"run":{}}', '{"submit":{}}'))
+    result = AdaptiveActorProjectExecutor(executor, actor, object(),
+                                         retain_semantic_failure=True)(_request(tmp_path, executor))
+    assert result.evidence.classification.value == classification
+    assert not result.evidence.verified
+    assert result.memory.no_new_knowledge
     assert actor.distill_calls == []
 
 

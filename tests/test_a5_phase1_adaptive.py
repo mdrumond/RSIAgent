@@ -418,7 +418,11 @@ def test_target_stops_and_resume_with_larger_target_preserves_memory(tmp_path):
             CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
     first = campaign(1).run()
     assert first["status"] == "TARGET_REACHED"
-    second = campaign(2).resume()
+    with pytest.raises(ValueError, match="continue_campaign"):
+        campaign(2).resume()
+    continued = campaign(1)
+    continued.continue_campaign(2)
+    second = continued.resume()
     assert second["successful_projects"] == 2
     assert second["published_projects"][0] == first["published_projects"][0]
     assert "pipe-mte2" not in second["coverage_gaps"]

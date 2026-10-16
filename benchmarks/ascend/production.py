@@ -22,6 +22,7 @@ def compose_adaptive_controller(
     request_profile=None, request_timing=None, request_diagnostic=None,
     diagnostic_instructions=None,
     unavailable_capabilities=(),
+    reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
 ):
     """One action loop, curriculum and progressive-memory controller for both targets."""
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -33,16 +34,27 @@ def compose_adaptive_controller(
         request_profile=request_profile, request_timing=request_timing,
         request_diagnostic=request_diagnostic, immutable_context=immutable_context,
         diagnostic_instructions=diagnostic_instructions,
+        retain_semantic_failure=reviewed_snapshot is not None,
+        **({"trace_recorder_factory": trace_recorder_factory} if trace_recorder_factory is not None else {}),
     )
     curriculum = CurriculumAgent(
         lambda messages: provider.complete(profile, messages).text,
         target_policy=target_policy, profiling_guidance=profiling_guidance,
         unavailable_capabilities=unavailable_capabilities,
     )
-    coordinator = AdaptivePhase1Coordinator(
-        root, objective, initial_memory, curriculum, project_actor,
-        max_parallel=max_parallel, project_target=project_target, max_projects=max_projects,
-    )
+    if reviewed_snapshot is None:
+        coordinator = AdaptivePhase1Coordinator(
+            root, objective, initial_memory, curriculum, project_actor,
+            max_parallel=max_parallel, project_target=project_target, max_projects=max_projects,
+        )
+    else:
+        from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+        if max_parallel != 1 or max_projects is not None:
+            raise ValueError("adaptive Phase 2 uses serial selection and verified project_target")
+        coordinator = AdaptivePhase2Coordinator(
+            root, objective, reviewed_snapshot, curriculum, project_actor,
+            project_target=project_target, trace_hook=trace_hook,
+        )
     return project_actor, coordinator
 
 
@@ -77,6 +89,7 @@ def build_native_adaptive_phase1(
     environment, provider_transport=None, embeddings=None, project_target=None,
     max_projects=None, request_profile=None, request_timing=None,
     profiling_guidance=None,
+    reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
 ):
     """Compose native A3 learning without a Catlass checkout requirement.
 
@@ -114,6 +127,10 @@ def build_native_adaptive_phase1(
         "kdb_collection": config.collection,
         "environment_identity": config.environment_identity or {},
     }
+    if reviewed_snapshot is not None:
+        reviewed_snapshot.verify()
+        identity.update(schema="ascend-native-adaptive-phase2-identity-v1",
+                        phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
     query = None
     if config.kdb is not None:
         if embeddings is None or not config.collection:
@@ -158,6 +175,8 @@ def build_native_adaptive_phase1(
         query_knowledge=query, request_profile=request_profile, request_timing=request_timing,
         diagnostic_instructions="Debugger and sanitizer routes are unavailable in this native composition.\n",
         project_target=project_target, max_projects=max_projects,
+        reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
+        trace_recorder_factory=trace_recorder_factory,
         unavailable_capabilities=tuple(capability for capability, action in (
             (Capability.PROFILING, request_profile), (Capability.TIMING_SWEEP, request_timing),
         ) if action is None),

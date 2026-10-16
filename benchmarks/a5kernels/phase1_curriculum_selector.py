@@ -403,12 +403,14 @@ class CurriculumAgent:
         unavailable_capabilities: Sequence[Capability] = (),
         target_policy: "CurriculumPolicy | None" = None,
         profiling_guidance: str | None = None,
+        require_fresh_project_ids: bool = False,
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
         self._complete = complete
         self.target_policy = target_policy
         self.profiling_guidance = profiling_guidance
+        self.require_fresh_project_ids = require_fresh_project_ids
         self._held_out = frozenset(
             _digest(item, "held-out information identity")
             for item in held_out_information_sha256
@@ -541,7 +543,8 @@ class CurriculumAgent:
         verified_outcomes = tuple(
             item for item in context.prior_outcomes if item.verified
         )
-        prior_ids = {item.project_id for item in verified_outcomes}
+        prior_ids = {item.project_id for item in (
+            context.prior_outcomes if self.require_fresh_project_ids else verified_outcomes)}
         prior_information = {item.information_sha256 for item in verified_outcomes}
         information = tuple(
             ProjectInformation.from_project(item.spec) for item in wave.projects
