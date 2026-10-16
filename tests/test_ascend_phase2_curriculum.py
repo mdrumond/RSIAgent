@@ -1,6 +1,8 @@
 """Fresh-project adaptation and durable continuation across both phases."""
 import base64
 import json
+from dataclasses import replace
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.a5kernels.phase2_adaptive_memory import _memory
 from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
 from test_a5_phase1_adaptive import SEED, _memory as project_memory, _project, _result, _wave
@@ -25,6 +28,54 @@ def project(ordinal):
     for tensor in value["graph"]["inputs"]:
         tensor["shape"] = value["shape"]
     return value
+
+
+def test_failed_project_focus_stays_in_selector_but_does_not_close_coverage_gaps(tmp_path):
+    contexts = []
+    failed = project(1)
+    failed["learning_focus"] = ["tool-msprof", "pipe-vector"]
+
+    def select(messages):
+        contexts.append(json.loads(messages[-1]["content"].rsplit("\n", 1)[-1]))
+        if len(contexts) == 1:
+            return _wave(messages[-1]["content"], [failed])
+        return 'DECISION: STALLED\n{"reason":"host mismatch requires another experiment"}'
+
+    coordinator = AdaptivePhase2Coordinator(
+        tmp_path, "Learn tools", snapshot(), CurriculumAgent(select),
+        lambda req: _result(req.spec, False, "host mismatch; profiler not run"), project_target=1)
+    report = coordinator.run()
+    assert report["failed_projects"] == 1
+    assert report["successful_projects"] == 0
+    assert {"tool-msprof", "pipe-vector"} <= set(report["coverage_gaps"])
+    prior = contexts[1]["prior_outcomes"][-1]
+    assert not prior["verified"]
+    assert set(prior["information"]["learning_focus"]) == {"tool-msprof", "pipe-vector"}
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_reviewed_seed_tool_coverage_requires_observed_host_facts(tmp_path, observed):
+    seed = _project("seed-with-requested-tools", "gm-ub-movement")
+    seed["learning_focus"] = ["tool-msprof", "tool-msdebug", "debug-print"]
+    memory = project_memory(ProjectSpec.from_mapping(seed))
+    if observed:
+        evidence = memory.host_facts[0].evidence_sha256
+        memory = replace(memory, host_facts=(*memory.host_facts,
+            HostFact("profiling", "profiler trace observed", evidence),
+            HostFact("diagnostic", 'tool-observation:{"tool":"msdebug","available":true,"execution":{}}', evidence),
+            HostFact("diagnostic", "verified-debug-print:observed values", evidence)))
+    reviewed = SimpleNamespace(snapshot_id="reviewed-tools", verify=lambda: None,
+                               memory_entries=lambda: [memory.as_dict()])
+    coordinator = AdaptivePhase2Coordinator(tmp_path, "Learn tools", reviewed,
+        CurriculumAgent(lambda _: 'DECISION: SATURATED\n{"reason":"reviewed seed checked"}'),
+        lambda _: None, project_target=1)
+    state = deepcopy(coordinator._load_state())
+    # Simulate an older retained campaign that stored requested seed focus.
+    state["seed_outcomes"][0]["spec"]["learning_focus"] = seed["learning_focus"]
+    coordinator._atomic_json(tmp_path / "state.json", state)
+    gaps = coordinator.report()["coverage_gaps"]
+    for focus in seed["learning_focus"]:
+        assert (focus not in gaps) is observed
 
 
 def test_adapts_to_semantic_failure_and_prior_verified_learning(tmp_path):

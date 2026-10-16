@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from copy import copy
+import base64
 import hashlib
 
 from benchmarks.a5kernels.evidence import canonical_bytes
@@ -44,6 +45,11 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
             "spec": memory.project_spec.as_dict(), "verified": True,
             "summary": "Reviewed Phase 1 project; consult pinned seed memory.",
         } for memory in memories]
+        self.seed_outcomes = AdaptivePhase1Coordinator._effective_outcomes({
+            "prior_outcomes": self.seed_outcomes,
+            "memory_bytes_base64": [base64.b64encode(canonical_bytes(entry)).decode("ascii")
+                                    for entry in entries],
+        })
         initial = canonical_bytes({
             "schema": "ascend-phase2-curriculum-seed-v1",
             "snapshot_id": reviewed_snapshot.snapshot_id,
@@ -64,7 +70,9 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
         if exists:
             if state.get("phase") != "adaptive-phase2":
                 raise ValueError("campaign root is not an adaptive Phase 2 lineage")
-            return state
+            # Recompute from the authenticated seed for campaigns retained before
+            # observed-tool filtering was applied to Phase 1 outcomes.
+            return {**state, "seed_outcomes": self.seed_outcomes}
         state.update(phase="adaptive-phase2", snapshot_id=self.snapshot.snapshot_id,
                      seed_outcomes=self.seed_outcomes, failed_outcomes=[])
         state["coverage"] = list(dict.fromkeys(
