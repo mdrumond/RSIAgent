@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from dataclasses import replace
 import hashlib
 import json
@@ -376,8 +375,8 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert actor.observations[5]["artifacts"]["observed"]["payload"]["output"]
     assert actor.observations[6]["error"].startswith("submit requires")
     assert actor.observations[8]["classification"] == "host-verified"
-    encoded_memory = base64.b64encode(b'{"prior":"memory"}').decode("ascii")
-    assert encoded_memory in actor.instruction
+    assert '"prior":"memory"' in actor.instruction
+    assert 'read-artifact' in actor.instruction
     assert 'Production context (immutable' in actor.instruction
     assert actor.instruction.count('{"guide":"exact"}') == 1
     assert executor.prepare(_spec()).instruction in actor.instruction

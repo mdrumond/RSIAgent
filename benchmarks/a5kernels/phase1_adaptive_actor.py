@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ast
-import base64
 from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
@@ -11,6 +10,9 @@ import re
 from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from benchmarks.ascend.agent_presentation import (
+    compact_observation, memory_presentation, mismatch_summary, read_artifact,
+)
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.phase1_adaptive import (
     AdaptiveProjectRequest,
@@ -211,6 +213,13 @@ class _ProjectActions:
                 )
         if action.kind == "propose":
             return self._observation({"event": "proposal-recorded"})
+        if action.kind == "read-artifact":
+            try:
+                page = read_artifact(action.payload, self.artifacts)
+            except (ValueError, FileNotFoundError) as exc:
+                return self._observation({"error": str(exc)})
+            return ActionOutcome(canonical_bytes({"host": page}).decode("ascii"),
+                                 False, "continue")
         if action.kind == "write":
             return self._write(action)
         if action.kind == "compile":
@@ -319,6 +328,10 @@ class _ProjectActions:
             "source_sha256": self.source_sha256,
             "classification": result.evidence.classification.value,
             "detail": result.evidence.detail,
+            "numerical_summary": mismatch_summary(
+                result.artifacts["expected"]["storage"],
+                result.artifacts["observed"]["output"],
+            ),
             "artifacts": retained,
         })
 
@@ -413,12 +426,11 @@ class _ProjectActions:
             "classification_sha256": self.latest.artifact_sha256["classification"],
         }, True, "host-verified")
 
-    @staticmethod
     def _observation(
-        payload: Mapping[str, object], terminal: bool = False, status: str = "continue",
+        self, payload: Mapping[str, object], terminal: bool = False, status: str = "continue",
     ) -> ActionOutcome:
         return ActionOutcome(
-            canonical_bytes({"host": payload}).decode("ascii"), terminal, status,
+            canonical_bytes({"host": compact_observation(payload, self.artifacts)}).decode("ascii"), terminal, status,
         )
 
 
@@ -505,10 +517,13 @@ class AdaptiveActorProjectExecutor:
                    "Unavailable tools are reported explicitly. Do not deliberately run "
                    "hanging kernels; bounded termination does not guarantee device recovery.\n")
         opening = (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
-        opening += prepared.instruction + "\nPre-wave memory (immutable): " + json.dumps({
-            "sha256": memory_sha256,
-            "base64": base64.b64encode(request.pre_wave_memory).decode("ascii"),
-        }, sort_keys=True, separators=(",", ":"))
+        opening += prepared.instruction + "\nPre-wave memory (immutable, readable index): " + json.dumps(
+            memory_presentation(request.pre_wave_memory, artifacts),
+            sort_keys=True, separators=(",", ":"))
+        opening += ('\nInspect full retained evidence or memory with '
+                    '{"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}. '
+                    'Offsets and limits are bytes; follow next_offset for more. '
+                    'Observation previews do not replace authoritative host verification.')
         opening += (
             '\nAfter host verification of the current source, request timing with '
             '{"request-timing":{}} and profiling with {"request-profile":{}}. '
