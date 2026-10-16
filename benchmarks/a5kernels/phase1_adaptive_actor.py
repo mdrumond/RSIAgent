@@ -581,11 +581,14 @@ class AdaptiveActorProjectExecutor:
             )
         except Exception as exc:
             if recorder is not None:
+                from benchmarks.ascend.agent_context import ContextBudgetError
+                context_abort = isinstance(exc, ContextBudgetError)
                 digest = artifacts.put_json({"exception": type(exc).__name__, "detail": str(exc)})
                 recorder.validation(
                     candidate_id=actions.source_sha256 or "no-candidate", validator="actor-abort",
-                    status="infrastructure-failure", evidence_sha256=digest,
+                    status="failed" if context_abort else "infrastructure-failure", evidence_sha256=digest,
                     candidate_sha256=actions.source_sha256 or "0" * 64,
+                    details={"abort_status": "context-budget-exhausted"} if context_abort else {},
                 )
                 recorder.finish()
             raise

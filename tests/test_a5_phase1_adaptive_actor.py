@@ -258,6 +258,33 @@ def test_parallel_project_traces_are_isolated_and_abort_evidence_is_retained(tmp
     assert (request.branch_root / "artifacts" / "objects" / digest[:2] / digest[2:]).is_file()
 
 
+def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path):
+    from benchmarks.ascend.agent_context import ContextBudget, ContextBudgetError
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.sft_dataset import _read_trace
+
+    identity = MODEL_IDENTITIES[0]
+    provider = DirectCompletionProvider(
+        {"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
+        transport=lambda **_: pytest.fail("oversized request must not reach transport"),
+        context_budgets={identity.backend_model.value: ContextBudget(2000, 1024, 3000)},
+    )
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(identity),
+        trace_recorder_factory=recorder_factory(phase="phase1", round_id="context-limit",
+            model="fixture", source_manifest_sha256="a" * 64))
+    with pytest.raises(ContextBudgetError):
+        driver(request)
+    trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    validations = [row["payload"] for row in trace if row["kind"] == "validation"]
+    assert validations[-1]["status"] == "failed"
+    assert validations[-1]["details"]["abort_status"] == "context-budget-exhausted"
+    assert all(row["status"] != "infrastructure-failure" for row in validations)
+
+
 def test_infrastructure_retry_preserves_failed_trace_and_verified_retry(tmp_path):
     from benchmarks.ascend.training_traces import recorder_factory
     from benchmarks.a5kernels.sft_dataset import _read_trace, _example
