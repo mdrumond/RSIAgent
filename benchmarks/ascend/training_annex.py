@@ -206,7 +206,8 @@ def inventory_campaign(root, *, artifact_store=None):
                 result = row.get("result", {})
                 target = evidence.get("profile") or result.get("identity", {}).get("execution_profile")
                 found.append(_report(target, evidence["remote_report"],
-                                     result.get("summary", {}).get("report_sha256"), origin, store))
+                                     result.get("report_sha256") or result.get("summary", {}).get("report_sha256"),
+                                     origin, store))
             for capture in _captures(row):
                 archive = capture.get("evidence", {})
                 if archive.get("remote_tree"):
@@ -264,7 +265,12 @@ def inventory_campaign(root, *, artifact_store=None):
                 issues.append({"kind": "missing-or-corrupt-source", "origin": relative})
         if relative.endswith("snapshot.json"):
             snapshot = documents[relative][0]
-            for name, expected in snapshot.get("files", {}).items():
+            expected_files = dict(snapshot.get("files", {}))
+            for field, name in (("phase1_memory_sha256", "phase1-memory.jsonl"),
+                                ("phase1_terminal_sha256", "phase1-terminal.json")):
+                if field in snapshot:
+                    expected_files[name] = snapshot[field]
+            for name, expected in expected_files.items():
                 path = root / Path(relative).parent / name
                 if not path.is_relative_to(root) or not path.is_file() or _sha(path.read_bytes()) != expected:
                     issues.append({"kind": "missing-or-corrupt-snapshot-file", "path": name})
