@@ -259,6 +259,42 @@ def test_parallel_project_traces_are_isolated_and_abort_evidence_is_retained(tmp
     assert (request.branch_root / "artifacts" / "objects" / digest[:2] / digest[2:]).is_file()
 
 
+def test_infrastructure_retry_preserves_failed_trace_and_verified_retry(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+
+    class RetryBackend(SourceBackend):
+        fail_once = True
+
+        def compile(self, request):
+            if self.fail_once:
+                self.fail_once = False
+                raise OSError("transient compiler infrastructure failure")
+            return super().compile(request)
+
+    executor = ProjectExecutor(RetryBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
+                                '{"run":{}}', '{"submit":{}}'])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
+        phase="phase1", round_id="retry-round", model="fixture", source_manifest_sha256="a" * 64,
+    ))
+    with pytest.raises(OSError, match="transient"):
+        driver(request)
+    failed_path = next((request.branch_root / "sft-traces").glob("*.jsonl"))
+    failed_bytes = failed_path.read_bytes()
+    driver(request)
+    paths = list((request.branch_root / "sft-traces").glob("*.jsonl"))
+    assert len(paths) == 2
+    assert failed_path.read_bytes() == failed_bytes
+    failed = _read_trace(failed_path)
+    successful = _read_trace(next(path for path in paths if path != failed_path))
+    assert failed[0]["payload"]["trace_id"] != successful[0]["payload"]["trace_id"]
+    assert _example(failed) is None
+    assert _example(successful)[0]["messages"][-1]["content"] == "fixed source"
+    assert [row["payload"]["status"] for row in failed if row["kind"] == "validation"] == ["infrastructure-failure"]
+
+
 def test_measurement_requires_verified_current_source_and_preserves_comparison_facts(tmp_path):
     from benchmarks.a5kernels.trial import parse_trial_action
     assert parse_trial_action('{"request-timing":{}}').kind == "request-timing"

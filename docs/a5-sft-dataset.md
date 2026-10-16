@@ -16,7 +16,9 @@ by `benchmarks.ascend.training_traces.recorder_factory(phase=..., round_id=...,
 model=..., source_manifest_sha256=...)`. Each project gets a fresh recorder and
 Actor observer under its own branch's `sft-traces`; concurrent projects share no
 trace buffer. Write, failed compile, execution and infrastructure abort evidence
-are retained. Only a host-verified submitted current source receives positive
+are retained. Each invocation has a fresh trace ID, so retrying the same project
+preserves its earlier failed or infrastructure trajectory alongside the retry.
+Only a host-verified submitted current source receives positive
 supervision. Capture seals before terminal distillation, which remains in the
 provider evidence annex. `supervised_source` preserves exact admitted source
 bytes even for ordinary identifiers such as `token = 0`.
