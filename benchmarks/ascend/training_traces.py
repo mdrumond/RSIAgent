@@ -6,6 +6,7 @@ from pathlib import Path
 import hashlib
 import json
 import tempfile
+from uuid import uuid4
 
 from benchmarks.a5kernels.sft_dataset import (
     TraceRecorder, _canonical, _example, _read_trace, build_dataset,
@@ -15,14 +16,18 @@ from benchmarks.ascend.training_annex import inventory_campaign
 
 def recorder_factory(*, phase, round_id, model, source_manifest_sha256,
                      operator_family="adaptive", tools=()):
-    """Return a recorder bound to each request's isolated branch root."""
+    """Return a fresh invocation recorder within each request's branch root.
+
+    Retries reuse project identity and CAS, but must retain separate trajectories.
+    The invocation suffix also isolates concurrent retries of the same request.
+    """
     def create(request):
         identity = hashlib.sha256(_canonical({
             "project": request.spec.as_dict(), "ordinal": request.authored_ordinal,
             "memory_sha256": hashlib.sha256(request.pre_wave_memory).hexdigest(),
             "phase": phase, "round": round_id,
         })).hexdigest()
-        trace_id = "adaptive-" + identity
+        trace_id = "adaptive-" + identity + "-" + uuid4().hex
         return TraceRecorder(
             Path(request.branch_root) / "sft-traces" / f"{trace_id}.jsonl",
             trace_id=trace_id, phase=phase, round_id=round_id,
