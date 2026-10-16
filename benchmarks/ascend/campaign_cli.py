@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tarfile
 import time
 
 from .artifact_collector import ArtifactCollector
@@ -155,9 +156,22 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
             result = worker.collect_once()
             _write(control / "collector-status.json", result)
             if (control / "worker.json").exists() and _read(control / "worker.json")["status"] == "complete":
-                destination = control / f"campaign-{job['project_target']}.tar.gz"
+                current = _read(control / "job.json")
+                inventory = inventory_campaign(current["root"], artifact_store=control / "reports")
+                destination = control / f"campaign-{current['project_target']}.tar.gz"
+                if destination.exists():
+                    try:
+                        with tarfile.open(destination) as archive:
+                            retained = json.load(archive.extractfile("manifest.json"))
+                        matches = retained["complete"] and retained["inventory_sha256"] == inventory["inventory_sha256"]
+                    except (OSError, tarfile.TarError, KeyError, ValueError):
+                        matches = False
+                    if not matches:
+                        destination = control / f"campaign-{current['project_target']}-{inventory['inventory_sha256'][:12]}.tar.gz"
+                        if destination.exists():
+                            raise ValueError("checkpoint destination already exists; inspect it before retrying packaging")
                 if not destination.exists():
-                    package_campaign(job["root"], destination, artifact_store=control / "reports")
+                    package_campaign(current["root"], destination, artifact_store=control / "reports")
                 _write(control / "package-status.json", {"status": "complete", "archive": str(destination)})
                 return
         except Exception as error:
@@ -170,7 +184,7 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
 def start_screen(job, role, *, runner=subprocess.run):
     control = Path(job["control"])
     name = "rsi-" + hashlib.sha256(str(control).encode()).hexdigest()[:12] + "-" + role
-    command = ["screen", "-DmS", name, "-L", "-Logfile", str(control / f"{role}.log"),
+    command = ["screen", "-dmS", name, "-L", "-Logfile", str(control / f"{role}.log"),
                sys.executable, str(Path(__file__).resolve().parents[2] / "run_ascend_campaign.py"),
                "_" + role, "--control", str(control)]
     # Screen creation is idempotent for live sessions, including interrupted CLI startup.

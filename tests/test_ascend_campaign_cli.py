@@ -1,4 +1,6 @@
 import json
+import shutil
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -116,12 +118,60 @@ def test_screen_uses_distinct_durable_local_commands_and_reuses_existing(tmp_pat
     campaign = cli.start_screen(job, "campaign", runner=run)
     collector = cli.start_screen(job, "collector", runner=run)
     assert campaign != collector
-    assert commands[1][:2] == ["screen", "-DmS"]
+    assert commands[1][:2] == ["screen", "-dmS"]
     assert "_campaign" in commands[1] and "_collector" in commands[3]
     commands.clear()
     cli.start_screen(job, "campaign", runner=lambda command, **kw:
                      commands.append(command) or SimpleNamespace(stdout=f"123.{campaign}\t(Detached)\n"))
     assert commands == [["screen", "-ls"]]
+
+
+@pytest.mark.skipif(shutil.which("screen") is None, reason="GNU Screen unavailable")
+def test_real_screen_start_returns_while_worker_is_active(tmp_path):
+    job = start(tmp_path)
+    started = []
+    def runner(command, **kwargs):
+        if command[1] != "-ls":
+            started.append(command[2])
+            command = command[:6] + ["sleep", "30"]
+        return subprocess.run(command, timeout=2, **kwargs)
+    try:
+        name = cli.start_screen(job, "collector", runner=runner)
+        sessions = subprocess.run(["screen", "-ls"], capture_output=True, text=True, timeout=2)
+        assert name in sessions.stdout
+    finally:
+        for name in started:
+            subprocess.run(["screen", "-S", name, "-X", "quit"], capture_output=True, timeout=2)
+
+
+@pytest.mark.parametrize("stale_current_archive", [False, True])
+def test_live_collector_reloads_continuation_target_and_preserves_old_archive(tmp_path, stale_current_archive):
+    job = start(tmp_path)
+    control, root = Path(job["control"]), Path(job["root"])
+    old_archive = control / "campaign-2.tar.gz"
+    old_archive.write_bytes(b"previous completed campaign")
+    write(root / "state.json", {"completed_waves": [], "project_target": 4})
+    write(control / "worker.json", {"status": "complete"})
+    current = {**job, "project_target": 4}
+    write(control / "job.json", current)
+    public = cli._read(root / "campaign-run.json")
+    write(root / "campaign-run.json", {**public, "project_target": 4})
+    stale = control / "campaign-4.tar.gz"
+    if stale_current_archive:
+        stale.write_bytes(b"incomplete old archive")
+    class Downloader:
+        def __init__(self, *args):
+            pass
+        def collect_once(self):
+            return {"counts": {}}
+    cli.collector_worker(job, once=True, factory=Downloader)
+    packaged = cli._read(control / "package-status.json")
+    assert packaged["status"] == "complete"
+    assert Path(packaged["archive"]).name.startswith("campaign-4")
+    assert old_archive.read_bytes() == b"previous completed campaign"
+    if stale_current_archive:
+        assert Path(packaged["archive"]) != stale
+        assert stale.read_bytes() == b"incomplete old archive"
 
 
 @pytest.mark.parametrize("target", ["a3", "a5"])
