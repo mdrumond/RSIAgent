@@ -438,6 +438,7 @@ class AdaptivePhase1Coordinator:
     def _coverage_gaps(cls, state):
         from benchmarks.a5kernels.phase1_curriculum import LEARNING_FOCI
         covered = {focus for row in cls._effective_outcomes(state)
+                   if row["verified"]
                    for focus in row["spec"].get("learning_focus", ())}
         return [focus for focus in LEARNING_FOCI if focus not in covered]
 

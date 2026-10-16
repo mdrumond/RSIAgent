@@ -455,7 +455,7 @@ def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
                   {"category": "runtime", "statement": "verified-debug-print:source"}]
     else:
         facts += [{"category": "runtime", "statement": 'tool-observation:{"available":false,"tool":"memcheck"}'}]
-    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+    state = {"prior_outcomes": [{"spec": spec, "verified": True}], "memory_bytes_base64": [
         base64.b64encode(json.dumps({"host_facts": facts}).encode()).decode()]}
     effective = AdaptivePhase1Coordinator._effective_outcomes(state)[0]["spec"]
     assert effective.get("learning_focus", []) == (spec["learning_focus"] if observed else [])
