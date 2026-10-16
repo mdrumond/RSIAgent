@@ -302,3 +302,26 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
     archive = tmp_path / "complete.tar.gz"
     manifest = cli.package_campaign(job["root"], archive)
     assert manifest["complete"] and archive.exists()
+
+
+def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_path):
+    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from test_ascend_phase2_curriculum import snapshot, project
+    from test_a5_phase1_adaptive import _result, _wave
+    calls, executions = [], []
+    def select(messages):
+        calls.append(messages)
+        return _wave(messages[-1]["content"], [project(len(calls))])
+    def execute(request):
+        executions.append(request)
+        return _result(request.spec, len(executions) > 1, "host outcome")
+    root = tmp_path / "phase2"
+    coordinator = AdaptivePhase2Coordinator(root, "Learn from failures and success", snapshot(),
+        CurriculumAgent(select), execute, project_target=1)
+    result = coordinator.run()
+    assert result["successful_projects"] == 1 and result["failed_projects"] == 1
+    manifest = cli.package_campaign(root, tmp_path / "phase2.tar.gz")
+    assert manifest["complete"]
+    assert any(row["path"].endswith("closed-failure.json") for row in manifest["files"])
+    assert sum(row["path"].endswith("outcome.json") for row in manifest["files"]) == 2
