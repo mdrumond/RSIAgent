@@ -1,0 +1,148 @@
+"""Bounded, non-authoritative views over immutable agent evidence artifacts."""
+
+from __future__ import annotations
+
+import base64
+import json
+import math
+from collections.abc import Mapping
+
+from benchmarks.a5kernels.evidence import canonical_bytes
+
+PAGE_BYTES = 8192
+
+
+def _preview(value, *, depth=0):
+    if isinstance(value, str):
+        encoded = value.encode("utf-8")
+        if len(encoded) <= 2048:
+            return value
+        return {"prefix": encoded[:1536].decode("utf-8", errors="replace"),
+                "suffix": encoded[-512:].decode("utf-8", errors="replace"),
+                "bytes": len(encoded), "truncated": True}
+    if isinstance(value, Mapping):
+        if depth > 8:
+            return {"omitted": True, "keys": list(value)[:16]}
+        return {key: _preview(item, depth=depth + 1)
+                for key, item in list(value.items())[:48]}
+    if isinstance(value, (list, tuple)):
+        if len(value) <= 16:
+            return [_preview(item, depth=depth + 1) for item in value]
+        result = {"count": len(value), "sample": [
+            _preview(item, depth=depth + 1) for item in value[:4]], "truncated": True}
+        numbers = [item for item in value if type(item) in (int, float)
+                   and math.isfinite(item)]
+        if len(numbers) == len(value):
+            result.update(min=min(numbers), max=max(numbers))
+        return result
+    return value
+
+
+def compact_observation(payload, artifacts):
+    """Retain exact host bytes before presenting a bounded, hash-linked view.
+
+    This view never replaces the host result used by verification or publication.
+    """
+    digest = artifacts.put_json(payload)
+    if len(canonical_bytes(payload)) <= 12 * 1024:
+        return dict(payload)
+    preview = _preview(payload)
+    artifact = preview.get("artifact")
+    if isinstance(artifact, dict) and isinstance(artifact.get("payload"), dict):
+        if artifact["payload"].get("compile_diagnostic") == preview.get("diagnostic"):
+            artifact["payload"].pop("compile_diagnostic", None)
+    # Rare wide reports are still accessible by hash, not recursively duplicated.
+    if len(canonical_bytes(preview)) > 12 * 1024:
+        preview = {key: _preview(payload[key]) for key in (
+            "event", "source_sha256", "classification", "detail", "passed", "error",
+            "diagnostic", "numerical_summary",
+        ) if key in payload}
+        for key in ("artifact", "artifacts"):
+            if isinstance(payload.get(key), Mapping):
+                value = payload[key]
+                preview[key] = ({"sha256": value["sha256"]} if "sha256" in value else
+                                {name: {"sha256": row["sha256"]} for name, row in value.items()
+                                 if isinstance(row, Mapping) and "sha256" in row})
+    if len(canonical_bytes(preview)) > 11 * 1024:
+        preview = {key: _preview(payload[key]) for key in (
+            "event", "source_sha256", "classification", "passed", "error", "diagnostic",
+        ) if key in payload}
+    preview["full_observation_sha256"] = digest
+    preview["presentation_only"] = True
+    return preview
+
+
+def mismatch_summary(expected, observed):
+    """Numerical repair clues only; authoritative tolerance remains the host's."""
+    if observed is None:
+        return None
+    samples, maximum, unequal = [], 0.0, 0
+    for index, (want, got) in enumerate(zip(expected, observed)):
+        if want != got:
+            unequal += 1
+            error = abs(want - got) if type(got) in (int, float) else None
+            if error is not None and math.isfinite(error):
+                maximum = max(maximum, error)
+            if len(samples) < 8:
+                samples.append({"index": index, "expected": want, "observed": got,
+                                "absolute_error": error if error is None or math.isfinite(error) else None})
+    return {"expected_count": len(expected), "observed_count": len(observed),
+            "unequal_count": unequal, "max_finite_absolute_error": maximum,
+            "samples": samples, "comparison": "exact differences, not host tolerance"}
+
+
+def memory_presentation(raw, artifacts):
+    """Index every original memory; show readable bounded lessons, not base64."""
+    digest = artifacts.put_bytes(raw)
+    result = {"sha256": digest, "bytes": len(raw), "projects": [],
+              "note": "Presentation only. Full immutable memories available via read-artifact."}
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        result["preview"] = raw[:2048].decode("utf-8", errors="replace")
+        return result
+    if not isinstance(value, dict) or "project_memory_base64" not in value:
+        result["preview"] = _preview(value)
+        if len(canonical_bytes(result)) > 8192:
+            result.pop("preview")
+        return result
+    initial = base64.b64decode(value["initial_memory_base64"], validate=True)
+    result["initial_memory_sha256"] = artifacts.put_bytes(initial)
+    try:
+        seed = json.loads(initial)
+    except (ValueError, UnicodeDecodeError):
+        seed = None
+    seed_entries = seed.get("phase1_memory", []) if isinstance(seed, dict) else []
+    if not seed_entries:
+        initial_preview = _preview(seed) if seed is not None else initial[:2048].decode("utf-8", errors="replace")
+        if len(canonical_bytes(initial_preview)) <= 2048:
+            result["initial_memory_preview"] = initial_preview
+    entries = [(canonical_bytes(entry), "reviewed-phase1") for entry in seed_entries]
+    entries.extend((base64.b64decode(encoded, validate=True), "progressive")
+                   for encoded in value["project_memory_base64"])
+    remaining = 8192
+    for content, origin in entries:
+        project = json.loads(content)
+        row = {"sha256": artifacts.put_bytes(content),
+               "origin": origin,
+               "project_id": project.get("project_spec", {}).get("project_id")}
+        lessons = _preview(project.get("agent_lessons", []))
+        size = len(canonical_bytes(lessons))
+        if size <= remaining:
+            row["lessons"] = lessons
+            remaining -= size
+        result["projects"].append(row)
+    return result
+
+
+def read_artifact(payload, artifacts):
+    """Read up to 8 KiB from a hash-verified artifact, using byte offsets."""
+    content = artifacts.read_bytes(payload["sha256"])
+    offset, limit = payload.get("offset", 0), payload.get("limit", PAGE_BYTES)
+    page = content[offset:offset + limit]
+    # Base64 pages are exact even when a UTF-8 character crosses a byte boundary.
+    return {"event": "artifact-page", "sha256": payload["sha256"],
+            "offset": offset, "size_bytes": len(content),
+            "next_offset": offset + len(page) if offset + len(page) < len(content) else None,
+            "text": page.decode("utf-8", errors="replace"),
+            "base64": base64.b64encode(page).decode("ascii")}
