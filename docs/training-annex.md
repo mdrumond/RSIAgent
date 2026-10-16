@@ -55,6 +55,11 @@ reports. A complete package describes a committed prefix; it need not mean the
 campaign reached its requested project budget. `allow_pending=True` explicitly
 creates a `pending-checkpoint` with all gaps listed, suitable for carrying an
 unfinished continuation. No claim of complete evidence is made for that package.
+An unverified single-project wave may be closed with `closed-failure.json`
+containing its wave fingerprint and raw outcome SHA-256. Inventory authenticates
+that marker, branch identity, memory delta and execution evidence before treating
+the failure as complete retained evidence. It never becomes a verified
+publication; an existing `pending.json` still makes the package pending.
 Pause writers for packaging: changes to the selected inventory while copying
 abort the archive and remove its partial output. Existing archives are never
 overwritten.
