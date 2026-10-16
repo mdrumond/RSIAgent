@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from copy import deepcopy
 import json
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -462,8 +463,10 @@ class DirectActorDriver:
             ),
         })
         self._trace("message", messages[-1])
-        working = continuation.working_context
-        working.append(messages[-1])
+        working = deepcopy(continuation.working_context)
+        # Terminal schema and admitted citation identities must survive repairs:
+        # they are instructions, not history that a work log may fold away.
+        working.pinned.append(dict(messages[-1]))
         tokens = outcome.tokens or 0
         for correction in range(_MAX_DISTILLATION_ATTEMPTS):
             turn = outcome.iterations + correction + 1
@@ -480,7 +483,7 @@ class DirectActorDriver:
                 continuation.recorder.failure(
                     exc, stage="distillation", turn=turn,
                 )
-                return outcome
+                return replace(outcome, tokens=tokens)
             continuation.recorder.response(
                 completion.text, stage="distillation", turn=turn,
             )
@@ -499,8 +502,7 @@ class DirectActorDriver:
                         "or rerun kernel actions."
                     )},
                 ))
-                for message in messages[-2:]:
-                    working.append(message)
+                working.tail = [dict(message) for message in messages[-2:]]
                 self._trace("message", messages[-1])
                 continue
             return ActorOutcome(

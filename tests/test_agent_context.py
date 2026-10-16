@@ -137,3 +137,73 @@ def test_request_size_counts_unicode_and_wire_metadata():
     assert request_bytes({"messages": [{"content": "é"}]}) > len("é")
     with pytest.raises(ValueError):
         ContextBudget(1024, 2000, 3000)
+
+
+def test_legacy_written_and_run_observations_pin_only_current_candidate():
+    working = WorkingContext([])
+    for observation in ({"event": "written", "slot": "kernel", "sha256": "a" * 64},
+                        {"event": "run", "passed": True, "status": "passed"}):
+        working.append({"role": "user", "content": json.dumps({"host": observation})})
+    assert working.host_state["run"]["passed"] is True
+    working.append({"role": "user", "content": json.dumps({"host": {
+        "event": "written", "slot": "kernel", "sha256": "b" * 64}})})
+    assert working.host_state["source_sha256"] == "b" * 64
+    assert "run" not in working.host_state
+
+
+def test_distillation_schema_and_citation_map_survive_correction_compaction(tmp_path):
+    calls, distill_calls = [], []
+    def transport(**kw):
+        request = kw["request"]
+        calls.append(request)
+        if request["messages"][0]["content"].startswith("Update a compact working log"):
+            return DirectCompletion("Retain host verification and citation identity.", 7)
+        if len(calls) == 1:
+            return DirectCompletion('{"submit":{}}', 1)
+        distill_calls.append(request)
+        return DirectCompletion("x" * 3500 if len(distill_calls) == 1 else
+            '{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    provider = DirectCompletionProvider(ENV, transport=transport,
+        context_budgets={profile.identity.backend_model.value: BUDGET})
+    actor = DirectActorDriver(provider, system_prompt="kernel actions only")
+    workspace = tmp_path / "project/actor"
+    workspace.mkdir(parents=True)
+    outcome = actor("task", profile=profile, workspace=workspace, context=None,
+        turn_parser=parse_trial_action, action_executor=lambda _: ActionOutcome(
+            json.dumps({"host": {"event": "done", "detail": "terminal" * 10}}), terminal=True,
+            admitted_artifacts={"a" * 64: "host-verification"}))
+    outcome.continuation.working_context.recent[:0] = [
+        {"role": "assistant", "content": "old repair" * 40},
+        {"role": "user", "content": "old diagnostic" * 40},
+    ]
+    actor.distill(outcome)
+    assert len(distill_calls) == 2
+    assert any(call["messages"][0]["content"].startswith("Update a compact working log") for call in calls)
+    for request in distill_calls:
+        text = json.dumps(request)
+        assert "no_new_knowledge" in text and "a" * 64 in text
+
+
+def test_distillation_infrastructure_failure_retains_summary_usage(tmp_path):
+    calls = []
+    def transport(**kw):
+        calls.append(kw["request"])
+        if len(calls) == 1:
+            return DirectCompletion('{"submit":{}}', 1)
+        if kw["request"]["messages"][0]["content"].startswith("Update a compact working log"):
+            return DirectCompletion("Host terminal result retained.", 7)
+        raise TimeoutError()
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    provider = DirectCompletionProvider(ENV, transport=transport,
+        context_budgets={profile.identity.backend_model.value: ContextBudget(5000, 3500, 15000)})
+    actor = DirectActorDriver(provider, system_prompt="system")
+    workspace = tmp_path / "project/actor"
+    workspace.mkdir(parents=True)
+    outcome = actor("task", profile=profile, workspace=workspace, context=None,
+        turn_parser=parse_trial_action, action_executor=lambda _: ActionOutcome(
+            json.dumps({"host": {"event": "done", "detail": "x" * 2400}}), terminal=True))
+    # Additional earlier exchange forces a successful work-log update before timeout.
+    outcome.continuation.working_context.recent.insert(0, {"role": "user", "content": "old repair" * 30})
+    result = actor.distill(outcome)
+    assert result.tokens >= 8

@@ -39,6 +39,11 @@ these request events or the request CAS artifacts to reconstruct actual inputs.
 
 Terminal distillation also applies the budget and bounded host evidence views.
 Complete evidence stays in content-addressed storage, not in repeated prompts.
+Its schema and admitted citation map remain pinned through correction attempts,
+outside the work log; only the latest invalid response/correction is retained in
+the correction tail. A provider outage during distillation retains usage from
+successful summaries. Context-budget aborts are recorded as failed local Actor
+validation with `abort_status=context-budget-exhausted`, not infrastructure loss.
 
 Run focused regressions with:
 

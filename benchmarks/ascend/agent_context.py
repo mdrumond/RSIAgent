@@ -46,6 +46,8 @@ class WorkingContext:
         self.recent = [dict(item) for item in messages[2:]]
         self.work_log = ""
         self.host_state = {}
+        self.pinned = []
+        self.tail = []
 
     def append(self, message):
         self.recent.append(dict(message))
@@ -58,6 +60,8 @@ class WorkingContext:
         if not isinstance(host, dict):
             return
         source = host.get("source_sha256")
+        if host.get("event") == "written":
+            source = host.get("sha256", source)
         if source and source != self.host_state.get("source_sha256"):
             self.host_state = {"source_sha256": source}
         # Copy only host-origin identity/status facts; never consult agent text.
@@ -76,7 +80,7 @@ class WorkingContext:
         if self.host_state:
             middle.append({"role": "user", "content": "Host-owned current state:\n" +
                            json.dumps(self.host_state, sort_keys=True)})
-        return self.fixed + middle + self.recent
+        return self.fixed + middle + self.recent + self.pinned + self.tail
 
     def prepare(self, profile, budget, summarize):
         if request_bytes(profile.request(self.messages())) <= budget.high:
