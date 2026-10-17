@@ -567,7 +567,8 @@ class CurriculumAgent:
         verified_outcomes = tuple(
             item for item in context.prior_outcomes if item.verified
         )
-        prior_ids = {item.project_id for item in context.prior_outcomes}
+        prior_ids = {item.project_id for item in (
+            context.prior_outcomes if self.require_fresh_project_ids else verified_outcomes)}
         prior_information = {
             item.information.comparison_sha256 for item in verified_outcomes
         }

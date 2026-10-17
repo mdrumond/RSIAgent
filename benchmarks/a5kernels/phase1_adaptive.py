@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from copy import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -43,15 +44,24 @@ DELTA_SCHEMA = "a5-phase1-adaptive-memory-delta-v1"
 def retained_failure_outcome(root: Path, wave_id: str, project: ProjectSpec) -> dict:
     """Concise selection feedback, backed by the retained branch evidence."""
     branch = root / "waves" / wave_id / "branches" / project.project_id
-    evidence = json.loads((branch / "execution-evidence.bin").read_bytes())
+    try:
+        evidence = json.loads((branch / "execution-evidence.bin").read_bytes())
+    except (ValueError, UnicodeDecodeError):
+        evidence = {}
+    if not isinstance(evidence, dict):
+        evidence = {}
     outcome = json.loads((branch / "outcome.json").read_bytes())
-    summary = str(evidence.get("summary") or evidence.get("detail")
+    delta = json.loads((branch / "memory-delta.bin").read_bytes())
+    source = evidence.get("source_sha256")
+    if delta.get("schema") == DELTA_SCHEMA:
+        source = source or json.loads(base64.b64decode(delta["memory_base64"], validate=True))["source_revision"]
+    summary = str(delta.get("summary") or evidence.get("summary") or evidence.get("detail")
                   or "Completed attempt without host verification").strip()
     return {"project_id": project.project_id, "spec": project.as_dict(), "verified": False,
             "summary": summary[:1200].rstrip(),
             "evidence": {"path": str(branch.relative_to(root)),
                          "sha256": outcome["evidence_sha256"],
-                         "source_sha256": evidence.get("source_sha256"),
+                         "source_sha256": source,
                          "classification": outcome["classification"],
                          "iterations": evidence.get("iterations"), "tokens": evidence.get("tokens"),
                          "actor_status": evidence.get("actor_status"),
@@ -137,7 +147,8 @@ class AdaptivePhase1Coordinator:
         self.root = Path(root)
         self.objective = objective.strip()
         self.initial_memory = initial_memory
-        self.curriculum = curriculum
+        self.curriculum = copy(curriculum)
+        self.curriculum.require_fresh_project_ids = True
         self.execute_project = execute_project
         self.max_parallel = max_parallel
         if max_projects is not None and (type(max_projects) is not int or max_projects < 1):

@@ -2,6 +2,7 @@
 from dataclasses import replace
 import json
 import base64
+import hashlib
 
 import pytest
 
@@ -135,14 +136,63 @@ def test_all_failed_wave_selects_again_and_failed_id_is_rejected(tmp_path):
             return _result(request.spec, False, "observed host mismatch")
         return verified(request)
 
-    report = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED,
-        CurriculumAgent(select), execute, max_parallel=1, project_target=1).run()
+    curriculum = CurriculumAgent(select, require_fresh_project_ids=False)
+    coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED,
+        curriculum, execute, max_parallel=1, project_target=1)
+    assert not curriculum.require_fresh_project_ids
+    assert coordinator.curriculum.require_fresh_project_ids
+    report = coordinator.run()
     assert calls == ["failed", "fresh-smaller"]
     assert report["successful_projects"] == report["failed_projects"] == 1
     assert "prior project ID" in contexts[-1]
     published = json.loads((tmp_path / "waves/wave-001/published.json").read_bytes())
     assert published["commits"] == []
     assert published["skipped_projects"] == ["failed"]
+
+
+@pytest.mark.parametrize("payload", [b"raw host execution report", b"\xff\x00", b"[1,2]", b"null"])
+def test_opaque_failed_evidence_is_preserved_through_publication_resume_and_annex(tmp_path, monkeypatch, payload):
+    from benchmarks.a5kernels.phase1_project import ExecutionEvidence, EvidenceClassification
+    (tmp_path / "initial-memory.bin").write_bytes(SEED)
+    calls, prompts = [], []
+    def select(messages):
+        prompt = messages[-1]["content"]
+        prompts.append(json.loads(prompt.rsplit("\n", 1)[-1]))
+        name = "opaque-failure" if len(prompts) == 1 else "smaller-probe"
+        return _wave(prompt, [project(name, 32 if len(prompts) == 1 else 16)])
+    def execute(request):
+        calls.append(request.spec.project_id)
+        result = verified(request, low_yield=True)
+        if request.spec.project_id == "opaque-failure":
+            return replace(result, evidence=ExecutionEvidence(EvidenceClassification.HOST_MISMATCH,
+                                                              "observed mismatch"),
+                           evidence_payload=payload, summary="observed host mismatch")
+        return result
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
+                                          execute, max_parallel=1, project_target=1)
+    controller = make()
+    atomic = controller._atomic_json
+    def crash(path, value):
+        if path.name == "state.json" and value.get("wave_index") == 2:
+            raise RuntimeError("simulated after publication")
+        atomic(path, value)
+    monkeypatch.setattr(controller, "_atomic_json", crash)
+    with pytest.raises(RuntimeError, match="simulated"):
+        controller.run()
+    monkeypatch.undo()
+    report = make().resume()
+    assert calls == ["opaque-failure", "smaller-probe"]
+    assert report["successful_projects"] == report["failed_projects"] == 1
+    feedback = prompts[-1]["curriculum_memory"][-1]
+    assert feedback["summary"] == "observed host mismatch"
+    branch = tmp_path / feedback["evidence"]["path"]
+    assert (branch / "execution-evidence.bin").read_bytes() == payload
+    assert feedback["evidence"]["sha256"] == hashlib.sha256(payload).hexdigest()
+    delta = json.loads((branch / "memory-delta.bin").read_bytes())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    assert feedback["evidence"]["source_sha256"] == memory["source_revision"]
+    assert inventory_campaign(tmp_path)["complete"]
 
 
 @pytest.mark.parametrize("failure", [RuntimeError("transport unavailable"), ValueError("bad provider")])
