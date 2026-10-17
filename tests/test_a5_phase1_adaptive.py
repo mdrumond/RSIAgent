@@ -505,3 +505,15 @@ def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
     assert effective.get("learning_focus", []) == (spec["learning_focus"] if observed else [])
     gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
     assert all((focus not in gaps) == observed for focus in spec["learning_focus"])
+
+
+@pytest.mark.parametrize("device_capture", [False, True])
+def test_timing_counts_only_retained_msprof_capture_even_without_requested_focus(device_capture):
+    summary = {"timing": [{"device_kernel": {"duration_us": 2}}] if device_capture else []}
+    spec = _project("timed", "gm-ub-movement")
+    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+        base64.b64encode(json.dumps({"host_facts": [
+            {"category": "performance-study", "statement": json.dumps(summary)},
+        ]}).encode()).decode()]}
+    gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
+    assert ("tool-msprof" not in gaps) == device_capture
