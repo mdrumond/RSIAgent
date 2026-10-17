@@ -9,7 +9,7 @@ from benchmarks.a5kernels.source_acquisition import acquire_source, acquire_sour
 
 
 @pytest.fixture
-def upstream(tmp_path):
+def upstream(tmp_path, monkeypatch):
     root = tmp_path / "upstream"
     root.mkdir()
     git("init", "--quiet", cwd=root)
@@ -27,6 +27,15 @@ def upstream(tmp_path):
     (root / "link.py").symlink_to("kernel.py")
     git("add", ".", cwd=root)
     git("commit", "--quiet", "-m", "sources", cwd=root)
+    published = tmp_path / "published.git"
+    git("clone", "--quiet", "--bare", str(root), str(published))
+
+    def local_transport(*args, **kwargs):
+        if args[0] == "fetch":
+            args = tuple(str(published) if arg == "origin" else arg for arg in args)
+        return git(*args, **kwargs)
+
+    monkeypatch.setattr("benchmarks.a5kernels.source_acquisition.git", local_transport)
     return root
 
 
@@ -71,6 +80,29 @@ def test_local_clone_must_match_real_upstream(upstream, tmp_path):
     wrong = {**spec(), "repository": "https://different.test/source.git"}
     with pytest.raises(ValueError, match="origin"):
         acquire_source(wrong, tmp_path / "artifacts", upstream)
+
+
+@pytest.mark.parametrize("pinned", [False, True])
+def test_reuse_rejects_clean_unpublished_commit(upstream, tmp_path, pinned):
+    (upstream / "kernel.py").write_text("unpublished = True\n")
+    git("add", "kernel.py", cwd=upstream)
+    git("commit", "--quiet", "-m", "local only", cwd=upstream)
+    revision = git("rev-parse", "HEAD", cwd=upstream)
+    requested = {**spec(), "revision": revision} if pinned else spec()
+    assert git("status", "--porcelain", cwd=upstream) == ""
+    with pytest.raises(ValueError, match="not reachable from upstream"):
+        acquire_source(requested, tmp_path / "artifacts", upstream)
+    assert not (tmp_path / "artifacts" / "kernel" / revision).exists()
+
+
+def test_reuse_can_select_published_ancestor_of_local_head(upstream, tmp_path):
+    revision = git("rev-parse", "HEAD", cwd=upstream)
+    (upstream / "kernel.py").write_text("local = True\n")
+    git("add", "kernel.py", cwd=upstream)
+    git("commit", "--quiet", "-m", "local only", cwd=upstream)
+    result = acquire_source({**spec(), "revision": revision}, tmp_path / "artifacts", upstream)
+    assert result["revision"] == revision
+    assert (Path(result["root"]) / "kernel.py").read_text().startswith("def add")
 
 
 def test_partial_success_preserved_and_errors_sanitized(upstream, tmp_path):

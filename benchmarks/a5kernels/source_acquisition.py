@@ -152,6 +152,16 @@ def acquire_source(spec: dict, destination: Path, reuse: Path | None = None) -> 
                 git("fetch", "--quiet", "--depth=1", "origin", requested, cwd=root)
                 git("checkout", "--quiet", "--detach", requested, cwd=root)
             revision = git("rev-parse", "HEAD", cwd=root)
+            if reuse is not None:
+                # A matching origin URL does not establish that local HEAD was
+                # published. Fetch upstream refs into a separate namespace so
+                # cloned local branches cannot count as provenance evidence.
+                git("fetch", "--quiet", "--no-tags", "origin",
+                    "+refs/heads/*:refs/upstream-verification/heads/*",
+                    "+refs/tags/*:refs/upstream-verification/tags/*", cwd=root)
+                if not git("for-each-ref", "--format=%(refname)",
+                           "--contains=" + revision, "refs/upstream-verification/", cwd=root):
+                    raise ValueError("reused commit is not reachable from upstream branches or tags")
             target = base / revision
             if not target.exists():
                 os.replace(root, target)
