@@ -559,11 +559,13 @@ def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tm
         ])
     def execute(request):
         calls.append(request.spec.project_id)
-        return _result(request.spec, request.spec.project_id != "second", "observed")
+        if request.spec.project_id == "second":
+            raise RuntimeError("interrupted before terminal outcome")
+        return _result(request.spec, True, "observed")
     def campaign(target):
         return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
             CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
-    with pytest.raises(RuntimeError, match="not verified"):
+    with pytest.raises(RuntimeError, match="failed before verification"):
         campaign(3).run()
     assert campaign(3).report()["pending_wave"]["projects"][0]["status"] == "verified"
     files = {path: (path.read_bytes(), path.stat().st_mtime_ns)
