@@ -13,8 +13,10 @@ from typing import Mapping
 
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel
+from benchmarks.a5kernels.phase2_adaptive_memory import AdaptivePhase1Snapshot
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies, Phase2LiveRunner
 from benchmarks.a5kernels.phase2_memory import (
+    ADAPTIVE_CELL_SCHEMA,
     A5Phase1Snapshot,
     A5Phase2Cell,
     QUALIFICATION_SCHEMA,
@@ -143,6 +145,9 @@ def _qualification_provenance(
         )
     ):
         raise ValueError("invalid Phase 2 transport qualification")
+    if (cell.schema == ADAPTIVE_CELL_SCHEMA
+            and not provenance_map.get("cann_version", "").startswith("9.3")):
+        raise ValueError("adaptive Phase 3 admission requires the checked CANN 9.3 runtime")
     assert isinstance(record_sha256, str)
     return record_sha256, payload, provenance
 
@@ -238,7 +243,11 @@ def admit_phase2_lineage(
         raise ValueError("Phase 3 benchmark admission requires an OpenAI Phase 2 cell")
     phase2_root = Path(phase2_root).resolve()
     cell_root = phase2_root / "cells" / cell.cell_id
-    snapshot = A5Phase1Snapshot.open(cell_root / "snapshot", cell)
+    snapshot_type = (
+        AdaptivePhase1Snapshot
+        if cell.schema == ADAPTIVE_CELL_SCHEMA else A5Phase1Snapshot
+    )
+    snapshot = snapshot_type.open(cell_root / "snapshot", cell)
 
     def forbidden(*_args, **_kwargs):
         raise AssertionError("Phase 3 admission must not execute Phase 2")
