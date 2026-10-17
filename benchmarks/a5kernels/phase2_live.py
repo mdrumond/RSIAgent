@@ -415,7 +415,7 @@ class Phase2LiveRunner:
         memory = memories[-1]
         ordinal = int(memory["attempt"])
         source = (
-            self.root / "attempts" / f"attempt-{ordinal:02d}" / "candidate.py"
+            self.root / "attempts" / f"attempt-{ordinal:02d}" / self.source_filename
         ).read_text(encoding="utf-8")
         source_bytes = source.encode("utf-8")
         candidate_sha256 = hashlib.sha256(source_bytes).hexdigest()
