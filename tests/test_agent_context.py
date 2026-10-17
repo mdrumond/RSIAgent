@@ -109,6 +109,51 @@ def test_compaction_transport_failure_is_explicit_noninfra(tmp_path):
                                                      _ProviderEvidenceRecorder(None), turn=3)
 
 
+@pytest.mark.parametrize("stage", ["compaction", "distillation"])
+def test_provider_retry_preserves_compaction_and_distillation_requests(tmp_path, stage):
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    calls, actions, delays = [], [], []
+    class Rejected(Exception):
+        status_code, code, request_id = 400, "invalid_prompt", "req_stage_retry"
+    stage_calls = []
+    def transport(**kw):
+        request = kw["request"]
+        calls.append(request)
+        is_summary = request["messages"][0]["content"].startswith("Update a compact working log")
+        is_distill = "The host has now returned" in request["messages"][-1]["content"]
+        if (stage == "compaction" and is_summary) or (stage == "distillation" and is_distill):
+            stage_calls.append(request)
+            if len(stage_calls) == 1:
+                raise Rejected("not retained")
+        return DirectCompletion("Preserve current source and host facts." if is_summary else
+            '{"distillation":{"no_new_knowledge":true,"lessons":[]}}' if is_distill else
+            '{"submit":{}}', 2)
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    provider = DirectCompletionProvider(ENV, transport=transport, sleeper=delays.append,
+        context_budgets={profile.identity.backend_model.value: BUDGET})
+    actor = DirectActorDriver(provider, system_prompt="kernel actions")
+    workspace = tmp_path / "actor"
+    if stage == "compaction":
+        working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+        working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+        actor._prepare_context(working, profile, _ProviderEvidenceRecorder(workspace), turn=3)
+    else:
+        def execute(action):
+            actions.append(action.kind)
+            return ActionOutcome('{"host":{"event":"done"}}', terminal=True)
+        outcome = actor("task", profile=profile, workspace=workspace, context=None,
+            turn_parser=parse_trial_action, action_executor=execute)
+        actor.distill(outcome)
+    assert delays == [120] and stage_calls[0] == stage_calls[1]
+    assert actions == ([] if stage == "compaction" else ["submit"])
+    rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    stage_rows = [row for row in rows if row.get("stage") == stage]
+    requests = [row for row in stage_rows if row["role"] == "provider-request"]
+    assert [row["attempt"] for row in requests[:2]] == [1, 2]
+    assert requests[0]["sha256"] == requests[1]["sha256"]
+    assert sum(row["role"] == "provider-attempt-rejection" for row in stage_rows) == 1
+
+
 def test_distillation_large_host_data_and_correction_are_bounded(tmp_path):
     calls = []
     def transport(**kw):

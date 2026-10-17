@@ -285,6 +285,49 @@ def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path):
     assert all(row["status"] != "infrastructure-failure" for row in validations)
 
 
+def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import (
+        DirectActorDriver, DirectCompletion, DirectCompletionProvider, ProviderRejectionError, direct_profile,
+    )
+    from benchmarks.a5kernels.sft_dataset import _read_trace
+    import base64
+    raw = b'{"prior":"memory"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    calls = []
+    class Rejected(Exception):
+        status_code, code, request_id = 400, "invalid_prompt", "req_fixture"
+    def transport(**kwargs):
+        calls.append(kwargs["request"])
+        if len(calls) == 1:
+            return DirectCompletion(json.dumps({"read-artifact": {"sha256": digest}}), 1)
+        raise Rejected("credential must not appear")
+    provider = DirectCompletionProvider({"OPENAI_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret"},
+        transport=transport, sleeper=lambda _: None)
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(MODEL_IDENTITIES[0]),
+        trace_recorder_factory=recorder_factory(phase="phase1", round_id="provider-rejection",
+            model="fixture", source_manifest_sha256="a" * 64))
+    with pytest.raises(ProviderRejectionError):
+        driver(request)
+    assert len(calls) == 5 and calls[1:] == [calls[1]] * 4
+    view = json.loads(calls[1]["messages"][-1]["content"])["host"]
+    assert view["text"].encode() == raw and "base64" not in view
+    store = ContentAddressedArtifacts(request.branch_root / "artifacts")
+    raw_page = store.read_json(view["full_observation_sha256"])
+    assert base64.b64decode(raw_page["base64"]) == raw
+    assert store.read_bytes(digest) == raw
+    trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    validations = [row["payload"] for row in trace if row["kind"] == "validation"]
+    assert validations[-1]["status"] == "failed"
+    assert validations[-1]["details"]["abort_status"] == "provider-rejected"
+    assert validations[-1]["details"]["request_id"] == "req_fixture"
+    assert "credential must not appear" not in json.dumps(trace)
+
+
 def test_infrastructure_retry_preserves_failed_trace_and_verified_retry(tmp_path):
     from benchmarks.ascend.training_traces import recorder_factory
     from benchmarks.a5kernels.sft_dataset import _read_trace, _example

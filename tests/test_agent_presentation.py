@@ -10,7 +10,7 @@ from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.trial import parse_trial_action
 from benchmarks.ascend.agent_presentation import (
-    compact_observation, memory_presentation, mismatch_summary, read_artifact,
+    artifact_page_presentation, compact_observation, memory_presentation, mismatch_summary, read_artifact,
 )
 
 
@@ -93,6 +93,37 @@ def test_artifact_pages_exact_bytes_including_unicode_boundaries(tmp_path):
         offset = page["next_offset"]
     assert hashlib.sha256(recovered).hexdigest() == digest
     assert read_artifact({"sha256": digest, "offset": 999999}, store)["next_offset"] is None
+
+
+@pytest.mark.parametrize("raw", [b"plain kernel research\n" * 1000, ("\u20ac\U0001f600" * 2000).encode()])
+def test_readable_pages_preserve_text_and_raw_evidence(tmp_path, raw):
+    store = ContentAddressedArtifacts(tmp_path)
+    digest = store.put_bytes(raw)
+    offset, text = 0, ""
+    while offset is not None:
+        view = artifact_page_presentation({"sha256": digest, "offset": offset}, store)
+        assert "base64" not in view
+        assert view["encoding"] == "utf-8"
+        assert view["page_bytes"] <= 8192
+        original = store.read_json(view["full_observation_sha256"])
+        assert base64.b64decode(original["base64"]) == view["text"].encode()
+        text += view["text"]
+        offset = view["next_offset"]
+    assert text.encode() == raw
+    assert store.read_bytes(digest) == raw
+
+
+def test_binary_and_nonboundary_offset_are_metadata_only(tmp_path):
+    store = ContentAddressedArtifacts(tmp_path)
+    for raw, offset in [(b"\xff\x00binary", 0), ("\u20ac\u20ac".encode(), 1)]:
+        digest = store.put_bytes(raw)
+        view = artifact_page_presentation({"sha256": digest, "offset": offset, "limit": 4}, store)
+        assert view["text_available"] is False
+        assert "text" not in view and "base64" not in view
+        page = store.read_json(view["full_observation_sha256"])
+        assert base64.b64decode(page["base64"]) == raw[offset:offset + 4]
+    with pytest.raises(ValueError, match="codepoint"):
+        artifact_page_presentation({"sha256": digest, "limit": 1}, store)
 
 
 @pytest.mark.parametrize("extra", [{"limit": 8193}, {"offset": -1}, {"limit": True},

@@ -232,6 +232,7 @@ _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON obj
 {"request-sanitizer":{"tool":"memcheck"}}, or {"submit":{}}.
 Adaptive projects also support {"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}.
 Read full retained evidence in byte pages (maximum 8192 bytes); follow next_offset.
+UTF-8 pages contain readable text, not base64; binary pages return metadata only.
 Diagnostic actions are bound by adaptive projects; sanitizer tool can also be racecheck,
 initcheck, or synccheck. Diagnostic observations never establish correctness or timing.
 You cannot choose paths or commands and cannot report a score or authoritative result."""

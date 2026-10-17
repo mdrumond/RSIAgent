@@ -155,3 +155,34 @@ def read_artifact(payload, artifacts):
             "next_offset": offset + len(page) if offset + len(page) < len(content) else None,
             "text": page.decode("utf-8", errors="replace"),
             "base64": base64.b64encode(page).decode("ascii")}
+
+
+def artifact_page_presentation(payload, artifacts):
+    """Readable Actor view; byte-exact pages remain available in the CAS.
+
+    Valid UTF-8 pages end on a codepoint boundary. Binary content and offsets
+    inside a codepoint return metadata, never an opaque encoded blob.
+    """
+    raw = read_artifact(payload, artifacts)
+    content = artifacts.read_bytes(payload["sha256"])
+    offset, limit = raw["offset"], payload.get("limit", PAGE_BYTES)
+    view = {key: value for key, value in raw.items() if key not in {"text", "base64"}}
+    try:
+        content.decode("utf-8")
+        content[:offset].decode("utf-8")
+    except UnicodeDecodeError:
+        view.update(encoding="binary", text_available=False,
+                    note="No UTF-8 preview at this byte offset; exact bytes remain in the retained artifact.")
+    else:
+        page = content[offset:offset + limit]
+        # Only a trailing partial codepoint can remain after the checks above.
+        text = page.decode("utf-8", errors="ignore")
+        consumed = len(text.encode("utf-8"))
+        if page and not consumed:
+            raise ValueError("page limit cannot fit the next UTF-8 codepoint; use limit >= 4")
+        view.update(encoding="utf-8", text_available=True, text=text,
+                    next_offset=offset + consumed if offset + consumed < len(content) else None)
+        raw = read_artifact({**payload, "limit": consumed or limit}, artifacts)
+    view["page_bytes"] = len(base64.b64decode(raw["base64"]))
+    view["full_observation_sha256"] = artifacts.put_json(raw)
+    return view

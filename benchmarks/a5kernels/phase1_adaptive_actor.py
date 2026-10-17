@@ -11,7 +11,7 @@ from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.ascend.agent_presentation import (
-    compact_observation, memory_presentation, mismatch_summary, read_artifact,
+    artifact_page_presentation, compact_observation, memory_presentation, mismatch_summary,
 )
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.phase1_adaptive import (
@@ -215,7 +215,7 @@ class _ProjectActions:
             return self._observation({"event": "proposal-recorded"})
         if action.kind == "read-artifact":
             try:
-                page = read_artifact(action.payload, self.artifacts)
+                page = artifact_page_presentation(action.payload, self.artifacts)
             except (ValueError, FileNotFoundError) as exc:
                 return self._observation({"error": str(exc)})
             return ActionOutcome(canonical_bytes({"host": page}).decode("ascii"),
@@ -582,13 +582,18 @@ class AdaptiveActorProjectExecutor:
         except Exception as exc:
             if recorder is not None:
                 from benchmarks.ascend.agent_context import ContextBudgetError
+                from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
                 context_abort = isinstance(exc, ContextBudgetError)
-                digest = artifacts.put_json({"exception": type(exc).__name__, "detail": str(exc)})
+                provider_abort = isinstance(exc, ProviderRejectionError)
+                abort_details = ({"abort_status": "context-budget-exhausted"} if context_abort else
+                                 {"abort_status": "provider-rejected", **exc.evidence()} if provider_abort else {})
+                digest = artifacts.put_json(exc.evidence() if provider_abort else
+                                            {"exception": type(exc).__name__, "detail": str(exc)})
                 recorder.validation(
                     candidate_id=actions.source_sha256 or "no-candidate", validator="actor-abort",
-                    status="failed" if context_abort else "infrastructure-failure", evidence_sha256=digest,
+                    status="failed" if context_abort or provider_abort else "infrastructure-failure", evidence_sha256=digest,
                     candidate_sha256=actions.source_sha256 or "0" * 64,
-                    details={"abort_status": "context-budget-exhausted"} if context_abort else {},
+                    details=abort_details,
                 )
                 recorder.finish()
             raise
