@@ -171,6 +171,50 @@ def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     assert after["memory_bytes_base64"] == before["memory_bytes_base64"]
 
 
+def test_resume_rejects_reordered_focus_without_rewriting_retained_evidence(tmp_path):
+    retained = _project("published", "gm-ub-movement")
+    retained["learning_focus"] = ["sync-performance", "pipe-mte2"]
+    proposal = {**retained, "project_id": "renamed",
+                "learning_focus": retained["learning_focus"][::-1]}
+    calls = []
+
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return _wave(messages[-1]["content"], [retained])
+        return "DECISION: WAVE\n{broken"
+
+    executions = []
+    def execute(request):
+        executions.append(request.spec.project_id)
+        return _result(request.spec, True, "retained host evidence")
+
+    def campaign(provider):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn focus", SEED,
+            CurriculumAgent(provider), execute, max_parallel=1)
+
+    with pytest.raises(ValueError, match="3 attempts"):
+        campaign(complete).run()
+    before_state = json.loads((tmp_path / "state.json").read_bytes())
+    retained_files = {path: path.read_bytes() for path in (tmp_path / "waves").rglob("*")
+                      if path.is_file()}
+    replay_calls = []
+    def replay(messages):
+        replay_calls.append(messages)
+        if len(replay_calls) == 1:
+            return _wave(messages[-1]["content"], [proposal])
+        assert "repeats prior information" in messages[-1]["content"]
+        return 'DECISION: SATURATED\n{"reason":"retained project already covers focus"}'
+
+    report = campaign(replay).resume()
+    assert report["published_projects"] == ["published"]
+    assert executions == ["published"]
+    assert all(path.read_bytes() == value for path, value in retained_files.items())
+    after_state = json.loads((tmp_path / "state.json").read_bytes())
+    assert after_state["prior_outcomes"] == before_state["prior_outcomes"]
+    assert after_state["memory_bytes_base64"] == before_state["memory_bytes_base64"]
+
+
 def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_path):
     selection_prompts = []
 

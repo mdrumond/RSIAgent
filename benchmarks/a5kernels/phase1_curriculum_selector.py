@@ -136,6 +136,18 @@ class ProjectInformation:
             ),
         }
 
+    @property
+    def comparison_sha256(self) -> str:
+        """Order-independent admission key, separate from retained identities.
+
+        Keep serialization unchanged so historical specs, prompts, and evidence
+        retain their original hashes when a campaign resumes.
+        """
+        value = self.as_dict()
+        if self.learning_focus:
+            value["learning_focus"] = sorted(self.learning_focus)
+        return canonical_digest(value)
+
 
 @dataclass(frozen=True)
 class PriorOutcome:
@@ -545,12 +557,14 @@ class CurriculumAgent:
         )
         prior_ids = {item.project_id for item in (
             context.prior_outcomes if self.require_fresh_project_ids else verified_outcomes)}
-        prior_information = {item.information_sha256 for item in verified_outcomes}
+        prior_information = {
+            item.information.comparison_sha256 for item in verified_outcomes
+        }
         information = tuple(
             ProjectInformation.from_project(item.spec) for item in wave.projects
         )
         signatures = tuple(
-            canonical_digest(item.as_dict()) for item in information
+            item.comparison_sha256 for item in information
         )
         if any(item.spec.project_id in prior_ids for item in wave.projects):
             raise ValueError("wave repeats a prior project ID")

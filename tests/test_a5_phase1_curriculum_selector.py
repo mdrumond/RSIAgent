@@ -492,6 +492,51 @@ def test_long_explanations_and_distinct_learning_focus_are_admitted():
     assert decision.wave.projects[0].spec.hypothesis == first["hypothesis"].strip()
 
 
+@pytest.mark.parametrize("reverse_prior", [False, True])
+def test_learning_focus_order_does_not_distinguish_verified_prior(reverse_prior):
+    focus = ["sync-performance", "pipe-mte2"]
+    prior_focus = focus[::-1] if reverse_prior else focus
+    prior = outcome(project("old", learning_focus=prior_focus))
+    proposal = project("new", learning_focus=prior_focus[::-1])
+    with pytest.raises(ValueError, match="repeats prior information"):
+        CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
+
+
+def test_learning_focus_order_does_not_distinguish_siblings():
+    first = project("first", learning_focus=["sync-performance", "pipe-mte2"])
+    second = project("second", learning_focus=["pipe-mte2", "sync-performance"])
+    with pytest.raises(ValueError, match="repeats executable information between siblings"):
+        CurriculumAgent(lambda _: wave([first, second])).select(context())
+
+
+def test_different_learning_focus_set_still_adds_information():
+    prior = outcome(project("old", learning_focus=["sync-performance", "pipe-mte2"]))
+    proposal = project("new", learning_focus=["pipe-mte2", "sync-correctness"])
+    decision, _ = CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
+    assert isinstance(decision, WaveDecision)
+
+
+def test_focus_comparison_keeps_historical_serialization_and_identity():
+    from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+
+    original = project(learning_focus=["sync-performance", "pipe-mte2"])
+    stored = canonical_bytes(original)
+    restored = ProjectSpec.from_mapping(json.loads(stored))
+    information = ProjectInformation.from_project(restored)
+    serialized_information = canonical_bytes(information.as_dict())
+    prior = outcome(original)
+    historical_identity = canonical_digest(json.loads(serialized_information))
+    reversed_information = ProjectInformation.from_project(
+        project(learning_focus=original["learning_focus"][::-1]))
+    assert information.comparison_sha256 == reversed_information.comparison_sha256
+    assert canonical_bytes(restored.as_dict()) == stored
+    assert canonical_bytes(information.as_dict()) == serialized_information
+    assert prior.information_sha256 == historical_identity
+    assert project_information_sha256(restored) == historical_identity
+    assert prior.information_sha256 != canonical_digest(reversed_information.as_dict())
+
+
 def test_wave_cannot_overshoot_remaining_target():
     reply = wave([project(), project("second", learning_focus=["debug-print"])])
     with pytest.raises(ValueError, match="remaining project target"):
