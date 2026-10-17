@@ -191,6 +191,7 @@ class CurriculumContext:
     pre_wave_coverage: tuple[Capability, ...]
     prior_outcomes: tuple[PriorOutcome, ...]
     remaining_projects: int = 64
+    curriculum_memory: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -374,6 +375,7 @@ def curriculum_prompt(
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
         "prior_outcomes": [item.prompt_dict() for item in context.prior_outcomes],
+        "curriculum_memory": list(context.curriculum_memory),
         "bounded_project_grammar": (
             _grammar() if target_policy is None else target_policy.grammar(_grammar())
         ),
@@ -384,6 +386,10 @@ def curriculum_prompt(
         ]
     instructions = (
         "Choose DECISION: WAVE for useful experiments informed by prior outcomes. "
+        "Use curriculum_memory to avoid repeating low-yield or failed strategies. "
+        "A failed attempt is not kernel knowledge or a permanent operation ban: "
+        "a smaller, changed experiment with a fresh ID may still be useful. "
+        "no_new_knowledge means verified execution yielded no reusable lesson. "
         "Coverage dimensions are advisory: new exact shapes within a covered shape "
         "class and new combinations of covered dimensions are allowed. Avoid exact "
         "repeats of verified prior or sibling project information; changing only "
@@ -561,8 +567,7 @@ class CurriculumAgent:
         verified_outcomes = tuple(
             item for item in context.prior_outcomes if item.verified
         )
-        prior_ids = {item.project_id for item in (
-            context.prior_outcomes if self.require_fresh_project_ids else verified_outcomes)}
+        prior_ids = {item.project_id for item in context.prior_outcomes}
         prior_information = {
             item.information.comparison_sha256 for item in verified_outcomes
         }

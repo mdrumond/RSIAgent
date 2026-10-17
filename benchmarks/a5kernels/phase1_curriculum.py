@@ -460,7 +460,7 @@ class WaveConsolidation:
 
 
 def consolidate_wave(
-    wave: WaveSpec, outcomes: Sequence[ProjectOutcome],
+    wave: WaveSpec, outcomes: Sequence[ProjectOutcome], *, allow_semantic_failures: bool = False,
 ) -> WaveConsolidation:
     """Validate a complete barrier, then describe atomic authored-order commits."""
 
@@ -483,7 +483,7 @@ def consolidate_wave(
         for project_id in expected
     ):
         raise ValueError("project outcomes must match the current wave assignments")
-    if any(not by_id[project_id].verified for project_id in expected):
+    if not allow_semantic_failures and any(not by_id[project_id].verified for project_id in expected):
         raise ValueError("every project must be verified before memory publication")
     commits = tuple(
         ConsolidationCommit(
@@ -491,7 +491,8 @@ def consolidate_wave(
             by_id[project_id].memory_delta_sha256,
         )
         for commit_ordinal, (authored_ordinal, project_id) in enumerate(
-            enumerate(expected, 1), 1
+            ((ordinal, project_id) for ordinal, project_id in enumerate(expected, 1)
+             if by_id[project_id].verified), 1
         )
     )
     return WaveConsolidation(wave.wave_id, wave.pre_wave_memory_sha256, commits)

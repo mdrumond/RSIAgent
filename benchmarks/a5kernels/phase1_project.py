@@ -430,6 +430,7 @@ def evaluate_reference(spec: "ProjectSpec", inputs: Sequence[HostTensor]) -> Ref
 
 
 class EvidenceClassification(str, Enum):
+    ACTOR_UNVERIFIED = "actor-unverified"
     COMPILE_FAILURE = "compile-failure"
     RUNTIME_FAILURE = "runtime-failure"
     HOST_MISMATCH = "host-mismatch"

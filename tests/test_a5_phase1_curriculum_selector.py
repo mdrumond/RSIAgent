@@ -481,13 +481,14 @@ def test_terminal_decisions_require_host_observations_and_hide_held_out_names():
             CurriculumAgent(lambda _, reply=reply: reply).select(context())
 
 
-def test_unverified_prior_can_be_retried_and_does_not_count_as_coverage():
+def test_unverified_prior_can_be_revisited_with_fresh_id_and_does_not_count_as_coverage():
     item = project()
     failed = PriorOutcome(
         "movement", ProjectInformation.from_project(item), False,
         "candidate failed host verification",
     )
-    decision, _ = CurriculumAgent(lambda _: wave([item])).select(
+    fresh = {**item, "project_id": "fresh-attempt"}
+    decision, _ = CurriculumAgent(lambda _: wave([fresh])).select(
         context(prior_outcomes=(failed,))
     )
     assert isinstance(decision, WaveDecision)

@@ -94,8 +94,7 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
     @staticmethod
     def _effective_outcomes(state):
         return [*state.get("seed_outcomes", []),
-                *AdaptivePhase1Coordinator._effective_outcomes(state),
-                *state.get("failed_outcomes", [])]
+                *AdaptivePhase1Coordinator._effective_outcomes(state)]
 
     def _context(self, state, snapshot):
         return replace(super()._context(state, snapshot), remaining_projects=1)

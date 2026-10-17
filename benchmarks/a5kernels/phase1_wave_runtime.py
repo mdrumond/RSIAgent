@@ -33,6 +33,18 @@ OUTCOME_SCHEMA = "a5-phase1-live-wave-outcome-v1"
 PUBLICATION_SCHEMA = "a5-phase1-live-wave-publication-v1"
 
 
+class SemanticProjectFailure(RuntimeError):
+    """A normally completed Actor attempt without host-verified current source.
+
+    Provider, context-budget, transport and host infrastructure exceptions must
+    propagate instead; this is not a catch-all exception conversion.
+    """
+
+    def __init__(self, summary: str, evidence: dict):
+        super().__init__(summary)
+        self.summary, self.evidence = summary, evidence
+
+
 @dataclass(frozen=True)
 class WaveProjectRequest:
     """One isolated sibling invocation from an immutable memory snapshot."""
@@ -69,7 +81,11 @@ WaveProjectExecutor = Callable[[WaveProjectRequest], WaveProjectResult]
 
 
 class LiveWaveCoordinator:
-    """Run siblings concurrently and publish only a complete verified wave."""
+    """Wait for all siblings; optionally skip completed semantic failures.
+
+    Only verified deltas become commits. The default retains the original
+    strict all-verified barrier for standalone callers.
+    """
 
     def __init__(
         self,
@@ -78,6 +94,7 @@ class LiveWaveCoordinator:
         pre_wave_memory: bytes,
         execute: WaveProjectExecutor,
         max_parallel: int,
+        *, allow_semantic_failures: bool = False,
     ) -> None:
         if not isinstance(wave, WaveSpec):
             raise TypeError("wave must be a WaveSpec")
@@ -94,6 +111,7 @@ class LiveWaveCoordinator:
         self.pre_wave_memory = pre_wave_memory
         self.execute = execute
         self.max_parallel = max_parallel
+        self.allow_semantic_failures = allow_semantic_failures
 
     def run(self) -> WaveConsolidation:
         self._ensure_plan()
@@ -106,7 +124,7 @@ class LiveWaveCoordinator:
         pending = []
         for assignment in assignments:
             outcome = self._load_outcome(assignment)
-            if outcome is not None and outcome.verified:
+            if outcome is not None and (outcome.verified or self.allow_semantic_failures):
                 outcomes[assignment.project_id] = outcome
             else:
                 pending.append(assignment)
@@ -133,14 +151,15 @@ class LiveWaveCoordinator:
                 f"wave project {project_id!r} failed before verification"
             ) from failure
         try:
-            consolidation = consolidate_wave(self.wave, tuple(outcomes.values()))
+            consolidation = consolidate_wave(self.wave, tuple(outcomes.values()),
+                                             allow_semantic_failures=self.allow_semantic_failures)
         except ValueError as exc:
             raise RuntimeError(f"wave is not verified: {exc}") from exc
         self._publish(consolidation)
         return consolidation
 
     def resume(self) -> WaveConsolidation:
-        """Reuse retained verified branches and execute only unfinished siblings."""
+        """Reuse retained terminal branches and execute only unfinished siblings."""
 
         return self.run()
 
@@ -148,13 +167,23 @@ class LiveWaveCoordinator:
         branch_root = self.root / "branches" / assignment.project_id
         branch_root.mkdir(parents=True, exist_ok=True)
         inputs = materialize_inputs(assignment.spec)
-        result = self.execute(WaveProjectRequest(
-            assignment=assignment,
-            pre_wave_memory=self.pre_wave_memory,
-            branch_root=branch_root,
-            inputs=inputs,
-            oracle=evaluate_reference(assignment.spec, inputs),
-        ))
+        try:
+            result = self.execute(WaveProjectRequest(
+                assignment=assignment,
+                pre_wave_memory=self.pre_wave_memory,
+                branch_root=branch_root,
+                inputs=inputs,
+                oracle=evaluate_reference(assignment.spec, inputs),
+            ))
+        except SemanticProjectFailure as exc:
+            if not self.allow_semantic_failures:
+                raise
+            # No kernel memory is manufactured for an unverified attempt.
+            from benchmarks.a5kernels.phase1_project import EvidenceClassification
+            payload = canonical_bytes({"classification": "actor-unverified",
+                                       "summary": exc.summary, **exc.evidence})
+            result = WaveProjectResult(payload, ExecutionEvidence(
+                EvidenceClassification.ACTOR_UNVERIFIED, exc.summary), payload)
         if not isinstance(result, WaveProjectResult):
             raise TypeError("project executor must return WaveProjectResult")
         delta_sha256 = hashlib.sha256(result.memory_delta).hexdigest()
@@ -273,6 +302,10 @@ class LiveWaveCoordinator:
                 for item in consolidation.commits
             ],
         }
+        skipped = [assignment.project_id for assignment in self.wave.assignments()
+                   if not self._load_outcome(assignment).verified]
+        if skipped:
+            value["skipped_projects"] = skipped
         self._atomic_json(self.root / "published.json", value)
 
     def _load_publication(self) -> WaveConsolidation | None:
@@ -281,7 +314,7 @@ class LiveWaveCoordinator:
             return None
         value = self._read_json(path)
         if (
-            set(value) != {
+            set(value) - {"skipped_projects"} != {
                 "schema", "wave_id", "wave_fingerprint",
                 "pre_wave_memory_sha256", "commits",
                 "consolidated_memory_sha256",
@@ -301,7 +334,12 @@ class LiveWaveCoordinator:
                 for assignment in self.wave.assignments()
                 if (outcome := self._load_outcome(assignment)) is not None
             ),
+            allow_semantic_failures=bool(value.get("skipped_projects")),
         )
+        skipped = [assignment.project_id for assignment in self.wave.assignments()
+                   if not self._load_outcome(assignment).verified]
+        if value.get("skipped_projects", []) != skipped:
+            raise ValueError("published skipped projects differ from branch outcomes")
         loaded = WaveConsolidation(
             value["wave_id"], value["pre_wave_memory_sha256"], commits,
         )
@@ -346,5 +384,5 @@ class LiveWaveCoordinator:
 
 __all__ = [
     "LiveWaveCoordinator", "WaveProjectExecutor", "WaveProjectRequest",
-    "WaveProjectResult",
+    "WaveProjectResult", "SemanticProjectFailure",
 ]

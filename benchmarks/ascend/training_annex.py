@@ -112,6 +112,7 @@ def _verify_wave(root, *, closed_failure=False):
     read = lambda path: json.loads(path.read_bytes())
     wave = WaveSpec.from_mapping(read(root / "plan.json")["wave"])
     publication = read(root / ("closed-failure.json" if closed_failure else "published.json"))
+    skipped = publication.get("skipped_projects", [])
     if closed_failure and len(wave.projects) != 1:
         raise ValueError("closed failure requires a single project")
     outcomes = []
@@ -122,7 +123,7 @@ def _verify_wave(root, *, closed_failure=False):
                 or outcome["project_id"] != assignment.project_id
                 or outcome["authored_ordinal"] != assignment.authored_ordinal
                 or outcome["pre_wave_memory_sha256"] != wave.pre_wave_memory_sha256
-                or outcome["verified"] is not (not closed_failure)
+                or outcome["verified"] is not (not closed_failure and assignment.project_id not in skipped)
                 or outcome["verified"] != (outcome["classification"] == "host-verified")):
             raise ValueError("branch differs from committed wave")
         for name, field in (("memory-delta.bin", "memory_delta_sha256"),
@@ -136,7 +137,9 @@ def _verify_wave(root, *, closed_failure=False):
                 or publication["outcome_sha256"] != _sha((branch / "outcome.json").read_bytes())):
             raise ValueError("closed failure marker differs from retained outcome")
         return
-    consolidation = consolidate_wave(wave, tuple(outcomes))
+    consolidation = consolidate_wave(wave, tuple(outcomes), allow_semantic_failures=bool(skipped))
+    if skipped != [outcome.project_id for outcome in outcomes if not outcome.verified]:
+        raise ValueError("skipped projects differ from retained outcomes")
     from dataclasses import asdict
     consolidated = read(root / "consolidated-memory.json")
     expected_memory = {
@@ -191,13 +194,13 @@ def _project_memory(branch):
 
 def _verify_adaptive_state(root, state):
     """Bind the published state to ordered deltas and every pre-wave snapshot."""
-    from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA
+    from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA, retained_failure_outcome
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
     seed = root / "initial-memory.bin"
     initial = seed.read_bytes() if seed.is_file() else None
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
-    memories, outcomes = [], []
+    memories, outcomes, failures = [], [], []
     for wave_id in state["completed_waves"]:
         wave_root = root / "waves" / wave_id
         wave = WaveSpec.from_mapping(json.loads((wave_root / "plan.json").read_bytes())["wave"])
@@ -207,7 +210,11 @@ def _verify_adaptive_state(root, state):
                         "project_memory_base64": memories}
             if wave.pre_wave_memory_sha256 != _sha(_json(snapshot)):
                 raise ValueError("published pre-wave memory chain differs")
+        publication = json.loads((wave_root / "published.json").read_bytes())
         for project in wave.projects:
+            if project.spec.project_id in publication.get("skipped_projects", []):
+                failures.append(retained_failure_outcome(root, wave_id, project.spec))
+                continue
             delta, memory = _project_memory(wave_root / "branches" / project.spec.project_id)
             if (delta["project_id"] != project.spec.project_id
                     or memory.project_spec != project.spec
@@ -219,6 +226,8 @@ def _verify_adaptive_state(root, state):
                              "summary": delta["summary"]})
     if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
         raise ValueError("adaptive state differs from ordered published deltas")
+    if state.get("phase") != "adaptive-phase2" and failures != state.get("failed_outcomes", []):
+        raise ValueError("curriculum failures differ from retained completed attempts")
 
 
 def inventory_campaign(root, *, artifact_store=None):

@@ -262,6 +262,8 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         elif attempt == 1 and request.spec.project_id == "second":
             second_done.set()
         verified = not (request.spec.project_id == "second" and fail_second)
+        if not verified:
+            raise RuntimeError("infrastructure unavailable")
         return _result(
             request.spec, verified,
             f"{request.spec.project_id} host verification {'passed' if verified else 'failed'}",
@@ -272,7 +274,7 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         root, "Learn reusable Catlass DSL programming.", SEED,
         CurriculumAgent(complete), execute, max_parallel=3,
     )
-    with pytest.raises(RuntimeError, match="not verified"):
+    with pytest.raises(RuntimeError, match="failed before verification"):
         first.run()
 
     assert set(calls) == {"first", "second", "third"}
@@ -287,7 +289,7 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         "wave_id": "wave-001",
         "projects": [
             {"project_id": "first", "status": "verified"},
-            {"project_id": "second", "status": "unverified"},
+            {"project_id": "second", "status": "unfinished"},
             {"project_id": "third", "status": "verified"},
         ],
     }
