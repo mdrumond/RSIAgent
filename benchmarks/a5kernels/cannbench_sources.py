@@ -148,11 +148,23 @@ def repository_source(url: str, job: dict, root: Path) -> tuple[bytes, dict]:
                       if owner.get(field)), "HEAD")
     if not isinstance(reference, str) or reference.startswith("-"):
         raise ValueError("Unsupported repository revision pointer")
-    if reference != "HEAD":
+    # Freeze each published pointer once, including mutable branches and HEAD.
+    key = digest(json.dumps([url, job.get("id"), reference]).encode())
+    pinned = root / "repository-revisions" / f"{key}.json"
+    if pinned.exists():
+        reference = json.loads(pinned.read_text())["revision"]
+    revision = None
+    if reference == "HEAD" or re.fullmatch(r"[0-9a-fA-F]{7,64}", reference):
+        try:
+            revision = git("-C", str(destination), "rev-parse", "--verify",
+                           f"{reference}^{{commit}}").decode().strip()
+        except subprocess.CalledProcessError:
+            pass  # A published commit may not have been included in the clone.
+    if revision is None:
         git("-C", str(destination), "fetch", "origin", reference)
-        reference = "FETCH_HEAD"
-    revision = git("-C", str(destination), "rev-parse", f"{reference}^{{commit}}").decode().strip()
+        revision = git("-C", str(destination), "rev-parse", "FETCH_HEAD^{commit}").decode().strip()
     data = git("-C", str(destination), "archive", "--format=zip", revision)
+    save_json(pinned, {"revision": revision})
     return data, {"url": url, "status": 200, "sha256": digest(data), "revision": revision,
                   "retrieved_at": datetime.now(timezone.utc).isoformat()}
 
@@ -185,7 +197,9 @@ def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], st
 
 def published_source(url: str, job: dict, operator: dict, archive: PublicArchive,
                      root: Path) -> tuple[dict[str, bytes] | None, str | None, dict]:
-    repositories = [owner.get("repository_url") for owner in (job, job.get("submission") or {})]
+    repositories = [urljoin(BASE, owner["repository_url"])
+                    for owner in (job, job.get("submission") or {})
+                    if isinstance(owner.get("repository_url"), str)]
     if url in repositories:
         with REPOSITORY_LOCKS.setdefault(url, threading.Lock()):
             data, response = repository_source(url, job, root)

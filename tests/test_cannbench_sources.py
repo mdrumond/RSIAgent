@@ -224,6 +224,78 @@ def test_published_https_git_source_freezes_commit_without_credentials(tmp_path,
                                               FakeArchive(), tmp_path)
     assert record["revision"] == "a" * 40
     assert "exp/kernel.cpp" in files
-    assert any("fetch" in command for command, _ in calls) == bool(given_revision)
+    assert any("fetch" in command for command, _ in calls) == (given_revision == "published-branch")
     assert all(kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0" for _, kwargs in calls)
     assert all("credential.helper=" in command for command, _ in calls)
+
+
+@pytest.mark.parametrize("given_revision", [None, "a" * 40, "a" * 7, "published-branch"])
+def test_git_acquisition_resume_keeps_frozen_source_offline(tmp_path, monkeypatch, given_revision):
+    payload = bundle({"exp/kernel.cpp": "AscendC::Exp(x,y,n);"})
+    offline = False
+    calls = []
+    def git_run(command, **kwargs):
+        calls.append(command)
+        if "clone" in command:
+            assert not offline
+            Path(command[-1]).mkdir()
+        if "fetch" in command:
+            assert not offline, "cached source attempted to contact its unavailable origin"
+        # Simulate a moved HEAD/branch after the initial acquisition.
+        revision = "a" * 40 if not offline or "a" * 40 + "^{commit}" in command else "b" * 40
+        return SimpleNamespace(stdout=payload if "archive" in command else (revision + "\n").encode())
+    monkeypatch.setattr(source.subprocess, "run", git_run)
+    class RepositoryArchive(FakeArchive):
+        def json(self, url):
+            if "/api/jobs/" in url:
+                job = {"id": url.split("/")[-1], "repository_url": "https://example.invalid/repo.git"}
+                if given_revision:
+                    job["source_revision"] = given_revision
+                return {"job": job}
+            return super().json(url)
+        def get(self, url):
+            pytest.fail("repository was dispatched as a download")
+    first = source.acquire_operator(OP, RepositoryArchive(), tmp_path, "1.1.2", 1)
+    offline = True
+    calls.clear()
+    resumed = source.acquire_operator(OP, RepositoryArchive(), tmp_path, "1.1.2", 1)
+    assert resumed["sources"][0]["revision"] == first["sources"][0]["revision"] == "a" * 40
+    assert resumed["shortfall"] == resumed["retryable_failures"] == 0
+    assert not any("fetch" in command or "clone" in command for command in calls)
+
+
+def test_published_commit_missing_from_clone_is_fetched(tmp_path, monkeypatch):
+    calls = []
+    revision = "a" * 40
+    def git_run(command, **kwargs):
+        calls.append(command)
+        if "clone" in command:
+            Path(command[-1]).mkdir()
+        if "--verify" in command:
+            raise source.subprocess.CalledProcessError(128, command)
+        return SimpleNamespace(stdout=b"archive" if "archive" in command else (revision + "\n").encode())
+    monkeypatch.setattr(source.subprocess, "run", git_run)
+    _, record = source.repository_source("https://example.invalid/repo.git",
+                                         {"source_revision": revision}, tmp_path)
+    assert record["revision"] == revision
+    assert any(command[-3:] == ["fetch", "origin", revision] for command in calls)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_root_relative_repository_pointer_uses_git_acquisition(tmp_path, monkeypatch, nested):
+    pointer = {"repository_url": "/published/repo.git"}
+    job = {"submission": pointer} if nested else pointer
+    calls = []
+    payload = bundle({"exp/kernel.cpp": "AscendC::Exp(x,y,n);"})
+    def repository(url, received_job, root):
+        calls.append((url, received_job, root))
+        return payload, {"status": 200, "revision": "a" * 40}
+    monkeypatch.setattr(source, "repository_source", repository)
+    class NoDownloads:
+        def get(self, url):
+            pytest.fail("repository was dispatched as a download")
+    url, = source.candidate_urls(job)
+    files, _, record = source.published_source(url, job, OP, NoDownloads(), tmp_path)
+    assert calls == [(source.BASE + "/published/repo.git", job, tmp_path)]
+    assert "exp/kernel.cpp" in files
+    assert record["revision"] == "a" * 40
