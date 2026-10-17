@@ -523,20 +523,27 @@ def test_timing_counts_only_retained_msprof_capture_even_without_requested_focus
 @pytest.mark.parametrize("statement", ["Measured current source", "fixed source", "[]", "null", "42", '{"timing":null}'])
 def test_prose_measurement_facts_survive_report_resume_and_next_selection(tmp_path, statement):
     selections = []
+    paused = []
     def complete(messages):
         selections.append(messages[-1]["content"])
         spec = _project(f"project-{len(selections)}", "gm-ub-movement")
         spec["learning_focus"] = ["pipe-mte2" if len(selections) == 1 else "pipe-mte3"]
         return _wave(messages[-1]["content"], [spec])
     def execute(request):
+        if request.spec.project_id == "project-2" and not paused:
+            paused.append(True)
+            raise RuntimeError("pause before second publication")
         result = _result(request.spec, True, "verified")
         fact = HostFact("performance-study", statement, result.memory.admitted_artifact_sha256[0])
         return replace(result, memory=replace(result.memory, host_facts=(*result.memory.host_facts, fact)))
     def campaign(target):
         return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
             CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
-    assert campaign(1).run()["status"] == "TARGET_REACHED"
-    assert "tool-msprof" in campaign(1).report()["coverage_gaps"]
+    # The shared runner changes targets through its explicit continuation API.
+    # Resume the same target after a normal interrupted second attempt instead.
+    with pytest.raises(RuntimeError, match="failed before verification"):
+        campaign(2).run()
+    assert "tool-msprof" in campaign(2).report()["coverage_gaps"]
     assert campaign(2).resume()["successful_projects"] == 2
     assert len(selections) == 2
 
