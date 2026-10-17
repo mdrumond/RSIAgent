@@ -49,7 +49,7 @@ _ROOT_FILES = {"state.json", "pending.json", "campaign-identity.json",
                "phase1-memory.jsonl", "phase1-terminal.json"}
 _TREES = {"waves", "native-evidence", "measurements", "cells", "attempts",
           "provider", "provider-evidence", "source-evidence", "artifacts", "traces",
-          "sft-traces", "snapshot"}
+          "sft-traces", "snapshot", "project-bundles", "measurement-evidence"}
 
 
 def _retained(root):
@@ -198,6 +198,9 @@ def _verify_adaptive_state(root, state):
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
     seed = root / "initial-memory.bin"
     initial = seed.read_bytes() if seed.is_file() else None
+    if state.get("phase") == "adaptive-phase2":
+        from .phase2_curriculum import reviewed_seed
+        initial, _ = reviewed_seed(root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
     memories, outcomes, failures = [], [], []
@@ -250,6 +253,11 @@ def inventory_campaign(root, *, artifact_store=None):
         data = path.read_bytes()
         files.append({"path": relative, "sha256": _sha(data), "size": len(data)})
         is_object = "objects" in path.parts
+        if relative.startswith("project-bundles/cas/"):
+            digest = path.stem
+            if _sha(data) != digest:
+                issues.append({"kind": "missing-or-corrupt-object", "origin": relative,
+                               "sha256": digest})
         if path.suffix not in {".json", ".jsonl"} and not is_object:
             continue
         try:
@@ -269,6 +277,12 @@ def inventory_campaign(root, *, artifact_store=None):
                             "classification": row.get("classification"),
                             "project_id": row.get("project_id"),
                             "attempt_id": row.get("attempt_id")})
+            if row.get("schema") == "a5-phase1-project-observation-v1":
+                directory = root / "project-bundles" / row["identity"]
+                for name in ("kernel.py", "host_driver.py", "project_diagnostics.py", "manifest.json"):
+                    if not (directory / name).is_file():
+                        issues.append({"kind": "missing-project-bundle-file", "origin": origin,
+                                       "path": str((directory / name).relative_to(root))})
             if (row.get("kind") == "artifact" and isinstance(row.get("payload"), dict)
                     and "sha256" in row["payload"]):
                 digest = row["payload"].get("sha256", "")

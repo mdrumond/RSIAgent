@@ -32,7 +32,8 @@ def _languages(source: dict) -> tuple[str, ...]:
 
 def ingest(inventory_path: Path, database_path: Path, embeddings, *, batch_size=32):
     """Resume immutable collections in a staging DB, publish only on success."""
-    inventory = json.loads(inventory_path.read_text())
+    inventory_bytes = inventory_path.read_bytes()
+    inventory = json.loads(inventory_bytes)
     if inventory.get("schema_version") != 1:
         raise ValueError("inventory schema_version must be 1")
     database_path = database_path.resolve()
@@ -95,7 +96,7 @@ def ingest(inventory_path: Path, database_path: Path, embeddings, *, batch_size=
             raise ValueError("staging DB contains collections from another inventory; use a new DB path")
     os.replace(staging, database_path)
     report = {"schema_version": 1, "collections": completed,
-              "inventory_sha256": hashlib.sha256(inventory_path.read_bytes()).hexdigest()}
+              "inventory_sha256": hashlib.sha256(inventory_bytes).hexdigest()}
     database_path.with_suffix(database_path.suffix + ".inventory.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n")
     return report

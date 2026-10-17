@@ -94,6 +94,26 @@ def test_unverified_source_never_publishes_over_existing_index(tmp_path):
     assert db.read_bytes() == b"retained prior index"
 
 
+@pytest.mark.parametrize("remove", [False, True])
+def test_ingestion_report_pins_inventory_bytes_read_before_indexing(tmp_path, remove):
+    path = inventory(tmp_path, names=("ops-nn",))
+    original = path.read_bytes()
+    class ChangedInventory(Embeddings):
+        def embed(self, texts):
+            if path.exists():
+                if remove:
+                    path.unlink()
+                else:
+                    path.write_text('{"schema_version":1,"sources":[]}')
+            return super().embed(texts)
+    db = tmp_path / "published.sqlite3"
+    report = ingest(path, db, ChangedInventory())
+    assert report["inventory_sha256"] == hashlib.sha256(original).hexdigest()
+    assert json.loads(db.with_suffix(".sqlite3.inventory.json").read_bytes()) == report
+    with KnowledgeDB.open_read_only(db, Embeddings()) as database:
+        assert len(database.manifest(report["collections"][0]["collection"]).sources) == 1
+
+
 def test_source_change_between_verification_and_index_snapshot_never_publishes(tmp_path, monkeypatch):
     path = inventory(tmp_path, names=("ops-nn",))
     db = tmp_path / "published.sqlite3"

@@ -5,11 +5,73 @@ from __future__ import annotations
 import base64
 import json
 import math
+from pathlib import Path
 from collections.abc import Mapping
 
 from benchmarks.a5kernels.evidence import canonical_bytes
 
 PAGE_BYTES = 8192
+
+
+class MemoryArtifactReader:
+    """Read only memory-reachable historical objects; never admit host facts."""
+
+    def __init__(self, request, current):
+        from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+        self.current, self.sources = current, {}
+        try:
+            envelope = json.loads(request.pre_wave_memory)
+        except (ValueError, UnicodeDecodeError):
+            return
+        if not isinstance(envelope, dict) or "project_memory_base64" not in envelope:
+            return
+        root = Path(request.branch_root).parents[3]
+        entries = [(base64.b64decode(row, validate=True), None)
+                   for row in envelope["project_memory_base64"]]
+        try:
+            seed = json.loads(base64.b64decode(envelope["initial_memory_base64"], validate=True))
+        except (ValueError, UnicodeDecodeError):
+            seed = None
+        if isinstance(seed, dict) and seed.get("schema") == "ascend-phase2-curriculum-seed-v1":
+            from .phase2_curriculum import reviewed_seed
+            authenticated, snapshot_root = reviewed_seed(root, seed["snapshot_id"])
+            if json.loads(authenticated) != seed:
+                raise ValueError("reviewed seed differs from current memory")
+            entries += [(canonical_bytes(row), snapshot_root) for row in seed["phase1_memory"]]
+        for raw, snapshot_root in entries:
+            memory = Phase1ProjectMemory.from_mapping(json.loads(raw))
+            if snapshot_root is not None:
+                stores = [ContentAddressedArtifacts(snapshot_root / "artifacts")]
+            else:
+                stores = []
+                if memory.project_spec is None:
+                    continue
+                project_id = memory.project_spec.project_id
+                for delta_path in (root / "waves").glob(f"*/branches/{project_id}/memory-delta.bin"):
+                    delta = json.loads(delta_path.read_bytes())
+                    if base64.b64decode(delta["memory_base64"], validate=True) == raw:
+                        stores.append(ContentAddressedArtifacts(
+                            delta_path.parent / (memory.artifact_store or "artifacts")))
+            digests = {memory.source_revision, *memory.admitted_artifact_sha256,
+                       *(fact.evidence_sha256 for fact in memory.host_facts),
+                       *(digest for lesson in memory.lessons for digest in lesson.evidence_artifact_sha256)}
+            for digest in digests:
+                self.sources.setdefault(digest, []).extend(stores)
+
+    def read_bytes(self, digest):
+        try:
+            return self.current.read_bytes(digest)
+        except FileNotFoundError:
+            for store in self.sources.get(digest, ()):
+                try:
+                    return store.read_bytes(digest)
+                except FileNotFoundError:
+                    continue
+            raise
+
+    def put_json(self, value):
+        return self.current.put_json(value)
 
 
 def _preview(value, *, depth=0):

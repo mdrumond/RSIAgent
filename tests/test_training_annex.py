@@ -65,6 +65,43 @@ def test_portable_package_preserves_memory_failed_attempts_and_sources(campaign,
         assert json.load(archive.extractfile("campaign/native-evidence/failure.json"))["exit_code"] == 1
 
 
+@pytest.mark.parametrize("mutation", [None, "missing-bundle", "corrupt-object"])
+def test_a5_production_bundle_and_measurement_trees_are_portable(campaign, tmp_path, mutation):
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.a5kernels.profiling_bz import BZProfileBackend
+    from tests.test_a5_phase1_project_bz import FakeExecutor
+    from tests.test_a5_phase1_project_executor import _spec
+    backend = CatlassProjectBackend(FakeExecutor([]), session_wrapper="/checked/session.sh",
+                                   evidence_root=campaign / "project-bundles")
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "host-ledger"))
+    prepared = executor.prepare(_spec("movement"))
+    request = executor.request(prepared, "# exact retained Catlass source\n")
+    identity, files = backend._bundle(request)
+    digest = backend._retain_evidence({"schema": "a5-phase1-project-observation-v1",
+        "identity": identity, "mode": "compile", "record": {"status": "compile-failure"}})
+    profiler = object.__new__(BZProfileBackend)
+    profiler._evidence_directory = campaign / "measurement-evidence"
+    profiler._retain_timing_evidence("replay-one", "exact checked-wrapper stdout\n")
+    cas = campaign / "project-bundles/cas" / digest[:2] / (digest + ".json")
+    if mutation == "missing-bundle":
+        (campaign / "project-bundles" / identity / "kernel.py").unlink()
+    elif mutation == "corrupt-object":
+        cas.write_text('{}')
+    if mutation:
+        assert not inventory_campaign(campaign)["complete"]
+        with pytest.raises(ValueError, match="incomplete"):
+            package_campaign(campaign, tmp_path / "a5.tar.gz")
+        return
+    assert package_campaign(campaign, tmp_path / "a5.tar.gz")["complete"]
+    with tarfile.open(tmp_path / "a5.tar.gz") as archive:
+        for source in files:
+            assert archive.extractfile(f"campaign/project-bundles/{identity}/{source.relative_path}").read() == source.content.encode()
+        assert archive.extractfile("campaign/" + cas.relative_to(campaign).as_posix()).read() == cas.read_bytes()
+        assert archive.extractfile("campaign/measurement-evidence/replay-one/timing-stdout.txt").read() == b"exact checked-wrapper stdout\n"
+
+
 def test_missing_cas_and_publication_are_explicit(campaign):
     next(campaign.glob("waves/**/objects/*/*")).unlink()
     (campaign / "waves/wave-001/published.json").unlink()

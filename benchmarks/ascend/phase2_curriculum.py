@@ -11,6 +11,8 @@ from dataclasses import replace
 from copy import copy
 import base64
 import hashlib
+import json
+from pathlib import Path
 
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator, PENDING_SCHEMA
@@ -18,6 +20,46 @@ from benchmarks.a5kernels.phase1_curriculum import WaveSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import TerminalDecision
 from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
 from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator
+
+
+def reviewed_seed(root, snapshot_id):
+    """Recover the seed from its pinned, authenticated portable snapshot."""
+    from benchmarks.a5kernels.evidence import canonical_digest
+    from benchmarks.a5kernels.phase2_adaptive_memory import _memory, _published_evidence, _review
+    matches = []
+    for manifest_path in Path(root).glob("cells/*/snapshot/snapshot.json"):
+        manifest = json.loads(manifest_path.read_bytes())
+        if manifest.get("snapshot_id") == snapshot_id:
+            matches.append((manifest_path.parent, manifest))
+    if len(matches) != 1:
+        raise ValueError("reviewed snapshot is missing or ambiguous")
+    directory, manifest = matches[0]
+    if manifest.get("schema") not in {
+            "a5-phase2-adaptive-snapshot-v1", "a3-native-phase2-adaptive-snapshot-v1"}:
+        raise ValueError("reviewed snapshot schema changed")
+    if canonical_digest({k: v for k, v in manifest.items() if k != "snapshot_id"}) != snapshot_id:
+        raise ValueError("reviewed snapshot identity changed")
+    for relative, digest in manifest["files"].items():
+        if hashlib.sha256((directory / relative).read_bytes()).hexdigest() != digest:
+            raise ValueError("reviewed snapshot bytes changed")
+    state = json.loads((directory / "state.json").read_bytes())
+    initial = (directory / "initial-memory.bin").read_bytes()
+    memories, memory_sha = _memory(state, initial)
+    _published_evidence(directory, state, initial)
+    destination = manifest["destination_identity"]
+    native = destination.get("language") == "ascend-c"
+    source_id = ("a3-phase1-cell-" + canonical_digest(destination["source_identity"])[:16]
+                 if native else destination["source_cell_id"])
+    review = json.loads((directory / "review.json").read_bytes())
+    _review(review, memory_sha, source_id, schema=(
+        "ascend-phase1-usefulness-review-v1" if native else "a5-phase1-usefulness-review-v1"))
+    if canonical_digest(review) != destination["qualification_sha256"]:
+        raise ValueError("reviewed snapshot review changed")
+    entries = [json.loads(row) for row in memories]
+    if (directory / "phase1-memory.jsonl").read_bytes() != b"".join(row + b"\n" for row in memories):
+        raise ValueError("reviewed snapshot memory changed")
+    return canonical_bytes({"schema": "ascend-phase2-curriculum-seed-v1",
+                            "snapshot_id": snapshot_id, "phase1_memory": entries}), directory
 
 
 class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
