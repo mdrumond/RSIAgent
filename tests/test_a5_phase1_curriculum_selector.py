@@ -601,7 +601,9 @@ def test_focus_comparison_keeps_historical_serialization_and_identity():
     assert canonical_bytes(restored.as_dict()) == stored
     assert canonical_bytes(information.as_dict()) == serialized_information
     assert prior.information_sha256 == historical_identity
-    assert project_information_sha256(restored) == historical_identity
+    executable_information = json.loads(serialized_information)
+    executable_information.pop("learning_focus")
+    assert project_information_sha256(restored) == canonical_digest(executable_information)
     assert prior.information_sha256 != canonical_digest(reversed_information.as_dict())
 
 
@@ -650,8 +652,9 @@ def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
 
 
 def test_learning_focus_cannot_bypass_held_out_executable_signature():
-    signature = project_information_sha256(project())
-    for focus in (["tool-msprof"], ["sync-performance", "pipe-mte2"], ["pipe-mte2", "sync-performance"]):
-        proposal = project(learning_focus=focus)
-        with pytest.raises(ValueError, match="held-out contract"):
-            CurriculumAgent(lambda _: wave([proposal]), held_out_information_sha256=[signature]).select(context())
+    for held_out_focus in ([], ["tool-msprof"], ["pipe-mte2", "sync-performance"]):
+        signature = project_information_sha256(project(learning_focus=held_out_focus))
+        for focus in ([], ["tool-msprof"], ["sync-performance", "pipe-mte2"], ["pipe-mte2", "sync-performance"]):
+            proposal = project(learning_focus=focus)
+            with pytest.raises(ValueError, match="held-out contract"):
+                CurriculumAgent(lambda _: wave([proposal]), held_out_information_sha256=[signature]).select(context())

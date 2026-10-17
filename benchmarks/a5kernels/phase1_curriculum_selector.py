@@ -58,9 +58,11 @@ def _digest(value: object, field: str) -> str:
 
 
 def project_information_sha256(value: ProjectSpec | Mapping[str, object]) -> str:
-    """Identify the admitted information dimensions, not labels or tuning."""
+    """Identify executable information for held-out matching, excluding focus."""
 
-    return canonical_digest(ProjectInformation.from_project(value).as_dict())
+    information = ProjectInformation.from_project(value).as_dict()
+    information.pop("learning_focus", None)
+    return canonical_digest(information)
 
 
 @dataclass(frozen=True)

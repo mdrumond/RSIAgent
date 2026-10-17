@@ -501,6 +501,10 @@ class AdaptivePhase1Coordinator:
                 if fact["category"] == "profiling":
                     observed.add("tool-msprof")
                 statement = fact["statement"]
+                if fact["category"] == "performance-study":
+                    summary = json.loads(statement)
+                    if any(row.get("device_kernel") for row in summary.get("timing", ())):
+                        observed.add("tool-msprof")
                 if statement.startswith("tool-observation:"):
                     record = json.loads(statement.removeprefix("tool-observation:"))
                     if record.get("available") and "execution" in record:
@@ -510,6 +514,7 @@ class AdaptivePhase1Coordinator:
             spec = dict(row["spec"])
             focus = [item for item in spec.get("learning_focus", ())
                      if not (item.startswith("tool-") or item == "debug-print") or item in observed]
+            focus += sorted(observed - set(focus))
             if focus:
                 spec["learning_focus"] = focus
             else:

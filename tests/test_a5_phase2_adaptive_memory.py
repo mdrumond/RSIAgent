@@ -113,10 +113,11 @@ def test_admission_rejects_incomplete_or_unreviewed_memory(tmp_path, failure):
         admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
 
 
-def test_project_limit_terminal_is_admitted(tmp_path):
+@pytest.mark.parametrize("status", ["PROJECT_LIMIT_REACHED", "TARGET_REACHED"])
+def test_completed_terminal_is_admitted(tmp_path, status):
     root, source, review, _ = _source(tmp_path)
     state = json.loads((root / "state.json").read_bytes())
-    state["terminal"]["status"] = "PROJECT_LIMIT_REACHED"
+    state["terminal"]["status"] = status
     (root / "state.json").write_bytes(canonical_bytes(state))
     admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2").verify()
 
