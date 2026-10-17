@@ -472,7 +472,8 @@ def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, matc
         actor.distill(outcome)
 
 
-def test_direct_actor_counts_tokens_but_not_opted_in_compile_probes(tmp_path):
+@pytest.mark.parametrize("terminal", [True, False])
+def test_direct_actor_counts_all_turns_but_exempts_compile_budget(tmp_path, terminal):
     calls = []
     provider = _scripted_provider([
         '{"write":{"slot":"kernel","content":"source"}}',
@@ -493,18 +494,20 @@ def test_direct_actor_counts_tokens_but_not_opted_in_compile_probes(tmp_path):
         turn_parser=parse_trial_action,
         action_executor=lambda action: ActionOutcome(
             json.dumps({"host": {"event": action.kind}}),
-            terminal=action.kind == "submit",
+            terminal=terminal and action.kind == "submit",
             budget_exempt=action.kind == "compile",
             admitted_artifacts={ADMITTED: "host-verification"},
         ),
     )
 
-    assert outcome.status == "done"
-    assert outcome.iterations == 2
+    assert outcome.status == ("done" if terminal else "turn-budget-exhausted")
+    assert outcome.iterations == 4
     assert outcome.tokens == 8
     assert len(calls) == 4
+    if not terminal:
+        return
     learned = actor.distill(outcome)
-    assert learned.iterations == 2
+    assert learned.iterations == 4
     assert learned.tokens == 10
     retained = [entry.payload for entry in EvidenceLedger(
         tmp_path / "trial/evidence.jsonl"
@@ -629,7 +632,7 @@ def test_bound_trial_retains_and_explains_unmetered_compile_allowance(tmp_path):
     )
 
     assert result.verified.passed
-    assert result.outcome.iterations == 2
+    assert result.outcome.iterations == 3
     assert result.outcome.tokens == 6
     assert len(backend.compiles) == 1
     opening = calls[0]["request"]["messages"][1]["content"]

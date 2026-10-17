@@ -361,7 +361,7 @@ class DirectActorDriver:
                         "admitted_artifacts": dict(outcome.admitted_artifacts),
                     })
                     return ActorOutcome(
-                        outcome.status, ordinary_turns, tokens,
+                        outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
                         continuation=_DirectActorContinuation(
                             profile, tuple(dict(item) for item in messages), recorder, turn
@@ -372,7 +372,7 @@ class DirectActorDriver:
             if action is None:
                 ordinary_turns += 1
         self._trace("terminal", {"status": "turn-budget-exhausted"})
-        return ActorOutcome("turn-budget-exhausted", ordinary_turns, tokens)
+        return ActorOutcome("turn-budget-exhausted", turn, tokens)
 
     def distill(
         self,

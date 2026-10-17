@@ -375,6 +375,7 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
     class Result:
         status = "done"
         iters = 2
+        turns = 3
         wall_secs = 3.5
 
     def run_attempt(*args, **kwargs):
@@ -400,15 +401,19 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
         assert action in captured["kwargs"]["action_nudge"]
     assert outcome.wall_time_s == 3.5
     assert outcome.tokens is None
+    assert outcome.iterations == 3
 
 
-def test_core_driver_disables_inherited_compaction_without_mutating_config(monkeypatch, tmp_path):
+@pytest.mark.parametrize("compile_probe", [False, True])
+def test_core_driver_disables_inherited_compaction_without_mutating_config(
+    monkeypatch, tmp_path, compile_probe,
+):
     import core.loop as loop
     from config.settings import load
     from core.trace import ArtifactSink
 
     cfg = load(None)
-    cfg.max_iters = 4
+    cfg.max_iters = 2 if compile_probe else 4
     cfg.history_keep_pairs = 1
     cfg.keep_chars = 0
     cfg.fold_batch = 1
@@ -416,7 +421,7 @@ def test_core_driver_disables_inherited_compaction_without_mutating_config(monke
     requests = []
     replies = iter([
         '{"propose":{"text":"first"}}',
-        '{"propose":{"text":"second"}}',
+        '{"compile":{}}' if compile_probe else '{"propose":{"text":"second"}}',
         '{"submit":{}}',
     ])
 
@@ -429,11 +434,14 @@ def test_core_driver_disables_inherited_compaction_without_mutating_config(monke
     outcome = CoreAttemptDriver(object(), cfg, lambda path: ArtifactSink(str(path)))(
         "task", profile=load_a5_model_profile(), workspace=tmp_path,
         context=tmp_path / "context", turn_parser=parse_trial_action,
-        action_executor=lambda action: ActionOutcome("ok", action.kind == "submit"),
+        action_executor=lambda action: ActionOutcome(
+            "ok", action.kind == "submit", budget_exempt=action.kind == "compile",
+        ),
     )
 
     assert outcome.status == "done"
     assert len(requests) == 3
+    assert outcome.iterations == 3
     assert all(request["allow_truncation_retry"] is False for request in requests)
     assert all(request["top_p"] == 1.0 for request in requests)
     assert cfg.history_keep_pairs == 1

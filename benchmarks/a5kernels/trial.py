@@ -218,7 +218,7 @@ class CoreAttemptDriver:
         )
         return ActorOutcome(
             result.status,
-            result.iters,
+            result.turns,
             wall_time_s=result.wall_secs,
         )
 
