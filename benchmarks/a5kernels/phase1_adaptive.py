@@ -132,6 +132,12 @@ class AdaptivePhase1Coordinator:
 
     def run(self) -> dict[str, object]:
         state = self._load_state()
+        pending = self._load_pending(state)
+        if pending is not None and (
+            len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects)
+            > self.project_target
+        ):
+            raise ValueError("retained wave exceeds configured project target")
         if state.get("project_target", self.project_target) != self.project_target:
             raise ValueError("use continue_campaign to change the retained project target")
         state = {**state, "project_target": self.project_target}
@@ -454,8 +460,14 @@ class AdaptivePhase1Coordinator:
                     observed.add("tool-msprof")
                 statement = fact["statement"]
                 if fact["category"] == "performance-study":
-                    summary = json.loads(statement)
-                    if any(row.get("device_kernel") for row in summary.get("timing", ())):
+                    try:
+                        summary = json.loads(statement)
+                    except json.JSONDecodeError:
+                        summary = None
+                    timing = summary.get("timing", ()) if isinstance(summary, dict) else ()
+                    if isinstance(timing, list) and any(
+                        isinstance(row, dict) and row.get("device_kernel") for row in timing
+                    ):
                         observed.add("tool-msprof")
                 if statement.startswith("tool-observation:"):
                     record = json.loads(statement.removeprefix("tool-observation:"))

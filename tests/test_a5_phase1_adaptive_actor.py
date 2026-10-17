@@ -833,15 +833,17 @@ def test_sync_performance_rejects_one_source_and_same_source_rewrites(tmp_path, 
     assert result.evidence.verified
 
 
-def test_verified_print_source_records_runtime_tool_observation(tmp_path):
+@pytest.mark.parametrize("source", [
+    "tla.print(1)", "def unused():\n    tla.print(1)", "if False:\n    tla.print(1)",
+])
+def test_print_source_without_runtime_trace_does_not_claim_tool_observation(tmp_path, source):
     class CorrectPrint(SourceBackend):
         def run(self, request, compilation):
             return RuntimeObservation(True, canonical_digest({"run": request.candidate_source}),
                                       "verified", request.expected.storage)
     executor = ProjectExecutor(CorrectPrint(), EvidenceLedger(tmp_path / "evidence.jsonl"))
-    source = "tla.print(1)"
     actor = ScriptedActor((json.dumps({"write": {"slot": "kernel", "content": source}}),
                            '{"run":{}}', '{"submit":{}}'))
     result = AdaptiveActorProjectExecutor(executor, actor, object())(
         _request(tmp_path, executor, _special_spec()))
-    assert any(f.statement.startswith("verified-debug-print:") for f in result.memory.host_facts)
+    assert not any(f.statement.startswith("verified-debug-print:") for f in result.memory.host_facts)
