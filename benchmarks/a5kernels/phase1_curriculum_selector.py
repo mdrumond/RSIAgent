@@ -193,6 +193,7 @@ class CurriculumContext:
     pre_wave_coverage: tuple[Capability, ...]
     prior_outcomes: tuple[PriorOutcome, ...]
     remaining_projects: int = 64
+    curriculum_memory: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -376,6 +377,7 @@ def curriculum_prompt(
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
         "prior_outcomes": [item.prompt_dict() for item in context.prior_outcomes],
+        "curriculum_memory": list(context.curriculum_memory),
         "bounded_project_grammar": (
             _grammar() if target_policy is None else target_policy.grammar(_grammar())
         ),
@@ -386,6 +388,10 @@ def curriculum_prompt(
         ]
     instructions = (
         "Choose DECISION: WAVE for useful experiments informed by prior outcomes. "
+        "Use curriculum_memory to avoid repeating low-yield or failed strategies. "
+        "A failed attempt is not kernel knowledge or a permanent operation ban: "
+        "a smaller, changed experiment with a fresh ID may still be useful. "
+        "no_new_knowledge means verified execution yielded no reusable lesson. "
         "Coverage dimensions are advisory: new exact shapes within a covered shape "
         "class and new combinations of covered dimensions are allowed. Avoid exact "
         "repeats of verified prior or sibling project information; changing only "
@@ -535,7 +541,7 @@ class CurriculumAgent:
                      for item in project.spec.capabilities):
                 raise ValueError("native vector capability requires an explicit target policy")
         if len(wave.projects) > min(8, context.remaining_projects):
-            raise ValueError("wave exceeds eight-project wave limit or remaining project target")
+            raise ValueError("wave exceeds eight-project wave limit or remaining project target or remaining project budget")
         unavailable = set(self.unavailable_capabilities)
         if any(unavailable.intersection(item.spec.capabilities) for item in wave.projects):
             raise ValueError("wave selects a capability unavailable in this factory")

@@ -34,7 +34,7 @@ def compose_adaptive_controller(
         request_profile=request_profile, request_timing=request_timing,
         request_diagnostic=request_diagnostic, immutable_context=immutable_context,
         diagnostic_instructions=diagnostic_instructions,
-        retain_semantic_failure=reviewed_snapshot is not None,
+        retain_semantic_failure=True,
         **({"trace_recorder_factory": trace_recorder_factory} if trace_recorder_factory is not None else {}),
     )
     curriculum = CurriculumAgent(

@@ -263,6 +263,8 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         elif attempt == 1 and request.spec.project_id == "second":
             second_done.set()
         verified = not (request.spec.project_id == "second" and fail_second)
+        if not verified:
+            raise RuntimeError("infrastructure unavailable")
         return _result(
             request.spec, verified,
             f"{request.spec.project_id} host verification {'passed' if verified else 'failed'}",
@@ -273,7 +275,7 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         root, "Learn reusable Catlass DSL programming.", SEED,
         CurriculumAgent(complete), execute, max_parallel=3,
     )
-    with pytest.raises(RuntimeError, match="not verified"):
+    with pytest.raises(RuntimeError, match="failed before verification"):
         first.run()
 
     assert set(calls) == {"first", "second", "third"}
@@ -288,7 +290,7 @@ def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_p
         "wave_id": "wave-001",
         "projects": [
             {"project_id": "first", "status": "verified"},
-            {"project_id": "second", "status": "unverified"},
+            {"project_id": "second", "status": "unfinished"},
             {"project_id": "third", "status": "verified"},
         ],
     }
@@ -557,11 +559,13 @@ def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tm
         ])
     def execute(request):
         calls.append(request.spec.project_id)
-        return _result(request.spec, request.spec.project_id != "second", "observed")
+        if request.spec.project_id == "second":
+            raise RuntimeError("interrupted before terminal outcome")
+        return _result(request.spec, True, "observed")
     def campaign(target):
         return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
             CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
-    with pytest.raises(RuntimeError, match="not verified"):
+    with pytest.raises(RuntimeError, match="failed before verification"):
         campaign(3).run()
     assert campaign(3).report()["pending_wave"]["projects"][0]["status"] == "verified"
     files = {path: (path.read_bytes(), path.stat().st_mtime_ns)

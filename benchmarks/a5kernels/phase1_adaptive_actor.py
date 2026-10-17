@@ -591,6 +591,10 @@ class AdaptiveActorProjectExecutor:
                 recorder.finish()
             raise
         result = actions.latest
+        if not isinstance(outcome, ActorOutcome):
+            raise RuntimeError("Actor returned an invalid outcome")
+        from collections import Counter
+        action_counts = {"write": 0, "compile": 0, "run": 0, **Counter(actions.actions)}
         if (self.retain_semantic_failure and result is not None
                 and not result.evidence.verified
                 and actions.latest_source_sha256 == actions.source_sha256):
@@ -610,6 +614,10 @@ class AdaptiveActorProjectExecutor:
             return AdaptiveProjectResult(memory, result.evidence, canonical_bytes({
                 "classification": result.evidence.classification.value,
                 "detail": result.evidence.detail, "source_sha256": actions.source_sha256,
+                "actor_status": outcome.status,
+                "iterations": outcome.iterations, "tokens": outcome.tokens,
+                "action_counts": action_counts,
+                "metered_actions": actions.metered_actions,
                 "artifacts": dict(result.artifact_sha256),
             }), result.evidence.detail.strip() or "Host execution failed")
         if (
@@ -624,12 +632,25 @@ class AdaptiveActorProjectExecutor:
                     digest = artifacts.put_json({"status": getattr(outcome, "status", "invalid-outcome")})
                     recorder.validation(
                         candidate_id=actions.source_sha256 or "no-candidate", validator="actor-terminal",
-                        status="infrastructure-failure", evidence_sha256=digest,
+                        status="failed", evidence_sha256=digest,
                         candidate_sha256=actions.source_sha256 or "0" * 64,
-                        details={"incomplete_attempt": True},
+                        details={"abort_status": "completed-unverified"},
                     )
                 recorder.finish()
-            raise RuntimeError("Actor ended without host-verified current source")
+            from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+            raise SemanticProjectFailure(
+                f"Actor ended without host-verified current source ({outcome.status}); "
+                f"observed action counts: {json.dumps(action_counts, sort_keys=True)}", {
+                "actor_status": getattr(outcome, "status", "invalid-outcome"),
+                "iterations": getattr(outcome, "iterations", None),
+                "tokens": getattr(outcome, "tokens", None),
+                "source_sha256": actions.source_sha256,
+                "actions": list(actions.actions),
+                "action_counts": action_counts,
+                "metered_actions": actions.metered_actions,
+                "host_facts": [asdict(fact) for fact in actions.host_facts],
+                "admitted_artifact_sha256": sorted(actions.admitted),
+            })
         if recorder is not None:
             recorder.supervised_source(actions.source)
             recorder.finish()

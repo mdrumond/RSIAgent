@@ -3,10 +3,31 @@
 The adaptive curriculum starts with `--project-target 64`. Increase the target
 on `resume` to continue the same campaign; published memory and project identity
 remain intact. Every wave contains at most eight projects, bounded by the number remaining,
-so later waves can adapt to measured outcomes. A failed
-wave remains `RECOVERY_REQUIRED`: its unverified projects are reported, never
-published as successful lessons. `TARGET_REACHED` means the project count was
+so later waves can adapt to measured outcomes. A normally completed attempt
+without a host-verified current source is skipped, not retried on resume. The
+wave still waits for every sibling, then publishes only verified projects;
+failed attempts do not count toward the verified project target. Provider,
+context-budget, transport and infrastructure exceptions leave pending work
+`RECOVERY_REQUIRED` rather than being mislabeled as kernel failures.
+`TARGET_REACHED` means the verified project count was
 reached, not that every requested topic was learned. Inspect `coverage_gaps`.
+An explicit `--max-projects` smoke cap instead bounds **all completed attempts**
+(verified plus semantic failures). Reaching it returns `PROJECT_LIMIT_REACHED`,
+not saturation. Infrastructure failures remain pending, not completed attempts.
+
+`report` includes the full `curriculum_memory`: concise lesson claims, explicit
+`no_new_knowledge` outcomes, and completed failures. Each curriculum request
+retains concise yield summaries for all prior outcomes and at most eight
+detailed feedback entries: up to four recent failures and the remaining slots
+for recent verified learning. Old failures cannot crowd out new lessons or
+`no_new_knowledge` results, and selection context stays bounded.
+Failure feedback includes retained source/evidence pointers, Actor status and
+actual action counts and usage when available. A research-only budget exhaustion
+does not establish a compiler or device limitation. Failed feedback is kept in
+`state.json` separately from verified kernel memory, and the portable annex
+retains its raw branch evidence. Completed project IDs cannot be reused, but a
+smaller or changed experiment in the same operation family with a fresh ID is
+allowed. These are advisory lessons for the curriculum, not hard family bans.
 
 The saved curriculum session retains the complete selection chronology for
 audit and resume; it is not a verbatim provider request transcript. Each new
