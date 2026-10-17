@@ -167,9 +167,8 @@ class CurriculumProposal:
             not isinstance(self.hypothesis, str)
             or not self.hypothesis.strip()
             or self.hypothesis != self.hypothesis.strip()
-            or len(self.hypothesis) > 500
         ):
-            raise ValueError("hypothesis must be a trimmed 1-500 character string")
+            raise ValueError("hypothesis must be a non-empty trimmed string")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "CurriculumProposal":

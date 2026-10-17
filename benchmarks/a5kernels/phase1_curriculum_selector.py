@@ -15,6 +15,7 @@ from typing import Callable, Mapping, Sequence
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_curriculum import (
     Capability,
+    LEARNING_FOCI,
     DType,
     FailureMode,
     ProfileMetric,
@@ -27,8 +28,8 @@ from benchmarks.a5kernels.phase1_project import ProjectOp
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _DECISION = re.compile(r"DECISION: (WAVE|SATURATED|STALLED)\n(.+)", re.DOTALL)
 _HELD_OUT_WORDS = re.compile(
-    r"(?i)(?:\bgdn\b|gated[ -]delta|\bbsa\b|block[ -]sparse[ -]attention|"
-    r"\bmatmul\b|matrix[ -]multiplication)"
+    r"(?i)(?:\bgdn\b|gated[ -]delta|\bbsa\b|block[ -]sparse[ -]attention"
+    r")"
 )
 
 
@@ -55,9 +56,11 @@ def _digest(value: object, field: str) -> str:
 
 
 def project_information_sha256(value: ProjectSpec | Mapping[str, object]) -> str:
-    """Identify the admitted information dimensions, not labels or tuning."""
+    """Identify executable information for held-out matching, excluding focus."""
 
-    return canonical_digest(ProjectInformation.from_project(value).as_dict())
+    information = ProjectInformation.from_project(value).as_dict()
+    information.pop("learning_focus", None)
+    return canonical_digest(information)
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,7 @@ class ProjectInformation:
     dtype: DType
     failure_mode: FailureMode
     profile_metric: ProfileMetric | None
+    learning_focus: tuple[str, ...] = ()
 
     @classmethod
     def from_project(
@@ -86,6 +90,7 @@ class ProjectInformation:
             spec.dtype,
             spec.failure_mode,
             spec.profile_metric,
+            spec.learning_focus,
         )
 
     def __post_init__(self) -> None:
@@ -107,6 +112,11 @@ class ProjectInformation:
         rows = {
             *(('operation', item.value) for item in self.operations),
             *(('shape-class', _shape_class(item)) for item in self.shapes),
+            *(('learning-focus', item) for item in self.learning_focus),
+            *((('experiment', canonical_digest({
+                'focus': sorted(self.learning_focus), 'dtype': self.dtype.value,
+                'operations': [item.value for item in self.operations],
+            })),) if self.learning_focus else ()),
             ('dtype', self.dtype.value),
             ('failure', self.failure_mode.value),
             ('profile', 'none' if self.profile_metric is None else self.profile_metric.value),
@@ -115,6 +125,7 @@ class ProjectInformation:
 
     def as_dict(self) -> dict[str, object]:
         return {
+            **({"learning_focus": list(self.learning_focus)} if self.learning_focus else {}),
             "operations": [item.value for item in self.operations],
             "shapes": [list(item) for item in self.shapes],
             "dtype": self.dtype.value,
@@ -143,9 +154,8 @@ class PriorOutcome:
             not isinstance(self.summary, str)
             or not self.summary.strip()
             or self.summary != self.summary.strip()
-            or len(self.summary) > 500
         ):
-            raise ValueError("prior summary must be a trimmed 1-500 character string")
+            raise ValueError("prior summary must be a non-empty trimmed string")
 
     def prompt_dict(self) -> dict[str, object]:
         return {
@@ -167,6 +177,7 @@ class CurriculumContext:
     pre_wave_memory_sha256: str
     pre_wave_coverage: tuple[Capability, ...]
     prior_outcomes: tuple[PriorOutcome, ...]
+    remaining_projects: int = 64
 
     def __post_init__(self) -> None:
         if (
@@ -178,6 +189,8 @@ class CurriculumContext:
         if type(self.wave_index) is not int or self.wave_index < 1:
             raise ValueError("wave_index must be a positive integer")
         _digest(self.pre_wave_memory_sha256, "pre-wave memory identity")
+        if type(self.remaining_projects) is not int or self.remaining_projects < 0:
+            raise ValueError("remaining_projects must be nonnegative")
         if any(not isinstance(item, Capability) for item in self.pre_wave_coverage):
             raise ValueError("coverage must contain registered capabilities")
         if len(set(self.pre_wave_coverage)) != len(self.pre_wave_coverage):
@@ -215,9 +228,8 @@ class TerminalDecision:
             not isinstance(self.reason, str)
             or not self.reason.strip()
             or self.reason != self.reason.strip()
-            or len(self.reason) > 500
         ):
-            raise ValueError("terminal reason must be a trimmed 1-500 character string")
+            raise ValueError("terminal reason must be a non-empty trimmed string")
 
 
 CurriculumDecision = WaveDecision | TerminalDecision
@@ -232,6 +244,59 @@ already present before the wave. Return exactly one allowed decision and JSON.
 No Markdown fences or text may precede or follow it."""
 
 
+ASCEND_EXPERIMENT_GUIDANCE = """
+Build an adaptive Ascend A5 curriculum, starting with 64 projects and extending
+later. Cover SCALAR address/control work; VECTOR arithmetic; CUBE matrix work;
+MTE2 GM->UB/L1; MTE1 L1->L0 operands; MTE3 UB->GM; FIX Cube result conversion
+and output. Exercise these through legal copy/vector/matmul graphs, not invented
+pipe opcodes. Cover float16, bfloat16, float32 and supported 8-bit FP8/MXFP8.
+MXFP8 uses quantized operands plus E8M0 scales for each 32 K elements; compare
+against the quantized/scaled host reference, not original unquantized values.
+
+For each hypothesis write a concrete experiment with five labeled parts:
+Question; Controlled change; Tools; Measurements; Expected lesson. There is no
+500-character limit. Use optional learning_focus to distinguish different
+experiments on the same graph; a new ID or rewritten hypothesis is not novelty.
+Plan small runnable projects with explicit source changes, not conditional menus.
+
+Examples:
+* Copy: Question: does redundant MTE2->VECTOR->MTE3 ordering stall movement?
+  Controlled change: hold shape/dtype/launch fixed and compare two correct
+  sources, minimal ordering vs extra legal barriers. Tools: msprof timeline.
+  Measurements: verify both against host, retain source hashes and device kernel
+  duration for both; extract explicit wait intervals when the trace exposes them.
+  Expected lesson: identify redundant ordering cost. Focus inter-pipe-sync and
+  sync-performance; do not infer wait time from blank timeline space.
+* Reduction: Question: which shared-UB SIMT barrier is required? Controlled change:
+  diagnose an ordinary wrong-result case and repair with uniform sync_threads.
+  Tools: mssanitizer memcheck then racecheck/synccheck, bounded msdebug inspection,
+  and tla.print selected values. Measurements: sanitizer findings and host errors
+  before/after repair. Expected lesson: correct producer/consumer ownership.
+  Do not time broken sources or deliberately hang a device.
+* Cube/Vector: compare correct cross-core producer/consumer flag ordering and a
+  correct over-synchronized variant. Use a supported cross_flag set/wait protocol;
+  test SIMD local-memory ordering and SIMT barriers in separate focused projects.
+  Verify all variants; profile Cube, operand movement, FIX and cross-core waits.
+
+Use msprof via request-profile for pipe-utilization, memory-throughput, or
+common-clock timeline. request-timing measures the current verified shape when
+there is no 1-D sweep; timing_lengths is only for 1-D sweeps. Keep launch plus
+synchronize latency separate from msprof diagnostic device kernel duration.
+Instrumented duration is not uninstrumented kernel runtime. Report explicit wait
+events/endpoints, not gaps; missing counters are unavailable, never zero.
+Use request-debug (msdebug) to inspect supported bounded kernel state, not as
+a timer. Use request-sanitizer (mssanitizer) for memory/race/init/sync correctness;
+its pass never replaces the host oracle. Respect actual route availability and
+record unsupported tool/device combinations rather than inventing evidence.
+Use tla.print inside the kernel for selected scalars/tensor prefixes in a debug
+source only. FP8/BF16/E8M0 need conversion to printable FP32 or storage bytes.
+GM/UB printing supports rank 1/2; L1/L0C have stricter layout/prefix rules: consult
+the installed Catlass programming API. Remove printing before timing. Never mix
+sanitizer, debugger, debug-print and performance runs. Retain measurements for
+both correct source variants, and reverify/remeasure the final source.
+"""
+
+
 def _grammar() -> dict[str, object]:
     return {
         "project_fields_exactly": [
@@ -239,6 +304,7 @@ def _grammar() -> dict[str, object]:
             "padding_multiple", "failure_mode", "timing_lengths",
             "profile_metric", "hypothesis", "graph",
         ],
+        "optional_project_fields": {"learning_focus": list(LEARNING_FOCI)},
         "capabilities": [item.value for item in Capability],
         "dtypes": [item.value for item in DType],
         "low_precision_rules": {
@@ -247,6 +313,7 @@ def _grammar() -> dict[str, object]:
         },
         "failure_modes": [item.value for item in FailureMode],
         "profile_metrics": [item.value for item in ProfileMetric],
+        "output_dtype": "input dtype by default; FP8 copy-only graphs preserve FP8; every non-copy FP8 graph computes intermediates and output in float32; MXFP8 matmul outputs float32",
         "padding_multiples": [1, 16, 32, 64, 128, 256],
         "block_count_bounds": [1, 32],
         "shape": "1-3 dimensions, each integer in [1, 4096]; graph inputs must match shape except matmul shape [m,k,n] with inputs [m,k] and [k,n]; each graph tensor may contain at most 65536 elements",
@@ -265,9 +332,12 @@ def _grammar() -> dict[str, object]:
             "input_fields_exactly": ["name", "shape"],
             "node_fields_exactly": ["name", "op", "operands", "axis"],
             "operations": [item.value for item in ProjectOp],
+            "axis": "null for every non-reduction operation; reduce-sum requires an integer zero-based axis within operand rank",
+            "mask-positive": "elementwise 1 if x > 0 else 0, converted to output dtype",
             "bounds": "1-3 inputs, 1-12 topological nodes, 1-3 dimensions",
         },
         "wave_project_fields_exactly": ["spec", "requires"],
+        "requires": "list of Capability values already in pre_wave_coverage, never project IDs; [] for the initial wave",
         "wave_fields_exactly": [
             "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage", "projects",
         ],
@@ -280,6 +350,8 @@ def curriculum_prompt(
 ) -> str:
     payload = {
         "objective": context.objective,
+        "remaining_projects": context.remaining_projects,
+        "max_wave_projects": min(8, context.remaining_projects),
         "next_wave_id": f"wave-{context.wave_index:03d}",
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
@@ -292,7 +364,7 @@ def curriculum_prompt(
         ]
     instructions = (
         "Choose DECISION: WAVE only when every project adds operation, shape, dtype, "
-        "failure, or profile information not covered by prior outcomes. Capability "
+        "failure, profile, or learning-focus information not covered by prior outcomes. Select no more than max_wave_projects (at most eight), then adapt the next wave to observed results. Capability "
         "labels alone are not information gain. Copy the supplied "
         "wave ID, memory identity, and coverage exactly. Otherwise choose SATURATED "
         "when the objective is covered, or STALLED when useful work is blocked.\n"
@@ -306,7 +378,7 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
-    return instructions + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return instructions + ASCEND_EXPERIMENT_GUIDANCE + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class CurriculumAgent:
@@ -418,6 +490,8 @@ class CurriculumAgent:
                 raise ValueError("stall requires an observed prior attempt")
             return terminal
         wave = WaveSpec.from_mapping(value)
+        if len(wave.projects) > min(8, context.remaining_projects):
+            raise ValueError("wave exceeds eight-project wave limit or remaining project target")
         unavailable = set(self.unavailable_capabilities)
         if any(unavailable.intersection(item.spec.capabilities) for item in wave.projects):
             raise ValueError("wave selects a capability unavailable in this factory")
@@ -464,14 +538,19 @@ class CurriculumAgent:
             raise ValueError("wave repeats executable information between siblings")
         if prior_information.intersection(signatures):
             raise ValueError("wave repeats prior information")
-        if self._held_out.intersection(signatures):
+        executable_signatures = {
+            canonical_digest({key: value for key, value in item.as_dict().items()
+                              if key != "learning_focus"})
+            for item in information
+        }
+        if self._held_out.intersection(executable_signatures):
             raise ValueError("wave matches a held-out contract or shape")
         marginal_coverage = set(covered_dimensions)
         for item in information:
             if not item.tokens - marginal_coverage:
                 raise ValueError(
                     "every project must add marginal operation/shape-class/dtype/"
-                    "failure/profile information"
+                    "failure/profile/learning-focus information"
                 )
             marginal_coverage.update(item.tokens)
         return WaveDecision(wave)

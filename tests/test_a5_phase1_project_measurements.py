@@ -376,3 +376,23 @@ def test_profile_driver_initialization_and_conversion_do_not_launch_helper_kerne
             exec(compile(module, '<project-driver>', 'exec'), namespace)
     assert calls == [('fill', 'cpu'), ('cast', 'cpu'), ('transfer', 'npu'),
                      ('transfer', 'cpu'), ('cast', 'cpu')]
+
+
+def test_current_matrix_shape_timing_needs_no_sweep():
+    spec = _spec("movement")
+    assert len(spec.shape) > 1
+    assert specialize_timing(spec) == (spec,)
+
+
+def test_device_duration_requires_units_and_preserves_overlapping_tasks():
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.phase1_project_measurements import device_duration_summary
+    capture = SimpleNamespace(exported_kernels=("kernel",), summary=(
+        ("OpBasicInfo.csv.gz:Task Duration(us)", "7.2"),
+        ("OpBasicInfo.csv.gz:Duration(us)", "5.1"),
+        ("duration", "999")))
+    result = device_duration_summary(capture)
+    assert result["task_durations_us"] == [7.2, 5.1]
+    assert result["instrumented"] is True
+    capture.summary = (("duration", "999"),)
+    assert device_duration_summary(capture)["status"] == "unavailable"
