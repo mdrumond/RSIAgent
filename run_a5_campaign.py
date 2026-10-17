@@ -36,6 +36,7 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--runtime-catlass-revision")
     reconcile.add_argument("--phase2-guide", type=Path)
     reconcile.add_argument("--phase2-cpl-skills-revision")
+    reconcile.add_argument("--compile-probes", type=int, default=0, metavar="N")
     reconcile.add_argument("--collection", required=True)
     reconcile.add_argument("--env-file", type=Path)
     reconcile.add_argument("--until-complete", action="store_true")
@@ -98,6 +99,8 @@ def _command_factory(args, destinations):
                     ("phase2-guide", args.phase2_guide),
                     ("phase2-cpl-skills-revision", args.phase2_cpl_skills_revision),
                 )
+            if getattr(args, "compile_probes", 0):
+                values += (("compile-probes", args.compile_probes),)
             runtime_revision = getattr(args, "runtime_catlass_revision", None)
             if runtime_revision is not None:
                 values += (("runtime-catlass-revision", runtime_revision),)
