@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from copy import deepcopy
 import json
+import math
+import re
+import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 from benchmarks.ascend.agent_context import (
@@ -12,7 +15,7 @@ from benchmarks.ascend.agent_context import (
 )
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger, canonical_digest
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel, A5ModelIdentity
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
@@ -130,6 +133,18 @@ class DirectCompletion:
 Transport = Callable[..., DirectCompletion]
 
 
+class ProviderRejectionError(RuntimeError):
+    """Provider rejection (final after retry exhaustion), without raw secrets."""
+
+    def __init__(self, *, code: str, status_code: int, request_id: str | None):
+        self.code, self.status_code, self.request_id = code, status_code, request_id
+        super().__init__(f"provider rejected request: {code} (HTTP {status_code})")
+
+    def evidence(self):
+        return {"exception_type": type(self).__name__, "code": self.code,
+                "status_code": self.status_code, "request_id": self.request_id}
+
+
 def _is_openai_transport_failure(exc: Exception) -> bool:
     """Recognize optional OpenAI SDK connection failures when it is installed."""
 
@@ -169,6 +184,9 @@ class DirectCompletionProvider:
         *,
         transport: Transport = openai_compatible_transport,
         context_budgets: Mapping[str, ContextBudget] | None = None,
+        invalid_prompt_retries: int = 3,
+        invalid_prompt_backoff_seconds: float = 120,
+        sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
         credentials = {}
         for values in _DIRECT_VALUES.values():
@@ -179,6 +197,15 @@ class DirectCompletionProvider:
             credentials[name] = value
         self._credentials = credentials
         self._transport = transport
+        if type(invalid_prompt_retries) is not int or invalid_prompt_retries < 0:
+            raise ValueError("invalid_prompt_retries must be a nonnegative integer")
+        if (type(invalid_prompt_backoff_seconds) not in (float, int)
+                or not math.isfinite(invalid_prompt_backoff_seconds)
+                or invalid_prompt_backoff_seconds < 0):
+            raise ValueError("invalid_prompt_backoff_seconds must be nonnegative")
+        self.invalid_prompt_retries = invalid_prompt_retries
+        self.invalid_prompt_backoff_seconds = invalid_prompt_backoff_seconds
+        self._sleep = sleeper
         self.context_budgets = dict(DEFAULT_CONTEXT_BUDGETS)
         if context_budgets is not None:
             if set(context_budgets) - set(self.context_budgets) or not all(
@@ -194,19 +221,55 @@ class DirectCompletionProvider:
         self,
         profile: DirectModelProfile,
         messages: Sequence[Mapping[str, str]],
+        *, attempt_observer=None,
     ) -> DirectCompletion:
         if profile != direct_profile(profile.identity):
             raise ValueError("provider profile is not canonical")
         if request_bytes(profile.request(messages)) > self.context_budget(profile).hard:
             raise ContextBudgetError("direct provider request exceeds context hard byte budget")
+        request = profile.request(messages)
+        request_sha256 = canonical_digest(request)
+        for attempt in range(1, self.invalid_prompt_retries + 2):
+            if attempt_observer is not None:
+                attempt_observer("request", {"attempt": attempt, "request": deepcopy(request),
+                                             "request_sha256": request_sha256})
+            try:
+                return self._complete_once(profile, request)
+            except ProviderRejectionError as exc:
+                retry = attempt <= self.invalid_prompt_retries
+                delay = self.invalid_prompt_backoff_seconds if retry else 0
+                if attempt_observer is not None:
+                    attempt_observer("rejection", {"attempt": attempt, **exc.evidence(),
+                                                  "request_sha256": request_sha256,
+                                                  "retry": retry, "backoff_seconds": delay})
+                if not retry:
+                    raise
+                self._sleep(delay)
+
+    def _complete_once(self, profile, request):
         try:
             result = self._transport(
                 base_url=profile.base_url,
                 api_key=self._credentials[profile.identity.credential_env],
-                request=profile.request(messages),
+                request=deepcopy(request),
             )
         except Exception as exc:
             status = getattr(exc, "status_code", None)
+            body = getattr(exc, "body", None)
+            code = getattr(exc, "code", None)
+            if isinstance(body, dict):
+                error = body.get("error", body)
+                if isinstance(error, dict):
+                    code = error.get("code", code)
+            if status == 400 and code == "invalid_prompt":
+                request_id = getattr(exc, "request_id", None)
+                # Retain only an ID, never arbitrary exception/body text.
+                if not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", request_id):
+                    request_id = None
+                if request_id and any(secret in request_id for secret in self._credentials.values()):
+                    request_id = None
+                raise ProviderRejectionError(code=code, status_code=status,
+                                             request_id=request_id) from None
             retryable = (
                 isinstance(exc, (ConnectionError, TimeoutError))
                 or _is_openai_transport_failure(exc)
@@ -249,8 +312,17 @@ class _ProviderEvidenceRecorder:
     def failure(self, exc: Exception, *, stage: str, turn: int) -> None:
         if not self.enabled:
             return
-        digest = self.artifacts.put_json({"exception_type": type(exc).__name__})
+        payload = exc.evidence() if isinstance(exc, ProviderRejectionError) else {"exception_type": type(exc).__name__}
+        digest = self.artifacts.put_json(payload)
         self._append("provider-response-failure", digest, stage=stage, turn=turn)
+
+    def attempt(self, event, payload, *, stage, turn):
+        if not self.enabled:
+            return
+        digest = self.artifacts.put_json(payload.get("request", payload))
+        role = "provider-request" if event == "request" else "provider-attempt-rejection"
+        self._append(role, digest, stage=stage, turn=turn,
+                     attempt=payload["attempt"], request_sha256=payload["request_sha256"])
 
     def observation(self, text: str, *, turn: int) -> None:
         if not self.enabled:
@@ -330,9 +402,11 @@ class DirectActorDriver:
             nonlocal tokens
             self._request(recorder, profile, messages, stage="compaction", turn=turn)
             try:
-                completion = self.provider.complete(profile, messages)
+                completion = self._complete(recorder, profile, messages, stage="compaction", turn=turn)
             except Exception as exc:
                 recorder.failure(exc, stage="compaction", turn=turn)
+                if isinstance(exc, ProviderRejectionError):
+                    raise
                 raise ContextBudgetError("work-log summarization failed; original evidence retained") from exc
             recorder.response(completion.text, stage="compaction", turn=turn)
             tokens += completion.completion_tokens
@@ -345,9 +419,15 @@ class DirectActorDriver:
         return messages, tokens
 
     def _request(self, recorder, profile, messages, *, stage, turn):
-        recorder.request(profile, messages, stage=stage, turn=turn)
         self._trace("tool", {"name": "provider-request", "stage": stage, "turn": turn,
                              "request": profile.request(messages)})
+
+    def _complete(self, recorder, profile, messages, *, stage, turn):
+        def observe(event, payload):
+            recorder.attempt(event, payload, stage=stage, turn=turn)
+            self._trace("tool", {"name": "provider-attempt-" + event,
+                                "stage": stage, "turn": turn, **payload})
+        return self.provider.complete(profile, messages, attempt_observer=observe)
 
     def __call__(
         self,
@@ -373,7 +453,11 @@ class DirectActorDriver:
             messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
             tokens += summary_tokens
             self._request(recorder, profile, messages, stage="action", turn=turn)
-            completion = self.provider.complete(profile, messages)
+            try:
+                completion = self._complete(recorder, profile, messages, stage="action", turn=turn)
+            except Exception as exc:
+                recorder.failure(exc, stage="action", turn=turn)
+                raise
             recorder.response(completion.text, stage="action", turn=turn)
             tokens += completion.completion_tokens
             messages.append({"role": "assistant", "content": completion.text})
@@ -478,12 +562,16 @@ class DirectActorDriver:
                 continuation.profile, messages, stage="distillation", turn=turn,
             )
             try:
-                completion = self.provider.complete(continuation.profile, messages)
+                completion = self._complete(continuation.recorder, continuation.profile,
+                                            messages, stage="distillation", turn=turn)
             except InfrastructureFailure as exc:
                 continuation.recorder.failure(
                     exc, stage="distillation", turn=turn,
                 )
                 return replace(outcome, tokens=tokens)
+            except Exception as exc:
+                continuation.recorder.failure(exc, stage="distillation", turn=turn)
+                raise
             continuation.recorder.response(
                 completion.text, stage="distillation", turn=turn,
             )
