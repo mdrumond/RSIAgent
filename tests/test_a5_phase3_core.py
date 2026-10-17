@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -7,11 +8,13 @@ import pytest
 
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_experiments import A5BackendModel
+from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
 from benchmarks.a5kernels.phase2_live import MAX_ATTEMPTS, Phase2LiveRunner
 from benchmarks.a5kernels.phase2_memory import QUALIFICATION_SCHEMA, phase2_cells
 from benchmarks.a5kernels.phase3_core import admit_phase2_lineage
 from tests.test_a5_phase2_live import _Backend, _deps
 from tests.test_a5_phase2_memory import _snapshot
+from tests.test_a5_phase2_adaptive_memory import _source
 
 
 def _write_qualification(root, cell, runtime_revision="b" * 40):
@@ -101,6 +104,47 @@ def test_admission_freezes_only_authenticated_actor_visible_memory(tmp_path):
     reopened = type(frozen).open(frozen.root, cell)
     assert reopened.snapshot_id == frozen.snapshot_id
     assert admit_phase2_lineage(root, cell, tmp_path / "phase3") == frozen
+
+
+def test_legacy_frozen_bytes_remain_unchanged(tmp_path):
+    root, cell, _runner, _terminal = _phase2(tmp_path)
+    frozen = admit_phase2_lineage(root, cell, tmp_path / "phase3")
+    assert hashlib.sha256(frozen.memory_path.read_bytes()).hexdigest() == (
+        "07917374b5df7f9d4af1cc772593f60cf650fe2db9fce06e05f34240e5a3366e"
+    )
+    assert hashlib.sha256(frozen.manifest_path.read_bytes()).hexdigest() == (
+        "6f66e2221c5d504364ed20dfaa389286a53a9daaecd4b5b3f96dc86936c6d358"
+    )
+
+
+@pytest.mark.parametrize("new_guidance", [False, True])
+def test_reviewed_adaptive_phase2_freezes_into_phase3(tmp_path, new_guidance):
+    source_root, source, review, memory = _source(tmp_path, new=new_guidance)
+    root = tmp_path / "phase2"
+    snapshot = admit_adaptive_snapshot(source_root, b"", review, source, root)
+    original = {path.relative_to(snapshot.root): path.read_bytes()
+                for path in snapshot.root.rglob("*") if path.is_file()}
+    runner = Phase2LiveRunner(
+        phase2_root=root,
+        snapshot=snapshot,
+        dependencies=_deps(snapshot, _Backend(), []),
+    )
+    assert runner.run()["status"] == "passed"
+    _write_qualification(root, snapshot.destination)
+
+    frozen = admit_phase2_lineage(root, snapshot.destination, tmp_path / "phase3")
+
+    assert frozen.manifest["source_snapshot_id"] == snapshot.snapshot_id
+    assert frozen.manifest["phase1_entries"] == 1
+    assert canonical_bytes(frozen.actor_memory()["phase1"]) == canonical_bytes([memory])
+    assert frozen.actor_memory()["phase2"][0]["passed"] is True
+    assert type(frozen).open(frozen.root, snapshot.destination) == frozen
+    assert original == {path.relative_to(snapshot.root): path.read_bytes()
+                        for path in snapshot.root.rglob("*") if path.is_file()}
+
+    (snapshot.root / "review.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="adaptive snapshot bytes changed"):
+        admit_phase2_lineage(root, snapshot.destination, tmp_path / "tampered-phase3")
 
 
 def test_frozen_copy_rejects_memory_and_manifest_tampering(tmp_path):
