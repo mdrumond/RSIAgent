@@ -153,7 +153,11 @@ def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
     second, session = agent.select(next_context, session)
     assert isinstance(second, TerminalDecision)
     assert session.turns == 2
-    assert calls[1][:3] == calls[0] + ({"role": "assistant", "content": wave([project()])},)
+    assert len(calls[1]) == 2
+    assert calls[1][0] == calls[0][0]
+    assert '"next_wave_id":"wave-002"' in calls[1][1]["content"]
+    assert '"project_id":"movement"' in calls[1][1]["content"]
+    assert session.messages[:3] == calls[0] + ({"role": "assistant", "content": wave([project()])},)
 
 
 @pytest.mark.parametrize("invalid", [
@@ -208,6 +212,70 @@ def test_provider_value_error_is_not_retried_as_proposal_validation():
         CurriculumAgent(complete).select(context())
     assert caught.value is failure
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("model_index", [0, 1])
+def test_64_serial_selections_and_oversized_session_resume_use_bounded_wire(model_index):
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import (
+        DirectCompletion, DirectCompletionProvider, direct_profile,
+    )
+    from benchmarks.ascend.agent_context import request_bytes
+
+    profile = direct_profile(MODEL_IDENTITIES[model_index])
+    requests = []
+    expected_context = None
+    retry = False
+    def transport(*, request, **kwargs):
+        nonlocal retry
+        requests.append(request)
+        messages = request["messages"]
+        assert messages[0]["role"] == "system"
+        assert "Profiling guidance:\nKeep raw profiling evidence." in messages[1]["content"]
+        assert "Project budget: select no more than 1 projects" in messages[1]["content"]
+        payload = json.loads(messages[1]["content"].rsplit("\n", 1)[-1])
+        assert payload["pre_wave_memory_sha256"] == expected_context.pre_wave_memory_sha256
+        assert payload["pre_wave_coverage"] == [item.value for item in expected_context.pre_wave_coverage]
+        assert payload["prior_outcomes"] == [item.prompt_dict() for item in expected_context.prior_outcomes]
+        if expected_context.wave_index == 64 and not retry:
+            retry = True
+            return DirectCompletion("DECISION: WAVE\n{broken", 1)
+        if len(messages) == 4:
+            assert "{broken" in messages[2]["content"]
+            assert "Proposal validation failed" in messages[3]["content"]
+        else:
+            assert len(messages) == 2
+        item = with_shape(project(f"project-{expected_context.wave_index}"), [expected_context.wave_index])
+        return DirectCompletion(wave([item], memory=expected_context.pre_wave_memory_sha256,
+                                     coverage=payload["pre_wave_coverage"],
+                                     wave_id=payload["next_wave_id"]), 1)
+
+    provider = DirectCompletionProvider(
+        {"OPENAI_API_KEY": "test-openai", "DEEPSEEK_API_KEY": "test-deepseek"}, transport=transport)
+    agent = CurriculumAgent(lambda messages: provider.complete(profile, messages).text,
+                            profiling_guidance="Keep raw profiling evidence.")
+    session = CurriculumSession()
+    priors = []
+    for index in range(1, 66):
+        expected_context = context(wave_index=index, prior_outcomes=tuple(priors),
+                                   pre_wave_memory_sha256=f"{index:064x}",
+                                   pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), remaining_projects=1)
+        if index == 65:
+            # Real persisted schema: old oversized chronology is preserved on
+            # load, but only this selection's context/corrections go on the wire.
+            assert request_bytes(profile.request(session.messages)) > provider.context_budget(profile).hard
+            restored = json.loads(json.dumps({"messages": session.messages, "turns": session.turns}))
+            session = CurriculumSession(tuple(restored["messages"]), restored["turns"])
+        original_history = session.messages
+        decision, session = agent.select(expected_context, session, remaining_projects=1)
+        assert session.messages[:len(original_history)] == original_history
+        priors.append(PriorOutcome(decision.wave.projects[0].spec.project_id,
+                      ProjectInformation.from_project(decision.wave.projects[0].spec), True,
+                      "Host verified exact output; retain measured evidence."))
+    assert len(priors) == 65
+    assert session.turns == 66  # One validation repair, no lost chronology.
+    assert len(requests) == 66
+    assert all(request_bytes(item) <= provider.context_budget(profile).hard for item in requests)
 
 
 @pytest.mark.parametrize("reply", [

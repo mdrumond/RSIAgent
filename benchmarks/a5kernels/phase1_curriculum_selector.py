@@ -214,6 +214,8 @@ class CurriculumContext:
 
 @dataclass(frozen=True)
 class CurriculumSession:
+    """Complete selection chronology, not a verbatim provider wire transcript."""
+
     messages: tuple[Mapping[str, str], ...] = ()
     turns: int = 0
 
@@ -446,11 +448,11 @@ class CurriculumAgent:
         current = CurriculumSession() if session is None else session
         if not isinstance(current, CurriculumSession):
             raise TypeError("session must be CurriculumSession")
-        history = list(current.messages) if current.messages else [
-            {"role": "system", "content": (
-                _SYSTEM if self.target_policy is None else self.target_policy.system
-            )}
-        ]
+        system = {"role": "system", "content": (
+            _SYSTEM if self.target_policy is None else self.target_policy.system
+        )}
+        history = list(current.messages) if current.messages else [system]
+        selection_start = len(history)
         history.append({
             "role": "user",
             "content": (
@@ -467,7 +469,11 @@ class CurriculumAgent:
         for attempt in range(1, 4):
             # Provider failures are not proposal-validation failures. Let the
             # caller's existing infrastructure handling observe them unchanged.
-            completion = self._complete(tuple(dict(item) for item in history))
+            # The current host context contains all authoritative prior outcomes.
+            # Keep old selections for audit/resume, but do not resend redundant
+            # historical contexts. Include all corrections within this selection.
+            wire = [system, *history[selection_start:]]
+            completion = self._complete(tuple(dict(item) for item in wire))
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})

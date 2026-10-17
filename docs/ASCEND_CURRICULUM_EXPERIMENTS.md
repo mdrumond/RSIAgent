@@ -8,6 +8,14 @@ wave remains `RECOVERY_REQUIRED`: its unverified projects are reported, never
 published as successful lessons. `TARGET_REACHED` means the project count was
 reached, not that every requested topic was learned. Inspect `coverage_gaps`.
 
+The saved curriculum session retains the complete selection chronology for
+audit and resume; it is not a verbatim provider request transcript. Each new
+selection sends only the system instruction and current authoritative host
+context (including all prior outcomes, current coverage, and memory identity),
+plus any validation corrections from that selection. Obsolete full contexts
+from earlier selections are not resent. The shared provider request-size guard
+still rejects oversized current contexts rather than silently truncating them.
+
 Each hypothesis describes five parts: **Question; Controlled change; Tools;
 Measurements; Expected lesson**. Text must be nonempty and trimmed, with no
 arbitrary 500-character cap. Model response budgets still apply. Optional
