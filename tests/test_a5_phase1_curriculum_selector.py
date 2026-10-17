@@ -601,7 +601,9 @@ def test_focus_comparison_keeps_historical_serialization_and_identity():
     assert canonical_bytes(restored.as_dict()) == stored
     assert canonical_bytes(information.as_dict()) == serialized_information
     assert prior.information_sha256 == historical_identity
-    assert project_information_sha256(restored) == historical_identity
+    executable_information = json.loads(serialized_information)
+    executable_information.pop("learning_focus")
+    assert project_information_sha256(restored) == canonical_digest(executable_information)
     assert prior.information_sha256 != canonical_digest(reversed_information.as_dict())
 
 

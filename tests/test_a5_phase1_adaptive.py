@@ -511,7 +511,7 @@ def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
 def test_timing_counts_only_retained_msprof_capture_even_without_requested_focus(device_capture):
     summary = {"timing": [{"device_kernel": {"duration_us": 2}}] if device_capture else []}
     spec = _project("timed", "gm-ub-movement")
-    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+    state = {"prior_outcomes": [{"spec": spec, "verified": True}], "memory_bytes_base64": [
         base64.b64encode(json.dumps({"host_facts": [
             {"category": "performance-study", "statement": json.dumps(summary)},
         ]}).encode()).decode()]}
