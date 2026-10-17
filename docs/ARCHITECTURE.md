@@ -44,6 +44,14 @@ The alternative `verifier_pass` policy stops after a target PASS and its memory
 commit. Neither policy turns an infrastructure error into a PASS or FAIL.
 `STALLED` and budget exits must remain distinguishable from successful convergence.
 
+The A5 Catlass attention runner keeps semantic attempts immutable. A first attempt
+receives no repair context. After a host-verified failure, the next attempt receives
+the immediately preceding candidate (bounded to 256 KiB), its candidate and evidence
+digests, and the admitted failure summary. The prompt asks for a focused repair of
+that candidate. This context exposes no host data beyond the already admitted
+diagnostic and mismatch summary and cannot override the host verifier; retained
+attempts are reauthenticated before the context is rebuilt.
+
 The Curriculum Agent's context persists within the target lineage. Its default
 direct memory view is read-only. The `none` comparison setting removes that direct
 view while retaining normal trajectory and Verifier Agent feedback. The Actor
