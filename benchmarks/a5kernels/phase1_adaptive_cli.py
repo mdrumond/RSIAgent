@@ -26,6 +26,7 @@ from benchmarks.a5kernels.phase1_experiments import (
 )
 from benchmarks.a5kernels.phase1_production import load_direct_environment
 from benchmarks.a5kernels.production import _transformers_cache
+from benchmarks.a5kernels.profiling_guidance import admit_profiling_guidance
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -45,6 +46,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-parallel", type=int, default=1)
     parser.add_argument("--project-target", type=int)
+    parser.add_argument("--max-projects", type=int)
+    parser.add_argument("--profiling-guidance-skill", type=Path)
     parser.add_argument("--kdb", type=Path)
     parser.add_argument("--collection")
     parser.add_argument("--bge-cache", type=Path)
@@ -84,8 +87,15 @@ def main(
         cpl_skills_revision=args.cpl_skills_revision,
         catlass_revision=args.catlass_revision,
     )
+    profiling_guide = guidance_text = None
+    if args.profiling_guidance_skill is not None:
+        if args.profiling != ProfilingGuidance.NEW.value:
+            raise ValueError("--profiling-guidance-skill requires --profiling new")
+        profiling_guide, guidance_text = admit_profiling_guidance(
+            args.profiling_guidance_skill, cpl_skills_revision=args.cpl_skills_revision,
+        )
     cell = next(
-        item for item in build_cells(guide)
+        item for item in build_cells(guide, profiling_guide=profiling_guide)
         if item.model.backend_model is A5BackendModel(args.model)
         and item.knowledge is KnowledgeMode(args.knowledge)
         and item.profiling is ProfilingGuidance(args.profiling)
@@ -115,6 +125,8 @@ def main(
         embeddings=embeddings,
         max_parallel=args.max_parallel,
         project_target=args.project_target,
+        **({"max_projects": args.max_projects} if args.max_projects is not None else {}),
+        **({"profiling_guidance_text": guidance_text} if guidance_text is not None else {}),
     )
     result = getattr(campaign, args.action)()
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

@@ -49,6 +49,7 @@ from benchmarks.a5kernels.phase1_provider import (
     direct_profile,
     openai_compatible_transport,
 )
+from benchmarks.a5kernels.profiling_guidance import verify_profiling_guidance
 
 
 _REVISION = re.compile(r"[0-9a-f]{40}\Z")
@@ -260,7 +261,7 @@ def _checked_command(paths: AdaptiveProductionPaths) -> BZCommandExecutor:
     return command
 
 
-def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes) -> bytes:
+def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes, profiling_guidance_text: str | None = None) -> bytes:
     if not isinstance(guide_bytes, bytes) or not guide_bytes:
         raise TypeError("programming guide must be non-empty immutable bytes")
     if hashlib.sha256(guide_bytes).hexdigest() != cell.guide.guide_sha256:
@@ -274,6 +275,11 @@ def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes) -> bytes:
         if cell.profiling is ProfilingGuidance.WITH_GUIDANCE
         else None
     )
+    if cell.profiling is ProfilingGuidance.NEW:
+        verify_profiling_guidance(cell.profiling_guide, profiling_guidance_text)
+        guidance = profiling_guidance_text
+    elif profiling_guidance_text is not None:
+        raise ValueError("explicit new guidance cannot change a legacy treatment")
     return canonical_bytes({
         "schema": _INITIAL_CONTEXT_SCHEMA,
         "programming_guide": {
@@ -324,6 +330,8 @@ def build_adaptive_phase1(
     command_executor: BZCommandExecutor | None = None,
     max_parallel: int = 1,
     project_target: int | None = None,
+    max_projects: int | None = None,
+    profiling_guidance_text: str | None = None,
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 
@@ -334,7 +342,7 @@ def build_adaptive_phase1(
         raise ValueError("runtime Catlass revision does not match the admitted guide")
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
-    actor_context = _actor_context(admitted, guide_bytes)
+    actor_context = _actor_context(admitted, guide_bytes, profiling_guidance_text)
     _bind_campaign_identity(paths.root, admitted)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
@@ -384,6 +392,7 @@ def build_adaptive_phase1(
     )
     curriculum = CurriculumAgent(
         lambda messages: provider.complete(profile, messages).text,
+        profiling_guidance=profiling_guidance_text,
     )
 
     coordinator = AdaptivePhase1Coordinator(
@@ -394,6 +403,7 @@ def build_adaptive_phase1(
         project_actor,
         max_parallel=max_parallel,
         project_target=project_target,
+        max_projects=max_projects,
     )
     return AdaptivePhase1Production(
         admitted,

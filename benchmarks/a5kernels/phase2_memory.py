@@ -33,6 +33,7 @@ from benchmarks.a5kernels.phase2_attention import SUITE_SHA256
 CELL_SCHEMA = "a5-catlass-phase2-cell-v1"
 CELL_SCHEMA_V2 = "a5-catlass-phase2-cell-v2"
 SNAPSHOT_SCHEMA = "a5-catlass-phase2-phase1-snapshot-v1"
+QUALIFICATION_SCHEMA = "a5-catlass-phase2-transport-qualification-v1"
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -425,6 +426,7 @@ __all__ = [
     "A5Phase2Cell",
     "CELL_SCHEMA",
     "CELL_SCHEMA_V2",
+    "QUALIFICATION_SCHEMA",
     "SNAPSHOT_SCHEMA",
     "admit_phase1_snapshot",
     "phase2_cell_pairs",
