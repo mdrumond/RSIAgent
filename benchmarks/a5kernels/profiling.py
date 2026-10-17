@@ -23,6 +23,8 @@ _SHA256 = re.compile(r"[0-9a-f]{64}")
 class ProfileMetric(str, Enum):
     BASIC_INFO = "BasicInfo"
     PIPE_UTILIZATION = "PipeUtilization"
+    MEMORY = "Memory"
+    PIPE_TIMELINE = "PipeTimeline"
 
 
 class CampaignKind(str, Enum):
@@ -204,8 +206,8 @@ class CaptureCommand:
     def __post_init__(self) -> None:
         if self.kernel_name is not None and not self.kernel_name:
             raise ValueError("kernel name must be non-empty when supplied")
-        if self.metric is ProfileMetric.PIPE_UTILIZATION and not self.kernel_name:
-            raise ValueError("PipeUtilization requires an exact kernel name")
+        if self.metric is not ProfileMetric.BASIC_INFO and not self.kernel_name:
+            raise ValueError(f"{self.metric.value} requires an exact kernel name")
 
 
 @dataclass(frozen=True)

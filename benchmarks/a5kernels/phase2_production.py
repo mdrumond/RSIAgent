@@ -46,14 +46,13 @@ from benchmarks.a5kernels.phase2_attention_bz import (
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies
 from benchmarks.a5kernels.phase2_memory import (
     A5Phase1Snapshot,
+    QUALIFICATION_SCHEMA,
     admit_phase1_snapshot,
     phase2_cells,
 )
 from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider
+from benchmarks.a5kernels.sft_dataset import SourceManifest, TraceRecorder
 from benchmarks.a5kernels.production import _probe_knowledge_query, _transformers_cache
-
-
-QUALIFICATION_SCHEMA = "a5-catlass-phase2-transport-qualification-v1"
 
 
 @dataclass(frozen=True)
@@ -69,6 +68,7 @@ class Phase2ProductionConfig:
     tla_root: Path
     catlass_source: str
     device: int
+    runtime_catlass_revision: str | None = None
     bge_cache: Path | None = None
     kdb: Path | None = None
     collection: str | None = None
@@ -86,6 +86,11 @@ class Phase2ProductionConfig:
             raise ValueError("device must be a non-negative integer")
         if not isinstance(self.cell_id, str) or not self.cell_id:
             raise ValueError("cell_id must be non-empty")
+        if self.runtime_catlass_revision is not None and (
+            len(self.runtime_catlass_revision) != 40
+            or any(character not in "0123456789abcdef" for character in self.runtime_catlass_revision)
+        ):
+            raise ValueError("runtime_catlass_revision must be a lowercase 40-character SHA")
         if (self.phase2_guide_path is None) != (
             self.phase2_cpl_skills_revision is None
         ):
@@ -145,6 +150,7 @@ def _qualification_identity(config: Phase2ProductionConfig, cell, provenance):
         "cell_id": cell.cell_id,
         "catlass_source": config.catlass_source,
         "catlass_revision": cell.catlass_revision,
+        "runtime_catlass_revision": dict(provenance)["catlass_revision"],
         "runtime_provenance": [list(item) for item in provenance],
         "physical_device": config.device,
         "case": asdict(case),
@@ -163,9 +169,19 @@ def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
     retained = dict(value)
     digest = retained.pop("record_sha256", None)
     output = retained.get("output")
+    expected_identity = dict(identity)
+    if (
+        "runtime_catlass_revision" not in retained
+        and expected_identity["runtime_catlass_revision"]
+        == expected_identity["catlass_revision"]
+    ):
+        expected_identity.pop("runtime_catlass_revision")
     if (
         digest != canonical_digest(retained)
-        or any(retained.get(key) != expected for key, expected in identity.items())
+        or any(
+            retained.get(key) != expected
+            for key, expected in expected_identity.items()
+        )
         or retained.get("status") != "transport-qualified"
         or retained.get("exit_code") != 0
         or not isinstance(retained.get("session_handle"), str)
@@ -356,7 +372,9 @@ def build_phase2_production(
             upload_wrapper=str(config.upload_wrapper),
             validation_wrapper=str(config.validation_wrapper),
             catlass_source=config.catlass_source,
-            catlass_revision=cell.catlass_revision,
+            catlass_revision=(
+                config.runtime_catlass_revision or cell.catlass_revision
+            ),
         )
     retained_provenance = _retained_qualification_provenance(config, cell)
     live_provenance = tuple(executor.runtime_provenance)
@@ -366,8 +384,11 @@ def build_phase2_production(
             "retained Phase 2 qualification runtime provenance changed"
         )
     provenance = live_provenance
-    if dict(provenance).get("catlass_revision") != cell.catlass_revision:
-        raise ValueError("runtime provenance changed the admitted Catlass revision")
+    expected_runtime_revision = (
+        config.runtime_catlass_revision or cell.catlass_revision
+    )
+    if dict(provenance).get("catlass_revision") != expected_runtime_revision:
+        raise ValueError("runtime provenance changed the configured Catlass revision")
     if dict(provenance).get("catlass_source") != config.catlass_source:
         raise ValueError("runtime provenance changed the retained Catlass source")
     if not is_resume:
@@ -416,6 +437,48 @@ def build_phase2_production(
         max_compile_probes=config.compile_probes,
     )
     verifier = AttentionTargetVerifier(backend)
+    source_manifest = SourceManifest.load(
+        Path(__file__).parents[2] / "config/a5/sft-source-manifest.json"
+    )
+
+    def retain_sft_trace(request, candidate, evidence):
+        conversation = source.conversation(cell.cell_id, request.attempt_id)
+        if conversation is None:
+            return
+        recorder = TraceRecorder(
+            config.phase2_root.resolve() / "sft-traces" / f"{request.attempt_id}.jsonl",
+            trace_id=request.attempt_id,
+            phase="phase2",
+            round_id=f"p2-{snapshot.snapshot_id[:16]}",
+            operator_family="attention",
+            model=cell.model.profile_id,
+            source_manifest_sha256=source_manifest.sha256,
+        )
+        for message in conversation:
+            recorder.message(message["role"], message["content"])
+        for previous in request.phase2_memory:
+            if previous.get("passed") is False:
+                recorder.tool_event("previous-host-validation", {
+                    "status": "failed",
+                    "candidate_sha256": previous.get("candidate_sha256"),
+                    "evidence_sha256": previous.get("evidence_sha256"),
+                    "failed_cases": previous.get("failed_cases", []),
+                })
+        recorder.message(
+            "user",
+            "Return the exact host-verified candidate source as the supervised answer.",
+        )
+        recorder.message("assistant", candidate)
+        recorder.candidate(candidate, candidate_id=request.attempt_id)
+        recorder.validation(
+            candidate_id=request.attempt_id,
+            validator="bz-a5-attention-suite",
+            status="passed" if evidence.passed else "failed",
+            evidence_sha256=evidence.evidence_sha256,
+            candidate_sha256=evidence.candidate_sha256,
+        )
+        recorder.finish()
+
     return snapshot, Phase2Dependencies(
         cell,
         source,
@@ -426,6 +489,7 @@ def build_phase2_production(
             execution_profile="bz-a5",
             workdir=workdir,
         ),
+        retain_sft_trace,
     )
 
 

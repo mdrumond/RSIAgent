@@ -7,6 +7,7 @@ import pytest
 import run_a5_phase2
 import benchmarks.a5kernels.phase2_production as production_module
 from benchmarks.a5kernels.bz import RuntimeUnavailableError
+from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_composition import (
     A5_PROFILING_GUIDANCE,
     CellDisposition,
@@ -18,13 +19,16 @@ from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
     AttentionInfrastructureError,
     AttentionReceipt,
+    attention_reference,
 )
 from benchmarks.a5kernels.phase2_attention_bz import ATTENTION_CANDIDATE_FIXTURE
+from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
 from benchmarks.a5kernels.phase2_production import (
     Phase2ProductionConfig,
     build_phase2_production,
 )
 from benchmarks.a5kernels.phase2_memory import phase2_cell_pairs
+from benchmarks.a5kernels.sft_dataset import build_dataset
 from tests.test_a5_phase1_composition import (
     FakeEmbeddings,
     _dependencies as phase1_dependencies,
@@ -138,6 +142,53 @@ def _transport(**_kwargs):
     return DirectCompletion('{"candidate_source":{"source":"source"}}', 1)
 
 
+class RepairBackend(CopyVBackend):
+    def execute(self, source, execution, workdir):
+        self.calls.append((source, execution, workdir))
+        if "qualification" in str(workdir):
+            output = execution.v
+        else:
+            output = attention_reference(execution)
+            if "attempt-01" in str(workdir):
+                output = (output[0] + 1.0, *output[1:])
+        return AttentionReceipt(0, output, session_handle="bz-a5:repair-test")
+
+
+def test_production_trace_and_dataset_classify_successful_repair(tmp_path):
+    _composition, destination, config = _config(tmp_path)
+    backend = RepairBackend()
+    snapshot, dependencies = build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=FakeExecutor(destination.catlass_revision), backend=backend,
+    )
+    terminal = Phase2LiveRunner(
+        phase2_root=config.phase2_root,
+        snapshot=snapshot,
+        dependencies=dependencies,
+    ).run()
+    assert terminal["status"] == "passed"
+    assert terminal["completed_attempts"] == 2
+
+    traces = config.phase2_root / "sft-traces"
+    passed_trace = next(
+        path for path in traces.glob("*.jsonl")
+        if any(
+            row["kind"] == "validation" and row["payload"]["status"] == "passed"
+            for row in map(json.loads, path.read_text().splitlines())
+        )
+    )
+    rows = [json.loads(line) for line in passed_trace.read_text().splitlines()]
+    failed = [row for row in rows if row["kind"] == "tool" and row["payload"]["status"] == "failed"]
+    assert failed and failed[0]["payload"]["failed_cases"]
+
+    manifest = build_dataset(traces, tmp_path / "dataset")
+    assert manifest["eligible"] == 1
+    example = manifest["examples"][0]
+    assert example["repair"] is True
+    assert len(example["repair_pattern_sha256"]) == 64
+    assert manifest["rounds"][0]["novel_repair_patterns"] == 1
+
+
 def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
     composition, destination, config = _config(tmp_path)
     assert destination.knowledge is KnowledgeMode.WITHOUT_KDB
@@ -159,6 +210,7 @@ def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
     assert qualification["status"] == "transport-qualified"
     assert qualification["physical_device"] == 3
     assert qualification["catlass_revision"] == composition.guide.catlass_revision
+    assert qualification["runtime_catlass_revision"] == destination.catlass_revision
     assert qualification["session_handle"] == "bz-a5:qualification"
     assert "correct" not in qualification and "attention_passed" not in qualification
     assert dependencies.source.knowledge_factory is None
@@ -191,6 +243,50 @@ def test_opt_in_compile_probe_uses_host_compile_only_and_rejects_bad_abi(tmp_pat
         "session_handle": "bz-a5:compile",
     }
     assert len(backend.compile_calls) == 1
+
+
+def test_historical_snapshot_can_use_explicit_current_runtime(tmp_path):
+    composition, destination, config = _config(
+        tmp_path, runtime_catlass_revision="b" * 40,
+    )
+    executor = FakeExecutor("b" * 40)
+
+    snapshot, dependencies = build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=executor, backend=CopyVBackend(),
+    )
+
+    assert snapshot.destination.catlass_revision == composition.guide.catlass_revision
+    assert dependencies.cell == destination
+    qualification = json.loads(
+        (config.phase2_root / "cells" / destination.cell_id / "qualification.json").read_text()
+    )
+    assert qualification["catlass_revision"] == destination.catlass_revision
+    assert qualification["runtime_catlass_revision"] == "b" * 40
+    assert dict(qualification["runtime_provenance"])["catlass_revision"] == "b" * 40
+
+
+def test_same_runtime_accepts_legacy_v1_qualification_without_runtime_field(tmp_path):
+    _composition, destination, config = _config(tmp_path)
+    executor = FakeExecutor(destination.catlass_revision)
+    backend = CopyVBackend()
+    build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=executor, backend=backend,
+    )
+    path = config.phase2_root / "cells" / destination.cell_id / "qualification.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("runtime_catlass_revision")
+    legacy.pop("record_sha256")
+    legacy["record_sha256"] = canonical_digest(legacy)
+    path.write_text(json.dumps(legacy))
+
+    build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=executor, backend=backend,
+    )
+
+    assert len(backend.calls) == 1
 
 
 @pytest.mark.parametrize(

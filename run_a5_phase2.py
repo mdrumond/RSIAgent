@@ -53,6 +53,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--phase2-cpl-skills-revision")
         command.add_argument("--tla-root", type=Path)
         command.add_argument("--catlass-source")
+        command.add_argument("--runtime-catlass-revision")
         command.add_argument("--bge-cache", type=Path)
         command.add_argument("--kdb", type=Path)
         command.add_argument("--collection")
@@ -95,6 +96,7 @@ def _production_factory(
         cell_id=args.cell_id,
         tla_root=args.tla_root,
         catlass_source=args.catlass_source,
+        runtime_catlass_revision=args.runtime_catlass_revision,
         device=args.device,
         bge_cache=args.bge_cache,
         kdb=args.kdb,

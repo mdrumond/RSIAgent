@@ -8,11 +8,13 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, ProgressiveMemoryJournal
 from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_provider import (
+    DISTILLATION_PROMPT,
     DirectActorDriver,
     DirectCompletion,
     DirectCompletionProvider,
@@ -22,7 +24,7 @@ from benchmarks.a5kernels.phase1_provider import (
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.protocol import ExecutionPlan, SourceFile, VerifiedResult
-from benchmarks.a5kernels.trial import CandidateRun, TrialOrchestrator
+from benchmarks.a5kernels.trial import CandidateRun, TrialOrchestrator, _SYSTEM_PROMPT
 
 
 ENVIRONMENT = {
@@ -30,6 +32,27 @@ ENVIRONMENT = {
     "DEEPSEEK_API_KEY": "deepseek-secret",
 }
 SOURCE = "agent source"
+ADMITTED = "a" * 64
+NO_NEW_DISTILLATION = (
+    '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
+)
+
+
+def _distillation(*, evidence=ADMITTED, category="correctness"):
+    return json.dumps({"distillation": {
+        "no_new_knowledge": False,
+        "lessons": [{
+            "category": category,
+            "claim": "The submitted padded vector add passed host verification.",
+            "applicability": "This exact registered padded vector-add contract.",
+            "preconditions": "The host uses the retained source and dimensions.",
+            "limitations": "No claim is made for other shapes.",
+            "evidence_artifact_sha256": [evidence],
+            "failure_signature": None,
+            "repair": None,
+            "confidence": "high",
+        }],
+    }}, sort_keys=True, separators=(",", ":"))
 
 
 def test_openai_transport_bounds_each_attempt_and_disables_sdk_retries(monkeypatch):
@@ -214,14 +237,18 @@ def test_openai_sdk_transport_failures_use_infrastructure_signal(
         provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
 
 
-def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations():
+def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations(tmp_path):
     calls = []
     provider = _scripted_provider([
         "not-json",
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
         '{"submit":{}}',
+        NO_NEW_DISTILLATION,
     ], calls)
-    actor = DirectActorDriver(provider)
+    trace_events = []
+    actor = DirectActorDriver(
+        provider, trace_event=lambda kind, payload: trace_events.append((kind, payload))
+    )
     seen = []
 
     def execute(action):
@@ -235,11 +262,13 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
 
     from benchmarks.a5kernels.trial import parse_trial_action
 
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
     outcome = actor(
         "instruction",
         profile=direct_profile(MODEL_IDENTITIES[0]),
-        workspace=None,
-        context=None,
+        workspace=workspace,
+        context=tmp_path / "trial/context",
         turn_parser=parse_trial_action,
         action_executor=execute,
     )
@@ -247,12 +276,194 @@ def test_direct_actor_reprompts_invalid_output_and_preserves_host_observations()
     assert seen == ["write", "submit"]
     assert outcome.iterations == 3
     assert outcome.tokens == 6
+    assert trace_events[0] == (
+        "message", {"role": "system", "content": _SYSTEM_PROMPT}
+    )
+    assert trace_events[1] == (
+        "message", {"role": "user", "content": "instruction"}
+    )
+    assert trace_events[-1] == (
+        "terminal", {"status": "done", "admitted_artifacts": {}}
+    )
     second_request = calls[1]["request"]["messages"]
     assert json.loads(second_request[-1]["content"])["host"]["event"] == "invalid-action"
     assert calls[2]["request"]["messages"][-1] == {
         "role": "user",
         "content": json.dumps({"host": {"event": "write"}}),
     }
+    outcome = actor.distill(outcome)
+    assert outcome.tokens == 8
+    ledger = EvidenceLedger(tmp_path / "trial/evidence.jsonl")
+    artifacts = ContentAddressedArtifacts(tmp_path / "trial/artifacts")
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    assert [entry["role"] for entry in retained].count("provider-request") == 4
+    assert [entry["role"] for entry in retained].count("provider-response") == 4
+    responses = [artifacts.read_bytes(entry["sha256"]).decode()
+                 for entry in retained if entry["role"] == "provider-response"]
+    assert responses[0] == "not-json"
+    actor_observations = [entry for entry in retained
+                          if entry["role"] == "host-observation"
+                          and entry.get("origin") == "actor"]
+    assert json.loads(artifacts.read_bytes(
+        actor_observations[0]["sha256"]
+    ))["host"]["event"] == "invalid-action"
+
+
+def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_path):
+    calls = []
+    provider = _scripted_provider([
+        '{"submit":{}}',
+        _distillation(),
+    ], calls)
+    actor = DirectActorDriver(provider, max_turns=1)
+
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+
+    terminal = json.dumps({"host": {"event": "submitted", "passed": True}})
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
+    outcome = actor(
+        "instruction",
+        profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=workspace,
+        context=tmp_path / "trial/context",
+        turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            terminal, terminal=True,
+            admitted_artifacts={ADMITTED: "host-verification"},
+        ),
+    )
+
+    assert len(calls) == 1
+    assert outcome.distillation is None
+    outcome = actor.distill(outcome)
+    assert len(calls) == 2
+    assert calls[-1]["request"]["messages"][-2] == {
+        "role": "user", "content": terminal,
+    }
+    prompt = calls[-1]["request"]["messages"][-1]
+    assert prompt["role"] == "user"
+    assert DISTILLATION_PROMPT in prompt["content"]
+    assert ADMITTED in prompt["content"]
+    assert outcome.terminal_response == _distillation()
+    assert outcome.tokens == 4
+
+
+def test_post_terminal_provider_failure_does_not_erase_host_success(tmp_path):
+    calls = 0
+
+    def transport(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return DirectCompletion('{"submit":{}}', 2)
+        raise ConnectionError("provider unavailable after host completion")
+
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport)
+    actor = DirectActorDriver(provider, max_turns=1)
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=workspace, context=tmp_path / "trial/context",
+        turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            '{"host":{"event":"submitted","passed":true}}', terminal=True,
+        ),
+    )
+    outcome = actor.distill(outcome)
+
+    assert outcome.status == "done"
+    assert outcome.terminal_response is None
+    ledger = EvidenceLedger(tmp_path / "trial/evidence.jsonl")
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    assert [entry["role"] for entry in retained][-2:] == [
+        "provider-request", "provider-response-failure",
+    ]
+
+
+def test_distillation_correction_is_bounded_and_does_not_rerun_actions(tmp_path):
+    calls = []
+    provider = _scripted_provider([
+        '{"submit":{}}',
+        "not-json",
+        _distillation(),
+    ], calls)
+    actor = DirectActorDriver(provider, max_turns=1)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    actions = []
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
+
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=workspace, context=tmp_path / "trial/context",
+        turn_parser=parse_trial_action,
+        action_executor=lambda action: (
+            actions.append(action.kind)
+            or ActionOutcome(
+                '{"host":{"event":"submitted","passed":true}}',
+                terminal=True, admitted_artifacts={ADMITTED: "host-verification"},
+            )
+        ),
+    )
+    learned = actor.distill(outcome)
+
+    assert actions == ["submit"]
+    assert learned.distillation is not None
+    assert len(calls) == 3
+    assert "invalid structured distillation response" in (
+        calls[-1]["request"]["messages"][-1]["content"]
+    )
+
+
+def test_distillation_correction_stops_after_three_invalid_responses():
+    provider = _scripted_provider([
+        '{"submit":{}}', "bad-1", "bad-2", "bad-3",
+    ], [])
+    actor = DirectActorDriver(provider, max_turns=1)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=None, context=None, turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            '{"host":{"event":"submitted","passed":true}}', terminal=True,
+            admitted_artifacts={ADMITTED: "host-verification"},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="invalid structured distillation"):
+        actor.distill(outcome)
+
+
+@pytest.mark.parametrize("response,match,role", [
+    ('{"distillation":{"no_new_knowledge":true,"lessons":[],"extra":1}}',
+     "distillation response", "compile"),
+    (_distillation(evidence="b" * 64), "admitted artifact", "compile"),
+    (_distillation(category="correctness"), "correctness", "compile"),
+    (_distillation(category="performance"), "performance", "compile"),
+])
+def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match, role):
+    # The last case deliberately admits only compile evidence, which cannot
+    # establish correctness even when its digest is genuine.
+    provider = _scripted_provider(['{"submit":{}}', response, response, response], [])
+    actor = DirectActorDriver(provider, max_turns=1)
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+
+    outcome = actor(
+        "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=None, context=None, turn_parser=parse_trial_action,
+        action_executor=lambda _action: ActionOutcome(
+            '{"host":{"event":"submitted","passed":true}}',
+            terminal=True, admitted_artifacts={ADMITTED: role},
+        ),
+    )
+    with pytest.raises(ValueError, match=match):
+        actor.distill(outcome)
 
 
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
@@ -294,9 +505,27 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
 
     assert result.verified.passed
     assert result.outcome.tokens == 6
+    assert result.outcome.distillation is None
     assert len(backend.runs) == 2
     assert result.final_profile["kernel"] == "vector_add_generated"
     assert result.workspace.joinpath("kernel.py").read_text() == SOURCE
+    artifacts = ContentAddressedArtifacts(result.artifacts)
+    retained = [entry.payload for entry in ledger.entries
+                if entry.kind == EvidenceKind.ARTIFACT.value]
+    by_role = {entry["role"]: entry["sha256"] for entry in retained}
+    assert artifacts.read_bytes(by_role["actor-instruction"]).decode() == (
+        f"execute registered {proposal.family.value}"
+    )
+    assert artifacts.read_bytes(by_role["actor-system-prompt"]).decode() == _SYSTEM_PROMPT
+    assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
+    assert artifacts.read_bytes(by_role["candidate-source"]).decode() == SOURCE
+    assert artifacts.read_bytes(by_role["final-source"]).decode() == SOURCE
+    assert "agent-distillation" not in by_role
+    assert artifacts.verify()
+    retained_bytes = b"".join(path.read_bytes()
+                              for path in artifacts.objects.glob("*/*"))
+    assert ENVIRONMENT["OPENAI_API_KEY"].encode() not in retained_bytes
+    assert ENVIRONMENT["DEEPSEEK_API_KEY"].encode() not in retained_bytes
     request_entries = [
         entry for entry in ledger.entries if entry.kind == EvidenceKind.REQUEST.value
     ]

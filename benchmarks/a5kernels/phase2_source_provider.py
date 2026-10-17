@@ -26,10 +26,14 @@ from benchmarks.a5kernels.phase2_attention import (
     SUITE_SHA256,
     TARGET_ID,
 )
-from benchmarks.a5kernels.phase2_live import Phase2AttemptRequest
+from benchmarks.a5kernels.phase2_live import (
+    MAX_REPAIR_SOURCE_BYTES,
+    REPAIR_INSTRUCTION,
+    Phase2AttemptRequest,
+)
 
 
-PROVIDER_SCHEMA = "a5-catlass-phase2-source-provider-v1"
+PROVIDER_SCHEMA = "a5-catlass-phase2-source-provider-v2"
 _SYSTEM_PROMPT = """You write one Catlass DSL FlashAttention candidate for host testing.
 The host owns all correctness decisions. Use exactly one JSON object as each response:
 {"knowledge_query":{"query":"...","limit":5}} to request gated references, or
@@ -262,6 +266,9 @@ class Phase2SourceProvider:
         resumed = self._resume_probe_session(root, binding)
         if resumed is not None:
             messages, transcript, queries, tokens, ordinary_turns, probes = resumed
+        progress = self._resume_progress(root, binding)
+        if progress is not None and len(progress[1]) >= len(transcript):
+            messages, transcript, queries, tokens, ordinary_turns, probes = progress
         knowledge = self._knowledge(root, request)
         try:
             while ordinary_turns < self.max_turns:
@@ -296,7 +303,7 @@ class Phase2SourceProvider:
                     transcript.append(summary)
                     self._commit(
                         root, source, binding, profile.identity.as_dict(),
-                        tokens, transcript, queries, ordinary_turns, probes,
+                        tokens, transcript, queries, ordinary_turns, probes, messages,
                     )
                     return source
 
@@ -324,6 +331,10 @@ class Phase2SourceProvider:
                         )
                         transcript.append(summary)
                         messages.append({"role": "user", "content": observation_text})
+                        self._retain_progress(
+                            root, binding, messages, transcript, queries,
+                            tokens, ordinary_turns, probes,
+                        )
                         continue
                     else:
                         probes += 1
@@ -385,6 +396,10 @@ class Phase2SourceProvider:
                 summary["observation_sha256"] = _sha256(observation_text.encode())
                 transcript.append(summary)
                 messages.append({"role": "user", "content": observation_text})
+                self._retain_progress(
+                    root, binding, messages, transcript, queries,
+                    tokens, ordinary_turns, probes,
+                )
         finally:
             close = getattr(knowledge, "close", None)
             if callable(close):
@@ -416,6 +431,53 @@ class Phase2SourceProvider:
             raise ValueError("Phase 2 memory exceeds the semantic-attempt bound")
         if request.attempt != len(request.phase2_memory) + 1:
             raise ValueError("Phase 2 memory does not precede this attempt")
+        if request.attempt == 1:
+            if request.repair_context is not None:
+                raise ValueError("first Phase 2 attempt cannot have repair context")
+        else:
+            self._validate_repair_context(request)
+
+    @staticmethod
+    def _validate_repair_context(request: Phase2AttemptRequest) -> None:
+        context = request.repair_context
+        if not isinstance(context, Mapping):
+            raise ValueError("Phase 2 retry requires preceding repair context")
+        expected_keys = {
+            "instruction", "prior_attempt", "candidate_sha256",
+            "evidence_sha256", "memory_entry_sha256", "host_evidence",
+            "candidate_source", "candidate_source_bytes",
+            "candidate_source_truncated", "candidate_context_sha256",
+        }
+        if set(context) != expected_keys:
+            raise ValueError("Phase 2 repair context has invalid fields")
+        prior = request.phase2_memory[-1]
+        source = context["candidate_source"]
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("Phase 2 repair context requires candidate source")
+        source_payload = source.encode("utf-8")
+        if len(source_payload) > MAX_REPAIR_SOURCE_BYTES:
+            raise ValueError("Phase 2 repair candidate exceeds the context bound")
+        if (
+            context["prior_attempt"] != request.attempt - 1
+            or context["instruction"] != REPAIR_INSTRUCTION
+            or context["prior_attempt"] != prior.get("attempt")
+            or context["candidate_sha256"] != prior.get("candidate_sha256")
+            or context["evidence_sha256"] != prior.get("evidence_sha256")
+            or context["memory_entry_sha256"] != prior.get("entry_sha256")
+            or context["host_evidence"] != prior
+            or context["candidate_context_sha256"] != _sha256(source_payload)
+            or type(context["candidate_source_bytes"]) is not int
+            or context["candidate_source_bytes"] < len(source_payload)
+            or type(context["candidate_source_truncated"]) is not bool
+            or context["candidate_source_truncated"]
+            != (context["candidate_source_bytes"] > len(source_payload))
+        ):
+            raise ValueError("Phase 2 repair context changed preceding evidence")
+        if (
+            not context["candidate_source_truncated"]
+            and _sha256(source_payload) != context["candidate_sha256"]
+        ):
+            raise ValueError("Phase 2 repair source changed preceding candidate")
 
     def _prompt_and_binding(
         self, request: Phase2AttemptRequest,
@@ -428,6 +490,9 @@ class Phase2SourceProvider:
         )
         _phase2, phase2_sha256 = _canonical_context(
             list(request.phase2_memory), "Phase 2 memory"
+        )
+        _repair, repair_sha256 = _canonical_context(
+            request.repair_context, "Phase 2 repair context"
         )
         guidance_sha256 = (
             _sha256(self.profiling_guidance.encode("utf-8"))
@@ -463,6 +528,8 @@ class Phase2SourceProvider:
                 "compilation_only": True,
                 "correctness_established": False,
             }
+        if request.repair_context is not None:
+            prompt_value["repair_context"] = request.repair_context
         prompt_bytes, prompt_sha256 = _canonical_context(prompt_value, "provider prompt")
         binding = {
             "cell_id": request.cell.cell_id,
@@ -474,6 +541,7 @@ class Phase2SourceProvider:
             "prompt_sha256": prompt_sha256,
             "phase1_memory_sha256": phase1_sha256,
             "phase2_memory_sha256": phase2_sha256,
+            "repair_context_sha256": repair_sha256,
             "programming_guide_sha256": guide_sha256,
             "profiling_guidance_sha256": guidance_sha256,
             "target_contract_sha256": target_contract_sha256,
@@ -502,6 +570,7 @@ class Phase2SourceProvider:
         provider_identity: Mapping[str, object], tokens: int,
         transcript: list[dict[str, object]], queries: list[dict[str, object]],
         ordinary_turns: int, probes: int,
+        messages: list[dict[str, str]],
     ) -> None:
         source_bytes = source.encode("utf-8")
         body = {
@@ -514,11 +583,48 @@ class Phase2SourceProvider:
             "compile_probes": probes,
             "knowledge_queries": queries,
             "transcript": transcript,
+            "messages": messages,
             "candidate_sha256": _sha256(source_bytes),
         }
         manifest = {**body, "record_sha256": canonical_digest(body)}
         _publish_exact(root / "candidate.py", source_bytes)
         _publish_exact(root / "provider.json", canonical_bytes(manifest) + b"\n")
+
+    @staticmethod
+    def _retain_progress(
+        root: Path, binding: Mapping[str, object],
+        messages: list[dict[str, str]], transcript: list[dict[str, object]],
+        queries: list[dict[str, object]], tokens: int, ordinary_turns: int,
+        probes: int,
+    ) -> None:
+        body = {
+            "attempt_binding_sha256": canonical_digest(binding),
+            "messages": messages, "transcript": transcript,
+            "knowledge_queries": queries, "completion_tokens": tokens,
+            "ordinary_turns": ordinary_turns, "compile_probes": probes,
+        }
+        _publish_exact(
+            root / "progress" / f"turn-{len(transcript):03d}.json",
+            canonical_bytes({**body, "record_sha256": canonical_digest(body)}) + b"\n",
+        )
+
+    @staticmethod
+    def _resume_progress(root: Path, binding: Mapping[str, object]):
+        checkpoints = sorted((root / "progress").glob("turn-*.json"))
+        if not checkpoints:
+            return None
+        retained = json.loads(checkpoints[-1].read_bytes())
+        digest = retained.pop("record_sha256", None)
+        if (
+            digest != canonical_digest(retained)
+            or retained.get("attempt_binding_sha256") != canonical_digest(binding)
+        ):
+            raise ValueError("retained provider progress changed")
+        return (
+            retained["messages"], retained["transcript"],
+            retained["knowledge_queries"], retained["completion_tokens"],
+            retained["ordinary_turns"], retained["compile_probes"],
+        )
 
     def _probe(
         self, source: str, root: Path, ordinal: int,
@@ -720,6 +826,28 @@ class Phase2SourceProvider:
                 or digest != canonical_digest(result)
             ):
                 raise ValueError("completed provider compile probe changed")
+
+    def conversation(
+        self, cell_id: str, attempt_id: str,
+    ) -> tuple[Mapping[str, str], ...] | None:
+        """Read the exact retained provider conversation for SFT trace capture."""
+        manifest = json.loads(
+            (self.evidence_root / cell_id / attempt_id / "provider.json").read_bytes()
+        )
+        messages = manifest.get("messages")
+        if messages is None:
+            return None
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("provider conversation is invalid")
+        if any(
+            not isinstance(item, dict)
+            or set(item) != {"role", "content"}
+            or item["role"] not in {"system", "user", "assistant"}
+            or not isinstance(item["content"], str)
+            for item in messages
+        ):
+            raise ValueError("provider conversation is invalid")
+        return tuple(dict(item) for item in messages)
 
 
 __all__ = ["PROVIDER_SCHEMA", "Phase2SourceProvider"]

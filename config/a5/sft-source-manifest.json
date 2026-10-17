@@ -1,0 +1,61 @@
+{
+  "schema": "a5-sft-sources-v1",
+  "sources": [
+    {
+      "name": "cannbench",
+      "repository": "https://github.com/hicann/cann-bench",
+      "revision": "524885b308a8f23af197636213d397414687210a",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["README.md", "tasks/**"]
+    },
+    {
+      "name": "catlass",
+      "repository": "https://gitcode.com/cann/catlass.git",
+      "revision": "a8b4fffbd9cabc021dfd47253e907a1cde59de25",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["examples/**", "python/tla_dsl/docs/**", "python/tla_dsl/examples/**"]
+    },
+    {
+      "name": "ops-cv",
+      "repository": "https://gitcode.com/cann/ops-cv.git",
+      "revision": "118ce6c0c096c8d406e848e37f7f7bf3a0f4289c",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["examples/**"]
+    },
+    {
+      "name": "ops-nn",
+      "repository": "https://gitcode.com/cann/ops-nn.git",
+      "revision": "1df7c5665dcbf2b06e723b60643d252c61e14b7d",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["examples/**"]
+    },
+    {
+      "name": "ops-transformer",
+      "repository": "https://gitcode.com/cann/ops-transformer.git",
+      "revision": "f19d59d56c7f612b479c96f7e831802c7b9dec9b",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["examples/**"]
+    },
+    {
+      "name": "pto-isa",
+      "repository": "https://gitcode.com/cann/pto-isa.git",
+      "revision": "2d60f21c4e22645f5aa3fc22c2a4a8818eaa4d81",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["docs/**", "include/**", "kernels/**", "tests/**"]
+    },
+    {
+      "name": "pypto",
+      "repository": "https://gitcode.com/cann/pypto.git",
+      "revision": "5144cfa139556fedacafe1d00fcc9d130a5ba9ff",
+      "license": "CANN Open Software License Agreement 2.0",
+      "include": ["docs/**", "examples/**", "python/**"]
+    },
+    {
+      "name": "recsdk",
+      "repository": "https://gitcode.com/Ascend/RecSDK.git",
+      "revision": "2308d674a9251fa535ad6dcfd36ae5af1c300d97",
+      "license": "Apache-2.0",
+      "include": ["docs/**", "examples/**", "python/**"]
+    }
+  ]
+}

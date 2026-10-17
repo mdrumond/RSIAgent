@@ -33,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
                  "tla-root", "profiling-skill-root", "bge-cache", "kdb"):
         reconcile.add_argument(f"--{flag}", type=Path, required=True)
     reconcile.add_argument("--catlass-source", required=True)
+    reconcile.add_argument("--runtime-catlass-revision")
     reconcile.add_argument("--phase2-guide", type=Path)
     reconcile.add_argument("--phase2-cpl-skills-revision")
     reconcile.add_argument("--compile-probes", type=int, default=0, metavar="N")
@@ -100,6 +101,9 @@ def _command_factory(args, destinations):
                 )
             if getattr(args, "compile_probes", 0):
                 values += (("compile-probes", args.compile_probes),)
+            runtime_revision = getattr(args, "runtime_catlass_revision", None)
+            if runtime_revision is not None:
+                values += (("runtime-catlass-revision", runtime_revision),)
         for name, value in values:
             _option(argv, name, value)
         if args.env_file is not None:

@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import csv
+import base64
+from dataclasses import asdict
 import gzip
 import hashlib
 import io
+import json
 import os
 from pathlib import Path, PurePosixPath
 import subprocess
@@ -159,6 +162,21 @@ class BZProfileBackend:
                 ) from None
         return hashlib.sha256(data).hexdigest()
 
+    def timing_evidence_payload(self, replay_id: str) -> dict[str, object]:
+        return {"replay_id": replay_id, "stdout": (
+            self._evidence_directory / replay_id / "timing-stdout.txt"
+        ).read_text(encoding="utf-8")}
+
+    def capture_evidence_payload(self, capture: ProfileCapture) -> dict[str, object]:
+        data = (self._evidence_directory / capture.replay_id /
+                capture.evidence.archive_name).read_bytes()
+        if len(data) > 16 * 1024 * 1024:
+            raise ValueError("compact profile archive exceeds 16 MiB evidence bound")
+        if hashlib.sha256(data).hexdigest() != capture.evidence.archive_sha256:
+            raise ValueError("compact profile archive hash mismatch")
+        return {"capture": asdict(capture), "archive_encoding": "base64",
+                "archive": base64.b64encode(data).decode("ascii")}
+
     def capture(self, command: CaptureCommand) -> ProfileCapture:
         request = command.request
         argv = list(self._adapter_argv(command.replay_id, "profile", request))
@@ -193,12 +211,14 @@ class BZProfileBackend:
         remote_tree = remote_values[0]
         if not PurePosixPath(remote_tree).is_absolute():
             raise RuntimeError("profiler returned a non-absolute retained tree")
+        if command.metric is ProfileMetric.PIPE_TIMELINE:
+            self._normalize_timeline(command, remote_tree)
         archive = self._collect(command, remote_tree)
         kernels, summary = _read_metric_archive(
             self._evidence_directory / command.replay_id / archive.archive_name,
             command.metric,
         )
-        if command.metric is ProfileMetric.PIPE_UTILIZATION:
+        if command.metric is not ProfileMetric.BASIC_INFO:
             # The wrapper has already required exact-name OpBasicInfo evidence for
             # this replay. Pipe rows themselves are block/sub-block keyed.
             assert command.kernel_name is not None
@@ -213,17 +233,45 @@ class BZProfileBackend:
             archive,
         )
 
+    def _normalize_timeline(self, command: CaptureCommand, remote_tree: str) -> None:
+        scripts = Path(self._collector).parent
+        remote_scripts = f"artifacts/ascend-profiling/{command.replay_id}/scripts"
+        upload = self._call((str(Path(self._validation).parent / "bz-a5" / "scp.sh"),
+                             "--recursive", "upload", str(scripts),
+                             str(PurePosixPath(remote_scripts).parent)))
+        if upload.returncode:
+            _raise_replay_failure(upload.returncode, "timeline helpers upload failed")
+        script = (
+            "import pathlib,subprocess,sys; root=pathlib.Path(sys.argv[1]); "
+            "paths=sorted(p for p in root.rglob('trace.json') if p.stat().st_size); "
+            "assert len(paths)==1, 'expected one native PipeTimeline JSON trace'; "
+            "subprocess.run([sys.executable,sys.argv[2],'--pipe-timeline',str(paths[0]),"
+            "'--output',str(root/'adaptive-timeline')],check=True); "
+            "print('A5TIMELINE_NORMALIZED=1')"
+        )
+        operation = _collection_operation(command.replay_id) + "-norm"
+        completed = self._call((self._validation, "--profile", "bz-a5", "--operation",
+                               operation, "run",
+                               "--catlass-src", self._catlass_source, "--", "python",
+                               "-c", script, remote_tree,
+                               f"{remote_scripts}/summarize_timelines.py"))
+        output, returncode = self._marker_result(
+            completed, command.replay_id, "A5TIMELINE_NORMALIZED=", operation=operation)
+        if returncode or _marked_values(output, "A5TIMELINE_NORMALIZED=") != ["1"]:
+            _raise_replay_failure(returncode, "PipeTimeline normalization failed")
+
     def _marker_result(
         self,
         completed: subprocess.CompletedProcess[str],
         replay_id: str,
         marker: str,
+        *, operation: str | None = None,
     ) -> tuple[str, int]:
         """Recover workload markers and terminal status from the retained session."""
 
         if _marked_values(completed.stdout, marker):
             return completed.stdout, completed.returncode
-        operation = _profiling_operation(replay_id)
+        operation = operation or _profiling_operation(replay_id)
         retries = self._observation_retries
         observation_returncode = completed.returncode
         observation_output = completed.stdout
@@ -276,9 +324,13 @@ class BZProfileBackend:
             environment = environment.with_binding("A5KERNEL_BLOCK_NUM", block_num)
         environment = environment.with_binding(
             "BZ_A5_PROFILE_PHYSICAL_DEVICE", str(request.device)
-        ).with_binding(
-            "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE", "1"
         )
+        if action == "profile" or dict(environment.bindings).get("A5PROJECT_MASKED_TIMING") != "1":
+            environment = environment.with_binding(
+                "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE", "1"
+            )
+        else:
+            environment = environment.with_unset("A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE")
         if action == "run":
             environment = environment.with_binding(
                 "A5KERNEL_EMIT_TIMING", "1"
@@ -288,6 +340,11 @@ class BZProfileBackend:
                 "A5KERNEL_LAUNCH_COUNT", str(request.launch_count)
             )
         workload = environment.render(workload)
+        device_options = (
+            ("--device", str(request.device))
+            if action == "run" and dict(environment.bindings).get("A5PROJECT_MASKED_TIMING") == "1"
+            else ()
+        )
         return (
             self._validation,
             "--profile",
@@ -299,6 +356,7 @@ class BZProfileBackend:
             self._catlass_source,
             "--timeout",
             str(self._timeout),
+            *device_options,
             "--",
             *workload,
         )
@@ -370,7 +428,7 @@ class BZProfileBackend:
         # name. PipeUtilization rows are keyed by block/sub-block instead; the
         # profiler replay itself is already exact-name filtered, so asking the
         # curator to filter those rows would discard the requested metric export.
-        if command.metric is ProfileMetric.BASIC_INFO:
+        if command.metric is ProfileMetric.BASIC_INFO and request.expected_kernel != "*":
             argv += ["--kernel-name", request.expected_kernel]
         if implementation == "dsl":
             argv += ["--catlass-src", self._catlass_source]
@@ -460,6 +518,14 @@ def _read_metric_archive(
     report_seen = False
     with tarfile.open(path, mode="r:gz") as archive:
         for member in sorted(archive.getmembers(), key=lambda item: item.name):
+            if metric is ProfileMetric.PIPE_TIMELINE and member.name.endswith("timeline-summary.json"):
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise ValueError("profile archive contains an unreadable timeline")
+                payload = json.load(stream)
+                summary.append(("timeline-summary", json.dumps(payload, sort_keys=True)))
+                report_seen = True
+                continue
             if not member.isfile() or not member.name.endswith(".csv.gz"):
                 continue
             if not Path(member.name).name.startswith(expected_report):

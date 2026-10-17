@@ -1,0 +1,9 @@
+{
+  "profile_id": "fireworks-deepseek-v4-flash-v1",
+  "model": "accounts/fireworks/models/deepseek-v4-flash",
+  "base_url": "https://api.fireworks.ai/inference/v1",
+  "credential_env": "FIREWORKS_API_KEY",
+  "max_tokens": 32768,
+  "temperature": 0.0,
+  "top_p": 1.0
+}
