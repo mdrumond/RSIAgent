@@ -153,7 +153,11 @@ def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
     second, session = agent.select(next_context, session)
     assert isinstance(second, TerminalDecision)
     assert session.turns == 2
-    assert calls[1][:3] == calls[0] + ({"role": "assistant", "content": wave([project()])},)
+    assert len(calls[1]) == 2
+    assert calls[1][0] == calls[0][0]
+    assert '"next_wave_id":"wave-002"' in calls[1][1]["content"]
+    assert '"project_id":"movement"' in calls[1][1]["content"]
+    assert session.messages[:3] == calls[0] + ({"role": "assistant", "content": wave([project()])},)
 
 
 @pytest.mark.parametrize("invalid", [
@@ -210,6 +214,70 @@ def test_provider_value_error_is_not_retried_as_proposal_validation():
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize("model_index", [0, 1])
+def test_64_serial_selections_and_oversized_session_resume_use_bounded_wire(model_index):
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import (
+        DirectCompletion, DirectCompletionProvider, direct_profile,
+    )
+    from benchmarks.ascend.agent_context import request_bytes
+
+    profile = direct_profile(MODEL_IDENTITIES[model_index])
+    requests = []
+    expected_context = None
+    retry = False
+    def transport(*, request, **kwargs):
+        nonlocal retry
+        requests.append(request)
+        messages = request["messages"]
+        assert messages[0]["role"] == "system"
+        assert "Profiling guidance:\nKeep raw profiling evidence." in messages[1]["content"]
+        assert "Project budget: select no more than 1 projects" in messages[1]["content"]
+        payload = json.loads(messages[1]["content"].rsplit("\n", 1)[-1])
+        assert payload["pre_wave_memory_sha256"] == expected_context.pre_wave_memory_sha256
+        assert payload["pre_wave_coverage"] == [item.value for item in expected_context.pre_wave_coverage]
+        assert payload["prior_outcomes"] == [item.prompt_dict() for item in expected_context.prior_outcomes]
+        if expected_context.wave_index == 64 and not retry:
+            retry = True
+            return DirectCompletion("DECISION: WAVE\n{broken", 1)
+        if len(messages) == 4:
+            assert "{broken" in messages[2]["content"]
+            assert "Proposal validation failed" in messages[3]["content"]
+        else:
+            assert len(messages) == 2
+        item = with_shape(project(f"project-{expected_context.wave_index}"), [expected_context.wave_index])
+        return DirectCompletion(wave([item], memory=expected_context.pre_wave_memory_sha256,
+                                     coverage=payload["pre_wave_coverage"],
+                                     wave_id=payload["next_wave_id"]), 1)
+
+    provider = DirectCompletionProvider(
+        {"OPENAI_API_KEY": "test-openai", "DEEPSEEK_API_KEY": "test-deepseek"}, transport=transport)
+    agent = CurriculumAgent(lambda messages: provider.complete(profile, messages).text,
+                            profiling_guidance="Keep raw profiling evidence.")
+    session = CurriculumSession()
+    priors = []
+    for index in range(1, 66):
+        expected_context = context(wave_index=index, prior_outcomes=tuple(priors),
+                                   pre_wave_memory_sha256=f"{index:064x}",
+                                   pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), remaining_projects=1)
+        if index == 65:
+            # Real persisted schema: old oversized chronology is preserved on
+            # load, but only this selection's context/corrections go on the wire.
+            assert request_bytes(profile.request(session.messages)) > provider.context_budget(profile).hard
+            restored = json.loads(json.dumps({"messages": session.messages, "turns": session.turns}))
+            session = CurriculumSession(tuple(restored["messages"]), restored["turns"])
+        original_history = session.messages
+        decision, session = agent.select(expected_context, session, remaining_projects=1)
+        assert session.messages[:len(original_history)] == original_history
+        priors.append(PriorOutcome(decision.wave.projects[0].spec.project_id,
+                      ProjectInformation.from_project(decision.wave.projects[0].spec), True,
+                      "Host verified exact output; retain measured evidence."))
+    assert len(priors) == 65
+    assert session.turns == 66  # One validation repair, no lost chronology.
+    assert len(requests) == 66
+    assert all(request_bytes(item) <= provider.context_budget(profile).hard for item in requests)
+
+
 @pytest.mark.parametrize("reply", [
     "DECISION: PROJECT\n{}",
     "prefix\nDECISION: SATURATED\n{\"reason\":\"done\"}",
@@ -224,7 +292,6 @@ def test_decisions_are_strict(reply):
 @pytest.mark.parametrize("bad_project", [
     project("gdn-study"),
     project("bsa-study"),
-    project("matmul-study"),
     {**project(), "source": "kernel code"},
     {**project(), "command": "python run.py"},
 ])
@@ -426,11 +493,50 @@ def test_unverified_prior_can_be_retried_and_does_not_count_as_coverage():
     assert isinstance(decision, WaveDecision)
 
 
-def test_siblings_need_marginal_semantic_gain_not_exact_shape_variation():
+def test_siblings_allow_exact_shape_variation_with_same_coverage_tokens():
     first = project("first")
     second = with_shape(project("second"), [259])
-    with pytest.raises(ValueError, match="marginal"):
-        CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert ProjectInformation.from_project(first).tokens == ProjectInformation.from_project(second).tokens
+    decision, _ = CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert len(decision.wave.projects) == 2
+
+
+@pytest.mark.parametrize("item", [
+    with_shape(project("new-shape"), [259]),
+    with_shape(project("new-combination", dtype="float16"), [257]),
+])
+def test_prior_coverage_allows_new_shapes_and_combinations(item):
+    priors = (
+        outcome(project("prior-f32"), "prior-f32"),
+        outcome(with_shape(project("prior-f16", dtype="float16"), [259]), "prior-f16"),
+    )
+    covered = frozenset().union(*(prior.information.tokens for prior in priors))
+    assert ProjectInformation.from_project(item).tokens <= covered
+    decision, _ = CurriculumAgent(lambda _: wave([item])).select(context(prior_outcomes=priors))
+    assert isinstance(decision, WaveDecision)
+
+
+def test_siblings_reject_identical_information_despite_label_or_tuning_changes():
+    second = project("second", block_count=2, hypothesis="A rewritten question.")
+    with pytest.raises(ValueError, match="repeats executable information between siblings"):
+        CurriculumAgent(lambda _: wave([project("first"), second])).select(context())
+
+
+def test_prior_project_id_still_rejected_for_a_new_exact_shape():
+    prior = outcome(project("old"))
+    proposal = with_shape(project("old"), [259])
+    with pytest.raises(ValueError, match="repeats a prior project ID"):
+        CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
+
+
+def test_prompt_describes_advisory_coverage_and_controlled_variations():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+
+    prompt = curriculum_prompt(context())
+    assert "Coverage dimensions are advisory" in prompt
+    assert "new exact shapes within a covered shape class" in prompt
+    assert "new combinations of covered dimensions are allowed" in prompt
+    assert "only when every project adds" not in prompt
 
 
 def test_held_out_names_are_rejected_in_graph_identifiers():
@@ -443,3 +549,112 @@ def test_held_out_names_are_rejected_in_graph_identifiers():
     })
     with pytest.raises(ValueError, match="held-out"):
         CurriculumAgent(lambda _: wave([item])).select(context())
+
+
+def test_long_explanations_and_distinct_learning_focus_are_admitted():
+    first = project("matmul-study", hypothesis=("Question: matrix multiplication. " * 80).strip(),
+                    learning_focus=["sync-correctness"])
+    second = project("performance", learning_focus=["sync-performance"])
+    decision, _ = CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert len(decision.wave.projects) == 2
+    assert decision.wave.projects[0].spec.hypothesis == first["hypothesis"].strip()
+
+
+@pytest.mark.parametrize("reverse_prior", [False, True])
+def test_learning_focus_order_does_not_distinguish_verified_prior(reverse_prior):
+    focus = ["sync-performance", "pipe-mte2"]
+    prior_focus = focus[::-1] if reverse_prior else focus
+    prior = outcome(project("old", learning_focus=prior_focus))
+    proposal = project("new", learning_focus=prior_focus[::-1])
+    with pytest.raises(ValueError, match="repeats prior information"):
+        CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
+
+
+def test_learning_focus_order_does_not_distinguish_siblings():
+    first = project("first", learning_focus=["sync-performance", "pipe-mte2"])
+    second = project("second", learning_focus=["pipe-mte2", "sync-performance"])
+    with pytest.raises(ValueError, match="repeats executable information between siblings"):
+        CurriculumAgent(lambda _: wave([first, second])).select(context())
+
+
+def test_different_learning_focus_set_still_adds_information():
+    prior = outcome(project("old", learning_focus=["sync-performance", "pipe-mte2"]))
+    proposal = project("new", learning_focus=["pipe-mte2", "sync-correctness"])
+    decision, _ = CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
+    assert isinstance(decision, WaveDecision)
+
+
+def test_focus_comparison_keeps_historical_serialization_and_identity():
+    from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+
+    original = project(learning_focus=["sync-performance", "pipe-mte2"])
+    stored = canonical_bytes(original)
+    restored = ProjectSpec.from_mapping(json.loads(stored))
+    information = ProjectInformation.from_project(restored)
+    serialized_information = canonical_bytes(information.as_dict())
+    prior = outcome(original)
+    historical_identity = canonical_digest(json.loads(serialized_information))
+    reversed_information = ProjectInformation.from_project(
+        project(learning_focus=original["learning_focus"][::-1]))
+    assert information.comparison_sha256 == reversed_information.comparison_sha256
+    assert canonical_bytes(restored.as_dict()) == stored
+    assert canonical_bytes(information.as_dict()) == serialized_information
+    assert prior.information_sha256 == historical_identity
+    executable_information = json.loads(serialized_information)
+    executable_information.pop("learning_focus")
+    assert project_information_sha256(restored) == canonical_digest(executable_information)
+    assert prior.information_sha256 != canonical_digest(reversed_information.as_dict())
+
+
+def test_wave_cannot_overshoot_remaining_target():
+    reply = wave([project(), project("second", learning_focus=["debug-print"])])
+    with pytest.raises(ValueError, match="remaining project target"):
+        CurriculumAgent(lambda _: reply).select(context(remaining_projects=1))
+
+
+def test_documented_mxfp8_example_matches_published_grammar():
+    from pathlib import Path
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    text = Path("docs/ASCEND_CURRICULUM_EXPERIMENTS.md").read_text()
+    example = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
+    spec = ProjectSpec.from_mapping(example)
+    assert spec.dtype.value == "mxfp8_e4m3fn"
+    decision, _ = CurriculumAgent(lambda _: wave([example])).select(context())
+    assert decision.wave.projects[0].spec == spec
+
+
+def test_small_adaptive_waves_are_bounded_by_remaining_target():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    for remaining, maximum in ((3, 3), (64, 8), (128, 8)):
+        prompt = curriculum_prompt(context(remaining_projects=remaining))
+        payload = json.loads(prompt.rsplit("\n", 1)[-1])
+        assert payload["max_wave_projects"] == maximum
+        projects = [with_shape(project(f"item-{i}"), (i + 1,))
+                    for i in range(maximum + 1)]
+        with pytest.raises(ValueError, match="wave limit or remaining"):
+            CurriculumAgent(lambda _: wave(projects)).select(
+                context(remaining_projects=remaining))
+
+
+def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    grammar = json.loads(curriculum_prompt(context()).rsplit("\n", 1)[-1])["bounded_project_grammar"]
+    assert "never project IDs" in grammar["requires"]
+    assert "[] for the initial wave" in grammar["requires"]
+    assert "zero-based axis" in grammar["graph"]["axis"]
+    assert "null for every non-reduction" in grammar["graph"]["axis"]
+    assert "1 if x > 0 else 0" in grammar["graph"]["mask-positive"]
+    assert "input dtype by default" in grammar["output_dtype"]
+    assert "matmul outputs float32" in grammar["output_dtype"]
+    assert "copy-only graphs preserve FP8" in grammar["output_dtype"]
+    assert "every non-copy FP8 graph computes intermediates and output in float32" in grammar["output_dtype"]
+
+
+def test_learning_focus_cannot_bypass_held_out_executable_signature():
+    for held_out_focus in ([], ["tool-msprof"], ["pipe-mte2", "sync-performance"]):
+        signature = project_information_sha256(project(learning_focus=held_out_focus))
+        for focus in ([], ["tool-msprof"], ["sync-performance", "pipe-mte2"], ["pipe-mte2", "sync-performance"]):
+            proposal = project(learning_focus=focus)
+            with pytest.raises(ValueError, match="held-out contract"):
+                CurriculumAgent(lambda _: wave([proposal]), held_out_information_sha256=[signature]).select(context())

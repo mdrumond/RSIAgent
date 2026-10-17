@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-import re
 from typing import Mapping, Protocol
+
+from benchmarks.ascend.contracts import CompileObservation, RuntimeObservation
 
 from benchmarks.a5kernels.evidence import (
     EvidenceKind,
@@ -28,15 +29,13 @@ from benchmarks.a5kernels.phase1_project import (
 )
 
 
-_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-
-
 class ProjectExecutionFamily(str, Enum):
     """Backend techniques selected from the closed project graph."""
 
     MOVEMENT_ELEMENTWISE = "movement-elementwise-padded-tail"
     SIMT_REDUCTION_MASK = "simt-reduction-mask"
     CUBE_MATMUL = "cube-matmul"
+    VECTOR_REDUCTION_MASK = "vector-reduction-mask"
 
 
 @dataclass(frozen=True)
@@ -60,60 +59,6 @@ class ProjectKernelABI:
         }
 
 
-def _require_digest(value: str) -> None:
-    if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
-        raise ValueError("evidence_sha256 must be a lowercase SHA-256 digest")
-
-
-@dataclass(frozen=True)
-class CompileObservation:
-    """An actual compiler observation supplied by the execution backend."""
-
-    passed: bool
-    evidence_sha256: str
-    diagnostic: str
-    artifact_id: str | None
-
-    def __post_init__(self) -> None:
-        if type(self.passed) is not bool:
-            raise ValueError("compile passed must be boolean")
-        _require_digest(self.evidence_sha256)
-        if not isinstance(self.diagnostic, str) or not self.diagnostic.strip():
-            raise ValueError("compile diagnostic must be non-empty")
-        if self.passed and (
-            not isinstance(self.artifact_id, str) or not self.artifact_id.strip()
-        ):
-            raise ValueError("artifact_id is required after successful compilation")
-        if not self.passed and self.artifact_id is not None:
-            raise ValueError("artifact_id is invalid after failed compilation")
-
-
-@dataclass(frozen=True)
-class RuntimeObservation:
-    """A synchronized runtime observation, including the complete host output."""
-
-    passed: bool
-    evidence_sha256: str
-    diagnostic: str
-    output: tuple[float, ...] | None
-
-    def __post_init__(self) -> None:
-        if type(self.passed) is not bool:
-            raise ValueError("runtime passed must be boolean")
-        _require_digest(self.evidence_sha256)
-        if not isinstance(self.diagnostic, str) or not self.diagnostic.strip():
-            raise ValueError("runtime diagnostic must be non-empty")
-        if self.passed != (self.output is not None):
-            raise ValueError("output is required exactly when runtime passed")
-        if self.output is not None and (
-            not isinstance(self.output, tuple)
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                for value in self.output
-            )
-        ):
-            raise ValueError("runtime output must be a numeric tuple")
 
 
 @dataclass(frozen=True)
@@ -253,25 +198,63 @@ def _instruction(
     )
 
 
+class ProjectTargetBinding(Protocol):
+    """Language-specific ABI and instructions, independent of host verification.
+
+    Binding implementations must describe the supplied graph, not change its
+    generated inputs or numerical oracle. Existing callers default to Catlass.
+    """
+
+    def abi(
+        self, spec: ProjectSpec, inputs: tuple[HostTensor, ...],
+    ) -> ProjectKernelABI: ...
+
+    def instruction(
+        self, spec: ProjectSpec, family: ProjectExecutionFamily,
+        abi: ProjectKernelABI, inputs_sha256: str,
+    ) -> str: ...
+
+
+class CatlassProjectBinding:
+    """Compatibility binding preserving the established A5 public contract."""
+
+    def abi(
+        self, spec: ProjectSpec, inputs: tuple[HostTensor, ...],
+    ) -> ProjectKernelABI:
+        return ProjectKernelABI(
+            "project_kernel",
+            tuple(f"gm_input{index}" for index in range(len(inputs)))
+            + (("gm_scale0", "gm_scale1") if spec.dtype.value in MX_DTYPES else ()),
+            "gm_output",
+        )
+
+    @staticmethod
+    def instruction(
+        spec: ProjectSpec, family: ProjectExecutionFamily,
+        abi: ProjectKernelABI, inputs_sha256: str,
+    ) -> str:
+        return _instruction(spec, family, abi, inputs_sha256)
+
+
 class ProjectExecutor:
     """Prepare and execute a project without inspecting candidate semantics."""
 
-    def __init__(self, backend: ProjectExecutionBackend, ledger: EvidenceLedger):
+    def __init__(
+        self, backend: ProjectExecutionBackend, ledger: EvidenceLedger,
+        *, binding: ProjectTargetBinding | None = None,
+    ):
         self._backend = backend
         self._ledger = ledger
+        self._binding = binding if binding is not None else CatlassProjectBinding()
 
     def prepare(self, spec: ProjectSpec) -> PreparedProject:
         if not isinstance(spec, ProjectSpec):
             raise TypeError("project must be a validated ProjectSpec")
         inputs = materialize_inputs(spec)
         expected = evaluate_reference(spec, inputs)
-        family = _family(spec)
-        abi = ProjectKernelABI(
-            "project_kernel",
-            tuple(f"gm_input{index}" for index in range(len(inputs)))
-            + (("gm_scale0", "gm_scale1") if spec.dtype.value in MX_DTYPES else ()),
-            "gm_output",
-        )
+        family_selector = getattr(self._binding, "family", _family)
+        family = family_selector(spec)
+        abi = self._binding.abi(spec, inputs)
         inputs_sha256 = canonical_digest({
             "tensors": [_tensor_payload(tensor) for tensor in inputs]
         })
@@ -279,7 +262,7 @@ class ProjectExecutor:
             spec,
             family,
             abi,
-            _instruction(spec, family, abi, inputs_sha256),
+            self._binding.instruction(spec, family, abi, inputs_sha256),
             inputs,
             expected,
         )
@@ -413,6 +396,7 @@ class ProjectExecutor:
 
 
 __all__ = [
+    "CatlassProjectBinding",
     "CompileObservation",
     "PreparedProject",
     "ProjectCompileResult",
@@ -422,5 +406,6 @@ __all__ = [
     "ProjectExecutionRequest",
     "ProjectExecutionResult",
     "ProjectExecutor",
+    "ProjectTargetBinding",
     "RuntimeObservation",
 ]

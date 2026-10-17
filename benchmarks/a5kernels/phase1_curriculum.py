@@ -36,10 +36,20 @@ class Capability(str, Enum):
     PADDED_TAIL = "padded-tail"
     SIMT_REDUCTION = "simt-reduction"
     SIMT_MASK = "simt-mask"
+    VECTOR_REDUCTION = "vector-reduction"
+    VECTOR_MASK = "vector-mask"
     CUBE_TILING = "cube-tiling"
     FAILURE_REPAIR = "failure-repair"
     TIMING_SWEEP = "timing-sweep"
     PROFILING = "profiling"
+
+
+LEARNING_FOCI = (
+    "pipe-scalar", "pipe-vector", "pipe-cube", "pipe-mte1", "pipe-mte2",
+    "pipe-mte3", "pipe-fix", "inter-pipe-sync", "simd-barrier", "simt-barrier",
+    "cross-core-sync", "sync-correctness", "sync-performance",
+    "tool-msprof", "tool-msdebug", "tool-mssanitizer", "debug-print",
+)
 
 
 class DType(str, Enum):
@@ -97,6 +107,7 @@ class ProjectSpec:
     profile_metric: ProfileMetric | None
     hypothesis: str
     graph: ProjectGraph
+    learning_focus: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.project_id, str) or not _ID.fullmatch(self.project_id):
@@ -134,11 +145,14 @@ class ProjectSpec:
             not isinstance(self.hypothesis, str)
             or not self.hypothesis.strip()
             or self.hypothesis != self.hypothesis.strip()
-            or len(self.hypothesis) > 500
         ):
-            raise ValueError("hypothesis must be a trimmed 1-500 character string")
+            raise ValueError("hypothesis must be a non-empty trimmed string")
         if not isinstance(self.graph, ProjectGraph):
             raise ValueError("graph must be a bounded ProjectGraph")
+        if (type(self.learning_focus) is not tuple
+            or len(set(self.learning_focus)) != len(self.learning_focus)
+            or any(item not in LEARNING_FOCI for item in self.learning_focus)):
+            raise ValueError("learning_focus must contain unique registered focuses")
         self._validate_composition()
 
     def _validate_composition(self) -> None:
@@ -146,8 +160,6 @@ class ProjectSpec:
         operations = {node.op for node in self.graph.nodes}
         required_operations = {
             Capability.CUBE_TILING: {ProjectOp.MATMUL},
-            Capability.SIMT_REDUCTION: {ProjectOp.REDUCE_SUM},
-            Capability.SIMT_MASK: {ProjectOp.MASK_POSITIVE},
             Capability.SIMD_VECTOR: {
                 ProjectOp.ADD, ProjectOp.MULTIPLY, ProjectOp.RELU,
             },
@@ -157,6 +169,14 @@ class ProjectSpec:
                 raise ValueError(
                     f"{capability.value} capability must agree with graph operations"
                 )
+        for operation, alternatives in (
+            (ProjectOp.REDUCE_SUM, {Capability.SIMT_REDUCTION, Capability.VECTOR_REDUCTION}),
+            (ProjectOp.MASK_POSITIVE, {Capability.SIMT_MASK, Capability.VECTOR_MASK}),
+        ):
+            selected = alternatives & capabilities
+            if len(selected) != int(operation in operations):
+                labels = "/".join(sorted(item.value for item in alternatives))
+                raise ValueError(f"{labels} capability must agree with graph operations exactly once")
         if ProjectOp.MATMUL in operations:
             if len(self.shape) != 3:
                 raise ValueError("cube project shape must be (m, k, n)")
@@ -209,10 +229,12 @@ class ProjectSpec:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "ProjectSpec":
-        if not isinstance(value, Mapping) or set(value) != _PROJECT_FIELDS:
+        if not isinstance(value, Mapping) or set(value) - {"learning_focus"} != _PROJECT_FIELDS:
             raise ValueError(
                 "project fields must be exactly " + ", ".join(sorted(_PROJECT_FIELDS))
             )
+        if not isinstance(value.get("learning_focus", ()), (list, tuple)):
+            raise ValueError("learning_focus must be a list")
         raw_capabilities = value["capabilities"]
         if not isinstance(raw_capabilities, (list, tuple)):
             raise ValueError("capabilities must be a list")
@@ -239,6 +261,7 @@ class ProjectSpec:
             profile_metric=(
                 None if metric is None else _enum(metric, ProfileMetric, "profile metric")
             ),
+            learning_focus=tuple(value.get("learning_focus", ())),
             hypothesis=value["hypothesis"],
             graph=ProjectGraph.from_mapping(value["graph"]),
         )
@@ -258,6 +281,7 @@ class ProjectSpec:
             ),
             "hypothesis": self.hypothesis,
             "graph": self.graph.as_dict(),
+            **({"learning_focus": list(self.learning_focus)} if self.learning_focus else {}),
         }
 
 

@@ -58,7 +58,7 @@ class Phase2ProductionConfig:
     """Machine-local production inputs for one exact Phase 2 destination."""
 
     phase1_root: Path
-    gate: GateReport
+    gate: GateReport | None
     guide_path: Path
     phase2_root: Path
     snapshot_path: Path
@@ -69,13 +69,19 @@ class Phase2ProductionConfig:
     runtime_catlass_revision: str | None = None
     bge_cache: Path | None = None
     kdb: Path | None = None
-    collection: str | None = None
+    collection: str | tuple[str, ...] | list[str] | None = None
     env_file: Path | None = None
     phase2_guide_path: Path | None = None
     phase2_cpl_skills_revision: str | None = None
+    adaptive_review: Path | None = None
+    initial_memory: Path | None = None
+    profiling_guidance_text: str | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.gate, GateReport):
+        if self.adaptive_review is not None:
+            if self.gate is not None or self.initial_memory is None or self.phase2_guide_path:
+                raise ValueError("adaptive admission requires initial memory, no legacy gate or guide replacement")
+        elif not isinstance(self.gate, GateReport):
             raise TypeError("gate must be a GateReport")
         if not Path(self.catlass_source).is_absolute():
             raise ValueError("catlass_source must be an absolute retained BZ path")
@@ -279,6 +285,45 @@ def _phase2_guide(config: Phase2ProductionConfig, composition):
     return guide, text
 
 
+def _admit_snapshot(config):
+    expected = config.phase2_root.resolve() / "cells" / config.cell_id / "snapshot"
+    if config.snapshot_path.resolve() != expected:
+        raise ValueError("requested snapshot path does not match the registered cell")
+    if config.adaptive_review is not None:
+        from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
+        from benchmarks.a5kernels.phase1_experiments import build_cells
+        from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
+        identity = json.loads((config.phase1_root / "campaign-identity.json").read_bytes())["cell"]
+        guide = admit_programming_guide(
+            config.guide_path, cpl_skills_revision=identity["guide"]["cpl_skills_revision"],
+            catlass_revision=identity["guide"]["catlass_revision"],
+        )
+        profiling_guide = (ProfilingGuidanceIdentity(**identity["profiling_guide"])
+                           if identity.get("profiling_guide") else None)
+        source = next((cell for cell in build_cells(guide, profiling_guide=profiling_guide)
+                       if cell.as_dict() == identity), None)
+        if source is None:
+            raise ValueError("adaptive source is not a registered treatment")
+        snapshot = admit_adaptive_snapshot(
+            config.phase1_root, config.initial_memory.read_bytes(), config.adaptive_review,
+            source, config.phase2_root,
+        )
+        if config.cell_id != snapshot.destination.cell_id:
+            raise ValueError("requested cell differs from adaptive destination")
+        return snapshot, config.guide_path.read_text(encoding="utf-8")
+    composition = Phase1CellComposition(
+        config.phase1_root, config.guide_path, config.gate.guide,
+        config.gate, _unavailable_dependencies(),
+    )
+    guide, text = _phase2_guide(config, composition)
+    destinations = {cell.cell_id: cell for cell in phase2_cells(
+        config.gate.guide, config.gate.report_sha256, destination_guide=guide,
+    )}
+    if config.cell_id not in destinations:
+        raise ValueError("requested cell is not a registered Phase 2 destination")
+    return admit_phase1_snapshot(composition, destinations[config.cell_id], config.phase2_root), text
+
+
 def build_phase2_production(
     config: Phase2ProductionConfig,
     *,
@@ -290,32 +335,16 @@ def build_phase2_production(
 ) -> tuple[A5Phase1Snapshot, Phase2Dependencies]:
     """Validate local identity, qualify transport, then expose live dependencies."""
 
-    composition = Phase1CellComposition(
-        config.phase1_root,
-        config.guide_path,
-        config.gate.guide,
-        config.gate,
-        _unavailable_dependencies(),
-    )
-    phase2_guide, phase2_guide_text = _phase2_guide(config, composition)
-    destinations = {
-        cell.cell_id: cell
-        for cell in phase2_cells(
-            config.gate.guide,
-            config.gate.report_sha256,
-            destination_guide=phase2_guide,
-        )
-    }
-    try:
-        cell = destinations[config.cell_id]
-    except KeyError:
-        raise ValueError("requested cell is not a registered Phase 2 destination") from None
+    snapshot, phase2_guide_text = _admit_snapshot(config)
+    cell = snapshot.destination
+    if cell.profiling is ProfilingGuidance.NEW:
+        from benchmarks.a5kernels.profiling_guidance import verify_profiling_guidance
+        verify_profiling_guidance(cell.profiling_guide, config.profiling_guidance_text)
     expected_snapshot = (
         config.phase2_root.resolve() / "cells" / cell.cell_id / "snapshot"
     )
     if config.snapshot_path.resolve() != expected_snapshot:
         raise ValueError("requested snapshot path does not match the registered cell")
-    snapshot = admit_phase1_snapshot(composition, cell, config.phase2_root)
 
     # Exhaust every local dependency check before probing or dispatching BZ-A5.
     # Constructing the provider is side-effect free; its first model call remains
@@ -342,11 +371,9 @@ def build_phase2_production(
         embeddings.embed_query(["A5 Phase 2 preflight"])
         database = KnowledgeDB.open_read_only(config.kdb, embeddings)
         try:
-            manifest = database.manifest(config.collection)
-            if (
-                manifest.embedding_model != embeddings.model
-                or manifest.embedding_revision != embeddings.revision
-            ):
+            if any(manifest.embedding_model != embeddings.model
+                   or manifest.embedding_revision != embeddings.revision
+                   for manifest in database.selected_manifests(config.collection)):
                 raise ValueError("KDB manifest does not match pinned embeddings")
             _probe_knowledge_query(database, config.collection)
         finally:
@@ -375,6 +402,8 @@ def build_phase2_production(
             "retained Phase 2 qualification runtime provenance changed"
         )
     provenance = live_provenance
+    if config.adaptive_review is not None and not dict(provenance).get("cann_version", "").startswith("9.3"):
+        raise ValueError("adaptive Phase 2 requires the checked CANN 9.3 weekly runtime")
     expected_runtime_revision = (
         config.runtime_catlass_revision or cell.catlass_revision
     )
@@ -394,6 +423,8 @@ def build_phase2_production(
         A5_PROFILING_GUIDANCE
         if cell.profiling is ProfilingGuidance.WITH_GUIDANCE else None
     )
+    if cell.profiling is ProfilingGuidance.NEW:
+        guidance = config.profiling_guidance_text
     source = Phase2SourceProvider(
         provider,
         evidence_root=config.phase2_root.resolve() / "cells",

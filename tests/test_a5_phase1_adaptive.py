@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -169,6 +170,50 @@ def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     assert executions == ["published"]
     after = json.loads((root / "state.json").read_text())
     assert after["memory_bytes_base64"] == before["memory_bytes_base64"]
+
+
+def test_resume_rejects_reordered_focus_without_rewriting_retained_evidence(tmp_path):
+    retained = _project("published", "gm-ub-movement")
+    retained["learning_focus"] = ["sync-performance", "pipe-mte2"]
+    proposal = {**retained, "project_id": "renamed",
+                "learning_focus": retained["learning_focus"][::-1]}
+    calls = []
+
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return _wave(messages[-1]["content"], [retained])
+        return "DECISION: WAVE\n{broken"
+
+    executions = []
+    def execute(request):
+        executions.append(request.spec.project_id)
+        return _result(request.spec, True, "retained host evidence")
+
+    def campaign(provider):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn focus", SEED,
+            CurriculumAgent(provider), execute, max_parallel=1)
+
+    with pytest.raises(ValueError, match="3 attempts"):
+        campaign(complete).run()
+    before_state = json.loads((tmp_path / "state.json").read_bytes())
+    retained_files = {path: path.read_bytes() for path in (tmp_path / "waves").rglob("*")
+                      if path.is_file()}
+    replay_calls = []
+    def replay(messages):
+        replay_calls.append(messages)
+        if len(replay_calls) == 1:
+            return _wave(messages[-1]["content"], [proposal])
+        assert "repeats prior information" in messages[-1]["content"]
+        return 'DECISION: SATURATED\n{"reason":"retained project already covers focus"}'
+
+    report = campaign(replay).resume()
+    assert report["published_projects"] == ["published"]
+    assert executions == ["published"]
+    assert all(path.read_bytes() == value for path, value in retained_files.items())
+    after_state = json.loads((tmp_path / "state.json").read_bytes())
+    assert after_state["prior_outcomes"] == before_state["prior_outcomes"]
+    assert after_state["memory_bytes_base64"] == before_state["memory_bytes_base64"]
 
 
 def test_reverse_completion_failure_resume_and_authored_atomic_publication(tmp_path):
@@ -401,3 +446,129 @@ def test_cli_uses_explicit_production_factory_and_reports_json(tmp_path, capsys)
     ) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "RUNNING"
     assert seen == ["binding:build"]
+
+
+def test_target_stops_and_resume_with_larger_target_preserves_memory(tmp_path):
+    counter = 0
+    def complete(messages):
+        nonlocal counter
+        counter += 1
+        item = _project(f"project-{counter}", "gm-ub-movement")
+        item["learning_focus"] = ["pipe-mte2" if counter == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [item])
+    def execute(request):
+        return _result(request.spec, True, "verified")
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    first = campaign(1).run()
+    assert first["status"] == "TARGET_REACHED"
+    with pytest.raises(ValueError, match="continue_campaign"):
+        campaign(2).resume()
+    continued = campaign(1)
+    continued.continue_campaign(2)
+    second = continued.resume()
+    assert second["successful_projects"] == 2
+    assert second["published_projects"][0] == first["published_projects"][0]
+    assert "pipe-mte2" not in second["coverage_gaps"]
+    assert "pipe-mte3" not in second["coverage_gaps"]
+
+
+def test_omitted_target_preserves_retained_override_and_new_default(tmp_path):
+    def create(root, target=None):
+        return AdaptivePhase1Coordinator(root, "Learn pipes", SEED,
+            CurriculumAgent(lambda _: 'DECISION: STALLED\n{"reason":"unneeded"}'),
+            lambda _: None, max_parallel=1, project_target=target)
+    assert create(tmp_path / "new").project_target == 64
+    retained = create(tmp_path / "retained", 128)
+    state = retained._load_state()
+    state["project_target"] = 128
+    retained._atomic_json(retained.root / "state.json", state)
+    assert create(retained.root).project_target == 128
+    assert create(retained.root, 256).project_target == 256
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
+    spec = _project("tools", "gm-ub-movement")
+    spec["learning_focus"] = ["tool-msprof", "tool-msdebug", "tool-mssanitizer", "debug-print"]
+    facts = [{"category": "host-verification", "statement": "verified"}]
+    if observed:
+        facts += [{"category": "profiling", "statement": "profiled"},
+                  {"category": "runtime", "statement": 'tool-observation:{"available":true,"tool":"msdebug","execution":{}}'},
+                  {"category": "runtime", "statement": 'tool-observation:{"available":true,"tool":"memcheck","execution":{}}'},
+                  {"category": "runtime", "statement": "verified-debug-print:source"}]
+    else:
+        facts += [{"category": "runtime", "statement": 'tool-observation:{"available":false,"tool":"memcheck"}'}]
+    state = {"prior_outcomes": [{"spec": spec, "verified": True}], "memory_bytes_base64": [
+        base64.b64encode(json.dumps({"host_facts": facts}).encode()).decode()]}
+    effective = AdaptivePhase1Coordinator._effective_outcomes(state)[0]["spec"]
+    assert effective.get("learning_focus", []) == (spec["learning_focus"] if observed else [])
+    gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
+    assert all((focus not in gaps) == observed for focus in spec["learning_focus"])
+
+
+@pytest.mark.parametrize("device_capture", [False, True])
+def test_timing_counts_only_retained_msprof_capture_even_without_requested_focus(device_capture):
+    summary = {"timing": [{"device_kernel": {"duration_us": 2}}] if device_capture else []}
+    spec = _project("timed", "gm-ub-movement")
+    state = {"prior_outcomes": [{"spec": spec, "verified": True}], "memory_bytes_base64": [
+        base64.b64encode(json.dumps({"host_facts": [
+            {"category": "performance-study", "statement": json.dumps(summary)},
+        ]}).encode()).decode()]}
+    gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
+    assert ("tool-msprof" not in gaps) == device_capture
+
+
+@pytest.mark.parametrize("statement", ["Measured current source", "fixed source", "[]", "null", "42", '{"timing":null}'])
+def test_prose_measurement_facts_survive_report_resume_and_next_selection(tmp_path, statement):
+    selections = []
+    paused = []
+    def complete(messages):
+        selections.append(messages[-1]["content"])
+        spec = _project(f"project-{len(selections)}", "gm-ub-movement")
+        spec["learning_focus"] = ["pipe-mte2" if len(selections) == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [spec])
+    def execute(request):
+        if request.spec.project_id == "project-2" and not paused:
+            paused.append(True)
+            raise RuntimeError("pause before second publication")
+        result = _result(request.spec, True, "verified")
+        fact = HostFact("performance-study", statement, result.memory.admitted_artifact_sha256[0])
+        return replace(result, memory=replace(result.memory, host_facts=(*result.memory.host_facts, fact)))
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    # The shared runner changes targets through its explicit continuation API.
+    # Resume the same target after a normal interrupted second attempt instead.
+    with pytest.raises(RuntimeError, match="failed before verification"):
+        campaign(2).run()
+    assert "tool-msprof" in campaign(2).report()["coverage_gaps"]
+    assert campaign(2).resume()["successful_projects"] == 2
+    assert len(selections) == 2
+
+
+def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tmp_path):
+    calls = []
+    def complete(messages):
+        return _wave(messages[-1]["content"], [
+            _project("first", "gm-ub-movement"), _project("second", "simd-vector"),
+            _project("third", "padded-tail"),
+        ])
+    def execute(request):
+        calls.append(request.spec.project_id)
+        return _result(request.spec, request.spec.project_id != "second", "observed")
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    with pytest.raises(RuntimeError, match="not verified"):
+        campaign(3).run()
+    assert campaign(3).report()["pending_wave"]["projects"][0]["status"] == "verified"
+    files = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+             for path in tmp_path.rglob("*") if path.is_file()}
+    before_calls = list(calls)
+    with pytest.raises(ValueError, match="retained wave exceeds configured project target"):
+        campaign(2).resume()
+    assert calls == before_calls
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tmp_path.rglob("*") if path.is_file()} == files

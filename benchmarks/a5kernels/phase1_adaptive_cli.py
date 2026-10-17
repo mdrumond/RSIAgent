@@ -45,10 +45,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--profiling", choices=[item.value for item in ProfilingGuidance])
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-parallel", type=int, default=1)
+    parser.add_argument("--project-target", type=int)
     parser.add_argument("--max-projects", type=int)
     parser.add_argument("--profiling-guidance-skill", type=Path)
     parser.add_argument("--kdb", type=Path)
-    parser.add_argument("--collection")
+    parser.add_argument("--collection", action="append")
     parser.add_argument("--bge-cache", type=Path)
     parser.add_argument("--env-file", type=Path)
     return parser
@@ -115,7 +116,8 @@ def main(
             args.catlass_revision,
             args.device,
             args.kdb,
-            args.collection,
+            (args.collection[0] if args.collection and len(args.collection) == 1
+             else tuple(args.collection) if args.collection else None),
         ),
         objective=args.objective,
         initial_memory=initial_memory,
@@ -123,6 +125,7 @@ def main(
         environment=environment_loader(env_file=args.env_file),
         embeddings=embeddings,
         max_parallel=args.max_parallel,
+        project_target=args.project_target,
         **({"max_projects": args.max_projects} if args.max_projects is not None else {}),
         **({"profiling_guidance_text": guidance_text} if guidance_text is not None else {}),
     )

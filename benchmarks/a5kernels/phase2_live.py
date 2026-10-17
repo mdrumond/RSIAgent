@@ -63,9 +63,10 @@ class Phase2Dependencies:
     source: SourceProvider
     verify: TargetVerifier
     trace: TraceSink | None = None
+    cell_type: type = A5Phase2Cell
 
     def __post_init__(self) -> None:
-        if not isinstance(self.cell, A5Phase2Cell):
+        if not isinstance(self.cell, self.cell_type):
             raise TypeError("Phase 2 dependencies require an A5Phase2Cell")
         if not callable(self.source) or not callable(self.verify):
             raise TypeError("Phase 2 source and verifier must be callable")
@@ -100,11 +101,23 @@ def _read_object(path: Path, label: str) -> dict[str, object]:
 class Phase2LiveRunner:
     """Run one isolated A5 treatment until host PASS or bounded exhaustion."""
 
+    snapshot_type = A5Phase1Snapshot
+    evidence_type = AttentionTargetEvidence
+    execution_profile = "bz-a5"
+    @property
+    def candidate_abi_sha256(self):
+        return CANDIDATE_ABI_SHA256
+    protocol_schema = PROTOCOL_SCHEMA
+    attempt_schema = ATTEMPT_SCHEMA
+    memory_schema = MEMORY_SCHEMA
+    terminal_schema = TERMINAL_SCHEMA
+    source_filename = "candidate.py"
+
     def __init__(
         self, *, phase2_root: str | Path, snapshot: A5Phase1Snapshot,
         dependencies: Phase2Dependencies,
     ) -> None:
-        if not isinstance(snapshot, A5Phase1Snapshot):
+        if not isinstance(snapshot, self.snapshot_type):
             raise TypeError("snapshot must be an A5Phase1Snapshot")
         if not isinstance(dependencies, Phase2Dependencies):
             raise TypeError("dependencies must be Phase2Dependencies")
@@ -165,15 +178,15 @@ class Phase2LiveRunner:
     def _protocol_body(self) -> dict[str, object]:
         identity = {
             "target_suite_sha256": SUITE_SHA256,
-            "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
+            "candidate_abi_sha256": self.candidate_abi_sha256,
             "host_target_grading_sha256": HOST_TARGET_GRADING_SHA256,
             "source_snapshot_id": self.snapshot.snapshot_id,
             "cell": self.dependencies.cell.as_dict(),
         }
         return {
-            "schema": PROTOCOL_SCHEMA,
+            "schema": self.protocol_schema,
             "identity": identity,
-            "execution_profile": "bz-a5",
+            "execution_profile": self.execution_profile,
             "maximum_semantic_attempts": MAX_ATTEMPTS,
             "semantic_retry": {
                 "preceding_attempt_only": True,
@@ -199,12 +212,12 @@ class Phase2LiveRunner:
     ) -> dict[str, object]:
         prefix = f"{self.snapshot.snapshot_id[:16]}-a{ordinal:02d}"
         body = {
-            "schema": ATTEMPT_SCHEMA,
+            "schema": self.attempt_schema,
             "protocol_sha256": protocol["protocol_sha256"],
             "cell_id": self.dependencies.cell.cell_id,
             "snapshot_id": self.snapshot.snapshot_id,
             "suite_sha256": SUITE_SHA256,
-            "candidate_abi_sha256": CANDIDATE_ABI_SHA256,
+            "candidate_abi_sha256": self.candidate_abi_sha256,
             "host_target_grading_sha256": HOST_TARGET_GRADING_SHA256,
             "attempt": ordinal,
             "request_id": prefix,
@@ -221,7 +234,7 @@ class Phase2LiveRunner:
         identity_path = attempt_root / "attempt.json"
         _publish_exact(identity_path, canonical_bytes(identity) + b"\n")
 
-        source_path = attempt_root / "candidate.py"
+        source_path = attempt_root / self.source_filename
         request = Phase2AttemptRequest(
             self.dependencies.cell,
             str(protocol["protocol_sha256"]),
@@ -242,32 +255,31 @@ class Phase2LiveRunner:
 
         evidence_path = attempt_root / "evidence.json"
         if evidence_path.exists():
-            evidence = AttentionTargetEvidence.read(evidence_path)
+            evidence = self.evidence_type.read(evidence_path)
         else:
             # Infrastructure errors intentionally propagate before evidence or
             # memory is committed.  Resume therefore retries this same attempt.
             evidence = self.dependencies.verify(
                 source, request.request_id, request.attempt_id, attempt_root / "host",
             )
-            if not isinstance(evidence, AttentionTargetEvidence):
+            if not isinstance(evidence, self.evidence_type):
                 raise TypeError("Phase 2 verifier must return AttentionTargetEvidence")
             self._validate_evidence(evidence, source, request)
             _publish_exact(evidence_path, canonical_bytes(asdict(evidence)) + b"\n")
-            evidence = AttentionTargetEvidence.read(evidence_path)
+            evidence = self.evidence_type.read(evidence_path)
         self._validate_evidence(evidence, source, request)
         if self.dependencies.trace is not None:
             self.dependencies.trace(request, source, evidence)
         return evidence
 
-    @staticmethod
     def _validate_evidence(
-        evidence: AttentionTargetEvidence, source: str,
+        self, evidence: AttentionTargetEvidence, source: str,
         request: Phase2AttemptRequest,
     ) -> None:
         if (
             evidence.request_id != request.request_id
             or evidence.attempt_id != request.attempt_id
-            or evidence.execution_profile != "bz-a5"
+            or evidence.execution_profile != self.execution_profile
             or evidence.suite_sha256 != SUITE_SHA256
             or evidence.candidate_sha256
             != hashlib.sha256(source.encode("utf-8")).hexdigest()
@@ -288,7 +300,7 @@ class Phase2LiveRunner:
                 raise ValueError("invalid Phase 2 memory journal") from exc
             digest = entry.pop("entry_sha256", None)
             if (
-                entry.get("schema") != MEMORY_SCHEMA
+                entry.get("schema") != self.memory_schema
                 or entry.get("protocol_sha256") != protocol["protocol_sha256"]
                 or entry.get("attempt") != ordinal
                 or entry.get("previous_sha256") != previous
@@ -310,8 +322,8 @@ class Phase2LiveRunner:
             if _read_object(root / "attempt.json", "Phase 2 attempt") != identity:
                 raise ValueError("committed Phase 2 attempt identity changed")
             try:
-                source = (root / "candidate.py").read_text(encoding="utf-8")
-                evidence = AttentionTargetEvidence.read(root / "evidence.json")
+                source = (root / self.source_filename).read_text(encoding="utf-8")
+                evidence = self.evidence_type.read(root / "evidence.json")
             except OSError as exc:
                 raise ValueError("committed Phase 2 attempt is incomplete") from exc
             request = Phase2AttemptRequest(
@@ -342,7 +354,7 @@ class Phase2LiveRunner:
         failures = [self._failure_context(item) for item in evidence.cases
                     if not item.passed]
         body = {
-            "schema": MEMORY_SCHEMA,
+            "schema": self.memory_schema,
             "protocol_sha256": protocol["protocol_sha256"],
             "attempt": ordinal,
             "attempt_identity_sha256": self._attempt_identity(
@@ -403,7 +415,7 @@ class Phase2LiveRunner:
         memory = memories[-1]
         ordinal = int(memory["attempt"])
         source = (
-            self.root / "attempts" / f"attempt-{ordinal:02d}" / "candidate.py"
+            self.root / "attempts" / f"attempt-{ordinal:02d}" / self.source_filename
         ).read_text(encoding="utf-8")
         source_bytes = source.encode("utf-8")
         candidate_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -437,7 +449,7 @@ class Phase2LiveRunner:
         ):
             raise ValueError("failed terminal requires exhausted host evidence")
         body = {
-            "schema": TERMINAL_SCHEMA,
+            "schema": self.terminal_schema,
             "status": status,
             "cell_id": self.dependencies.cell.cell_id,
             "protocol_sha256": protocol["protocol_sha256"],
@@ -463,7 +475,7 @@ class Phase2LiveRunner:
             and memories[-1]["passed"] is False
         )
         if (
-            value.get("schema") != TERMINAL_SCHEMA
+            value.get("schema") != self.terminal_schema
             or value.get("cell_id") != self.dependencies.cell.cell_id
             or value.get("protocol_sha256") != protocol["protocol_sha256"]
             or value.get("completed_attempts") != len(memories)

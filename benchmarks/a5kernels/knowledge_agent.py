@@ -5,11 +5,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .knowledge import CollectionManifest, KnowledgeDB, SearchHit
+from .knowledge import CollectionManifest, KnowledgeDB, SearchHit, collection_names
 
 if TYPE_CHECKING:
     from core.loop import DomainActionResult
@@ -40,6 +40,27 @@ class Citation:
     start_line: int
     end_line: int
     chunk_hash: str
+    repository: str | None = None
+    revision: str | None = None
+    source_sha256: str | None = None
+    reference_exposed: bool = False
+    provenance_present: InitVar[bool] = False
+
+    def __post_init__(self, provenance_present):
+        object.__setattr__(self, "_provenance_present", provenance_present)
+
+    def as_dict(self) -> dict[str, object]:
+        value = asdict(self)
+        if (not self._provenance_present and self.repository is None and self.revision is None
+                and self.source_sha256 is None and not self.reference_exposed):
+            for field in ("repository", "revision", "source_sha256", "reference_exposed"):
+                value.pop(field)
+        return value
+
+    @classmethod
+    def from_mapping(cls, value):
+        return cls(**value, provenance_present=any(field in value for field in (
+            "repository", "revision", "source_sha256", "reference_exposed")))
 
 
 @dataclass(frozen=True)
@@ -47,6 +68,8 @@ class KnowledgeResult:
     citation: Citation
     text: str
     score: float
+    lexical_rank: int | None = None
+    vector_rank: int | None = None
 
 
 def validate_knowledge_hit(
@@ -54,12 +77,18 @@ def validate_knowledge_hit(
 ) -> KnowledgeResult:
     """Apply the Knowledge Agent's citation gate to one retrieved hit."""
 
+    manifest = database.manifest(collection)
+    source = database.source_fingerprint(collection, hit.path)
     citation = Citation(
         collection=collection,
         path=hit.path,
         start_line=hit.start_line,
         end_line=hit.end_line,
         chunk_hash=hit.chunk_id,
+        repository=manifest.repository,
+        revision=manifest.revision,
+        source_sha256=source.sha256,
+        reference_exposed=manifest.reference_exposed,
     )
     database.validate_citation(
         citation.collection,
@@ -68,7 +97,8 @@ def validate_knowledge_hit(
         start_line=citation.start_line,
         end_line=citation.end_line,
     )
-    return KnowledgeResult(citation=citation, text=hit.text, score=hit.score)
+    return KnowledgeResult(citation=citation, text=hit.text, score=hit.score,
+                           lexical_rank=hit.lexical_rank, vector_rank=hit.vector_rank)
 
 
 def parse_knowledge_action(value: str) -> Any:
@@ -218,20 +248,26 @@ class KnowledgeAgent:
         enabled: bool,
         journal: ProgressiveMemoryJournal,
         database: KnowledgeDB | None = None,
-        collection: str | None = None,
+        collection: str | tuple[str, ...] | list[str] | None = None,
+        collections: tuple[str, ...] = (),
     ):
-        if enabled and (database is None or not collection):
+        if collection and collections:
+            raise ValueError("select collection or collections, not both")
+        selected = collection_names(collections or collection) if (collections or collection) else ()
+        if enabled and (database is None or not selected):
             raise ValueError("enabled Knowledge Agent requires a database and collection")
-        if not enabled and (database is not None or collection is not None):
+        if not enabled and (database is not None or selected):
             raise ValueError("disabled Knowledge Agent must not receive KDB access")
         self.enabled = enabled
         self.journal = journal
         self.database = database
-        self.collection = collection
+        self.collections = selected
+        self.collection = selected[0] if selected else None
         self.manifest = None
         if database is not None:
             self.database = database.read_only_view()
-            self.manifest = self.database.manifest(collection)
+            self.manifests = {name: self.database.manifest(name) for name in selected}
+            self.manifest = self.manifests[self.collection]
 
     def close(self) -> None:
         if self.database is not None:
@@ -244,15 +280,19 @@ class KnowledgeAgent:
             )
             return ()
         assert self.database is not None and self.collection is not None
-        hits = self.database.query(self.collection, action.query, limit=action.limit)
-        results = tuple(self._validated_result(hit) for hit in hits)
-        self.journal.append(
-            enabled=True,
-            collection=self.collection,
-            query=action.query,
-            citations=tuple(result.citation for result in results),
-            manifest=self.manifest,
-        )
+        candidates = [validate_knowledge_hit(self.database, name, hit)
+                      for name in self.collections
+                      for hit in self.database.query(name, action.query, limit=action.limit)]
+        results = tuple(sorted(candidates, key=lambda result: (
+            -result.score, result.citation.collection, result.citation.chunk_hash
+        ))[:action.limit])
+        for name in self.collections:
+            self.journal.append(
+                enabled=True, collection=name, query=action.query,
+                citations=tuple(result.citation for result in results
+                                if result.citation.collection == name),
+                manifest=self.manifests[name],
+            )
         return results
 
     def execute(self, action: KnowledgeQuery) -> "DomainActionResult":

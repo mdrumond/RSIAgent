@@ -1,6 +1,9 @@
 """Adaptive Actor seam for bounded, exact-source BZ diagnostic observations."""
 
+import json
+
 from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
+from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 
 
@@ -22,9 +25,14 @@ def diagnostic_action(backend):
         digest = context.artifacts.put_json(result["artifact"])
         if digest != result["evidence_sha256"]:
             raise ValueError("diagnostic artifact hash does not match payload")
+        record = result["record"]
+        observed = {"tool": record.get("tool", tool), "available": record["available"]}
+        if "execution" in record:
+            observed["execution"] = True
         return AdaptiveActionResult(
-            {"event": "diagnostic", **result["record"], "evidence_sha256": digest},
+            {"event": "diagnostic", **record, "evidence_sha256": digest},
             admitted_artifacts={digest: "diagnostic"},
+            host_facts=(HostFact("diagnostic", "tool-observation:" + json.dumps(observed, sort_keys=True), digest),),
         )
 
     return diagnose

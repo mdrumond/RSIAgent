@@ -42,7 +42,7 @@ class HostFact:
     evidence_sha256: str
 
     def __post_init__(self) -> None:
-        if self.category not in {"compile", "runtime", "host-verification", "profiling", "performance-study"}:
+        if self.category not in {"compile", "runtime", "host-verification", "profiling", "performance-study", "diagnostic"}:
             raise ValueError("host fact category is not recognized")
         if not isinstance(self.statement, str) or not self.statement.strip():
             raise ValueError("host fact statement must be non-empty")
@@ -168,7 +168,7 @@ def parse_agent_distillation(
                             for digest in lesson.evidence_artifact_sha256)):
             raise ValueError("correctness requires host-verification evidence")
         if (lesson.category == "performance"
-                and not any(admitted_artifacts[digest] in {"performance-study", "profiling"}
+                and not any(admitted_artifacts[digest] in {"performance-study", "profiling", "comparison-performance-study", "comparison-profiling"}
                             for digest in lesson.evidence_artifact_sha256)):
             raise ValueError("performance requires retained timing or profiling evidence")
         lessons.append(lesson)
@@ -292,7 +292,7 @@ class Phase1ProjectMemory:
             "agent_interpretations": [{
                 **asdict(item), "supports": list(item.supports),
             } for item in self.interpretations],
-            "kdb_citations": [asdict(item) for item in self.kdb_citations],
+            "kdb_citations": [item.as_dict() for item in self.kdb_citations],
             "agent_lessons": [{
                 **asdict(item),
                 "evidence_artifact_sha256": list(item.evidence_artifact_sha256),
@@ -360,7 +360,7 @@ class Phase1ProjectMemory:
                     )
                     for item in interpretations
                 ),
-                kdb_citations=tuple(Citation(**item) for item in citations),
+                kdb_citations=tuple(Citation.from_mapping(item) for item in citations),
                 lessons=lessons,
                 no_new_knowledge=value.get("no_new_knowledge", True),
                 admitted_artifact_sha256=tuple(admitted),
