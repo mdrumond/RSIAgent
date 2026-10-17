@@ -105,6 +105,23 @@ def test_reuse_can_select_published_ancestor_of_local_head(upstream, tmp_path):
     assert (Path(result["root"]) / "kernel.py").read_text().startswith("def add")
 
 
+def test_unpinned_reuse_rejects_existing_snapshot_with_changed_head(upstream, tmp_path):
+    destination = tmp_path / "artifacts"
+    first = acquire_source(spec(), destination, upstream)
+    snapshot = Path(first["root"])
+    git("config", "user.name", "test", cwd=snapshot)
+    git("config", "user.email", "test@example.test", cwd=snapshot)
+    (snapshot / "kernel.py").write_text("local = True\n")
+    git("add", "kernel.py", cwd=snapshot)
+    git("commit", "--quiet", "-m", "changed snapshot", cwd=snapshot)
+    changed = git("rev-parse", "HEAD", cwd=snapshot)
+    assert changed != first["revision"]
+    assert git("status", "--porcelain", cwd=snapshot) == ""
+    with pytest.raises(ValueError, match="existing snapshot revision mismatch"):
+        acquire_source(spec(), destination, upstream)
+    assert git("rev-parse", "HEAD", cwd=snapshot) == changed
+
+
 def test_partial_success_preserved_and_errors_sanitized(upstream, tmp_path):
     bad = {"name": "missing", "repository": "https://wrong.test/missing.git"}
     result = acquire_sources([spec(), bad], tmp_path / "artifacts", reuse={"kernel": upstream, "missing": upstream})

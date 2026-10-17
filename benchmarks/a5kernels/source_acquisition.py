@@ -165,6 +165,8 @@ def acquire_source(spec: dict, destination: Path, reuse: Path | None = None) -> 
             target = base / revision
             if not target.exists():
                 os.replace(root, target)
+            elif git("rev-parse", "HEAD", cwd=target) != revision:
+                raise ValueError("existing snapshot revision mismatch")
             root = target
     revision = git("rev-parse", "HEAD", cwd=root)
     if git("status", "--porcelain", cwd=root):
