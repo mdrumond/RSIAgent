@@ -84,3 +84,31 @@ resume; infrastructure failures leave the current semantic attempt uncommitted.
 Omitting `--target` or selecting `a5` dispatches the existing A5 Phase2 CLI with
 its original arguments and defaults. Old A3 vector-add entrypoints remain
 separate compatibility targets.
+
+## Adaptive Phase 2 curriculum composition
+
+For fresh generic projects, construct `AdaptivePhase2Coordinator` from
+`benchmarks.ascend.phase2_curriculum` with an admitted reviewed snapshot,
+objective, `CurriculumAgent`, and the existing adaptive project executor. It
+pins the snapshot identity and exact Phase 1 memory. Each selection sees reviewed
+Phase 1 outcomes, previous verified Phase 2 learning, and semantic failure
+summaries, then authors one new project through the existing closed grammar and
+host oracle. `project_target` counts only verified Phase 2 publications; the loop
+continues after a pass. Executor exceptions retain the pending project for resume.
+
+Both `build_native_adaptive_phase1` and `build_adaptive_phase1` accept explicit
+`reviewed_snapshot=` and optional `trace_hook=` arguments to select this mode
+while preserving their target, model, guide, KDB and runtime composition. They
+write a distinct Phase 2 campaign identity including the pinned snapshot ID.
+Changed reviewed memory requires a new root. Existing Phase 2 attention CLI
+entrypoints retain their compatibility behavior.
+
+For either adaptive phase, `coordinator.continue_campaign(new_target,
+reopen_terminal=True)` explicitly raises the retained target and reopens a
+SATURATED or STALLED curriculum. Omit `reopen_terminal` when extending a campaign
+that reached its target. Publications, selector history and prior stop decisions
+remain retained. `resume()` alone never extends the target. A constructor target
+that conflicts with retained state is rejected; use the continuation method.
+The optional trace hook receives a deterministic event ID, verification flag,
+summary and retained attempt directory after publication; exporters can also
+inspect those retained directories after interrupted notification.

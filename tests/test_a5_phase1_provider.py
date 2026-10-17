@@ -18,6 +18,7 @@ from benchmarks.a5kernels.phase1_provider import (
     DirectActorDriver,
     DirectCompletion,
     DirectCompletionProvider,
+    ProviderRejectionError,
     direct_profile,
     openai_compatible_transport,
 )
@@ -36,6 +37,103 @@ ADMITTED = "a" * 64
 NO_NEW_DISTILLATION = (
     '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
 )
+
+
+class PromptRejected(Exception):
+    status_code = 400
+    code = "invalid_prompt"
+    request_id = "req_ordinary_123"
+    body = {"error": {"code": "invalid_prompt", "message": "openai-secret deepseek-secret"}}
+
+
+def test_invalid_prompt_retries_identical_request_without_replaying_actions(tmp_path):
+    calls, delays, actions = [], [], []
+    def transport(**kwargs):
+        calls.append(kwargs["request"])
+        if len(calls) == 1:
+            raise PromptRejected("openai-secret")
+        return DirectCompletion('{"submit":{}}', 2)
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append)
+    driver = DirectActorDriver(provider)
+    def execute(action):
+        actions.append(action.kind)
+        from benchmarks.a5kernels.trial import ActionOutcome
+        return ActionOutcome('{"host":{"event":"done"}}', True, "host-verified")
+    from benchmarks.a5kernels.trial import parse_trial_action
+    outcome = driver("write an ordinary kernel", profile=direct_profile(MODEL_IDENTITIES[0]),
+                     workspace=tmp_path / "actor", context=None,
+                     turn_parser=parse_trial_action, action_executor=execute)
+    assert calls[0] == calls[1]
+    assert delays == [120]
+    assert actions == ["submit"] and outcome.iterations == 1 and outcome.tokens == 2
+    rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    requests = [row for row in rows if row["role"] == "provider-request"]
+    assert len(requests) == 2 and requests[0]["sha256"] == requests[1]["sha256"]
+    assert [row["attempt"] for row in requests] == [1, 2]
+    failures = [row for row in rows if row["role"] == "provider-attempt-rejection"]
+    retained = ContentAddressedArtifacts(tmp_path / "artifacts").read_json(failures[0]["sha256"])
+    assert retained["request_id"] == "req_ordinary_123" and retained["backoff_seconds"] == 120
+    assert retained["request_sha256"] == requests[0]["sha256"]
+    assert "secret" not in json.dumps(retained)
+
+
+def test_invalid_prompt_exhaustion_is_noninfra_and_safe():
+    calls, delays, events = [], [], []
+    def transport(**kwargs):
+        calls.append(kwargs["request"])
+        raise PromptRejected("openai-secret")
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append)
+    with pytest.raises(ProviderRejectionError) as caught:
+        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [{"role": "user", "content": "kernel"}],
+                          attempt_observer=lambda event, payload: events.append((event, payload)))
+    assert len(calls) == 4 and all(call == calls[0] for call in calls)
+    assert delays == [120, 120, 120]
+    assert [payload["retry"] for event, payload in events if event == "rejection"] == [True, True, True, False]
+    assert caught.value.code == "invalid_prompt" and caught.value.status_code == 400
+    assert not isinstance(caught.value, InfrastructureFailure)
+    assert "secret" not in str(caught.value) + json.dumps(caught.value.evidence())
+
+
+@pytest.mark.parametrize("exhaust", [False, True])
+def test_rejections_are_logged_safely_without_actor_observer(caplog, exhaust):
+    calls = []
+    def transport(**kwargs):
+        calls.append(kwargs["request"])
+        if exhaust or len(calls) == 1:
+            raise PromptRejected("openai-secret deepseek-secret raw body")
+        return DirectCompletion("ordinary response", 1)
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=lambda _: None)
+    if exhaust:
+        with pytest.raises(ProviderRejectionError):
+            provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
+    else:
+        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
+    logs = [json.loads(record.getMessage().split(": ", 1)[1]) for record in caplog.records
+            if record.name == "benchmarks.a5kernels.phase1_provider"]
+    assert len(logs) == (4 if exhaust else 1)
+    assert [entry["attempt"] for entry in logs] == list(range(1, len(logs) + 1))
+    assert all(entry["code"] == "invalid_prompt" and entry["status_code"] == 400 for entry in logs)
+    assert all(entry["request_id"] == "req_ordinary_123" for entry in logs)
+    assert len({entry["request_sha256"] for entry in logs}) == 1
+    assert logs[-1]["retry"] is not exhaust
+    assert logs[-1]["backoff_seconds"] == (0 if exhaust else 120)
+    assert "secret" not in caplog.text and "raw body" not in caplog.text
+
+
+@pytest.mark.parametrize("code,status", [("invalid_schema", 400), ("invalid_prompt", 401),
+                                        ("context_length_exceeded", 400)])
+def test_other_provider_rejections_are_not_retried(code, status):
+    calls = []
+    error = PromptRejected("ordinary rejection")
+    error.code, error.status_code, error.body = code, status, None
+    def transport(**kwargs):
+        calls.append(kwargs)
+        raise error
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport,
+                                       sleeper=lambda _: pytest.fail("unexpected backoff"))
+    with pytest.raises(PromptRejected):
+        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
+    assert len(calls) == 1
 
 
 def _distillation(*, evidence=ADMITTED, category="correctness"):

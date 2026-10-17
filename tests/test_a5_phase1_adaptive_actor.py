@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import base64
 from dataclasses import replace
 import hashlib
 import json
+import copy
 
 import pytest
 
@@ -165,6 +165,205 @@ def _request(tmp_path, executor, spec=None):
     )
 
 
+class TracedScriptedActor(ScriptedActor):
+    def with_trace(self, callback):
+        result = copy.copy(self)
+        result.trace_event = callback
+        return result
+
+    def __call__(self, instruction, **kwargs):
+        self.trace_event("message", {"role": "user", "content": instruction})
+        original = kwargs["action_executor"]
+        replies = iter(self.replies)
+        def execute(action):
+            self.trace_event("message", {"role": "assistant", "content": next(replies)})
+            return original(action)
+        return super().__call__(instruction, **{**kwargs, "action_executor": execute})
+
+
+def test_adaptive_trace_retains_repair_but_excludes_distillation(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    actor = TracedScriptedActor([
+        '{"write":{"slot":"kernel","content":"broken source"}}',
+        '{"run":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+    ])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
+        phase="phase1", round_id="round-1", model="fixture", source_manifest_sha256="a" * 64,
+    ))
+    driver(request)
+    rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    example, metadata = _example(rows)
+    assert metadata["repair"]
+    assistants = [m for m in example["messages"] if m["role"] == "assistant"]
+    assert assistants[-1] == {"role": "assistant", "content": "fixed source", "weight": 1}
+    assert all(m["weight"] == 0 for m in assistants[:-1])
+    assert all("distillation" not in m["content"] for m in assistants)
+    assert not hasattr(actor, "trace_event")
+
+
+def test_adaptive_failed_trace_is_retained_without_positive_label(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"broken source"}}', '{"run":{}}'])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
+        phase="phase2", round_id="round-1", model="fixture", source_manifest_sha256="a" * 64,
+    ))
+    with pytest.raises(RuntimeError, match="without host-verified"):
+        driver(request)
+    rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    assert _example(rows) is None
+    assert any(row["kind"] == "validation" for row in rows)
+
+
+def test_parallel_project_traces_are_isolated_and_abort_evidence_is_retained(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+    actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
+                                '{"run":{}}', '{"submit":{}}'])
+    factory = recorder_factory(phase="phase2", round_id="round-2", model="fixture",
+                               source_manifest_sha256="a" * 64)
+    def run(index):
+        executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / str(index) / "evidence.jsonl"))
+        request = _request(tmp_path / str(index), executor)
+        request = replace(request, authored_ordinal=index + 1)
+        AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=factory)(request)
+        return next((request.branch_root / "sft-traces").glob("*.jsonl"))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paths = list(pool.map(run, range(2)))
+    assert paths[0].name != paths[1].name
+    for path in paths:
+        assert _example(_read_trace(path))[0]["messages"][-1]["content"] == "fixed source"
+    assert not hasattr(actor, "trace_event")
+
+    class BrokenBackend(SourceBackend):
+        def compile(self, request):
+            raise OSError("retained infrastructure failure")
+    executor = ProjectExecutor(BrokenBackend(), EvidenceLedger(tmp_path / "abort-evidence.jsonl"))
+    request = _request(tmp_path / "abort", executor)
+    with pytest.raises(OSError):
+        AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=factory)(request)
+    rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    assert _example(rows) is None
+    validation = next(row["payload"] for row in rows if row["kind"] == "validation")
+    assert validation["status"] == "infrastructure-failure"
+    digest = validation["evidence_sha256"]
+    assert (request.branch_root / "artifacts" / "objects" / digest[:2] / digest[2:]).is_file()
+
+
+def test_context_budget_abort_is_not_recorded_as_infrastructure(tmp_path):
+    from benchmarks.ascend.agent_context import ContextBudget, ContextBudgetError
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.sft_dataset import _read_trace
+
+    identity = MODEL_IDENTITIES[0]
+    provider = DirectCompletionProvider(
+        {"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
+        transport=lambda **_: pytest.fail("oversized request must not reach transport"),
+        context_budgets={identity.backend_model.value: ContextBudget(2000, 1024, 3000)},
+    )
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(identity),
+        trace_recorder_factory=recorder_factory(phase="phase1", round_id="context-limit",
+            model="fixture", source_manifest_sha256="a" * 64))
+    with pytest.raises(ContextBudgetError):
+        driver(request)
+    trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    validations = [row["payload"] for row in trace if row["kind"] == "validation"]
+    assert validations[-1]["status"] == "failed"
+    assert validations[-1]["details"]["abort_status"] == "context-budget-exhausted"
+    assert all(row["status"] != "infrastructure-failure" for row in validations)
+
+
+def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import (
+        DirectActorDriver, DirectCompletion, DirectCompletionProvider, ProviderRejectionError, direct_profile,
+    )
+    from benchmarks.a5kernels.sft_dataset import _read_trace
+    import base64
+    raw = b'{"prior":"memory"}'
+    digest = hashlib.sha256(raw).hexdigest()
+    calls = []
+    class Rejected(Exception):
+        status_code, code, request_id = 400, "invalid_prompt", "req_fixture"
+    def transport(**kwargs):
+        calls.append(kwargs["request"])
+        if len(calls) == 1:
+            return DirectCompletion(json.dumps({"read-artifact": {"sha256": digest}}), 1)
+        raise Rejected("credential must not appear")
+    provider = DirectCompletionProvider({"OPENAI_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret"},
+        transport=transport, sleeper=lambda _: None)
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(MODEL_IDENTITIES[0]),
+        trace_recorder_factory=recorder_factory(phase="phase1", round_id="provider-rejection",
+            model="fixture", source_manifest_sha256="a" * 64))
+    with pytest.raises(ProviderRejectionError):
+        driver(request)
+    assert len(calls) == 5 and calls[1:] == [calls[1]] * 4
+    view = json.loads(calls[1]["messages"][-1]["content"])["host"]
+    assert view["text"].encode() == raw and "base64" not in view
+    store = ContentAddressedArtifacts(request.branch_root / "artifacts")
+    raw_page = store.read_json(view["full_observation_sha256"])
+    assert base64.b64decode(raw_page["base64"]) == raw
+    assert store.read_bytes(digest) == raw
+    trace = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+    validations = [row["payload"] for row in trace if row["kind"] == "validation"]
+    assert validations[-1]["status"] == "failed"
+    assert validations[-1]["details"]["abort_status"] == "provider-rejected"
+    assert validations[-1]["details"]["request_id"] == "req_fixture"
+    assert "credential must not appear" not in json.dumps(trace)
+
+
+def test_infrastructure_retry_preserves_failed_trace_and_verified_retry(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+
+    class RetryBackend(SourceBackend):
+        fail_once = True
+
+        def compile(self, request):
+            if self.fail_once:
+                self.fail_once = False
+                raise OSError("transient compiler infrastructure failure")
+            return super().compile(request)
+
+    executor = ProjectExecutor(RetryBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    request = _request(tmp_path, executor)
+    actor = TracedScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
+                                '{"run":{}}', '{"submit":{}}'])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(), trace_recorder_factory=recorder_factory(
+        phase="phase1", round_id="retry-round", model="fixture", source_manifest_sha256="a" * 64,
+    ))
+    with pytest.raises(OSError, match="transient"):
+        driver(request)
+    failed_path = next((request.branch_root / "sft-traces").glob("*.jsonl"))
+    failed_bytes = failed_path.read_bytes()
+    driver(request)
+    paths = list((request.branch_root / "sft-traces").glob("*.jsonl"))
+    assert len(paths) == 2
+    assert failed_path.read_bytes() == failed_bytes
+    failed = _read_trace(failed_path)
+    successful = _read_trace(next(path for path in paths if path != failed_path))
+    assert failed[0]["payload"]["trace_id"] != successful[0]["payload"]["trace_id"]
+    assert _example(failed) is None
+    assert _example(successful)[0]["messages"][-1]["content"] == "fixed source"
+    assert [row["payload"]["status"] for row in failed if row["kind"] == "validation"] == ["infrastructure-failure"]
+
+
 def test_measurement_requires_verified_current_source_and_preserves_comparison_facts(tmp_path):
     from benchmarks.a5kernels.trial import parse_trial_action
     assert parse_trial_action('{"request-timing":{}}').kind == "request-timing"
@@ -246,8 +445,8 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert actor.observations[5]["artifacts"]["observed"]["payload"]["output"]
     assert actor.observations[6]["error"].startswith("submit requires")
     assert actor.observations[8]["classification"] == "host-verified"
-    encoded_memory = base64.b64encode(b'{"prior":"memory"}').decode("ascii")
-    assert encoded_memory in actor.instruction
+    assert '"prior":"memory"' in actor.instruction
+    assert 'read-artifact' in actor.instruction
     assert 'Production context (immutable' in actor.instruction
     assert actor.instruction.count('{"guide":"exact"}') == 1
     assert executor.prepare(_spec()).instruction in actor.instruction
@@ -273,6 +472,34 @@ def test_exhausted_mismatch_never_distills_or_returns_publishable_memory(tmp_pat
 
     assert actor.observations[1]["classification"] == "host-mismatch"
     assert actor.distill_calls == []
+
+
+@pytest.mark.parametrize("source, classification", [
+    ("still broken", "host-mismatch"), ("compile failure", "compile-failure"),
+    ("runtime failure", "runtime-failure"),
+])
+@pytest.mark.parametrize("traced", [False, True])
+def test_phase2_retains_semantic_failure_without_distilling(tmp_path, source, classification, traced):
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = (TracedScriptedActor if traced else ScriptedActor)((json.dumps({"write": {"slot": "kernel", "content": source}}),
+                           '{"run":{}}', '{"submit":{}}'))
+    factory = None
+    if traced:
+        from benchmarks.ascend.training_traces import recorder_factory
+        factory = recorder_factory(phase="phase2", round_id="semantic-failure", model="fixture",
+                                   source_manifest_sha256="a" * 64)
+    request = _request(tmp_path, executor)
+    result = AdaptiveActorProjectExecutor(executor, actor, object(),
+        trace_recorder_factory=factory, retain_semantic_failure=True)(request)
+    assert result.evidence.classification.value == classification
+    assert not result.evidence.verified
+    assert result.memory.no_new_knowledge
+    assert actor.distill_calls == []
+    if traced:
+        from benchmarks.a5kernels.sft_dataset import _read_trace, _example
+        rows = _read_trace(next((request.branch_root / "sft-traces").glob("*.jsonl")))
+        assert _example(rows) is None
+        assert any(row["kind"] == "validation" for row in rows)
 
 
 def test_adapter_fails_closed_when_request_materialization_differs(tmp_path):
