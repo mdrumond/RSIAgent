@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import run_a5_phase1
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, KnowledgeQuery, ProgressiveMemoryJournal
 from benchmarks.a5kernels.phase1_composition import A5_PROFILING_GUIDANCE, LiveProjectRequest
@@ -192,14 +193,18 @@ def test_dependency_builder_fails_closed_then_wires_read_only_kdb(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "model,profiling,guidance,expected_commands",
+    "model,profiling,guidance,proposal,expected_commands",
     [
-        (MODEL_IDENTITIES[0], ProfilingGuidance.WITHOUT_GUIDANCE, None, 3),
-        (MODEL_IDENTITIES[1], ProfilingGuidance.WITH_GUIDANCE, A5_PROFILING_GUIDANCE, 5),
+        (MODEL_IDENTITIES[0], ProfilingGuidance.WITHOUT_GUIDANCE, None,
+         DEFAULT_PROPOSALS[0], 3),
+        (MODEL_IDENTITIES[1], ProfilingGuidance.WITH_GUIDANCE,
+         A5_PROFILING_GUIDANCE,
+         next(item for item in DEFAULT_PROPOSALS
+              if item.evidence_preset.value == "correctness-timing"), 8),
     ],
 )
 def test_executor_binds_direct_model_and_profiling_treatment(
-    tmp_path, model, profiling, guidance, expected_commands,
+    tmp_path, model, profiling, guidance, proposal, expected_commands,
 ):
     gate_root = tmp_path / "gate"
     gate_root.mkdir()
@@ -221,7 +226,33 @@ def test_executor_binds_direct_model_and_profiling_treatment(
 
     def transport(**kwargs):
         provider_calls.append(kwargs)
-        return DirectCompletion(next(replies), 2)
+        try:
+            response = next(replies)
+        except StopIteration:
+            prompt = kwargs["request"]["messages"][-1]["content"]
+            context = json.loads(prompt.rsplit("\n", 1)[-1])
+            admitted = context["admitted_artifacts"]
+            performance = [digest for digest, role in admitted.items()
+                           if role == "performance-study"]
+            category = "performance" if performance else "correctness"
+            evidence = performance[0] if performance else next(
+                digest for digest, role in admitted.items()
+                if role == "host-verification")
+            response = json.dumps({"distillation": {
+                "no_new_knowledge": False,
+                "lessons": [{
+                    "category": category,
+                    "claim": "The retained study supports this bounded lesson.",
+                    "applicability": "The exact registered vector-add dimensions.",
+                    "preconditions": "Use the retained source and host contract.",
+                    "limitations": "This does not generalize to other shapes.",
+                    "evidence_artifact_sha256": [evidence],
+                    "failure_signature": None,
+                    "repair": None,
+                    "confidence": "high",
+                }],
+            }})
+        return DirectCompletion(response, 2)
 
     profile_backend = TrialProfileBackend()
     executor = ProductionProjectExecutor(
@@ -230,7 +261,6 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         DirectCompletionProvider(ENVIRONMENT, transport=transport),
         device=0,
     )
-    proposal = DEFAULT_PROPOSALS[0]
     memory_path = tmp_path / "memory"
     memory_path.mkdir()
     request = LiveProjectRequest(
@@ -253,11 +283,54 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     )
 
     assert memory.host_facts[0].category == "host-verification"
+    assert memory.no_new_knowledge is False
+    expected_category = (
+        "performance" if proposal.evidence_preset.value == "correctness-timing"
+        else "correctness"
+    )
+    assert memory.lessons[0].category == expected_category
+    assert memory.lessons[0].evidence_artifact_sha256[0] in (
+        memory.admitted_artifact_sha256
+    )
+    assert memory.artifact_store.startswith("provider-attempts/attempt-")
+    traces = list((memory_path / "sft-traces").glob("*.jsonl"))
+    assert len(traces) == 1
+    trace_rows = [json.loads(line) for line in traces[0].read_text().splitlines()]
+    trace_messages = [row["payload"] for row in trace_rows if row["kind"] == "message"]
+    assert trace_messages[-2]["role"] == "user"
+    assert "verified candidate" in trace_messages[-2]["content"]
+    assert trace_messages[-1] == {"role": "assistant", "content": SOURCE}
+    assert any(row["kind"] == "tool" for row in trace_rows)
+    assert trace_rows[-2]["kind"] == "validation"
+    assert trace_rows[-2]["payload"]["status"] == "passed"
+    assert trace_rows[-2]["payload"]["evidence_sha256"] == memory.host_facts[0].evidence_sha256
+    assert (memory_path / memory.artifact_store / "objects").is_dir()
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     instruction = provider_calls[0]["request"]["messages"][1]["content"]
     assert ("Profiling guidance:" in instruction) == (guidance is not None)
     assert "previous-project-action" not in memory.actions
+    distillation_messages = provider_calls[-1]["request"]["messages"]
+    prior_messages = provider_calls[-2]["request"]["messages"]
+    assert distillation_messages[:len(prior_messages)] == prior_messages
+    assert distillation_messages[len(prior_messages)]["content"] == '{"submit":{}}'
+    assert json.loads(
+        distillation_messages[len(prior_messages) + 1]["content"]
+    )["host"]["event"] == "submitted"
+    if expected_category == "performance":
+        study = next(
+            digest for digest in memory.admitted_artifact_sha256
+            if digest in distillation_messages[-1]["content"]
+            and memory.lessons[0].evidence_artifact_sha256 == (digest,)
+        )
+        retained = ContentAddressedArtifacts(
+            next(memory_path.glob("provider-attempts/attempt-*/artifacts"))
+        )
+        study_payload = retained.read_json(study)
+        assert study_payload["timing"]
+        context = json.loads(distillation_messages[-1]["content"].rsplit("\n", 1)[-1])
+        assert context["artifact_payloads"][study]["payload"] == study_payload
+        assert context["host_summaries"][0]["category"] == "host-verification"
 
 
 def test_project_instruction_uses_registered_runtime_dimensions():

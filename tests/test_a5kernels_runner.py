@@ -31,7 +31,9 @@ from benchmarks.a5kernels.protocol import (
 )
 
 
-def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
+def _write_fake_catlass(
+    root: Path, *, compatible: bool, weekly_layout: bool = False
+) -> str:
     package = root / "catlass"
     package.mkdir()
     (package / "__init__.py").write_text("")
@@ -40,20 +42,45 @@ def _write_fake_catlass(root: Path, *, compatible: bool) -> str:
         if compatible
         else "from_dlpack = object()\n"
     )
-    native_setup = """\
+    native_path = (
+        "python/tla_dsl/catlass/_tla_type_bridge_native.test.so"
+        if weekly_layout
+        else "python/tla_dsl/csrc/mlir/build/python/catlass/"
+        "_tla_type_bridge_native.test.so"
+    )
+    native_setup = f"""\
 import sys
 import types
 from pathlib import Path
 native = types.ModuleType("catlass._tla_type_bridge_native")
-native.__file__ = str(Path(__file__).resolve().parents[1] / "python/tla_dsl/csrc/mlir/build/python/catlass/_tla_type_bridge_native.test.so")
+native.__file__ = str(Path(__file__).resolve().parents[1] / "{native_path}")
 sys.modules[native.__name__] = native
 runtime = types.ModuleType("catlass.tla.runtime")
 runtime.__file__ = str(Path(__file__).with_name("tla_runtime.py"))
 sys.modules[runtime.__name__] = runtime
 """
+    if weekly_layout:
+        native_setup += """\
+mlir = types.ModuleType("catlass._mlir")
+mlir.__file__ = str(Path(__file__).resolve().parents[1] / "python/tla_dsl/catlass/_mlir/__init__.py")
+sys.modules[mlir.__name__] = mlir
+ir = types.ModuleType("catlass._mlir.ir")
+ir.__file__ = str(Path(__file__).resolve().parents[1] / "python/tla_dsl/catlass/_mlir/ir.py")
+sys.modules[ir.__name__] = ir
+"""
     (package / "tla.py").write_text(native_setup + exports)
     (package / "tla_runtime.py").write_text("# tracked runtime fixture\n")
-    (root / ".gitignore").write_text("python/tla_dsl/csrc/mlir/build/\ndeps/\n")
+    ignore = "python/tla_dsl/csrc/mlir/build/\ndeps/\n"
+    if weekly_layout:
+        generated = root / "python/tla_dsl/catlass/_mlir"
+        generated.mkdir(parents=True)
+        (generated / "__init__.py").write_text("# generated package\n")
+        (generated / "ir.py").write_text("# generated bindings\n")
+        ignore += (
+            "python/tla_dsl/catlass/_mlir/\n"
+            "python/tla_dsl/catlass/_tla_type_bridge_native*.so\n"
+        )
+    (root / ".gitignore").write_text(ignore)
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "add", "."], check=True)
     subprocess.run(
@@ -89,11 +116,29 @@ sys.modules[runtime.__name__] = runtime
         capture_output=True,
         check=True,
     ).stdout.strip()
-    _write_native_manifest(root, revision)
+    generated_paths = None
+    if weekly_layout:
+        generated_paths = [
+            "python/tla_dsl/catlass/_mlir/__init__.py",
+            "python/tla_dsl/catlass/_mlir/ir.py",
+        ]
+    bridge = _write_native_manifest(root, revision, generated_paths=generated_paths)
+    if weekly_layout:
+        packaged_bridge = (
+            root / "python/tla_dsl/catlass/_tla_type_bridge_native.test.so"
+        )
+        packaged_bridge.parent.mkdir(parents=True, exist_ok=True)
+        packaged_bridge.write_bytes(bridge.read_bytes())
     return revision
 
 
-def _write_native_manifest(root: Path, revision: str, *, digest: str | None = None):
+def _write_native_manifest(
+    root: Path,
+    revision: str,
+    *,
+    digest: str | None = None,
+    generated_paths: list[str] | None = None,
+) -> Path:
     bridge = (
         root
         / "python/tla_dsl/csrc/mlir/build/python/catlass/_tla_type_bridge_native.test.so"
@@ -102,7 +147,9 @@ def _write_native_manifest(root: Path, revision: str, *, digest: str | None = No
     bridge.write_bytes(b"native bridge fixture")
     actual_digest = hashlib.sha256(bridge.read_bytes()).hexdigest()
     manifest = {
-        "schema": "catlass-native-build-v1",
+        "schema": (
+            "catlass-native-build-v2" if generated_paths else "catlass-native-build-v1"
+        ),
         "catlass_revision": revision,
         "ascendnpu_ir_gitlink": "1" * 40,
         "ascendnpu_ir_install_commit": "1" * 40,
@@ -115,6 +162,14 @@ def _write_native_manifest(root: Path, revision: str, *, digest: str | None = No
             }
         ],
     }
+    if generated_paths:
+        manifest["generated_importables"] = [
+            {
+                "path": relative,
+                "sha256": hashlib.sha256((root / relative).read_bytes()).hexdigest(),
+            }
+            for relative in generated_paths
+        ]
     manifest_path = root / "python/tla_dsl/csrc/mlir/build/.codex-native-provenance.json"
     manifest_path.write_text(json.dumps(manifest))
     dep_root = root / "deps"
@@ -122,15 +177,28 @@ def _write_native_manifest(root: Path, revision: str, *, digest: str | None = No
     (dep_root / ".cpl-build-provenance").write_text(
         f"CAT_DEP_ASCENDNPU_IR_COMMIT={'1' * 40}\nASCEND_CANN_VERSION=test-cann\n"
     )
+    return bridge
 
 
-def _fake_runtime_env(root: Path):
-    return {
+def _fake_runtime_env(root: Path, *, packaged: bool = False):
+    environment = {
         **os.environ,
         "PYTHONPATH": str(root),
         "CATLASS_SRC": str(root),
         "CATLASS_DSL_ASCENDNPU_IR_INSTALL_DIR": str(root / "deps"),
     }
+    if packaged:
+        (root / "deps/.cpl-build-provenance").unlink()
+        source = root.parent / f"{root.name}-packaged-dependency"
+        source.mkdir()
+        (source / ".npuir-pipeline").write_text(
+            f"SCHEMA_VERSION=2\nSOURCE_SHA={'1' * 40}\n"
+        )
+        environment.update({
+            "CATLASS_DSL_ASCENDNPU_IR_ROOT": str(source),
+            "ASCEND_CANN_VERSION": "test-cann",
+        })
+    return environment
 
 
 def _driver_argv(root: Path, revision: str):
@@ -636,6 +704,91 @@ def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_pat
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"{OUTPUT_MARKER}[4.0,2.0]\n"
+
+
+def test_staged_host_driver_accepts_packaged_dependency_provenance(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "kernel.py").write_text(
+        "def run(a, b):\n    return [left + right for left, right in zip(a, b)]\n"
+    )
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(tmp_path, compatible=True)
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision), cwd=tmp_path, text=True,
+        capture_output=True, check=False,
+        env=_fake_runtime_env(tmp_path, packaged=True),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{OUTPUT_MARKER}[3.0]\n"
+
+
+def test_staged_host_driver_accepts_manifested_weekly_generated_imports(tmp_path):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "kernel.py").write_text(
+        "def run(a, b):\n    return [left + right for left, right in zip(a, b)]\n"
+    )
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(
+        tmp_path, compatible=True, weekly_layout=True
+    )
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision), cwd=tmp_path, text=True,
+        capture_output=True, check=False, env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{OUTPUT_MARKER}[3.0]\n"
+
+
+@pytest.mark.parametrize("stale_artifact", ["generated", "packaged-bridge"])
+def test_host_driver_rejects_stale_weekly_artifacts_before_kernel_import(
+    tmp_path, stale_artifact
+):
+    fixture = fixture_for(Language.CATLASS_DSL)
+    driver = next(item for item in fixture.files if item.relative_path == "host_driver.py")
+    (tmp_path / driver.relative_path).write_text(driver.content)
+    (tmp_path / "kernel.py").write_text(
+        "from pathlib import Path\nPath('kernel-imported').touch()\n"
+        "def run(a, b):\n    return [3.0]\n"
+    )
+    (tmp_path / "input.json").write_text(
+        json.dumps({"input_a": [1], "input_b": [2]})
+    )
+    revision = _write_fake_catlass(
+        tmp_path, compatible=True, weekly_layout=True
+    )
+    if stale_artifact == "generated":
+        target = tmp_path / "python/tla_dsl/catlass/_mlir/ir.py"
+    else:
+        target = (
+            tmp_path / "python/tla_dsl/catlass/_tla_type_bridge_native.test.so"
+        )
+    target.write_bytes(target.read_bytes() + b"stale")
+
+    result = subprocess.run(
+        _driver_argv(tmp_path, revision), cwd=tmp_path, text=True,
+        capture_output=True, check=False, env=_fake_runtime_env(tmp_path),
+    )
+
+    assert result.returncode != 0
+    expected_error = (
+        "generated import provenance mismatch"
+        if stale_artifact == "generated"
+        else "untracked or ignored importable Catlass artifact"
+    )
+    assert expected_error in result.stderr
+    assert not (tmp_path / "kernel-imported").exists()
 
 
 def test_host_driver_rejects_external_pycache_prefix_before_catlass_import(tmp_path):
@@ -1260,7 +1413,7 @@ def test_catlass_executor_probes_exact_device_through_checked_profile():
             "--device", "3",
             "--timeout", "600", "--",
             "env", "BZ_A5_PROFILE_PHYSICAL_DEVICE=3",
-            "python", "-c", calls[0][-1],
+            "PYTHONDONTWRITEBYTECODE=1", "python", "-B", "-c", calls[0][-1],
         )
     ]
     assert "torch.npu.set_device(0)" in calls[0][-1]

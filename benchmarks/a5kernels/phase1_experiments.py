@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 import re
 from typing import Mapping
+from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
 
 
 PLAN_SCHEMA = "a5-catlass-phase1-experiment-plan-v2"
@@ -135,8 +136,10 @@ class ProgrammingGuideIdentity:
             self.cpl_skills_revision
         ) is None:
             raise ValueError("cpl_skills_revision must be a full lowercase Git revision")
-        if self.catlass_revision != PINNED_CATLASS_REVISION:
-            raise ValueError("Catlass revision does not match the Phase 1 pin")
+        if not isinstance(self.catlass_revision, str) or _GIT_REVISION.fullmatch(
+            self.catlass_revision
+        ) is None:
+            raise ValueError("catlass_revision must be a full lowercase Git revision")
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -192,6 +195,7 @@ class A5Phase1Cell:
     guide: ProgrammingGuideIdentity
     target: A5Target = A5Target.A5
     language: A5Language = A5Language.CATLASS_DSL
+    profiling_guide: ProfilingGuidanceIdentity | None = None
 
     def __post_init__(self) -> None:
         typed = (
@@ -206,11 +210,16 @@ class A5Phase1Cell:
             raise ValueError("cell dimensions must use registered A5 types")
         if self.model != _MODEL_BY_BACKEND.get(self.model.backend_model):
             raise ValueError("cell model must use a registered A5 profile")
+        if self.profiling_guide is not None and (
+            self.profiling is not ProfilingGuidance.NEW
+            or not isinstance(self.profiling_guide, ProfilingGuidanceIdentity)
+        ):
+            raise ValueError("explicit profiling guide belongs only to the new treatment")
         if self.cell_id != _cell_id(self.identity_values()):
             raise ValueError("cell_id does not match its A5 Phase 1 dimensions")
 
     def identity_values(self) -> dict[str, object]:
-        return {
+        values = {
             "target": self.target.value,
             "language": self.language.value,
             "model": self.model.as_dict(),
@@ -218,9 +227,14 @@ class A5Phase1Cell:
             "profiling": self.profiling.value,
             "guide": self.guide.as_dict(),
         }
+        if self.profiling_guide is not None:
+            values["profiling_guide"] = self.profiling_guide.as_dict()
+        return values
 
     @property
     def status(self) -> TreatmentStatus:
+        if self.profiling is ProfilingGuidance.NEW and self.profiling_guide is not None:
+            return TreatmentStatus.READY
         return _PROFILING_STATUS[self.profiling]
 
     @property
@@ -255,6 +269,7 @@ class A5Phase1Plan:
     schema: str = PLAN_SCHEMA
     target: A5Target = A5Target.A5
     language: A5Language = A5Language.CATLASS_DSL
+    profiling_guide: ProfilingGuidanceIdentity | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -269,18 +284,21 @@ class A5Phase1Plan:
             raise ValueError("A5 Phase 1 requires twelve unique cells")
         if any(cell.guide != self.guide for cell in self.cells):
             raise ValueError("every Phase 1 cell must bind the admitted guide identity")
-        expected = build_cells(self.guide)
+        expected = build_cells(self.guide, profiling_guide=self.profiling_guide)
         if self.cells != expected:
             raise ValueError("plan must contain the complete ordered treatment registry")
 
     def as_dict(self) -> dict[str, object]:
-        return {
+        values = {
             "schema": self.schema,
             "target": self.target.value,
             "language": self.language.value,
             "guide": self.guide.as_dict(),
             "cells": [cell.as_dict() for cell in self.cells],
         }
+        if self.profiling_guide is not None:
+            values["profiling_guide"] = self.profiling_guide.as_dict()
+        return values
 
     def to_json(self) -> str:
         return _canonical_json(self.as_dict()) + "\n"
@@ -294,7 +312,7 @@ class A5Phase1Plan:
         return tuple(cell for cell in self.cells if not cell.runnable)
 
 
-def build_cells(guide: ProgrammingGuideIdentity) -> tuple[A5Phase1Cell, ...]:
+def build_cells(guide: ProgrammingGuideIdentity, *, profiling_guide: ProfilingGuidanceIdentity | None = None) -> tuple[A5Phase1Cell, ...]:
     if not isinstance(guide, ProgrammingGuideIdentity):
         raise ValueError("guide must be an admitted ProgrammingGuideIdentity")
     cells = []
@@ -309,9 +327,13 @@ def build_cells(guide: ProgrammingGuideIdentity) -> tuple[A5Phase1Cell, ...]:
                     "profiling": profiling.value,
                     "guide": guide.as_dict(),
                 }
+                admitted = profiling_guide if profiling is ProfilingGuidance.NEW else None
+                if admitted is not None:
+                    dimensions["profiling_guide"] = admitted.as_dict()
                 cells.append(
                     A5Phase1Cell(
-                        _cell_id(dimensions), model, knowledge, profiling, guide
+                        _cell_id(dimensions), model, knowledge, profiling, guide,
+                        profiling_guide=admitted,
                     )
                 )
     return tuple(cells)
@@ -322,13 +344,17 @@ def build_a5_phase1_plan(
     *,
     cpl_skills_revision: str,
     catlass_revision: str = PINNED_CATLASS_REVISION,
+    profiling_guide: ProfilingGuidanceIdentity | None = None,
 ) -> A5Phase1Plan:
     guide = admit_programming_guide(
         guide_path,
         cpl_skills_revision=cpl_skills_revision,
         catlass_revision=catlass_revision,
     )
-    return A5Phase1Plan(build_cells(guide), guide)
+    return A5Phase1Plan(
+        build_cells(guide, profiling_guide=profiling_guide), guide,
+        profiling_guide=profiling_guide,
+    )
 
 
 __all__ = [

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from copy import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field as dataclass_field, replace
+import difflib
 import hashlib
 import json
 import math
@@ -12,6 +13,7 @@ import re
 from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.evidence import EvidenceKind, EvidenceLedger
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, KnowledgeQuery
 from benchmarks.a5kernels.matrix import (
     CapabilityUnavailableError,
@@ -26,7 +28,7 @@ from benchmarks.a5kernels.model_profile import A5ModelProfile, load_a5_model_pro
 from benchmarks.a5kernels.protocol import ExecutionPlan, VerifiedResult
 
 
-_EMPTY_ACTIONS = {"compile", "run", "request-profile", "submit"}
+_EMPTY_ACTIONS = {"compile", "run", "request-profile", "request-timing", "request-debug", "submit"}
 _SOURCE_PATHS = {
     "catlass-dsl": "kernel.py",
     "ascend-c": "kernel.cpp",
@@ -48,6 +50,7 @@ class ActionOutcome:
     observation: str
     terminal: bool = False
     status: str = "done"
+    admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
     budget_exempt: bool = False
 
 
@@ -64,6 +67,10 @@ def parse_trial_action(text: str) -> TrialAction | None:
     if kind in _EMPTY_ACTIONS:
         return TrialAction(kind, {}) if payload == {} else None
     if not isinstance(payload, dict):
+        return None
+    if kind == "request-sanitizer" and set(payload) == {"tool"}:
+        if payload["tool"] in ("memcheck", "racecheck", "initcheck", "synccheck"):
+            return TrialAction(kind, payload)
         return None
     if kind == "propose" and set(payload) == {"text"}:
         return TrialAction(kind, payload) if isinstance(payload["text"], str) else None
@@ -148,6 +155,10 @@ class ActorOutcome:
     # misleading zero in experiment results.
     tokens: int | None = None
     wall_time_s: float = 0.0
+    terminal_response: str | None = None
+    distillation: object | None = None
+    admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
+    continuation: object | None = None
 
 
 class ActorDriver(Protocol):
@@ -215,13 +226,17 @@ class CoreAttemptDriver:
 _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON object:
 {"propose":{"text":"..."}}, {"write":{"slot":"kernel","content":"..."}},
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
-{"request-profile":{}}, or {"submit":{}}.
+{"request-profile":{}}, {"request-timing":{}}, {"request-debug":{}},
+{"request-sanitizer":{"tool":"memcheck"}}, or {"submit":{}}.
+Diagnostic actions are bound by adaptive projects; sanitizer tool can also be racecheck,
+initcheck, or synccheck. Diagnostic observations never establish correctness or timing.
 You cannot choose paths or commands and cannot report a score or authoritative result.
 Compile checks source with the host compiler only; it never launches the kernel or
 establishes runtime or numerical correctness."""
 
 _ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
-compile, run, query-knowledge, request-profile, or submit. Use the object shape shown
+compile, run, query-knowledge, request-profile, request-timing, request-debug,
+request-sanitizer, or submit. Use the object shape shown
 in the system instructions and no surrounding prose."""
 
 
@@ -292,7 +307,8 @@ class TrialActionExecutor:
                  knowledge: KnowledgeAgent, profiling: ProfileEvaluation,
                  profiling_guidance: bool,
                  max_actions: int = 40, max_source_bytes: int = 128_000,
-                 unmetered_compile_probes: int | None = None):
+                 unmetered_compile_probes: int | None = None,
+                 artifacts: ContentAddressedArtifacts | None = None):
         if type(max_actions) is not int or max_actions < 1:
             raise ValueError("max_actions must be a positive integer")
         if (
@@ -311,6 +327,7 @@ class TrialActionExecutor:
         self.profiling_guidance = profiling_guidance
         self.max_actions, self.max_source_bytes = max_actions, max_source_bytes
         self.unmetered_compile_probes = unmetered_compile_probes
+        self.artifacts = artifacts
         # The same source can recur across cells and determinism repeats. BZ
         # sessions use attempt IDs, so local workspace isolation must reach them.
         self._attempt_namespace = hashlib.sha256(
@@ -321,6 +338,7 @@ class TrialActionExecutor:
         self.latest_run: CandidateRun | None = None
         self.final_run: CandidateRun | None = None
         self.final_profile: Mapping[str, object] | None = None
+        self.admitted_artifacts: dict[str, str] = {}
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
@@ -337,7 +355,7 @@ class TrialActionExecutor:
             self.compile_probes > self.unmetered_compile_probes
             if compile_exempt else self.actions > self.max_actions
         )
-        self.ledger.append(EvidenceKind.ACTION, {
+        action_evidence = {
             "ordinal": self.total_actions,
             "action": action.kind,
             "payload_sha256": hashlib.sha256(
@@ -349,8 +367,9 @@ class TrialActionExecutor:
                 "compile_probe_limit": self.unmetered_compile_probes,
                 "ordinary_budget_exempt": compile_exempt,
             },
-        })
+        }
         if exhausted:
+            self.ledger.append(EvidenceKind.ACTION, action_evidence)
             budget = "compile probe" if compile_exempt else "action"
             return ActionOutcome(
                 json.dumps({"error": f"{budget} budget exhausted"}),
@@ -359,15 +378,30 @@ class TrialActionExecutor:
                 budget_exempt=compile_exempt,
             )
         handler = getattr(self, "_" + action.kind.replace("-", "_"))
+        action_value = {"kind": action.kind, "payload": action.payload}
+        action_ref = self.artifacts.put_json(action_value) if self.artifacts else None
+        if action_ref is not None:
+            action_evidence["payload_artifact_sha256"] = action_ref
+        self.ledger.append(EvidenceKind.ACTION, action_evidence)
+        if action_ref is not None:
+            self._artifact("action-payload", action_ref, ordinal=self.total_actions)
+            self.admitted_artifacts[action_ref] = "action"
         outcome = handler(action.payload)
-        if compile_exempt:
-            return ActionOutcome(
-                outcome.observation,
-                outcome.terminal,
-                outcome.status,
-                budget_exempt=True,
-            )
-        return outcome
+        if self.artifacts is not None:
+            observation_ref = self.artifacts.put_bytes(outcome.observation.encode("utf-8"))
+            self._artifact("host-observation", observation_ref, ordinal=self.total_actions)
+            evidence_kind = action.kind
+            try:
+                host = json.loads(outcome.observation).get("host", {})
+            except (AttributeError, json.JSONDecodeError):
+                host = {}
+            if action.kind in {"run", "submit"} and host.get("passed") is True:
+                evidence_kind = "host-verification"
+            elif action.kind == "request-profile":
+                evidence_kind = "profiling"
+            self.admitted_artifacts[observation_ref] = evidence_kind
+        return replace(outcome, budget_exempt=compile_exempt,
+                       admitted_artifacts=dict(self.admitted_artifacts))
 
     def _propose(self, payload) -> ActionOutcome:
         return self._observation("proposal-recorded", chars=len(payload["text"]))
@@ -377,7 +411,20 @@ class TrialActionExecutor:
         if not content or len(content.encode()) > self.max_source_bytes:
             return self._observation("write-rejected", reason="source size")
         path = self.workspace / _SOURCE_PATHS[self.language]
+        previous = path.read_text(encoding="utf-8") if path.exists() else ""
         path.write_text(content, encoding="utf-8")
+        if self.artifacts is not None:
+            source_ref = self.artifacts.put_bytes(content.encode("utf-8"))
+            difference = "".join(difflib.unified_diff(
+                previous.splitlines(keepends=True), content.splitlines(keepends=True),
+                fromfile="previous/kernel", tofile="candidate/kernel",
+            ))
+            diff_ref = self.artifacts.put_bytes(difference.encode("utf-8"))
+            self._artifact("candidate-source", source_ref, ordinal=self.total_actions)
+            self._artifact("candidate-diff", diff_ref, ordinal=self.total_actions,
+                           source_sha256=source_ref)
+            self.admitted_artifacts[source_ref] = "source"
+            self.admitted_artifacts[diff_ref] = "diff"
         self.latest_run = None
         return self._observation("written", slot="kernel", sha256=hashlib.sha256(
             content.encode()).hexdigest())
@@ -426,6 +473,21 @@ class TrialActionExecutor:
             for result in results
         ]}}
         return ActionOutcome(json.dumps(response, sort_keys=True, separators=(",", ":")))
+
+    def _request_debug(self, _payload) -> ActionOutcome:
+        return self._observation(
+            "diagnostic", available=False,
+            reason="debugger and sanitizer execution is supported by adaptive Phase 1 only",
+        )
+
+    def _request_sanitizer(self, payload) -> ActionOutcome:
+        return self._request_debug(payload)
+
+    def _request_timing(self, _payload) -> ActionOutcome:
+        return self._observation(
+            "timing", available=False,
+            reason="timing-sweep measurements are supported by adaptive Phase 1 only",
+        )
 
     def _request_profile(self, _payload) -> ActionOutcome:
         if not self.profiling_guidance:
@@ -478,6 +540,11 @@ class TrialActionExecutor:
         if candidate.candidate_source_sha256 != hashlib.sha256(current_source).hexdigest():
             raise ValueError("candidate source does not match current workspace kernel")
 
+    def _artifact(self, role: str, digest: str, **fields: object) -> None:
+        self.ledger.append(EvidenceKind.ARTIFACT, {
+            "role": role, "sha256": digest, **fields,
+        })
+
     @staticmethod
     def _observation(event: str, terminal: bool = False, **fields) -> ActionOutcome:
         return ActionOutcome(json.dumps({"host": {"event": event, **fields}},
@@ -494,10 +561,36 @@ class TrialResult:
     memory: Path
     context: Path
     evidence_sha256: str
+    artifacts: Path | None = None
 
     @property
     def verified(self) -> VerifiedResult:
         return self.run.verified
+
+
+def _retain_final_artifacts(
+    *, workspace: Path, language: str, executor: TrialActionExecutor,
+    artifacts: ContentAddressedArtifacts, ledger: EvidenceLedger,
+    outcome: ActorOutcome,
+) -> None:
+    """Bind final host-verified state into the trial's content-addressed store."""
+
+    final_source = (workspace / _SOURCE_PATHS[language]).read_bytes()
+    source_ref = artifacts.put_bytes(final_source)
+    if source_ref != executor.final_run.candidate_source_sha256:
+        raise RuntimeError("retained final source does not match verified candidate")
+    ledger.append(EvidenceKind.ARTIFACT, {
+        "role": "final-source", "sha256": source_ref,
+    })
+    profile_ref = artifacts.put_json(executor.final_profile)
+    ledger.append(EvidenceKind.ARTIFACT, {
+        "role": "final-profile", "sha256": profile_ref,
+    })
+    if outcome.terminal_response is not None:
+        response_ref = artifacts.put_bytes(outcome.terminal_response.encode("utf-8"))
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "post-terminal-response", "sha256": response_ref,
+        })
 
 
 class TrialOrchestrator:
@@ -531,9 +624,19 @@ class TrialOrchestrator:
         for path in (workspace, memory, context):
             path.mkdir()
         ledger = EvidenceLedger(trial_root / "evidence.jsonl")
+        artifacts = ContentAddressedArtifacts(trial_root / "artifacts")
+        instruction_ref = artifacts.put_bytes(instruction.encode("utf-8"))
+        system_ref = artifacts.put_bytes(_SYSTEM_PROMPT.encode("utf-8"))
         ledger.append(EvidenceKind.REQUEST, {
             "cell": asdict(cell), "workload": workload.value,
             "model_profile_sha256": profile.fingerprint,
+            "instruction_artifact_sha256": instruction_ref,
+        })
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "actor-instruction", "sha256": instruction_ref,
+        })
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "actor-system-prompt", "sha256": system_ref,
         })
         knowledge = self.knowledge_factory(memory, cell)
         try:
@@ -544,15 +647,22 @@ class TrialOrchestrator:
                 workspace=workspace, language=cell.language.value, workload=workload,
                 backend=self.backend, ledger=ledger, knowledge=knowledge,
                 profiling=profiling,
-                profiling_guidance=cell.profiling is ProfilingMode.WITH_GUIDANCE)
+                profiling_guidance=cell.profiling is ProfilingMode.WITH_GUIDANCE,
+                artifacts=artifacts)
             outcome = self.actor(
                 instruction,
                 profile=profile, workspace=workspace, context=context,
                 turn_parser=parse_trial_action, action_executor=executor)
             if executor.final_run is None or executor.final_profile is None:
                 raise RuntimeError("Actor ended without a host-verified submit action")
+            _retain_final_artifacts(
+                workspace=workspace, language=cell.language.value,
+                executor=executor, artifacts=artifacts, ledger=ledger,
+                outcome=outcome,
+            )
             return TrialResult(outcome, executor.final_run, executor.final_profile,
-                               workspace, memory, context, ledger.head_sha256)
+                               workspace, memory, context, ledger.head_sha256,
+                               artifacts.root)
         finally:
             knowledge.close()
 
@@ -592,7 +702,27 @@ class TrialOrchestrator:
             "ordinary_action_limit": 40,
             "unmetered_compile_probes": unmetered_compile_probes,
         }
-        ledger.append(EvidenceKind.REQUEST, request)
+        actor_instruction = instruction
+        if unmetered_compile_probes is not None:
+            actor_instruction += (
+                "\n\nCompile-probe allowance: compile actions do not consume your "
+                "ordinary action budget in this trial. You have exactly "
+                f"{unmetered_compile_probes} compile probe(s); failed or rejected "
+                "compiles consume a probe. Compilation does not launch the kernel "
+                "or establish correctness. Use run and submit for host verification."
+            )
+        artifacts = ContentAddressedArtifacts(trial_root / "artifacts")
+        instruction_ref = artifacts.put_bytes(actor_instruction.encode("utf-8"))
+        system_ref = artifacts.put_bytes(_SYSTEM_PROMPT.encode("utf-8"))
+        ledger.append(EvidenceKind.REQUEST, {
+            **request, "instruction_artifact_sha256": instruction_ref,
+        })
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "actor-instruction", "sha256": instruction_ref,
+        })
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "actor-system-prompt", "sha256": system_ref,
+        })
         executor = TrialActionExecutor(
             workspace=workspace,
             language=language,
@@ -603,16 +733,8 @@ class TrialOrchestrator:
             profiling=profiling,
             profiling_guidance=profiling_guidance,
             unmetered_compile_probes=unmetered_compile_probes,
+            artifacts=artifacts,
         )
-        actor_instruction = instruction
-        if unmetered_compile_probes is not None:
-            actor_instruction += (
-                "\n\nCompile-probe allowance: compile actions do not consume your "
-                "ordinary action budget in this trial. You have exactly "
-                f"{unmetered_compile_probes} compile probe(s); failed or rejected "
-                "compiles consume a probe. Compilation does not launch the kernel "
-                "or establish correctness. Use run and submit for host verification."
-            )
         outcome = actor(
             actor_instruction,
             profile=profile,
@@ -623,6 +745,21 @@ class TrialOrchestrator:
         )
         if executor.final_run is None or executor.final_profile is None:
             raise RuntimeError("Actor ended without a host-verified submit action")
+        final_source = (workspace / _SOURCE_PATHS[language]).read_bytes()
+        source_ref = artifacts.put_bytes(final_source)
+        if source_ref != executor.final_run.candidate_source_sha256:
+            raise RuntimeError("retained final source does not match verified candidate")
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "final-source", "sha256": source_ref,
+        })
+        profile_ref = artifacts.put_json(executor.final_profile)
+        ledger.append(EvidenceKind.ARTIFACT, {
+            "role": "final-profile", "sha256": profile_ref,
+        })
+        admitted = dict(outcome.admitted_artifacts)
+        admitted[source_ref] = "source"
+        admitted[profile_ref] = "profiling"
+        outcome = replace(outcome, admitted_artifacts=admitted)
         return TrialResult(
             outcome,
             executor.final_run,
@@ -631,4 +768,5 @@ class TrialOrchestrator:
             memory,
             context,
             ledger.head_sha256,
+            artifacts.root,
         )

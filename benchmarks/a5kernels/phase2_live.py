@@ -20,13 +20,20 @@ from benchmarks.a5kernels.phase2_attention import (
 from benchmarks.a5kernels.phase2_memory import A5Phase1Snapshot, A5Phase2Cell
 
 
-PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v2"
+PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v3"
 ATTEMPT_SCHEMA = "a5-catlass-phase2-attempt-v1"
 MEMORY_SCHEMA = "a5-catlass-phase2-memory-v1"
 TERMINAL_SCHEMA = "a5-catlass-phase2-terminal-v1"
 MAX_ATTEMPTS = 3
 _MAX_FAILURE_DETAIL = 160
 _MAX_HOST_DIAGNOSTIC = 512
+MAX_REPAIR_SOURCE_BYTES = 256 * 1024
+REPAIR_INSTRUCTION = (
+    "Diagnose the supplied host evidence and repair the preceding candidate. "
+    "Preserve working structure and make focused changes instead of replacing "
+    "the implementation blindly. Submit the complete revised source; only the "
+    "host verifier can establish correctness."
+)
 
 
 @dataclass(frozen=True)
@@ -40,10 +47,12 @@ class Phase2AttemptRequest:
     attempt_id: str
     phase1_memory: tuple[Mapping[str, object], ...]
     phase2_memory: tuple[Mapping[str, object], ...]
+    repair_context: Mapping[str, object] | None = None
 
 
 SourceProvider = Callable[[Phase2AttemptRequest], str]
 TargetVerifier = Callable[[str, str, str, Path], AttentionTargetEvidence]
+TraceSink = Callable[[Phase2AttemptRequest, str, AttentionTargetEvidence], None]
 
 
 @dataclass(frozen=True)
@@ -53,12 +62,15 @@ class Phase2Dependencies:
     cell: A5Phase2Cell
     source: SourceProvider
     verify: TargetVerifier
+    trace: TraceSink | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.cell, A5Phase2Cell):
             raise TypeError("Phase 2 dependencies require an A5Phase2Cell")
         if not callable(self.source) or not callable(self.verify):
             raise TypeError("Phase 2 source and verifier must be callable")
+        if self.trace is not None and not callable(self.trace):
+            raise TypeError("Phase 2 trace sink must be callable")
 
 
 def _publish_exact(path: Path, value: bytes) -> None:
@@ -163,6 +175,13 @@ class Phase2LiveRunner:
             "identity": identity,
             "execution_profile": "bz-a5",
             "maximum_semantic_attempts": MAX_ATTEMPTS,
+            "semantic_retry": {
+                "preceding_attempt_only": True,
+                "candidate_source_max_bytes": MAX_REPAIR_SOURCE_BYTES,
+                "instruction_sha256": hashlib.sha256(
+                    REPAIR_INSTRUCTION.encode("utf-8")
+                ).hexdigest(),
+            },
         }
 
     def _ensure_protocol(self) -> dict[str, object]:
@@ -211,6 +230,7 @@ class Phase2LiveRunner:
             str(identity["attempt_id"]),
             self.snapshot.memory_entries(),
             tuple(self._memory_context(item) for item in memories),
+            self._repair_context(memories),
         )
         if source_path.exists():
             source = source_path.read_text(encoding="utf-8")
@@ -235,6 +255,8 @@ class Phase2LiveRunner:
             _publish_exact(evidence_path, canonical_bytes(asdict(evidence)) + b"\n")
             evidence = AttentionTargetEvidence.read(evidence_path)
         self._validate_evidence(evidence, source, request)
+        if self.dependencies.trace is not None:
+            self.dependencies.trace(request, source, evidence)
         return evidence
 
     @staticmethod
@@ -371,6 +393,38 @@ class Phase2LiveRunner:
             )
         }
 
+    def _repair_context(
+        self, memories: tuple[Mapping[str, object], ...],
+    ) -> Mapping[str, object] | None:
+        """Rebuild the preceding candidate/evidence pair for a focused retry."""
+
+        if not memories:
+            return None
+        memory = memories[-1]
+        ordinal = int(memory["attempt"])
+        source = (
+            self.root / "attempts" / f"attempt-{ordinal:02d}" / "candidate.py"
+        ).read_text(encoding="utf-8")
+        source_bytes = source.encode("utf-8")
+        candidate_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        if candidate_sha256 != memory["candidate_sha256"]:
+            raise ValueError("preceding Phase 2 candidate changed host evidence")
+        bounded_source = _truncate_utf8(source, MAX_REPAIR_SOURCE_BYTES)
+        return {
+            "instruction": REPAIR_INSTRUCTION,
+            "prior_attempt": ordinal,
+            "candidate_sha256": candidate_sha256,
+            "evidence_sha256": memory["evidence_sha256"],
+            "memory_entry_sha256": memory["entry_sha256"],
+            "host_evidence": self._memory_context(memory),
+            "candidate_source": bounded_source,
+            "candidate_source_bytes": len(source_bytes),
+            "candidate_source_truncated": bounded_source != source,
+            "candidate_context_sha256": hashlib.sha256(
+                bounded_source.encode("utf-8")
+            ).hexdigest(),
+        }
+
     def _publish_terminal(
         self, protocol: Mapping[str, object],
         memories: tuple[Mapping[str, object], ...], status: str,
@@ -424,6 +478,6 @@ class Phase2LiveRunner:
 
 
 __all__ = [
-    "MAX_ATTEMPTS", "Phase2AttemptRequest", "Phase2Dependencies",
-    "Phase2LiveRunner",
+    "MAX_ATTEMPTS", "MAX_REPAIR_SOURCE_BYTES", "REPAIR_INSTRUCTION",
+    "Phase2AttemptRequest", "Phase2Dependencies", "Phase2LiveRunner",
 ]

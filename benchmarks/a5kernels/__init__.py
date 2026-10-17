@@ -93,6 +93,18 @@ from benchmarks.a5kernels.model_profile import (
     complete_a5,
     load_a5_model_profile,
 )
+from benchmarks.a5kernels.fireworks import (
+    FIREWORKS_BASE_MODEL,
+    DatasetIdentity,
+    FireworksCompletion,
+    FireworksHTTPTransport,
+    FireworksInferenceProfile,
+    FireworksManagedSFT,
+    FireworksSFTContract,
+    complete_fireworks,
+    load_fireworks_profile,
+    validate_chat_jsonl,
+)
 from benchmarks.a5kernels.phase1_registry import (
     PHASE1_BRIEF,
     PROJECT_REGISTRY,
@@ -111,6 +123,10 @@ from benchmarks.a5kernels.phase1_runtime import (
     Phase1ProjectRuntime,
     RecoveryEvidence,
     RecoveryStarter,
+)
+from benchmarks.a5kernels.phase1_project_bz import (
+    CatlassProjectBackend,
+    ProjectInfrastructureError,
 )
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
@@ -137,6 +153,13 @@ __all__ = [
     "A5Completion",
     "A5ModelProfile",
     "A5RunProvenance",
+    "FIREWORKS_BASE_MODEL",
+    "DatasetIdentity",
+    "FireworksCompletion",
+    "FireworksHTTPTransport",
+    "FireworksInferenceProfile",
+    "FireworksManagedSFT",
+    "FireworksSFTContract",
     "ATTENTION_CASES",
     "ATTENTION_CANDIDATE_FIXTURE",
     "AccessClass",
@@ -157,6 +180,7 @@ __all__ = [
     "CatlassCandidateBackend",
     "CatlassAttentionBackend",
     "CatlassContractHarness",
+    "CatlassProjectBackend",
     "CATLASS_REVISION",
     "CompileDiagnostics",
     "Citation",
@@ -193,6 +217,7 @@ __all__ = [
     "ProfileEvaluation",
     "ProfileRequest",
     "ProfilingTreatmentController",
+    "ProjectInfrastructureError",
     "PROJECT_REGISTRY",
     "PHASE1_BRIEF",
     "PHASE2_ATTENTION_CANDIDATE_ABI_SHA256",
@@ -237,5 +262,8 @@ __all__ = [
     "validate_contract_source",
     "write_result",
     "complete_a5",
+    "complete_fireworks",
     "load_a5_model_profile",
+    "load_fireworks_profile",
+    "validate_chat_jsonl",
 ]

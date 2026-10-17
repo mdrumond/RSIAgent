@@ -7,15 +7,74 @@ import pytest
 import benchmarks.a5kernels.phase1_memory as phase1_memory
 from benchmarks.a5kernels.knowledge_agent import Citation
 from benchmarks.a5kernels.phase1_memory import (
+    AgentLesson,
     AgentInterpretation,
     HostFact,
     Phase1LearningJournal,
     Phase1ProjectMemory,
 )
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 
 
 EVIDENCE = "a" * 64
+
+
+def generic_project() -> ProjectSpec:
+    return ProjectSpec.from_mapping({
+        "project_id": "vector-tail-study",
+        "capabilities": ["gm-ub-movement", "simd-vector", "padded-tail"],
+        "shape": [2, 3],
+        "dtype": "float32",
+        "block_count": 2,
+        "padding_multiple": 16,
+        "failure_mode": "none",
+        "timing_lengths": [],
+        "profile_metric": None,
+        "hypothesis": "Padded host evidence distinguishes logical and physical data.",
+        "graph": {
+            "inputs": [
+                {"name": "lhs", "shape": [2, 3]},
+                {"name": "rhs", "shape": [2, 3]},
+            ],
+            "nodes": [{
+                "name": "sum",
+                "op": "add",
+                "operands": ["lhs", "rhs"],
+                "axis": None,
+            }],
+            "output": "sum",
+        },
+    })
+
+
+def generic_memory() -> Phase1ProjectMemory:
+    lesson = AgentLesson(
+        category="data-movement",
+        claim="Logical tails must not expose padded storage.",
+        applicability="Padded elementwise projects.",
+        preconditions="The final logical extent is not alignment-sized.",
+        limitations="The retained observation covers one generated project.",
+        evidence_artifact_sha256=(EVIDENCE,),
+        failure_signature=None,
+        repair=None,
+        confidence="high",
+    )
+    return Phase1ProjectMemory(
+        proposal=generic_project(),
+        source_revision="f" * 64,
+        actions=("compile candidate", "run host oracle"),
+        host_facts=(HostFact(
+            "host-verification", "output matched the host oracle", EVIDENCE,
+        ),),
+        interpretations=(AgentInterpretation(
+            "The observed tail behavior is reusable.", (EVIDENCE,),
+        ),),
+        kdb_citations=(Citation("catlass", "tail-guide.py", 4, 12, "b" * 64),),
+        lessons=(lesson,),
+        no_new_knowledge=False,
+        admitted_artifact_sha256=(EVIDENCE,),
+    )
 
 
 def memory(ordinal, *, interpretation=True):
@@ -310,6 +369,134 @@ def test_durable_sequence_accepts_ordinary_integer(tmp_path):
 def test_interpretation_supports_requires_exact_tuple(supports):
     with pytest.raises(TypeError, match="must be a tuple"):
         AgentInterpretation("Interpretation", supports)
+
+
+def test_structured_lesson_round_trips_with_explicit_no_new_knowledge():
+    lesson = AgentLesson(
+        category="failure-repair",
+        claim="Initialize branch-local values before dynamic control flow.",
+        applicability="Catlass DSL dynamic branches.",
+        preconditions="A value is consumed after the branch.",
+        limitations="Does not establish kernel correctness.",
+        evidence_artifact_sha256=(EVIDENCE,),
+        failure_signature="dynamic branch variable is uninitialized",
+        repair="Initialize the value before branching.",
+        confidence="high",
+    )
+    project = Phase1ProjectMemory(
+        DEFAULT_PROPOSALS[0], "source", ("compile",),
+        (HostFact("compile", "compile failed", EVIDENCE),),
+        lessons=(lesson,), no_new_knowledge=False,
+        admitted_artifact_sha256=(EVIDENCE,),
+        artifact_store="provider-attempts/attempt-01/artifacts",
+    )
+
+    encoded = project.as_dict()
+    assert encoded["no_new_knowledge"] is False
+    assert encoded["agent_lessons"][0]["repair"].startswith("Initialize")
+    assert encoded["artifact_store"] == "provider-attempts/attempt-01/artifacts"
+    assert Phase1ProjectMemory.from_mapping(encoded) == project
+
+
+@pytest.mark.parametrize("field", [
+    "claim", "applicability", "preconditions", "limitations",
+    "failure_signature", "repair",
+])
+def test_structured_lesson_caps_compact_text_fields(field):
+    values = {
+        "category": "failure-repair",
+        "claim": "bounded claim",
+        "applicability": "bounded applicability",
+        "preconditions": "bounded preconditions",
+        "limitations": "bounded limitations",
+        "evidence_artifact_sha256": (EVIDENCE,),
+        "failure_signature": "bounded signature",
+        "repair": "bounded repair",
+        "confidence": "medium",
+    }
+    values[field] = "x" * 2001
+
+    with pytest.raises(ValueError, match="at most 2000 characters"):
+        AgentLesson(**values)
+
+
+def test_project_memory_rejects_nonrelative_artifact_store():
+    with pytest.raises(ValueError, match="relative artifact store"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", (),
+            (HostFact("compile", "compiled", EVIDENCE),),
+            artifact_store="../other-attempt/artifacts",
+        )
+
+
+def test_no_new_knowledge_is_explicit_and_mutually_exclusive_with_lessons():
+    fact = (HostFact("compile", "compiled", EVIDENCE),)
+    with pytest.raises(ValueError, match="no_new_knowledge"):
+        Phase1ProjectMemory(
+            DEFAULT_PROPOSALS[0], "source", ("compile",), fact,
+            no_new_knowledge=False, admitted_artifact_sha256=(EVIDENCE,),
+        )
+
+
+def test_generic_project_memory_has_canonical_lossless_round_trip():
+    project = generic_memory()
+
+    encoded = project.as_dict()
+    assert "proposal" not in encoded
+    assert encoded["project_spec"] == generic_project().as_dict()
+    assert encoded["source_revision"] == "f" * 64
+    assert encoded["actions"] == ["compile candidate", "run host oracle"]
+    assert encoded["host_facts"][0]["evidence_sha256"] == EVIDENCE
+    assert encoded["agent_lessons"][0]["evidence_artifact_sha256"] == [EVIDENCE]
+    assert encoded["kdb_citations"][0]["chunk_hash"] == "b" * 64
+    assert encoded["no_new_knowledge"] is False
+    assert encoded["admitted_artifact_sha256"] == [EVIDENCE]
+
+    decoded = Phase1ProjectMemory.from_mapping(encoded)
+    assert decoded == project
+    assert decoded.project_identity == generic_project()
+    assert decoded.project_spec == generic_project()
+    assert decoded.legacy_proposal is None
+    assert phase1_memory._canonical(decoded.as_dict()) == phase1_memory._canonical(encoded)
+
+
+def test_mixed_legacy_and_generic_memory_snapshot_is_canonical():
+    legacy = memory(1)
+    generic = generic_memory()
+    snapshot = [legacy.as_dict(), generic.as_dict()]
+
+    restored = tuple(Phase1ProjectMemory.from_mapping(item) for item in snapshot)
+    reencoded = [item.as_dict() for item in restored]
+
+    assert restored == (legacy, generic)
+    assert restored[0].legacy_proposal == DEFAULT_PROPOSALS[0]
+    assert restored[0].project_spec is None
+    assert restored[1].project_identity == generic_project()
+    assert phase1_memory._canonical(reencoded) == phase1_memory._canonical(snapshot)
+
+
+def test_legacy_project_memory_serialization_stays_backward_compatible():
+    legacy = memory(1)
+    encoded = legacy.as_dict()
+
+    assert "proposal" in encoded
+    assert "project_spec" not in encoded
+    assert encoded["proposal"] == DEFAULT_PROPOSALS[0].as_dict()
+    assert legacy.project_identity == DEFAULT_PROPOSALS[0]
+    assert legacy.legacy_proposal == DEFAULT_PROPOSALS[0]
+    assert Phase1ProjectMemory.from_mapping(encoded) == legacy
+
+
+def test_project_memory_rejects_ambiguous_or_missing_identity():
+    encoded = generic_memory().as_dict()
+    encoded["proposal"] = DEFAULT_PROPOSALS[0].as_dict()
+    with pytest.raises(ValueError, match="fields"):
+        Phase1ProjectMemory.from_mapping(encoded)
+
+    encoded.pop("proposal")
+    encoded.pop("project_spec")
+    with pytest.raises(ValueError, match="fields"):
+        Phase1ProjectMemory.from_mapping(encoded)
 
 
 @pytest.mark.parametrize("supports", [EVIDENCE, {EVIDENCE: True}])
