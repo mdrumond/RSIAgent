@@ -112,6 +112,15 @@ def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_gr
     assert "65536" in grammar["shape"]
     assert "[1, 4096]" in grammar["timing_lengths"]
     assert "one-dimensional" in grammar["timing_lengths"]
+    low_precision = grammar["low_precision_rules"]
+    fp8 = low_precision["float8_e4m3fn/float8_e5m2"]
+    mx = low_precision["mxfp8_e4m3fn/mxfp8_e5m2"]
+    assert "exactly one matmul" in fp8 and "no padded-tail" in fp8
+    assert "copy-only graphs preserve FP8" in fp8
+    assert "every non-copy FP8 graph computes all intermediates and output in FP32" in fp8
+    assert "only one matmul" in mx and "inputs in order" in mx
+    assert "no padded-tail" in mx and "FP32 output" in mx
+    assert "per 32 K" in mx and "gm_scale0 and gm_scale1 before gm_output" in mx
     rules = grammar["capability_operation_rules"]
     assert "if and only if" in rules["rule"]
     assert rules["simd-vector"] == ["add", "multiply", "relu"]

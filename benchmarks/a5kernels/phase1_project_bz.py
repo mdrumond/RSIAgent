@@ -13,6 +13,7 @@ import tempfile
 from benchmarks.a5kernels.bz import BZCommandExecutor, CommandInvocation, CommandResult
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.fixtures import _CATLASS_DRIVER
+from benchmarks.a5kernels.phase1_low_precision import MX_DTYPES, mx_quantize
 from benchmarks.a5kernels.phase1_project_executor import (
     CompileObservation,
     ProjectExecutionRequest,
@@ -109,6 +110,16 @@ class CatlassProjectBackend:
     ) -> tuple[str, tuple[SourceFile, ...]]:
         if not isinstance(request, ProjectExecutionRequest):
             raise TypeError("request must be a ProjectExecutionRequest")
+        input_payloads = [
+            {"shape": list(item.shape), "physical_shape": list(item.physical_shape),
+             "storage": list(item.storage)} for item in request.inputs
+        ]
+        scales = []
+        if request.spec.dtype.value in MX_DTYPES:
+            for index, item in enumerate(input_payloads):
+                item["storage"], scale, _ = mx_quantize(
+                    item["shape"], item["storage"], request.spec.dtype.value, index)
+                scales.append(scale)
         manifest = {
             "schema": "a5-phase1-project-v1",
             "project_id": request.spec.project_id,
@@ -118,14 +129,9 @@ class CatlassProjectBackend:
             "dtype": request.spec.dtype.value,
             "block_count": request.spec.block_count,
             "inputs_sha256": request.inputs_sha256,
-            "inputs": [
-                {
-                    "shape": list(item.shape),
-                    "physical_shape": list(item.physical_shape),
-                    "storage": list(item.storage),
-                }
-                for item in request.inputs
-            ],
+            "inputs": input_payloads,
+            "scales": scales,
+            "output_dtype": request.expected.dtype,
             "output": {
                 "shape": list(request.expected.shape),
                 "physical_shape": list(request.expected.physical_shape),
@@ -142,6 +148,7 @@ class CatlassProjectBackend:
         files = (
             SourceFile("kernel.py", request.candidate_source),
             SourceFile("host_driver.py", _PROJECT_DRIVER),
+            SourceFile("project_diagnostics.py", _diagnostic_driver()),
             SourceFile("manifest.json", manifest_text),
         )
         identity = canonical_digest({
@@ -174,6 +181,22 @@ class CatlassProjectBackend:
                                  unset=("PYTHONPYCACHEPREFIX",)),
         )
 
+    def diagnostic(self, request: ProjectExecutionRequest, *, tool: str) -> dict[str, object]:
+        """Run fixed diagnostic commands; their result never verifies the kernel."""
+        if tool not in {"msdebug", "memcheck", "racecheck", "initcheck", "synccheck"}:
+            raise ValueError("unsupported project diagnostic tool")
+        identity, files = self._bundle(request)
+        record, digest = self._execute(identity, files, "diagnostic-" + tool, 0)
+        if (record.get("status") != "diagnostic-observation"
+                or record.get("candidate_sha256") != hashlib.sha256(
+                    request.candidate_source.encode("utf-8")).hexdigest()
+                or type(record.get("available")) is not bool
+                or record.get("host_verified") is not False
+                or record.get("coverage") != "unconfirmed"):
+            raise ProjectInfrastructureError("host driver returned invalid diagnostic evidence")
+        return {"record": record, "evidence_sha256": digest,
+                "artifact": self.observation_payload(digest)}
+
     def observation_payload(self, digest: str) -> dict[str, object]:
         path = self._root / "cas" / digest[:2] / f"{digest}.json"
         data = path.read_bytes()
@@ -201,8 +224,11 @@ class CatlassProjectBackend:
         output_elements: int,
     ) -> tuple[dict[str, object], str]:
         attempt = self._reserve_attempt(identity, mode)
+        # The checked session wrapper allows at most 63 characters. Diagnostic
+        # tool names already distinguish modes; omit their redundant prefix.
+        session_mode = mode.removeprefix("diagnostic-")
         session = (
-            f"codex-a5project-{mode}-{identity[:_SESSION_IDENTITY_CHARS]}-"
+            f"codex-a5project-{session_mode}-{identity[:_SESSION_IDENTITY_CHARS]}-"
             f"{self._session_namespace}-{attempt:06d}"
         )
         remote = f".a5kernels/projects/{identity}"
@@ -407,11 +433,17 @@ def _emit(status, diagnostic, output=None):
     print(RESULT_MARKER + json.dumps(record, separators=(",", ":"), allow_nan=False))
 
 def _main():
-    if len(sys.argv) != 10 or sys.argv[3] not in {{"compile", "run"}}:
+    if len(sys.argv) != 10 or (sys.argv[3] not in {{"compile", "run"}}
+                              and not sys.argv[3].startswith("diagnostic-")):
         raise RuntimeError("invalid project host-driver invocation")
     manifest = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
     if manifest.get("schema") != "a5-phase1-project-v1":
         raise RuntimeError("invalid project manifest")
+    if sys.argv[3].startswith("diagnostic-"):
+        from project_diagnostics import diagnose
+        record = diagnose(sys.argv)
+        print(RESULT_MARKER + json.dumps(record, separators=(",", ":"), allow_nan=False))
+        return 0
     source, native_location, native_sha256, generated = _preflight_runtime(*sys.argv[4:])
     import catlass.tla as tla
     import torch
@@ -420,15 +452,29 @@ def _main():
     device = int(os.environ["BZ_A5_PROFILE_PHYSICAL_DEVICE"]) if os.environ.get(
         "A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE") == "1" else 0
     torch.npu.set_device(device)
-    dtype = {{"float16": torch.float16, "bfloat16": torch.bfloat16,
-             "float32": torch.float32}}[manifest["dtype"]]
-    tla_dtype = {{"float16": tla.Float16, "bfloat16": tla.BFloat16,
-                 "float32": tla.Float32}}[manifest["dtype"]]
-    tensors = [torch.tensor(item["storage"], dtype=dtype, device="npu").reshape(
+    storage_name = manifest["dtype"].replace("mxfp8_", "float8_")
+    dtype = getattr(torch, storage_name)
+    tla_names = {{"float16": "Float16", "bfloat16": "BFloat16", "float32": "Float32",
+                 "float8_e4m3fn": "Float8E4M3FN", "float8_e5m2": "Float8E5M2"}}
+    tla_dtype = getattr(tla, tla_names[storage_name])
+    output_name = manifest.get("output_dtype", storage_name)
+    output_dtype = getattr(torch, output_name)
+    low_precision = storage_name.startswith("float8_")
+    mx = manifest["dtype"].startswith("mxfp8_")
+    # CPU casts preserve byte-exact FP8 and avoid framework Cast kernels in traces.
+    tensors = [torch.tensor(item["storage"], dtype=torch.float32).to(dtype).reshape(
                tuple(item["physical_shape"])) for item in manifest["inputs"]]
+    if low_precision:
+        tensors = [item.view(torch.int8) for item in tensors]
+    if mx:
+        tensors[1] = tensors[1].transpose(0, 1).contiguous()
+    tensors = [item.to("npu") for item in tensors]
     output_shape = tuple(manifest["output"]["physical_shape"])
-    # Avoid device FillD/Cast helpers polluting BasicInfo kernel discovery.
-    output = torch.full(output_shape, -991.0, dtype=dtype).to("npu")
+    output = torch.full(output_shape, -7.0 if low_precision else -991.0,
+                        dtype=torch.float32).to(output_dtype)
+    if output_name.startswith("float8_"):
+        output = output.view(torch.int8)
+    output = output.to("npu")
     try:
         kernel = _load_kernel(sys.argv[1])
         _verify_loaded_catlass_modules(
@@ -441,11 +487,28 @@ def _main():
         kernel.LOGICAL_OUTPUT_SHAPE = tuple(manifest["output"]["shape"])
         kernel.PHYSICAL_OUTPUT_SHAPE = output_shape
         kernel.DTYPE = tla_dtype
+        kernel.OUTPUT_DTYPE = getattr(tla, tla_names[output_name])
         entry = getattr(kernel, manifest["abi"]["kernel_name"])
         as_tla = lambda tensor: from_dlpack(tensor.contiguous(),
                                             layout_tag=tla.arch.RowMajor)
-        tla_inputs = [as_tla(item) for item in tensors]
-        tla_output = as_tla(output)
+        if low_precision:
+            tla_inputs = [from_dlpack(item, layout_tag=(tla.arch.ColumnMajor if mx and index == 1
+                          else tla.arch.RowMajor), origin_shape=tuple(contract["physical_shape"]),
+                          element_type=tla_dtype)
+                          for index, (item, contract) in enumerate(zip(tensors, manifest["inputs"]))]
+        else:
+            tla_inputs = [as_tla(item) for item in tensors]
+        if mx:
+            for index, scale in enumerate(manifest["scales"]):
+                scale_tensor = torch.tensor(scale["storage"], dtype=torch.uint8).reshape(
+                    tuple(scale["shape"])).view(torch.int8).to("npu")
+                shape = tuple(scale["shape"]) if index == 0 else tuple(reversed(scale["shape"]))
+                tag = tla.arch.RowMajorMxScaleA if index == 0 else tla.arch.ColMajorMxScaleB
+                tla_inputs.append(from_dlpack(scale_tensor, layout_tag=tag,
+                                  origin_shape=shape, element_type=tla.Float8E8M0).mark_layout_dynamic())
+        tla_output = (from_dlpack(output, layout_tag=tla.arch.RowMajor,
+                                 element_type=tla_dtype) if output_name.startswith("float8_")
+                      else as_tla(output))
         artifact = tla.compile(entry, *tla_inputs, tla_output,
                                options="--npu-arch 3510")
     except Exception as exc:
@@ -457,7 +520,10 @@ def _main():
     try:
         artifact(*tla_inputs, tla_output, block_num=manifest["block_count"])
         torch.npu.synchronize()
-        values = output.cpu().float().reshape(-1).tolist()
+        host_output = output.cpu()
+        if output_name.startswith("float8_"):
+            host_output = host_output.view(output_dtype)
+        values = host_output.float().reshape(-1).tolist()
         if len(values) != manifest["output"]["storage_elements"] or not all(
             math.isfinite(value) for value in values
         ):
@@ -488,6 +554,10 @@ if __name__ == "__main__":
     except Exception as exc:
         _emit("infrastructure-failure", f"{{type(exc).__name__}}: {{exc}}")
 '''
+
+
+def _diagnostic_driver() -> str:
+    return Path(__file__).with_name("phase1_project_diagnostic_driver.py").read_text(encoding="utf-8")
 
 
 __all__ = [

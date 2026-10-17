@@ -335,6 +335,10 @@ def test_profile_driver_initialization_and_conversion_do_not_launch_helper_kerne
     class Tensor:
         device = 'cpu'
         def to(self, device):
+            if device not in ('cpu', 'npu'):
+                assert self.device == 'cpu', 'device Cast would pollute BasicInfo'
+                calls.append(('cast', self.device))
+                return self
             calls.append(('transfer', device))
             self.device = device
             return self
@@ -349,14 +353,26 @@ def test_profile_driver_initialization_and_conversion_do_not_launch_helper_kerne
         def tolist(self):
             return [1.]
     class Torch:
+        float32 = "float32"
         def full(self, shape, value, *, dtype, device='cpu'):
             assert device == 'cpu', 'device FillD would pollute BasicInfo'
             calls.append(('fill', device))
             return Tensor()
-    namespace = {'torch': Torch(), 'output_shape': (1,), 'dtype': 'float16'}
-    assignments = {node.targets[0].id: node for node in ast.walk(ast.parse(_PROJECT_DRIVER))
-                   if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)}
-    for name in ('output', 'values'):
-        module = ast.Module(body=[assignments[name]], type_ignores=[])
-        exec(compile(module, '<project-driver>', 'exec'), namespace)
-    assert calls == [('fill', 'cpu'), ('transfer', 'npu'), ('transfer', 'cpu'), ('cast', 'cpu')]
+    namespace = {'torch': Torch(), 'output_shape': (1,), 'output_dtype': 'float16',
+                 'low_precision': False}
+    main = next(node for node in ast.parse(_PROJECT_DRIVER).body
+                if isinstance(node, ast.FunctionDef) and node.name == '_main')
+    blocks = [main, *(node for node in main.body if isinstance(node, ast.Try))]
+    assignments = [node for block in blocks for node in block.body
+                   if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)]
+    # Execute every output initialization step in order, then CPU observation.
+    # This catches accidental device Fill/Cast helpers without relying on one
+    # specific spelling of the driver's intermediate tensors.
+    for name in ('output', 'host_output', 'values'):
+        for node in assignments:
+            if node.targets[0].id != name:
+                continue
+            module = ast.Module(body=[node], type_ignores=[])
+            exec(compile(module, '<project-driver>', 'exec'), namespace)
+    assert calls == [('fill', 'cpu'), ('cast', 'cpu'), ('transfer', 'npu'),
+                     ('transfer', 'cpu'), ('cast', 'cpu')]

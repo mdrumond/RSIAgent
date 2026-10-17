@@ -380,6 +380,7 @@ def build_adaptive_phase1(
     )
     request_profile = _measurement_action(measurements, profiling=True)
     request_timing = _measurement_action(measurements, profiling=False)
+    from benchmarks.a5kernels.phase1_project_diagnostics import diagnostic_action
     project_actor = AdaptiveActorProjectExecutor(
         executor,
         actor,
@@ -387,6 +388,7 @@ def build_adaptive_phase1(
         query_knowledge=query_knowledge,
         request_profile=request_profile,
         request_timing=request_timing,
+        request_diagnostic=diagnostic_action(backend),
         immutable_context=actor_context,
     )
     curriculum = CurriculumAgent(

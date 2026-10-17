@@ -26,10 +26,14 @@ from benchmarks.a5kernels.phase2_attention import (
     SUITE_SHA256,
     TARGET_ID,
 )
-from benchmarks.a5kernels.phase2_live import Phase2AttemptRequest
+from benchmarks.a5kernels.phase2_live import (
+    MAX_REPAIR_SOURCE_BYTES,
+    REPAIR_INSTRUCTION,
+    Phase2AttemptRequest,
+)
 
 
-PROVIDER_SCHEMA = "a5-catlass-phase2-source-provider-v1"
+PROVIDER_SCHEMA = "a5-catlass-phase2-source-provider-v2"
 _SYSTEM_PROMPT = """You write one Catlass DSL FlashAttention candidate for host testing.
 The host owns all correctness decisions. Use exactly one JSON object as each response:
 {"knowledge_query":{"query":"...","limit":5}} to request gated references, or
@@ -344,6 +348,53 @@ class Phase2SourceProvider:
             raise ValueError("Phase 2 memory exceeds the semantic-attempt bound")
         if request.attempt != len(request.phase2_memory) + 1:
             raise ValueError("Phase 2 memory does not precede this attempt")
+        if request.attempt == 1:
+            if request.repair_context is not None:
+                raise ValueError("first Phase 2 attempt cannot have repair context")
+        else:
+            self._validate_repair_context(request)
+
+    @staticmethod
+    def _validate_repair_context(request: Phase2AttemptRequest) -> None:
+        context = request.repair_context
+        if not isinstance(context, Mapping):
+            raise ValueError("Phase 2 retry requires preceding repair context")
+        expected_keys = {
+            "instruction", "prior_attempt", "candidate_sha256",
+            "evidence_sha256", "memory_entry_sha256", "host_evidence",
+            "candidate_source", "candidate_source_bytes",
+            "candidate_source_truncated", "candidate_context_sha256",
+        }
+        if set(context) != expected_keys:
+            raise ValueError("Phase 2 repair context has invalid fields")
+        prior = request.phase2_memory[-1]
+        source = context["candidate_source"]
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("Phase 2 repair context requires candidate source")
+        source_payload = source.encode("utf-8")
+        if len(source_payload) > MAX_REPAIR_SOURCE_BYTES:
+            raise ValueError("Phase 2 repair candidate exceeds the context bound")
+        if (
+            context["prior_attempt"] != request.attempt - 1
+            or context["instruction"] != REPAIR_INSTRUCTION
+            or context["prior_attempt"] != prior.get("attempt")
+            or context["candidate_sha256"] != prior.get("candidate_sha256")
+            or context["evidence_sha256"] != prior.get("evidence_sha256")
+            or context["memory_entry_sha256"] != prior.get("entry_sha256")
+            or context["host_evidence"] != prior
+            or context["candidate_context_sha256"] != _sha256(source_payload)
+            or type(context["candidate_source_bytes"]) is not int
+            or context["candidate_source_bytes"] < len(source_payload)
+            or type(context["candidate_source_truncated"]) is not bool
+            or context["candidate_source_truncated"]
+            != (context["candidate_source_bytes"] > len(source_payload))
+        ):
+            raise ValueError("Phase 2 repair context changed preceding evidence")
+        if (
+            not context["candidate_source_truncated"]
+            and _sha256(source_payload) != context["candidate_sha256"]
+        ):
+            raise ValueError("Phase 2 repair source changed preceding candidate")
 
     def _prompt_and_binding(
         self, request: Phase2AttemptRequest,
@@ -356,6 +407,9 @@ class Phase2SourceProvider:
         )
         _phase2, phase2_sha256 = _canonical_context(
             list(request.phase2_memory), "Phase 2 memory"
+        )
+        _repair, repair_sha256 = _canonical_context(
+            request.repair_context, "Phase 2 repair context"
         )
         guidance_sha256 = (
             _sha256(self.profiling_guidance.encode("utf-8"))
@@ -383,6 +437,8 @@ class Phase2SourceProvider:
             "knowledge_access": request.cell.knowledge.value,
             "profiling_guidance": self.profiling_guidance,
         }
+        if request.repair_context is not None:
+            prompt_value["repair_context"] = request.repair_context
         prompt_bytes, prompt_sha256 = _canonical_context(prompt_value, "provider prompt")
         binding = {
             "cell_id": request.cell.cell_id,
@@ -394,6 +450,7 @@ class Phase2SourceProvider:
             "prompt_sha256": prompt_sha256,
             "phase1_memory_sha256": phase1_sha256,
             "phase2_memory_sha256": phase2_sha256,
+            "repair_context_sha256": repair_sha256,
             "programming_guide_sha256": guide_sha256,
             "profiling_guidance_sha256": guidance_sha256,
             "target_contract_sha256": target_contract_sha256,
