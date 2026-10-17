@@ -145,6 +145,9 @@ def _qualification_provenance(
         )
     ):
         raise ValueError("invalid Phase 2 transport qualification")
+    if (cell.schema == ADAPTIVE_CELL_SCHEMA
+            and not provenance_map.get("cann_version", "").startswith("9.3")):
+        raise ValueError("adaptive Phase 3 admission requires the checked CANN 9.3 runtime")
     assert isinstance(record_sha256, str)
     return record_sha256, payload, provenance
 

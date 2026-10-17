@@ -17,13 +17,15 @@ from tests.test_a5_phase2_memory import _snapshot
 from tests.test_a5_phase2_adaptive_memory import _source
 
 
-def _write_qualification(root, cell, runtime_revision="b" * 40):
+def _write_qualification(root, cell, runtime_revision="b" * 40, cann_version=None):
     provenance = [
         ["catlass_revision", runtime_revision],
         ["catlass_source", "/remote/catlass"],
         ["execution_profile", "bz-a5"],
         ["manifest_sha256", "a" * 64],
     ]
+    if cann_version is not None:
+        provenance.append(["cann_version", cann_version])
     case = {"case_id": "copy-v", "seed": 7}
     output = [1.0, 2.0]
     body = {
@@ -118,7 +120,8 @@ def test_legacy_frozen_bytes_remain_unchanged(tmp_path):
 
 
 @pytest.mark.parametrize("new_guidance", [False, True])
-def test_reviewed_adaptive_phase2_freezes_into_phase3(tmp_path, new_guidance):
+@pytest.mark.parametrize("cann_version", [None, "9.1.0", "9.3.0-weekly-20261009"])
+def test_reviewed_adaptive_phase2_freezes_into_phase3(tmp_path, new_guidance, cann_version):
     source_root, source, review, memory = _source(tmp_path, new=new_guidance)
     root = tmp_path / "phase2"
     snapshot = admit_adaptive_snapshot(source_root, b"", review, source, root)
@@ -130,12 +133,19 @@ def test_reviewed_adaptive_phase2_freezes_into_phase3(tmp_path, new_guidance):
         dependencies=_deps(snapshot, _Backend(), []),
     )
     assert runner.run()["status"] == "passed"
-    _write_qualification(root, snapshot.destination)
+    _write_qualification(root, snapshot.destination, cann_version=cann_version)
+
+    if cann_version is None or not cann_version.startswith("9.3"):
+        with pytest.raises(ValueError, match="CANN 9.3"):
+            admit_phase2_lineage(root, snapshot.destination, tmp_path / "phase3")
+        assert not (tmp_path / "phase3").exists()
+        return
 
     frozen = admit_phase2_lineage(root, snapshot.destination, tmp_path / "phase3")
 
     assert frozen.manifest["source_snapshot_id"] == snapshot.snapshot_id
     assert frozen.manifest["phase1_entries"] == 1
+    assert dict(frozen.manifest["runtime_provenance"])["cann_version"] == cann_version
     assert canonical_bytes(frozen.actor_memory()["phase1"]) == canonical_bytes([memory])
     assert frozen.actor_memory()["phase2"][0]["passed"] is True
     assert type(frozen).open(frozen.root, snapshot.destination) == frozen
