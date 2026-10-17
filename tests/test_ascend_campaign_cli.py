@@ -44,7 +44,7 @@ def test_unknown_harness_revision_is_not_fabricated(tmp_path, metadata):
         cli._harness_revision(tmp_path)
 
 
-def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session"):
+def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session", seed=b"seed"):
     manifest = write(tmp_path / "sources.json", {
         "schema": "ascend-sft-sources-v2", "sources": [{"name": "catlass",
         "repository": "https://example.invalid/catlass", "revision": "a" * 40,
@@ -52,7 +52,7 @@ def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session"):
     config = write(tmp_path / "settings.json", {"model": "openai/gpt-5.6-sol",
         "phase1_arguments": list(extra), "source_manifest": str(manifest)})
     memory = tmp_path / "seed"
-    memory.write_bytes(b"seed")
+    memory.write_bytes(seed)
     argv = ["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),
             "--target", "a3", "--phase", str(phase), "--objective", "Learn kernels",
             "--config", str(config), "--initial-memory", str(memory), "--project-target", "2"]
@@ -75,6 +75,50 @@ def test_start_retains_public_provenance_not_private_settings_and_separate_worke
     assert (root / "source-evidence" / "manifest.json").is_file()
     with pytest.raises(SystemExit):
         start(tmp_path)
+
+
+@pytest.mark.parametrize("legacy_seed", [False, True])
+def test_phase2_cli_start_complete_and_strict_package_uses_reviewed_seed(tmp_path, legacy_seed):
+    from dataclasses import replace
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from benchmarks.a5kernels.phase1_memory import HostFact
+    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+    from tests.test_a3_reviewed_phase2 import native_source
+    from tests.test_a5_phase1_adaptive import _project, _result, _wave
+    source, review, _ = native_source(tmp_path)
+    source.rename(tmp_path / "old")
+    job = start(tmp_path, phase=2, seed=b"")
+    root = Path(job["root"])
+    snapshot = cli._snapshot(job, {})
+    # Older launchers retained the Phase 1 input, not the reviewed Phase 2 seed.
+    if legacy_seed:
+        (root / "initial-memory.bin").write_bytes(b"old unrelated launch input")
+    original = (root / "initial-memory.bin").read_bytes()
+    counter = 0
+    def select(messages):
+        nonlocal counter
+        counter += 1
+        spec = _project(f"phase2-{counter}", "gm-ub-movement")
+        spec["learning_focus"] = ["pipe-mte2" if counter == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [spec])
+    def execute(request):
+        objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
+        source = objects.put_bytes(b"source")
+        host = objects.put_bytes(b"host verification")
+        result = _result(request.spec, True, "verified")
+        return replace(result, memory=replace(result.memory, source_revision=source,
+            host_facts=(HostFact("host-verification", "host passed", host),),
+            lessons=(), no_new_knowledge=True, admitted_artifact_sha256=(host,), artifact_store="artifacts"))
+    coordinator = AdaptivePhase2Coordinator(root, job["objective"], snapshot,
+        CurriculumAgent(select), execute, project_target=2)
+    assert coordinator.run()["successful_projects"] == 2
+    output = tmp_path / "phase2.tar.gz"
+    cli.main(["package", "--control", job["control"], "--output", str(output)])
+    assert output.is_file()
+    assert (root / "initial-memory.bin").read_bytes() == original
+    with tarfile.open(output) as archive:
+        assert archive.extractfile("campaign/initial-memory.bin").read() == original
 
 
 def test_optional_collector_start_failure_does_not_prevent_compute(tmp_path):
@@ -339,7 +383,9 @@ def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_pa
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
     from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
-    from test_ascend_phase2_curriculum import snapshot, project
+    from test_ascend_phase2_curriculum import project
+    from tests.test_a3_reviewed_phase2 import native_source
+    from benchmarks.ascend.phase2 import admit_native_snapshot
     from test_a5_phase1_adaptive import _result, _wave
     calls, executions = [], []
     def select(messages):
@@ -356,11 +402,14 @@ def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_pa
             admitted_artifact_sha256=(evidence,), lessons=(), no_new_knowledge=True)
         return replace(result, memory=memory)
     root = tmp_path / "phase2"
-    coordinator = AdaptivePhase2Coordinator(root, "Learn from failures and success", snapshot(),
+    source, review, _ = native_source(tmp_path)
+    reviewed = admit_native_snapshot(source, b"", review, root)
+    coordinator = AdaptivePhase2Coordinator(root, "Learn from failures and success", reviewed,
         CurriculumAgent(select), execute, project_target=1)
     result = coordinator.run()
     assert result["successful_projects"] == 1 and result["failed_projects"] == 1
     manifest = cli.package_campaign(root, tmp_path / "phase2.tar.gz")
     assert manifest["complete"]
     assert any(row["path"].endswith("closed-failure.json") for row in manifest["files"])
-    assert sum(row["path"].endswith("outcome.json") for row in manifest["files"]) == 2
+    assert sum(row["path"].startswith("waves/") and row["path"].endswith("outcome.json")
+               for row in manifest["files"]) == 2

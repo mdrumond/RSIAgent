@@ -56,11 +56,13 @@ class NativeProjectMeasurements:
         )
 
     @staticmethod
-    def _combine(results, summary):
+    def _combine(results, summary, source):
         artifacts = {}
+        candidate_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
         for result in results:
             artifacts.update(result["artifact_payloads"])
-            payload = {"identity": result["identity"], "summary": result["summary"]}
+            payload = {"identity": result["identity"], "summary": result["summary"],
+                       "candidate_sha256": candidate_sha256}
             artifacts[canonical_digest(payload)] = payload
         return dict(summary=summary, artifact_payloads=artifacts, evidence_sha256=tuple(artifacts))
 
@@ -78,7 +80,8 @@ class NativeProjectMeasurements:
                 raise ProjectInfrastructureError(str(exc)) from exc
         return self._combine(results, {"timing": [
             {"shape": r["identity"]["output"]["logical_shape"],
-             "physical_shape": r["identity"]["output"]["shape"], **r["summary"]} for r in results]})
+             "physical_shape": r["identity"]["output"]["shape"], **r["summary"]} for r in results]},
+             request.candidate_source)
 
     def profile(self, request, metric):
         if metric != "pipe-utilization":
@@ -87,7 +90,7 @@ class NativeProjectMeasurements:
             result = self._measurement(request).capture("PipeUtilization")
         except (_PendingObservation, OSError) as exc:
             raise ProjectInfrastructureError(str(exc)) from exc
-        return self._combine([result], result["summary"])
+        return self._combine([result], result["summary"], request.candidate_source)
 
 
 def _guidance(path):

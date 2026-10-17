@@ -16,7 +16,8 @@ def test_a5_selection_delegates_exact_legacy_arguments():
     assert calls == [["report", "--root", "existing"]]
 
 
-def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_path, capsys):
+@pytest.mark.parametrize("sync_performance", [False, True])
+def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_path, capsys, sync_performance):
     guide = tmp_path / "guide.md"
     guide.write_text("Native guide; do not use Catlass DSL.")
     memory = tmp_path / "initial.md"
@@ -56,8 +57,12 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
                         artifact_payloads={digest: raw}, evidence_sha256=digest)
 
     source = 'extern "C" __global__ __aicore__ void project_kernel(GM_ADDR gm_input0, GM_ADDR gm_output) {}'
-    actions = iter((json.dumps({"write": {"slot": "kernel", "content": source}}),
-                    '{"compile":{}}', '{"run":{}}', '{"request-profile":{}}', '{"submit":{}}'))
+    actions = [json.dumps({"write": {"slot": "kernel", "content": source}}),
+               '{"compile":{}}', '{"run":{}}', '{"request-profile":{}}']
+    if sync_performance:
+        actions += [json.dumps({"write": {"slot": "kernel", "content": source + " // variant"}}),
+                    '{"run":{}}', '{"request-profile":{}}']
+    actions = iter([*actions, '{"submit":{}}'])
     def provider(**kwargs):
         messages = kwargs["request"]["messages"]
         if "Curriculum Agent" in messages[0]["content"]:
@@ -66,6 +71,8 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
                 shape=[4], dtype="float32", block_count=1, padding_multiple=1, failure_mode="none",
                 timing_lengths=[], profile_metric="pipe-utilization", hypothesis="Study native copy pipeline.",
                 graph=dict(inputs=[dict(name="x", shape=[4])], nodes=[dict(name="out", op="copy", operands=["x"], axis=None)], output="out"))
+            if sync_performance:
+                spec["learning_focus"] = ["sync-performance"]
             text = "DECISION: WAVE\n" + json.dumps(dict(wave_id=context["next_wave_id"],
                 pre_wave_memory_sha256=context["pre_wave_memory_sha256"], pre_wave_coverage=context["pre_wave_coverage"],
                 projects=[dict(spec=spec, requires=[])]))
@@ -83,6 +90,15 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
          environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
     assert "profile" in events
     assert events.index("run") < events.index("profile")
+    if sync_performance:
+        assert events.count("profile") == 2
+        from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        import hashlib
+        store = ContentAddressedArtifacts(root / "waves/wave-001/branches/profile-copy/artifacts")
+        payloads = [json.loads(path.read_bytes()) for path in store.objects.glob("*/*")
+                    if path.read_bytes().startswith(b'{')]
+        assert {hashlib.sha256(value.encode()).hexdigest() for value in (source, source + " // variant")} <= {
+            row.get("candidate_sha256") for row in payloads}
     assert json.loads((root / "campaign-identity.json").read_text())["language"] == "ascend-c"
     assert "discovered-a3" in (root / "campaign-identity.json").read_text()
     assert "CATLASS" not in capsys.readouterr().out
@@ -135,6 +151,10 @@ def test_native_timing_action_recompiles_each_shape_with_host_inputs(tmp_path):
     assert shapes == [(16,), (16,)]
     assert logical_shapes == [(3,), (5,)]
     assert [item["shape"] for item in result["summary"]["timing"]] == [[3], [5]]
+    import hashlib
+    source_sha256 = hashlib.sha256(request.candidate_source.encode()).hexdigest()
+    assert len([payload for payload in result["artifact_payloads"].values()
+                if payload.get("candidate_sha256") == source_sha256]) == 2
 
 
 def test_native_runtime_config_fails_early_for_missing_version_identity(tmp_path):

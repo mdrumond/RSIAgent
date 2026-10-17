@@ -26,7 +26,7 @@ from tests.test_a5_phase2_source_provider import GUIDE, GUIDE_ID, ENVIRONMENT
 from tests.test_a5_phase2_production import FakeExecutor, CopyVBackend
 
 
-def _source(tmp_path, *, new=False):
+def _source(tmp_path, *, new=False, historical_citation=False):
     profiling_guide = None
     if new:
         from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
@@ -45,6 +45,15 @@ def _source(tmp_path, *, new=False):
         spec, source_sha, ("run",), (HostFact("host-verification", "passed", evidence),),
         admitted_artifact_sha256=(evidence,), artifact_store="artifacts",
     ).as_dict()
+    if historical_citation:
+        memory["kdb_citations"] = [dict(collection="docs", path="guide.py", start_line=1,
+                                       end_line=2, chunk_hash="c" * 64)]
+        if historical_citation == "empty-provenance":
+            memory["kdb_citations"][0].update(repository=None, revision=None,
+                                            source_sha256=None, reference_exposed=False)
+        elif historical_citation == "populated-provenance":
+            memory["kdb_citations"][0].update(repository="https://example.invalid/repo",
+                revision="d" * 40, source_sha256="e" * 64, reference_exposed=True)
     encoded = base64.b64encode(canonical_bytes(memory)).decode()
     pre_memory = canonical_bytes({
         "schema": MEMORY_SCHEMA, "initial_memory_base64": "", "project_memory_base64": [],
@@ -91,6 +100,20 @@ def test_snapshot_copies_exact_memory_and_evidence_and_survives_source_removal(t
     snapshot.memory_path.write_bytes(b"changed")
     with pytest.raises(ValueError, match="bytes changed"):
         snapshot.verify()
+
+
+@pytest.mark.parametrize("representation", [True, "empty-provenance", "populated-provenance"])
+def test_historical_nonempty_citation_resumes_and_hands_off_exact_bytes(tmp_path, representation):
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    root, source, review, memory = _source(tmp_path, historical_citation=representation)
+    coordinator = object.__new__(AdaptivePhase1Coordinator)
+    coordinator.root = root
+    delta = coordinator._read_delta("wave-01", "copy")
+    original = base64.b64decode(delta["memory_base64"])
+    assert json.loads(original)["kdb_citations"] == memory["kdb_citations"]
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
+    assert snapshot.memory_entries() == (memory,)
+    assert snapshot.memory_path.read_bytes() == original + b"\n"
 
 
 @pytest.mark.parametrize("failure", ["running", "pending", "rejected", "wrong-memory", "missing-evidence"])

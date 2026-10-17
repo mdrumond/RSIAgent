@@ -195,6 +195,9 @@ def _verify_adaptive_state(root, state):
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
     seed = root / "initial-memory.bin"
     initial = seed.read_bytes() if seed.is_file() else None
+    if state.get("phase") == "adaptive-phase2":
+        from .phase2_curriculum import reviewed_seed
+        initial, _ = reviewed_seed(root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
     memories, outcomes = [], []

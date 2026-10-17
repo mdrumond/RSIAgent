@@ -183,6 +183,7 @@ class _ProjectActions:
         self.request = request
         self.prepared = prepared
         self.artifacts = artifacts
+        self.read_artifacts = artifacts
         self.max_actions = max_actions
         self.max_source_bytes = max_source_bytes
         self.query_knowledge = query_knowledge
@@ -215,7 +216,7 @@ class _ProjectActions:
             return self._observation({"event": "proposal-recorded"})
         if action.kind == "read-artifact":
             try:
-                page = artifact_page_presentation(action.payload, self.artifacts)
+                page = artifact_page_presentation(action.payload, self.read_artifacts)
             except (ValueError, FileNotFoundError) as exc:
                 return self._observation({"error": str(exc)})
             return ActionOutcome(canonical_bytes({"host": page}).decode("ascii"),
@@ -509,6 +510,8 @@ class AdaptiveActorProjectExecutor:
             request_timing=self.request_timing,
             request_diagnostic=self.request_diagnostic,
         )
+        from benchmarks.ascend.agent_presentation import MemoryArtifactReader
+        actions.read_artifacts = MemoryArtifactReader(request, artifacts)
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "

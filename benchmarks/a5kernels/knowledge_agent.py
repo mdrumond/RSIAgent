@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import InitVar, asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +44,23 @@ class Citation:
     revision: str | None = None
     source_sha256: str | None = None
     reference_exposed: bool = False
+    provenance_present: InitVar[bool] = False
+
+    def __post_init__(self, provenance_present):
+        object.__setattr__(self, "_provenance_present", provenance_present)
+
+    def as_dict(self) -> dict[str, object]:
+        value = asdict(self)
+        if (not self._provenance_present and self.repository is None and self.revision is None
+                and self.source_sha256 is None and not self.reference_exposed):
+            for field in ("repository", "revision", "source_sha256", "reference_exposed"):
+                value.pop(field)
+        return value
+
+    @classmethod
+    def from_mapping(cls, value):
+        return cls(**value, provenance_present=any(field in value for field in (
+            "repository", "revision", "source_sha256", "reference_exposed")))
 
 
 @dataclass(frozen=True)

@@ -292,7 +292,7 @@ class Phase1ProjectMemory:
             "agent_interpretations": [{
                 **asdict(item), "supports": list(item.supports),
             } for item in self.interpretations],
-            "kdb_citations": [asdict(item) for item in self.kdb_citations],
+            "kdb_citations": [item.as_dict() for item in self.kdb_citations],
             "agent_lessons": [{
                 **asdict(item),
                 "evidence_artifact_sha256": list(item.evidence_artifact_sha256),
@@ -360,7 +360,7 @@ class Phase1ProjectMemory:
                     )
                     for item in interpretations
                 ),
-                kdb_citations=tuple(Citation(**item) for item in citations),
+                kdb_citations=tuple(Citation.from_mapping(item) for item in citations),
                 lessons=lessons,
                 no_new_knowledge=value.get("no_new_knowledge", True),
                 admitted_artifact_sha256=tuple(admitted),
