@@ -127,6 +127,21 @@ def operator_code(files: dict[str, bytes], operator: dict, job: dict) -> dict[st
         own = code
     if not own:
         raise ValueError("No code identifiable as the ranked operator")
+    def substantive(name, value):
+        text = value.decode("utf-8")
+        if Path(name).suffix.lower() == ".py":
+            text = re.sub(r"(?s)\"\"\".*?\"\"\"|'''.*?'''", "", text)
+            for line in text.splitlines():
+                line = line.split("#", 1)[0].strip()
+                if re.match(r"(?:async\s+)?(?:def|class)\s", line):
+                    line = line.split(":", 1)[-1].strip()
+                if line not in ("", "pass", "...") and not line.startswith(("@", "raise NotImplementedError")):
+                    return True
+            return False
+        text = re.sub(r"(?s)/\*.*?\*/|//[^\n]*", "", text)
+        return bool(text.strip())
+    if not any(substantive(name, value) for name, value in own.items()):
+        raise ValueError("Ranked operator contains only empty or placeholder code")
     return own
 
 
@@ -189,8 +204,17 @@ def unpack(data: bytes, operator: dict, job: dict) -> tuple[dict[str, bytes], st
             files[str(path)] = value
     own = operator_code(files, operator, job)
     # Prefer explicit kernel code over launch/test wrappers for duplicate checks.
+    archive_root = PurePosixPath(os.path.commonpath([str(PurePosixPath(name).parent)
+                                                   for name in files]))
+    key = re.sub(r"[^a-z0-9]", "", operator["function_name"].lower())
+    def implementation_parts(name):
+        path = PurePosixPath(name)
+        for index, part in enumerate(path.parts[:-1]):
+            if re.sub(r"[^a-z0-9]", "", part.lower()) == key:
+                return path.parts[index + 1:]
+        return path.relative_to(archive_root).parts
     kernels = {name: value for name, value in own.items()
-               if any("kernel" in part.lower() for part in PurePosixPath(name).parts)}
+               if any("kernel" in part.lower() for part in implementation_parts(name))}
     identity = digest(b"\0".join(sorted(set((kernels or own).values()))))
     return files, identity
 

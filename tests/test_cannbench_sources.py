@@ -42,6 +42,35 @@ def test_single_operator_submission_identifies_generic_kernel():
     assert "kernel.py" in files
 
 
+@pytest.mark.parametrize("placeholder", ["", " \n", "# TODO: implement exp\n", "pass\n", "...\n",
+                                         '"""Not implemented yet."""', "def exp():\n    pass\n",
+                                         "def exp(): raise NotImplementedError\n"])
+def test_placeholder_operator_falls_back_to_next_ranked_implementation(tmp_path, placeholder):
+    class PlaceholderArchive(FakeArchive):
+        def get(self, url):
+            if url.endswith("job0"):
+                data = bundle({"exp/__init__.py": placeholder, "README.md": "exp implementation"})
+                return data, {"status": 200, "sha256": source.digest(data), "url": url}
+            return super().get(url)
+    result = source.acquire_operator(OP, PlaceholderArchive(), tmp_path, "1.1.2", 1)
+    assert [item["rank"] for item in result["sources"]] == [2]
+    assert "placeholder" in result["skipped"][0]["attempts"][0]["source_error"]
+
+
+def test_kernel_named_archive_root_does_not_include_wrappers_in_identity(tmp_path):
+    class KernelRootArchive(FakeArchive):
+        def get(self, url):
+            job_id = url.split("/")[-1]
+            data = bundle({"cannbench-kernels-main/exp/kernel.cpp": "AscendC::Exp(x,y,n);",
+                           "cannbench-kernels-main/exp/launch.py": f"wrapper = '{job_id}'",
+                           "cannbench-kernels-main/README.md": "repository"})
+            return data, {"status": 200, "sha256": source.digest(data), "url": url}
+    result = source.acquire_operator(OP, KernelRootArchive(), tmp_path, "1.1.2", 2)
+    assert len(result["sources"]) == 1
+    assert result["shortfall"] == 1
+    assert all("Duplicate" in item["reason"] for item in result["skipped"])
+
+
 class FakeArchive:
     def __init__(self):
         self.offsets = []
