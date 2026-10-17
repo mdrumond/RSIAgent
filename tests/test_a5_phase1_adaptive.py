@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -519,3 +520,57 @@ def test_timing_counts_only_retained_msprof_capture_even_without_requested_focus
         ]}).encode()).decode()]}
     gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
     assert ("tool-msprof" not in gaps) == device_capture
+
+
+@pytest.mark.parametrize("statement", ["Measured current source", "fixed source", "[]", "null", "42", '{"timing":null}'])
+def test_prose_measurement_facts_survive_report_resume_and_next_selection(tmp_path, statement):
+    selections = []
+    paused = []
+    def complete(messages):
+        selections.append(messages[-1]["content"])
+        spec = _project(f"project-{len(selections)}", "gm-ub-movement")
+        spec["learning_focus"] = ["pipe-mte2" if len(selections) == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [spec])
+    def execute(request):
+        if request.spec.project_id == "project-2" and not paused:
+            paused.append(True)
+            raise RuntimeError("pause before second publication")
+        result = _result(request.spec, True, "verified")
+        fact = HostFact("performance-study", statement, result.memory.admitted_artifact_sha256[0])
+        return replace(result, memory=replace(result.memory, host_facts=(*result.memory.host_facts, fact)))
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    # The shared runner changes targets through its explicit continuation API.
+    # Resume the same target after a normal interrupted second attempt instead.
+    with pytest.raises(RuntimeError, match="failed before verification"):
+        campaign(2).run()
+    assert "tool-msprof" in campaign(2).report()["coverage_gaps"]
+    assert campaign(2).resume()["successful_projects"] == 2
+    assert len(selections) == 2
+
+
+def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tmp_path):
+    calls = []
+    def complete(messages):
+        return _wave(messages[-1]["content"], [
+            _project("first", "gm-ub-movement"), _project("second", "simd-vector"),
+            _project("third", "padded-tail"),
+        ])
+    def execute(request):
+        calls.append(request.spec.project_id)
+        return _result(request.spec, request.spec.project_id != "second", "observed")
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    with pytest.raises(RuntimeError, match="not verified"):
+        campaign(3).run()
+    assert campaign(3).report()["pending_wave"]["projects"][0]["status"] == "verified"
+    files = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+             for path in tmp_path.rglob("*") if path.is_file()}
+    before_calls = list(calls)
+    with pytest.raises(ValueError, match="retained wave exceeds configured project target"):
+        campaign(2).resume()
+    assert calls == before_calls
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tmp_path.rglob("*") if path.is_file()} == files
