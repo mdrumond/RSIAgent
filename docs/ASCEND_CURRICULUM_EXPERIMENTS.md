@@ -11,6 +11,9 @@ context-budget, transport and infrastructure exceptions leave pending work
 `RECOVERY_REQUIRED` rather than being mislabeled as kernel failures.
 `TARGET_REACHED` means the verified project count was
 reached, not that every requested topic was learned. Inspect `coverage_gaps`.
+An explicit `--max-projects` smoke cap instead bounds **all completed attempts**
+(verified plus semantic failures). Reaching it returns `PROJECT_LIMIT_REACHED`,
+not saturation. Infrastructure failures remain pending, not completed attempts.
 
 `report` includes the full `curriculum_memory`: concise lesson claims, explicit
 `no_new_knowledge` outcomes, and completed failures. Each curriculum request

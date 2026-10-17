@@ -539,7 +539,7 @@ class CurriculumAgent:
                      for item in project.spec.capabilities):
                 raise ValueError("native vector capability requires an explicit target policy")
         if len(wave.projects) > min(8, context.remaining_projects):
-            raise ValueError("wave exceeds eight-project wave limit or remaining project target")
+            raise ValueError("wave exceeds eight-project wave limit or remaining project target or remaining project budget")
         unavailable = set(self.unavailable_capabilities)
         if any(unavailable.intersection(item.spec.capabilities) for item in wave.projects):
             raise ValueError("wave selects a capability unavailable in this factory")

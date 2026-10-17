@@ -173,17 +173,18 @@ class AdaptivePhase1Coordinator:
                 return self._report(state)
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
+            completed = self._completed_attempts(state)
             if pending is None:
-                if self.max_projects is not None and len(state["prior_outcomes"]) >= self.max_projects:
+                if self.max_projects is not None and completed >= self.max_projects:
                     state = {**state, "terminal": {
                         "status": "PROJECT_LIMIT_REACHED",
-                        "reason": f"Published project limit {self.max_projects} reached; saturation was not evaluated.",
+                        "reason": f"Completed attempt limit {self.max_projects} reached; saturation was not evaluated.",
                     }}
                     self._atomic_json(self.root / "state.json", state)
                     return self._report(state)
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
-                    **({"remaining_projects": self.max_projects - len(state["prior_outcomes"])} if self.max_projects is not None else {}),
+                    **({"remaining_projects": self.max_projects - completed} if self.max_projects is not None else {}),
                 )
                 if isinstance(decision, TerminalDecision):
                     state = {
@@ -198,7 +199,7 @@ class AdaptivePhase1Coordinator:
                     return self._report(state)
                 assert isinstance(decision, WaveDecision)
                 if self.max_projects is not None and (
-                    len(state["prior_outcomes"]) + len(decision.wave.projects) > self.max_projects
+                    completed + len(decision.wave.projects) > self.max_projects
                 ):
                     raise ValueError("selected wave exceeds remaining project limit; select a smaller wave")
                 pending = {
@@ -210,7 +211,7 @@ class AdaptivePhase1Coordinator:
                 }
                 self._atomic_json(self.root / "pending.json", pending)
             wave = WaveSpec.from_mapping(pending["wave"])
-            if self.max_projects is not None and len(state["prior_outcomes"]) + len(wave.projects) > self.max_projects:
+            if self.max_projects is not None and completed + len(wave.projects) > self.max_projects:
                 raise ValueError("retained wave exceeds configured project limit")
             coordinator = LiveWaveCoordinator(
                 self.root / "waves" / wave.wave_id,
@@ -354,6 +355,9 @@ class AdaptivePhase1Coordinator:
         }
 
     def _context(self, state, snapshot):
+        remaining = max(0, self.project_target - len(state["prior_outcomes"]))
+        if self.max_projects is not None:
+            remaining = min(remaining, max(0, self.max_projects - self._completed_attempts(state)))
         return CurriculumContext(
             self.objective,
             state["wave_index"],
@@ -368,7 +372,7 @@ class AdaptivePhase1Coordinator:
                 )
                 for value in self._effective_outcomes(state)
             ),
-            max(0, self.project_target - len(state["prior_outcomes"])),
+            remaining,
             self._curriculum_feedback(state),
         )
 
@@ -462,6 +466,7 @@ class AdaptivePhase1Coordinator:
             "wave_index": state["wave_index"],
             "project_target": self.project_target,
             "successful_projects": len(state["prior_outcomes"]),
+            "completed_attempts": self._completed_attempts(state),
             "failed_projects": len(state.get("failed_outcomes", [])),
             "curriculum_memory": self._curriculum_memory(state),
             "unverified_projects": sum(row["status"] == "unverified" for row in pending["projects"]) if pending else 0,
@@ -480,6 +485,10 @@ class AdaptivePhase1Coordinator:
                    if row["verified"]
                    for focus in row["spec"].get("learning_focus", ())}
         return [focus for focus in LEARNING_FOCI if focus not in covered]
+
+    @staticmethod
+    def _completed_attempts(state):
+        return len(state["prior_outcomes"]) + len(state.get("failed_outcomes", []))
 
     @staticmethod
     def _effective_outcomes(state):
