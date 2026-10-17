@@ -46,6 +46,10 @@ class DType(str, Enum):
     FLOAT16 = "float16"
     BFLOAT16 = "bfloat16"
     FLOAT32 = "float32"
+    FLOAT8_E4M3FN = "float8_e4m3fn"
+    FLOAT8_E5M2 = "float8_e5m2"
+    MXFP8_E4M3FN = "mxfp8_e4m3fn"
+    MXFP8_E5M2 = "mxfp8_e5m2"
 
 
 class FailureMode(str, Enum):
@@ -165,6 +169,13 @@ class ProjectSpec:
                 )
         elif any(item.shape != self.shape for item in self.graph.inputs):
             raise ValueError("project shape must agree with every graph input")
+        if self.dtype.value.startswith("mxfp8_") or (
+            self.dtype.value.startswith("float8_") and ProjectOp.MATMUL in operations
+        ):
+            if (len(self.graph.nodes) != 1 or ProjectOp.MATMUL not in operations
+                    or self.graph.nodes[0].operands != tuple(item.name for item in self.graph.inputs)
+                    or Capability.PADDED_TAIL in capabilities):
+                raise ValueError("low-precision Cube requires one ordered matmul without physical padding")
         repairs = Capability.FAILURE_REPAIR in capabilities
         if repairs != (self.failure_mode is not FailureMode.NONE):
             raise ValueError("failure-repair capability and failure mode must agree")
