@@ -375,6 +375,7 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
     class Result:
         status = "done"
         iters = 2
+        turns = 3
         wall_secs = 3.5
 
     def run_attempt(*args, **kwargs):
@@ -400,15 +401,19 @@ def test_core_driver_freezes_generation_and_restricted_nudges(monkeypatch, tmp_p
         assert action in captured["kwargs"]["action_nudge"]
     assert outcome.wall_time_s == 3.5
     assert outcome.tokens is None
+    assert outcome.iterations == 3
 
 
-def test_core_driver_disables_inherited_compaction_without_mutating_config(monkeypatch, tmp_path):
+@pytest.mark.parametrize("compile_probe", [False, True])
+def test_core_driver_disables_inherited_compaction_without_mutating_config(
+    monkeypatch, tmp_path, compile_probe,
+):
     import core.loop as loop
     from config.settings import load
     from core.trace import ArtifactSink
 
     cfg = load(None)
-    cfg.max_iters = 4
+    cfg.max_iters = 2 if compile_probe else 4
     cfg.history_keep_pairs = 1
     cfg.keep_chars = 0
     cfg.fold_batch = 1
@@ -416,7 +421,7 @@ def test_core_driver_disables_inherited_compaction_without_mutating_config(monke
     requests = []
     replies = iter([
         '{"propose":{"text":"first"}}',
-        '{"propose":{"text":"second"}}',
+        '{"compile":{}}' if compile_probe else '{"propose":{"text":"second"}}',
         '{"submit":{}}',
     ])
 
@@ -429,11 +434,14 @@ def test_core_driver_disables_inherited_compaction_without_mutating_config(monke
     outcome = CoreAttemptDriver(object(), cfg, lambda path: ArtifactSink(str(path)))(
         "task", profile=load_a5_model_profile(), workspace=tmp_path,
         context=tmp_path / "context", turn_parser=parse_trial_action,
-        action_executor=lambda action: ActionOutcome("ok", action.kind == "submit"),
+        action_executor=lambda action: ActionOutcome(
+            "ok", action.kind == "submit", budget_exempt=action.kind == "compile",
+        ),
     )
 
     assert outcome.status == "done"
     assert len(requests) == 3
+    assert outcome.iterations == 3
     assert all(request["allow_truncation_retry"] is False for request in requests)
     assert all(request["top_p"] == 1.0 for request in requests)
     assert cfg.history_keep_pairs == 1
@@ -592,7 +600,7 @@ def test_run_feedback_distinguishes_runtime_failure_from_incorrect_output(
     }
 
 
-def _executor(tmp_path, backend):
+def _executor(tmp_path, backend, **kwargs):
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     return TrialActionExecutor(
@@ -601,7 +609,80 @@ def _executor(tmp_path, backend):
         ledger=EvidenceLedger(tmp_path / "evidence.jsonl"),
         knowledge=type("Knowledge", (), {"enabled": False})(),
         profiling=FakeProfile(), profiling_guidance=False,
+        **kwargs,
     )
+
+
+def test_compile_probes_use_separate_finite_budget_and_retained_accounting(tmp_path):
+    backend = FakeBackend()
+    executor = _executor(
+        tmp_path, backend, max_actions=2, unmetered_compile_probes=2,
+    )
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+
+    first = executor(parse_trial_action('{"compile":{}}'))
+    second = executor(parse_trial_action('{"compile":{}}'))
+    exhausted = executor(parse_trial_action('{"compile":{}}'))
+
+    assert first.budget_exempt and second.budget_exempt
+    assert exhausted.terminal and exhausted.status == "safety_ceiling"
+    assert exhausted.budget_exempt
+    assert json.loads(exhausted.observation) == {
+        "error": "compile probe budget exhausted"
+    }
+    assert len(backend.compiles) == 2
+    assert executor.actions == 1
+    assert executor.compile_probes == 3
+    budgets = [
+        entry.payload["budget"]
+        for entry in EvidenceLedger(tmp_path / "evidence.jsonl").entries
+    ]
+    assert budgets[-1] == {
+        "ordinary_used": 1,
+        "ordinary_limit": 2,
+        "compile_probes_used": 3,
+        "compile_probe_limit": 2,
+        "ordinary_budget_exempt": True,
+    }
+
+
+def test_compile_probes_remain_metered_by_default(tmp_path):
+    executor = _executor(tmp_path, FakeBackend(), max_actions=1)
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    exhausted = executor(parse_trial_action('{"compile":{}}'))
+
+    assert exhausted.terminal and exhausted.status == "safety_ceiling"
+    assert not exhausted.budget_exempt
+    assert executor.compile_probes == 0
+    assert json.loads(exhausted.observation) == {"error": "action budget exhausted"}
+
+
+def test_rejected_source_compile_still_consumes_one_compile_probe(tmp_path):
+    class RejectingBackend(FakeBackend):
+        def compile(self, workspace, language, attempt_id):
+            raise ValueError("invalid candidate source")
+
+    executor = _executor(
+        tmp_path, RejectingBackend(), unmetered_compile_probes=1,
+    )
+    executor(parse_trial_action(
+        '{"write":{"slot":"kernel","content":"agent source"}}'))
+    rejected = executor(parse_trial_action('{"compile":{}}'))
+    exhausted = executor(parse_trial_action('{"compile":{}}'))
+
+    assert rejected.budget_exempt
+    assert json.loads(rejected.observation)["host"]["status"] == (
+        "source-validation-error"
+    )
+    assert exhausted.terminal
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+def test_compile_probe_limit_must_be_a_positive_integer(tmp_path, value):
+    with pytest.raises(ValueError, match="unmetered_compile_probes"):
+        _executor(tmp_path, FakeBackend(), unmetered_compile_probes=value)
 
 
 @pytest.mark.parametrize("action", ["compile", "run", "submit"])
@@ -736,7 +817,7 @@ def test_no_kdb_catlass_opening_specifies_executable_contract():
     assert "does not establish correctness for other logical lengths" in contract["shape"]
     assert "[1, 400]" not in instruction and "448" not in instruction
     assert "gm_a[i] + gm_b[i]" in contract["output"]
-    assert "host evaluates all P output elements including the zero-padded tail" in contract["output"]
+    assert "host evaluates all 64 output elements including the zero-padded tail" in contract["output"]
     assert "1e-5" in contract["correctness"]
     assert "import catlass.tla as tla" in contract["source"]
     assert "block_num=1" in contract["runtime"]

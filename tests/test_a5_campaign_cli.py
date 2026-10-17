@@ -379,6 +379,26 @@ def test_until_complete_reconciles_again_after_bounded_poll(monkeypatch, capsys)
     ]
 
 
+def test_campaign_forwards_compile_probe_limit_only_to_phase1_workers():
+    args = type("Args", (), {
+        "gate": Path("/gate"), "guide": Path("/guide"),
+        "phase1_root": Path("/p1"), "phase2_root": Path("/p2"),
+        "tla_root": Path("/tla"), "profiling_skill_root": Path("/profile"),
+        "catlass_source": "/remote/catlass", "bge_cache": Path("/bge"),
+        "kdb": Path("/kdb"), "collection": "catlass", "env_file": None,
+        "phase2_guide": None, "phase2_cpl_skills_revision": None,
+        "compile_probes": 8,
+    })()
+    destination = type("Destination", (), {"cell_id": "p2-a"})()
+    command = run_a5_campaign._command_factory(args, (destination,))
+
+    phase1 = command(Job(JobKind.PHASE1_RUN, "p1-a"), 2)
+    phase2 = command(Job(JobKind.PHASE2_QUALIFY, "p2-a"), 3)
+
+    assert phase1[-2:] == ("--compile-probes", "8")
+    assert "--compile-probes" not in phase2
+
+
 def test_until_complete_retries_inventory_unavailability_without_scheduling(
     monkeypatch, capsys,
 ):
