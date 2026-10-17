@@ -335,6 +335,8 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
 
 
 def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_path):
+    from dataclasses import replace
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
     from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
     from test_ascend_phase2_curriculum import snapshot, project
@@ -345,7 +347,14 @@ def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_pa
         return _wave(messages[-1]["content"], [project(len(calls))])
     def execute(request):
         executions.append(request)
-        return _result(request.spec, len(executions) > 1, "host outcome")
+        result = _result(request.spec, len(executions) > 1, "host outcome")
+        objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
+        source = objects.put_bytes(b"retained candidate source")
+        evidence = objects.put_bytes(result.evidence_payload)
+        memory = replace(result.memory, source_revision=source,
+            host_facts=tuple(replace(fact, evidence_sha256=evidence) for fact in result.memory.host_facts),
+            admitted_artifact_sha256=(evidence,), lessons=(), no_new_knowledge=True)
+        return replace(result, memory=memory)
     root = tmp_path / "phase2"
     coordinator = AdaptivePhase2Coordinator(root, "Learn from failures and success", snapshot(),
         CurriculumAgent(select), execute, project_target=1)

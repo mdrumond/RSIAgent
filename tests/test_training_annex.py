@@ -73,6 +73,106 @@ def test_missing_cas_and_publication_are_explicit(campaign):
         "missing-or-corrupt-object", "missing-wave-publication"}
 
 
+@pytest.fixture
+def adaptive_campaign(tmp_path):
+    from dataclasses import replace
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from benchmarks.a5kernels.phase1_memory import HostFact
+    from tests.test_a5_phase1_adaptive import _project, _result, _wave, SEED
+
+    root = tmp_path / "adaptive"
+    root.mkdir()
+    (root / "initial-memory.bin").write_bytes(SEED)
+    count = 0
+    def complete(messages):
+        nonlocal count
+        count += 1
+        spec = _project(f"project-{count}", "gm-ub-movement")
+        spec["learning_focus"] = ["pipe-mte2" if count == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [spec])
+    def execute(request):
+        objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
+        source = objects.put_bytes(b"source")
+        host = objects.put_bytes(b"host verification")
+        annex = objects.put_bytes(b"extra admitted evidence")
+        result = _result(request.spec, True, "verified")
+        return replace(result, memory=replace(result.memory, source_revision=source,
+            host_facts=(HostFact("host-verification", "host passed", host),),
+            lessons=(), no_new_knowledge=True, admitted_artifact_sha256=(annex,),
+            artifact_store="artifacts"))
+    AdaptivePhase1Coordinator(root, "Learn pipes", SEED, CurriculumAgent(complete),
+                             execute, max_parallel=1, project_target=2).run()
+    assert inventory_campaign(root)["complete"]
+    return root
+
+
+@pytest.mark.parametrize("payload", [b"source", b"host verification", b"extra admitted evidence"])
+@pytest.mark.parametrize("mutation", ["remove", "corrupt"])
+def test_memory_only_cas_references_are_required(adaptive_campaign, tmp_path, payload, mutation):
+    digest = hashlib.sha256(payload).hexdigest()
+    obj = adaptive_campaign / "waves/wave-001/branches/project-1/artifacts/objects" / digest[:2] / digest[2:]
+    if mutation == "remove":
+        obj.unlink()
+    else:
+        obj.write_bytes(b"corrupt")
+    issues = inventory_campaign(adaptive_campaign)["issues"]
+    assert any(issue["kind"] == "missing-or-corrupt-object" and issue["sha256"] == digest for issue in issues)
+    with pytest.raises(ValueError, match="incomplete"):
+        package_campaign(adaptive_campaign, tmp_path / "incomplete.tar.gz")
+
+
+@pytest.mark.parametrize("mutation", ["memory", "outcome", "order", "seed", "chain"])
+def test_adaptive_state_is_bound_to_published_chain(adaptive_campaign, mutation):
+    state = json.loads((adaptive_campaign / "state.json").read_bytes())
+    if mutation == "memory":
+        state["memory_bytes_base64"] = state["memory_bytes_base64"][::-1]
+    elif mutation == "outcome":
+        state["prior_outcomes"][0]["summary"] = "stale summary"
+    elif mutation == "order":
+        state["completed_waves"].reverse()
+    elif mutation == "seed":
+        (adaptive_campaign / "initial-memory.bin").write_bytes(b"wrong seed")
+    else:
+        # Even an internally self-consistent second-wave publication cannot
+        # replace its authoritative pre-wave snapshot with a stale one.
+        plan = adaptive_campaign / "waves/wave-002/plan.json"
+        value = json.loads(plan.read_bytes())
+        value["wave"]["pre_wave_memory_sha256"] = "f" * 64
+        plan.write_text(json.dumps(value))
+    write(adaptive_campaign, "state.json", state)
+    assert "invalid-adaptive-memory-chain" in {issue["kind"] for issue in inventory_campaign(adaptive_campaign)["issues"]}
+
+
+def test_legacy_campaign_without_seed_reports_missing_seed_not_false_chain_mismatch(adaptive_campaign):
+    (adaptive_campaign / "initial-memory.bin").unlink()
+    kinds = {issue["kind"] for issue in inventory_campaign(adaptive_campaign)["issues"]}
+    assert kinds == {"missing-initial-memory"}
+
+
+def test_adaptive_archive_keeps_memory_only_objects_without_mutating_evidence(adaptive_campaign, tmp_path):
+    before = {path: path.read_bytes() for path in adaptive_campaign.rglob("*") if path.is_file()}
+    destination = tmp_path / "adaptive.tar.gz"
+    assert package_campaign(adaptive_campaign, destination)["complete"]
+    with tarfile.open(destination) as archive:
+        for path, payload in before.items():
+            assert archive.extractfile("campaign/" + path.relative_to(adaptive_campaign).as_posix()).read() == payload
+    assert all(path.read_bytes() == payload for path, payload in before.items())
+
+
+def test_consolidated_memory_cannot_disagree_with_ordered_deltas(campaign):
+    path = campaign / "waves/wave-001/consolidated-memory.json"
+    value = json.loads(path.read_bytes())
+    value["deltas"][0]["memory_delta_hex"] = b"wrong delta".hex()
+    path.write_text(json.dumps(value))
+    publication = campaign / "waves/wave-001/published.json"
+    value = json.loads(publication.read_bytes())
+    value["consolidated_memory_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    publication.write_text(json.dumps(value))
+    assert "invalid-wave-publication" in {issue["kind"] for issue in inventory_campaign(campaign)["issues"]}
+
+
 def test_pending_requires_explicit_checkpoint_and_never_overwrites(campaign, tmp_path):
     write(campaign, "pending.json", {"wave": "wave-002"})
     target = tmp_path / "checkpoint.tar.gz"

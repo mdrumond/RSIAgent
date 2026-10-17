@@ -6,6 +6,7 @@ Remote report descriptors are consumed by a separate transport worker.
 from __future__ import annotations
 
 import hashlib
+import base64
 import io
 import json
 from pathlib import Path
@@ -137,10 +138,20 @@ def _verify_wave(root, *, closed_failure=False):
         return
     consolidation = consolidate_wave(wave, tuple(outcomes))
     from dataclasses import asdict
+    consolidated = read(root / "consolidated-memory.json")
+    expected_memory = {
+        "schema": "a5-phase1-consolidated-memory-v1",
+        "pre_wave_memory_sha256": wave.pre_wave_memory_sha256,
+        "deltas": [{"project_id": commit.project_id,
+                    "memory_delta_hex": (root / "branches" / commit.project_id
+                                         / "memory-delta.bin").read_bytes().hex()}
+                   for commit in consolidation.commits],
+    }
     if (publication["wave_id"] != wave.wave_id
             or publication["wave_fingerprint"] != wave.fingerprint
             or publication["pre_wave_memory_sha256"] != wave.pre_wave_memory_sha256
             or publication["commits"] != [asdict(c) for c in consolidation.commits]
+            or consolidated != expected_memory
             or publication["consolidated_memory_sha256"] != _sha(
                 (root / "consolidated-memory.json").read_bytes())):
         raise ValueError("publication differs from retained committed evidence")
@@ -161,6 +172,53 @@ def _verify_memory_attempt(root, relative, memory):
             or memory["candidate_sha256"] != _sha(source.read_bytes())
             or memory["passed"] is not evidence["passed"]):
         raise ValueError("committed memory differs from retained attempt")
+
+
+def _project_memory(branch):
+    """Decode adaptive deltas without treating legacy opaque deltas as JSON."""
+    from benchmarks.a5kernels.phase1_adaptive import DELTA_SCHEMA
+    from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+    try:
+        delta = json.loads((branch / "memory-delta.bin").read_bytes())
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(delta, dict) or delta.get("schema") != DELTA_SCHEMA:
+        return None
+    memory = Phase1ProjectMemory.from_mapping(json.loads(
+        base64.b64decode(delta["memory_base64"], validate=True)))
+    return delta, memory
+
+
+def _verify_adaptive_state(root, state):
+    """Bind the published state to ordered deltas and every pre-wave snapshot."""
+    from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    seed = root / "initial-memory.bin"
+    initial = seed.read_bytes() if seed.is_file() else None
+    if initial is not None and state["initial_memory_sha256"] != _sha(initial):
+        raise ValueError("initial seed differs from adaptive state")
+    memories, outcomes = [], []
+    for wave_id in state["completed_waves"]:
+        wave_root = root / "waves" / wave_id
+        wave = WaveSpec.from_mapping(json.loads((wave_root / "plan.json").read_bytes())["wave"])
+        if initial is not None:
+            snapshot = {"schema": MEMORY_SCHEMA,
+                        "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
+                        "project_memory_base64": memories}
+            if wave.pre_wave_memory_sha256 != _sha(_json(snapshot)):
+                raise ValueError("published pre-wave memory chain differs")
+        for project in wave.projects:
+            delta, memory = _project_memory(wave_root / "branches" / project.spec.project_id)
+            if (delta["project_id"] != project.spec.project_id
+                    or memory.project_spec != project.spec
+                    or _json(memory.as_dict()) != base64.b64decode(delta["memory_base64"], validate=True)):
+                raise ValueError("published memory differs from project")
+            memories.append(delta["memory_base64"])
+            outcomes.append({"project_id": project.spec.project_id,
+                             "spec": project.spec.as_dict(), "verified": True,
+                             "summary": delta["summary"]})
+    if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
+        raise ValueError("adaptive state differs from ordered published deltas")
 
 
 def inventory_campaign(root, *, artifact_store=None):
@@ -244,7 +302,33 @@ def inventory_campaign(root, *, artifact_store=None):
                 _verify_wave(root / "waves" / wave)
             except (OSError, ValueError, KeyError, TypeError):
                 issues.append({"kind": "invalid-wave-publication", "wave": wave})
+    from benchmarks.a5kernels.phase1_adaptive import STATE_SCHEMA
+    if state.get("schema") == STATE_SCHEMA:
+        # Phase 2 uses its separately authenticated reviewed snapshot as seed;
+        # this file is the Phase 1 launcher's portable seed convention.
+        if state.get("phase") != "adaptive-phase2" and not (root / "initial-memory.bin").is_file():
+            issues.append({"kind": "missing-initial-memory"})
+        try:
+            _verify_adaptive_state(root, state)
+        except (OSError, ValueError, KeyError, TypeError):
+            issues.append({"kind": "invalid-adaptive-memory-chain"})
     for relative in documents:
+        if relative.startswith("waves/") and relative.endswith("/outcome.json"):
+            branch = (root / relative).parent
+            try:
+                decoded = _project_memory(branch)
+                if decoded is not None:
+                    _, memory = decoded
+                    digests = {memory.source_revision, *memory.admitted_artifact_sha256,
+                               *(fact.evidence_sha256 for fact in memory.host_facts)}
+                    objects = branch / (memory.artifact_store or "artifacts") / "objects"
+                    for digest in sorted(digests):
+                        obj = objects / digest[:2] / digest[2:]
+                        if not obj.is_file() or _sha(obj.read_bytes()) != digest:
+                            issues.append({"kind": "missing-or-corrupt-object",
+                                           "origin": relative, "sha256": digest})
+            except (OSError, ValueError, KeyError, TypeError):
+                issues.append({"kind": "invalid-project-memory", "origin": relative})
         if relative.startswith("waves/") and relative.endswith("/plan.json"):
             if relative.split("/")[1] not in state.get("completed_waves", []):
                 wave_root = relative.rsplit("/", 1)[0]
