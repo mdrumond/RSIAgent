@@ -89,7 +89,10 @@ def _published_evidence(root, state, initial):
             "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
             "project_memory_base64": published,
         })
-        reader = LiveWaveCoordinator(wave_root, wave, pre_memory, lambda _: None, 1)
+        reader = LiveWaveCoordinator(
+            wave_root, wave, pre_memory, lambda _: None, 1,
+            allow_semantic_failures=True,
+        )
         reader.read_published_memory()  # authenticates outcomes and both evidence digests
         for name in ("plan.json", "published.json", "consolidated-memory.json"):
             files[f"waves/{wave_id}/{name}"] = (wave_root / name).read_bytes()

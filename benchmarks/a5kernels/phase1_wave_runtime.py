@@ -334,7 +334,7 @@ class LiveWaveCoordinator:
                 for assignment in self.wave.assignments()
                 if (outcome := self._load_outcome(assignment)) is not None
             ),
-            allow_semantic_failures=bool(value.get("skipped_projects")),
+            allow_semantic_failures=self.allow_semantic_failures,
         )
         skipped = [assignment.project_id for assignment in self.wave.assignments()
                    if not self._load_outcome(assignment).verified]
