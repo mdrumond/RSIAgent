@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from copy import deepcopy
 import json
+import logging
 import math
 import re
 import time
@@ -56,6 +57,7 @@ _DIRECT_VALUES = {
 }
 
 _PROVIDER_TIMEOUT_SECONDS = 120
+_LOGGER = logging.getLogger(__name__)
 _MAX_DISTILLATION_ATTEMPTS = 3
 _MAX_DISTILLATION_ARTIFACT_BYTES = 64_000
 _MAX_DISTILLATION_SINGLE_ARTIFACT_BYTES = 32_000
@@ -238,10 +240,14 @@ class DirectCompletionProvider:
             except ProviderRejectionError as exc:
                 retry = attempt <= self.invalid_prompt_retries
                 delay = self.invalid_prompt_backoff_seconds if retry else 0
+                rejection = {"attempt": attempt, **exc.evidence(),
+                             "request_sha256": request_sha256,
+                             "retry": retry, "backoff_seconds": delay}
+                # Curriculum/KDB callers need diagnostics too, even without an
+                # Actor evidence observer. Never log exception bodies or keys.
+                _LOGGER.warning("provider prompt rejection: %s", json.dumps(rejection, sort_keys=True))
                 if attempt_observer is not None:
-                    attempt_observer("rejection", {"attempt": attempt, **exc.evidence(),
-                                                  "request_sha256": request_sha256,
-                                                  "retry": retry, "backoff_seconds": delay})
+                    attempt_observer("rejection", rejection)
                 if not retry:
                     raise
                 self._sleep(delay)

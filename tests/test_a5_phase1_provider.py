@@ -94,6 +94,32 @@ def test_invalid_prompt_exhaustion_is_noninfra_and_safe():
     assert "secret" not in str(caught.value) + json.dumps(caught.value.evidence())
 
 
+@pytest.mark.parametrize("exhaust", [False, True])
+def test_rejections_are_logged_safely_without_actor_observer(caplog, exhaust):
+    calls = []
+    def transport(**kwargs):
+        calls.append(kwargs["request"])
+        if exhaust or len(calls) == 1:
+            raise PromptRejected("openai-secret deepseek-secret raw body")
+        return DirectCompletion("ordinary response", 1)
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=lambda _: None)
+    if exhaust:
+        with pytest.raises(ProviderRejectionError):
+            provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
+    else:
+        provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
+    logs = [json.loads(record.getMessage().split(": ", 1)[1]) for record in caplog.records
+            if record.name == "benchmarks.a5kernels.phase1_provider"]
+    assert len(logs) == (4 if exhaust else 1)
+    assert [entry["attempt"] for entry in logs] == list(range(1, len(logs) + 1))
+    assert all(entry["code"] == "invalid_prompt" and entry["status_code"] == 400 for entry in logs)
+    assert all(entry["request_id"] == "req_ordinary_123" for entry in logs)
+    assert len({entry["request_sha256"] for entry in logs}) == 1
+    assert logs[-1]["retry"] is not exhaust
+    assert logs[-1]["backoff_seconds"] == (0 if exhaust else 120)
+    assert "secret" not in caplog.text and "raw body" not in caplog.text
+
+
 @pytest.mark.parametrize("code,status", [("invalid_schema", 400), ("invalid_prompt", 401),
                                         ("context_length_exceeded", 400)])
 def test_other_provider_rejections_are_not_retried(code, status):
