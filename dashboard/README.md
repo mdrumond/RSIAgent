@@ -1,7 +1,8 @@
 # RSI campaign dashboard
 
-This directory is an independent, read-only viewer for retained Phase 1 and
-Phase 2 campaign artifacts. It never imports campaign execution code. Copy
+This directory is an independent viewer for retained Phase 1 and Phase 2
+campaign artifacts. Campaign controls are disabled unless explicitly configured,
+and the dashboard never imports campaign execution code. Copy
 `config.example.json`, point each root at a locally mounted or synchronized
 campaign directory, then run:
 
@@ -16,3 +17,21 @@ is slow or temporarily unavailable, requests continue serving the last good
 snapshot and label it stale. Source is read only through the content-addressed
 digests retained by each project; unavailable source is reported rather than
 guessed.
+
+## Optional campaign controls
+
+Set `controls.enabled` to `true` only for a loopback listener. Each preset is a
+complete server-side A3 launch definition; browser requests can select a preset
+but cannot supply paths, commands, environment variables, targets, or arbitrary
+arguments. The runner is invoked without a shell. Phase 2 presets additionally
+require `phase1_root` and `review`.
+
+Mutation requests require the page's CSRF token, an explicit confirmation, and
+an idempotency key. They are serialized by one background worker and persisted
+in the same SQLite WAL database as the read cache. A dashboard restart marks an
+in-flight operation interrupted rather than submitting it again. The retained
+campaign approval record remains authoritative for a deliberate retry.
+
+The proposal view exposes the hypothesis plus deterministic novelty and coverage
+comparisons. Provider messages and hidden reasoning are never copied into the
+cache or API response.

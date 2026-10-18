@@ -1,7 +1,21 @@
 {% extends "base.html" %}{% block body %}
 <div class="eyebrow">A3 RESEARCH LOOP</div><h1>Campaign control room</h1>
-<p class="lede">A cached, read-only view of curriculum progress, evidence and evolving kernel source.</p>
+<p class="lede">A cached view of curriculum progress, evidence and evolving kernel source.</p>
 {% if view.stale %}<aside class="warning">Artifact refresh failed. Showing the last cached snapshot.</aside>{% endif %}
+{% if controls.enabled %}<section class="control-panel"><h2>Campaign controls</h2>
+<p>Actions run asynchronously. Confirm each operation before it is queued.</p>
+<div class="control-actions">{% for preset in controls.presets.values() %}
+<button data-action="start" data-subject="{{ preset.id }}" data-preset-id="{{ preset.id }}">Start phase {{ preset.phase }}</button>{% endfor %}
+{% for campaign_id, campaign in controls.campaigns.items() %}
+<button data-action="sample" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Sample {{ campaign.name or ('Phase ' ~ campaign.phase) }}</button>{% endfor %}</div>
+{% for proposal in proposals %}<article class="proposal"><div class="row"><h3>{{ proposal.campaign_id }} proposal</h3><span class="status {{ proposal.status }}">{{ proposal.status }}</span></div>
+<form data-proposal-form data-campaign-id="{{ proposal.campaign_id }}" data-proposal-id="{{ proposal.proposal_id }}">
+{% for project in proposal.projects %}<label class="proposal-project"><input type="checkbox" name="project_id" value="{{ project.project_id }}">
+<span><b>{{ project.project_id }}</b> — {{ project.hypothesis }}<small>{{ project.novelty_summary }}{% if project.new_coverage %}; new coverage: {{ project.new_coverage|join(', ') }}{% endif %}</small></span></label>{% endfor %}
+{% if proposal.status == 'proposed' %}<button data-proposal-action="approve">Approve selected</button><button data-proposal-action="reject">Reject</button>{% endif %}
+{% if proposal.status == 'approved' %}<button data-proposal-action="run-approved">Run approved</button>{% endif %}</form></article>{% endfor %}
+<div id="operation-status">{% for operation in operations %}<p class="operation {{ operation.status }}"><b>{{ operation.action }}</b> {{ operation.status }}{% if operation.error %}: {{ operation.error }}{% endif %}</p>{% endfor %}</div>
+</section>{% endif %}
 <section class="grid">{% for campaign in view.campaigns %}<a class="card" href="{{ url_for('phase_page', number=campaign.phase) }}">
 <div class="row"><span class="tag">PHASE {{ campaign.phase }}</span><span class="status {{ campaign.worker.status if campaign.worker else 'idle' }}">{{ campaign.worker.status if campaign.worker else 'idle' }}</span></div>
 <h2>{{ campaign.name }}</h2><div class="metrics"><b>{{ campaign.stats.attempted }}</b><span>attempted</span><b>{{ campaign.stats.verified }}</b><span>verified</span><b>{{ campaign.stats.published }}</b><span>published</span></div>

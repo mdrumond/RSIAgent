@@ -1,0 +1,20 @@
+.control-panel {
+  margin: 24px 0;
+  padding: 20px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+}
+.control-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+.control-panel button {
+  padding: 8px 12px;
+  border: 0;
+  background: var(--cyan);
+  color: #071017;
+  font-weight: 700;
+  cursor: pointer;
+}
+.proposal { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.proposal-project { display: flex; gap: 10px; margin: 10px 0; }
+.proposal-project small { display: block; }
+.operation.failed { color: #ff8c78; }
+.operation.succeeded { color: var(--cyan); }

@@ -1,1 +1,14 @@
-{"campaigns":[{"phase":1,"name":"A3 Phase 1","root":"/path/to/phase1/campaign","control":"/path/to/phase1/control"},{"phase":2,"name":"A3 Phase 2","root":"/path/to/phase2/campaign","control":"/path/to/phase2/control"}]}
+{
+  "campaigns": [
+    {"id": "phase1", "phase": 1, "name": "A3 Phase 1", "root": "/path/to/phase1/campaign", "control": "/path/to/phase1/control"},
+    {"id": "phase2", "phase": 2, "name": "A3 Phase 2", "root": "/path/to/phase2/campaign", "control": "/path/to/phase2/control"}
+  ],
+  "controls": {
+    "enabled": false,
+    "runner": "/path/to/RSIAgent/run_ascend_campaign.py",
+    "presets": [
+      {"id": "phase1", "phase": 1, "root": "/path/to/new-phase1", "control": "/path/to/new-phase1-control", "config": "/path/to/runtime.json", "initial_memory": "/path/to/initial-memory.bin", "objective": "Learn A3 kernels", "project_target": 64},
+      {"id": "phase2", "phase": 2, "root": "/path/to/new-phase2", "control": "/path/to/new-phase2-control", "config": "/path/to/runtime.json", "initial_memory": "/path/to/initial-memory.bin", "objective": "Extend reviewed A3 learning", "project_target": 1, "phase1_root": "/path/to/reviewed-phase1", "review": "/path/to/review.json"}
+    ]
+  }
+}

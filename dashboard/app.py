@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
+import secrets
 import time
 
-from flask import Flask, abort, jsonify, render_template
+from flask import Flask, abort, jsonify, render_template, request
 from markupsafe import Markup
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import CppLexer, DiffLexer
 
 from .store import DashboardStore
+from .control import ControlError, ControlManager
 
 
-def create_app(config_path, cache_path, *, refresh_seconds=30):
+def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None):
     app = Flask(__name__)
     store = DashboardStore(config_path, cache_path)
+    controls = ControlManager(config_path, cache_path, **(
+        {"runner": command_runner} if command_runner is not None else {}))
+    app.extensions["dashboard_controls"] = controls
+    csrf_token = secrets.token_urlsafe(32)
     last = [0.0]
 
     def view():
@@ -33,7 +39,9 @@ def create_app(config_path, cache_path, *, refresh_seconds=30):
 
     @app.get("/")
     def index():
-        return render_template("index.html", view=view())
+        return render_template("index.html", view=view(), controls=controls,
+                               proposals=controls.proposals() if controls.enabled else [],
+                               operations=controls.recent(), csrf_token=csrf_token)
 
     @app.get("/phase/<int:number>")
     def phase_page(number):
@@ -56,6 +64,34 @@ def create_app(config_path, cache_path, *, refresh_seconds=30):
 
     @app.get("/api/status")
     def api_status():
-        return jsonify(view())
+        result = view()
+        if controls.enabled:
+            result = {**result, "controls": {"proposals": controls.proposals(),
+                                              "operations": controls.recent()}}
+        return jsonify(result)
+
+    @app.get("/api/csrf")
+    def api_csrf():
+        return jsonify({"token": csrf_token})
+
+    @app.get("/api/operations/<operation_id>")
+    def api_operation(operation_id):
+        operation = controls.operation(operation_id)
+        return jsonify(operation) if operation else abort(404)
+
+    @app.post("/api/control/<action>")
+    def api_control(action):
+        if not controls.enabled:
+            abort(403)
+        if not secrets.compare_digest(request.headers.get("X-CSRF-Token", ""), csrf_token):
+            abort(403)
+        try:
+            operation_id = controls.enqueue(action, request.get_json(silent=True) or {},
+                                             request.headers.get("Idempotency-Key"))
+        except PermissionError:
+            abort(403)
+        except (ControlError, KeyError, TypeError) as error:
+            return jsonify({"error": str(error)}), 409
+        return jsonify({"operation_id": operation_id}), 202
 
     return app
