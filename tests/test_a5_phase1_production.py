@@ -486,3 +486,15 @@ def test_cli_retries_live_dependency_preflight(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["status"] == (
         "complete-with-pending-treatments"
     )
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_cli_rejects_nonpositive_compile_probe_limit(value):
+    with pytest.raises(SystemExit):
+        run_a5_phase1._parser().parse_args([
+            "run", "--gate", "gate", "--guide", "guide", "--root", "root",
+            "--tla-root", "tla", "--profiling-skill-root", "profile",
+            "--catlass-source", "/remote/catlass", "--bge-cache", "cache",
+            "--kdb", "kdb", "--collection", "catlass", "--device", "0",
+            "--compile-probes", value,
+        ])

@@ -51,6 +51,7 @@ class ActionOutcome:
     terminal: bool = False
     status: str = "done"
     admitted_artifacts: Mapping[str, str] = dataclass_field(default_factory=dict)
+    budget_exempt: bool = False
 
 
 def parse_trial_action(text: str) -> TrialAction | None:
@@ -201,7 +202,12 @@ class CoreAttemptDriver:
         cfg.history_keep_pairs = 0
         def execute(action):
             outcome = action_executor(action)
-            return DomainActionResult(outcome.observation, outcome.terminal, outcome.status)
+            return DomainActionResult(
+                outcome.observation,
+                outcome.terminal,
+                outcome.status,
+                budget_exempt=outcome.budget_exempt,
+            )
 
         result, _ = run_attempt(
             instruction, self.vm, cfg, self.sink_factory(context),
@@ -212,7 +218,7 @@ class CoreAttemptDriver:
         )
         return ActorOutcome(
             result.status,
-            result.iters,
+            result.turns,
             wall_time_s=result.wall_secs,
         )
 
@@ -224,7 +230,9 @@ _SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON obj
 {"request-sanitizer":{"tool":"memcheck"}}, or {"submit":{}}.
 Diagnostic actions are bound by adaptive projects; sanitizer tool can also be racecheck,
 initcheck, or synccheck. Diagnostic observations never establish correctness or timing.
-You cannot choose paths or commands and cannot report a score or authoritative result."""
+You cannot choose paths or commands and cannot report a score or authoritative result.
+Compile checks source with the host compiler only; it never launches the kernel or
+establishes runtime or numerical correctness."""
 
 _ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
 compile, run, query-knowledge, request-profile, request-timing, request-debug,
@@ -299,18 +307,34 @@ class TrialActionExecutor:
                  knowledge: KnowledgeAgent, profiling: ProfileEvaluation,
                  profiling_guidance: bool,
                  max_actions: int = 40, max_source_bytes: int = 128_000,
+                 unmetered_compile_probes: int | None = None,
                  artifacts: ContentAddressedArtifacts | None = None):
+        if type(max_actions) is not int or max_actions < 1:
+            raise ValueError("max_actions must be a positive integer")
+        if (
+            unmetered_compile_probes is not None
+            and (
+                type(unmetered_compile_probes) is not int
+                or unmetered_compile_probes < 1
+            )
+        ):
+            raise ValueError(
+                "unmetered_compile_probes must be a positive integer or None"
+            )
         self.workspace, self.language, self.workload = workspace, language, workload
         self.backend, self.ledger = backend, ledger
         self.knowledge, self.profiling = knowledge, profiling
         self.profiling_guidance = profiling_guidance
         self.max_actions, self.max_source_bytes = max_actions, max_source_bytes
+        self.unmetered_compile_probes = unmetered_compile_probes
         self.artifacts = artifacts
         # The same source can recur across cells and determinism repeats. BZ
         # sessions use attempt IDs, so local workspace isolation must reach them.
         self._attempt_namespace = hashlib.sha256(
             str(workspace.resolve()).encode("utf-8")).hexdigest()[:24]
         self.actions = 0
+        self.total_actions = 0
+        self.compile_probes = 0
         self.latest_run: CandidateRun | None = None
         self.final_run: CandidateRun | None = None
         self.final_profile: Mapping[str, object] | None = None
@@ -319,29 +343,53 @@ class TrialActionExecutor:
     def __call__(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
             raise TypeError("A5 trials accept only TrialAction values")
-        self.actions += 1
-        if self.actions > self.max_actions:
-            return ActionOutcome('{"error":"action budget exhausted"}', True,
-                                 "safety_ceiling")
-        handler = getattr(self, "_" + action.kind.replace("-", "_"))
-        action_value = {"kind": action.kind, "payload": action.payload}
-        action_ref = self.artifacts.put_json(action_value) if self.artifacts else None
+        self.total_actions += 1
+        compile_exempt = (
+            action.kind == "compile" and self.unmetered_compile_probes is not None
+        )
+        if compile_exempt:
+            self.compile_probes += 1
+        else:
+            self.actions += 1
+        exhausted = (
+            self.compile_probes > self.unmetered_compile_probes
+            if compile_exempt else self.actions > self.max_actions
+        )
         action_evidence = {
-            "ordinal": self.actions,
+            "ordinal": self.total_actions,
             "action": action.kind,
             "payload_sha256": hashlib.sha256(
                 json.dumps(action.payload, sort_keys=True).encode()).hexdigest(),
+            "budget": {
+                "ordinary_used": self.actions,
+                "ordinary_limit": self.max_actions,
+                "compile_probes_used": self.compile_probes,
+                "compile_probe_limit": self.unmetered_compile_probes,
+                "ordinary_budget_exempt": compile_exempt,
+            },
         }
+        if exhausted:
+            self.ledger.append(EvidenceKind.ACTION, action_evidence)
+            budget = "compile probe" if compile_exempt else "action"
+            return ActionOutcome(
+                json.dumps({"error": f"{budget} budget exhausted"}),
+                True,
+                "safety_ceiling",
+                budget_exempt=compile_exempt,
+            )
+        handler = getattr(self, "_" + action.kind.replace("-", "_"))
+        action_value = {"kind": action.kind, "payload": action.payload}
+        action_ref = self.artifacts.put_json(action_value) if self.artifacts else None
         if action_ref is not None:
             action_evidence["payload_artifact_sha256"] = action_ref
         self.ledger.append(EvidenceKind.ACTION, action_evidence)
         if action_ref is not None:
-            self._artifact("action-payload", action_ref, ordinal=self.actions)
+            self._artifact("action-payload", action_ref, ordinal=self.total_actions)
             self.admitted_artifacts[action_ref] = "action"
         outcome = handler(action.payload)
         if self.artifacts is not None:
             observation_ref = self.artifacts.put_bytes(outcome.observation.encode("utf-8"))
-            self._artifact("host-observation", observation_ref, ordinal=self.actions)
+            self._artifact("host-observation", observation_ref, ordinal=self.total_actions)
             evidence_kind = action.kind
             try:
                 host = json.loads(outcome.observation).get("host", {})
@@ -352,7 +400,8 @@ class TrialActionExecutor:
             elif action.kind == "request-profile":
                 evidence_kind = "profiling"
             self.admitted_artifacts[observation_ref] = evidence_kind
-        return replace(outcome, admitted_artifacts=dict(self.admitted_artifacts))
+        return replace(outcome, budget_exempt=compile_exempt,
+                       admitted_artifacts=dict(self.admitted_artifacts))
 
     def _propose(self, payload) -> ActionOutcome:
         return self._observation("proposal-recorded", chars=len(payload["text"]))
@@ -371,8 +420,8 @@ class TrialActionExecutor:
                 fromfile="previous/kernel", tofile="candidate/kernel",
             ))
             diff_ref = self.artifacts.put_bytes(difference.encode("utf-8"))
-            self._artifact("candidate-source", source_ref, ordinal=self.actions)
-            self._artifact("candidate-diff", diff_ref, ordinal=self.actions,
+            self._artifact("candidate-source", source_ref, ordinal=self.total_actions)
+            self._artifact("candidate-diff", diff_ref, ordinal=self.total_actions,
                            source_sha256=source_ref)
             self.admitted_artifacts[source_ref] = "source"
             self.admitted_artifacts[diff_ref] = "diff"
@@ -386,7 +435,7 @@ class TrialActionExecutor:
         try:
             result = dict(self.backend.compile(
                 self.workspace, self.language,
-                f"{self._attempt_namespace}-compile-{self.actions}"))
+                f"{self._attempt_namespace}-compile-{self.total_actions}"))
         except ValueError as exc:
             return self._observation("compile", status="source-validation-error",
                                      error=str(exc))
@@ -396,7 +445,7 @@ class TrialActionExecutor:
         if not self._has_source():
             return self._observation("run", error="write kernel source first")
         self.latest_run = None
-        attempt_id = f"{self._attempt_namespace}-candidate-{self.actions}"
+        attempt_id = f"{self._attempt_namespace}-candidate-{self.total_actions}"
         try:
             candidate = self.backend.run(
                 self.workspace, self.language, self.workload,
@@ -632,6 +681,7 @@ class TrialOrchestrator:
         profiling: ProfileEvaluation,
         profiling_guidance: bool,
         ledger: EvidenceLedger,
+        unmetered_compile_probes: int | None = None,
     ) -> TrialResult:
         """Run one host-bound project without the legacy pilot matrix scheduler.
 
@@ -647,11 +697,25 @@ class TrialOrchestrator:
         )
         for path in (workspace, memory, context):
             path.mkdir()
+        request = dict(request_payload)
+        request["trial_budget"] = {
+            "ordinary_action_limit": 40,
+            "unmetered_compile_probes": unmetered_compile_probes,
+        }
+        actor_instruction = instruction
+        if unmetered_compile_probes is not None:
+            actor_instruction += (
+                "\n\nCompile-probe allowance: compile actions do not consume your "
+                "ordinary action budget in this trial. You have exactly "
+                f"{unmetered_compile_probes} compile probe(s); failed or rejected "
+                "compiles consume a probe. Compilation does not launch the kernel "
+                "or establish correctness. Use run and submit for host verification."
+            )
         artifacts = ContentAddressedArtifacts(trial_root / "artifacts")
-        instruction_ref = artifacts.put_bytes(instruction.encode("utf-8"))
+        instruction_ref = artifacts.put_bytes(actor_instruction.encode("utf-8"))
         system_ref = artifacts.put_bytes(_SYSTEM_PROMPT.encode("utf-8"))
         ledger.append(EvidenceKind.REQUEST, {
-            **dict(request_payload), "instruction_artifact_sha256": instruction_ref,
+            **request, "instruction_artifact_sha256": instruction_ref,
         })
         ledger.append(EvidenceKind.ARTIFACT, {
             "role": "actor-instruction", "sha256": instruction_ref,
@@ -668,10 +732,11 @@ class TrialOrchestrator:
             knowledge=knowledge,
             profiling=profiling,
             profiling_guidance=profiling_guidance,
+            unmetered_compile_probes=unmetered_compile_probes,
             artifacts=artifacts,
         )
         outcome = actor(
-            instruction,
+            actor_instruction,
             profile=profile,
             workspace=workspace,
             context=context,

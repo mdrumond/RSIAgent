@@ -506,12 +506,17 @@ class DomainActionResult:
     prevents a domain adapter from inventing states the outer lifecycle cannot
     classify.  The executor, rather than core, owns domain-specific persistence and
     evidence because core must not know the action schema.
+
+    ``budget_exempt`` is an opt-in accounting signal for an adapter that enforces
+    and retains its own finite allowance. It never exempts provider usage or wall
+    time, and must remain false when no separate bounded domain budget exists.
     """
 
     observation: str
     terminal: bool = False
     status: str = "done"
     candidate_progress: bool = True
+    budget_exempt: bool = False
 
 
 def _validate_domain_action_result(value) -> DomainActionResult:
@@ -525,6 +530,8 @@ def _validate_domain_action_result(value) -> DomainActionResult:
         raise TypeError("DomainActionResult.terminal must be a bool")
     if type(value.candidate_progress) is not bool:
         raise TypeError("DomainActionResult.candidate_progress must be a bool")
+    if type(value.budget_exempt) is not bool:
+        raise TypeError("DomainActionResult.budget_exempt must be a bool")
     if value.terminal and value.status not in {
             "done", "evolve", "stalled", "infra", "safety_ceiling"}:
         raise ValueError("invalid terminal domain action status: " + value.status)
@@ -1116,6 +1123,11 @@ def run_attempt(instruction: str, vm, cfg, sink, iters_budget: int = None,
                 raise TypeError(
                     "turn_parser returned a domain action without action_executor")
             outcome = _validate_domain_action_result(action_executor(turn))
+            if outcome.budget_exempt:
+                # The domain adapter owns the separate finite allowance. Core still
+                # records the model call in ``turns`` and retains its provider usage,
+                # but the action does not consume the ordinary semantic-action budget.
+                res.iters -= 1
             log.info("iter %d: domain action (%s) -> %s", res.iters,
                      type(turn).__name__,
                      "terminal " + outcome.status if outcome.terminal else "observation")

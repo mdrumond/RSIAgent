@@ -315,6 +315,8 @@ def test_domain_action_without_executor_fails_closed(monkeypatch, tmp_path):
         (loop.DomainActionResult("x", terminal=1), "terminal must be a bool"),
         (loop.DomainActionResult("x", candidate_progress="false"),
          "candidate_progress must be a bool"),
+        (loop.DomainActionResult("x", budget_exempt=1),
+         "budget_exempt must be a bool"),
         (loop.DomainActionResult("x", terminal=True, status="passed"),
          "invalid terminal domain action status"),
     ],
@@ -339,3 +341,29 @@ def test_default_path_still_uses_original_parser(monkeypatch, tmp_path):
 
     assert result.status == "done"
     assert seen == ['{"done":null}']
+
+
+def test_budget_exempt_domain_action_preserves_ordinary_iteration_budget(
+    monkeypatch, tmp_path,
+):
+    cfg = _cfg()
+    cfg.max_iters = 1
+    replies = iter(["compile", "submit"])
+
+    monkeypatch.setattr(loop, "chat", lambda *_args, **_kwargs: next(replies))
+    result, _ = loop.run_attempt(
+        "author a kernel",
+        VM(),
+        cfg,
+        ArtifactSink(str(tmp_path)),
+        turn_parser=lambda text: KernelAction(text),
+        action_executor=lambda action: loop.DomainActionResult(
+            "trusted result",
+            terminal=action.kind == "submit",
+            budget_exempt=action.kind == "compile",
+        ),
+    )
+
+    assert result.status == "done"
+    assert result.iters == 1
+    assert result.turns == 2
