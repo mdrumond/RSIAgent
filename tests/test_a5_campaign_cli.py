@@ -379,7 +379,7 @@ def test_until_complete_reconciles_again_after_bounded_poll(monkeypatch, capsys)
     ]
 
 
-def test_campaign_forwards_compile_probe_limit_only_to_phase1_workers():
+def test_campaign_forwards_compile_probe_limit_to_both_phase_workers():
     args = type("Args", (), {
         "gate": Path("/gate"), "guide": Path("/guide"),
         "phase1_root": Path("/p1"), "phase2_root": Path("/p2"),
@@ -396,7 +396,11 @@ def test_campaign_forwards_compile_probe_limit_only_to_phase1_workers():
     phase2 = command(Job(JobKind.PHASE2_QUALIFY, "p2-a"), 3)
 
     assert phase1[-2:] == ("--compile-probes", "8")
-    assert "--compile-probes" not in phase2
+    assert phase2[phase2.index("--compile-probes") + 1] == "8"
+
+    args.compile_probes = None
+    assert "--compile-probes" not in command(Job(JobKind.PHASE1_RUN, "p1-a"), 2)
+    assert "--compile-probes" not in command(Job(JobKind.PHASE2_QUALIFY, "p2-a"), 3)
 
 
 def test_until_complete_retries_inventory_unavailability_without_scheduling(

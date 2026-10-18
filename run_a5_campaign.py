@@ -43,7 +43,6 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--runtime-catlass-revision")
     reconcile.add_argument("--phase2-guide", type=Path)
     reconcile.add_argument("--phase2-cpl-skills-revision")
-    reconcile.add_argument("--compile-probes", type=int, default=0, metavar="N")
     reconcile.add_argument("--collection", required=True)
     reconcile.add_argument("--env-file", type=Path)
     reconcile.add_argument(
@@ -51,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
         type=_positive_int,
         metavar="LIMIT",
         help=(
-            "give Phase 1 compile actions a separate positive LIMIT instead of "
+            "give Phase 1 and Phase 2 compile actions a separate positive LIMIT instead of "
             "charging their ordinary agent action budget"
         ),
     )
