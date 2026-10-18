@@ -64,7 +64,8 @@ class ControlManager:
                 key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL,
                 operation_id TEXT NOT NULL REFERENCES operations(id))""")
             db.execute("UPDATE operations SET status='failed', error=?, finished=? "
-                       "WHERE status='running'", ("operation interrupted by dashboard restart", time.time()))
+                       "WHERE status IN ('queued','running')",
+                       ("operation interrupted by dashboard restart", time.time()))
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rsi-dashboard")
 
     def _db(self):
@@ -78,7 +79,7 @@ class ControlManager:
             campaign = self.campaigns[campaign_id]
         except KeyError as error:
             raise ControlError("unknown campaign") from error
-        if campaign.get("phase") not in (1, 2):
+        if campaign.get("target") != "a3" or campaign.get("phase") not in (1, 2):
             raise ControlError("only A3 Phase 1 and Phase 2 campaigns are allowed")
         return campaign
 
@@ -128,7 +129,7 @@ class ControlManager:
                 preset = self.presets[identifier]
             except KeyError as error:
                 raise ControlError("unknown start preset") from error
-            if preset.get("phase") not in (1, 2):
+            if preset.get("target") != "a3" or preset.get("phase") not in (1, 2):
                 raise ControlError("only A3 Phase 1 and Phase 2 presets are allowed")
             return identifier
         campaign = self._campaign(identifier)

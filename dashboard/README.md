@@ -24,12 +24,14 @@ Set `controls.enabled` to `true` only for a loopback listener. Each preset is a
 complete server-side A3 launch definition; browser requests can select a preset
 but cannot supply paths, commands, environment variables, targets, or arbitrary
 arguments. The runner is invoked without a shell. Phase 2 presets additionally
-require `phase1_root` and `review`.
+require `phase1_root` and `review`. Every controlled campaign and launch preset
+must explicitly set `"target": "a3"`; other targets remain viewable but cannot
+be controlled.
 
 Mutation requests require the page's CSRF token, an explicit confirmation, and
 an idempotency key. They are serialized by one background worker and persisted
 in the same SQLite WAL database as the read cache. A dashboard restart marks an
-in-flight operation interrupted rather than submitting it again. The retained
+queued or in-flight operation interrupted rather than submitting it again. The retained
 campaign approval record remains authoritative for a deliberate retry.
 
 The proposal view exposes the hypothesis plus deterministic novelty and coverage

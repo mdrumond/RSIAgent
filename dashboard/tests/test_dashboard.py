@@ -112,13 +112,13 @@ def test_default_bind_is_loopback(monkeypatch, campaign, tmp_path):
 def controlled_config(tmp_path, *, phase=1):
     root, control = tmp_path / f"phase{phase}", tmp_path / f"control{phase}"
     config = tmp_path / "controlled.json"
-    preset = {"id": f"phase{phase}", "phase": phase, "root": str(root),
+    preset = {"id": f"phase{phase}", "target": "a3", "phase": phase, "root": str(root),
               "control": str(control), "config": str(tmp_path / "runtime.json"),
               "initial_memory": str(tmp_path / "memory.bin"), "objective": "Learn A3",
               "project_target": 4}
     if phase == 2:
         preset.update(phase1_root=str(tmp_path / "phase1"), review=str(tmp_path / "review.json"))
-    write(config, {"campaigns": [{"id": f"phase{phase}", "phase": phase,
+    write(config, {"campaigns": [{"id": f"phase{phase}", "target": "a3", "phase": phase,
                                    "root": str(root), "control": str(control)}],
                    "controls": {"enabled": True, "runner": "/repo/run_ascend_campaign.py",
                                 "presets": [preset]}})
@@ -144,6 +144,25 @@ def test_controls_disabled_by_default_and_csrf_required(campaign, tmp_path):
     client = create_app(config, tmp_path / "controlled.sqlite3", command_runner=lambda *a, **k: None).test_client()
     assert client.post("/api/control/start", json={"preset_id": "phase1",
                        "confirmation": "start:phase1"}).status_code == 403
+
+
+def test_a5_campaign_and_preset_are_rejected_before_invocation(tmp_path):
+    config, _, _ = controlled_config(tmp_path)
+    settings = json.loads(config.read_text())
+    settings["campaigns"][0]["target"] = "a5"
+    settings["controls"]["presets"][0]["target"] = "a5"
+    write(config, settings)
+    calls = []
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=lambda *a, **k: calls.append(a)).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "a5"}
+    assert client.post("/api/control/sample", json={"campaign_id": "phase1",
+        "confirmation": "sample:phase1"}, headers=headers).status_code == 409
+    assert client.post("/api/control/start", json={"preset_id": "phase1",
+        "confirmation": "start:phase1"}, headers={**headers,
+        "Idempotency-Key": "a5-start"}).status_code == 409
+    assert calls == []
 
 
 def test_start_is_async_allowlisted_and_idempotent(tmp_path):
@@ -244,11 +263,14 @@ def test_selection_staleness_phase2_cardinality_failures_and_restart(tmp_path):
         headers={**headers, "Idempotency-Key": "stale"}).status_code == 409
 
     manager = app.extensions["dashboard_controls"]
-    operation = manager._insert_for_test("sample", "phase2", "running")
+    running = manager._insert_for_test("sample", "phase2", "running")
+    queued = manager._insert_for_test("sample", "phase2", "queued")
     manager.close()
     restarted = create_app(config, cache, refresh_seconds=0, command_runner=lambda *a, **k: None)
-    interrupted = restarted.test_client().get(f"/api/operations/{operation}").get_json()
-    assert interrupted["status"] == "failed" and "interrupted" in interrupted["error"]
+    client = restarted.test_client()
+    for operation in (running, queued):
+        interrupted = client.get(f"/api/operations/{operation}").get_json()
+        assert interrupted["status"] == "failed" and "interrupted" in interrupted["error"]
 
 
 def test_reject_uses_only_the_retained_proposal(tmp_path):
