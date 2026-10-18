@@ -39,6 +39,11 @@ The host owns all correctness decisions. Use exactly one JSON object as each res
 {"knowledge_query":{"query":"...","limit":5}} to request gated references, or
 {"candidate_source":{"source":"complete Python source"}} to submit a candidate.
 Do not wrap the JSON in Markdown and do not include prose outside the JSON object."""
+_COMPILE_SYSTEM_PROMPT = _SYSTEM_PROMPT.replace(
+    '{"candidate_source"',
+    '{"compile_probe":{"source":"complete Python source"}} to request host '
+    'compilation only (not execution or correctness), or\n{"candidate_source"',
+)
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,159}")
 _MAX_CONTEXT_BYTES = 512 * 1024
@@ -46,6 +51,10 @@ _MAX_GUIDE_BYTES = 256 * 1024
 
 
 KnowledgeFactory = Callable[[Path, object], object]
+CompileProbe = Callable[[str, Path], Mapping[str, object]]
+_PROBE_RESULT_KEYS = {
+    "status", "case_id", "exit_code", "diagnostic", "session_handle",
+}
 
 
 def _sha256(value: bytes) -> str:
@@ -103,6 +112,14 @@ def _parse_action(text: str) -> tuple[str, object] | None:
         if not isinstance(source, str) or not source.strip():
             return None
         return "candidate_source", source
+    if set(value) == {"compile_probe"}:
+        payload = value["compile_probe"]
+        if not isinstance(payload, dict) or set(payload) != {"source"}:
+            return None
+        source = payload["source"]
+        if not isinstance(source, str) or not source.strip():
+            return None
+        return "compile_probe", source
     return None
 
 
@@ -190,6 +207,8 @@ class Phase2SourceProvider:
         profiling_guidance: str | None = None,
         max_turns: int = 12,
         max_queries: int = 4,
+        compile_probe: CompileProbe | None = None,
+        max_compile_probes: int = 0,
         max_completion_bytes: int = 256 * 1024,
     ) -> None:
         if not isinstance(provider, DirectCompletionProvider):
@@ -204,6 +223,14 @@ class Phase2SourceProvider:
             raise ValueError("max_turns must be in [1, 40]")
         if type(max_queries) is not int or not 0 <= max_queries <= max_turns:
             raise ValueError("max_queries must be in [0, max_turns]")
+        if not isinstance(max_compile_probes, int) or isinstance(
+            max_compile_probes, bool
+        ) or not 0 <= max_compile_probes <= 20:
+            raise ValueError("max_compile_probes must be in [0, 20]")
+        if (compile_probe is None) != (max_compile_probes == 0):
+            raise ValueError(
+                "compile_probe and a positive max_compile_probes must be enabled together"
+            )
         if (
             type(max_completion_bytes) is not int
             or not 1024 <= max_completion_bytes <= 1024 * 1024
@@ -216,6 +243,8 @@ class Phase2SourceProvider:
         self.profiling_guidance = profiling_guidance
         self.max_turns = max_turns
         self.max_queries = max_queries
+        self.compile_probe = compile_probe
+        self.max_compile_probes = max_compile_probes
         self.max_completion_bytes = max_completion_bytes
 
     def __call__(self, request: Phase2AttemptRequest) -> str:
@@ -230,20 +259,31 @@ class Phase2SourceProvider:
 
         profile = direct_profile(request.cell.model)
         messages: list[dict[str, str]] = [
-            {"role": "system", "content": self.system_prompt},
+            {"role": "system", "content": (
+                _COMPILE_SYSTEM_PROMPT
+                if self.compile_probe is not None else self.system_prompt
+            )},
             {"role": "user", "content": prompt},
         ]
         transcript: list[dict[str, object]] = []
         queries: list[dict[str, object]] = []
         tokens = 0
+        ordinary_turns = 0
+        probes = 0
+        resumed = self._resume_probe_session(root, binding)
+        if resumed is not None:
+            messages, transcript, queries, tokens, ordinary_turns, probes = resumed
+        progress = self._resume_progress(root, binding)
+        if progress is not None and len(progress[1]) >= len(transcript):
+            messages, transcript, queries, tokens, ordinary_turns, probes = progress
         knowledge = self._knowledge(root, request)
         try:
-            for turn in range(1, self.max_turns + 1):
+            while ordinary_turns < self.max_turns:
                 completion = self.provider.complete(profile, messages)
                 tokens += completion.completion_tokens
                 payload = completion.text.encode("utf-8")
                 summary: dict[str, object] = {
-                    "turn": turn,
+                    "turn": len(transcript) + 1,
                     "completion_sha256": _sha256(payload),
                     "completion_bytes": len(payload),
                     "completion_tokens": completion.completion_tokens,
@@ -265,15 +305,62 @@ class Phase2SourceProvider:
                 if action is not None and action[0] == "candidate_source":
                     source = action[1]
                     assert isinstance(source, str)
+                    ordinary_turns += 1
                     summary["candidate_sha256"] = _sha256(source.encode("utf-8"))
                     transcript.append(summary)
                     self._commit(
                         root, source, binding, profile.identity.as_dict(),
-                        tokens, transcript, queries, messages,
+                        tokens, transcript, queries, ordinary_turns, probes, messages,
                     )
                     return source
 
+                if action is not None and action[0] == "compile_probe":
+                    source = action[1]
+                    assert isinstance(source, str)
+                    if len(source.encode("utf-8")) > self.max_completion_bytes:
+                        action = None
+                        summary["action"] = "oversized"
+                    elif self.compile_probe is None:
+                        action = None
+                        summary["action"] = "compile-probe-disabled"
+                    elif probes >= self.max_compile_probes:
+                        ordinary_turns += 1
+                        observation = {"compile_probe": {
+                            "status": "probe-budget-exhausted",
+                            "compilation_only": True,
+                            "correctness_established": False,
+                        }}
+                        observation_text = json.dumps(
+                            observation, sort_keys=True, separators=(",", ":")
+                        )
+                        summary["observation_sha256"] = _sha256(
+                            observation_text.encode()
+                        )
+                        transcript.append(summary)
+                        messages.append({"role": "user", "content": observation_text})
+                        self._retain_progress(
+                            root, binding, messages, transcript, queries,
+                            tokens, ordinary_turns, probes,
+                        )
+                        continue
+                    else:
+                        probes += 1
+                        self._retain_probe_request(
+                            root, probes, binding, source, messages, transcript,
+                            queries, tokens, ordinary_turns, summary,
+                        )
+                        result = self._probe(source, root, probes, binding)
+                        observation_text = self._probe_observation(
+                            result, source, probes, summary
+                        )
+                        transcript.append(summary)
+                        messages.append({"role": "user", "content": observation_text})
+                        continue
+
                 if action is not None and action[0] == "knowledge_query":
+                    # Compile probes are the only accepted action exempt from
+                    # the ordinary provider-turn allowance.
+                    ordinary_turns += 1
                     query = action[1]
                     assert isinstance(query, KnowledgeQuery)
                     if len(queries) >= self.max_queries:
@@ -305,6 +392,7 @@ class Phase2SourceProvider:
                             "available": True, "citations": citations,
                         })
                 else:
+                    ordinary_turns += 1
                     observation = {"host": {
                         "event": "invalid-action",
                         "required": "one knowledge_query or candidate_source JSON object",
@@ -315,6 +403,10 @@ class Phase2SourceProvider:
                 summary["observation_sha256"] = _sha256(observation_text.encode())
                 transcript.append(summary)
                 messages.append({"role": "user", "content": observation_text})
+                self._retain_progress(
+                    root, binding, messages, transcript, queries,
+                    tokens, ordinary_turns, probes,
+                )
         finally:
             close = getattr(knowledge, "close", None)
             if callable(close):
@@ -450,6 +542,14 @@ class Phase2SourceProvider:
             "knowledge_access": request.cell.knowledge.value,
             "profiling_guidance": self.profiling_guidance,
         }
+        if self.compile_probe is not None:
+            prompt_value["compile_probes"] = {
+                "enabled": True,
+                "allowance": self.max_compile_probes,
+                "counts_against_ordinary_turns": False,
+                "compilation_only": True,
+                "correctness_established": False,
+            }
         if request.repair_context is not None:
             prompt_value["repair_context"] = request.repair_context
         prompt_bytes, prompt_sha256 = _canonical_context(prompt_value, "provider prompt")
@@ -468,6 +568,8 @@ class Phase2SourceProvider:
             "profiling_guidance_sha256": guidance_sha256,
             "target_contract_sha256": target_contract_sha256,
         }
+        if self.compile_probe is not None:
+            binding["max_compile_probes"] = self.max_compile_probes
         return prompt_bytes.decode("utf-8"), binding
 
     def _attempt_root(self, request: Phase2AttemptRequest) -> Path:
@@ -489,6 +591,7 @@ class Phase2SourceProvider:
         cls, root: Path, source: str, binding: Mapping[str, object],
         provider_identity: Mapping[str, object], tokens: int,
         transcript: list[dict[str, object]], queries: list[dict[str, object]],
+        ordinary_turns: int, probes: int,
         messages: list[dict[str, str]],
     ) -> None:
         source_bytes = source.encode("utf-8")
@@ -498,6 +601,8 @@ class Phase2SourceProvider:
             "provider": dict(provider_identity),
             "completion_tokens": tokens,
             "turns": len(transcript),
+            "ordinary_turns": ordinary_turns,
+            "compile_probes": probes,
             "knowledge_queries": queries,
             "transcript": transcript,
             "messages": messages,
@@ -506,6 +611,178 @@ class Phase2SourceProvider:
         manifest = {**body, "record_sha256": canonical_digest(body)}
         _publish_exact(root / cls.source_filename, source_bytes)
         _publish_exact(root / "provider.json", canonical_bytes(manifest) + b"\n")
+
+    @staticmethod
+    def _retain_progress(
+        root: Path, binding: Mapping[str, object],
+        messages: list[dict[str, str]], transcript: list[dict[str, object]],
+        queries: list[dict[str, object]], tokens: int, ordinary_turns: int,
+        probes: int,
+    ) -> None:
+        body = {
+            "attempt_binding_sha256": canonical_digest(binding),
+            "messages": messages, "transcript": transcript,
+            "knowledge_queries": queries, "completion_tokens": tokens,
+            "ordinary_turns": ordinary_turns, "compile_probes": probes,
+        }
+        _publish_exact(
+            root / "progress" / f"turn-{len(transcript):03d}.json",
+            canonical_bytes({**body, "record_sha256": canonical_digest(body)}) + b"\n",
+        )
+
+    @staticmethod
+    def _resume_progress(root: Path, binding: Mapping[str, object]):
+        checkpoints = sorted((root / "progress").glob("turn-*.json"))
+        if not checkpoints:
+            return None
+        retained = json.loads(checkpoints[-1].read_bytes())
+        digest = retained.pop("record_sha256", None)
+        if (
+            digest != canonical_digest(retained)
+            or retained.get("attempt_binding_sha256") != canonical_digest(binding)
+        ):
+            raise ValueError("retained provider progress changed")
+        return (
+            retained["messages"], retained["transcript"],
+            retained["knowledge_queries"], retained["completion_tokens"],
+            retained["ordinary_turns"], retained["compile_probes"],
+        )
+
+    def _probe(
+        self, source: str, root: Path, ordinal: int,
+        binding: Mapping[str, object],
+    ) -> dict[str, object]:
+        assert self.compile_probe is not None
+        source_bytes = source.encode("utf-8")
+        probe_root = root / "compile-probes" / f"probe-{ordinal:02d}"
+        result_path = probe_root / "result.json"
+        identity = {
+            "schema": "a5-catlass-phase2-compile-probe-v1",
+            "probe": ordinal,
+            "candidate_sha256": _sha256(source_bytes),
+            "attempt_binding_sha256": canonical_digest(binding),
+        }
+        _publish_exact(probe_root / "candidate.py", source_bytes)
+        if result_path.exists():
+            try:
+                retained = json.loads(result_path.read_bytes())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("invalid retained compile probe") from exc
+            digest = retained.pop("record_sha256", None)
+            if (
+                digest != canonical_digest(retained)
+                or any(retained.get(key) != value for key, value in identity.items())
+            ):
+                raise ValueError("retained compile probe changed identity")
+            return {key: retained[key] for key in _PROBE_RESULT_KEYS}
+        result = dict(self.compile_probe(source, probe_root / "host"))
+        if set(result) != _PROBE_RESULT_KEYS:
+            raise ValueError("compile probe returned an invalid result contract")
+        if (
+            result["status"] not in {"compiled", "compile-failed", "invalid-source"}
+            or not isinstance(result["case_id"], str)
+            or not 0 < len(result["case_id"].encode()) <= 160
+            or isinstance(result["exit_code"], bool)
+            or not isinstance(result["exit_code"], int)
+            or not isinstance(result["diagnostic"], str)
+            or len(result["diagnostic"].encode()) > 4096
+            or result["session_handle"] is not None
+            and (
+                not isinstance(result["session_handle"], str)
+                or not 0 < len(result["session_handle"].encode()) <= 256
+            )
+        ):
+            raise ValueError("compile probe returned invalid bounded evidence")
+        body = {**identity, **result}
+        _publish_exact(
+            result_path,
+            canonical_bytes({**body, "record_sha256": canonical_digest(body)}) + b"\n",
+        )
+        return result
+
+    @staticmethod
+    def _probe_observation(
+        result: Mapping[str, object], source: str, ordinal: int,
+        summary: dict[str, object],
+    ) -> str:
+        candidate_sha256 = _sha256(source.encode())
+        observation = {"compile_probe": {
+            **dict(result),
+            "probe": ordinal,
+            "candidate_sha256": candidate_sha256,
+            "compilation_only": True,
+            "correctness_established": False,
+        }}
+        text = json.dumps(observation, sort_keys=True, separators=(",", ":"))
+        summary["probe"] = ordinal
+        summary["candidate_sha256"] = candidate_sha256
+        summary["observation_sha256"] = _sha256(text.encode())
+        return text
+
+    @staticmethod
+    def _retain_probe_request(
+        root: Path, ordinal: int, binding: Mapping[str, object], source: str,
+        messages: list[dict[str, str]], transcript: list[dict[str, object]],
+        queries: list[dict[str, object]], tokens: int, ordinary_turns: int,
+        summary: Mapping[str, object],
+    ) -> None:
+        body = {
+            "schema": "a5-catlass-phase2-compile-probe-request-v1",
+            "probe": ordinal,
+            "attempt_binding_sha256": canonical_digest(binding),
+            "candidate_sha256": _sha256(source.encode()),
+            "source": source,
+            "messages": messages,
+            "transcript": transcript,
+            "knowledge_queries": queries,
+            "completion_tokens": tokens,
+            "ordinary_turns": ordinary_turns,
+            "summary": dict(summary),
+        }
+        _publish_exact(
+            root / "compile-probes" / f"probe-{ordinal:02d}" / "request.json",
+            canonical_bytes({**body, "record_sha256": canonical_digest(body)}) + b"\n",
+        )
+
+    def _resume_probe_session(
+        self, root: Path, binding: Mapping[str, object],
+    ) -> tuple[
+        list[dict[str, str]], list[dict[str, object]], list[dict[str, object]],
+        int, int, int,
+    ] | None:
+        probe_root = root / "compile-probes"
+        requests = sorted(probe_root.glob("probe-*/request.json"))
+        if not requests:
+            return None
+        try:
+            retained = json.loads(requests[-1].read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid retained compile probe request") from exc
+        digest = retained.pop("record_sha256", None)
+        ordinal = retained.get("probe")
+        source = retained.get("source")
+        if (
+            retained.get("schema") != "a5-catlass-phase2-compile-probe-request-v1"
+            or digest != canonical_digest(retained)
+            or retained.get("attempt_binding_sha256") != canonical_digest(binding)
+            or not isinstance(ordinal, int)
+            or ordinal != len(requests)
+            or not isinstance(source, str)
+            or retained.get("candidate_sha256") != _sha256(source.encode())
+        ):
+            raise ValueError("retained compile probe request changed")
+        result = self._probe(source, root, ordinal, binding)
+        messages = list(retained["messages"])
+        transcript = list(retained["transcript"])
+        queries = list(retained["knowledge_queries"])
+        summary = dict(retained["summary"])
+        observation = self._probe_observation(result, source, ordinal, summary)
+        transcript.append(summary)
+        messages.append({"role": "user", "content": observation})
+        return (
+            messages, transcript, queries, int(retained["completion_tokens"]),
+            int(retained["ordinary_turns"]), ordinal,
+        )
 
     @classmethod
     def _resume(cls, root: Path, binding: Mapping[str, object]) -> str | None:
@@ -541,7 +818,36 @@ class Phase2SourceProvider:
             or not source.strip()
         ):
             raise ValueError("completed provider evidence changed")
+        Phase2SourceProvider._validate_probes(root, binding, manifest)
         return source
+
+    @staticmethod
+    def _validate_probes(
+        root: Path, binding: Mapping[str, object], manifest: Mapping[str, object],
+    ) -> None:
+        summaries = [
+            item for item in manifest.get("transcript", ())
+            if isinstance(item, dict) and item.get("action") == "compile_probe"
+            and isinstance(item.get("probe"), int)
+        ]
+        if len(summaries) != manifest.get("compile_probes", 0):
+            raise ValueError("completed provider compile probes changed")
+        for summary in summaries:
+            ordinal = summary["probe"]
+            probe_root = root / "compile-probes" / f"probe-{ordinal:02d}"
+            try:
+                source = (probe_root / "candidate.py").read_bytes()
+                result = json.loads((probe_root / "result.json").read_bytes())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError("completed provider compile probe is invalid") from exc
+            digest = result.pop("record_sha256", None)
+            if (
+                _sha256(source) != summary.get("candidate_sha256")
+                or result.get("candidate_sha256") != summary.get("candidate_sha256")
+                or result.get("attempt_binding_sha256") != canonical_digest(binding)
+                or digest != canonical_digest(result)
+            ):
+                raise ValueError("completed provider compile probe changed")
 
     def conversation(
         self, cell_id: str, attempt_id: str,

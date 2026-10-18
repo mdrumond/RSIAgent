@@ -373,6 +373,7 @@ class _DirectActorContinuation:
     messages: tuple[Mapping[str, str], ...]
     recorder: _ProviderEvidenceRecorder
     working_context: WorkingContext
+    total_turns: int
 
 
 class DirectActorDriver:
@@ -455,7 +456,10 @@ class DirectActorDriver:
             self._trace("message", message)
         working = WorkingContext(messages)
         tokens = 0
-        for turn in range(1, self.max_turns + 1):
+        turn = 0
+        ordinary_turns = 0
+        while ordinary_turns < self.max_turns:
+            turn += 1
             messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
             tokens += summary_tokens
             self._request(recorder, profile, messages, stage="action", turn=turn)
@@ -478,6 +482,8 @@ class DirectActorDriver:
             else:
                 outcome = action_executor(action)
                 observation = outcome.observation
+                if not outcome.budget_exempt:
+                    ordinary_turns += 1
                 try:
                     host = json.loads(observation).get("host", {})
                 except (AttributeError, json.JSONDecodeError):
@@ -504,14 +510,16 @@ class DirectActorDriver:
                         outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
                         continuation=_DirectActorContinuation(
-                            profile, tuple(dict(item) for item in messages), recorder, working
+                            profile, tuple(dict(item) for item in messages), recorder, working, turn
                         ),
                     )
             messages.append({"role": "user", "content": observation})
             working.append(messages[-1])
             self._trace("message", messages[-1])
+            if action is None:
+                ordinary_turns += 1
         self._trace("terminal", {"status": "turn-budget-exhausted"})
-        return ActorOutcome("turn-budget-exhausted", self.max_turns, tokens)
+        return ActorOutcome("turn-budget-exhausted", turn, tokens)
 
     def distill(
         self,
@@ -559,7 +567,7 @@ class DirectActorDriver:
         working.pinned.append(dict(messages[-1]))
         tokens = outcome.tokens or 0
         for correction in range(_MAX_DISTILLATION_ATTEMPTS):
-            turn = outcome.iterations + correction + 1
+            turn = continuation.total_turns + correction + 1
             messages, summary_tokens = self._prepare_context(
                 working, continuation.profile, continuation.recorder, turn=turn,
             )
