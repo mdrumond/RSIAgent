@@ -471,11 +471,9 @@ def build_phase1_live_dependencies(
         embeddings.embed_query(["A5 Phase 1 preflight"])
     database = KnowledgeDB.open_read_only(paths.kdb, embeddings)
     try:
-        manifest = database.manifest(paths.collection)
-        if (
-            manifest.embedding_model != embeddings.model
-            or manifest.embedding_revision != embeddings.revision
-        ):
+        if any(manifest.embedding_model != embeddings.model
+               or manifest.embedding_revision != embeddings.revision
+               for manifest in database.selected_manifests(paths.collection)):
             raise ValueError("KDB manifest does not match the pinned embeddings")
         _probe_knowledge_query(database, paths.collection)
     finally:

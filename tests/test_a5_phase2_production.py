@@ -324,7 +324,8 @@ def test_retained_qualification_rejects_changed_live_runtime_provenance(
     assert len(backend.calls) == 1
 
 
-def test_with_kdb_preflights_read_only_access_and_supplies_exact_guidance(tmp_path):
+@pytest.mark.parametrize("selector", ["catlass", ["catlass"]])
+def test_with_kdb_preflights_read_only_access_and_supplies_exact_guidance(tmp_path, selector):
     database = _knowledge_database(tmp_path / "knowledge")
     cache = tmp_path / "bge-cache"
     cache.mkdir()
@@ -334,7 +335,7 @@ def test_with_kdb_preflights_read_only_access_and_supplies_exact_guidance(tmp_pa
         ProfilingGuidance.WITH_GUIDANCE,
         bge_cache=cache,
         kdb=database,
-        collection="catlass",
+        collection=selector,
     )
     dependencies = build_phase2_production(
         config,

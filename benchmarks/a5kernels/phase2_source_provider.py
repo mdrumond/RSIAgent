@@ -190,6 +190,13 @@ def _target_contract() -> dict[str, object]:
 class Phase2SourceProvider:
     """Generate candidate source without granting models correctness authority."""
 
+    system_prompt = _SYSTEM_PROMPT
+    task_prompt = "Produce Catlass DSL source for the host-owned attention suite."
+    target_contract = staticmethod(_target_contract)
+    adaptive_schema = "a5-catlass-phase2-adaptive-cell-v1"
+    provider_schema = PROVIDER_SCHEMA
+    source_filename = "candidate.py"
+
     def __init__(
         self,
         provider: DirectCompletionProvider,
@@ -254,7 +261,7 @@ class Phase2SourceProvider:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": (
                 _COMPILE_SYSTEM_PROMPT
-                if self.compile_probe is not None else _SYSTEM_PROMPT
+                if self.compile_probe is not None else self.system_prompt
             )},
             {"role": "user", "content": prompt},
         ]
@@ -407,6 +414,10 @@ class Phase2SourceProvider:
         raise RuntimeError("Phase 2 source provider turn budget exhausted")
 
     def _validate_request(self, request: Phase2AttemptRequest) -> None:
+        self._validate_profiling(request)
+        self._validate_context(request)
+
+    def _validate_profiling(self, request):
         if request.cell.profiling is ProfilingGuidance.NEW:
             from benchmarks.a5kernels.profiling_guidance import verify_profiling_guidance
             verify_profiling_guidance(request.cell.profiling_guide, self.profiling_guidance)
@@ -415,6 +426,8 @@ class Phase2SourceProvider:
                 raise ValueError("profiling-guidance treatment requires non-empty guidance")
         elif self.profiling_guidance is not None:
             raise ValueError("without-guidance treatment must not receive guidance")
+
+    def _validate_context(self, request):
         if request.cell.knowledge is KnowledgeMode.WITH_KDB and self.knowledge_factory is None:
             raise ValueError("with-KDB treatment requires a Knowledge Agent factory")
         if _SHA256.fullmatch(request.protocol_sha256) is None:
@@ -427,7 +440,7 @@ class Phase2SourceProvider:
         ):
             raise ValueError("request and attempt IDs must be safe identifiers")
         from benchmarks.a5kernels.phase2_memory import ADAPTIVE_CELL_SCHEMA
-        if request.cell.schema == ADAPTIVE_CELL_SCHEMA:
+        if request.cell.schema == self.adaptive_schema:
             from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
             if not request.phase1_memory:
                 raise ValueError("adaptive Phase 1 memory must contain published projects")
@@ -507,12 +520,12 @@ class Phase2SourceProvider:
             _sha256(self.profiling_guidance.encode("utf-8"))
             if self.profiling_guidance is not None else None
         )
-        target_contract = _target_contract()
+        target_contract = self.target_contract()
         if target_contract["suite_sha256"] != request.cell.suite_sha256:
             raise ValueError("host target contract changed its registered suite")
         target_contract_sha256 = canonical_digest(target_contract)
         prompt_value = {
-            "task": "Produce Catlass DSL source for the host-owned attention suite.",
+            "task": self.task_prompt,
             "host_verification_only": True,
             "cell": request.cell.as_dict(),
             "protocol_sha256": request.protocol_sha256,
@@ -573,9 +586,9 @@ class Phase2SourceProvider:
             raise TypeError("Knowledge Agent factory returned an invalid enabled gate")
         return knowledge
 
-    @staticmethod
+    @classmethod
     def _commit(
-        root: Path, source: str, binding: Mapping[str, object],
+        cls, root: Path, source: str, binding: Mapping[str, object],
         provider_identity: Mapping[str, object], tokens: int,
         transcript: list[dict[str, object]], queries: list[dict[str, object]],
         ordinary_turns: int, probes: int,
@@ -583,7 +596,7 @@ class Phase2SourceProvider:
     ) -> None:
         source_bytes = source.encode("utf-8")
         body = {
-            "schema": PROVIDER_SCHEMA,
+            "schema": cls.provider_schema,
             **dict(binding),
             "provider": dict(provider_identity),
             "completion_tokens": tokens,
@@ -596,7 +609,7 @@ class Phase2SourceProvider:
             "candidate_sha256": _sha256(source_bytes),
         }
         manifest = {**body, "record_sha256": canonical_digest(body)}
-        _publish_exact(root / "candidate.py", source_bytes)
+        _publish_exact(root / cls.source_filename, source_bytes)
         _publish_exact(root / "provider.json", canonical_bytes(manifest) + b"\n")
 
     @staticmethod
@@ -771,9 +784,9 @@ class Phase2SourceProvider:
             int(retained["ordinary_turns"]), ordinal,
         )
 
-    @staticmethod
-    def _resume(root: Path, binding: Mapping[str, object]) -> str | None:
-        source_path = root / "candidate.py"
+    @classmethod
+    def _resume(cls, root: Path, binding: Mapping[str, object]) -> str | None:
+        source_path = root / cls.source_filename
         manifest_path = root / "provider.json"
         if not source_path.exists() and not manifest_path.exists():
             return None
@@ -798,7 +811,7 @@ class Phase2SourceProvider:
             raise ValueError("completed provider evidence is invalid")
         digest = manifest.pop("record_sha256", None)
         if (
-            manifest.get("schema") != PROVIDER_SCHEMA
+            manifest.get("schema") != cls.provider_schema
             or digest != canonical_digest(manifest)
             or any(manifest.get(key) != value for key, value in binding.items())
             or manifest.get("candidate_sha256") != _sha256(source.encode("utf-8"))

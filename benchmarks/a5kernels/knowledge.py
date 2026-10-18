@@ -7,15 +7,24 @@ import json
 import math
 import re
 import sqlite3
+from itertools import islice
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Protocol, Sequence
+from typing import Callable, Iterable, Protocol, Sequence
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 DEFAULT_EMBEDDING_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 CHUNK_LINES = 80
 CHUNK_OVERLAP = 20
 RRF_K = 60
+
+
+def collection_names(value: str | Sequence[str]) -> tuple[str, ...]:
+    """Normalize a configured selector, keeping historical string inputs valid."""
+    names = (value,) if isinstance(value, str) else tuple(value)
+    if not names or any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError("collection selector requires nonempty collection names")
+    return tuple(dict.fromkeys(names))
 
 
 class EmbeddingBackend(Protocol):
@@ -54,14 +63,24 @@ class CollectionManifest:
     fingerprint: str
     chunk_lines: int = CHUNK_LINES
     chunk_overlap: int = CHUNK_OVERLAP
+    # Optional provenance keeps historical manifests readable without migration.
+    repository: str | None = None
+    revision: str | None = None
+    kernel_languages: tuple[str, ...] = ()
+    reference_exposed: bool = False
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True) + "\n"
+        value = asdict(self)
+        for key in ("repository", "revision", "kernel_languages", "reference_exposed"):
+            if not value[key]:
+                del value[key]
+        return json.dumps(value, indent=2, sort_keys=True) + "\n"
 
     @classmethod
     def from_json(cls, value: str) -> "CollectionManifest":
         raw = json.loads(value)
         raw["sources"] = tuple(SourceFingerprint(**item) for item in raw["sources"])
+        raw["kernel_languages"] = tuple(raw.get("kernel_languages", ()))
         return cls(**raw)
 
 
@@ -213,6 +232,8 @@ class KnowledgeDB:
             raise ValueError("KnowledgeDB requires a file-backed database")
         self.path = path.resolve()
         self.embeddings = embeddings
+        self._manifest_cache = {}
+        self._source_cache = {}
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
@@ -230,6 +251,8 @@ class KnowledgeDB:
         view = object.__new__(cls)
         view.path = resolved
         view.embeddings = embeddings
+        view._manifest_cache = {}
+        view._source_cache = {}
         view.connection = sqlite3.connect(resolved.as_uri() + "?mode=ro", uri=True)
         view.connection.row_factory = sqlite3.Row
         view.connection.execute("PRAGMA query_only = ON")
@@ -314,8 +337,16 @@ class KnowledgeDB:
         collection: str,
         language: str,
         manifest_path: Path | None = None,
+        batch_size: int = 32,
+        repository: str | None = None,
+        revision: str | None = None,
+        kernel_languages: tuple[str, ...] = (),
+        reference_exposed: bool = False,
+        progress: Callable[[int], None] | None = None,
     ) -> CollectionManifest:
         root = root.resolve()
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
         source_paths = tuple(dict.fromkeys(path.resolve() for path in paths))
         if not source_paths:
             raise ValueError("a collection must contain at least one source")
@@ -329,6 +360,13 @@ class KnowledgeDB:
             embedding_model=self.embeddings.model,
             embedding_revision=self.embeddings.revision,
         )
+        if repository or revision or kernel_languages or reference_exposed:
+            from dataclasses import replace
+            metadata = dict(repository=repository, revision=revision,
+                            kernel_languages=tuple(kernel_languages),
+                            reference_exposed=reference_exposed)
+            identity = manifest.fingerprint + json.dumps(metadata, sort_keys=True)
+            manifest = replace(manifest, **metadata, fingerprint=_sha256(identity.encode()))
         existing = self.connection.execute(
             "SELECT manifest_json FROM collections WHERE name = ?", (collection,)
         ).fetchone()
@@ -342,14 +380,11 @@ class KnowledgeDB:
                 manifest_path.write_text(current.to_json(), encoding="utf-8")
             return current
 
-        chunks = [
+        chunks = iter(
             chunk
             for snapshot in snapshots
             for chunk in chunk_source(snapshot.fingerprint.path, snapshot.data)
-        ]
-        vectors = self.embeddings.embed([chunk.text for chunk in chunks])
-        if len(vectors) != len(chunks):
-            raise ValueError("embedding backend returned the wrong number of vectors")
+        )
         with self.connection:
             fts_table = self._fts_table_name(collection)
             self.connection.execute(
@@ -359,7 +394,18 @@ class KnowledgeDB:
                 (collection, language, manifest.fingerprint, manifest.to_json(), fts_table),
             )
             self._ensure_fts_table(fts_table)
-            for chunk, vector in zip(chunks, vectors):
+            def encoded_chunks():
+                total = 0
+                while batch := list(islice(chunks, batch_size)):
+                    vectors = self.embeddings.embed([chunk.text for chunk in batch])
+                    if len(vectors) != len(batch):
+                        raise ValueError("embedding backend returned the wrong number of vectors")
+                    yield from zip(batch, vectors)
+                    total += len(batch)
+                    if progress:
+                        progress(total)
+
+            for chunk, vector in encoded_chunks():
                 cursor = self.connection.execute(
                     """INSERT INTO chunks
                        (collection, chunk_id, path, start_line, end_line, text, vector_json)
@@ -383,12 +429,27 @@ class KnowledgeDB:
         return manifest
 
     def manifest(self, collection: str) -> CollectionManifest:
+        if collection in self._manifest_cache:
+            return self._manifest_cache[collection]
         row = self.connection.execute(
             "SELECT manifest_json FROM collections WHERE name = ?", (collection,)
         ).fetchone()
         if not row:
             raise KeyError(collection)
-        return CollectionManifest.from_json(row["manifest_json"])
+        manifest = CollectionManifest.from_json(row["manifest_json"])
+        self._manifest_cache[collection] = manifest
+        self._source_cache[collection] = {source.path: source for source in manifest.sources}
+        return manifest
+
+    def source_fingerprint(self, collection: str, path: str) -> SourceFingerprint:
+        self.manifest(collection)
+        try:
+            return self._source_cache[collection][path]
+        except KeyError:
+            raise ValueError("citation path is absent from the collection manifest") from None
+
+    def selected_manifests(self, selector: str | Sequence[str]) -> tuple[CollectionManifest, ...]:
+        return tuple(self.manifest(name) for name in collection_names(selector))
 
     def validate_citation(
         self,
@@ -416,8 +477,7 @@ class KnowledgeDB:
         expected = (row["path"], row["start_line"], row["end_line"])
         if expected != (path, start_line, end_line):
             raise ValueError("citation location does not match the indexed chunk")
-        if path not in {source.path for source in manifest.sources}:
-            raise ValueError("citation path is absent from the collection manifest")
+        self.source_fingerprint(collection, path)
         identity = f"{path}\0{start_line}\0{end_line}\0{row['text']}".encode()
         if _sha256(identity) != chunk_id:
             raise ValueError("citation chunk hash does not match indexed content")
@@ -430,7 +490,7 @@ class KnowledgeDB:
         ).fetchone()
         if not collection_row:
             raise KeyError(collection)
-        manifest = CollectionManifest.from_json(collection_row["manifest_json"])
+        manifest = self.manifest(collection)
         actual_embedding = (self.embeddings.model, self.embeddings.revision)
         expected_embedding = (manifest.embedding_model, manifest.embedding_revision)
         if actual_embedding != expected_embedding:
@@ -444,9 +504,11 @@ class KnowledgeDB:
         fts_table = self._fts_table_name(collection)
         if collection_row["fts_table"] != fts_table:
             raise RuntimeError(f"invalid FTS metadata for collection {collection!r}")
+        # FTS must drive this join: a chunks-first plan repeats MATCH once per
+        # source chunk and becomes prohibitively slow on full repositories.
         lexical_rows = [] if lexical_query is None else self.connection.execute(
             f"""SELECT c.*, bm25({fts_table}) AS lexical_score
-               FROM {fts_table} JOIN chunks c ON c.rowid = {fts_table}.rowid
+               FROM {fts_table} CROSS JOIN chunks c ON c.rowid = {fts_table}.rowid
                WHERE {fts_table} MATCH ? AND c.collection = ?
                ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?""",
             (lexical_query, collection, candidate_limit),

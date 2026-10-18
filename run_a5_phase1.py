@@ -60,7 +60,7 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--catlass-source", required=True)
             command.add_argument("--bge-cache", type=Path, required=True)
             command.add_argument("--kdb", type=Path, required=True)
-            command.add_argument("--collection", required=True)
+            command.add_argument("--collection", action="append", required=True)
             command.add_argument("--device", type=int, required=True)
             command.add_argument("--env-file", type=Path)
             command.add_argument(
@@ -95,7 +95,7 @@ def _paths(
         catlass_revision=revision,
         bge_cache=args.bge_cache,
         kdb=args.kdb,
-        collection=args.collection,
+        collection=args.collection[0] if len(args.collection) == 1 else tuple(args.collection),
         results_root=args.root if results_root is None else results_root,
         device=args.device,
     )

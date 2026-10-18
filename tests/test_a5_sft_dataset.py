@@ -259,6 +259,28 @@ def test_dataset_exact_and_near_dedup_is_deterministic_and_stratified(tmp_path):
     ).hexdigest()
 
 
+def test_native_dedup_retains_distinct_preprocessor_values_and_identifier_case(tmp_path):
+    traces = tmp_path / "traces"
+    traces.mkdir()
+    template = ('#include "kernel_operator.h"\n#define TILE {tile}\n'
+                'extern "C" __global__ __aicore__ void kernel(GM_ADDR output) {{\n'
+                '  AscendC::LocalTensor<float> {identifier};\n'
+                '  // Common implementation makes the sources near-identical.\n'
+                '  AscendC::Duplicate({identifier}, 0.0f, TILE);\n}}\n')
+    sources = [template.format(tile=16, identifier="tile"),
+               template.format(tile=32, identifier="tile"),
+               template.format(tile=16, identifier="Tile")]
+    for index, source in enumerate(sources):
+        _trace(traces, f"native-{index}", "native", source)
+    _trace(traces, "native-exact-copy", "native", sources[0])
+    manifest = build_dataset(traces, tmp_path / "dataset")
+    assert manifest["eligible"] == 3
+    assert manifest["duplicates"] == 1
+    assert {row["candidate_sha256"] for row in manifest["examples"]} == {
+        hashlib.sha256(source.encode()).hexdigest() for source in sources
+    }
+
+
 def test_saturation_requires_three_rounds_and_stops_below_ten_percent():
     assert saturation_decision([20, 5], [4, 2]) == {"stop": False, "reason": "minimum-rounds"}
     assert saturation_decision([20, 5, 1], [4, 2, 0]) == {"stop": False, "reason": "continue"}

@@ -28,10 +28,14 @@ def _read(path):
 
 
 def _memory(state, initial):
+    terminal = state.get("terminal")
+    target = state.get("project_target")
+    target_complete = (terminal is None and type(target) is int and target > 0
+                       and len(state.get("prior_outcomes", [])) >= target)
     if (state.get("schema") != STATE_SCHEMA
             or state.get("initial_memory_sha256") != hashlib.sha256(initial).hexdigest()
-            or not state.get("terminal")
-            or state["terminal"].get("status") not in {"SATURATED", "PROJECT_LIMIT_REACHED"}):
+            or not (target_complete or terminal and terminal.get("status") in {
+                "SATURATED", "PROJECT_LIMIT_REACHED", "TARGET_REACHED"})):
         raise ValueError("adaptive Phase 1 must be complete with matching initial memory")
     memories = tuple(base64.b64decode(value, validate=True)
                      for value in state["memory_bytes_base64"])
@@ -144,8 +148,8 @@ class AdaptivePhase1Snapshot(A5Phase1Snapshot):
         return tuple(json.loads(row) for row in self.memory_path.read_bytes().splitlines())
 
 
-def _review(review, memory_sha, cell_id):
-    if (review.get("schema") != REVIEW_SCHEMA
+def _review(review, memory_sha, cell_id, *, schema=REVIEW_SCHEMA):
+    if (review.get("schema") != schema
             or review.get("memory_sha256") != memory_sha
             or review.get("cell_id") != cell_id
             or any(review.get(key) is not True for key in (
@@ -155,8 +159,8 @@ def _review(review, memory_sha, cell_id):
         raise ValueError("adaptive memory needs an accepted usefulness/diversity review")
 
 
-def admit_adaptive_snapshot(source_root, initial_memory, review_path, source, phase2_root):
-    """Copy exact published memory and all explicitly cited project evidence."""
+def collect_adaptive_snapshot(source_root, initial_memory, review_path):
+    """Read/authenticate exact published memory and referenced evidence for any target."""
     source_root = Path(source_root)
     if (source_root / "pending.json").exists():
         raise ValueError("adaptive Phase 1 has a pending wave")
@@ -165,8 +169,6 @@ def admit_adaptive_snapshot(source_root, initial_memory, review_path, source, ph
     memories, memory_sha = _memory(state, initial_memory)
     review_bytes = Path(review_path).read_bytes()
     review = json.loads(review_bytes)
-    _review(review, memory_sha, source.cell_id)
-    destination = adaptive_destination(source, review)
     files = {
         "state.json": state_bytes,
         "initial-memory.bin": initial_memory,
@@ -189,6 +191,14 @@ def admit_adaptive_snapshot(source_root, initial_memory, review_path, source, ph
         digests.update(fact.evidence_sha256 for fact in memory.host_facts)
         for digest in digests:
             files[f"artifacts/objects/{digest[:2]}/{digest[2:]}"] = artifacts.read_bytes(digest)
+    return files, review, memory_sha
+
+
+def admit_adaptive_snapshot(source_root, initial_memory, review_path, source, phase2_root):
+    """Copy exact published memory and all explicitly cited project evidence."""
+    files, review, memory_sha = collect_adaptive_snapshot(source_root, initial_memory, review_path)
+    _review(review, memory_sha, source.cell_id)
+    destination = adaptive_destination(source, review)
     body = {
         "schema": SCHEMA, "destination_identity": destination.as_dict(),
         "files": {name: hashlib.sha256(payload).hexdigest() for name, payload in files.items()},

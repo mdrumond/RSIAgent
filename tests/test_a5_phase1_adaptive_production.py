@@ -208,6 +208,31 @@ def test_factory_binds_registered_direct_actor_checked_backend_and_coordinator(t
     assert campaign.coordinator.curriculum.unavailable_capabilities == ()
 
 
+def test_phase2_factory_pins_seed_and_uses_distinct_identity(tmp_path):
+    from test_ascend_phase2_curriculum import snapshot
+    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+    campaign = _build(tmp_path, _cell(), reviewed_snapshot=snapshot())
+    assert isinstance(campaign.coordinator, AdaptivePhase2Coordinator)
+    assert campaign.project_actor.retain_semantic_failure
+    identity = json.loads((_paths(tmp_path).root / "campaign-identity.json").read_bytes())
+    assert identity["phase"] == "adaptive-phase2"
+    assert identity["snapshot_id"] == "reviewed-seed"
+    assert json.loads(campaign.coordinator.initial_memory)["phase1_memory"]
+    with pytest.raises(ValueError, match="different treatment"):
+        _build(tmp_path, _cell(), reviewed_snapshot=snapshot("changed-review"))
+
+
+def test_public_a5_builder_forwards_optional_trace_recorder_factory(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+
+    factory = recorder_factory(phase="phase1", round_id="builder-round",
+                               model="fixture", source_manifest_sha256="a" * 64)
+    campaign = _build(tmp_path, _cell(), trace_recorder_factory=factory)
+    assert campaign.project_actor.trace_recorder_factory is factory
+    assert campaign.coordinator.execute_project.trace_recorder_factory is factory
+    assert _build(tmp_path / "legacy", _cell()).project_actor.trace_recorder_factory is None
+
+
 def test_selected_model_uses_its_registered_direct_provider_route(tmp_path):
     calls = []
 
@@ -422,7 +447,8 @@ def test_measurements_are_bound_independently_of_guidance(tmp_path, profiling):
     assert result.admitted_artifacts == {}
 
 
-def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path):
+@pytest.mark.parametrize("selector", ["catlass", ["catlass", "native"]])
+def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path, selector):
     from benchmarks.a5kernels.knowledge import KnowledgeDB
     source = tmp_path / "sources"
     source.mkdir()
@@ -431,11 +457,13 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path)
     kdb = tmp_path / "knowledge.sqlite"
     with KnowledgeDB(kdb, FakeEmbeddings()) as database:
         database.index(source, [guide], collection="catlass", language="catlass-dsl")
+        database.index(source, [guide], collection="native", language="mixed",
+                       kernel_languages=("ascend-c",))
     campaign = _build(
         tmp_path,
         _cell(knowledge=KnowledgeMode.WITH_KDB),
         embeddings=FakeEmbeddings(),
-        path_changes={"kdb": kdb, "collection": "catlass"},
+        path_changes={"kdb": kdb, "collection": selector},
     )
     artifact_root = tmp_path / "action-artifacts"
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
@@ -446,12 +474,12 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path)
     )
 
     result = campaign.query_knowledge(
-        {"query": "movement", "limit": 1}, context
+        {"query": "movement", "limit": 2}, context
     )
 
     assert result.observation["event"] == "knowledge-query"
     assert result.observation["available"] is True
-    assert len(result.citations) == 1
+    assert len(result.citations) == (1 if isinstance(selector, str) else 2)
     retained = result.observation["results"][0]
     assert retained["citation"]["path"].endswith("guide.md")
     digest = retained["artifact_sha256"]

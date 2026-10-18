@@ -10,6 +10,7 @@ import tempfile
 from typing import Callable
 
 from .phase1_protocol import ExecutionPlan
+from .native_candidate import NativeCandidatePlan
 from .remote_candidate import (
     CandidateBundle,
     GZA3RemoteCandidateBackend,
@@ -65,7 +66,7 @@ class BZA3RemoteCandidateBackend(GZA3RemoteCandidateBackend):
         return self._profile
 
     def _require_execution_profile(self, plan: ExecutionPlan) -> None:
-        if not isinstance(plan, ExecutionPlan):
+        if not isinstance(plan, (ExecutionPlan, NativeCandidatePlan)):
             raise TypeError("plan must be an A3 ExecutionPlan")
         if plan.execution_profile != self._profile:
             raise ValueError(

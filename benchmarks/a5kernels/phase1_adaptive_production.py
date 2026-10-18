@@ -31,7 +31,6 @@ from benchmarks.a5kernels.phase1_adaptive_actor import (
 from benchmarks.a5kernels.phase1_composition import A5_PROFILING_GUIDANCE
 from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
-from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_experiments import (
     A5Phase1Cell,
     KnowledgeMode,
@@ -67,7 +66,7 @@ class AdaptiveProductionPaths:
     catlass_revision: str
     device: int = 0
     kdb: Path | None = None
-    collection: str | None = None
+    collection: str | tuple[str, ...] | list[str] | None = None
     profiling_skill_root: Path = field(
         default_factory=lambda: Path.home() / ".agents/skills/ascend-profiling",
     )
@@ -133,11 +132,9 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
         raise ValueError("KDB-on treatment requires a pinned embedding backend")
     # Opening once here validates the selected manifest before any provider call.
     with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
-        manifest = database.manifest(paths.collection)
-        if (
-            manifest.embedding_model != embeddings.model
-            or manifest.embedding_revision != embeddings.revision
-        ):
+        if any(manifest.embedding_model != embeddings.model
+               or manifest.embedding_revision != embeddings.revision
+               for manifest in database.selected_manifests(paths.collection)):
             raise ValueError("KDB manifest does not match the embedding backend")
 
     def query(
@@ -290,13 +287,18 @@ def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes, profiling_guidance_te
     })
 
 
-def _bind_campaign_identity(root: Path, cell: A5Phase1Cell) -> None:
+def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=None) -> None:
     root = Path(root)
     path = root / "campaign-identity.json"
-    expected = canonical_bytes({
+    identity = {
         "schema": _CAMPAIGN_IDENTITY_SCHEMA,
         "cell": cell.as_dict(),
-    }) + b"\n"
+    }
+    if reviewed_snapshot is not None:
+        reviewed_snapshot.verify()
+        identity.update(schema="ascend-catlass-adaptive-phase2-identity-v1",
+                        phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
+    expected = canonical_bytes(identity) + b"\n"
     try:
         root.mkdir(parents=True, exist_ok=True)
         if not path.exists() and (root / "state.json").exists():
@@ -332,6 +334,7 @@ def build_adaptive_phase1(
     project_target: int | None = None,
     max_projects: int | None = None,
     profiling_guidance_text: str | None = None,
+    reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 
@@ -343,7 +346,7 @@ def build_adaptive_phase1(
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
     actor_context = _actor_context(admitted, guide_bytes, profiling_guidance_text)
-    _bind_campaign_identity(paths.root, admitted)
+    _bind_campaign_identity(paths.root, admitted, reviewed_snapshot)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
             raise ValueError("KDB-off treatment must not receive KDB dependencies")
@@ -380,30 +383,21 @@ def build_adaptive_phase1(
     request_profile = _measurement_action(measurements, profiling=True)
     request_timing = _measurement_action(measurements, profiling=False)
     from benchmarks.a5kernels.phase1_project_diagnostics import diagnostic_action
-    project_actor = AdaptiveActorProjectExecutor(
-        executor,
-        actor,
-        profile,
+    from benchmarks.ascend.production import compose_adaptive_controller
+    project_actor, coordinator = compose_adaptive_controller(
+        root=paths.root, objective=objective, initial_memory=initial_memory,
+        executor=executor, actor=actor, profile=profile, provider=provider,
         query_knowledge=query_knowledge,
         request_profile=request_profile,
         request_timing=request_timing,
         request_diagnostic=diagnostic_action(backend),
         immutable_context=actor_context,
-    )
-    curriculum = CurriculumAgent(
-        lambda messages: provider.complete(profile, messages).text,
         profiling_guidance=profiling_guidance_text,
-    )
-
-    coordinator = AdaptivePhase1Coordinator(
-        paths.root,
-        objective,
-        initial_memory,
-        curriculum,
-        project_actor,
+        trace_recorder_factory=trace_recorder_factory,
         max_parallel=max_parallel,
         project_target=project_target,
         max_projects=max_projects,
+        reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
     )
     return AdaptivePhase1Production(
         admitted,

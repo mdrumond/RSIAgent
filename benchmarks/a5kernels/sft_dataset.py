@@ -14,6 +14,7 @@ from typing import Mapping, Sequence
 
 
 SOURCE_SCHEMA = "a5-sft-sources-v1"
+OBSERVED_SOURCE_SCHEMA = "ascend-sft-sources-v2"
 TRACE_SCHEMA = "a5-sft-trace-v1"
 DATASET_SCHEMA = "a5-fireworks-sft-dataset-v1"
 REQUIRED_SOURCE_NAMES = {
@@ -73,8 +74,8 @@ class Source:
     license: str
     include: tuple[str, ...]
 
-    def validate(self) -> None:
-        if self.name not in REQUIRED_SOURCE_NAMES:
+    def validate(self, *, observed: bool = False) -> None:
+        if not (_SAFE_ID.fullmatch(self.name) if observed else self.name in REQUIRED_SOURCE_NAMES):
             raise ValueError(f"unknown source name: {self.name}")
         if not self.repository.startswith("https://") or self.repository.endswith("/"):
             raise ValueError(f"invalid repository for {self.name}")
@@ -96,7 +97,7 @@ class SourceManifest:
     @classmethod
     def load(cls, path: Path) -> "SourceManifest":
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if set(raw) != {"schema", "sources"} or raw["schema"] != SOURCE_SCHEMA:
+        if set(raw) != {"schema", "sources"} or raw["schema"] not in {SOURCE_SCHEMA, OBSERVED_SOURCE_SCHEMA}:
             raise ValueError("invalid source manifest schema")
         sources = tuple(
             Source(
@@ -107,9 +108,9 @@ class SourceManifest:
             for item in raw["sources"]
         )
         for source in sources:
-            source.validate()
+            source.validate(observed=raw["schema"] == OBSERVED_SOURCE_SCHEMA)
         names = [source.name for source in sources]
-        if names != sorted(set(names)) or set(names) != REQUIRED_SOURCE_NAMES:
+        if names != sorted(set(names)) or (raw["schema"] == SOURCE_SCHEMA and set(names) != REQUIRED_SOURCE_NAMES):
             raise ValueError("manifest must contain all required sources exactly once")
         return cls(sources, hashlib.sha256(_canonical(raw)).hexdigest())
 
@@ -180,6 +181,13 @@ class TraceRecorder:
             raise ValueError("invalid tool event name")
         self._append("tool", {"name": name, **dict(payload)})
 
+    def supervised_source(self, source: str) -> None:
+        """Append exact admitted source without redacting ordinary identifiers."""
+        if _CANDIDATE_SECRET.search(source) or not source.strip():
+            raise ValueError("invalid supervised source")
+        self.message("user", "Return the exact host-verified candidate source as the supervised answer.")
+        self._append("message", {"role": "assistant", "content": source}, redact=False)
+
     def candidate(self, source: str, *, candidate_id: str) -> None:
         if not _SAFE_ID.fullmatch(candidate_id) or not source.strip():
             raise ValueError("candidate requires an id and source")
@@ -237,14 +245,29 @@ def _read_trace(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def _native_candidate(source: str) -> bool:
+    return bool(re.search(
+        r'^\s*#\s*(?:include|define|undef|if|ifdef|ifndef|elif|else|endif|pragma|error|line)\b'
+        r'|\b(?:__aicore__|__global__)\b|\bAscendC::|\bextern\s+"C"',
+        source, re.MULTILINE,
+    ))
+
+
 def _normalized_candidate(source: str) -> str:
+    # Native directives and case affect semantics; retain exact source for dedup.
+    if _native_candidate(source):
+        return source
     no_comments = re.sub(r"#.*", "", source)
     return " ".join(no_comments.lower().split())
 
 
 def _is_near_duplicate(value: str, retained: Sequence[str]) -> bool:
     """Collapse extremely close edits while retaining real kernel variants."""
-    return any(SequenceMatcher(None, value, item).ratio() >= 0.985 for item in retained)
+    if _native_candidate(value):
+        return False
+    return any(not _native_candidate(item)
+               and SequenceMatcher(None, value, item).ratio() >= 0.985
+               for item in retained)
 
 
 def _repair_pattern(rows: Sequence[Mapping[str, object]]) -> str | None:

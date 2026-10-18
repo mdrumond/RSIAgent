@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -312,11 +313,34 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert "previous-project-action" not in memory.actions
     distillation_messages = provider_calls[-1]["request"]["messages"]
     prior_messages = provider_calls[-2]["request"]["messages"]
-    assert distillation_messages[:len(prior_messages)] == prior_messages
-    assert distillation_messages[len(prior_messages)]["content"] == '{"submit":{}}'
-    assert json.loads(
-        distillation_messages[len(prior_messages) + 1]["content"]
-    )["host"]["event"] == "submitted"
+    assert distillation_messages[:2] == prior_messages[:2]
+    host_prefix = "Host-owned current state:\n"
+    def host_state(messages):
+        states = [json.loads(message["content"].removeprefix(host_prefix))
+                  for message in messages if message["content"].startswith(host_prefix)]
+        assert len(states) == 1
+        return states[0]
+    previous_state = host_state(prior_messages)
+    submitted_state = host_state(distillation_messages)
+    assert "submitted" not in previous_state
+    assert submitted_state == {**previous_state, "submitted": {"passed": True}}
+    assert submitted_state["source_sha256"] == hashlib.sha256(SOURCE.encode()).hexdigest()
+    # Only the separately pinned host facts evolve; preserve raw recent exchanges.
+    previous_history = [message for message in prior_messages
+                        if not message["content"].startswith(host_prefix)]
+    distillation_history = [message for message in distillation_messages
+                            if not message["content"].startswith(host_prefix)]
+    assert distillation_history[:len(previous_history)] == previous_history
+    assert distillation_history[len(previous_history)]["content"] == '{"submit":{}}'
+    submitted = json.loads(distillation_history[len(previous_history) + 1]["content"])["host"]
+    assert submitted["event"] == "submitted" and submitted["passed"] is True
+    assert len(bytes.fromhex(submitted["attestation_sha256"])) == 32
+    attempt = next(memory_path.glob("provider-attempts/attempt-*"))
+    artifacts = ContentAddressedArtifacts(attempt / "artifacts")
+    retained_requests = [artifacts.read_json(entry.payload["sha256"])
+                         for entry in EvidenceLedger(attempt / "evidence.jsonl").entries
+                         if entry.payload.get("role") == "provider-request"]
+    assert retained_requests == [call["request"] for call in provider_calls]
     if expected_category == "performance":
         study = next(
             digest for digest in memory.admitted_artifact_sha256
