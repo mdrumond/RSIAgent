@@ -164,6 +164,100 @@ def test_resume_does_not_extend_and_continue_is_explicit(tmp_path):
     assert cli._read(Path(job["root"]) / "campaign-run.json")["project_target"] == 4
 
 
+def test_approval_lifecycle_selects_subset_and_runs_once(tmp_path):
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    cli._write(Path(job["control"]) / "job.json", job)
+    proposals = [{"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                  "wave": {"projects": [
+                      {"spec": {"project_id": "one"}},
+                      {"spec": {"project_id": "two"}},
+                  ]}, "session": {"messages": [], "turns": 0}}]
+    calls = []
+
+    class Coordinator:
+        def propose_wave(self):
+            return proposals[0]
+        def approve_wave(self, proposal, selected):
+            calls.append(("approve", selected))
+            return {**proposal, "wave": {"projects": [proposal["wave"]["projects"][1]]}}
+        def run_approved_wave(self):
+            calls.append(("run",))
+            return {"successful_projects": 1}
+
+    builder = lambda _job: Coordinator()
+    sampled = cli.sample_curriculum(job, builder=builder)
+    assert sampled["status"] == "proposed"
+    assert [row["project_id"] for row in sampled["projects"]] == ["one", "two"]
+    approved = cli.approve_curriculum(job, ["two"], sampled["proposal_id"], builder=builder)
+    assert approved["status"] == "approved"
+    result = cli.run_approved_curriculum(job, sampled["proposal_id"], builder=builder)
+    assert result["result"] == {"successful_projects": 1}
+    assert calls == [("approve", ("two",)), ("run",)]
+    # Retrying the same request returns its retained result without re-execution.
+    assert cli.run_approved_curriculum(job, sampled["proposal_id"], builder=builder) == result
+    assert calls == [("approve", ("two",)), ("run",)]
+
+
+def test_approval_lifecycle_rejects_stale_or_wrong_proposal(tmp_path):
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    cli._write(Path(job["control"]) / "job.json", job)
+
+    class Coordinator:
+        def propose_wave(self):
+            return {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                    "wave": {"projects": [{"spec": {"project_id": "one"}}]},
+                    "session": {"messages": [], "turns": 0}}
+        def validate_proposal(self, proposal):
+            raise ValueError("proposal no longer matches published memory")
+
+    sampled = cli.sample_curriculum(job, builder=lambda _job: Coordinator())
+    with pytest.raises(ValueError, match="proposal ID"):
+        cli.reject_curriculum(job, "0" * 64, builder=lambda _job: Coordinator())
+    with pytest.raises(ValueError, match="published memory"):
+        cli.reject_curriculum(job, sampled["proposal_id"], builder=lambda _job: Coordinator())
+
+
+def test_phase2_approval_requires_exactly_one_project(tmp_path):
+    job = start(tmp_path, phase=2)
+    job["approval_mode"] = True
+    cli._write(Path(job["control"]) / "job.json", job)
+    proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                "wave": {"projects": [{"spec": {"project_id": "one"}},
+                                        {"spec": {"project_id": "two"}}]},
+                "session": {"messages": [], "turns": 0}}
+
+    class Coordinator:
+        def propose_wave(self):
+            return proposal
+        def approve_wave(self, proposal, selected):
+            assert len(selected) == 1
+            return proposal
+
+    sampled = cli.sample_curriculum(job, builder=lambda _job: Coordinator())
+    with pytest.raises(ValueError, match="exactly one"):
+        cli.approve_curriculum(job, ["one", "two"], sampled["proposal_id"],
+                               builder=lambda _job: Coordinator())
+
+
+def test_run_approved_recovers_after_wave_published_before_control_update(tmp_path):
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    control = Path(job["control"])
+    cli._write(control / "job.json", job)
+    proposal = {"base_wave_index": 3, "base_memory_sha256": "a" * 64,
+                "wave": {"projects": [{"spec": {"project_id": "one"}}]}}
+    proposal_id = cli._proposal_id(proposal)
+    cli._write(control / "curriculum-approval.json", {
+        "proposal_id": proposal_id, "status": "running", "proposal": proposal,
+    })
+    coordinator = SimpleNamespace(report=lambda: {"wave_index": 4, "successful_projects": 1})
+    recovered = cli.run_approved_curriculum(
+        job, proposal_id, builder=lambda _job: coordinator)
+    assert recovered["status"] == "complete" and recovered["recovered"] is True
+
+
 def test_worker_failure_and_unavailable_downloader_are_independent(tmp_path):
     job = start(tmp_path)
     def fail(job):

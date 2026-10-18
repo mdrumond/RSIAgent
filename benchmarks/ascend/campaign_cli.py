@@ -135,6 +135,106 @@ def build_controller(job):
     return captured[0]
 
 
+def _approval_path(job):
+    return Path(job["control"]) / "curriculum-approval.json"
+
+
+def _require_approval_mode(job):
+    if job.get("approval_mode") is not True:
+        raise ValueError("campaign was not started in approval mode")
+
+
+def _proposal_id(proposal):
+    payload = json.dumps(proposal, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _approval(job, proposal_id):
+    path = _approval_path(job)
+    if not path.exists():
+        raise ValueError("no curriculum proposal is retained")
+    record = _read(path)
+    if record.get("proposal_id") != proposal_id:
+        raise ValueError("proposal ID does not match the retained proposal")
+    return record
+
+
+def sample_curriculum(job, *, builder=build_controller):
+    """Retain one model-selected proposal without making it executable."""
+    _require_approval_mode(job)
+    path = _approval_path(job)
+    if path.exists() and _read(path).get("status") in {"proposed", "approved"}:
+        raise ValueError("resolve the retained curriculum proposal before sampling again")
+    proposal = builder(job).propose_wave()
+    identity = _proposal_id(proposal)
+    projects = [{"project_id": row["spec"]["project_id"],
+                 "hypothesis": row["spec"].get("hypothesis", "")}
+                for row in proposal.get("wave", {}).get("projects", [])]
+    record = {"schema": "ascend-curriculum-approval-v1", "proposal_id": identity,
+              "status": "proposed", "phase": job["phase"], "projects": projects,
+              "proposal": proposal, "created": time.time()}
+    _write(path, record)
+    return record
+
+
+def approve_curriculum(job, project_ids, proposal_id, *, builder=build_controller):
+    _require_approval_mode(job)
+    record = _approval(job, proposal_id)
+    if record["status"] == "approved":
+        if tuple(record["selected_project_ids"]) == tuple(project_ids):
+            return record
+        raise ValueError("proposal is already approved with a different selection")
+    if record["status"] != "proposed":
+        raise ValueError("only a proposed curriculum can be approved")
+    selected = tuple(project_ids)
+    if job["phase"] == 2 and len(selected) != 1:
+        raise ValueError("Phase 2 approval requires exactly one project")
+    approved = builder(job).approve_wave(record["proposal"], selected)
+    record = {**record, "status": "approved", "selected_project_ids": list(selected),
+              "approved_wave": approved["wave"], "approved": time.time()}
+    _write(_approval_path(job), record)
+    return record
+
+
+def reject_curriculum(job, proposal_id, *, builder=build_controller):
+    _require_approval_mode(job)
+    record = _approval(job, proposal_id)
+    if record["status"] == "rejected":
+        return record
+    if record["status"] != "proposed":
+        raise ValueError("only a proposed curriculum can be rejected")
+    builder(job).validate_proposal(record["proposal"])
+    record = {**record, "status": "rejected", "rejected": time.time()}
+    _write(_approval_path(job), record)
+    return record
+
+
+def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
+    _require_approval_mode(job)
+    record = _approval(job, proposal_id)
+    if record["status"] == "complete":
+        return record
+    if record["status"] not in {"approved", "running"}:
+        raise ValueError("curriculum proposal is not approved")
+    coordinator = builder(job)
+    base_wave = record["proposal"]["base_wave_index"]
+    if record["status"] == "running":
+        current = coordinator.report()
+        if current["wave_index"] == base_wave + 1:
+            record = {**record, "status": "complete", "result": current,
+                      "finished": time.time(), "recovered": True}
+            _write(_approval_path(job), record)
+            return record
+        if current["wave_index"] != base_wave:
+            raise ValueError("approved wave completion cannot be reconciled")
+    record = {**record, "status": "running", "started": time.time()}
+    _write(_approval_path(job), record)
+    result = coordinator.run_approved_wave()
+    record = {**record, "status": "complete", "result": result, "finished": time.time()}
+    _write(_approval_path(job), record)
+    return record
+
+
 def campaign_worker(job, *, builder=build_controller):
     """One retained worker; infrastructure recovery is an explicit resume."""
     control = Path(job["control"])
@@ -156,7 +256,7 @@ def campaign_worker(job, *, builder=build_controller):
                 public = _read(public_path)
                 public["project_target"] = job["project_target"]
                 _write(public_path, public)
-            result = coordinator.resume()
+            result = coordinator.report() if job.get("approval_mode") else coordinator.resume()
             _write(control / "worker.json", {"status": "complete", "finished": time.time(),
                                              "result": result})
             return result
@@ -239,7 +339,8 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("start", "resume", "continue", "status", "collect", "package", "_campaign", "_collector"):
+    for command in ("start", "resume", "continue", "status", "collect", "package",
+                    "sample", "approve", "reject", "run-approved", "_campaign", "_collector"):
         sub = commands.add_parser(command)
         sub.add_argument("--control", type=Path, required=True,
                          help="ignored local settings/queue directory outside the campaign")
@@ -253,6 +354,7 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--project-target", type=int, required=True)
             sub.add_argument("--phase1-root", type=Path)
             sub.add_argument("--review", type=Path)
+            sub.add_argument("--approval-mode", action="store_true")
         if command == "continue":
             sub.add_argument("--project-target", type=int, required=True)
             sub.add_argument("--reopen-terminal", action="store_true")
@@ -261,6 +363,10 @@ def main(argv=None, *, screen=start_screen):
         if command == "package":
             sub.add_argument("--output", type=Path, required=True)
             sub.add_argument("--allow-pending", action="store_true")
+        if command in {"approve", "reject", "run-approved"}:
+            sub.add_argument("--proposal-id", required=True)
+        if command == "approve":
+            sub.add_argument("--project-id", action="append", required=True)
     args = parser.parse_args(argv)
     control = args.control.resolve()
     if args.command == "start":
@@ -294,6 +400,8 @@ def main(argv=None, *, screen=start_screen):
                   "objective": args.objective, "project_target": args.project_target,
                   "model": settings["model"], "source_manifest_sha256": source.sha256,
                   "harness_revision": revision, "created": time.time(), "round_id": control.name}
+        if args.approval_mode:
+            public["approval_mode"] = True
         _write(root / "campaign-run.json", public)
         job = {**public, "root": str(root), "control": str(control), "config": str(config),
                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
@@ -329,6 +437,14 @@ def main(argv=None, *, screen=start_screen):
     elif args.command == "package":
         print(json.dumps(package_campaign(job["root"], args.output,
                          artifact_store=control / "reports", allow_pending=args.allow_pending)))
+    elif args.command == "sample":
+        print(json.dumps(sample_curriculum(job)))
+    elif args.command == "approve":
+        print(json.dumps(approve_curriculum(job, args.project_id, args.proposal_id)))
+    elif args.command == "reject":
+        print(json.dumps(reject_curriculum(job, args.proposal_id)))
+    elif args.command == "run-approved":
+        print(json.dumps(run_approved_curriculum(job, args.proposal_id)))
     else:
         while True:
             print(json.dumps(status(job)), flush=True)
