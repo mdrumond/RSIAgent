@@ -95,7 +95,7 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, select
     assert controller.curriculum.target_policy.target == "a3"
     assert controller.project_target == 64
     assert "A3 Ascend C" in controller.execute_project.actor.system_prompt
-    assert controller.execute_project.retain_semantic_failure is phase2
+    assert controller.execute_project.retain_semantic_failure is True
     identity = json.loads((tmp_path / "campaign-identity.json").read_bytes())
     if phase2:
         assert identity["phase"] == "adaptive-phase2"

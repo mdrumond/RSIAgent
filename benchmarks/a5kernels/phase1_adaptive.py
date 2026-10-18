@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+from copy import copy
 from dataclasses import dataclass
 import hashlib
 import json
@@ -38,6 +39,34 @@ STATE_SCHEMA = "a5-phase1-adaptive-state-v2"
 PENDING_SCHEMA = "a5-phase1-adaptive-pending-v1"
 MEMORY_SCHEMA = "a5-phase1-adaptive-memory-v1"
 DELTA_SCHEMA = "a5-phase1-adaptive-memory-delta-v1"
+
+
+def retained_failure_outcome(root: Path, wave_id: str, project: ProjectSpec) -> dict:
+    """Concise selection feedback, backed by the retained branch evidence."""
+    branch = root / "waves" / wave_id / "branches" / project.project_id
+    try:
+        evidence = json.loads((branch / "execution-evidence.bin").read_bytes())
+    except (ValueError, UnicodeDecodeError):
+        evidence = {}
+    if not isinstance(evidence, dict):
+        evidence = {}
+    outcome = json.loads((branch / "outcome.json").read_bytes())
+    delta = json.loads((branch / "memory-delta.bin").read_bytes())
+    source = evidence.get("source_sha256")
+    if delta.get("schema") == DELTA_SCHEMA:
+        source = source or json.loads(base64.b64decode(delta["memory_base64"], validate=True))["source_revision"]
+    summary = str(delta.get("summary") or evidence.get("summary") or evidence.get("detail")
+                  or "Completed attempt without host verification").strip()
+    return {"project_id": project.project_id, "spec": project.as_dict(), "verified": False,
+            "summary": summary[:1200].rstrip(),
+            "evidence": {"path": str(branch.relative_to(root)),
+                         "sha256": outcome["evidence_sha256"],
+                         "source_sha256": source,
+                         "classification": outcome["classification"],
+                         "iterations": evidence.get("iterations"), "tokens": evidence.get("tokens"),
+                         "actor_status": evidence.get("actor_status"),
+                         "action_counts": evidence.get("action_counts"),
+                         "metered_actions": evidence.get("metered_actions")}}
 
 
 def _validated_summary(value: object) -> str:
@@ -118,7 +147,8 @@ class AdaptivePhase1Coordinator:
         self.root = Path(root)
         self.objective = objective.strip()
         self.initial_memory = initial_memory
-        self.curriculum = curriculum
+        self.curriculum = copy(curriculum)
+        self.curriculum.require_fresh_project_ids = True
         self.execute_project = execute_project
         self.max_parallel = max_parallel
         if max_projects is not None and (type(max_projects) is not int or max_projects < 1):
@@ -149,17 +179,22 @@ class AdaptivePhase1Coordinator:
                 return self._report(state)
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
+            completed = self._completed_attempts(state)
             if pending is None:
-                if self.max_projects is not None and len(state["prior_outcomes"]) >= self.max_projects:
+                if self.max_projects is not None and completed >= self.max_projects:
                     state = {**state, "terminal": {
                         "status": "PROJECT_LIMIT_REACHED",
-                        "reason": f"Published project limit {self.max_projects} reached; saturation was not evaluated.",
+                        "reason": f"Completed attempt limit {self.max_projects} reached; saturation was not evaluated.",
                     }}
                     self._atomic_json(self.root / "state.json", state)
                     return self._report(state)
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
-                    remaining_projects=min(self.project_target, self.max_projects or self.project_target) - len(state["prior_outcomes"]),
+                    remaining_projects=min(
+                        self.project_target - len(state["prior_outcomes"]),
+                        self.max_projects - completed if self.max_projects is not None
+                        else self.project_target,
+                    ),
                 )
                 if isinstance(decision, TerminalDecision):
                     state = {
@@ -174,7 +209,7 @@ class AdaptivePhase1Coordinator:
                     return self._report(state)
                 assert isinstance(decision, WaveDecision)
                 if self.max_projects is not None and (
-                    len(state["prior_outcomes"]) + len(decision.wave.projects) > self.max_projects
+                    completed + len(decision.wave.projects) > self.max_projects
                 ):
                     raise ValueError("selected wave exceeds remaining project limit; select a smaller wave")
                 pending = {
@@ -186,7 +221,7 @@ class AdaptivePhase1Coordinator:
                 }
                 self._atomic_json(self.root / "pending.json", pending)
             wave = WaveSpec.from_mapping(pending["wave"])
-            if self.max_projects is not None and len(state["prior_outcomes"]) + len(wave.projects) > self.max_projects:
+            if self.max_projects is not None and completed + len(wave.projects) > self.max_projects:
                 raise ValueError("retained wave exceeds configured project limit")
             coordinator = LiveWaveCoordinator(
                 self.root / "waves" / wave.wave_id,
@@ -194,12 +229,13 @@ class AdaptivePhase1Coordinator:
                 snapshot,
                 self._execute,
                 self.max_parallel,
+                allow_semantic_failures=True,
             )
             consolidation = coordinator.resume()
-            deltas = tuple(
-                self._read_delta(wave.wave_id, commit.project_id)
-                for commit in consolidation.commits
-            )
+            committed = {commit.project_id for commit in consolidation.commits}
+            deltas = tuple(self._read_delta(wave.wave_id, project.spec.project_id)
+                           if project.spec.project_id in committed else None
+                           for project in wave.projects)
             state = self._publish(state, wave, pending, deltas)
             self._atomic_json(self.root / "state.json", state)
             (self.root / "pending.json").unlink(missing_ok=True)
@@ -280,7 +316,11 @@ class AdaptivePhase1Coordinator:
         memories = list(state["memory_bytes_base64"])
         outcomes = list(state["prior_outcomes"])
         coverage = list(state["coverage"])
+        failures = list(state.get("failed_outcomes", []))
         for project, delta in zip(wave.projects, deltas, strict=True):
+            if delta is None:
+                failures.append(retained_failure_outcome(self.root, wave.wave_id, project.spec))
+                continue
             memories.append(delta["memory_base64"])
             outcomes.append({
                 "project_id": project.spec.project_id,
@@ -299,6 +339,7 @@ class AdaptivePhase1Coordinator:
             "memory_bytes_base64": memories,
             "session": pending["session"],
             "completed_waves": [*state["completed_waves"], wave.wave_id],
+            **({"failed_outcomes": failures} if failures else {}),
         }
 
     def _read_delta(self, wave_id: str, project_id: str) -> dict[str, object]:
@@ -324,6 +365,9 @@ class AdaptivePhase1Coordinator:
         }
 
     def _context(self, state, snapshot):
+        remaining = max(0, self.project_target - len(state["prior_outcomes"]))
+        if self.max_projects is not None:
+            remaining = min(remaining, max(0, self.max_projects - self._completed_attempts(state)))
         return CurriculumContext(
             self.objective,
             state["wave_index"],
@@ -334,11 +378,12 @@ class AdaptivePhase1Coordinator:
                     value["project_id"],
                     ProjectInformation.from_project(value["spec"]),
                     value["verified"],
-                    value["summary"],
+                    value["summary"][:240].rstrip(),
                 )
                 for value in self._effective_outcomes(state)
             ),
-            max(0, self.project_target - len(state["prior_outcomes"])),
+            remaining,
+            self._curriculum_feedback(state),
         )
 
     @staticmethod
@@ -431,6 +476,9 @@ class AdaptivePhase1Coordinator:
             "wave_index": state["wave_index"],
             "project_target": self.project_target,
             "successful_projects": len(state["prior_outcomes"]),
+            "completed_attempts": self._completed_attempts(state),
+            "failed_projects": len(state.get("failed_outcomes", [])),
+            "curriculum_memory": self._curriculum_memory(state),
             "unverified_projects": sum(row["status"] == "unverified" for row in pending["projects"]) if pending else 0,
             "coverage_gaps": self._coverage_gaps(state),
             "coverage": list(state["coverage"]),
@@ -447,6 +495,10 @@ class AdaptivePhase1Coordinator:
                    if row["verified"]
                    for focus in row["spec"].get("learning_focus", ())}
         return [focus for focus in LEARNING_FOCI if focus not in covered]
+
+    @staticmethod
+    def _completed_attempts(state):
+        return len(state["prior_outcomes"]) + len(state.get("failed_outcomes", []))
 
     @staticmethod
     def _effective_outcomes(state):
@@ -483,8 +535,35 @@ class AdaptivePhase1Coordinator:
                 spec["learning_focus"] = focus
             else:
                 spec.pop("learning_focus", None)
-            rows.append({**row, "spec": spec})
-        return rows
+            lessons = memory.get("agent_lessons", [])
+            yield_summary = ("no_new_knowledge" if memory.get("no_new_knowledge") else
+                             "lessons: " + lessons[0]["claim"][:160] if lessons else "not-recorded")
+            rows.append({**row, "spec": spec,
+                         "summary": "Host verified; learning yield=" + yield_summary})
+        return [*rows, *state.get("failed_outcomes", [])]
+
+    @staticmethod
+    def _curriculum_memory(state):
+        rows = []
+        for row, encoded in zip(state["prior_outcomes"], state["memory_bytes_base64"], strict=True):
+            memory = json.loads(base64.b64decode(encoded, validate=True))
+            rows.append({"project_id": row["project_id"], "verified": True,
+                         "yield": ("no_new_knowledge" if memory.get("no_new_knowledge") else
+                                   "lessons" if memory.get("agent_lessons") else "not-recorded"),
+                         "summary": row["summary"][:1200],
+                         "lesson_claims": [lesson["claim"][:400] for lesson in memory.get("agent_lessons", [])[:2]],
+                         "source_sha256": memory["source_revision"],
+                         "evidence_sha256": [fact["evidence_sha256"] for fact in memory["host_facts"]]})
+        return [*rows, *({key: value for key, value in {**row, "yield": "failed"}.items()
+                         if key != "spec"} for row in state.get("failed_outcomes", []))]
+
+    @classmethod
+    def _curriculum_feedback(cls, state):
+        """Bound detailed pointers without letting old failures crowd out learning."""
+        rows = cls._curriculum_memory(state)
+        failed = [row for row in rows if not row["verified"]][-4:]
+        verified = [row for row in rows if row["verified"]][-(8 - len(failed)):]
+        return tuple([*verified, *failed])
 
     def _pending_report(self, state):
         pending = self._load_pending(state)

@@ -487,7 +487,7 @@ def test_unverified_prior_can_be_retried_and_does_not_count_as_coverage():
         "movement", ProjectInformation.from_project(item), False,
         "candidate failed host verification",
     )
-    decision, _ = CurriculumAgent(lambda _: wave([item])).select(
+    decision, _ = CurriculumAgent(lambda _: wave([item]), require_fresh_project_ids=False).select(
         context(prior_outcomes=(failed,))
     )
     assert isinstance(decision, WaveDecision)

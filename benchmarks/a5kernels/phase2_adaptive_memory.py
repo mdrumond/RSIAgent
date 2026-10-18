@@ -89,12 +89,19 @@ def _published_evidence(root, state, initial):
             "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
             "project_memory_base64": published,
         })
-        reader = LiveWaveCoordinator(wave_root, wave, pre_memory, lambda _: None, 1)
+        reader = LiveWaveCoordinator(
+            wave_root, wave, pre_memory, lambda _: None, 1,
+            allow_semantic_failures=True,
+        )
         reader.read_published_memory()  # authenticates outcomes and both evidence digests
         for name in ("plan.json", "published.json", "consolidated-memory.json"):
             files[f"waves/{wave_id}/{name}"] = (wave_root / name).read_bytes()
         for project in wave.projects:
             branch = wave_root / "branches" / project.spec.project_id
+            for name in ("outcome.json", "memory-delta.bin", "execution-evidence.bin"):
+                files[f"waves/{wave_id}/branches/{project.spec.project_id}/{name}"] = (branch / name).read_bytes()
+            if not _read(branch / "outcome.json")["verified"]:
+                continue
             delta = _read(branch / "memory-delta.bin")
             memory = Phase1ProjectMemory.from_mapping(json.loads(base64.b64decode(delta["memory_base64"])))
             evidence = _read(branch / "execution-evidence.bin")
@@ -107,8 +114,6 @@ def _published_evidence(root, state, initial):
                         if fact.category == "host-verification"}):
                 raise ValueError("published adaptive host evidence differs from memory")
             published.append(delta["memory_base64"])
-            for name in ("outcome.json", "memory-delta.bin", "execution-evidence.bin"):
-                files[f"waves/{wave_id}/branches/{project.spec.project_id}/{name}"] = (branch / name).read_bytes()
     if published != state["memory_bytes_base64"]:
         raise ValueError("adaptive state differs from published branch memory")
     return files

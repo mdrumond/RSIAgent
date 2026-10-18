@@ -135,6 +135,34 @@ def test_siblings_run_concurrently_from_identical_memory_and_publish_in_authored
     assert json.loads(memory)["deltas"][0]["project_id"] == "first"
 
 
+@pytest.mark.parametrize("method", ["run", "read_published_memory"])
+@pytest.mark.parametrize("allow_failures", [False, True])
+def test_reopened_mixed_publication_respects_reader_policy(tmp_path, method, allow_failures):
+    spec = wave("good", "bad")
+    LiveWaveCoordinator(
+        tmp_path, spec, MEMORY,
+        lambda request: wave_result(b"verified lesson", request.assignment.project_id == "good"),
+        2, allow_semantic_failures=True,
+    ).run()
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+    def execute(_):
+        pytest.fail("reopening a publication must not execute projects")
+
+    kwargs = {"allow_semantic_failures": True} if allow_failures else {}
+    reader = LiveWaveCoordinator(tmp_path, spec, MEMORY, execute, 2, **kwargs)
+    if allow_failures:
+        result = getattr(reader, method)()
+        if method == "run":
+            assert [commit.project_id for commit in result.commits] == ["good"]
+        else:
+            assert result == (tmp_path / "consolidated-memory.json").read_bytes()
+    else:
+        with pytest.raises(ValueError, match="every project must be verified"):
+            getattr(reader, method)()
+    assert all(path.read_bytes() == payload for path, payload in before.items())
+
+
 def test_sibling_graphs_receive_isolated_host_owned_inputs_and_oracles(tmp_path):
     specs = (project("add-project", "add"), project("multiply-project", "multiply"))
     spec = WaveSpec(
