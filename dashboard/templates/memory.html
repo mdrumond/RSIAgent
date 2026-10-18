@@ -1,0 +1,3 @@
+{% extends "base.html" %}{% block title %}Memory · RSI{% endblock %}{% block body %}
+<div class="eyebrow">DEMO VIEW</div><h1>Accumulated memory</h1><p class="lede">Published, evidence-linked lessons from completed curriculum projects.</p>
+{% for campaign in view.campaigns %}<h2>{{ campaign.name }}</h2><section class="memory">{% for project in campaign.projects %}{% for lesson in project.memory.lessons %}<article><span class="tag">{{ lesson.category }}</span><h3><a href="{{ url_for('project_page', number=campaign.phase, project_id=project.id) }}">{{ project.id }}</a></h3><p>{{ lesson.claim }}</p><small>confidence: {{ lesson.confidence }}</small></article>{% endfor %}{% endfor %}</section>{% endfor %}{% endblock %}

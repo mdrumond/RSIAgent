@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block body %}
+<div class="eyebrow">A3 RESEARCH LOOP</div><h1>Campaign control room</h1>
+<p class="lede">A cached, read-only view of curriculum progress, evidence and evolving kernel source.</p>
+{% if view.stale %}<aside class="warning">Artifact refresh failed. Showing the last cached snapshot.</aside>{% endif %}
+<section class="grid">{% for campaign in view.campaigns %}<a class="card" href="{{ url_for('phase_page', number=campaign.phase) }}">
+<div class="row"><span class="tag">PHASE {{ campaign.phase }}</span><span class="status {{ campaign.worker.status if campaign.worker else 'idle' }}">{{ campaign.worker.status if campaign.worker else 'idle' }}</span></div>
+<h2>{{ campaign.name }}</h2><div class="metrics"><b>{{ campaign.stats.attempted }}</b><span>attempted</span><b>{{ campaign.stats.verified }}</b><span>verified</span><b>{{ campaign.stats.published }}</b><span>published</span></div>
+</a>{% endfor %}</section>{% endblock %}
