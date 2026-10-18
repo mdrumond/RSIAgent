@@ -109,6 +109,39 @@ def test_default_bind_is_loopback(monkeypatch, campaign, tmp_path):
     assert called["host"] == "127.0.0.1" and called["port"] == 8080
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_controlled_cli_accepts_only_unambiguous_loopback_hosts(monkeypatch, tmp_path, host):
+    from dashboard import __main__
+    config, _, _ = controlled_config(tmp_path)
+    called = {}
+    monkeypatch.setattr(__main__, "create_app", lambda *a, **k: type(
+        "App", (), {"run": lambda self, **kw: called.update(kw)})())
+    __main__.main(["serve", "--config", str(config), "--cache-dir", str(tmp_path),
+                   "--host", host])
+    assert called["host"] == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.1", "example.invalid"])
+def test_controlled_cli_rejects_non_loopback_bind(monkeypatch, tmp_path, host):
+    from dashboard import __main__
+    config, _, _ = controlled_config(tmp_path)
+    monkeypatch.setattr(__main__, "create_app", lambda *a, **k:
+                        pytest.fail("app must not be created for unsafe bind"))
+    with pytest.raises(SystemExit):
+        __main__.main(["serve", "--config", str(config), "--cache-dir", str(tmp_path),
+                       "--host", host])
+
+
+def test_read_only_cli_retains_explicit_host_override(monkeypatch, campaign, tmp_path):
+    from dashboard import __main__
+    called = {}
+    monkeypatch.setattr(__main__, "create_app", lambda *a, **k: type(
+        "App", (), {"run": lambda self, **kw: called.update(kw)})())
+    __main__.main(["serve", "--config", str(campaign), "--cache-dir", str(tmp_path),
+                   "--host", "0.0.0.0"])
+    assert called["host"] == "0.0.0.0"
+
+
 def controlled_config(tmp_path, *, phase=1):
     root, control = tmp_path / f"phase{phase}", tmp_path / f"control{phase}"
     config = tmp_path / "controlled.json"

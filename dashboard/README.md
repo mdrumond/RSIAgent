@@ -20,8 +20,10 @@ guessed.
 
 ## Optional campaign controls
 
-Set `controls.enabled` to `true` only for a loopback listener. Each preset is a
-complete server-side A3 launch definition; browser requests can select a preset
+Set `controls.enabled` to `true` only for a loopback listener. The CLI enforces
+this boundary and accepts loopback IP literals or the exact `localhost` name;
+use an SSH tunnel for remote access. Each preset is a complete server-side A3
+launch definition; browser requests can select a preset
 but cannot supply paths, commands, environment variables, targets, or arbitrary
 arguments. The runner is invoked without a shell. Phase 2 presets additionally
 require `phase1_root` and `review`. Every controlled campaign and launch preset
