@@ -25,6 +25,13 @@ from benchmarks.a5kernels.priority_controller import CampaignController, JobKind
 from benchmarks.a5kernels.screen_workers import ScreenWorkerPool, run_request
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -39,6 +46,15 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--compile-probes", type=int, default=0, metavar="N")
     reconcile.add_argument("--collection", required=True)
     reconcile.add_argument("--env-file", type=Path)
+    reconcile.add_argument(
+        "--compile-probes",
+        type=_positive_int,
+        metavar="LIMIT",
+        help=(
+            "give Phase 1 compile actions a separate positive LIMIT instead of "
+            "charging their ordinary agent action budget"
+        ),
+    )
     reconcile.add_argument("--until-complete", action="store_true")
     reconcile.add_argument("--poll-seconds", type=float, default=30.0)
     reconcile.add_argument(
@@ -108,6 +124,15 @@ def _command_factory(args, destinations):
             _option(argv, name, value)
         if args.env_file is not None:
             _option(argv, "env-file", args.env_file)
+        if (
+            job.kind in {JobKind.PHASE1_RUN, JobKind.PHASE1_RESUME}
+            and getattr(args, "compile_probes", None) is not None
+        ):
+            _option(
+                argv,
+                "compile-probes",
+                args.compile_probes,
+            )
         return tuple(argv)
 
     return command

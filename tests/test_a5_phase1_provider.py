@@ -24,7 +24,13 @@ from benchmarks.a5kernels.phase1_provider import (
 from benchmarks.a5kernels.phase1_registry import DEFAULT_PROPOSALS
 from benchmarks.a5kernels.phase1_runtime import Phase1ProjectRuntime
 from benchmarks.a5kernels.protocol import ExecutionPlan, SourceFile, VerifiedResult
-from benchmarks.a5kernels.trial import CandidateRun, TrialOrchestrator, _SYSTEM_PROMPT
+from benchmarks.a5kernels.trial import (
+    ActionOutcome,
+    CandidateRun,
+    TrialOrchestrator,
+    parse_trial_action,
+    _SYSTEM_PROMPT,
+)
 
 
 ENVIRONMENT = {
@@ -466,6 +472,53 @@ def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, matc
         actor.distill(outcome)
 
 
+@pytest.mark.parametrize("terminal", [True, False])
+def test_direct_actor_counts_all_turns_but_exempts_compile_budget(tmp_path, terminal):
+    calls = []
+    provider = _scripted_provider([
+        '{"write":{"slot":"kernel","content":"source"}}',
+        '{"compile":{}}',
+        '{"compile":{}}',
+        '{"submit":{}}',
+        _distillation(),
+    ], calls)
+    actor = DirectActorDriver(provider, max_turns=2)
+    workspace = tmp_path / "trial/workspace"
+    workspace.mkdir(parents=True)
+
+    outcome = actor(
+        "instruction",
+        profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=workspace,
+        context=None,
+        turn_parser=parse_trial_action,
+        action_executor=lambda action: ActionOutcome(
+            json.dumps({"host": {"event": action.kind}}),
+            terminal=terminal and action.kind == "submit",
+            budget_exempt=action.kind == "compile",
+            admitted_artifacts={ADMITTED: "host-verification"},
+        ),
+    )
+
+    assert outcome.status == ("done" if terminal else "turn-budget-exhausted")
+    assert outcome.iterations == 4
+    assert outcome.tokens == 8
+    assert len(calls) == 4
+    if not terminal:
+        return
+    learned = actor.distill(outcome)
+    assert learned.iterations == 4
+    assert learned.tokens == 10
+    retained = [entry.payload for entry in EvidenceLedger(
+        tmp_path / "trial/evidence.jsonl"
+    ).entries if entry.kind == EvidenceKind.ARTIFACT.value]
+    assert [(entry["stage"], entry["turn"]) for entry in retained
+            if entry["role"] == "provider-request"] == [
+        ("action", 1), ("action", 2), ("action", 3), ("action", 4),
+        ("distillation", 5),
+    ]
+
+
 @pytest.mark.parametrize("proposal", DEFAULT_PROPOSALS, ids=lambda item: item.family.value)
 def test_every_registered_project_family_can_use_the_bound_trial_executor(
     tmp_path, proposal
@@ -531,6 +584,78 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     ]
     assert request_entries[-1].payload["proposal"] == proposal.as_dict()
     assert request_entries[-1].payload["runtime"] == runtime.as_dict()
+    assert request_entries[-1].payload["trial_budget"] == {
+        "ordinary_action_limit": 40,
+        "unmetered_compile_probes": None,
+    }
+
+
+def test_bound_trial_retains_and_explains_unmetered_compile_allowance(tmp_path):
+    class RecordingCompileBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.compiles = []
+
+        def compile(self, workspace, language, attempt_id):
+            self.compiles.append(attempt_id)
+            return super().compile(workspace, language, attempt_id)
+
+    calls = []
+    provider = _scripted_provider([
+        json.dumps({"write": {"slot": "kernel", "content": SOURCE}}),
+        '{"compile":{}}',
+        '{"submit":{}}',
+    ], calls)
+    backend = RecordingCompileBackend()
+    memory = tmp_path / "memory"
+    memory.mkdir()
+    knowledge = KnowledgeAgent(
+        enabled=False,
+        journal=ProgressiveMemoryJournal(memory / "knowledge.jsonl"),
+    )
+    ledger = EvidenceLedger(tmp_path / "evidence.jsonl")
+
+    result = TrialOrchestrator.run_bound(
+        trial_root=tmp_path / "trial",
+        request_payload={"schema": "unmetered-compile-test-v1"},
+        language="catlass-dsl",
+        workload=Workload.SMOKE_VECTOR_ADD,
+        instruction="develop the kernel",
+        profile=direct_profile(MODEL_IDENTITIES[0]),
+        backend=backend,
+        actor=DirectActorDriver(provider, max_turns=2),
+        knowledge=knowledge,
+        profiling=FakeProfile(),
+        profiling_guidance=False,
+        ledger=ledger,
+        unmetered_compile_probes=1,
+    )
+
+    assert result.verified.passed
+    assert result.outcome.iterations == 3
+    assert result.outcome.tokens == 6
+    assert len(backend.compiles) == 1
+    opening = calls[0]["request"]["messages"][1]["content"]
+    assert "exactly 1 compile probe(s)" in opening
+    assert "does not launch the kernel or establish correctness" in opening
+    artifacts = ContentAddressedArtifacts(result.artifacts)
+    instruction = next(entry.payload for entry in ledger.entries
+                       if entry.kind == EvidenceKind.ARTIFACT.value
+                       and entry.payload["role"] == "actor-instruction")
+    assert artifacts.read_bytes(instruction["sha256"]).decode() == opening
+    actions = [entry.payload for entry in ledger.entries
+               if entry.kind == EvidenceKind.ACTION.value]
+    assert [entry["ordinal"] for entry in actions] == [1, 2, 3]
+    assert actions[1]["budget"]["ordinary_budget_exempt"]
+    assert all("payload_artifact_sha256" in entry for entry in actions)
+    request = next(
+        entry for entry in ledger.entries
+        if entry.kind == EvidenceKind.REQUEST.value
+    )
+    assert request.payload["trial_budget"] == {
+        "ordinary_action_limit": 40,
+        "unmetered_compile_probes": 1,
+    }
 
 
 def test_bound_trial_requires_a_host_verified_submit(tmp_path):
