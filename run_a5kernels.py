@@ -35,7 +35,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--catlass-revision", required=True)
         command.add_argument("--bge-cache", type=Path, required=True)
         command.add_argument("--kdb", type=Path, required=True)
-        command.add_argument("--collection", required=True)
+        command.add_argument("--collection", action="append", required=True)
         command.add_argument("--results-root", type=Path, required=True)
         command.add_argument("--device", type=int, required=True)
     return parser
@@ -51,7 +51,7 @@ def _production_paths(args):
         catlass_revision=args.catlass_revision,
         bge_cache=args.bge_cache.resolve(),
         kdb=args.kdb.resolve(),
-        collection=args.collection,
+        collection=args.collection[0] if len(args.collection) == 1 else tuple(args.collection),
         results_root=args.results_root.resolve(),
         device=args.device,
     )

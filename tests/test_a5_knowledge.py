@@ -157,6 +157,27 @@ def test_hybrid_query_is_language_isolated_and_repeatable(tmp_path):
     assert first[0].vector_rank == 1
 
 
+def test_lexical_query_drives_fts_before_chunk_lookup(tmp_path):
+    root = tmp_path / "sources"
+    root.mkdir()
+    sources = _write_sources(root)
+    with KnowledgeDB(tmp_path / "kdb.sqlite", FakeEmbeddings()) as database:
+        database.index(root, sources, collection="docs", language="catlass")
+        statements = []
+        database.connection.set_trace_callback(statements.append)
+        hits = database.query("docs", "vector pipeline", limit=5)
+        database.connection.set_trace_callback(None)
+        lexical_sql = next(sql for sql in statements if "bm25(" in sql)
+        plan = database.connection.execute("EXPLAIN QUERY PLAN " + lexical_sql).fetchall()
+        fts_table = database._fts_table_name("docs")
+
+    # Starting from chunks repeats the FTS match for every document in a large
+    # collection. CROSS JOIN fixes the loop order without changing rank/limits.
+    assert fts_table in plan[0]["detail"]
+    assert any("INTEGER PRIMARY KEY" in row["detail"] for row in plan[1:])
+    assert hits and any(hit.lexical_rank is not None for hit in hits)
+
+
 def test_vector_ties_use_chunk_hash_as_stable_tiebreaker(tmp_path):
     root = tmp_path / "sources"
     root.mkdir()

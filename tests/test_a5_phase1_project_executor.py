@@ -13,7 +13,38 @@ from benchmarks.a5kernels.phase1_project_executor import (
     ProjectExecutionFamily,
     ProjectExecutor,
     RuntimeObservation,
+    ProjectKernelABI,
 )
+
+
+def test_target_binding_changes_language_not_host_oracle(tmp_path):
+    class NativeBinding:
+        def abi(self, spec, inputs):
+            return ProjectKernelABI("native_kernel", ("input",), "output")
+
+        def instruction(self, spec, family, abi, inputs_sha256):
+            return f"Ascend C {abi.kernel_name}: {inputs_sha256}"
+
+    backend = FakeBackend(_compile())
+    default = ProjectExecutor(backend, EvidenceLedger(tmp_path / "default.jsonl"))
+    native = ProjectExecutor(
+        backend, EvidenceLedger(tmp_path / "native.jsonl"), binding=NativeBinding(),
+    )
+    spec = _spec("movement")
+    expected = default.prepare(spec)
+    actual = native.prepare(spec)
+    assert actual.inputs == expected.inputs
+    assert actual.expected == expected.expected
+    assert actual.family == expected.family
+    assert actual.abi.kernel_name == "native_kernel"
+    assert actual.instruction.startswith("Ascend C native_kernel:")
+    assert "tla.Tensor" not in actual.instruction
+    backend.runtime_result = _runtime(actual.expected.storage)
+    good = native.execute(spec, "native candidate")
+    assert good.evidence.classification is EvidenceClassification.HOST_VERIFIED
+    backend.runtime_result = _runtime([999.0] * len(actual.expected.storage))
+    bad = native.execute(spec, "native candidate")
+    assert bad.evidence.classification is EvidenceClassification.HOST_MISMATCH
 
 
 def _spec(family: str) -> ProjectSpec:

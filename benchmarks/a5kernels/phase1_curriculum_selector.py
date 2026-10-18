@@ -12,6 +12,8 @@ import json
 import re
 from typing import Callable, Mapping, Sequence
 
+from benchmarks.ascend.targets import CurriculumPolicy
+
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_curriculum import (
     Capability,
@@ -109,6 +111,7 @@ class ProjectInformation:
 
     @property
     def tokens(self) -> frozenset[tuple[str, str]]:
+        """Coarse advisory coverage; token novelty is not an admission rule."""
         rows = {
             *(('operation', item.value) for item in self.operations),
             *(('shape-class', _shape_class(item)) for item in self.shapes),
@@ -134,6 +137,18 @@ class ProjectInformation:
                 None if self.profile_metric is None else self.profile_metric.value
             ),
         }
+
+    @property
+    def comparison_sha256(self) -> str:
+        """Order-independent admission key, separate from retained identities.
+
+        Keep serialization unchanged so historical specs, prompts, and evidence
+        retain their original hashes when a campaign resumes.
+        """
+        value = self.as_dict()
+        if self.learning_focus:
+            value["learning_focus"] = sorted(self.learning_focus)
+        return canonical_digest(value)
 
 
 @dataclass(frozen=True)
@@ -201,6 +216,8 @@ class CurriculumContext:
 
 @dataclass(frozen=True)
 class CurriculumSession:
+    """Complete selection chronology, not a verbatim provider wire transcript."""
+
     messages: tuple[Mapping[str, str], ...] = ()
     turns: int = 0
 
@@ -305,7 +322,9 @@ def _grammar() -> dict[str, object]:
             "profile_metric", "hypothesis", "graph",
         ],
         "optional_project_fields": {"learning_focus": list(LEARNING_FOCI)},
-        "capabilities": [item.value for item in Capability],
+        "capabilities": [item.value for item in Capability if item not in {
+            Capability.VECTOR_REDUCTION, Capability.VECTOR_MASK,
+        }],
         "dtypes": [item.value for item in DType],
         "low_precision_rules": {
             "float8_e4m3fn/float8_e5m2": "movement/vector graphs allowed; Cube requires exactly one matmul node with operands equal to graph inputs in order, no padded-tail capability; copy-only graphs preserve FP8 output; every non-copy FP8 graph computes all intermediates and output in FP32",
@@ -347,6 +366,7 @@ def _grammar() -> dict[str, object]:
 def curriculum_prompt(
     context: CurriculumContext,
     unavailable_capabilities: tuple[Capability, ...] = (),
+    *, target_policy: "CurriculumPolicy | None" = None,
 ) -> str:
     payload = {
         "objective": context.objective,
@@ -356,15 +376,21 @@ def curriculum_prompt(
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
         "prior_outcomes": [item.prompt_dict() for item in context.prior_outcomes],
-        "bounded_project_grammar": _grammar(),
+        "bounded_project_grammar": (
+            _grammar() if target_policy is None else target_policy.grammar(_grammar())
+        ),
     }
     if unavailable_capabilities:
         payload["unavailable_capabilities"] = [
             item.value for item in unavailable_capabilities
         ]
     instructions = (
-        "Choose DECISION: WAVE only when every project adds operation, shape, dtype, "
-        "failure, profile, or learning-focus information not covered by prior outcomes. Select no more than max_wave_projects (at most eight), then adapt the next wave to observed results. Capability "
+        "Choose DECISION: WAVE for useful experiments informed by prior outcomes. "
+        "Coverage dimensions are advisory: new exact shapes within a covered shape "
+        "class and new combinations of covered dimensions are allowed. Avoid exact "
+        "repeats of verified prior or sibling project information; changing only "
+        "an ID, hypothesis, or launch tuning does not distinguish information. "
+        "Select no more than max_wave_projects (at most eight), then adapt the next wave to observed results. Capability "
         "labels alone are not information gain. Copy the supplied "
         "wave ID, memory identity, and coverage exactly. Otherwise choose SATURATED "
         "when the objective is covered, or STALLED when useful work is blocked.\n"
@@ -378,7 +404,8 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
-    return instructions + ASCEND_EXPERIMENT_GUIDANCE + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    guidance = ASCEND_EXPERIMENT_GUIDANCE if target_policy is None else target_policy.guidance
+    return instructions + guidance + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 class CurriculumAgent:
@@ -390,12 +417,16 @@ class CurriculumAgent:
         *,
         held_out_information_sha256: Sequence[str] = (),
         unavailable_capabilities: Sequence[Capability] = (),
+        target_policy: "CurriculumPolicy | None" = None,
         profiling_guidance: str | None = None,
+        require_fresh_project_ids: bool = False,
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
         self._complete = complete
+        self.target_policy = target_policy
         self.profiling_guidance = profiling_guidance
+        self.require_fresh_project_ids = require_fresh_project_ids
         self._held_out = frozenset(
             _digest(item, "held-out information identity")
             for item in held_out_information_sha256
@@ -419,15 +450,18 @@ class CurriculumAgent:
         current = CurriculumSession() if session is None else session
         if not isinstance(current, CurriculumSession):
             raise TypeError("session must be CurriculumSession")
-        history = list(current.messages) if current.messages else [
-            {"role": "system", "content": _SYSTEM}
-        ]
+        system = {"role": "system", "content": (
+            _SYSTEM if self.target_policy is None else self.target_policy.system
+        )}
+        history = list(current.messages) if current.messages else [system]
+        selection_start = len(history)
         history.append({
             "role": "user",
             "content": (
                 "Profiling guidance:\n" + self.profiling_guidance + "\n"
                 if self.profiling_guidance is not None else ""
-            ) + curriculum_prompt(context, self.unavailable_capabilities),
+            ) + curriculum_prompt(context, self.unavailable_capabilities,
+                                  target_policy=self.target_policy),
         })
         if remaining_projects is not None:
             history[-1]["content"] = (
@@ -437,7 +471,11 @@ class CurriculumAgent:
         for attempt in range(1, 4):
             # Provider failures are not proposal-validation failures. Let the
             # caller's existing infrastructure handling observe them unchanged.
-            completion = self._complete(tuple(dict(item) for item in history))
+            # The current host context contains all authoritative prior outcomes.
+            # Keep old selections for audit/resume, but do not resend redundant
+            # historical contexts. Include all corrections within this selection.
+            wire = [system, *history[selection_start:]]
+            completion = self._complete(tuple(dict(item) for item in wire))
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
@@ -490,6 +528,12 @@ class CurriculumAgent:
                 raise ValueError("stall requires an observed prior attempt")
             return terminal
         wave = WaveSpec.from_mapping(value)
+        for project in wave.projects:
+            if self.target_policy is not None:
+                self.target_policy.admit(project.spec)
+            elif any(item in {Capability.VECTOR_REDUCTION, Capability.VECTOR_MASK}
+                     for item in project.spec.capabilities):
+                raise ValueError("native vector capability requires an explicit target policy")
         if len(wave.projects) > min(8, context.remaining_projects):
             raise ValueError("wave exceeds eight-project wave limit or remaining project target")
         unavailable = set(self.unavailable_capabilities)
@@ -519,18 +563,16 @@ class CurriculumAgent:
         verified_outcomes = tuple(
             item for item in context.prior_outcomes if item.verified
         )
-        prior_ids = {item.project_id for item in verified_outcomes}
-        prior_information = {item.information_sha256 for item in verified_outcomes}
-        covered_dimensions = frozenset(
-            token
-            for item in verified_outcomes
-            for token in item.information.tokens
-        )
+        prior_ids = {item.project_id for item in (
+            context.prior_outcomes if self.require_fresh_project_ids else verified_outcomes)}
+        prior_information = {
+            item.information.comparison_sha256 for item in verified_outcomes
+        }
         information = tuple(
             ProjectInformation.from_project(item.spec) for item in wave.projects
         )
         signatures = tuple(
-            canonical_digest(item.as_dict()) for item in information
+            item.comparison_sha256 for item in information
         )
         if any(item.spec.project_id in prior_ids for item in wave.projects):
             raise ValueError("wave repeats a prior project ID")
@@ -545,14 +587,6 @@ class CurriculumAgent:
         }
         if self._held_out.intersection(executable_signatures):
             raise ValueError("wave matches a held-out contract or shape")
-        marginal_coverage = set(covered_dimensions)
-        for item in information:
-            if not item.tokens - marginal_coverage:
-                raise ValueError(
-                    "every project must add marginal operation/shape-class/dtype/"
-                    "failure/profile/learning-focus information"
-                )
-            marginal_coverage.update(item.tokens)
         return WaveDecision(wave)
 
 

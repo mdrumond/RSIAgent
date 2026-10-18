@@ -138,6 +138,8 @@ class AdaptivePhase1Coordinator:
             > self.project_target
         ):
             raise ValueError("retained wave exceeds configured project target")
+        if state.get("project_target", self.project_target) != self.project_target:
+            raise ValueError("use continue_campaign to change the retained project target")
         state = {**state, "project_target": self.project_target}
         self._atomic_json(self.root / "state.json", state)
         while True:
@@ -204,6 +206,26 @@ class AdaptivePhase1Coordinator:
 
     def resume(self) -> dict[str, object]:
         return self.run()
+
+    def continue_campaign(self, project_target: int, *, reopen_terminal: bool = False):
+        """Explicitly extend a campaign without erasing its prior stop decisions."""
+        state = self._load_state()
+        old_target = state.get("project_target", self.project_target)
+        if type(project_target) is not int or project_target <= old_target:
+            raise ValueError("continuation must raise the retained project target")
+        terminal = state["terminal"]
+        if terminal is not None and not reopen_terminal:
+            raise ValueError("terminal curriculum requires explicit reopen_terminal")
+        history = list(state.get("continuations", []))
+        history.append({"old_target": old_target, "project_target": project_target,
+                        "terminal": terminal,
+                        "previous_status": self._report(state)["status"],
+                        "successful_projects": len(state["prior_outcomes"])})
+        state = {**state, "project_target": project_target, "terminal": None,
+                 "continuations": history}
+        self._atomic_json(self.root / "state.json", state)
+        self.project_target = project_target
+        return self._report(state)
 
     def report(self) -> dict[str, object]:
         return self._report(self._load_state())
@@ -422,6 +444,7 @@ class AdaptivePhase1Coordinator:
     def _coverage_gaps(cls, state):
         from benchmarks.a5kernels.phase1_curriculum import LEARNING_FOCI
         covered = {focus for row in cls._effective_outcomes(state)
+                   if row["verified"]
                    for focus in row["spec"].get("learning_focus", ())}
         return [focus for focus in LEARNING_FOCI if focus not in covered]
 
