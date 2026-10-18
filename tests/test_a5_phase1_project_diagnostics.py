@@ -188,3 +188,27 @@ def test_disabled_host_debug_switch_reports_unavailable_even_when_tool_exits_zer
     assert record["execution"]["output"] == transcript
     assert record["coverage"] == "unconfirmed"
     assert record["host_verified"] is False
+
+
+def test_diagnostic_memory_fact_stays_compact_while_raw_artifact_is_retained(tmp_path):
+    backend = SourceBackend()
+    transcript = "large diagnostic output " * 3000
+    artifact = {"execution": {"output": transcript}, "version": transcript}
+    def diagnostic(request, *, tool):
+        from benchmarks.a5kernels.evidence import canonical_digest
+        return {"artifact": artifact, "evidence_sha256": canonical_digest(artifact),
+                "record": {"available": True, "execution": artifact["execution"],
+                           "version": transcript}}
+    backend.diagnostic = diagnostic
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = ScriptedActor(('{"write":{"slot":"kernel","content":"fixed source"}}',
+                           '{"request-debug":{}}', '{"run":{}}', '{"submit":{}}'))
+    result = AdaptiveActorProjectExecutor(executor, actor, object(),
+                request_diagnostic=diagnostic_action(backend))(_request(tmp_path, executor))
+    fact = next(fact for fact in result.memory.host_facts if fact.category == "diagnostic")
+    assert len(fact.statement) < 150
+    assert '"tool": "msdebug"' in fact.statement
+    assert '"execution": true' in fact.statement
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    retained = ContentAddressedArtifacts(tmp_path / "branch" / "artifacts")
+    assert retained.read_json(fact.evidence_sha256) == artifact

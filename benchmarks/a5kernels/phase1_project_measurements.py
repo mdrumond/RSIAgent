@@ -19,10 +19,10 @@ from benchmarks.a5kernels.profiling import (
 
 def specialize_timing(spec):
     """Rebuild the graph for each requested length without changing the candidate."""
+    if not spec.timing_lengths:
+        return (spec,)
     if len(spec.shape) != 1:
         raise ValueError("timing sweeps support one-dimensional projects only")
-    if not spec.timing_lengths:
-        raise ValueError("project has no timing lengths")
     variants = []
     for length in spec.timing_lengths:
         graph = ProjectGraph(tuple(replace(item, shape=(length,)) for item in spec.graph.inputs),
@@ -44,6 +44,28 @@ def timing_summary(samples):
             "median_us": median(samples), "dispersion_us": pstdev(samples),
             "dispersion": "population-standard-deviation",
             "warmups": 5, "launches_per_sample": 20}
+
+
+def device_duration_summary(basic):
+    """Keep per-task durations; overlapping AIC/AIV rows must not be summed."""
+    values = []
+    headers = {"duration(us)", "taskduration(us)"}
+    for key, raw in basic.summary:
+        column = key.rsplit(":", 1)[-1].lower().replace(" ", "")
+        if column not in headers:
+            continue
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if math.isfinite(value) and value > 0:
+            values.append(value)
+    return {"measurement": "msprof OpBasicInfo diagnostic kernel duration",
+            "kernel_name": basic.exported_kernels[0],
+            "status": "available" if values else "unavailable",
+            "task_durations_us": values,
+            "aggregation": "per-task; overlapping AIC/AIV durations are not additive",
+            "raw_metrics": list(basic.summary), "instrumented": True}
 
 
 class ProjectMeasurementBackend:
@@ -107,7 +129,16 @@ class ProjectMeasurementBackend:
                 raw = self._profile.timing_evidence_payload(replay)
                 artifacts[canonical_digest(raw)] = raw
                 values.append(sample.duration_us)
-            results.append({"shape": list(spec.shape), **timing_summary(values)})
+            # Separate capture: never label Python launch latency as kernel time.
+            basic = self._profile.capture(CaptureCommand(
+                CampaignKind.INTERMEDIATE, self._request(variant),
+                ProfileMetric.BASIC_INFO, f"{profile_request.attempt_id}-device-duration"))
+            if len(basic.exported_kernels) != 1:
+                raise ValueError("BasicInfo must identify exactly one candidate kernel")
+            raw = self._profile.capture_evidence_payload(basic)
+            artifacts[canonical_digest(raw)] = raw
+            results.append({"shape": list(spec.shape), **timing_summary(values),
+                            "device_kernel": device_duration_summary(basic)})
         return self._result(request, {"timing": results}, artifacts)
 
     def profile(self, request: ProjectExecutionRequest, metric: str):

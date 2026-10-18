@@ -224,7 +224,6 @@ def test_decisions_are_strict(reply):
 @pytest.mark.parametrize("bad_project", [
     project("gdn-study"),
     project("bsa-study"),
-    project("matmul-study"),
     {**project(), "source": "kernel code"},
     {**project(), "command": "python run.py"},
 ])
@@ -443,3 +442,65 @@ def test_held_out_names_are_rejected_in_graph_identifiers():
     })
     with pytest.raises(ValueError, match="held-out"):
         CurriculumAgent(lambda _: wave([item])).select(context())
+
+
+def test_long_explanations_and_distinct_learning_focus_are_admitted():
+    first = project("matmul-study", hypothesis=("Question: matrix multiplication. " * 80).strip(),
+                    learning_focus=["sync-correctness"])
+    second = project("performance", learning_focus=["sync-performance"])
+    decision, _ = CurriculumAgent(lambda _: wave([first, second])).select(context())
+    assert len(decision.wave.projects) == 2
+    assert decision.wave.projects[0].spec.hypothesis == first["hypothesis"].strip()
+
+
+def test_wave_cannot_overshoot_remaining_target():
+    reply = wave([project(), project("second", learning_focus=["debug-print"])])
+    with pytest.raises(ValueError, match="remaining project target"):
+        CurriculumAgent(lambda _: reply).select(context(remaining_projects=1))
+
+
+def test_documented_mxfp8_example_matches_published_grammar():
+    from pathlib import Path
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    text = Path("docs/ASCEND_CURRICULUM_EXPERIMENTS.md").read_text()
+    example = json.loads(text.split("```json\n", 1)[1].split("```", 1)[0])
+    spec = ProjectSpec.from_mapping(example)
+    assert spec.dtype.value == "mxfp8_e4m3fn"
+    decision, _ = CurriculumAgent(lambda _: wave([example])).select(context())
+    assert decision.wave.projects[0].spec == spec
+
+
+def test_small_adaptive_waves_are_bounded_by_remaining_target():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    for remaining, maximum in ((3, 3), (64, 8), (128, 8)):
+        prompt = curriculum_prompt(context(remaining_projects=remaining))
+        payload = json.loads(prompt.rsplit("\n", 1)[-1])
+        assert payload["max_wave_projects"] == maximum
+        projects = [with_shape(project(f"item-{i}"), (i + 1,))
+                    for i in range(maximum + 1)]
+        with pytest.raises(ValueError, match="wave limit or remaining"):
+            CurriculumAgent(lambda _: wave(projects)).select(
+                context(remaining_projects=remaining))
+
+
+def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    grammar = json.loads(curriculum_prompt(context()).rsplit("\n", 1)[-1])["bounded_project_grammar"]
+    assert "never project IDs" in grammar["requires"]
+    assert "[] for the initial wave" in grammar["requires"]
+    assert "zero-based axis" in grammar["graph"]["axis"]
+    assert "null for every non-reduction" in grammar["graph"]["axis"]
+    assert "1 if x > 0 else 0" in grammar["graph"]["mask-positive"]
+    assert "input dtype by default" in grammar["output_dtype"]
+    assert "matmul outputs float32" in grammar["output_dtype"]
+    assert "copy-only graphs preserve FP8" in grammar["output_dtype"]
+    assert "every non-copy FP8 graph computes intermediates and output in float32" in grammar["output_dtype"]
+
+
+def test_learning_focus_cannot_bypass_held_out_executable_signature():
+    for held_out_focus in ([], ["tool-msprof"], ["pipe-mte2", "sync-performance"]):
+        signature = project_information_sha256(project(learning_focus=held_out_focus))
+        for focus in ([], ["tool-msprof"], ["sync-performance", "pipe-mte2"], ["pipe-mte2", "sync-performance"]):
+            proposal = project(learning_focus=focus)
+            with pytest.raises(ValueError, match="held-out contract"):
+                CurriculumAgent(lambda _: wave([proposal]), held_out_information_sha256=[signature]).select(context())

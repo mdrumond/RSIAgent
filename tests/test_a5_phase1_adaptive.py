@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import threading
+from dataclasses import replace
 
 import pytest
 
@@ -401,3 +402,118 @@ def test_cli_uses_explicit_production_factory_and_reports_json(tmp_path, capsys)
     ) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "RUNNING"
     assert seen == ["binding:build"]
+
+
+def test_target_stops_and_resume_with_larger_target_preserves_memory(tmp_path):
+    counter = 0
+    def complete(messages):
+        nonlocal counter
+        counter += 1
+        item = _project(f"project-{counter}", "gm-ub-movement")
+        item["learning_focus"] = ["pipe-mte2" if counter == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [item])
+    def execute(request):
+        return _result(request.spec, True, "verified")
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    first = campaign(1).run()
+    assert first["status"] == "TARGET_REACHED"
+    second = campaign(2).resume()
+    assert second["successful_projects"] == 2
+    assert second["published_projects"][0] == first["published_projects"][0]
+    assert "pipe-mte2" not in second["coverage_gaps"]
+    assert "pipe-mte3" not in second["coverage_gaps"]
+
+
+def test_omitted_target_preserves_retained_override_and_new_default(tmp_path):
+    def create(root, target=None):
+        return AdaptivePhase1Coordinator(root, "Learn pipes", SEED,
+            CurriculumAgent(lambda _: 'DECISION: STALLED\n{"reason":"unneeded"}'),
+            lambda _: None, max_parallel=1, project_target=target)
+    assert create(tmp_path / "new").project_target == 64
+    retained = create(tmp_path / "retained", 128)
+    state = retained._load_state()
+    state["project_target"] = 128
+    retained._atomic_json(retained.root / "state.json", state)
+    assert create(retained.root).project_target == 128
+    assert create(retained.root, 256).project_target == 256
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_tool_coverage_uses_observed_host_facts_not_requested_labels(observed):
+    spec = _project("tools", "gm-ub-movement")
+    spec["learning_focus"] = ["tool-msprof", "tool-msdebug", "tool-mssanitizer", "debug-print"]
+    facts = [{"category": "host-verification", "statement": "verified"}]
+    if observed:
+        facts += [{"category": "profiling", "statement": "profiled"},
+                  {"category": "runtime", "statement": 'tool-observation:{"available":true,"tool":"msdebug","execution":{}}'},
+                  {"category": "runtime", "statement": 'tool-observation:{"available":true,"tool":"memcheck","execution":{}}'},
+                  {"category": "runtime", "statement": "verified-debug-print:source"}]
+    else:
+        facts += [{"category": "runtime", "statement": 'tool-observation:{"available":false,"tool":"memcheck"}'}]
+    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+        base64.b64encode(json.dumps({"host_facts": facts}).encode()).decode()]}
+    effective = AdaptivePhase1Coordinator._effective_outcomes(state)[0]["spec"]
+    assert effective.get("learning_focus", []) == (spec["learning_focus"] if observed else [])
+    gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
+    assert all((focus not in gaps) == observed for focus in spec["learning_focus"])
+
+
+@pytest.mark.parametrize("device_capture", [False, True])
+def test_timing_counts_only_retained_msprof_capture_even_without_requested_focus(device_capture):
+    summary = {"timing": [{"device_kernel": {"duration_us": 2}}] if device_capture else []}
+    spec = _project("timed", "gm-ub-movement")
+    state = {"prior_outcomes": [{"spec": spec}], "memory_bytes_base64": [
+        base64.b64encode(json.dumps({"host_facts": [
+            {"category": "performance-study", "statement": json.dumps(summary)},
+        ]}).encode()).decode()]}
+    gaps = AdaptivePhase1Coordinator._coverage_gaps(state)
+    assert ("tool-msprof" not in gaps) == device_capture
+
+
+@pytest.mark.parametrize("statement", ["Measured current source", "fixed source", "[]", "null", "42", '{"timing":null}'])
+def test_prose_measurement_facts_survive_report_resume_and_next_selection(tmp_path, statement):
+    selections = []
+    def complete(messages):
+        selections.append(messages[-1]["content"])
+        spec = _project(f"project-{len(selections)}", "gm-ub-movement")
+        spec["learning_focus"] = ["pipe-mte2" if len(selections) == 1 else "pipe-mte3"]
+        return _wave(messages[-1]["content"], [spec])
+    def execute(request):
+        result = _result(request.spec, True, "verified")
+        fact = HostFact("performance-study", statement, result.memory.admitted_artifact_sha256[0])
+        return replace(result, memory=replace(result.memory, host_facts=(*result.memory.host_facts, fact)))
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    assert campaign(1).run()["status"] == "TARGET_REACHED"
+    assert "tool-msprof" in campaign(1).report()["coverage_gaps"]
+    assert campaign(2).resume()["successful_projects"] == 2
+    assert len(selections) == 2
+
+
+def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tmp_path):
+    calls = []
+    def complete(messages):
+        return _wave(messages[-1]["content"], [
+            _project("first", "gm-ub-movement"), _project("second", "simd-vector"),
+            _project("third", "padded-tail"),
+        ])
+    def execute(request):
+        calls.append(request.spec.project_id)
+        return _result(request.spec, request.spec.project_id != "second", "observed")
+    def campaign(target):
+        return AdaptivePhase1Coordinator(tmp_path, "Learn pipes", SEED,
+            CurriculumAgent(complete), execute, max_parallel=1, project_target=target)
+    with pytest.raises(RuntimeError, match="not verified"):
+        campaign(3).run()
+    assert campaign(3).report()["pending_wave"]["projects"][0]["status"] == "verified"
+    files = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+             for path in tmp_path.rglob("*") if path.is_file()}
+    before_calls = list(calls)
+    with pytest.raises(ValueError, match="retained wave exceeds configured project target"):
+        campaign(2).resume()
+    assert calls == before_calls
+    assert {path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in tmp_path.rglob("*") if path.is_file()} == files

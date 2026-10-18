@@ -45,7 +45,6 @@ def _validated_summary(value: object) -> str:
         not isinstance(value, str)
         or not value.strip()
         or value != value.strip()
-        or len(value) > 500
     ):
         raise ValueError("adaptive result summary must be trimmed and bounded")
     return value
@@ -97,6 +96,7 @@ class AdaptivePhase1Coordinator:
         execute_project: AdaptiveProjectExecutor,
         *,
         max_parallel: int,
+        project_target: int | None = None,
         max_projects: int | None = None,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
@@ -109,6 +109,12 @@ class AdaptivePhase1Coordinator:
             raise TypeError("project executor must be callable")
         if type(max_parallel) is not int or max_parallel < 1:
             raise ValueError("max_parallel must be positive")
+        if project_target is not None and (type(project_target) is not int or project_target < 1):
+            raise ValueError("project_target must be positive")
+        self.project_target = project_target
+        if project_target is None:
+            retained = self.root_state_target(root)
+            self.project_target = retained
         self.root = Path(root)
         self.objective = objective.strip()
         self.initial_memory = initial_memory
@@ -119,10 +125,25 @@ class AdaptivePhase1Coordinator:
             raise ValueError("max_projects must be a positive integer or None")
         self.max_projects = max_projects
 
+    @staticmethod
+    def root_state_target(root):
+        path = Path(root) / "state.json"
+        return json.loads(path.read_bytes()).get("project_target", 64) if path.exists() else 64
+
     def run(self) -> dict[str, object]:
         state = self._load_state()
+        pending = self._load_pending(state)
+        if pending is not None and (
+            len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects)
+            > self.project_target
+        ):
+            raise ValueError("retained wave exceeds configured project target")
+        state = {**state, "project_target": self.project_target}
+        self._atomic_json(self.root / "state.json", state)
         while True:
             if state["terminal"] is not None:
+                return self._report(state)
+            if len(state["prior_outcomes"]) >= self.project_target:
                 return self._report(state)
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
@@ -136,7 +157,7 @@ class AdaptivePhase1Coordinator:
                     return self._report(state)
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
-                    **({"remaining_projects": self.max_projects - len(state["prior_outcomes"])} if self.max_projects is not None else {}),
+                    remaining_projects=min(self.project_target, self.max_projects or self.project_target) - len(state["prior_outcomes"]),
                 )
                 if isinstance(decision, TerminalDecision):
                     state = {
@@ -198,6 +219,7 @@ class AdaptivePhase1Coordinator:
         if not isinstance(initial_memory, bytes):
             raise TypeError("initial memory must be immutable bytes")
         reader = object.__new__(cls)
+        reader.project_target = 64
         reader.root = Path(root)
         reader.objective = objective.strip()
         reader.initial_memory = initial_memory
@@ -206,6 +228,7 @@ class AdaptivePhase1Coordinator:
             raise ValueError("retained adaptive state does not exist")
         state = reader._read_json(path)
         reader._validate_state(state)
+        reader.project_target = state.get("project_target", 64)
         return reader._report(state)
 
     def _execute(self, request: WaveProjectRequest) -> WaveProjectResult:
@@ -291,8 +314,9 @@ class AdaptivePhase1Coordinator:
                     value["verified"],
                     value["summary"],
                 )
-                for value in state["prior_outcomes"]
+                for value in self._effective_outcomes(state)
             ),
+            max(0, self.project_target - len(state["prior_outcomes"])),
         )
 
     @staticmethod
@@ -377,17 +401,67 @@ class AdaptivePhase1Coordinator:
         return {
             "status": (
                 "RECOVERY_REQUIRED" if pending is not None
+                else "TARGET_REACHED" if len(state["prior_outcomes"]) >= self.project_target
                 else "RUNNING" if terminal is None
                 else terminal["status"]
             ),
             "reason": None if terminal is None else terminal["reason"],
             "wave_index": state["wave_index"],
+            "project_target": self.project_target,
+            "successful_projects": len(state["prior_outcomes"]),
+            "unverified_projects": sum(row["status"] == "unverified" for row in pending["projects"]) if pending else 0,
+            "coverage_gaps": self._coverage_gaps(state),
             "coverage": list(state["coverage"]),
             "published_projects": [row["project_id"] for row in state["prior_outcomes"]],
             "memory": memory,
             "memory_sha256": hashlib.sha256(snapshot).hexdigest(),
             "pending_wave": pending,
         }
+
+    @classmethod
+    def _coverage_gaps(cls, state):
+        from benchmarks.a5kernels.phase1_curriculum import LEARNING_FOCI
+        covered = {focus for row in cls._effective_outcomes(state)
+                   for focus in row["spec"].get("learning_focus", ())}
+        return [focus for focus in LEARNING_FOCI if focus not in covered]
+
+    @staticmethod
+    def _effective_outcomes(state):
+        """Requested tools count only when retained host facts show their use."""
+        rows = []
+        for row, encoded in zip(state["prior_outcomes"], state["memory_bytes_base64"], strict=True):
+            memory = json.loads(base64.b64decode(encoded, validate=True))
+            observed = set()
+            for fact in memory["host_facts"]:
+                if fact["category"] == "profiling":
+                    observed.add("tool-msprof")
+                statement = fact["statement"]
+                if fact["category"] == "performance-study":
+                    try:
+                        summary = json.loads(statement)
+                    except json.JSONDecodeError:
+                        summary = None
+                    timing = summary.get("timing", ()) if isinstance(summary, dict) else ()
+                    if isinstance(timing, list) and any(
+                        isinstance(row, dict) and row.get("device_kernel") for row in timing
+                    ):
+                        observed.add("tool-msprof")
+                if statement.startswith("tool-observation:"):
+                    record = json.loads(statement.removeprefix("tool-observation:"))
+                    if record.get("available") and "execution" in record:
+                        observed.add("tool-msdebug" if record.get("tool") == "msdebug" else "tool-mssanitizer")
+                if statement.startswith("verified-debug-print:"):
+                    observed.add("debug-print")
+            spec = dict(row["spec"])
+            focus = [item for item in spec.get("learning_focus", ())
+                     if not (item.startswith("tool-") or item == "debug-print") or item in observed]
+            focus += sorted(observed - set(focus))
+            if focus:
+                spec["learning_focus"] = focus
+            else:
+                spec.pop("learning_focus", None)
+            rows.append({**row, "spec": spec})
+        return rows
 
     def _pending_report(self, state):
         pending = self._load_pending(state)

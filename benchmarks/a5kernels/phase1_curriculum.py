@@ -42,6 +42,14 @@ class Capability(str, Enum):
     PROFILING = "profiling"
 
 
+LEARNING_FOCI = (
+    "pipe-scalar", "pipe-vector", "pipe-cube", "pipe-mte1", "pipe-mte2",
+    "pipe-mte3", "pipe-fix", "inter-pipe-sync", "simd-barrier", "simt-barrier",
+    "cross-core-sync", "sync-correctness", "sync-performance",
+    "tool-msprof", "tool-msdebug", "tool-mssanitizer", "debug-print",
+)
+
+
 class DType(str, Enum):
     FLOAT16 = "float16"
     BFLOAT16 = "bfloat16"
@@ -97,6 +105,7 @@ class ProjectSpec:
     profile_metric: ProfileMetric | None
     hypothesis: str
     graph: ProjectGraph
+    learning_focus: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.project_id, str) or not _ID.fullmatch(self.project_id):
@@ -134,11 +143,14 @@ class ProjectSpec:
             not isinstance(self.hypothesis, str)
             or not self.hypothesis.strip()
             or self.hypothesis != self.hypothesis.strip()
-            or len(self.hypothesis) > 500
         ):
-            raise ValueError("hypothesis must be a trimmed 1-500 character string")
+            raise ValueError("hypothesis must be a non-empty trimmed string")
         if not isinstance(self.graph, ProjectGraph):
             raise ValueError("graph must be a bounded ProjectGraph")
+        if (type(self.learning_focus) is not tuple
+            or len(set(self.learning_focus)) != len(self.learning_focus)
+            or any(item not in LEARNING_FOCI for item in self.learning_focus)):
+            raise ValueError("learning_focus must contain unique registered focuses")
         self._validate_composition()
 
     def _validate_composition(self) -> None:
@@ -209,10 +221,12 @@ class ProjectSpec:
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "ProjectSpec":
-        if not isinstance(value, Mapping) or set(value) != _PROJECT_FIELDS:
+        if not isinstance(value, Mapping) or set(value) - {"learning_focus"} != _PROJECT_FIELDS:
             raise ValueError(
                 "project fields must be exactly " + ", ".join(sorted(_PROJECT_FIELDS))
             )
+        if not isinstance(value.get("learning_focus", ()), (list, tuple)):
+            raise ValueError("learning_focus must be a list")
         raw_capabilities = value["capabilities"]
         if not isinstance(raw_capabilities, (list, tuple)):
             raise ValueError("capabilities must be a list")
@@ -239,6 +253,7 @@ class ProjectSpec:
             profile_metric=(
                 None if metric is None else _enum(metric, ProfileMetric, "profile metric")
             ),
+            learning_focus=tuple(value.get("learning_focus", ())),
             hypothesis=value["hypothesis"],
             graph=ProjectGraph.from_mapping(value["graph"]),
         )
@@ -258,6 +273,7 @@ class ProjectSpec:
             ),
             "hypothesis": self.hypothesis,
             "graph": self.graph.as_dict(),
+            **({"learning_focus": list(self.learning_focus)} if self.learning_focus else {}),
         }
 
 
