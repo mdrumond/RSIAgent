@@ -50,7 +50,7 @@ def _parser() -> argparse.ArgumentParser:
         type=_positive_int,
         metavar="LIMIT",
         help=(
-            "give Phase 1 compile actions a separate positive LIMIT instead of "
+            "give Phase 1 and Phase 2 compile actions a separate positive LIMIT instead of "
             "charging their ordinary agent action budget"
         ),
     )
@@ -114,6 +114,8 @@ def _command_factory(args, destinations):
                     ("phase2-guide", args.phase2_guide),
                     ("phase2-cpl-skills-revision", args.phase2_cpl_skills_revision),
                 )
+            if getattr(args, "compile_probes", 0):
+                values += (("compile-probes", args.compile_probes),)
             runtime_revision = getattr(args, "runtime_catlass_revision", None)
             if runtime_revision is not None:
                 values += (("runtime-catlass-revision", runtime_revision),)

@@ -151,6 +151,7 @@ def test_phase2_cli_forwards_separate_guide_admission(monkeypatch, tmp_path):
         "--phase2-cpl-skills-revision", CPL_REVISION,
         "--tla-root", str(tmp_path / "tla"),
         "--catlass-source", "/remote/catlass", "--device", "3",
+        "--compile-probes", "3",
     ])
 
     run_a5_phase2._production_factory(args)
@@ -158,6 +159,7 @@ def test_phase2_cli_forwards_separate_guide_admission(monkeypatch, tmp_path):
     assert captured[0].gate is gate
     assert captured[0].phase2_guide_path == tmp_path / "phase2-guide"
     assert captured[0].phase2_cpl_skills_revision == CPL_REVISION
+    assert captured[0].compile_probes == 3
 
 
 def test_campaign_only_forwards_phase2_guide_to_phase2_workers(tmp_path):

@@ -156,6 +156,34 @@ def test_same_candidate_and_case_have_deterministic_paths_and_no_source_in_argv(
     assert all(" " not in argument for argument in first.argv[-3:])
 
 
+def test_compile_only_uses_distinct_identity_and_never_requires_output(tmp_path):
+    execution = build_execution(ATTENTION_CASES[0])
+    logs = CommandResult(0, "A5KERNEL_NAME=dense_attention\nA5ATTENTION_COMPILED=1")
+    result = CommandResult(0, "", session_handle="bz-a5:compile")
+    executor = FakeCheckedExecutor(inspections=(logs, result))
+
+    receipt = _backend(executor).compile(SOURCE, execution, tmp_path / "compile")
+
+    assert receipt.exit_code == 0
+    assert receipt.output == ()
+    assert dict(receipt.metadata)["operation"] == "compile"
+    invocation = executor.invocations[0]
+    assert invocation.argv[2].startswith("codex-a5attnc-")
+    driver = invocation.files[1].content
+    assert 'print("A5ATTENTION_COMPILED=1")' in driver
+    assert "artifact(tla_q, tla_k, tla_v, tla_output" not in driver
+
+
+def test_compile_only_requires_host_compile_marker(tmp_path):
+    execution = build_execution(ATTENTION_CASES[0])
+    executor = FakeCheckedExecutor(inspections=(
+        CommandResult(0, "A5KERNEL_NAME=dense_attention"),
+        CommandResult(0, "", session_handle="bz-a5:compile"),
+    ))
+    with pytest.raises(AttentionInfrastructureError, match="receipt"):
+        _backend(executor).compile(SOURCE, execution, tmp_path / "compile")
+
+
 def test_host_driver_revision_changes_session_and_remote_identity(tmp_path, monkeypatch):
     execution = build_execution(ATTENTION_CASES[0])
     executors = [FakeCheckedExecutor(inspections=_success(execution)) for _ in range(2)]

@@ -16,10 +16,12 @@ from benchmarks.a5kernels.phase1_composition import (
 from benchmarks.a5kernels.phase1_experiments import KnowledgeMode, ProfilingGuidance
 from benchmarks.a5kernels.phase1_provider import DirectCompletion
 from benchmarks.a5kernels.phase2_attention import (
+    ATTENTION_CASES,
     AttentionInfrastructureError,
     AttentionReceipt,
     attention_reference,
 )
+from benchmarks.a5kernels.phase2_attention_bz import ATTENTION_CANDIDATE_FIXTURE
 from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
 from benchmarks.a5kernels.phase2_production import (
     Phase2ProductionConfig,
@@ -61,12 +63,19 @@ class FakeExecutor:
 class CopyVBackend:
     def __init__(self):
         self.calls = []
+        self.compile_calls = []
 
     def execute(self, source, execution, workdir):
         self.calls.append((source, execution, workdir))
         return AttentionReceipt(
             0, execution.v, session_handle="bz-a5:qualification",
             metadata=(("result_exit_code", "0"),),
+        )
+
+    def compile(self, source, execution, workdir):
+        self.compile_calls.append((source, execution, workdir))
+        return AttentionReceipt(
+            0, (), stdout="compiled", session_handle="bz-a5:compile",
         )
 
 
@@ -213,6 +222,27 @@ def test_without_kdb_qualifies_copy_v_once_and_composes_treatments(tmp_path):
     )
     assert retained == snapshot
     assert len(backend.calls) == 1
+
+
+def test_opt_in_compile_probe_uses_host_compile_only_and_rejects_bad_abi(tmp_path):
+    _composition, destination, config = _config(tmp_path, compile_probes=2)
+    backend = CopyVBackend()
+    dependencies = build_phase2_production(
+        config, environment=ENVIRONMENT, transport=_transport,
+        executor=FakeExecutor(destination.catlass_revision), backend=backend,
+    )[1]
+    probe = dependencies.source.compile_probe
+
+    invalid = probe("not Python", tmp_path / "invalid")
+    compiled = probe(ATTENTION_CANDIDATE_FIXTURE, tmp_path / "compiled")
+
+    assert invalid["status"] == "invalid-source"
+    assert compiled == {
+        "status": "compiled", "case_id": ATTENTION_CASES[0].case_id,
+        "exit_code": 0, "diagnostic": "compiled",
+        "session_handle": "bz-a5:compile",
+    }
+    assert len(backend.compile_calls) == 1
 
 
 def test_historical_snapshot_can_use_explicit_current_runtime(tmp_path):

@@ -25,6 +25,7 @@ from benchmarks.a5kernels.protocol import SourceFile
 
 
 OUTPUT_MARKER = "A5ATTENTION_OUTPUT="
+COMPILE_MARKER = "A5ATTENTION_COMPILED=1"
 KERNEL_NAME = "dense_attention"
 MAX_OBSERVED_BYTES = 4 * 1024 * 1024
 _ARGUMENTS = ("gm_q", "gm_k", "gm_v", "gm_output")
@@ -186,6 +187,26 @@ class CatlassAttentionBackend:
         execution: AttentionExecution,
         workdir: Path,
     ) -> AttentionReceipt:
+        return self._dispatch(candidate_source, execution, workdir, compile_only=False)
+
+    def compile(
+        self,
+        candidate_source: str,
+        execution: AttentionExecution,
+        workdir: Path,
+    ) -> AttentionReceipt:
+        """Compile one host-bound case without launching the artifact."""
+
+        return self._dispatch(candidate_source, execution, workdir, compile_only=True)
+
+    def _dispatch(
+        self,
+        candidate_source: str,
+        execution: AttentionExecution,
+        workdir: Path,
+        *,
+        compile_only: bool,
+    ) -> AttentionReceipt:
         validate_attention_candidate(candidate_source)
         if not isinstance(execution, AttentionExecution):
             raise TypeError("execution must be an AttentionExecution")
@@ -198,9 +219,10 @@ class CatlassAttentionBackend:
         payload_text = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
+        driver = _ATTENTION_COMPILE_DRIVER if compile_only else _ATTENTION_DRIVER
         files = (
             SourceFile("kernel.py", candidate_source),
-            SourceFile("host_driver.py", _ATTENTION_DRIVER),
+            SourceFile("host_driver.py", driver),
             SourceFile("input.json", payload_text),
         )
         for source in files:
@@ -210,17 +232,21 @@ class CatlassAttentionBackend:
         runtime_provenance = [
             list(item) for item in self._executor.runtime_provenance
         ]
+        identity_value = {
+            "candidate": hashlib.sha256(candidate_source.encode()).hexdigest(),
+            "case": asdict(execution.case),
+            "host_driver": hashlib.sha256(driver.encode()).hexdigest(),
+            "physical_device": self._device,
+            "input": hashlib.sha256(payload_text.encode()).hexdigest(),
+            "runtime_provenance": runtime_provenance,
+        }
+        if compile_only:
+            identity_value["operation"] = "compile"
         identity = hashlib.sha256(json.dumps(
-            {
-                "candidate": hashlib.sha256(candidate_source.encode()).hexdigest(),
-                "case": asdict(execution.case),
-                "host_driver": hashlib.sha256(_ATTENTION_DRIVER.encode()).hexdigest(),
-                "physical_device": self._device,
-                "input": hashlib.sha256(payload_text.encode()).hexdigest(),
-                "runtime_provenance": runtime_provenance,
-            }, sort_keys=True, separators=(",", ":"),
+            identity_value, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
-        session_name = f"codex-a5attn-{identity[:32]}"
+        prefix = "codex-a5attnc" if compile_only else "codex-a5attn"
+        session_name = f"{prefix}-{identity[:32]}"
         remote_directory = f".a5kernels/attention/{identity}"
         remote_argv = (
             "env",
@@ -273,30 +299,40 @@ class CatlassAttentionBackend:
             raise AttentionInfrastructureError("A5 attention result is indeterminate")
         if not _completed_result(result.exit_code, result.stdout, session_name):
             raise AttentionInfrastructureError("A5 attention terminal result is unavailable")
+        if (
+            compile_only and result.exit_code == 0
+            and logs.stdout.splitlines().count(COMPILE_MARKER) != 1
+        ):
+            raise AttentionInfrastructureError(
+                "A5 attention compile receipt is unavailable"
+            )
 
         stdout = _bounded_join(dispatch.stdout, logs.stdout)
         stderr = _bounded_join(dispatch.stderr, logs.stderr, result.stderr)
         output = (
             _parse_output(logs.stdout, execution.case.output_elements)
-            if result.exit_code == 0 else ()
+            if result.exit_code == 0 and not compile_only else ()
         )
         handle = (
             result.session_handle or logs.session_handle or dispatch.session_handle
             or f"bz-a5:{session_name}"
         )
+        metadata = [
+            ("case_id", execution.case.case_id),
+            ("dispatch_exit_code", str(dispatch.exit_code)),
+            ("logs_exit_code", str(logs.exit_code)),
+            ("result_exit_code", str(result.exit_code)),
+            ("remote_directory", remote_directory),
+        ]
+        if compile_only:
+            metadata.append(("operation", "compile"))
         return AttentionReceipt(
             exit_code=result.exit_code,
             output=output,
             stdout=stdout,
             stderr=stderr,
             session_handle=handle,
-            metadata=(
-                ("case_id", execution.case.case_id),
-                ("dispatch_exit_code", str(dispatch.exit_code)),
-                ("logs_exit_code", str(logs.exit_code)),
-                ("result_exit_code", str(result.exit_code)),
-                ("remote_directory", remote_directory),
-            ),
+            metadata=tuple(metadata),
         )
 
 
@@ -443,3 +479,18 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+
+_COMPILE_POINT = """\
+    print("A5KERNEL_NAME=dense_attention")
+    artifact(tla_q, tla_k, tla_v, tla_output, block_num=1)
+"""
+if _ATTENTION_DRIVER.count(_COMPILE_POINT) != 1:  # pragma: no cover
+    raise RuntimeError("attention compile-only integration point is unavailable")
+_ATTENTION_COMPILE_DRIVER = _ATTENTION_DRIVER.replace(
+    _COMPILE_POINT,
+    f"""\
+    print("A5KERNEL_NAME=dense_attention")
+    print("{COMPILE_MARKER}")
+    return 0
+""",
+)

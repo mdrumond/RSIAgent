@@ -35,11 +35,13 @@ from benchmarks.a5kernels.phase1_provider import (
 from benchmarks.a5kernels.phase2_attention import (
     ATTENTION_CASES,
     AttentionTargetVerifier,
+    _truncate_utf8,
     build_execution,
 )
 from benchmarks.a5kernels.phase2_attention_bz import (
     ATTENTION_CANDIDATE_FIXTURE,
     CatlassAttentionBackend,
+    validate_attention_candidate,
 )
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies
 from benchmarks.a5kernels.phase2_memory import (
@@ -73,6 +75,7 @@ class Phase2ProductionConfig:
     env_file: Path | None = None
     phase2_guide_path: Path | None = None
     phase2_cpl_skills_revision: str | None = None
+    compile_probes: int = 0
     adaptive_review: Path | None = None
     initial_memory: Path | None = None
     profiling_guidance_text: str | None = None
@@ -100,6 +103,12 @@ class Phase2ProductionConfig:
             raise ValueError(
                 "Phase 2 guide path and CPL skills revision must be supplied together"
             )
+        if (
+            isinstance(self.compile_probes, bool)
+            or not isinstance(self.compile_probes, int)
+            or not 0 <= self.compile_probes <= 20
+        ):
+            raise ValueError("compile_probes must be in [0, 20]")
 
     @property
     def validation_wrapper(self) -> Path:
@@ -425,12 +434,38 @@ def build_phase2_production(
     )
     if cell.profiling is ProfilingGuidance.NEW:
         guidance = config.profiling_guidance_text
+
+    def compile_probe(candidate: str, workdir: Path) -> Mapping[str, object]:
+        case = ATTENTION_CASES[0]
+        try:
+            validate_attention_candidate(candidate)
+        except ValueError as exc:
+            return {
+                "status": "invalid-source", "case_id": case.case_id,
+                "exit_code": 2, "diagnostic": _truncate_utf8(str(exc), 4096),
+                "session_handle": None,
+            }
+        receipt = backend.compile(candidate, build_execution(case), workdir)
+        diagnostic = _truncate_utf8(
+            "\n".join(part for part in (receipt.stdout, receipt.stderr) if part),
+            4096,
+        )
+        return {
+            "status": "compiled" if receipt.exit_code == 0 else "compile-failed",
+            "case_id": case.case_id,
+            "exit_code": receipt.exit_code,
+            "diagnostic": diagnostic,
+            "session_handle": receipt.session_handle,
+        }
+
     source = Phase2SourceProvider(
         provider,
         evidence_root=config.phase2_root.resolve() / "cells",
         guide_text=phase2_guide_text,
         knowledge_factory=knowledge_factory,
         profiling_guidance=guidance,
+        compile_probe=compile_probe if config.compile_probes else None,
+        max_compile_probes=config.compile_probes,
     )
     verifier = AttentionTargetVerifier(backend)
     source_manifest = SourceManifest.load(
