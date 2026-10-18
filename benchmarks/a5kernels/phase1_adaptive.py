@@ -159,7 +159,7 @@ class AdaptivePhase1Coordinator:
                     return self._report(state)
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
-                    **({"remaining_projects": self.max_projects - len(state["prior_outcomes"])} if self.max_projects is not None else {}),
+                    remaining_projects=min(self.project_target, self.max_projects or self.project_target) - len(state["prior_outcomes"]),
                 )
                 if isinstance(decision, TerminalDecision):
                     state = {
