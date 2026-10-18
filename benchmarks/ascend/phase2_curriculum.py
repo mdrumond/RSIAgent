@@ -72,6 +72,8 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
     a deterministic event_id and retained result after each state publication.
     """
 
+    approval_cardinality = 1
+
     def __init__(self, root, objective, reviewed_snapshot, curriculum,
                  execute_project, *, project_target=None, trace_hook=None):
         reviewed_snapshot.verify()
@@ -142,15 +144,21 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
         return replace(super()._context(state, snapshot), remaining_projects=1)
 
     def run(self):
+        return self._run()
+
+    def _run(self, *, wave_limit=None, approved_only=False):
         state = self._load_state()
         if state.get("project_target", self.project_target) != self.project_target:
             raise ValueError("use continue_campaign to change the retained project target")
         state = {**state, "project_target": self.project_target}
         self._atomic_json(self.root / "state.json", state)
+        executed_waves = 0
         while state["terminal"] is None and len(state["prior_outcomes"]) < self.project_target:
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
             if pending is None:
+                if approved_only:
+                    raise ValueError("no approved wave is pending")
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
                     remaining_projects=1)
@@ -213,6 +221,9 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
                                  "phase": "adaptive-phase2", "project_id": project.project_id,
                                  "verified": outcome.verified, "summary": delta["summary"],
                                  "attempt_root": str(runner.root)})
+            executed_waves += 1
+            if wave_limit is not None and executed_waves >= wave_limit:
+                return self._report(state)
         return self._report(state)
 
     def _report(self, state):
