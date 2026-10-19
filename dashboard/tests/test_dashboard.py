@@ -364,6 +364,38 @@ def test_extend_waits_for_detached_worker_and_propagates_failure(tmp_path, worke
         assert "continuation broke" in operation["error"]
 
 
+def test_extension_timeout_persists_intent_and_retry_does_not_increment_again(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"project_target": 64, "prior_outcomes": [{}] * 64,
+          "terminal": None, "wave_index": 9})
+    write(control / "job.json", {"project_target": 64, "approval_mode": True,
+                                  "adopted": True})
+    write(control / "adoption.json", {"project_target": 64})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '{"session":"detached"}', "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    manager = app.extensions["dashboard_controls"]
+    manager.EXTENSION_WAIT_SECONDS = .01
+    manager.EXTENSION_POLL_SECONDS = .001
+    client = app.test_client(); csrf = client.get("/api/csrf").get_json()["token"]
+    body = {"campaign_id": "phase1", "confirmation": "extend:phase1"}
+    first = client.post("/api/control/extend", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "timeout"})
+    assert wait_operation(client, first.get_json()["operation_id"])["status"] == "failed"
+    intent = json.loads((control / "extension-intent.json").read_text())
+    assert intent["project_target"] == 72
+    retry = client.post("/api/control/extend", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "retry"})
+    assert retry.status_code == 202
+    assert wait_operation(client, retry.get_json()["operation_id"])["status"] == "failed"
+    assert [call[-1] for call in calls] == ["72", "72"]
+
+
 @pytest.mark.parametrize("change", ["pending", "terminal", "short", "proposal", "worker"])
 def test_extend_requires_clean_target_reached_boundary(tmp_path, change):
     config, root, control = controlled_config(tmp_path)

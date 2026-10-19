@@ -489,6 +489,13 @@ def _worker_status(result):
     } else "waiting-approval")
 
 
+def _annex_options(job):
+    if not job.get("adopted"):
+        return {}
+    return {"external_initial_memory": job["initial_memory"],
+            "adoption": str(Path(job["control"]) / "adoption.json")}
+
+
 @_serialized_approval
 def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
     _require_approval_mode(job)
@@ -596,7 +603,8 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
             _write(control / "collector-status.json", result)
             if (control / "worker.json").exists() and _read(control / "worker.json")["status"] == "complete":
                 current = _read(control / "job.json")
-                inventory = inventory_campaign(current["root"], artifact_store=control / "reports")
+                inventory = inventory_campaign(current["root"], artifact_store=control / "reports",
+                                               **_annex_options(current))
                 destination = control / f"campaign-{current['project_target']}.tar.gz"
                 if destination.exists():
                     try:
@@ -610,7 +618,8 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
                         if destination.exists():
                             raise ValueError("checkpoint destination already exists; inspect it before retrying packaging")
                 if not destination.exists():
-                    package_campaign(current["root"], destination, artifact_store=control / "reports")
+                    package_campaign(current["root"], destination, artifact_store=control / "reports",
+                                     **_annex_options(current))
                 _write(control / "package-status.json", {"status": "complete", "archive": str(destination)})
                 return
         except Exception as error:
@@ -640,7 +649,7 @@ def status(job):
     outcomes = [_read(p) for p in root.glob("waves/*/branches/*/outcome.json")]
     published = len(state.get("prior_outcomes", []))
     elapsed = max(time.time() - job["created"], 1) / 3600
-    inventory = inventory_campaign(root, artifact_store=control / "reports")
+    inventory = inventory_campaign(root, artifact_store=control / "reports", **_annex_options(job))
     return {"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
             "attempted": len(list(root.glob("waves/*/branches/*"))),
             "verified": sum(o.get("verified") is True for o in outcomes),
@@ -774,7 +783,8 @@ def main(argv=None, *, screen=start_screen):
         collector_worker(job, once=not args.watch)
     elif args.command == "package":
         print(json.dumps(package_campaign(job["root"], args.output,
-                         artifact_store=control / "reports", allow_pending=args.allow_pending)))
+                         artifact_store=control / "reports", allow_pending=args.allow_pending,
+                         **_annex_options(job))))
     elif args.command == "sample":
         print(json.dumps(sample_curriculum(job)))
     elif args.command == "approve":

@@ -192,12 +192,13 @@ def _project_memory(branch):
     return delta, memory
 
 
-def _verify_adaptive_state(root, state):
+def _verify_adaptive_state(root, state, *, external_initial_memory=None):
     """Bind the published state to ordered deltas and every pre-wave snapshot."""
     from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA, retained_failure_outcome
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
     seed = root / "initial-memory.bin"
-    initial = seed.read_bytes() if seed.is_file() else None
+    initial = (Path(external_initial_memory).read_bytes() if external_initial_memory else
+               seed.read_bytes() if seed.is_file() else None)
     if state.get("phase") == "adaptive-phase2":
         from .phase2_curriculum import reviewed_seed
         initial, _ = reviewed_seed(root, state["snapshot_id"])
@@ -233,7 +234,8 @@ def _verify_adaptive_state(root, state):
         raise ValueError("curriculum failures differ from retained completed attempts")
 
 
-def inventory_campaign(root, *, artifact_store=None):
+def inventory_campaign(root, *, artifact_store=None, external_initial_memory=None,
+                       adoption=None):
     """Inventory every retained attempt, CAS object and measurement without writes.
 
     Paths in ``files`` and ``records`` are campaign-relative. Remote report
@@ -244,6 +246,7 @@ def inventory_campaign(root, *, artifact_store=None):
     root = Path(root).resolve(strict=True)
     store = Path(artifact_store).resolve() if artifact_store is not None else None
     files, records, reports, issues = [], [], [], []
+    external_files = []
     documents = {}
     identity_path = root / "campaign-identity.json"
     campaign_identity = json.loads(identity_path.read_bytes()) if identity_path.is_file() else {}
@@ -329,10 +332,11 @@ def inventory_campaign(root, *, artifact_store=None):
     if state.get("schema") == STATE_SCHEMA:
         # Phase 2 uses its separately authenticated reviewed snapshot as seed;
         # this file is the Phase 1 launcher's portable seed convention.
-        if state.get("phase") != "adaptive-phase2" and not (root / "initial-memory.bin").is_file():
+        if (state.get("phase") != "adaptive-phase2" and not (root / "initial-memory.bin").is_file()
+                and external_initial_memory is None):
             issues.append({"kind": "missing-initial-memory"})
         try:
-            _verify_adaptive_state(root, state)
+            _verify_adaptive_state(root, state, external_initial_memory=external_initial_memory)
         except (OSError, ValueError, KeyError, TypeError):
             issues.append({"kind": "invalid-adaptive-memory-chain"})
     for relative in documents:
@@ -400,17 +404,28 @@ def inventory_campaign(root, *, artifact_store=None):
                     issues.append({"kind": "missing-or-corrupt-snapshot-file", "path": name})
     if pending:
         issues.append({"kind": "pending-boundary", "paths": sorted(pending)})
+    if external_initial_memory is not None:
+        seed = Path(external_initial_memory).resolve(strict=True).read_bytes()
+        external_files.append({"path": "initial-memory.bin", "sha256": _sha(seed),
+                               "size": len(seed), "source": "adopted-external"})
+    adoption_record = None
+    if adoption is not None:
+        data = Path(adoption).resolve(strict=True).read_bytes()
+        adoption_record = {"path": "adoption.json", "sha256": _sha(data), "size": len(data)}
     return {"schema": "ascend-training-annex-v1", "identity": identity,
             "boundary": {"state_sha256": next((f["sha256"] for f in files
                          if f["path"] == "state.json"), None),
                          "completed_waves": state.get("completed_waves", []),
                          "pending": sorted(pending)},
-            "files": files, "records": records, "remote_reports": reports,
+            "files": files, "external_files": external_files, "adoption": adoption_record,
+            "records": records, "remote_reports": reports,
             "issues": issues, "complete": not issues,
-            "inventory_sha256": _sha(_json(files))}
+            "inventory_sha256": _sha(_json({"files": files, "external_files": external_files,
+                                               "adoption": adoption_record}))}
 
 
-def package_campaign(root, destination, *, artifact_store=None, allow_pending=False):
+def package_campaign(root, destination, *, artifact_store=None, allow_pending=False,
+                     external_initial_memory=None, adoption=None):
     """Create a new tar.gz containing memory and evidence at one frozen boundary.
 
     Default rejects incomplete evidence. ``allow_pending`` explicitly creates a
@@ -419,7 +434,10 @@ def package_campaign(root, destination, *, artifact_store=None, allow_pending=Fa
     root, destination = Path(root).resolve(strict=True), Path(destination).resolve()
     if destination.is_relative_to(root):
         raise ValueError("archive destination must be outside campaign")
-    manifest = inventory_campaign(root, artifact_store=artifact_store)
+    inventory_options = {"artifact_store": artifact_store,
+                         "external_initial_memory": external_initial_memory,
+                         "adoption": adoption}
+    manifest = inventory_campaign(root, **inventory_options)
     if not manifest["complete"] and not allow_pending:
         raise ValueError("campaign is incomplete; inspect inventory issues or allow_pending")
     manifest["package_kind"] = "complete" if manifest["complete"] else "pending-checkpoint"
@@ -438,6 +456,16 @@ def package_campaign(root, destination, *, artifact_store=None, allow_pending=Fa
                 if _sha(data) != entry["sha256"]:
                     raise ValueError("campaign changed during packaging")
                 add("campaign/" + entry["path"], data)
+            if external_initial_memory is not None:
+                data = Path(external_initial_memory).resolve(strict=True).read_bytes()
+                if _sha(data) != manifest["external_files"][0]["sha256"]:
+                    raise ValueError("external initial memory changed during packaging")
+                add("campaign/initial-memory.bin", data)
+            if adoption is not None:
+                data = Path(adoption).resolve(strict=True).read_bytes()
+                if _sha(data) != manifest["adoption"]["sha256"]:
+                    raise ValueError("adoption provenance changed during packaging")
+                add("adoption/adoption.json", data)
             raw_files = []
             packaged_reports = set()
             for report in manifest["remote_reports"]:
@@ -461,7 +489,7 @@ def package_campaign(root, destination, *, artifact_store=None, allow_pending=Fa
                     name = "reports/" + receipt.name
                     raw_files.append({"path": name, "sha256": _sha(data), "size": len(data)})
                     add(name, data)
-            current = inventory_campaign(root, artifact_store=artifact_store)
+            current = inventory_campaign(root, **inventory_options)
             if current != {k: v for k, v in manifest.items() if k != "package_kind"}:
                 raise ValueError("campaign changed during packaging")
             manifest["raw_files"] = raw_files

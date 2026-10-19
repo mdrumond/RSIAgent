@@ -388,6 +388,23 @@ def test_adopted_continuation_repairs_partial_metadata_without_incrementing_agai
     assert calls == ([9, 9] if boundary == "state" else [9])
 
 
+def test_adopted_package_authenticates_external_seed_and_adoption_provenance(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path)
+    control = tmp_path / "control"
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    cli.adopt_campaign(root, control, "Learn kernels", memory, runtime, "a" * 40)
+    output = tmp_path / "adopted.tar.gz"
+    cli.main(["package", "--control", str(control), "--output", str(output),
+              "--allow-pending"])
+    with tarfile.open(output) as archive:
+        manifest = json.load(archive.extractfile("manifest.json"))
+        assert archive.extractfile("campaign/initial-memory.bin").read() == b"seed"
+        adoption = archive.extractfile("adoption/adoption.json").read()
+    assert manifest["external_files"][0]["sha256"] == hashlib.sha256(b"seed").hexdigest()
+    assert manifest["adoption"]["sha256"] == hashlib.sha256(adoption).hexdigest()
+    assert not (root / "initial-memory.bin").exists()
+
+
 def test_start_retains_public_provenance_not_private_settings_and_separate_workers(tmp_path):
     calls = []
     job = start(tmp_path, screen=lambda job, role: calls.append(role) or role)

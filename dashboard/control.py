@@ -25,6 +25,13 @@ def _read(path, default=None):
         return default
 
 
+def _write(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
 def _safe_error(error):
     message = re.sub(r"\b\S*(?:SECRET|TOKEN|PASSWORD|API_KEY)\S*\b", "[redacted]",
                      str(error), flags=re.IGNORECASE)
@@ -149,18 +156,22 @@ class ControlManager:
             approval = _read(control / "curriculum-approval.json")
             target = state.get("project_target")
             adoption = _read(control / "adoption.json", {}) or {}
+            intent = _read(control / "extension-intent.json", {}) or {}
             old_target = adoption.get("project_target", job.get("project_target"))
             targets = [value for value in (
-                target, job.get("project_target"), job.get("continue_target"))
+                target, job.get("project_target"), job.get("continue_target"),
+                intent.get("project_target"))
                 if type(value) is int]
             partial_target = max(targets) if targets else None
             partial = (job.get("adopted") is True and type(old_target) is int
                        and partial_target > old_target
                        and len(state.get("prior_outcomes", [])) == old_target
-                       and worker.get("status") in {"failed", "queued", "running"})
+                       and (worker.get("status") in {"failed", "queued", "running"}
+                            or intent.get("project_target") == partial_target))
             clean = (type(target) is int and target == job.get("project_target")
                      and len(state.get("prior_outcomes", [])) == target
                      and worker.get("status") == "waiting-approval"
+                     and not intent
                      and worker.get("result", {}).get("status") == "TARGET_REACHED")
             if (campaign["phase"] != 1 or job.get("approval_mode") is not True
                     or not (clean or partial)
@@ -280,6 +291,12 @@ class ControlManager:
             db.execute("UPDATE operations SET status='running', started=? WHERE id=?",
                        (time.time(), operation_id))
         try:
+            if action == "extend":
+                campaign = self.campaigns[payload["campaign_id"]]
+                _write(Path(campaign["control"]) / "extension-intent.json", {
+                    "schema": "ascend-dashboard-extension-intent-v1",
+                    "project_target": payload["_validated_project_target"],
+                    "operation_id": operation_id, "created": time.time()})
             completed = self.runner(self._argv(action, payload), capture_output=True, text=True,
                                     check=False, shell=False)
             if completed.returncode:
@@ -287,6 +304,8 @@ class ControlManager:
                                     f"command exited {completed.returncode}").strip())
             if action == "extend":
                 self._wait_for_extension(payload)
+                campaign = self.campaigns[payload["campaign_id"]]
+                (Path(campaign["control"]) / "extension-intent.json").unlink(missing_ok=True)
             try:
                 result = json.loads(completed.stdout)
             except (TypeError, ValueError):
