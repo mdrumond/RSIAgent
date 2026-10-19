@@ -239,7 +239,7 @@ def _memory(branch: Path):
         memory = {}
     facts, performance = memory.get("host_facts", []), []
     for fact in facts:
-        if fact.get("category") != "performance-study":
+        if not isinstance(fact, dict) or fact.get("category") != "performance-study":
             continue
         try:
             performance.extend(json.loads(fact["statement"]).get("timing", []))
@@ -326,7 +326,7 @@ def _performance(project):
             dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4,
                            "float8_e4m3fn": 1, "float8_e5m2": 1,
                            "mxfp8_e4m3fn": 1, "mxfp8_e5m2": 1}.get(
-                               spec.get("dtype", "float32"))
+                               spec.get("dtype"))
             logical_elements = _logical_io_elements(spec, shape)
             if dtype_bytes and logical_elements is not None:
                 logical_bytes = logical_elements * dtype_bytes
@@ -344,13 +344,17 @@ def _performance(project):
     expected = [(f"{engine}-{name.replace(' / MAC', '').lower()}", engine, label, prefix)
                 for prefix, (engine, label) in _PIPE_COLUMNS.items() for name in [label]]
     for fact_index, fact in enumerate(project.get("memory", {}).get("facts", [])):
-        if fact.get("category") != "profiling":
+        if not isinstance(fact, dict) or fact.get("category") != "profiling":
             continue
         try:
             raw = json.loads(fact["statement"])
         except (KeyError, TypeError, ValueError):
             continue
         if not isinstance(raw, dict) or raw.get("metric") != "PipeUtilization":
+            continue
+        metric_values = raw.get("metric_values")
+        if not isinstance(metric_values, list) or any(not isinstance(item, list) or len(item) != 2
+                                                      for item in metric_values):
             continue
         try:
             identity = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -360,7 +364,7 @@ def _performance(project):
             continue
         seen_profiles.add(identity)
         columns = {}
-        for item in raw.get("metric_values", []):
+        for item in metric_values:
             if (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)
                     and _finite_number(item[1])):
                 match = re.search(r":(aic|aiv)_(mac|scalar|mte1|mte2|mte3|vec|fixpipe)_(ratio|time\(us\)):\d+\Z",

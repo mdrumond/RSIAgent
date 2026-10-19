@@ -33,7 +33,7 @@ def campaign(tmp_path):
     root = tmp_path / "phase1"
     branch = root / "waves/wave-001/branches/vector-add"
     spec = {"project_id": "vector-add", "hypothesis": "Measure a bounded vector add.",
-            "capabilities": ["simd-vector"], "shape": [1003]}
+            "capabilities": ["simd-vector"], "shape": [1003], "dtype": "float32"}
     write(root / "state.json", {"completed_waves": ["wave-001"], "prior_outcomes": [{}],
                                  "failed_outcomes": [], "project_target": 2})
     planned = {"project_id": "planned-only", "hypothesis": "Not started yet."}
@@ -182,6 +182,54 @@ def test_performance_api_rejects_malformed_values_and_handles_shapes(campaign, t
     assert client.get("/api/phase/1/project/missing/performance").status_code == 404
 
 
+@pytest.mark.parametrize("metric_values", [None, 7, {"bad": "shape"}, ["not-a-pair"]])
+def test_performance_api_ignores_malformed_profile_facts(campaign, tmp_path, metric_values):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    memory["host_facts"] = [None, 3, ["wrong"],
+        {"category": "profiling", "statement": json.dumps(
+            {"metric": "PipeUtilization", "metric_values": metric_values})}]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    response = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client().get(
+        "/api/phase/1/project/vector-add/performance")
+    assert response.status_code == 200
+    assert response.get_json()["profiles"] == []
+
+
+@pytest.mark.parametrize("dtype", [None, "unknown"])
+def test_performance_bandwidth_requires_supported_explicit_dtype(campaign, tmp_path, dtype):
+    plan_path = tmp_path / "phase1/waves/wave-001/plan.json"
+    plan = json.loads(plan_path.read_text())
+    spec = plan["wave"]["projects"][0]["spec"]
+    if dtype is None:
+        spec.pop("dtype")
+    else:
+        spec["dtype"] = dtype
+    write(plan_path, plan)
+    body = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client().get(
+        "/api/phase/1/project/vector-add/performance").get_json()
+    assert body["captures"][0]["useful_logical_io_gib_s"] is None
+
+
+def test_multiple_profile_captures_keep_capture_identity(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    profiles = [{"metric": "PipeUtilization", "metric_values": [
+        ["one.csv:aiv_vec_ratio:0", ratio]]} for ratio in (.1, .2)]
+    memory["host_facts"] = [{"category": "profiling", "statement": json.dumps(row)}
+                             for row in profiles]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    body = client.get("/api/phase/1/project/vector-add/performance").get_json()
+    assert [row["capture"] for row in body["profiles"]] == [1, 2]
+    script = client.get("/static/app.js").data
+    assert b"Capture ${metric.capture}" in script
+
+
 @pytest.mark.parametrize(("spec_shape", "input_shapes", "output_shape", "node", "expected"), [
     ([33, 257], [[33, 257]], [33],
      {"name": "sum", "op": "reduce-sum", "operands": ["x"], "axis": 1},
@@ -221,6 +269,8 @@ def test_project_performance_is_lazy_and_has_accessible_plot_scaffolds(campaign,
     assert b'data-performance-chart="attempts"' in detail.data
     assert b'data-performance-chart="shapes"' in detail.data
     assert b'data-performance-chart="pipes"' in detail.data
+    assert b'data-performance-chart="attempts" role="img"' not in detail.data
+    assert b'data-performance-chart="pipes" role="img"' not in detail.data
     assert b'data-pipe-engine="AIC"' in detail.data and b'data-pipe-engine="AIV"' in detail.data
     assert b'class="pipe-table"' in detail.data
     assert b"Performance data loads when this section opens." in detail.data

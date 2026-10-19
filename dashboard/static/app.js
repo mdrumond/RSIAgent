@@ -52,9 +52,9 @@ function chartFrame(label) {
   svg.append(svgNode('line', {x1: 55, y1: 20, x2: 55, y2: 220, class: 'axis'}));
   return svg;
 }
-function point(svg, x, y, title, unavailable = false) {
+function point(svg, x, y, title, unavailable = false, extraClass = '') {
   const mark = svgNode('circle', {cx: x, cy: y, r: unavailable ? 5 : 4,
-    class: unavailable ? 'plot-point unavailable' : 'plot-point', tabindex: 0, 'aria-label': title});
+    class: `${unavailable ? 'plot-point unavailable' : 'plot-point'}${extraClass}`, tabindex: 0, 'aria-label': title});
   mark.append(svgNode('title', {}, title)); svg.append(mark);
 }
 function renderTiming(target, captures, shapeMode) {
@@ -79,14 +79,14 @@ function renderTiming(target, captures, shapeMode) {
 }
 function renderPipes(target, profiles, engine = 'all') {
   const svg = chartFrame('AIC and AIV pipe utilization');
-  const metrics = profiles.flatMap(row => row.metrics).filter(metric => engine === 'all' || metric.engine === engine);
+  const metrics = profiles.flatMap(row => row.metrics.map(metric => ({...metric, capture: row.capture}))).filter(metric => engine === 'all' || metric.engine === engine);
   if (!metrics.length) { target.textContent = 'No retained PipeUtilization capture.'; return; }
   metrics.forEach((metric, index) => {
     const x = 70 + (metrics.length === 1 ? 305 : index / (metrics.length - 1) * 610);
     const value = metric.available ? metric.value : 0, y = 220 - Math.min(Math.max(value, 0), 100) * 1.9;
     const duration = metric.time_us == null ? 'time NA' : `time ${metric.time_us.toFixed(3)} µs`;
-    const title = metric.available ? `${metric.engine} ${metric.label}: ${value.toFixed(3)}%; ${duration}` : `${metric.engine} ${metric.label}: NA; ${duration}`;
-    point(svg, x, y, title, !metric.available);
+    const title = metric.available ? `Capture ${metric.capture} · ${metric.engine} ${metric.label}: ${value.toFixed(3)}%; ${duration}` : `Capture ${metric.capture} · ${metric.engine} ${metric.label}: NA; ${duration}`;
+    point(svg, x, y, title, !metric.available, ` capture-${metric.capture}`);
     svg.append(svgNode('text', {x, y: 242, class: `tick ${metric.engine.toLowerCase()}`}, `${metric.engine} ${metric.label}`));
   });
   target.replaceChildren(svg);
