@@ -158,8 +158,8 @@ def materialize_case(case, device="cpu"):
             order = list(range(len(shape)))
             order[-1], order[-2] = order[-2], order[-1]
             tensor = tensor.permute(order).contiguous().permute(order)
-        elif strides is not None:
-            tensor = torch.empty_strided(shape, strides, dtype=dtype).copy_(tensor)
+        if strides is not None:
+            return torch.empty_strided(shape, strides, dtype=dtype, device=device).copy_(tensor)
         return tensor.to(device)
 
     return [make(hint) for hint in case["args"]], {k: make(hint) for k, hint in case["kwargs"].items()}

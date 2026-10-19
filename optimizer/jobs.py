@@ -86,6 +86,11 @@ class JobStore:
             atomic(staging / 'manifest.json', canonical(manifest))
             self._event(staging, 'created', {'submission_sha256': sha(data)})
             staging.rename(directory)
+            descriptor = os.open(self.root, os.O_DIRECTORY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
             return manifest
 
     @staticmethod
@@ -181,7 +186,8 @@ class JobStore:
             raise ValueError('elapsed time must be nonnegative')
         def change(row):
             row['elapsed_seconds'] += seconds
-            self._exhaust(row)
+            if row['status'] == 'running':
+                self._exhaust(row)
         return self._update(job_id, 'elapsed', change)
 
     def stop(self, job_id):

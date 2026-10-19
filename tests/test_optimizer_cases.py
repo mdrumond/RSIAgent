@@ -9,6 +9,7 @@ def submission(**changes):
 
 
 def test_cases_preserve_representative_and_are_deterministic():
+    pytest.importorskip("torch")
     spec = submission()
     suite = generate_cases(spec)
     assert suite == generate_cases(spec)
@@ -33,6 +34,7 @@ def test_invalid_and_constrained_variants_are_explicit():
 
 
 def test_scalar_kwargs_and_strided_inputs():
+    pytest.importorskip("torch")
     spec = submission()
     spec["signatures"] = [{"args": [{"shape": [2, 3], "dtype": "float16", "strides": [1, 2]}],
                            "kwargs": {"scale": {"scalar": 2}}}]
@@ -46,3 +48,12 @@ def test_representatives_never_silently_truncated():
     spec["signatures"] *= 25
     with pytest.raises(ValueError, match="representative"):
         generate_cases(spec)
+
+
+def test_padded_strides_survive_device_transfer():
+    pytest.importorskip("torch")
+    spec = submission()
+    spec['signatures'] = [{'args': [{'shape': [2, 3], 'dtype': 'float32', 'strides': [4, 1]}]}]
+    case = generate_cases(spec)['cases'][0]
+    args, _ = materialize_case(case, device='meta')
+    assert args[0].stride() == (4, 1)

@@ -5,13 +5,13 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 from optimizer.measurement import aggregate_rows, parse_capture, capture
 
 
 def test_pinned_cannbot_differential():
+    np = pytest.importorskip('numpy')
     source = Path(__file__).parents[1] / 'optimizer/vendor/cannbot_aggregate.py'
     tree = ast.parse(source.read_text())
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
