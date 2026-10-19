@@ -16,6 +16,7 @@ import time
 from .cases import validate_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
+from .transport import ObservationUnavailable, WorkerStopped
 
 
 def score(baseline, result):
@@ -113,6 +114,15 @@ class OptimizationLoop:
             self.store.transition(self.key, 'running')
         try:
             self._run(submission)
+        except ObservationUnavailable:
+            if self.store.get(self.key)['status'] == 'running':
+                self.store.transition(self.key, 'running', stage='observation-unavailable')
+            raise
+        except WorkerStopped:
+            row = self.store.get(self.key)
+            if row['status'] == 'running':
+                self.store.transition(self.key, 'stopped' if row['stop_requested'] else 'budget-exhausted')
+            raise
         except Exception as exc:
             self.store.add_event(self.key, 'optimizer-error', {'type': type(exc).__name__, 'message': str(exc)})
             if self.store.get(self.key)['status'] == 'running':
