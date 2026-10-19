@@ -87,17 +87,28 @@ class RemoteBackend:
                    f'&& cd {quoted(str(remote_directory / "source"))} '
                    f'&& timeout --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
                    f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
+        failure = None
         try:
             self.transport.execute(directory, ['bash', '-c', command])
         except RuntimeError as exc:
             if isinstance(exc, (ObservationUnavailable, WorkerStopped)):
                 raise
             # Terminal compiler/reference failures still have compact evidence.
+            failure = str(exc)
             self.store.add_event(self.job_id, 'remote-operation-error', {'operation': operation, 'error': str(exc)})
         if (directory / 'transport.log').exists():
             self.store.put_artifact(self.job_id, str(relative / 'transport.log'), (directory / 'transport.log').read_bytes())
         compact = directory / 'compact.tar.gz'
-        self.transport.transfer('download', remote_directory / 'compact.tar.gz', compact)
+        try:
+            self.transport.transfer('download', remote_directory / 'compact.tar.gz', compact)
+        except RuntimeError as exc:
+            if failure is None or isinstance(exc, (ObservationUnavailable, WorkerStopped)):
+                raise
+            result = {'status': 'error', 'error': failure + '; no compact result was published',
+                      'operation': operation, 'cases': [], 'remote_directory': str(remote_directory)}
+            atomic(result_path, canonical(result))
+            self.store.put_artifact(self.job_id, str(relative / 'result.json'), canonical(result))
+            return result
         with tarfile.open(compact) as archive:
             rows = json.load(archive.extractfile('files.json'))
             for row in rows:

@@ -150,6 +150,25 @@ def test_cancelled_backend_restarts_only_in_fresh_generation(tmp_path):
     assert transport.calls == [directory / 'retry']
 
 
+def test_terminal_candidate_crash_without_archive_is_feedback_not_job_crash(tmp_path):
+    from optimizer.jobs import JobStore
+    from optimizer.worker import RemoteBackend
+    store = JobStore(tmp_path / 'jobs')
+    job = store.create('def forward(x): return x', 'forward', {}, {})['job_id']
+    class Transport:
+        def transfer(self, action, source, destination):
+            if action == 'download':
+                raise RuntimeError('missing compact archive')
+        def execute(self, directory, argv):
+            (directory / 'transport.log').write_text('candidate exited 139')
+            raise RuntimeError('remote operation failed')
+    backend = RemoteBackend(store, job, config(tmp_path), transport=Transport())
+    result = backend.evaluate('source', store.root / job / 'execution' / 'candidate', block_count=1)
+    assert result['status'] == 'error'
+    assert 'no compact result' in result['error']
+    assert {row['name'] for row in store.artifacts(job)} == {'candidate/transport.log', 'candidate/result.json'}
+
+
 def test_profile_observation_loss_preserves_pending_and_history_on_retry(tmp_path):
     from test_optimizer_loop import fixture, Agent, Backend, candidate
     from optimizer.loop import OptimizationLoop
