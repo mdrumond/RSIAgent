@@ -125,11 +125,29 @@ class RemoteBackend:
 def knowledge_query(config, directory):
     if not config.get('knowledge'):
         return None
+    settings = config['knowledge']
+    if 'kdb' in settings:
+        from benchmarks.a5kernels.embeddings import PinnedBGEEmbeddings
+        from benchmarks.a5kernels.knowledge import KnowledgeDB
+        from benchmarks.a5kernels.knowledge_agent import KnowledgeAgent, KnowledgeQuery, ProgressiveMemoryJournal
+        from benchmarks.a5kernels.production import _transformers_cache
+        embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(Path(settings['bge_cache'])))
+        database = KnowledgeDB.open_read_only(Path(settings['kdb']), embeddings)
+        try:
+            manifests = database.selected_manifests(settings['collection'])
+            actual = (manifests[0].fingerprint if isinstance(settings['collection'], str)
+                      else {manifest.collection: manifest.fingerprint for manifest in manifests})
+            if actual != settings['manifest']:
+                raise ValueError('optimizer selected KDB manifests changed')
+            gate = KnowledgeAgent(enabled=True, database=database, collection=settings['collection'],
+                                  journal=ProgressiveMemoryJournal(directory / 'knowledge.jsonl'))
+        finally:
+            database.close()
+        return lambda text: [dataclasses.asdict(row) for row in gate.query(KnowledgeQuery(query=text))]
     from benchmarks.a3kernels.live_composition import local_knowledge_factory
     from benchmarks.a3_experiments import KnowledgeMode
     from benchmarks.a3kernels.knowledge_agent import KnowledgeQuery
     from types import SimpleNamespace
-    settings = config['knowledge']
     gate = local_knowledge_factory(SimpleNamespace(**{key: Path(value) for key, value in settings.items()}))(
         SimpleNamespace(knowledge=KnowledgeMode.WITH_KDB), SimpleNamespace(root=directory))
     return lambda text: [dataclasses.asdict(row) for row in gate.query(KnowledgeQuery(query=text))]

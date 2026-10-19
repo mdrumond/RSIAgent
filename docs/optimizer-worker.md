@@ -22,6 +22,11 @@ Optional `env_file` loads provider credentials only in the detached worker.
 `model_profile` defaults to the existing A3 OpenAI profile. Optional `knowledge`
 contains `knowledge_manifest`, `knowledge_database`, and `embedding_cache` paths;
 the existing read-only manifest-checked KnowledgeAgent gates every query.
+For the current expanded multi-collection native campaign, use `knowledge` with
+`kdb`, `bge_cache`, `collection` (string or list) and `manifest` (the pinned
+fingerprint string or selected-collection fingerprint map). This uses the
+existing native campaign KnowledgeAgent and authenticates every selected manifest
+before the provider loop starts.
 Optional `lock_directory` coordinates optimizer workers sharing a device. Its
 default is `.optimizer-locks` beside the configured validation wrapper. Existing
 campaign/device admission remains an operator prerequisite.
