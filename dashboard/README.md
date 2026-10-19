@@ -45,3 +45,37 @@ The proposal view exposes the hypothesis plus deterministic novelty and coverage
 comparisons. A terminal proposal exposes only its status and concise reason and
 can be approved without selecting a project. Provider messages and hidden
 reasoning are never copied into the cache or API response.
+
+Completed legacy A3 Phase 1 campaigns can be adopted without modifying their
+retained history. The adoption command requires the original seed, runtime
+configuration, a source manifest for future work, and the exact legacy harness
+revision; it atomically creates a separate control directory and refuses to run
+while a local Python process still names the campaign root. Absolute and relative
+`--root` forms and retained `_campaign --control` workers are recognized through
+their process working directories and authenticated job metadata. The recovery
+supervisor must also be stopped or disabled before adoption; the command checks
+again immediately before publishing controls but never terminates processes.
+When historical SFT
+trace headers exist, their model and source-manifest provenance is validated.
+If their digest differs from the supplied manifest, both digests are recorded
+separately and the supplied manifest remains scoped to post-adoption work. When
+no historical headers exist, the adoption record explicitly marks historical
+source provenance unavailable. The supplied manifest is never presented as
+evidence for old projects. After configuring that
+control directory in the dashboard, **Extend by 8** is
+available only at a clean `TARGET_REACHED` boundary. It invokes continuation,
+but never samples or runs a project.
+
+```bash
+python run_ascend_campaign.py adopt \
+  --control /path/to/external-control \
+  --root /path/to/completed-phase1 \
+  --objective "Learn A3 kernels" \
+  --initial-memory /path/to/original-seed.bin \
+  --config /path/to/original-native-a3.json \
+  --model openai/gpt-5.6-sol \
+  --source-manifest /path/to/post-adoption-sources.json \
+  --knowledge with-kdb \
+  --profiling without-profiling-guidance \
+  --legacy-revision 0123456789abcdef0123456789abcdef01234567
+```

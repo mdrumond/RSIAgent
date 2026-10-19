@@ -25,6 +25,13 @@ def _read(path, default=None):
         return default
 
 
+def _write(path, value):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
 def _safe_error(error):
     message = re.sub(r"\b\S*(?:SECRET|TOKEN|PASSWORD|API_KEY)\S*\b", "[redacted]",
                      str(error), flags=re.IGNORECASE)
@@ -41,7 +48,9 @@ def _information(spec):
 class ControlManager:
     """Validate commands, persist their lifecycle and execute one at a time."""
 
-    ACTIONS = {"start", "sample", "approve", "reject", "run-approved"}
+    ACTIONS = {"start", "extend", "sample", "approve", "reject", "run-approved"}
+    EXTENSION_WAIT_SECONDS = 300
+    EXTENSION_POLL_SECONDS = .25
 
     def __init__(self, config_path, database, runner=subprocess.run):
         self.config_path, self.database = Path(config_path), Path(database)
@@ -124,7 +133,7 @@ class ControlManager:
         identifier = payload.get("preset_id") if action == "start" else payload.get("campaign_id")
         if not isinstance(identifier, str):
             raise ControlError("campaign identifier is required")
-        subject = identifier if action in {"start", "sample"} else payload.get("proposal_id")
+        subject = identifier if action in {"start", "extend", "sample"} else payload.get("proposal_id")
         if payload.get("confirmation") != f"{action}:{subject}":
             raise ControlError("confirmation does not match the requested action")
         if action == "start":
@@ -136,6 +145,42 @@ class ControlManager:
                 raise ControlError("only A3 Phase 1 and Phase 2 presets are allowed")
             return identifier
         campaign = self._campaign(identifier)
+        if action == "extend":
+            step = self.settings.get("extension_step")
+            if type(step) is not int or step != 8:
+                raise ControlError("campaign extension step must be exactly 8")
+            root, control = Path(campaign["root"]), Path(campaign["control"])
+            state = _read(root / "state.json", {}) or {}
+            job = _read(control / "job.json", {}) or {}
+            worker = _read(control / "worker.json", {}) or {}
+            approval = _read(control / "curriculum-approval.json")
+            target = state.get("project_target")
+            adoption = _read(control / "adoption.json", {}) or {}
+            intent = _read(control / "extension-intent.json", {}) or {}
+            old_target = adoption.get("project_target", job.get("project_target"))
+            targets = [value for value in (
+                target, job.get("project_target"), job.get("continue_target"),
+                intent.get("project_target"))
+                if type(value) is int]
+            partial_target = max(targets) if targets else None
+            partial = (job.get("adopted") is True and type(old_target) is int
+                       and partial_target > old_target
+                       and len(state.get("prior_outcomes", [])) == old_target
+                       and (worker.get("status") in {"failed", "queued", "running"}
+                            or intent.get("project_target") == partial_target))
+            clean = (type(target) is int and target == job.get("project_target")
+                     and len(state.get("prior_outcomes", [])) == target
+                     and worker.get("status") == "waiting-approval"
+                     and not intent
+                     and worker.get("result", {}).get("status") == "TARGET_REACHED")
+            if (campaign["phase"] != 1 or job.get("approval_mode") is not True
+                    or not (clean or partial)
+                    or state.get("terminal") is not None or (root / "pending.json").exists()
+                    or isinstance(approval, dict) and approval.get("status") in {
+                        "proposed", "approved", "running"}):
+                raise ControlError("campaign must be at a clean TARGET_REACHED boundary")
+            payload["_validated_project_target"] = partial_target if partial else target + step
+            return identifier
         if action == "sample":
             return identifier
         proposal = self.proposal(identifier)
@@ -189,6 +234,10 @@ class ControlManager:
                          "--review", str(preset["review"])]
             return argv
         campaign = self.campaigns[payload["campaign_id"]]
+        if action == "extend":
+            target = payload["_validated_project_target"]
+            return [sys.executable, runner, "continue", "--control", str(campaign["control"]),
+                    "--project-target", str(target)]
         argv = [sys.executable, runner, action, "--control", str(campaign["control"])]
         if action in {"approve", "reject", "run-approved"}:
             argv += ["--proposal-id", payload["proposal_id"]]
@@ -224,6 +273,11 @@ class ControlManager:
                 if old[0] != fingerprint:
                     raise ControlError("idempotency key was already used for a different request")
                 return old[1]
+            active = db.execute("SELECT 1 FROM operations WHERE campaign_id=? "
+                                "AND status IN ('queued','running') LIMIT 1",
+                                (campaign_id,)).fetchone()
+            if active:
+                raise ControlError("another campaign operation is already queued or running")
             db.execute("INSERT INTO operations(id,action,campaign_id,status,request,created) "
                        "VALUES(?,?,?,?,?,?)", (operation_id, action, campaign_id, "queued",
                                                json.dumps(payload, sort_keys=True), now))
@@ -237,11 +291,21 @@ class ControlManager:
             db.execute("UPDATE operations SET status='running', started=? WHERE id=?",
                        (time.time(), operation_id))
         try:
+            if action == "extend":
+                campaign = self.campaigns[payload["campaign_id"]]
+                _write(Path(campaign["control"]) / "extension-intent.json", {
+                    "schema": "ascend-dashboard-extension-intent-v1",
+                    "project_target": payload["_validated_project_target"],
+                    "operation_id": operation_id, "created": time.time()})
             completed = self.runner(self._argv(action, payload), capture_output=True, text=True,
                                     check=False, shell=False)
             if completed.returncode:
                 raise RuntimeError((completed.stderr or completed.stdout or
                                     f"command exited {completed.returncode}").strip())
+            if action == "extend":
+                self._wait_for_extension(payload)
+                campaign = self.campaigns[payload["campaign_id"]]
+                (Path(campaign["control"]) / "extension-intent.json").unlink(missing_ok=True)
             try:
                 result = json.loads(completed.stdout)
             except (TypeError, ValueError):
@@ -253,6 +317,26 @@ class ControlManager:
             with self._db() as db:
                 db.execute("UPDATE operations SET status='failed', error=?, finished=? WHERE id=?",
                            (_safe_error(error), time.time(), operation_id))
+
+    def _wait_for_extension(self, payload):
+        campaign = self.campaigns[payload["campaign_id"]]
+        root, control = Path(campaign["root"]), Path(campaign["control"])
+        target = payload["_validated_project_target"]
+        deadline = time.monotonic() + self.EXTENSION_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            worker = _read(control / "worker.json", {}) or {}
+            if worker.get("status") == "failed":
+                raise RuntimeError(worker.get("error") or "campaign extension worker failed")
+            state = _read(root / "state.json", {}) or {}
+            job = _read(control / "job.json", {}) or {}
+            adoption = _read(control / "adoption.json", {}) or {}
+            if (worker.get("status") == "waiting-approval"
+                    and state.get("project_target") == target
+                    and job.get("project_target") == target
+                    and (not job.get("adopted") or adoption.get("project_target") == target)):
+                return
+            time.sleep(self.EXTENSION_POLL_SECONDS)
+        raise RuntimeError("campaign extension did not reach waiting-approval before timeout")
 
     def operation(self, operation_id):
         with self._db() as db:

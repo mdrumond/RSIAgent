@@ -218,8 +218,206 @@ def controlled_config(tmp_path, *, phase=1):
     write(config, {"campaigns": [{"id": f"phase{phase}", "target": "a3", "phase": phase,
                                    "root": str(root), "control": str(control)}],
                    "controls": {"enabled": True, "runner": "/repo/run_ascend_campaign.py",
+                                "extension_step": 8,
                                 "presets": [preset]}})
     return config, root, control
+
+
+def test_extend_is_fixed_server_side_idempotent_and_serialized(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"project_target": 64, "prior_outcomes": [{}] * 64,
+          "terminal": None, "wave_index": 9})
+    write(control / "job.json", {"project_target": 64, "approval_mode": True})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if argv[2] == "continue":
+            state = json.loads((root / "state.json").read_text())
+            write(root / "state.json", {**state, "project_target": 72})
+            write(control / "job.json", {"project_target": 72, "approval_mode": True})
+            write(control / "worker.json", {"status": "waiting-approval"})
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    client = app.test_client(); csrf = client.get("/api/csrf").get_json()["token"]
+    body = {"campaign_id": "phase1", "confirmation": "extend:phase1",
+            "project_target": 999, "command": "evil"}
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "extend-once"}
+    first = client.post("/api/control/extend", json=body, headers=headers)
+    replay = client.post("/api/control/extend", json=body, headers=headers)
+    assert first.status_code == replay.status_code == 202
+    assert first.get_json()["operation_id"] == replay.get_json()["operation_id"]
+    assert wait_operation(client, first.get_json()["operation_id"])["status"] == "succeeded"
+    assert calls == [[pytest.importorskip("sys").executable, "/repo/run_ascend_campaign.py",
+                      "continue", "--control", str(control), "--project-target", "72"]]
+
+
+def test_distinct_extend_requests_cannot_queue_concurrently(tmp_path):
+    import threading
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"project_target": 64, "prior_outcomes": [{}] * 64,
+          "terminal": None, "wave_index": 9})
+    write(control / "job.json", {"project_target": 64, "approval_mode": True})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    entered, release = threading.Event(), threading.Event()
+    def run(argv, **kwargs):
+        entered.set(); assert release.wait(2)
+        state = json.loads((root / "state.json").read_text())
+        write(root / "state.json", {**state, "project_target": 72})
+        write(control / "job.json", {"project_target": 72, "approval_mode": True})
+        write(control / "worker.json", {"status": "waiting-approval"})
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    client = app.test_client(); csrf = client.get("/api/csrf").get_json()["token"]
+    body = {"campaign_id": "phase1", "confirmation": "extend:phase1"}
+    first = client.post("/api/control/extend", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "first"})
+    assert first.status_code == 202 and entered.wait(2)
+    second = client.post("/api/control/extend", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "second"})
+    assert second.status_code == 409
+    release.set()
+    assert wait_operation(client, first.get_json()["operation_id"])["status"] == "succeeded"
+
+
+def test_extend_pins_validated_target_before_background_execution(tmp_path):
+    import threading
+    config, root, control = controlled_config(tmp_path)
+    settings = json.loads(config.read_text())
+    settings["controls"]["presets"].append({**settings["controls"]["presets"][0],
+        "id": "blocker", "root": str(tmp_path / "unused"),
+        "control": str(tmp_path / "unused-control")})
+    write(config, settings)
+    root.mkdir()
+    write(root / "state.json", {"project_target": 64, "prior_outcomes": [{}] * 64,
+          "terminal": None, "wave_index": 9})
+    write(control / "job.json", {"project_target": 64, "approval_mode": True})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    entered, release, calls = threading.Event(), threading.Event(), []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if len(calls) == 1:
+            entered.set(); assert release.wait(2)
+        else:
+            write(control / "job.json", {"project_target": 72, "approval_mode": True})
+            write(control / "worker.json", {"status": "waiting-approval"})
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    client = app.test_client(); csrf = client.get("/api/csrf").get_json()["token"]
+    blocker = client.post("/api/control/start", json={"preset_id": "blocker",
+        "confirmation": "start:blocker"}, headers={"X-CSRF-Token": csrf,
+        "Idempotency-Key": "blocker"})
+    assert blocker.status_code == 202 and entered.wait(2)
+    extension = client.post("/api/control/extend", json={"campaign_id": "phase1",
+        "confirmation": "extend:phase1", "project_target": 999}, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "pinned"})
+    assert extension.status_code == 202
+    state = json.loads((root / "state.json").read_text())
+    write(root / "state.json", {**state, "project_target": 72,
+                                  "prior_outcomes": [{}] * 72})
+    release.set()
+    assert wait_operation(client, extension.get_json()["operation_id"])["status"] == "succeeded"
+    assert calls[-1][-2:] == ["--project-target", "72"]
+
+
+@pytest.mark.parametrize("worker_failure", [False, True])
+def test_extend_waits_for_detached_worker_and_propagates_failure(tmp_path, worker_failure):
+    import threading
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"project_target": 64, "prior_outcomes": [{}] * 64,
+          "terminal": None, "wave_index": 9})
+    write(control / "job.json", {"project_target": 64, "approval_mode": True})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    release = threading.Event()
+    def mutate():
+        assert release.wait(2)
+        if worker_failure:
+            write(control / "worker.json", {"status": "failed", "error": "continuation broke"})
+        else:
+            state = json.loads((root / "state.json").read_text())
+            write(root / "state.json", {**state, "project_target": 72})
+            write(control / "job.json", {"project_target": 72, "approval_mode": True})
+            write(control / "worker.json", {"status": "waiting-approval"})
+    def run(argv, **kwargs):
+        threading.Thread(target=mutate).start()
+        return subprocess.CompletedProcess(argv, 0, '{"session":"detached"}', "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    app.extensions["dashboard_controls"].EXTENSION_POLL_SECONDS = .001
+    client = app.test_client(); csrf = client.get("/api/csrf").get_json()["token"]
+    response = client.post("/api/control/extend", json={"campaign_id": "phase1",
+        "confirmation": "extend:phase1"}, headers={"X-CSRF-Token": csrf,
+        "Idempotency-Key": "async"})
+    operation_id = response.get_json()["operation_id"]
+    time.sleep(.02)
+    assert client.get(f"/api/operations/{operation_id}").get_json()["status"] == "running"
+    release.set()
+    operation = wait_operation(client, operation_id)
+    assert operation["status"] == ("failed" if worker_failure else "succeeded")
+    if worker_failure:
+        assert "continuation broke" in operation["error"]
+
+
+def test_extension_timeout_persists_intent_and_retry_does_not_increment_again(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"project_target": 64, "prior_outcomes": [{}] * 64,
+          "terminal": None, "wave_index": 9})
+    write(control / "job.json", {"project_target": 64, "approval_mode": True,
+                                  "adopted": True})
+    write(control / "adoption.json", {"project_target": 64})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '{"session":"detached"}', "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    manager = app.extensions["dashboard_controls"]
+    manager.EXTENSION_WAIT_SECONDS = .01
+    manager.EXTENSION_POLL_SECONDS = .001
+    client = app.test_client(); csrf = client.get("/api/csrf").get_json()["token"]
+    body = {"campaign_id": "phase1", "confirmation": "extend:phase1"}
+    first = client.post("/api/control/extend", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "timeout"})
+    assert wait_operation(client, first.get_json()["operation_id"])["status"] == "failed"
+    intent = json.loads((control / "extension-intent.json").read_text())
+    assert intent["project_target"] == 72
+    retry = client.post("/api/control/extend", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "retry"})
+    assert retry.status_code == 202
+    assert wait_operation(client, retry.get_json()["operation_id"])["status"] == "failed"
+    assert [call[-1] for call in calls] == ["72", "72"]
+
+
+@pytest.mark.parametrize("change", ["pending", "terminal", "short", "proposal", "worker"])
+def test_extend_requires_clean_target_reached_boundary(tmp_path, change):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    state = {"project_target": 64, "prior_outcomes": [{}] * 64,
+             "terminal": None, "wave_index": 9}
+    write(root / "state.json", state)
+    write(control / "job.json", {"project_target": 64, "approval_mode": True})
+    write(control / "worker.json", {"status": "waiting-approval",
+                                      "result": {"status": "TARGET_REACHED"}})
+    if change == "pending": write(root / "pending.json", {})
+    elif change == "terminal": state["terminal"] = {"status": "STALLED"}; write(root / "state.json", state)
+    elif change == "short": state["prior_outcomes"].pop(); write(root / "state.json", state)
+    elif change == "proposal": write(control / "curriculum-approval.json", {"status": "proposed"})
+    elif change == "worker": write(control / "worker.json", {"status": "running"})
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=lambda *a, **k: pytest.fail("must not run")).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    response = client.post("/api/control/extend", json={"campaign_id": "phase1",
+        "confirmation": "extend:phase1"}, headers={"X-CSRF-Token": csrf,
+        "Idempotency-Key": change})
+    assert response.status_code == 409
 
 
 def wait_operation(client, operation_id):
