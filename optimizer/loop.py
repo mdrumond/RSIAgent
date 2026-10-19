@@ -212,9 +212,11 @@ class OptimizationLoop:
             if value is not None and value > self.state.get('best', {}).get('speedup', 0):
                 self.state['best'] = {**history, 'source': self.state['candidate'],
                                      'block_count': pending['block_count'], 'faster_than_torch': value > 1}
-                if self._boundary():
+                row = self.store.get(self.key)
+                if not row['stop_requested'] and row['elapsed_seconds'] < row['max_seconds']:
                     try:
-                        report = self._action('profile', lambda: self.backend.profile(pending['source'],
+                        self.store.add_event(self.key, 'reserved-stage', {'stage': 'profile'})
+                        report = self._reserved_action(lambda: self.backend.profile(pending['source'],
                             self.directory / pending['sha256'] / 'profile', block_count=pending['block_count']))
                         self.state['best']['profiling'] = self._artifact('profiling', report)
                     except Exception as exc:
@@ -226,12 +228,15 @@ class OptimizationLoop:
             self._save()
 
     def _evaluate_reserved(self, pending):
+        return self._reserved_action(lambda: self.backend.evaluate(pending['source'],
+            self.directory / pending['sha256'], block_count=pending['block_count']))
+
+    def _reserved_action(self, callback):
         started = self.clock()
         self.state['inflight_started'] = started
         self._save()
         try:
-            return self.backend.evaluate(pending['source'], self.directory / pending['sha256'],
-                                         block_count=pending['block_count'])
+            return callback()
         finally:
             self.store.account_time(self.key, max(0, self.clock() - started))
             self.state.pop('inflight_started', None)

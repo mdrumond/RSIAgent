@@ -15,6 +15,9 @@ Optimization actions: {"action":"candidate","source":"Ascend C device source",
 {"action":"read-memory","index":0}, or {"action":"finish","summary":"..."}.
 Candidates define extern "C" __global__ __aicore__ void optimizer_kernel(...)
 with GM_ADDR arguments in inputs, frozen state, outputs order. Host defines
+Declare the kernel task type explicitly inside optimizer_kernel with
+KERNEL_TASK_TYPE_DEFAULT: KERNEL_TYPE_AIV_ONLY for pure vector/scalar work,
+KERNEL_TYPE_AIC_ONLY for pure Cube work, or the appropriate supported mixed type.
 INPUTi/STATEi/OUTPUTi_NUMEL,RANK,SIZEj,STRIDEj and scalar ARGi constants.
 Use only supplied native contracts and guide/KDB evidence. Every frozen case must
 pass the host comparison policy before timing. Never remove cases or loosen policy.

@@ -150,3 +150,21 @@ def test_loop_preserves_recoverable_transport_state(tmp_path, error, status):
     with pytest.raises(type(error)):
         OptimizationLoop(store, job, Agent(), Backend()).run()
     assert store.get(job)['status'] == status
+
+
+@pytest.mark.parametrize('boundary', ['stop', 'deadline'])
+def test_final_reserved_profile_respects_stop_and_elapsed_deadline(tmp_path, boundary):
+    from test_optimizer_loop import fixture, Agent, Backend, candidate
+    from optimizer.loop import OptimizationLoop
+    store, job = fixture(tmp_path, attempts=1, seconds=10)
+    class BoundBackend(Backend):
+        def evaluate(self, *args, **kwargs):
+            result = super().evaluate(*args, **kwargs)
+            if boundary == 'stop':
+                store.stop(job)
+            else:
+                store.account_time(job, 10)
+            return result
+    backend = BoundBackend()
+    OptimizationLoop(store, job, Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend).run()
+    assert backend.profiles == []

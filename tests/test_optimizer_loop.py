@@ -64,7 +64,7 @@ def test_failure_repair_slower_faster_and_budget(tmp_path):
     state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
     assert state['best']['speedup'] == 2
     assert state['best']['faster_than_torch'] is True
-    assert backend.profiles == ['slow']  # last candidate consumed final attempt
+    assert backend.profiles == ['slow', 'fast']  # reserved final attempt retains diagnostics
     assert store.get(key)['attempts'] == 3
     assert backend.prepares == 1
     assert any(e['kind'] == 'model-response' for e in store.events(key))
