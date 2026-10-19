@@ -333,3 +333,24 @@ def test_selector_retains_previous_practice_rationale_with_latest_result(tmp_pat
     assert "padded output now matches" in prompt
     assert "BSA" not in prompt and "Invalid proposal" not in prompt
     assert "BSA" in json.dumps(session.messages)
+
+
+@pytest.mark.parametrize("stage", ["qualify", "reverify"])
+@pytest.mark.parametrize("payload", [b"", b"retained device timing observation"])
+def test_timing_requires_nonempty_retained_evidence_at_qualification_and_verification(tmp_path, stage, payload):
+    store = ContentAddressedArtifacts(tmp_path / "artifacts")
+    timing = {"value": 1.5, "unit": "us", "conditions": "device events; warm; no diagnostics",
+              "evidence_sha256": store.put_bytes(payload)}
+    def validate():
+        if stage == "qualify":
+            qualified(tmp_path, timings=(timing,))
+        else:
+            target, _, _ = qualified(tmp_path)
+            reference = store.read_json(target.reference_sha256)
+            reference["timings"] = [timing]
+            replace(target, reference_sha256=store.put_json(reference)).verify(store, RUNTIME)
+    if payload:
+        validate()
+    else:
+        with pytest.raises(ValueError, match="timing evidence is empty"):
+            validate()
