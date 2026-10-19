@@ -179,3 +179,48 @@ def test_archive_memory_chain_uses_reviewed_seed_not_launcher_input(tmp_path, mo
     (c.root / "initial-memory.bin").write_bytes(b"original Phase 1 launcher input")
     monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
     _verify_adaptive_state(c.root, json.loads((c.root / "state.json").read_bytes()))
+
+
+def test_semantic_actor_failure_preserves_actual_summary_and_host_facts(tmp_path):
+    from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.agent_presentation import memory_presentation
+    def execute(request, ordinal):
+        if ordinal == 1:
+            raise SemanticProjectFailure("Actor stopped after compiler rejected missing barrier", {
+                "actor_status": "completed-unverified", "host_facts": [
+                    {"category": "diagnostic", "statement": "compiler: expected event before Vector load",
+                     "evidence_sha256": "a" * 64}]})
+        return _result(request.spec, True, "host pass")
+    c, contexts, requests = build(tmp_path, [wire("RETRY_TARGET"), wire("READY")], execute=execute)
+    assert c.run()["status"] == "READY"
+    actual = contexts[0]["latest_target_attempt"]["host_feedback"]
+    assert actual["summary"] == "Actor stopped after compiler rejected missing barrier"
+    assert actual["host_facts"][0]["statement"] == "compiler: expected event before Vector load"
+    presented = memory_presentation(requests[-1].pre_wave_memory,
+                                   ContentAddressedArtifacts(tmp_path / "view"))
+    assert presented["phase2_feedback"][0]["host_feedback"] == actual
+
+
+@pytest.mark.parametrize("field", ["kind", "verified", "spec", "host_feedback"])
+def test_terminal_attempt_metadata_must_match_retained_branch(tmp_path, monkeypatch, field):
+    from copy import deepcopy
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state
+    c, _, _ = build(tmp_path, [wire("READY")])
+    c.run()
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    state = json.loads((c.root / "state.json").read_bytes())
+    _verify_adaptive_state(c.root, state)
+    changed = deepcopy(state)
+    row = changed["attempts"][-1]
+    if field == "kind":
+        row[field] = "practice"
+    elif field == "verified":
+        row[field] = False
+    elif field == "spec":
+        row[field]["hypothesis"] = "changed after completion"
+    else:
+        row[field]["detail"] = "different observed diagnostic"
+    with pytest.raises(ValueError, match="retained host outcome"):
+        _verify_adaptive_state(c.root, changed)

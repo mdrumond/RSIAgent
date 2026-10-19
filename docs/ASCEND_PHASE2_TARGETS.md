@@ -83,7 +83,10 @@ rejects matching goal/settings dictionaries if the selected executor differs.
 For native composition, the selected transport fixes runtime `py311-torch`,
 physical device and execution profile; configuration supplies the discovered
 product/architecture and CANN/compiler observations. Goal mode requires
-`environment_identity.compiler_version` as well as `cann_version`; older Phase 1
+a top-level native configuration `compiler_version` observation as well as
+`environment_identity.cann_version`. The compiler observation is runtime-only and
+does not change the reviewed Phase 1 identity; an existing pinned
+`environment_identity.compiler_version` is also accepted. Older Phase 1
 and legacy Phase 2 configurations remain valid without the compiler observation.
 For Catlass, the identity uses the already-probed CANN/compiler commit, selected
 physical device, profile, and available Catlass/manifest pins. `Ascend950` denotes

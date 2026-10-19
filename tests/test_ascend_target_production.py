@@ -101,6 +101,10 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, select
         assert identity["phase"] == "adaptive-phase2"
         assert identity["snapshot_id"] == "reviewed-seed"
     assert build_native_adaptive_phase1(**kwargs).project_target == 64
+    # New goal qualification may observe a compiler without changing reviewed seed pins.
+    observed = build_native_adaptive_phase1(**dict(kwargs, config=replace(config, compiler_version="observed-compiler")))
+    assert json.loads((tmp_path / "campaign-identity.json").read_bytes()) == identity
+    assert observed.snapshot.snapshot_id == "reviewed-seed" if phase2 else True
     from benchmarks.ascend.training_traces import recorder_factory
     factory = recorder_factory(phase="phase1", round_id="native-builder-round",
                                model="fixture", source_manifest_sha256="b" * 64)

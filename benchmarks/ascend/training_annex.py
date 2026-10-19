@@ -203,6 +203,8 @@ def _verify_adaptive_state(root, state):
         initial, _ = reviewed_seed(root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
+    if state.get("phase") == "target-driven-phase2" and len(state["attempts"]) != len(state["completed_waves"]):
+        raise ValueError("target attempt count differs from completed waves")
     memories, outcomes, failures = [], [], []
     for ordinal, wave_id in enumerate(state["completed_waves"]):
         wave_root = root / "waves" / wave_id
@@ -229,6 +231,21 @@ def _verify_adaptive_state(root, state):
             outcomes.append({"project_id": project.spec.project_id,
                              "spec": project.spec.as_dict(), "verified": True,
                              "summary": delta["summary"]})
+        if state.get("phase") == "target-driven-phase2":
+            from .phase2_target_loop import TargetDrivenPhase2Coordinator
+            if len(wave.projects) != 1:
+                raise ValueError("target attempts must contain one project")
+            project = wave.projects[0].spec
+            branch = wave_root / "branches" / project.project_id
+            verified = json.loads((branch / "outcome.json").read_bytes())["verified"]
+            retained = (outcomes if verified else failures)[-1]
+            kind = "target" if project.as_dict() == state["goal_identity"]["target"]["spec"] else "practice"
+            expected_attempt = {**retained, "kind": kind, "wave_id": wave_id,
+                                "host_feedback": TargetDrivenPhase2Coordinator._host_feedback(branch)}
+            recorded_attempt = {key: value for key, value in state["attempts"][ordinal].items()
+                                if key != "attempt_root"}
+            if recorded_attempt != expected_attempt:
+                raise ValueError("target attempt differs from retained host outcome")
     if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
         raise ValueError("adaptive state differs from ordered published deltas")
     if state.get("phase") != "adaptive-phase2" and failures != state.get("failed_outcomes", []):

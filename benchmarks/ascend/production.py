@@ -20,11 +20,12 @@ from benchmarks.a5kernels.phase1_project_executor import ProjectExecutionFamily,
 def native_target_runtime(config, transport):
     """Canonical goal identity from the selected native transport and observations."""
     environment = config.environment_identity or {}
-    if (not environment.get("compiler_version") or not environment.get("cann_version")
+    compiler = getattr(config, "compiler_version", None) or environment.get("compiler_version")
+    if (not compiler or not environment.get("cann_version")
             or not hasattr(transport, "_device") or not hasattr(transport, "profile")):
         return None
     return {"target": "a3", "runtime": "py311-torch", "device": str(transport._device),
-            "toolchain": environment["cann_version"], "compiler": environment["compiler_version"],
+            "toolchain": environment["cann_version"], "compiler": compiler,
             "product": config.target, "architecture": config.arch,
             "execution_profile": transport.profile}
 
@@ -86,6 +87,7 @@ class NativeProductionConfig:
     collection: str | tuple[str, ...] | list[str] | None = None
     environment_identity: dict | None = None
     profiling_mode: str | None = None
+    compiler_version: str | None = None
 
     def __post_init__(self):
         if self.execution_profile not in {"bz-a3-1", "bz-a3-2"}:

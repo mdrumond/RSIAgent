@@ -792,6 +792,9 @@ def test_binding_print_capability_and_native_runtime_observations(tmp_path):
             cli._composed_target_runtime(actor, {**actual, field: "stale"})
     config.environment_identity.pop("compiler_version")
     assert native_target_runtime(config, transport) is None
+    config.compiler_version = "independently-observed-compiler"
+    assert native_target_runtime(config, transport)["compiler"] == "independently-observed-compiler"
+    assert "compiler_version" not in config.environment_identity
     with pytest.raises(ValueError, match="require observed"):
         cli._composed_target_runtime(SimpleNamespace(executor=native), actual)
     a5 = catlass_target_runtime(SimpleNamespace(device=5), SimpleNamespace(runtime_provenance=(

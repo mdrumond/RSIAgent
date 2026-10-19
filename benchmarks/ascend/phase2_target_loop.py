@@ -120,7 +120,7 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
         from benchmarks.ascend.agent_presentation import mismatch_summary
         payload = json.loads((branch / "execution-evidence.bin").read_bytes())
-        feedback = {key: str(payload[key])[:1600] for key in ("classification", "detail") if key in payload}
+        feedback = {key: str(payload[key])[:1600] for key in ("classification", "detail", "summary") if key in payload}
         store = ContentAddressedArtifacts(branch / "artifacts")
         hashes = payload.get("artifacts", {})
         if "observed" in hashes:
@@ -131,10 +131,13 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
                 expected = store.read_json(hashes["expected"])
                 feedback["numerical_summary"] = mismatch_summary(expected["storage"], observed["output"])
         delta = json.loads((branch / "memory-delta.bin").read_bytes())
+        facts = payload.get("host_facts", [])
         if "memory_base64" in delta:
             memory = json.loads(base64.b64decode(delta["memory_base64"], validate=True))
+            facts = memory["host_facts"]
+        if facts:
             feedback["host_facts"] = [{**fact, "statement": fact["statement"][:800]}
-                                      for fact in memory["host_facts"][-8:]]
+                                      for fact in facts[-8:]]
         return feedback
 
     def _run(self, *, wave_limit=None, approved_only=False):
