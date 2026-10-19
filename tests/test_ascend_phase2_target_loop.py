@@ -265,3 +265,65 @@ def test_duplicate_practice_correction_is_bounded_without_consuming_attempts(tmp
     c.curriculum = TargetCurriculumAgent(lambda _: wire("READY"))
     assert c.resume()["status"] == "READY"
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("field", ["target_attempts", "practice_since_target"])
+def test_archive_rejects_budget_counters_that_differ_from_completed_attempts(tmp_path, monkeypatch, field):
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state, inventory_campaign
+    c, _, _ = build(tmp_path, [], execute=lambda r, n: _result(r.spec, n != 2, "host verdict"))
+    c.curriculum = TargetCurriculumAgent(lambda _: wire("PRACTICE", practice(c)))
+    c.run_attempt()
+    c.run_attempt()
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    state = json.loads((c.root / "state.json").read_bytes())
+    assert (state["target_attempts"], state["practice_since_target"]) == (1, 1)
+    _verify_adaptive_state(c.root, state)
+    state[field] = 0
+    with pytest.raises(ValueError, match="budget counters differ"):
+        _verify_adaptive_state(c.root, state)
+    c._atomic_json(c.root / "state.json", state)
+    assert {"kind": "invalid-adaptive-memory-chain"} in inventory_campaign(c.root)["issues"]
+
+
+def test_archive_budget_counts_failed_practice_and_resets_on_each_target_retry(tmp_path, monkeypatch):
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state
+    c, _, _ = build(tmp_path, [], execute=lambda r, n: _result(r.spec, n > 2, "host verdict"))
+    replies = iter([wire("PRACTICE", practice(c, "one")), wire("RETRY_TARGET"),
+                    wire("PRACTICE", practice(c, "two")), wire("RETRY_TARGET"), wire("READY")])
+    c.curriculum = TargetCurriculumAgent(lambda _: next(replies))
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    _verify_adaptive_state(c.root, c._load_state())
+    for counters in [(1, 0), (1, 1), (2, 0), (2, 1), (3, 0)]:
+        c.run_attempt()
+        state = json.loads((c.root / "state.json").read_bytes())
+        assert (state["target_attempts"], state["practice_since_target"]) == counters
+        _verify_adaptive_state(c.root, state)
+    assert c.resume()["status"] == "READY"
+    _verify_adaptive_state(c.root, c._load_state())
+
+
+def test_archive_budget_counters_exclude_infrastructure_pending_attempts(tmp_path, monkeypatch):
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state
+    def execute(request, ordinal):
+        if ordinal in (1, 3):
+            raise OSError("transport interrupted")
+        return _result(request.spec, True, "host verdict")
+    c, _, requests = build(tmp_path, [], execute=execute)
+    replies = iter([wire("PRACTICE", practice(c)), wire("RETRY_TARGET"), wire("READY")])
+    c.curriculum = TargetCurriculumAgent(lambda _: next(replies))
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    for counters in [(0, 0), (1, 0)]:
+        with pytest.raises(RuntimeError):
+            c.run_attempt()
+        state = c._load_state()
+        assert (c.root / "pending.json").exists()
+        assert (state["target_attempts"], state["practice_since_target"]) == counters
+        _verify_adaptive_state(c.root, state)
+        c.run_attempt()
+        _verify_adaptive_state(c.root, c._load_state())
+    assert c.resume()["status"] == "READY"
+    assert len(requests) == 5
+    _verify_adaptive_state(c.root, c._load_state())

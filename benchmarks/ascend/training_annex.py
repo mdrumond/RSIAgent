@@ -207,6 +207,7 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None):
     if state.get("phase") == "target-driven-phase2" and len(state["attempts"]) != len(state["completed_waves"]):
         raise ValueError("target attempt count differs from completed waves")
     memories, outcomes, failures = [], [], []
+    target_attempts = practice_since_target = 0
     for ordinal, wave_id in enumerate(state["completed_waves"]):
         wave_root = root / "waves" / wave_id
         wave = WaveSpec.from_mapping(json.loads((wave_root / "plan.json").read_bytes())["wave"])
@@ -247,6 +248,15 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None):
                                 if key != "attempt_root"}
             if recorded_attempt != expected_attempt:
                 raise ValueError("target attempt differs from retained host outcome")
+            if kind == "target":
+                target_attempts += 1
+                practice_since_target = 0
+            else:
+                practice_since_target += 1
+    if state.get("phase") == "target-driven-phase2" and (
+            state["target_attempts"] != target_attempts
+            or state["practice_since_target"] != practice_since_target):
+        raise ValueError("target budget counters differ from retained completed attempts")
     if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
         raise ValueError("adaptive state differs from ordered published deltas")
     if state.get("phase") != "adaptive-phase2" and failures != state.get("failed_outcomes", []):
