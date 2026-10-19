@@ -42,6 +42,8 @@ class ControlManager:
     """Validate commands, persist their lifecycle and execute one at a time."""
 
     ACTIONS = {"start", "extend", "sample", "approve", "reject", "run-approved"}
+    EXTENSION_WAIT_SECONDS = 300
+    EXTENSION_POLL_SECONDS = .25
 
     def __init__(self, config_path, database, runner=subprocess.run):
         self.config_path, self.database = Path(config_path), Path(database)
@@ -146,16 +148,27 @@ class ControlManager:
             worker = _read(control / "worker.json", {}) or {}
             approval = _read(control / "curriculum-approval.json")
             target = state.get("project_target")
+            adoption = _read(control / "adoption.json", {}) or {}
+            old_target = adoption.get("project_target", job.get("project_target"))
+            targets = [value for value in (
+                target, job.get("project_target"), job.get("continue_target"))
+                if type(value) is int]
+            partial_target = max(targets) if targets else None
+            partial = (job.get("adopted") is True and type(old_target) is int
+                       and partial_target > old_target
+                       and len(state.get("prior_outcomes", [])) == old_target
+                       and worker.get("status") in {"failed", "queued", "running"})
+            clean = (type(target) is int and target == job.get("project_target")
+                     and len(state.get("prior_outcomes", [])) == target
+                     and worker.get("status") == "waiting-approval"
+                     and worker.get("result", {}).get("status") == "TARGET_REACHED")
             if (campaign["phase"] != 1 or job.get("approval_mode") is not True
-                    or type(target) is not int or target != job.get("project_target")
-                    or len(state.get("prior_outcomes", [])) != target
+                    or not (clean or partial)
                     or state.get("terminal") is not None or (root / "pending.json").exists()
-                    or worker.get("status") != "waiting-approval"
-                    or worker.get("result", {}).get("status") != "TARGET_REACHED"
                     or isinstance(approval, dict) and approval.get("status") in {
                         "proposed", "approved", "running"}):
                 raise ControlError("campaign must be at a clean TARGET_REACHED boundary")
-            payload["_validated_project_target"] = target + step
+            payload["_validated_project_target"] = partial_target if partial else target + step
             return identifier
         if action == "sample":
             return identifier
@@ -272,6 +285,8 @@ class ControlManager:
             if completed.returncode:
                 raise RuntimeError((completed.stderr or completed.stdout or
                                     f"command exited {completed.returncode}").strip())
+            if action == "extend":
+                self._wait_for_extension(payload)
             try:
                 result = json.loads(completed.stdout)
             except (TypeError, ValueError):
@@ -283,6 +298,26 @@ class ControlManager:
             with self._db() as db:
                 db.execute("UPDATE operations SET status='failed', error=?, finished=? WHERE id=?",
                            (_safe_error(error), time.time(), operation_id))
+
+    def _wait_for_extension(self, payload):
+        campaign = self.campaigns[payload["campaign_id"]]
+        root, control = Path(campaign["root"]), Path(campaign["control"])
+        target = payload["_validated_project_target"]
+        deadline = time.monotonic() + self.EXTENSION_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            worker = _read(control / "worker.json", {}) or {}
+            if worker.get("status") == "failed":
+                raise RuntimeError(worker.get("error") or "campaign extension worker failed")
+            state = _read(root / "state.json", {}) or {}
+            job = _read(control / "job.json", {}) or {}
+            adoption = _read(control / "adoption.json", {}) or {}
+            if (worker.get("status") == "waiting-approval"
+                    and state.get("project_target") == target
+                    and job.get("project_target") == target
+                    and (not job.get("adopted") or adoption.get("project_target") == target)):
+                return
+            time.sleep(self.EXTENSION_POLL_SECONDS)
+        raise RuntimeError("campaign extension did not reach waiting-approval before timeout")
 
     def operation(self, operation_id):
         with self._db() as db:

@@ -72,14 +72,19 @@ def completed_legacy(tmp_path, *, with_trace=False):
     root.mkdir()
     memory = tmp_path / "legacy-seed.bin"
     memory.write_bytes(b"seed")
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+    model_identity = direct_profile(next(item for item in MODEL_IDENTITIES
+        if item.backend_model.value == "openai/gpt-5.6-sol")).identity.as_dict()
     identity = {"schema": "ascend-native-adaptive-identity-v1", "target": "native-a3",
                 "arch": "ascend910b", "execution_profile": "bz-a3-1",
                 "language": "ascend-c", "guide_sha256": "1" * 64,
                 "cpl_skills_revision": "2" * 40, "dtypes": ["float32"],
-                "model": {"backend_model": "openai/gpt-5.6-sol"},
+                "model": model_identity,
                 "profiling_guidance": None, "profiling_mode": "without-profiling-guidance",
-                "measurement_actions": {"profiling": False, "timing": False},
-                "kdb_collection": None, "environment_identity": {"cann": "fixture"}}
+                "measurement_actions": {"profiling": True, "timing": True},
+                "kdb_collection": None, "environment_identity": {
+                    "cann_version": "fixture-cann", "profiler_version": "fixture-profiler"}}
     write(root / "campaign-identity.json", identity)
     project_memory = {"source_revision": "3" * 64, "host_facts": [],
                       "agent_lessons": [], "no_new_knowledge": True}
@@ -109,7 +114,11 @@ def completed_legacy(tmp_path, *, with_trace=False):
           "without-profiling-guidance"]})
     write(tmp_path / "native.json", {"target": "native-a3", "arch": "ascend910b",
         "execution_profile": "bz-a3-1", "guide": str(tmp_path / "guide.md"),
-        "cpl_skills_revision": "2" * 40, "environment_identity": {"cann": "fixture"}})
+        "cpl_skills_revision": "2" * 40, "cpl_remote": "/tools/cpl-remote",
+        "validation_wrapper": "/tools/validate", "remote_workspace": "/owned",
+        "physical_device": 0,
+        "environment_identity": {"cann_version": "fixture-cann",
+                                   "profiler_version": "fixture-profiler"}})
     (tmp_path / "guide.md").write_text("guide")
     identity["guide_sha256"] = hashlib.sha256(b"guide").hexdigest()
     write(root / "campaign-identity.json", identity)
@@ -139,6 +148,24 @@ def test_adopt_completed_legacy_campaign_is_external_atomic_and_provenanced(tmp_
     assert not (root / "campaign-run.json").exists()
     assert before == {path.relative_to(root): hashlib.sha256(path.read_bytes()).hexdigest()
                       for path in root.rglob("*") if path.is_file()}
+
+
+def test_adopt_accepts_direct_native_config_and_retains_owned_wrapper(tmp_path, monkeypatch):
+    root, memory, wrapper = completed_legacy(tmp_path)
+    settings = cli._read(wrapper)
+    native = Path(settings["phase1_arguments"][1])
+    source = Path(settings["source_manifest"])
+    control = tmp_path / "control"
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    cli.adopt_campaign(root, control, "Learn kernels", memory, native, "a" * 40,
+        model="openai/gpt-5.6-sol", source_manifest=source,
+        knowledge="without-kdb", profiling="without-profiling-guidance")
+    job = cli._read(control / "job.json")
+    retained = cli._read(control / "runtime.json")
+    assert job["config"] == str(control / "runtime.json")
+    assert retained["model"] == "openai/gpt-5.6-sol"
+    assert retained["source_manifest"] == str(source.resolve())
+    assert retained["phase1_arguments"][:2] == ["--config", str(native.resolve())]
 
 
 @pytest.mark.parametrize("mutation,match", [
@@ -203,6 +230,17 @@ def test_adopt_rejects_active_legacy_compute_process_before_writes(tmp_path, mon
     assert not (tmp_path / "control").exists()
 
 
+def test_adopt_rechecks_for_restarted_process_before_publication(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path)
+    probes = iter([[], [{"pid": 43, "command": "python restarted"}]])
+    monkeypatch.setattr(cli, "_active_campaign_processes", lambda campaign_root: next(probes))
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    with pytest.raises(ValueError, match="appeared during adoption"):
+        cli.adopt_campaign(root, tmp_path / "control", "Learn kernels", memory,
+                           runtime, "a" * 40)
+    assert not (tmp_path / "control").exists()
+
+
 def test_active_process_probe_is_bounded_to_python_process_naming_exact_root(tmp_path):
     proc = tmp_path / "proc"; proc.mkdir()
     root = tmp_path / "campaign"; root.mkdir()
@@ -215,8 +253,26 @@ def test_active_process_probe_is_bounded_to_python_process_naming_exact_root(tmp
     for pid, argv in commands.items():
         directory = proc / str(pid); directory.mkdir()
         (directory / "cmdline").write_bytes(b"\0".join(item.encode() for item in argv) + b"\0")
+        (directory / "cwd").symlink_to(tmp_path, target_is_directory=True)
     assert cli._active_campaign_processes(root, proc_root=proc, current_pid=13) == [{
         "pid": 10, "command": f"python run_ascend_phase1.py --root {root}"}]
+
+
+def test_active_process_probe_normalizes_relative_root_and_control_worker(tmp_path):
+    proc = tmp_path / "proc"; proc.mkdir()
+    root = tmp_path / "campaign"; root.mkdir()
+    control = tmp_path / "legacy-control"; control.mkdir()
+    write(control / "job.json", {"schema": "ascend-campaign-run-v1", "root": str(root)})
+    commands = {
+        20: ["python", "run_ascend_phase1.py", "--root=campaign"],
+        21: ["python", "run_ascend_campaign.py", "_campaign", "--control", "legacy-control"],
+    }
+    for pid, argv in commands.items():
+        directory = proc / str(pid); directory.mkdir()
+        (directory / "cmdline").write_bytes(b"\0".join(item.encode() for item in argv) + b"\0")
+        (directory / "cwd").symlink_to(tmp_path, target_is_directory=True)
+    assert [row["pid"] for row in cli._active_campaign_processes(
+        root, proc_root=proc, current_pid=999)] == [20, 21]
 
 
 def test_adopt_rejects_existing_control(tmp_path):
@@ -224,6 +280,25 @@ def test_adopt_rejects_existing_control(tmp_path):
     control = tmp_path / "control"; control.mkdir()
     with pytest.raises(FileExistsError):
         cli.adopt_campaign(root, control, "Learn kernels", memory, runtime, "a" * 40)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("dtypes", ["float16"]),
+    ("kdb_collection", "unexpected"),
+    ("profiling_guidance", "unexpected"),
+    ("profiling_mode", "new"),
+    ("measurement_actions", {"profiling": False, "timing": True}),
+])
+def test_adopt_rejects_behavior_identity_that_future_sampling_would_reject(
+        tmp_path, monkeypatch, field, value):
+    root, memory, runtime = completed_legacy(tmp_path)
+    identity = cli._read(root / "campaign-identity.json")
+    identity[field] = value
+    write(root / "campaign-identity.json", identity)
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    with pytest.raises(ValueError, match="runtime configuration"):
+        cli.adopt_campaign(root, tmp_path / "control", "Learn kernels", memory,
+                           runtime, "a" * 40)
 
 
 def test_completed_fixture_adopt_extend_sample_approve_run(tmp_path, monkeypatch):
@@ -269,6 +344,48 @@ def test_completed_fixture_adopt_extend_sample_approve_run(tmp_path, monkeypatch
                                             builder=lambda _job: coordinator)
     assert approved["selected_project_ids"] == ["next"]
     assert completed["status"] == "complete" and completed["result"]["wave_index"] == 2
+
+
+@pytest.mark.parametrize("boundary", ["state", "job", "adoption"])
+def test_adopted_continuation_repairs_partial_metadata_without_incrementing_again(
+        tmp_path, monkeypatch, boundary):
+    root, memory, runtime = completed_legacy(tmp_path)
+    control = tmp_path / "control"
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    cli.adopt_campaign(root, control, "Learn kernels", memory, runtime, "a" * 40)
+    job = cli._read(control / "job.json")
+    job["continue_target"] = 9
+    cli._write(control / "job.json", job)
+    calls = []
+    class Coordinator:
+        project_target = 1
+        def continue_campaign(self, target, **kwargs):
+            calls.append(target)
+            state = cli._read(root / "state.json")
+            cli._write(root / "state.json", {**state, "project_target": target})
+        def report(self):
+            return {"status": "RUNNING", "wave_index": 1, "project_target": 9}
+    original_write = cli._write
+    failed = False
+    def interrupt(path, value):
+        nonlocal failed
+        path = Path(path)
+        selected_path = {"state": root / "state.json", "job": control / "job.json",
+                         "adoption": control / "adoption.json"}[boundary]
+        selected = path == selected_path
+        if selected and not failed and value.get("project_target") == 9:
+            failed = True
+            raise OSError("interrupted metadata write")
+        original_write(path, value)
+    monkeypatch.setattr(cli, "_write", interrupt)
+    with pytest.raises(OSError, match="interrupted metadata"):
+        cli.campaign_worker(cli._read(control / "job.json"), builder=lambda _job: Coordinator())
+    monkeypatch.setattr(cli, "_write", original_write)
+    cli.campaign_worker(cli._read(control / "job.json"), builder=lambda _job: Coordinator())
+    assert cli._read(root / "state.json")["project_target"] == 9
+    assert cli._read(control / "job.json")["project_target"] == 9
+    assert cli._read(control / "adoption.json")["project_target"] == 9
+    assert calls == ([9, 9] if boundary == "state" else [9])
 
 
 def test_start_retains_public_provenance_not_private_settings_and_separate_workers(tmp_path):
