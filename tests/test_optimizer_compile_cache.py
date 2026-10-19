@@ -8,6 +8,8 @@ import pytest
 
 from optimizer import native
 
+pytest.importorskip('torch')
+
 
 @pytest.fixture
 def compiler(tmp_path, monkeypatch):
