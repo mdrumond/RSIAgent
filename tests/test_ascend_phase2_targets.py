@@ -23,6 +23,7 @@ def qualified(tmp_path, *, wrong=False, timings=()):
     spec = _spec("movement")
     backend = FakeBackend(_compile())
     executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"))
+    executor.runtime_identity = dict(RUNTIME)
     expected = executor.prepare(spec).expected.storage
     backend.runtime_result = _runtime([999.] * len(expected) if wrong else expected)
     target = qualify_target(spec, "private working reference", RUNTIME, executor, store,
@@ -144,6 +145,7 @@ def test_compile_success_without_numerical_runtime_is_not_feasibility(tmp_path):
     store = ContentAddressedArtifacts(tmp_path / "objects")
     backend = FakeBackend(_compile(), _runtime(passed=False))
     executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"))
+    executor.runtime_identity = dict(RUNTIME)
     with pytest.raises(ValueError, match="execute and pass"):
         qualify_target(_spec("movement"), "reference", RUNTIME, executor, store)
     backend.compile_result = _compile(passed=False)
@@ -297,3 +299,31 @@ def test_native_vector_practice_requires_explicit_native_policy(tmp_path, capabi
     decision, session = agent.select(context(target))
     assert decision.action == "practice" and session.turns == 1
     assert capability in {item.value for item in decision.project.capabilities}
+
+
+@pytest.mark.parametrize("changed", [None, *RUNTIME])
+def test_reference_runtime_must_match_observed_executor_before_backend_work(tmp_path, changed):
+    store = ContentAddressedArtifacts(tmp_path / "objects")
+    backend = FakeBackend(_compile())
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"))
+    if changed is not None:
+        executor.runtime_identity = {**RUNTIME, changed: "different-observation"}
+    with pytest.raises(ValueError, match="reference executor.*runtime"):
+        qualify_target(_spec("movement"), "reference", RUNTIME, executor, store)
+    assert not backend.compile_requests and not backend.run_requests
+
+
+def test_selector_retains_previous_practice_rationale_with_latest_result(tmp_path):
+    target, _, _ = qualified(tmp_path)
+    calls = []
+    replies = iter([practice_wire(), 'DECISION: RETRY_TARGET\n{"reason":"apply learned tail ownership"}'])
+    agent = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
+    decision, session = agent.select(context(target))
+    latest = replace(context(target), lessons=({"project_id": decision.project.project_id,
+        "verified": True, "host_feedback": "padded output now matches"},))
+    followup, updated = agent.select(latest, session)
+    assert followup.action == "retry-target" and updated.turns == 2
+    assert calls[1][:-1] == list(session.messages)
+    assert calls[1][-2]["content"] == practice_wire()
+    assert "compare tail ownership with one fixed launch" in calls[1][-2]["content"]
+    assert "padded output now matches" in calls[1][-1]["content"]

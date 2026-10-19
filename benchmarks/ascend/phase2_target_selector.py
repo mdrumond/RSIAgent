@@ -138,7 +138,7 @@ class TargetCurriculumAgent:
         history = list(session.messages) if session.messages else [system]
         turn = [{"role": "user", "content": target_curriculum_prompt(context, self.target_policy)}]
         for attempt in range(1, 4):
-            response = self.complete([system, *turn])
+            response = self.complete([*history, *turn])
             turn.append({"role": "assistant", "content": response})
             try:
                 decision = self.parse(response, context)

@@ -122,6 +122,11 @@ def qualify_target(spec: ProjectSpec, reference_source: str, runtime: Mapping[st
                    timings=(), policy: CurriculumPolicy | None = None) -> TargetContract:
     """Execute a reference before enabling a target; no actor-supplied pass flags."""
     runtime = _runtime(runtime)
+    actual_runtime = getattr(executor, "runtime_identity", None)
+    if actual_runtime is None:
+        raise ValueError("reference executor requires an observed runtime identity")
+    if _runtime(actual_runtime) != runtime:
+        raise ValueError("reference executor runtime differs from target runtime")
     if policy is not None:
         if policy.target != runtime["target"]:
             raise ValueError("target policy and runtime differ")
