@@ -153,19 +153,27 @@ def build_controller(job):
                     if key != "schema" and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
-        if job.get("target_goal") is not None:
+        if job.get("target_goal") is not None or job.get("autonomous_goal"):
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
             from .phase2_targets import TargetContract
             from .phase2_target_selector import TargetCurriculumAgent
             from .phase2_target_loop import TargetDrivenPhase2Coordinator
+            if job.get("autonomous_goal"):
+                from .phase2_goal_bootstrap import bootstrap_goal
+                goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
+                    private_root=Path(job["control"]) / "bootstrap", objective=job["objective"],
+                    available_tools=_target_available_tools(coordinator.execute_project))
+                runtime = goal.runtime
+            else:
+                goal = TargetContract.from_mapping(job["target_goal"])
+                artifacts = ContentAddressedArtifacts(Path(job["target_artifact_store"]))
+                runtime = _composed_target_runtime(coordinator.execute_project, settings["target_runtime"])
             coordinator = TargetDrivenPhase2Coordinator(
                 job["root"], job["objective"], snapshot,
                 TargetCurriculumAgent(coordinator.curriculum._complete,
                                       target_policy=coordinator.curriculum.target_policy),
                 coordinator.execute_project,
-                target=TargetContract.from_mapping(job["target_goal"]),
-                artifacts=ContentAddressedArtifacts(Path(job["target_artifact_store"])),
-                runtime=_composed_target_runtime(coordinator.execute_project, settings["target_runtime"]),
+                target=goal, artifacts=artifacts, runtime=runtime,
                 target_policy=coordinator.curriculum.target_policy,
                 max_target_attempts=job["target_attempt_budget"],
                 max_practice_attempts=job["practice_attempt_budget"],
@@ -722,7 +730,7 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--config", type=Path, required=True)
             sub.add_argument("--project-target", type=int, required=True)
             sub.add_argument("--target-goal", type=Path,
-                             help="host-qualified fixed TargetContract JSON; required for new Phase 2")
+                             help="host-qualified TargetContract JSON; omission lets curriculum author and qualify a new goal")
             sub.add_argument("--target-attempt-budget", type=int, default=3)
             sub.add_argument("--practice-attempt-budget", type=int, default=2)
             sub.add_argument("--phase1-root", type=Path)
@@ -767,12 +775,12 @@ def main(argv=None, *, screen=start_screen):
             parser.error("--project-target must be positive")
         if args.phase == 2 and (args.phase1_root is None or args.review is None):
             parser.error("phase 2 requires --phase1-root and --review")
-        if args.phase == 2 and args.target_goal is None:
-            parser.error("new phase 2 requires --target-goal; existing campaigns use resume")
         if args.phase == 1 and args.target_goal is not None:
             parser.error("--target-goal is only supported for phase 2")
-        if args.target_goal is not None and args.approval_mode:
+        if args.phase == 2 and args.approval_mode:
             parser.error("target-driven phase 2 does not support --approval-mode")
+        if args.phase == 2 and args.project_target != 1:
+            parser.error("new phase 2 starts exactly one goal; use --project-target 1")
         if args.target_attempt_budget < 1 or args.practice_attempt_budget < 1:
             parser.error("target and practice attempt budgets must be positive")
         root = args.root.resolve()
@@ -812,6 +820,9 @@ def main(argv=None, *, screen=start_screen):
         if goal is not None:
             public.update(target_goal=goal.as_dict(), target_attempt_budget=args.target_attempt_budget,
                           practice_attempt_budget=args.practice_attempt_budget)
+        elif args.phase == 2:
+            public.update(autonomous_goal=True, target_attempt_budget=args.target_attempt_budget,
+                          practice_attempt_budget=args.practice_attempt_budget)
         if args.approval_mode:
             public["approval_mode"] = True
         _write(root / "campaign-run.json", public)
@@ -839,7 +850,7 @@ def main(argv=None, *, screen=start_screen):
             except BlockingIOError:
                 parser.error("campaign is already running; use status")
         if args.command == "continue":
-            if job.get("target_goal") is not None:
+            if job.get("target_goal") is not None or job.get("autonomous_goal"):
                 parser.error("target-driven budgets are fixed; start a new campaign to change them")
             adoption = (_read(control / "adoption.json") if job.get("adopted")
                         and (control / "adoption.json").exists() else {})
