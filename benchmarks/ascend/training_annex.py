@@ -192,7 +192,7 @@ def _project_memory(branch):
     return delta, memory
 
 
-def _verify_adaptive_state(root, state, *, external_initial_memory=None):
+def _verify_adaptive_state(root, state, *, external_initial_memory=None, reviewed_seed_root=None):
     """Bind the published state to ordered deltas and every pre-wave snapshot."""
     from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA, retained_failure_outcome
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
@@ -201,7 +201,7 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None):
                seed.read_bytes() if seed.is_file() else None)
     if state.get("phase") in {"adaptive-phase2", "target-driven-phase2"}:
         from .phase2_curriculum import reviewed_seed
-        initial, _ = reviewed_seed(root, state["snapshot_id"])
+        initial, _ = reviewed_seed(reviewed_seed_root or root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
     if state.get("phase") == "target-driven-phase2" and len(state["attempts"]) != len(state["completed_waves"]):
