@@ -6,11 +6,14 @@ import fcntl
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 
 from .artifact_collector import ArtifactCollector
@@ -173,8 +176,9 @@ def build_controller(job):
         # The old CLI calls run() after composing. Capture without executing it.
         return type("Deferred", (), {"run": lambda self: {"deferred": True}})()
 
+    initial_memory = job.get("initial_memory", str(Path(job["root"]) / "initial-memory.bin"))
     arguments = ["run", "--root", job["root"], "--objective", job["objective"],
-                 "--initial-memory", str(Path(job["root"]) / "initial-memory.bin"),
+                 "--initial-memory", initial_memory,
                  "--project-target", str(job["project_target"]), *settings["phase1_arguments"]]
     with redirect_stdout(io.StringIO()):
         target_main(["--target", job["target"], *arguments], native_builder=capture,
@@ -185,6 +189,251 @@ def build_controller(job):
 
 def _approval_path(job):
     return Path(job["control"]) / "curriculum-approval.json"
+
+
+def _argument_value(arguments, option):
+    for index, argument in enumerate(arguments):
+        if argument == option and index + 1 < len(arguments):
+            return arguments[index + 1]
+        if argument.startswith(option + "="):
+            return argument.split("=", 1)[1]
+    return None
+
+
+def _trace_provenance(root):
+    records = []
+    for path in Path(root).rglob("*.jsonl"):
+        if path.parent.name not in {"sft-traces", "traces"}:
+            continue
+        try:
+            first = next(line for line in path.read_text().splitlines() if line.strip())
+            record = json.loads(first)
+            if record.get("kind") == "header":
+                records.append(record.get("payload", {}))
+        except (OSError, ValueError, StopIteration):
+            raise ValueError(f"invalid source provenance trace: {path}") from None
+    return records
+
+
+def _process_option(argv, option, cwd):
+    for index, token in enumerate(argv):
+        value = (argv[index + 1] if token == option and index + 1 < len(argv) else
+                 token.split("=", 1)[1] if token.startswith(option + "=") else None)
+        if value is not None:
+            path = Path(value)
+            return (cwd / path).resolve() if not path.is_absolute() else path.resolve()
+    return None
+
+
+def _active_campaign_processes(root, *, proc_root=Path("/proc"), current_pid=None):
+    """Return bounded Linux process evidence for Python workers naming this root."""
+    root = str(Path(root).resolve())
+    current_pid = os.getpid() if current_pid is None else current_pid
+    matches = []
+    try:
+        entries = sorted((path for path in Path(proc_root).iterdir()
+                          if path.name.isdigit()), key=lambda path: int(path.name))[:4096]
+    except OSError:
+        return matches
+    for process in entries:
+        pid = int(process.name)
+        if pid == current_pid:
+            continue
+        try:
+            with (process / "cmdline").open("rb") as stream:
+                raw = stream.read(65537)
+            if len(raw) > 65536:
+                continue
+            argv = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+            cwd = (process / "cwd").resolve(strict=True)
+        except OSError:
+            continue
+        named_root = _process_option(argv, "--root", cwd)
+        names_root = named_root is not None and str(named_root) == root
+        control = _process_option(argv, "--control", cwd)
+        if not names_root and "_campaign" in argv and control is not None:
+            try:
+                job = _read(control / "job.json")
+                names_root = (job.get("schema") == "ascend-campaign-run-v1"
+                              and str(Path(job["root"]).resolve()) == root)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+        python_worker = any("python" in Path(token).name.lower() or token.endswith(".py")
+                            for token in argv[:3])
+        if names_root and python_worker:
+            matches.append({"pid": pid, "command": " ".join(argv[:4])[:300]})
+    return matches
+
+
+def adopt_campaign(root, control, objective, initial_memory, config, legacy_revision, *,
+                   model=None, source_manifest=None, knowledge=None, profiling=None,
+                   env_file=None):
+    """Adopt a completed native Phase 1 boundary without rewriting its history."""
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from benchmarks.a5kernels.sft_dataset import SourceManifest
+
+    root = Path(root).resolve(strict=True)
+    control = Path(control).resolve()
+    initial_memory = Path(initial_memory).resolve(strict=True)
+    config = Path(config).resolve(strict=True)
+    if control.exists():
+        raise FileExistsError(f"control directory already exists: {control}")
+    if root == control or root in control.parents or control in root.parents:
+        raise ValueError("campaign and control directories must be separate")
+    if not re.fullmatch(r"[0-9a-f]{40}", legacy_revision):
+        raise ValueError("legacy harness revision must be an exact Git revision")
+    active = _active_campaign_processes(root)
+    if active:
+        raise ValueError("active legacy campaign process still references the campaign root")
+    if (root / "pending.json").exists():
+        raise ValueError("legacy campaign still has a pending wave")
+    identity = _read(root / "campaign-identity.json")
+    if (identity.get("schema") != "ascend-native-adaptive-identity-v1"
+            or identity.get("language") != "ascend-c"):
+        raise ValueError("legacy campaign has incompatible A3 Phase 1 identity")
+    state = _read(root / "state.json")
+    retained_state = (root / "state.json").read_bytes()
+    retained_identity = (root / "campaign-identity.json").read_bytes()
+    if state.get("terminal") is not None:
+        raise ValueError("legacy campaign must be at TARGET_REACHED without a terminal decision")
+    seed = initial_memory.read_bytes()
+    report = AdaptivePhase1Coordinator.read_retained_report(root, objective, seed)
+    if report["status"] != "TARGET_REACHED":
+        raise ValueError("legacy campaign must be at TARGET_REACHED")
+
+    supplied = json.loads(config.read_bytes())
+    # Retain compatibility for already-created test/control records while the
+    # public adopt CLI accepts the native config directly.
+    if "phase1_arguments" in supplied:
+        arguments = supplied["phase1_arguments"]
+        model = model or supplied.get("model")
+        source_manifest = source_manifest or supplied.get("source_manifest")
+        knowledge = knowledge or _argument_value(arguments, "--knowledge")
+        profiling = profiling or _argument_value(arguments, "--profiling")
+        native_path = _argument_value(arguments, "--config")
+    else:
+        if None in (model, source_manifest, knowledge, profiling):
+            raise ValueError("direct native adoption requires model, source manifest, knowledge and profiling")
+        native_path = str(config)
+        arguments = ["--config", native_path, "--model", model,
+                     "--knowledge", knowledge, "--profiling", profiling]
+        if env_file is not None:
+            arguments += ["--env-file", str(Path(env_file).resolve(strict=True))]
+    if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
+        raise ValueError("runtime phase1_arguments must be a string list")
+    if (_argument_value(arguments, "--model") != model
+            or identity.get("model", {}).get("backend_model") != model):
+        raise ValueError("model provenance differs from retained A3 identity")
+    if native_path is None:
+        raise ValueError("runtime configuration has no native --config")
+    native_path = Path(native_path).resolve(strict=True)
+    from .phase1_cli import load_native_config
+    native = load_native_config(native_path)
+    guide = Path(native["guide"]).resolve(strict=True).read_bytes()
+    from .phase1_cli import _guidance
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+    expected_identity = {
+        "schema": "ascend-native-adaptive-identity-v1",
+        "target": native.get("target"), "arch": native.get("arch"),
+        "execution_profile": native.get("execution_profile"),
+        "language": "ascend-c",
+        "guide_sha256": hashlib.sha256(guide).hexdigest(),
+        "cpl_skills_revision": native.get("cpl_skills_revision"),
+        "dtypes": native.get("dtypes", ["float32"]),
+        "model": direct_profile(next(item for item in MODEL_IDENTITIES
+                                      if item.backend_model.value == model)).identity.as_dict(),
+        "profiling_guidance": (_guidance(native["profiling_guide"])
+                               if profiling == "new" else None),
+        "environment_identity": native.get("environment_identity"),
+        "profiling_mode": profiling,
+        "measurement_actions": {"profiling": True, "timing": True},
+        "kdb_collection": native.get("collection") if knowledge == "with-kdb" else None,
+    }
+    if knowledge == "with-kdb":
+        import sqlite3
+        from benchmarks.a5kernels.knowledge import CollectionManifest, collection_names
+        connection = sqlite3.connect(Path(native["kdb"]).resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            manifests = [CollectionManifest.from_json(connection.execute(
+                "SELECT manifest_json FROM collections WHERE name=?", (name,)).fetchone()[0])
+                for name in collection_names(native["collection"])]
+        finally:
+            connection.close()
+        expected_identity["kdb_manifest"] = (manifests[0].fingerprint
+            if isinstance(native["collection"], str)
+            else {manifest.collection: manifest.fingerprint for manifest in manifests})
+    if identity != expected_identity:
+        for key, value in expected_identity.items():
+            if identity.get(key) != value:
+                raise ValueError(f"runtime configuration differs from retained identity: {key}")
+        unexpected = sorted(set(identity) - set(expected_identity))
+        if unexpected:
+            raise ValueError("retained identity has unsupported behavior fields: " + ", ".join(unexpected))
+    source_path = Path(source_manifest).resolve(strict=True)
+    source = SourceManifest.load(source_path)
+    traces = _trace_provenance(root)
+    historical_digests = {row.get("source_manifest_sha256") for row in traces}
+    if (any(row.get("phase") != "phase1" or row.get("model") != model for row in traces)
+            or any(not isinstance(digest, str)
+                   or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                   for digest in historical_digests)
+            or len(historical_digests) > 1):
+        raise ValueError("source provenance in retained traces is invalid or inconsistent")
+    historical_digest = next(iter(historical_digests), None)
+    historical_source = "validated" if traces else "unavailable"
+    source_scope = ("historical-and-post-adoption"
+                    if historical_digest == source.sha256 else "post-adoption")
+
+    adopting_revision = _harness_revision()
+    created = time.time()
+    wrapper = {"model": model, "source_manifest": str(source_path),
+               "phase1_arguments": arguments}
+    wrapper_bytes = json.dumps(wrapper, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    job = {"schema": "ascend-campaign-run-v1", "target": "a3", "phase": 1,
+           "objective": objective, "project_target": report["project_target"],
+           "model": model, "source_manifest_sha256": source.sha256,
+           "harness_revision": adopting_revision,
+           "legacy_harness_revision": legacy_revision,
+           "adopting_harness_revision": adopting_revision,
+           "historical_code_provenance": legacy_revision,
+           "historical_source_provenance": historical_source,
+           "historical_source_manifest_sha256": historical_digest,
+           "source_provenance_scope": source_scope,
+           "source_provenance_activation_wave": report["wave_index"],
+           "created": created, "round_id": control.name, "approval_mode": True,
+           "adopted": True, "root": str(root), "control": str(control),
+           "config": str(control / "runtime.json"),
+           "config_sha256": hashlib.sha256(wrapper_bytes).hexdigest(),
+           "initial_memory": str(initial_memory),
+           "initial_memory_sha256": hashlib.sha256(seed).hexdigest(),
+           "source_manifest": str(source_path), "phase1_root": None, "review": None}
+    adoption = {key: job[key] for key in (
+        "schema", "target", "phase", "objective", "project_target", "model",
+        "source_manifest_sha256", "initial_memory_sha256", "legacy_harness_revision",
+        "adopting_harness_revision", "historical_code_provenance",
+        "historical_source_provenance", "historical_source_manifest_sha256",
+        "source_provenance_scope",
+        "source_provenance_activation_wave", "created")}
+    if ((root / "pending.json").exists()
+            or (root / "state.json").read_bytes() != retained_state
+            or (root / "campaign-identity.json").read_bytes() != retained_identity):
+        raise ValueError("legacy campaign changed during adoption validation")
+    control.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix="." + control.name + ".", dir=control.parent))
+    try:
+        _write(staging / "job.json", job)
+        (staging / "runtime.json").write_bytes(wrapper_bytes)
+        _write(staging / "adoption.json", adoption)
+        _write(staging / "worker.json", {"status": "waiting-approval", "finished": created,
+                                          "result": report})
+        if _active_campaign_processes(root):
+            raise ValueError("active legacy campaign process appeared during adoption validation")
+        os.replace(staging, control)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return {"status": "adopted", "control": str(control), "result": report}
 
 
 def _require_approval_mode(job):
@@ -287,6 +536,13 @@ def _worker_status(result):
     } else "waiting-approval")
 
 
+def _annex_options(job):
+    if not job.get("adopted"):
+        return {}
+    return {"external_initial_memory": job["initial_memory"],
+            "adoption": str(Path(job["control"]) / "adoption.json")}
+
+
 @_serialized_approval
 def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
     _require_approval_mode(job)
@@ -349,9 +605,23 @@ def campaign_worker(job, *, builder=build_controller):
                 job["project_target"] = job.pop("continue_target")
                 _write(control / "job.json", job)
                 public_path = Path(job["root"]) / "campaign-run.json"
-                public = _read(public_path)
-                public["project_target"] = job["project_target"]
-                _write(public_path, public)
+                if public_path.exists():
+                    public = _read(public_path)
+                    public["project_target"] = job["project_target"]
+                    _write(public_path, public)
+                elif job.get("adopted"):
+                    adoption_path = Path(job["control"]) / "adoption.json"
+                    public = _read(adoption_path)
+                    public["project_target"] = job["project_target"]
+                    _write(adoption_path, public)
+                else:
+                    raise ValueError("campaign run provenance is missing")
+            elif job.get("adopted"):
+                adoption_path = control / "adoption.json"
+                adoption = _read(adoption_path)
+                if adoption.get("project_target") != job["project_target"]:
+                    adoption["project_target"] = job["project_target"]
+                    _write(adoption_path, adoption)
             result = coordinator.report() if job.get("approval_mode") else coordinator.resume()
             worker_status = _worker_status(result) if job.get("approval_mode") else "complete"
             _write(control / "worker.json", {"status": worker_status, "finished": time.time(),
@@ -380,7 +650,8 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
             _write(control / "collector-status.json", result)
             if (control / "worker.json").exists() and _read(control / "worker.json")["status"] == "complete":
                 current = _read(control / "job.json")
-                inventory = inventory_campaign(current["root"], artifact_store=control / "reports")
+                inventory = inventory_campaign(current["root"], artifact_store=control / "reports",
+                                               **_annex_options(current))
                 destination = control / f"campaign-{current['project_target']}.tar.gz"
                 if destination.exists():
                     try:
@@ -394,7 +665,8 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
                         if destination.exists():
                             raise ValueError("checkpoint destination already exists; inspect it before retrying packaging")
                 if not destination.exists():
-                    package_campaign(current["root"], destination, artifact_store=control / "reports")
+                    package_campaign(current["root"], destination, artifact_store=control / "reports",
+                                     **_annex_options(current))
                 _write(control / "package-status.json", {"status": "complete", "archive": str(destination)})
                 return
         except Exception as error:
@@ -424,7 +696,7 @@ def status(job):
     outcomes = [_read(p) for p in root.glob("waves/*/branches/*/outcome.json")]
     published = len(state.get("prior_outcomes", []))
     elapsed = max(time.time() - job["created"], 1) / 3600
-    inventory = inventory_campaign(root, artifact_store=control / "reports")
+    inventory = inventory_campaign(root, artifact_store=control / "reports", **_annex_options(job))
     return {"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
             "attempted": len(list(root.glob("waves/*/branches/*"))),
             "verified": sum(o.get("verified") is True for o in outcomes),
@@ -436,7 +708,7 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("start", "resume", "continue", "status", "collect", "package",
+    for command in ("start", "adopt", "resume", "continue", "status", "collect", "package",
                     "sample", "approve", "reject", "run-approved", "_campaign", "_collector"):
         sub = commands.add_parser(command)
         sub.add_argument("--control", type=Path, required=True,
@@ -456,6 +728,17 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--phase1-root", type=Path)
             sub.add_argument("--review", type=Path)
             sub.add_argument("--approval-mode", action="store_true")
+        if command == "adopt":
+            sub.add_argument("--root", type=Path, required=True)
+            sub.add_argument("--objective", required=True)
+            sub.add_argument("--initial-memory", type=Path, required=True)
+            sub.add_argument("--config", type=Path, required=True)
+            sub.add_argument("--model", required=True)
+            sub.add_argument("--source-manifest", type=Path, required=True)
+            sub.add_argument("--knowledge", choices=("with-kdb", "without-kdb"), required=True)
+            sub.add_argument("--profiling", choices=("new", "without-profiling-guidance"), required=True)
+            sub.add_argument("--env-file", type=Path)
+            sub.add_argument("--legacy-revision", required=True)
         if command == "continue":
             sub.add_argument("--project-target", type=int, required=True)
             sub.add_argument("--reopen-terminal", action="store_true")
@@ -470,6 +753,14 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
     control = args.control.resolve()
+    if args.command == "adopt":
+        print(json.dumps(adopt_campaign(args.root, control, args.objective,
+                                        args.initial_memory, args.config,
+                                        args.legacy_revision, model=args.model,
+                                        source_manifest=args.source_manifest,
+                                        knowledge=args.knowledge, profiling=args.profiling,
+                                        env_file=args.env_file)))
+        return
     if args.command == "start":
         from benchmarks.a5kernels.sft_dataset import SourceManifest
         if args.project_target < 1:
@@ -550,7 +841,13 @@ def main(argv=None, *, screen=start_screen):
         if args.command == "continue":
             if job.get("target_goal") is not None:
                 parser.error("target-driven budgets are fixed; start a new campaign to change them")
-            if args.project_target <= job["project_target"]:
+            adoption = (_read(control / "adoption.json") if job.get("adopted")
+                        and (control / "adoption.json").exists() else {})
+            reconciling = (job.get("adopted") is True
+                           and args.project_target == job["project_target"]
+                           and adoption.get("project_target") != args.project_target)
+            if args.project_target < job["project_target"] or (
+                    args.project_target == job["project_target"] and not reconciling):
                 parser.error("continuation must increase project target")
             job.update(continue_target=args.project_target, reopen_terminal=args.reopen_terminal)
             _write(control / "job.json", job)
@@ -569,7 +866,8 @@ def main(argv=None, *, screen=start_screen):
         collector_worker(job, once=not args.watch)
     elif args.command == "package":
         print(json.dumps(package_campaign(job["root"], args.output,
-                         artifact_store=control / "reports", allow_pending=args.allow_pending)))
+                         artifact_store=control / "reports", allow_pending=args.allow_pending,
+                         **_annex_options(job))))
     elif args.command == "sample":
         print(json.dumps(sample_curriculum(job)))
     elif args.command == "approve":

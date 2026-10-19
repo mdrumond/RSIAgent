@@ -2,7 +2,9 @@
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>{% block title %}RSI dashboard{% endblock %}</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-<link rel="stylesheet" href="{{ url_for('static', filename='controls.css') }}"></head>
+<link rel="stylesheet" href="{{ url_for('static', filename='controls.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='trace.css') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='performance.css') }}"></head>
 <body{% if csrf_token %} data-csrf="{{ csrf_token }}"{% endif %}><header><a href="{{ url_for('index') }}" class="brand">RSI / Ascend</a>
 <nav><a href="{{ url_for('index') }}">Campaigns</a><a href="{{ url_for('memory_page') }}">Memory</a></nav></header>
 <main>{% block body %}{% endblock %}</main><script src="{{ url_for('static', filename='app.js') }}"></script></body></html>
