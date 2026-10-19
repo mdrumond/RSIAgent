@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import logging
 import sys
 from pathlib import Path
@@ -13,6 +14,10 @@ from optimizer.measurement import aggregate_rows, parse_capture, capture
 def test_pinned_cannbot_differential():
     source = Path(__file__).parents[1] / 'optimizer/vendor/cannbot_aggregate.py'
     tree = ast.parse(source.read_text())
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+    exact_function = ast.get_source_segment(source.read_text(), function) + '\n'
+    assert hashlib.sha256(exact_function.encode()).hexdigest() == (
+        'd269af7cffead124102b319723fd8921ed4b521be894e1f51f047510b313fa17')
     namespace = {'np': np, 'logger': logging.getLogger(), 'Tuple': tuple,
                  'BAD_ROW_K': 50, 'BAD_ROW_FLOOR_US': 10.0}
     exec(compile(tree, str(source), 'exec'), namespace)
