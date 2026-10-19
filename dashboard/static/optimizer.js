@@ -61,13 +61,19 @@
       document.querySelector('#optimizer-progress').textContent = `${state.status} · ${state.stage}${state.stop_requested ? ' · stop requested' : ''}`;
       document.querySelector('#optimizer-budget').textContent = `${state.attempts} / ${state.max_attempts} attempts; ${Math.round(state.elapsed_seconds)} / ${state.max_seconds} seconds`;
       document.querySelector('#optimizer-handles').textContent = state.handles.map(row => `${row.operation}: ${row.handle}`).join('\n');
-      document.querySelector('#optimizer-stop').disabled = !['running', 'queued'].includes(state.status) || state.stop_requested;
-      document.querySelector('#optimizer-resume').hidden = !['stopped', 'failed', 'budget-exhausted'].includes(state.status);
+      document.querySelector('#optimizer-stop').disabled = !(state.worker_active || ['running', 'queued'].includes(state.status)) || state.stop_requested;
+      document.querySelector('#optimizer-resume').hidden = state.worker_active || !['stopped', 'failed', 'budget-exhausted'].includes(state.status);
+      document.querySelector('#optimizer-recover').hidden = state.worker_active || !['running', 'budget-exhausted'].includes(state.status) || state.stage !== 'observation-unavailable';
     } catch (error) {message.textContent = error.message;}
   }
   document.querySelector('#optimizer-stop').addEventListener('click', async () => {
     if (!confirm('Request this job to stop? Retained evidence will remain available.')) return;
     try {await action(`${base}/stop`, {}, key()); await refresh();}
+    catch (error) {message.textContent = error.message;}
+  });
+  document.querySelector('#optimizer-recover').addEventListener('click', async () => {
+    if (!confirm('Reconnect to the retained operation? This does not add budget or resubmit work.')) return;
+    try {await action(`${base}/recover`, {}, key()); await refresh();}
     catch (error) {message.textContent = error.message;}
   });
   const resume = document.querySelector('#optimizer-resume');
@@ -107,6 +113,19 @@
           try {
             const data = await read(`${base}/events/${event.sequence}`);
             const pre = document.createElement('pre'); pre.textContent = JSON.stringify(data.payload, null, 2); detail.append(pre);
+            if (data.payload?.sha256 && data.payload?.name) {
+              const button = document.createElement('button'); button.textContent = `Load retained ${data.payload.name}`;
+              button.addEventListener('click', async () => {
+                try {
+                  const response = await fetch(`${base}/artifacts/${data.payload.sha256}`);
+                  if (!response.ok) throw Error(`Artifact unavailable (${response.status})`);
+                  const body = await response.text();
+                  try {pre.textContent = JSON.stringify(JSON.parse(body), null, 2);}
+                  catch (_) {pre.textContent = body;}
+                  button.remove();
+                } catch (error) {message.textContent = error.message;}
+              }); detail.append(button);
+            }
           } catch (error) {message.textContent = error.message;}
         }); container.append(detail);
       }

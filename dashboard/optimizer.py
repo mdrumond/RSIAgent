@@ -1,5 +1,6 @@
 """Optimizer HTTP adapter. Python submissions are only executed by detached workers."""
 import hashlib
+import fcntl
 import json
 from pathlib import Path
 import secrets
@@ -46,6 +47,49 @@ class OptimizerDashboard:
             self.store.add_event(job_id, 'worker-launch-failed', {'error': str(error)})
             self.store.transition(job_id, 'failed', stage='worker-launch-failed')
 
+    def worker_active(self, job_id):
+        """The detached worker owns this lock even while awaiting its device."""
+        path = self.store._directory(job_id) / 'worker.lock'
+        try:
+            with path.open('rb') as stream:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                return False
+        except FileNotFoundError:
+            return False
+
+    def resume_action(self, job_id, data, receipt, intent):
+        """Replay a durable launch intent without granting the budget twice."""
+        job = self.store.get(job_id)
+        if intent.get('state') != 'resume-prepared':
+            if self.worker_active(job_id):
+                raise ValueError('cannot resume while the worker is active')
+            self.store._budget(data.get('additional_attempts'), data.get('additional_seconds'))
+            if job['status'] not in {'stopped', 'budget-exhausted', 'failed'}:
+                raise ValueError('job must be stopped before resume')
+            intent.update(state='resume-prepared',
+                before=[job['max_attempts'], job['max_seconds']],
+                expected=[job['max_attempts'] + data['additional_attempts'],
+                          job['max_seconds'] + data['additional_seconds']])
+            atomic(receipt, canonical(intent))
+        budget = [job['max_attempts'], job['max_seconds']]
+        if budget == intent['before']:
+            if self.worker_active(job_id):
+                raise ValueError('cannot resume while the worker is active')
+            job = self.store.resume(job_id,
+                additional_attempts=data['additional_attempts'],
+                additional_seconds=data['additional_seconds'])
+        elif budget != intent['expected']:
+            raise ValueError('resume intent conflicts with the current job budget')
+        # A prior launch may have succeeded before the completed receipt landed.
+        # The worker lock prevents concurrent execution if launch is retried.
+        if job['status'] == 'queued' and not self.worker_active(job_id):
+            self.launch(job_id)
+        atomic(receipt, canonical({'fingerprint': intent['fingerprint'], 'job_id': job_id}))
+        return self.store.get(job_id)
+
     def action(self, action, job_id, data, key):
         if not key or len(key) > 200:
             raise ValueError('Idempotency-Key is required (maximum 200 characters)')
@@ -57,16 +101,23 @@ class OptimizerDashboard:
                 previous = json.loads(receipt.read_bytes())
                 if previous['fingerprint'] != fingerprint:
                     raise ValueError('idempotency key reused with different action')
+                if previous.get('state') == 'resume-prepared':
+                    return self.resume_action(job_id, data, receipt, previous)
                 return self.store.get(previous['job_id'])
             # Creation takes its own store lock, so release it before creating.
             if action != 'create':
                 if action == 'stop':
                     job = self.store.stop(job_id)
-                else:
-                    job = self.store.resume(job_id,
-                        additional_attempts=data.get('additional_attempts'),
-                        additional_seconds=data.get('additional_seconds'))
+                elif action == 'recover':
+                    job = self.store.get(job_id)
+                    if (job['status'] not in {'running', 'budget-exhausted'}
+                            or job['stage'] != 'observation-unavailable'
+                            or self.worker_active(job_id)):
+                        raise ValueError('recover requires an inactive worker awaiting observation')
                     self.launch(job_id)
+                else:
+                    return self.resume_action(job_id, data, receipt,
+                        {'fingerprint': fingerprint, 'job_id': job_id})
                 atomic(receipt, canonical({'fingerprint': fingerprint, 'job_id': job_id}))
                 return self.store.get(job_id)
         source = data.get('source', '')
@@ -93,6 +144,8 @@ class OptimizerDashboard:
 def register_optimizer(app, config_path, csrf_token, launcher=None):
     manager = OptimizerDashboard(config_path, launcher)
     app.extensions['optimizer'] = manager
+    from .optimizer_results import register_results
+    register_results(app, manager)
 
     @app.get('/optimizer')
     def optimizer_page():
@@ -132,6 +185,7 @@ def register_optimizer(app, config_path, csrf_token, launcher=None):
                 result['memory_snapshot']['memory_count'] = len(snapshot.get('memory_entries', []))
             elif '/events' not in request.path:
                 result = manager.store.get(job_id)
+                result['worker_active'] = manager.worker_active(job_id)
             else:
                 manager.store.get(job_id)
                 events = manager.store.events(job_id)
@@ -148,7 +202,7 @@ def register_optimizer(app, config_path, csrf_token, launcher=None):
         if not manager.enabled or not secrets.compare_digest(
                 request.headers.get('X-CSRF-Token', ''), csrf_token):
             abort(403)
-        if action not in {'create', 'stop', 'resume'}:
+        if action not in {'create', 'stop', 'resume', 'recover'}:
             abort(404)
         try:
             data = request.get_json(silent=True) or request.form.to_dict()
