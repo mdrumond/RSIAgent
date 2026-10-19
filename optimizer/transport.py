@@ -48,6 +48,8 @@ class CheckedTransport:
             result = self.run([self.config['cpl_remote'], '--json', action,
                                self.config['target'], str(source), str(destination)],
                               capture_output=True, text=True)
+            atomic(local.with_name(local.name + '.' + action + '.log'),
+                   (f'returncode={result.returncode}\n' + result.stdout + '\n' + result.stderr).encode())
             try:
                 state = json.loads(result.stdout)
             except ValueError:

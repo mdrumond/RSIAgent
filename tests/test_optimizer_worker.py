@@ -27,6 +27,20 @@ def test_uncertain_dispatch_is_never_submitted_twice(tmp_path):
     assert len(calls) == 1
 
 
+def test_transfer_retains_diagnostics_before_json_parse(tmp_path):
+    source = tmp_path / 'package.tar.gz'
+    source.write_bytes(b'package')
+    def run(argv, **kwargs):
+        return SimpleNamespace(returncode=2, stdout='', stderr='SSH transfer capability probe failed')
+    transport = CheckedTransport(config(tmp_path), run=run)
+    with pytest.raises(ObservationUnavailable):
+        transport.transfer('upload', source, '/work/package.tar.gz')
+    log = source.with_name(source.name + '.upload.log').read_text()
+    assert 'returncode=2' in log and 'SSH transfer capability probe failed' in log
+    with pytest.raises(ObservationUnavailable, match='uncertain transfer'):
+        transport.transfer('upload', source, '/work/package.tar.gz')
+
+
 def test_retained_handle_is_observed_and_persisted(tmp_path):
     calls, handles = [], []
     def run(argv, **kwargs):
