@@ -120,6 +120,8 @@ class CheckedTransport:
             for line in output.splitlines():
                 if line.startswith('BZ_A3_JOB_STATE='):
                     observed = line.split('=', 1)[1].split()[0]
+                    if 'exit=124' in line.split():
+                        state['deadline_expired'] = True
                     if observed in {'failed', 'cancelled', 'missing'}:
                         state['state'] = 'failed'
                 for prefix, key in [('BZ_A3_REMOTE_HANDLE=', 'native_handle'),
@@ -133,6 +135,11 @@ class CheckedTransport:
             if not result.returncode:
                 state['state'] = 'completed'
             atomic(path, canonical(state))
+            if state.get('deadline_expired'):
+                state['state'] = 'cancelled'
+                state['reason'] = 'wall-time budget exhausted'
+                atomic(path, canonical(state))
+                raise WorkerStopped('remote wall-time budget exhausted')
             if state['state'] == 'completed':
                 return
             if state['state'] == 'failed' and state.get('handle'):

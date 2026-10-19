@@ -65,6 +65,17 @@ def test_failed_profile_observer_is_terminal(tmp_path):
         CheckedTransport(config(tmp_path), run=run).execute(directory, ['true'])
 
 
+def test_remote_timeout_is_budget_boundary_without_compact_download(tmp_path):
+    directory = tmp_path / 'op'
+    directory.mkdir()
+    (directory / 'transport.json').write_text(json.dumps({'state': 'running', 'handle': 'bz-a3-1:abc'}))
+    def run(argv, **kwargs):
+        return SimpleNamespace(returncode=124, stdout='BZ_A3_JOB_STATE=failed exit=124', stderr='')
+    with pytest.raises(WorkerStopped, match='budget exhausted'):
+        CheckedTransport(config(tmp_path), run=run).execute(directory, ['true'])
+    assert json.loads((directory / 'transport.json').read_text())['state'] == 'cancelled'
+
+
 def test_exclusive_lock_rejects_second_worker(tmp_path):
     with exclusive(tmp_path / 'lock'):
         with pytest.raises(BlockingIOError):
