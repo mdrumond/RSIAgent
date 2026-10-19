@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+from types import ModuleType
 
 from .cases import digest, generate_cases, materialize_case, validate_submission
 
@@ -139,7 +140,9 @@ def _input_state(args, kwargs):
 def _model_state(model):
     import torch
     if not isinstance(model, torch.nn.Module):
-        return {}
+        return {"globals": {k: _value_state(v) for k, v in getattr(model, "__globals__", {}).items()
+                            if not k.startswith("__") and not callable(v) and not isinstance(v, ModuleType)},
+                "closure": [_value_state(cell.cell_contents) for cell in (getattr(model, "__closure__", None) or [])]}
     attributes = {}
     for name, module in model.named_modules():
         attributes[name] = {k: _value_state(v) for k, v in vars(module).items() if not k.startswith("_")}
@@ -163,11 +166,13 @@ def _run_checked(prepared, args, kwargs):
     import torch
     before, state_before = _input_state(args, kwargs), _model_state(prepared.model)
     rng_before = torch.get_rng_state()
-    output = prepared.invoke(*args, **kwargs)
-    if before != _input_state(args, kwargs) or state_before != _model_state(prepared.model):
-        raise ReferenceError("reference mutates inputs or module state")
-    if not torch.equal(rng_before, torch.get_rng_state()):
-        raise ReferenceError("random/nondeterministic forward is unsupported")
+    try:
+        output = prepared.invoke(*args, **kwargs)
+    finally:
+        if before != _input_state(args, kwargs) or state_before != _model_state(prepared.model):
+            raise ReferenceError("reference mutates inputs or module state")
+        if not torch.equal(rng_before, torch.get_rng_state()):
+            raise ReferenceError("random/nondeterministic forward is unsupported")
     return output
 
 

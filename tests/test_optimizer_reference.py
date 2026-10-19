@@ -44,6 +44,11 @@ def test_stateful_module_is_rejected():
         prepare_reference(spec("import torch\nclass Model(torch.nn.Module):\n def __init__(self):\n  super().__init__(); self.register_buffer('count',torch.tensor(0))\n def forward(self,x):\n  self.count.add_(1); return x", "Model"))
 
 
+def test_stateful_function_is_rejected_even_when_output_is_unchanged():
+    with pytest.raises(ReferenceError, match="mutat"):
+        prepare_reference(spec("count = 0\ndef kernel(x):\n global count\n count += 1\n return x"))
+
+
 def test_comparison_checks_full_structure_shape_dtype_and_all_leaves():
     golden = {"a": torch.ones(2), "b": [torch.zeros(2)]}
     for actual in ({"a": torch.ones(2)},
