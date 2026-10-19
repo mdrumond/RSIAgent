@@ -85,6 +85,64 @@ def test_failed_project_unblocks_slots_without_dispatch_until_recovered():
     assert NativeProjectPool([execute])("next") == "next"
 
 
+@pytest.mark.parametrize("explicit_device, expected", [(None, 2), (7, 7)])
+def test_public_campaign_build_controller_keeps_adaptive_phase2_serial(tmp_path, monkeypatch, explicit_device, expected):
+    import hashlib
+    from types import SimpleNamespace
+    from benchmarks.ascend import campaign_cli, phase1_cli
+    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+    from test_ascend_phase2_curriculum import snapshot as reviewed_snapshot
+    monkeypatch.setenv("OPENAI_API_KEY", "fake")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fake")
+    guide = tmp_path / "guide.md"
+    guide.write_text("Native guide")
+    runtime = dict(guide=str(guide), target="a3", arch="arch", execution_profile="bz-a3-1",
+        cpl_skills_revision="a" * 40, cpl_remote="/tools/cpl-remote",
+        validation_wrapper="/checked/catlass-validation.sh", remote_workspace="/owned",
+        physical_devices=[2, 5], environment_identity=dict(cann_version="cann", profiler_version="msprof"))
+    if explicit_device is not None:
+        runtime["physical_device"] = explicit_device
+    runtime_path = tmp_path / "native.json"
+    runtime_path.write_text(json.dumps(runtime))
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps(dict(phase1_arguments=["--config", str(runtime_path),
+        "--model", "openai/gpt-5.6-sol", "--knowledge", "without-kdb",
+        "--profiling", "without-profiling-guidance"])))
+    measurement_bindings = []
+    class Measurements:
+        def __init__(self, backend, config, root, **kwargs):
+            measurement_bindings.append((backend.transport._device, config["physical_device"], root))
+        def profile(self, *args):
+            pass
+        def timing(self, *args):
+            pass
+    monkeypatch.setattr(phase1_cli, "NativeProjectMeasurements", Measurements)
+    job = dict(target="a3", phase=1, config=str(settings),
+        config_sha256=hashlib.sha256(settings.read_bytes()).hexdigest(),
+        model="openai/gpt-5.6-sol", round_id="test-round", source_manifest_sha256="c" * 64,
+        root=str(tmp_path / "phase1"), objective="Learn native kernels", project_target=2)
+    phase1_root = tmp_path / "phase1"
+    phase1_root.mkdir()
+    (phase1_root / "initial-memory.bin").write_bytes(b"")
+    phase1 = campaign_cli.build_controller(job)
+    assert isinstance(phase1.execute_project, NativeProjectPool)
+    source = json.loads((phase1_root / "campaign-identity.json").read_bytes())
+    snapshot = reviewed_snapshot()
+    snapshot.destination = SimpleNamespace(source_identity=source)
+    monkeypatch.setattr(campaign_cli, "_snapshot", lambda *args: snapshot)
+    phase2_root = tmp_path / "phase2"
+    phase2_root.mkdir()
+    (phase2_root / "initial-memory.bin").write_bytes(b"")
+    measurement_bindings.clear()
+    phase2 = campaign_cli.build_controller({**job, "phase": 2, "root": str(phase2_root)})
+    assert isinstance(phase2, AdaptivePhase2Coordinator)
+    assert phase2.max_parallel == 1
+    transport = phase2.execute_project.executor._backend.transport
+    assert transport._device == expected
+    assert transport._state_root == phase2_root / "transport-state"
+    assert measurement_bindings == [(expected, expected, phase2_root / "measurements")]
+
+
 def test_semantic_project_failure_does_not_stop_the_pool():
     from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
     def execute(request):

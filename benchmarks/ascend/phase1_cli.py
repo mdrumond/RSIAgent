@@ -138,7 +138,7 @@ def native_transport(config, root, *, factory=BZA3RemoteCandidateBackend):
 def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1,
          transport_factory=BZA3RemoteCandidateBackend, provider_transport=None,
          environment_loader=load_direct_environment, embedding_factory=None,
-         measurement_factory=NativeMeasurementBackend):
+         measurement_factory=NativeMeasurementBackend, native_parallel=True):
     selector = argparse.ArgumentParser(add_help=False)
     selector.add_argument("--target", required=True, choices=("a5", "a3"))
     target, rest = selector.parse_known_args(sys.argv[1:] if argv is None else argv)
@@ -186,9 +186,10 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             profiling_mode=args.profiling,
         )
         workers = []
-        for device in native_devices(config):
+        parallel = native_parallel and "physical_devices" in config
+        for device in native_devices(config) if parallel else [config["physical_device"]]:
             worker_root = (args.root / "native-workers" / f"device-{device}"
-                           if "physical_devices" in config else args.root)
+                           if parallel else args.root)
             worker_config = {**config, "physical_device": device}
             transport = native_transport(worker_config, worker_root, factory=transport_factory)
             backend = NativeProjectBackend(transport, worker_root / "native-measurement-evidence",
@@ -206,7 +207,7 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             environment=environment_loader(env_file=args.env_file), provider_transport=provider_transport,
             embeddings=embeddings, project_target=args.project_target, max_projects=args.max_projects,
             request_timing=first.request_timing, request_profile=first.request_profile,
-            **({"project_workers": tuple(workers)} if "physical_devices" in config else {}),
+            **({"project_workers": tuple(workers)} if parallel else {}),
             profiling_guidance=guidance,
         ), args.action)()
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
