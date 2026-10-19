@@ -1,6 +1,6 @@
 """Bounded production proof against an existing job, using a supplied real kernel.
 
-python tests/optimizer_worker_proof.py --root ROOT --job-id ID --config CONFIG
+PYTHONPATH=. python tests/optimizer_worker_proof.py --root ROOT --job-id ID --config CONFIG
     --candidate KERNEL.cpp
 Omit --candidate to exercise the real configured provider instead.
 """
