@@ -184,12 +184,15 @@ class OptimizationLoop:
                         or not isinstance(action['source'], str) or not action['source'].strip()
                         or type(action['block_count']) is not int or not 1 <= action['block_count'] <= 65535):
                     raise ValueError('invalid candidate action')
-                identity = sha(action['source'].encode())
+                source_sha = sha(action['source'].encode())
+                identity = sha(canonical({'source_sha256': source_sha, 'block_count': action['block_count']}))
                 if identity in self.state['seen']:
-                    self.state['history'].append({'candidate_sha256': identity, 'status': 'duplicate-skipped'})
+                    self.state['history'].append({'candidate_sha256': source_sha,
+                        'configuration_sha256': identity, 'block_count': action['block_count'], 'status': 'duplicate-skipped'})
                     self._save()
                     continue
-                pending = {**action, 'sha256': identity, 'attempt': self.store.get(self.key)['attempts'] + 1}
+                pending = {**action, 'sha256': source_sha, 'configuration_sha256': identity,
+                           'attempt': self.store.get(self.key)['attempts'] + 1}
                 self.state['pending'] = pending
                 self.state['candidate'] = self._artifact('candidate.cpp', action['source'])
                 self._save()
@@ -206,9 +209,11 @@ class OptimizationLoop:
             result = self._read(pending['evaluation'])
             value = score(baseline, result)
             history = {'candidate_sha256': pending['sha256'], 'result': pending['evaluation'],
+                       'configuration_sha256': pending.get('configuration_sha256', pending['sha256']),
+                       'block_count': pending['block_count'],
                        'content': result, 'speedup': value, 'summary': pending['summary']}
             self.state['history'].append(history)
-            self.state['seen'].append(pending['sha256'])
+            self.state['seen'].append(pending.get('configuration_sha256', pending['sha256']))
             if value is not None and value > self.state.get('best', {}).get('speedup', 0):
                 self.state['best'] = {**history, 'source': self.state['candidate'],
                                      'block_count': pending['block_count'], 'faster_than_torch': value > 1}
@@ -217,7 +222,7 @@ class OptimizationLoop:
                     try:
                         self.store.add_event(self.key, 'reserved-stage', {'stage': 'profile'})
                         report = self._reserved_action(lambda: self.backend.profile(pending['source'],
-                            self.directory / pending['sha256'] / 'profile', block_count=pending['block_count']))
+                            self.directory / pending.get('configuration_sha256', pending['sha256']) / 'profile', block_count=pending['block_count']))
                         self.state['best']['profiling'] = self._artifact('profiling', report)
                     except Exception as exc:
                         self.store.add_event(self.key, 'profiling-unavailable', {'error': str(exc)})
@@ -229,7 +234,7 @@ class OptimizationLoop:
 
     def _evaluate_reserved(self, pending):
         return self._reserved_action(lambda: self.backend.evaluate(pending['source'],
-            self.directory / pending['sha256'], block_count=pending['block_count']))
+            self.directory / pending.get('configuration_sha256', pending['sha256']), block_count=pending['block_count']))
 
     def _reserved_action(self, callback):
         started = self.clock()
