@@ -246,3 +246,38 @@ def test_tool_dependent_capabilities_are_rejected_and_model_can_repair(tmp_path,
     grammar = json.loads(target_curriculum_prompt(absent).rsplit("\n", 1)[-1])["project_grammar"]
     assert capability not in grammar["capabilities"]
     assert grammar["profile_metrics"] == []
+
+
+@pytest.mark.parametrize("field", ["reason", "weakness", "control", "evidence", "retry_plan"])
+def test_practice_rationale_rejects_held_out_names_and_can_be_corrected(tmp_path, field):
+    target, _, _ = qualified(tmp_path)
+    value = json.loads(practice_wire().split("\n", 1)[1])
+    value[field] = "Reconstruct the held-out BSA benchmark with this practice."
+    invalid = "DECISION: PRACTICE\n" + json.dumps(value)
+    replies = iter([invalid, practice_wire()])
+    calls = []
+    agent = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
+    with pytest.raises(ValueError, match="held-out benchmark name"):
+        agent.parse(invalid, context(target))
+    decision, session = agent.select(context(target))
+    assert decision.action == "practice" and session.turns == 2
+    assert "held-out benchmark name" in calls[1][-1]["content"]
+
+
+@pytest.mark.parametrize("runtime_target,policy_target", [("a3", "a5"), ("a5", "a3")])
+def test_curriculum_rejects_wrong_target_policy_before_completion_and_direct_parse(
+        tmp_path, runtime_target, policy_target):
+    target, _, _ = qualified(tmp_path)
+    target = replace(target, runtime={**target.runtime, "target": runtime_target})
+    policy = replace(a3_curriculum_policy(), target=policy_target)
+    calls = []
+    agent = TargetCurriculumAgent(lambda messages: calls.append(messages), target_policy=policy)
+    with pytest.raises(ValueError, match="target policy and runtime differ"):
+        target_curriculum_prompt(context(target), policy)
+    with pytest.raises(ValueError, match="target policy and runtime differ"):
+        agent.select(context(target))
+    assert calls == []
+    with pytest.raises(ValueError, match="target policy and runtime differ"):
+        agent.parse(practice_wire(), context(target))
+    with pytest.raises(ValueError, match="target policy and runtime differ"):
+        agent.parse('DECISION: RETRY_TARGET\n{"reason":"retry unchanged goal"}', context(target))
