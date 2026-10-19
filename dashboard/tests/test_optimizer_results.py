@@ -141,3 +141,23 @@ def test_profile_attempt_uses_configuration_identity(setup):
         **history[1], 'profiling': profiling}})
     result = app.test_client().get(f'/api/optimizer/jobs/{key}/results').json
     assert result['metrics'][0]['attempt'] == 2
+
+
+def test_reconnect_only_relaunches_inactive_observation_without_budget(setup):
+    app, _, launched = setup
+    store = app.extensions['optimizer'].store
+    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
+    store.transition(key, 'running', stage='observation-unavailable')
+    client = app.test_client()
+    url = f'/api/optimizer/jobs/{key}/recover'
+    with (store._directory(key) / 'worker.lock').open('wb') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert client.post(url, json={}, headers=headers(client, 'busy')).status_code == 409
+    before = store.get(key)
+    response = client.post(url, json={}, headers=headers(client, 'recover'))
+    assert response.status_code == 202 and len(launched) == 1
+    assert store.get(key) == before
+    assert client.post(url, json={}, headers=headers(client, 'recover')).status_code == 202
+    assert len(launched) == 1
+    store.transition(key, 'running', stage='evaluating')
+    assert client.post(url, json={}, headers=headers(client, 'not-pending')).status_code == 409

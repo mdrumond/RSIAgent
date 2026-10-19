@@ -76,6 +76,12 @@ class OptimizerDashboard:
             if action != 'create':
                 if action == 'stop':
                     job = self.store.stop(job_id)
+                elif action == 'recover':
+                    job = self.store.get(job_id)
+                    if (job['status'] != 'running' or job['stage'] != 'observation-unavailable'
+                            or self.worker_active(job_id)):
+                        raise ValueError('recover requires an inactive worker awaiting observation')
+                    self.launch(job_id)
                 else:
                     job = self.store.resume(job_id,
                         additional_attempts=data.get('additional_attempts'),
@@ -165,7 +171,7 @@ def register_optimizer(app, config_path, csrf_token, launcher=None):
         if not manager.enabled or not secrets.compare_digest(
                 request.headers.get('X-CSRF-Token', ''), csrf_token):
             abort(403)
-        if action not in {'create', 'stop', 'resume'}:
+        if action not in {'create', 'stop', 'resume', 'recover'}:
             abort(404)
         try:
             data = request.get_json(silent=True) or request.form.to_dict()
