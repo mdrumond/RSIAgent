@@ -281,3 +281,19 @@ def test_curriculum_rejects_wrong_target_policy_before_completion_and_direct_par
         agent.parse(practice_wire(), context(target))
     with pytest.raises(ValueError, match="target policy and runtime differ"):
         agent.parse('DECISION: RETRY_TARGET\n{"reason":"retry unchanged goal"}', context(target))
+
+
+@pytest.mark.parametrize("capability,op,axis", [
+    ("vector-reduction", "reduce-sum", 1), ("vector-mask", "mask-positive", None)])
+def test_native_vector_practice_requires_explicit_native_policy(tmp_path, capability, op, axis):
+    target, _, _ = qualified(tmp_path)
+    value = json.loads(practice_wire().split("\n", 1)[1])
+    value["project"]["capabilities"] = ["gm-ub-movement", capability]
+    value["project"]["graph"]["nodes"][-1].update(op=op, axis=axis)
+    wire = "DECISION: PRACTICE\n" + json.dumps(value)
+    with pytest.raises(ValueError, match="native vector capability requires an explicit target policy"):
+        TargetCurriculumAgent(lambda _: "").parse(wire, context(target))
+    agent = TargetCurriculumAgent(lambda _: wire, target_policy=a3_curriculum_policy())
+    decision, session = agent.select(context(target))
+    assert decision.action == "practice" and session.turns == 1
+    assert capability in {item.value for item in decision.project.capabilities}
