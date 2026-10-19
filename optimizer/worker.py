@@ -76,7 +76,7 @@ class RemoteBackend:
                    f'&& timeout --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
                    f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
         try:
-            self.transport.execute(directory, ['bash', '-lc', command])
+            self.transport.execute(directory, ['bash', '-c', command])
         except RuntimeError as exc:
             if isinstance(exc, (ObservationUnavailable, WorkerStopped)):
                 raise
