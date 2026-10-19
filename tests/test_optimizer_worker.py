@@ -559,6 +559,21 @@ def test_injected_worker_routes_stop_and_pins_transport_identity(tmp_path):
         run_worker(store.root, key, settings, agent=agent, transport_factory=factory)
 
 
+def test_completed_remote_result_survives_interrupted_client_at_deadline(tmp_path):
+    expired = False
+    def run(argv, **kwargs):
+        nonlocal expired
+        expired = True
+        return SimpleNamespace(returncode=-15, interrupted=True, stderr='', stdout=(
+            'BZ_A3_REMOTE_HANDLE=remote:bz-a3-1:job:completed\n'
+            'CATLASS_VALIDATION_HANDLE=bz-a3-1:completed\n'
+            'CATLASS_VALIDATION_STATE=completed\n'))
+    transport = CheckedTransport(config(tmp_path), run=run, stopped=lambda: expired)
+    directory = tmp_path / 'op'
+    transport.execute(directory, ['true'])
+    assert json.loads((directory / 'transport.json').read_text())['state'] == 'completed'
+
+
 @pytest.mark.parametrize('boundary', ['deadline', 'stop', 'client-timeout', 'failed-cancel', 'unknown-dispatch'])
 def test_interrupted_observation_cancels_only_known_operation_at_real_stop(tmp_path, boundary):
     import time

@@ -199,6 +199,8 @@ class CheckedTransport:
                 state['state'] = 'completed'
             atomic(path, canonical(state))
             if getattr(result, 'interrupted', False):
+                if state.get('state') == 'completed':
+                    return  # Terminal remote evidence survives client teardown.
                 # A local observation timeout is still uncertain. Only a real
                 # Stop/budget boundary plus confirmed exact-handle cancellation
                 # can become WorkerStopped (and release optional diagnostics).
