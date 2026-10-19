@@ -238,3 +238,20 @@ def test_curriculum_sees_optimizer_learning_after_large_phase1_index(tmp_path):
     assert latest["project_id"] == "practice-residual"
     assert latest["host_fact"] == "Frozen suite passed"
     assert "physical row strides" in latest["interpretation"]
+
+
+def test_export_authenticates_job_once_not_once_per_profile_artifact(tmp_path, monkeypatch):
+    from test_optimizer_phase2_artifacts import campaign
+    from benchmarks.ascend.optimizer_phase2_artifacts import verify_campaign
+    from optimizer.jobs import JobStore
+    state, store, key = campaign(tmp_path)
+    for i in range(20):
+        store.put_artifact(key, f"compact-{i}.csv", f"value,{i}".encode())
+    calls = []
+    original = JobStore.get
+    def counted(self, job_id):
+        calls.append(job_id)
+        return original(self, job_id)
+    monkeypatch.setattr(JobStore, "get", counted)
+    verify_campaign(tmp_path, require_ready=True)
+    assert len(calls) <= 3
