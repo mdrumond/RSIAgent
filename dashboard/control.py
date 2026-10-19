@@ -13,6 +13,8 @@ import sys
 import time
 import uuid
 
+from .store import _description_fields
+
 
 class ControlError(ValueError):
     """A safe request conflict that can be returned to the dashboard user."""
@@ -109,6 +111,7 @@ class ControlManager:
             novel = json.dumps(_information(spec), sort_keys=True) not in prior
             projects.append({"project_id": spec.get("project_id"),
                              "hypothesis": spec.get("hypothesis", ""),
+                             "description_fields": _description_fields(spec.get("hypothesis", "")),
                              "new_coverage": sorted(set(capabilities) - covered),
                              "novelty_summary": ("New project information" if novel
                                                  else "Repeats prior project information"),

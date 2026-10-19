@@ -23,3 +23,16 @@ document.querySelectorAll('[data-proposal-action]').forEach(button => button.add
   if (action === 'approve') body.project_ids = [...form.querySelectorAll('input:checked')].map(item => item.value);
   control(action, form.dataset.proposalId, body);
 }));
+
+document.querySelectorAll('.trace-event[data-trace-url]').forEach(section => section.addEventListener('toggle', async () => {
+  if (!section.open || section.dataset.loaded) return;
+  const output = section.querySelector('.trace-payload');
+  try {
+    const response = await fetch(section.dataset.traceUrl);
+    if (!response.ok) throw new Error(`payload unavailable (${response.status})`);
+    output.textContent = (await response.json()).text;
+    section.dataset.loaded = 'true';
+  } catch (error) {
+    output.textContent = error.message;
+  }
+}));

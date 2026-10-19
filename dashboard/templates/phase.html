@@ -2,6 +2,6 @@
 <div class="eyebrow">PHASE {{ campaign.phase }}</div><h1>{{ campaign.name }}</h1>
 <div class="metrics hero"><b>{{ campaign.stats.attempted }}</b><span>attempted</span><b>{{ campaign.stats.verified }}</b><span>verified</span><b>{{ campaign.stats.published }}</b><span>published</span></div>
 <section class="list">{% for project in campaign.projects %}<a href="{{ url_for('project_page', number=campaign.phase, project_id=project.id) }}">
-<div><span class="status {{ 'complete' if project.verified else 'failed' }}">{{ project.classification }}</span><h2>{{ project.id }}</h2><p>{{ project.description }}</p></div>
+<div><span class="status {{ 'complete' if project.verified else 'failed' }}">{{ project.classification }}</span><h2>{{ project.id }}</h2><p>{{ project.question }}</p></div>
 <strong>{{ project.performance|length }} perf samples →</strong></a>{% else %}<p>No attempted projects yet.</p>{% endfor %}</section>
-{% if campaign.planned %}<h2>Planned next</h2><section class="list">{% for project in campaign.planned %}<article><span class="tag">PLANNED</span><h3>{{ project.id }}</h3><p>{{ project.description }}</p></article>{% endfor %}</section>{% endif %}{% endblock %}
+{% if campaign.planned %}<h2>Planned next</h2><section class="list">{% for project in campaign.planned %}<article><span class="tag">PLANNED</span><h3>{{ project.id }}</h3><p>{{ project.question }}</p></article>{% endfor %}</section>{% endif %}{% endblock %}

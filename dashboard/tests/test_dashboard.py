@@ -7,7 +7,7 @@ import time
 import pytest
 
 from dashboard.app import create_app
-from dashboard.store import DashboardStore, _source
+from dashboard.store import DashboardStore, _description_fields, _source
 
 
 def write(path, value):
@@ -132,6 +132,126 @@ def test_routes_render_escaped_data_and_project_views(campaign, tmp_path):
     assert client.get("/memory").status_code == 200
     assert client.get("/api/status").json["campaigns"][0]["worker"]["status"] == "running"
     assert client.get("/phase/1/project/../../etc/passwd").status_code == 404
+
+
+def test_description_labels_are_presentation_only_and_lossless():
+    text = ("Question: What changes? Controlled change: Only length. "
+            "Tools: Exact comparison. Measurements: Mismatches. "
+            "Expected lesson: Find the knee.")
+    parsed = _description_fields(text)
+    assert parsed == [
+        {"label": "Question", "value": "What changes?"},
+        {"label": "Controlled change", "value": "Only length."},
+        {"label": "Tools", "value": "Exact comparison."},
+        {"label": "Measurements", "value": "Mismatches."},
+        {"label": "Expected lesson", "value": "Find the knee."},
+    ]
+    for malformed in ["Free form only", "Question: Q Tools: T", "Question: Q Question: again"]:
+        assert _description_fields(malformed) == [{"label": "Description", "value": malformed}]
+
+
+def test_project_sections_and_phase_summary_are_structured(campaign, tmp_path):
+    plan_path = tmp_path / "phase1/waves/wave-001/plan.json"
+    plan = json.loads(plan_path.read_text())
+    hypothesis = ("Question: Does it copy? Controlled change: Length only. Tools: Native copy. "
+                  "Measurements: Exact mismatch count. Expected lesson: Locate knees.")
+    plan["wave"]["projects"][0]["spec"]["hypothesis"] = hypothesis
+    write(plan_path, plan)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    phase = client.get("/phase/1").data
+    assert b"Does it copy?" in phase and b"Controlled change" not in phase
+    detail = client.get("/phase/1/project/vector-add").data
+    for label in [b"Question", b"Controlled change", b"Tools", b"Measurements", b"Expected lesson"]:
+        assert label in detail
+    assert detail.count(b"<details open") == 2
+    assert detail.count(b"<details") >= 6
+    assert detail.index(b"Memory gained") < detail.index(b"Execution trace")
+
+
+def test_trace_index_is_compact_and_payloads_are_lazy_authenticated(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    request = b'{"messages":[{"role":"user","content":"<script>bad()</script>"}]}'
+    digest = __import__("hashlib").sha256(request).hexdigest()
+    obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
+    obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(request)
+    missing = "d" * 64
+    (branch / "evidence.jsonl").write_text("\n".join([
+        json.dumps({"payload": {"role": "provider-request", "sha256": digest,
+                                "stage": "action", "turn": 1}}),
+        json.dumps({"payload": {"role": "provider-request", "sha256": digest,
+                                "stage": "action", "turn": 2}}),
+        json.dumps({"payload": {"role": "provider-attempt-rejection", "sha256": digest,
+                                "stage": "action", "turn": 2}}),
+        json.dumps({"payload": {"role": "host-observation", "sha256": missing,
+                                "turn": 2}}),
+    ]) + "\n")
+    (tmp_path / "phase1/project-evidence.jsonl").write_text("\n".join([
+        json.dumps({"payload": {"project_id": "vector-add", "event": "verification"}}),
+        json.dumps({"payload": {"project_id": "vector-add", "event": "verification"}}),
+        json.dumps({"payload": {"project_id": "other", "event": "verification"}}),
+    ]) + "\n")
+    cache = tmp_path / "cache.sqlite3"
+    client = create_app(campaign, cache, refresh_seconds=0).test_client()
+    index = client.get("/api/phase/1/project/vector-add/trace").get_json()
+    actor = [row for row in index["events"] if row.get("sha256") == digest and
+             row["label"] == "Actor prompt"]
+    assert len(actor) == 2 and [row["turn"] for row in actor] == [1, 2]
+    assert "content" not in json.dumps(index)
+    assert any(row["label"] == "Verifier prompt" and not row["available"] and
+               "host-owned" in row["reason"] for row in index["events"])
+    assert sum(row["label"] == "Host verifier evidence" for row in index["events"]) == 2
+    assert any(row["label"] == "Actor attempt rejection" for row in index["events"])
+    assert any(row.get("sha256") == missing and not row["available"] for row in index["events"])
+    payload = client.get(actor[0]["payload_url"])
+    assert payload.status_code == 200 and payload.get_json()["text"] == request.decode()
+    assert b"<script>" not in client.get("/phase/1/project/vector-add").data
+    raw = client.get(actor[0]["download_url"])
+    assert raw.data == request and raw.headers["Content-Disposition"].startswith("attachment")
+    with __import__("sqlite3").connect(cache) as db:
+        assert db.execute("SELECT body FROM payloads WHERE sha256=?", (digest,)).fetchone()[0] == request
+
+    obj.write_bytes(b"tampered")
+    with __import__("sqlite3").connect(cache) as db:
+        db.execute("DELETE FROM payloads WHERE sha256=?", (digest,))
+    assert client.get(actor[0]["payload_url"]).status_code == 409
+    assert client.get("/api/phase/1/project/../../etc/passwd/trace").status_code == 404
+
+
+def test_trace_payload_survives_backing_artifact_removal_after_cache(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    raw = b"\x00\xffbinary"
+    digest = __import__("hashlib").sha256(raw).hexdigest()
+    obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
+    obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(raw)
+    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
+        "role": "provider-response", "sha256": digest, "stage": "action", "turn": 1}}) + "\n")
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    event = next(row for row in client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+                 if row.get("sha256") == digest)
+    assert client.get(event["download_url"]).data == raw
+    shutil.rmtree(tmp_path / "phase1")
+    assert client.get(event["download_url"]).data == raw
+    assert client.get(event["payload_url"]).status_code == 415
+
+
+def test_trace_uses_matching_retained_curriculum_session(campaign, tmp_path):
+    state_path = tmp_path / "phase1/state.json"
+    state = json.loads(state_path.read_text())
+    state["session"] = {"messages": [
+        {"role": "system", "content": "curriculum system"},
+        {"role": "user", "content": "choose wave-001"},
+        {"role": "assistant", "content": 'DECISION: WAVE {"wave_id":"wave-001"}'},
+        {"role": "user", "content": "choose wave-002"},
+        {"role": "assistant", "content": 'DECISION: WAVE {"wave_id":"wave-002"}'},
+    ], "turns": 2}
+    write(state_path, state)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    for label, expected in [("Curriculum system prompt", "curriculum system"),
+                            ("Curriculum user prompt", "choose wave-001"),
+                            ("Curriculum decision", '"wave_id":"wave-001"')]:
+        event = next(row for row in events if row["label"] == label)
+        assert expected in client.get(event["payload_url"]).get_json()["text"]
 
 
 @pytest.mark.parametrize("digest", [
@@ -511,7 +631,9 @@ def test_sample_summary_approve_and_run_without_raw_provider_content(tmp_path):
             proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
                         "session": {"messages": [{"content": "private reasoning"}]},
                         "wave": {"projects": [
-                            {"spec": {"project_id": "copy", "hypothesis": "Measure copy.",
+                            {"spec": {"project_id": "copy", "hypothesis":
+                                      "Question: Copy? Controlled change: Length. Tools: Native. "
+                                      "Measurements: Mismatches. Expected lesson: Copy safely.",
                                       "capabilities": ["gm-ub-movement"]}},
                             {"spec": {"project_id": "vector", "hypothesis": "Measure vector.",
                                       "capabilities": ["simd-vector"]}}]}}
@@ -534,7 +656,10 @@ def test_sample_summary_approve_and_run_without_raw_provider_content(tmp_path):
     status = client.get("/api/status").get_json()
     proposals = status["controls"]["proposals"]
     assert proposals[0]["projects"][1]["new_coverage"] == ["simd-vector"]
-    assert proposals[0]["projects"][0]["hypothesis"] == "Measure copy."
+    assert proposals[0]["projects"][0]["description_fields"][0] == {
+        "label": "Question", "value": "Copy?"}
+    home = client.get("/").data
+    assert b"Controlled change" in home and b"Expected lesson" in home
     assert "private reasoning" not in json.dumps(status)
     approval_body = {"campaign_id": "phase1", "proposal_id": "proposal-1",
                      "project_ids": ["vector"], "confirmation": "approve:proposal-1"}
