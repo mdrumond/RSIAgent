@@ -275,6 +275,56 @@ def test_trace_uses_matching_retained_curriculum_session(campaign, tmp_path):
         assert expected in client.get(event["payload_url"]).get_json()["text"]
 
 
+def test_running_wave_uses_exact_matching_pending_session(campaign, tmp_path):
+    root = tmp_path / "phase1"
+    plan = json.loads((root / "waves/wave-001/plan.json").read_text())
+    wave = {"wave_id": "wave-001", **plan["wave"]}
+    pending_session = {"messages": [
+        {"role": "system", "content": "pending system"},
+        {"role": "user", "content": "pending user"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(wave)},
+    ], "turns": 1}
+    write(root / "pending.json", {"wave": wave, "session": pending_session})
+    state = json.loads((root / "state.json").read_text())
+    state["session"] = {"messages": [{"role": "assistant", "content": "stale state"}],
+                        "turns": 1}
+    write(root / "state.json", state)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    curriculum = [row for row in events if row["category"] == "curriculum"]
+    assert [row["label"] for row in curriculum] == [
+        "Curriculum system prompt", "Curriculum user prompt", "Curriculum admitted decision"]
+    texts = [client.get(row["payload_url"]).get_json()["text"] for row in curriculum]
+    assert texts[0] == "pending system" and texts[1] == "pending user"
+    assert all("stale state" not in text for text in texts)
+
+
+@pytest.mark.parametrize("pending", [
+    "not json",
+    json.dumps([]),
+    json.dumps({"wave": {"wave_id": "another-wave"}, "session": {
+        "messages": [{"role": "assistant", "content": "wrong pending"}]}}),
+])
+def test_running_wave_safely_falls_back_from_invalid_pending(campaign, tmp_path, pending):
+    root = tmp_path / "phase1"
+    plan = json.loads((root / "waves/wave-001/plan.json").read_text())
+    wave = {"wave_id": "wave-001", **plan["wave"]}
+    state = json.loads((root / "state.json").read_text())
+    state["session"] = {"messages": [
+        {"role": "system", "content": "state system"},
+        {"role": "user", "content": "state user"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(wave)},
+    ], "turns": 1}
+    write(root / "state.json", state)
+    (root / "pending.json").write_text(pending)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    curriculum = [row for row in events if row["category"] == "curriculum"]
+    texts = [client.get(row["payload_url"]).get_json()["text"] for row in curriculum]
+    assert texts[:2] == ["state system", "state user"]
+    assert all("wrong pending" not in text for text in texts)
+
+
 def test_trace_index_does_not_read_actor_payload_bodies(campaign, tmp_path, monkeypatch):
     branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
     body = b'{"nested":{"value":1}}'
@@ -403,6 +453,45 @@ def test_host_verification_chain_stops_at_prior_project_attribution(campaign, tm
     texts = [client.get(row["payload_url"]).get_json()["text"] for row in host]
     assert all("selected" in text for text in texts)
     assert all("other-terminal" not in text for text in texts)
+
+
+def test_host_verification_collects_interleaved_project_chains(campaign, tmp_path):
+    root = tmp_path / "phase1"
+    rows, heads = [], {"vector-add": "0" * 64, "sibling": "0" * 64,
+                       "vector-reset": "0" * 64}
+    definitions = [
+        ("vector-add", "selected-one"), ("sibling", "sibling-one"),
+        (None, "selected-unattributed"), (None, "sibling-unattributed"),
+        ("vector-add", "selected-two"), ("sibling", "sibling-two"),
+        ("vector-add", "selected-reset"),
+    ]
+    # Unattributed rows are linked into their owning project's independent hash chain.
+    owners = ["vector-add", "sibling", "vector-add", "sibling", "vector-add", "sibling",
+              "vector-reset"]
+    for sequence, ((attributed, marker), owner) in enumerate(zip(definitions, owners)):
+        artifact_payload = {"marker": marker}
+        artifact = __import__("hashlib").sha256(json.dumps(
+            artifact_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        payload = {"artifact_kind": marker, "artifact_sha256": artifact,
+                   "payload": artifact_payload}
+        if attributed:
+            payload["project_id"] = attributed
+        record = {"sequence": sequence, "previous_sha256": heads[owner], "payload": payload}
+        record["entry_sha256"] = __import__("hashlib").sha256(json.dumps(
+            record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        heads[owner] = record["entry_sha256"]
+        rows.append(record)
+    (root / "project-evidence.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    ledger = [row for row in events if row["label"] == "Host verification ledger entry"]
+    texts = [client.get(row["payload_url"]).get_json()["text"] for row in ledger]
+    assert len(texts) == 4
+    assert [next(marker for marker in (
+        "selected-one", "selected-unattributed", "selected-two", "selected-reset")
+        if marker in text) for text in texts] == [
+            "selected-one", "selected-unattributed", "selected-two", "selected-reset"]
+    assert all("sibling" not in text for text in texts)
 
 
 def test_completed_trace_catalog_refreshes_when_partial_sync_finishes(campaign, tmp_path):

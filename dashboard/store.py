@@ -305,22 +305,25 @@ class DashboardStore:
         except (OSError, TypeError):
             return []
         rows = []
-        for raw in raw_rows:
+        for position, raw in enumerate(raw_rows):
             try:
-                rows.append((json.loads(raw), raw + "\n"))
+                rows.append((json.loads(raw), raw + "\n", position))
             except (ValueError, TypeError):
                 continue
-        by_digest = {record.get("entry_sha256"): (record, raw) for record, raw in rows
+        by_digest = {record.get("entry_sha256"): (record, raw, position)
+                     for record, raw, position in rows
                      if isinstance(record.get("entry_sha256"), str)}
-        terminals = [(record, raw) for record, raw in rows
+        terminals = [(record, raw, position) for record, raw, position in rows
                      if record.get("payload", {}).get("project_id") == project_id]
         if not terminals:
             return []
-        record, raw = terminals[-1]
-        if not record.get("entry_sha256"):
-            chain = terminals
-        else:
-            chain, seen = [], set()
+        included = {}
+        for terminal, terminal_raw, terminal_position in terminals:
+            record, raw, position = terminal, terminal_raw, terminal_position
+            if not record.get("entry_sha256"):
+                included[position] = (record, raw)
+                continue
+            seen = set()
             while record is not None and record.get("entry_sha256") not in seen:
                 attributed = record.get("payload", {}).get("project_id")
                 if attributed is not None and attributed != project_id:
@@ -328,12 +331,12 @@ class DashboardStore:
                 digest = record.get("entry_sha256")
                 if digest:
                     seen.add(digest)
-                chain.append((record, raw))
+                included[position] = (record, raw)
                 previous = record.get("previous_sha256")
                 if not previous or previous == "0" * 64 or previous not in by_digest:
                     break
-                record, raw = by_digest[previous]
-            chain.reverse()
+                record, raw, position = by_digest[previous]
+        chain = [included[position] for position in sorted(included)]
         events = []
         for record, raw in chain:
             events.append(self._inline_event("Host verification ledger entry", "verification", raw))
@@ -369,6 +372,7 @@ class DashboardStore:
         manifest = {"root": str(root), "files": {
             "plan": self._metadata(plan_path),
             "state": self._metadata(root / "state.json"),
+            "pending": self._metadata(root / "pending.json"),
             "actor-ledger": self._metadata(ledger),
             "host-ledger": self._metadata(root / "project-evidence.jsonl"),
             "outcome": self._metadata(branch / "outcome.json"),
@@ -397,7 +401,15 @@ class DashboardStore:
         root, plan_path, branch, spec = located
         plan = _json(plan_path, {}) or {}
         expected_wave = {"wave_id": plan_path.parent.name, **plan.get("wave", {})}
-        session = (_json(root / "state.json", {}) or {}).get("session", {})
+        pending = _json(root / "pending.json", {}) or {}
+        if not isinstance(pending, dict):
+            pending = {}
+        pending_session = pending.get("session") if pending.get("wave") == expected_wave else None
+        state = _json(root / "state.json", {}) or {}
+        if not isinstance(state, dict):
+            state = {}
+        session = (pending_session if isinstance(pending_session, dict) else
+                   state.get("session", {}))
         messages = session.get("messages", []) if isinstance(session, dict) else []
         decision_index = next((index for index, message in enumerate(messages)
                                if message.get("role") == "assistant" and
