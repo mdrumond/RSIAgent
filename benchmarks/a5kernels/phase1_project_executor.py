@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 from benchmarks.ascend.contracts import CompileObservation, RuntimeObservation
 
@@ -244,10 +244,21 @@ class ProjectExecutor:
     def __init__(
         self, backend: ProjectExecutionBackend, ledger: EvidenceLedger,
         *, binding: ProjectTargetBinding | None = None,
+        runtime_identity: Mapping[str, str] | Callable[[], Mapping[str, str] | None] | None = None,
     ):
         self._backend = backend
         self._ledger = ledger
         self._binding = binding if binding is not None else CatlassProjectBinding()
+        self._runtime_identity = runtime_identity
+
+    @property
+    def runtime_identity(self):
+        identity = getattr(self, "_runtime_identity", None)
+        return identity() if callable(identity) else identity
+
+    @runtime_identity.setter
+    def runtime_identity(self, identity):
+        self._runtime_identity = identity
 
     @property
     def runtime_identity(self):

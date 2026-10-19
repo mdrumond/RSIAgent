@@ -22,8 +22,8 @@ def qualified(tmp_path, *, wrong=False, timings=()):
     store = ContentAddressedArtifacts(tmp_path / "artifacts")
     spec = _spec("movement")
     backend = FakeBackend(_compile())
-    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"))
-    executor.runtime_identity = dict(RUNTIME)
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"),
+                               runtime_identity=dict(RUNTIME))
     expected = executor.prepare(spec).expected.storage
     backend.runtime_result = _runtime([999.] * len(expected) if wrong else expected)
     target = qualify_target(spec, "private working reference", RUNTIME, executor, store,
@@ -144,8 +144,8 @@ def test_failed_target_cannot_be_ready_and_invalid_proposal_is_corrected(tmp_pat
 def test_compile_success_without_numerical_runtime_is_not_feasibility(tmp_path):
     store = ContentAddressedArtifacts(tmp_path / "objects")
     backend = FakeBackend(_compile(), _runtime(passed=False))
-    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"))
-    executor.runtime_identity = dict(RUNTIME)
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"),
+                               runtime_identity=dict(RUNTIME))
     with pytest.raises(ValueError, match="execute and pass"):
         qualify_target(_spec("movement"), "reference", RUNTIME, executor, store)
     backend.compile_result = _compile(passed=False)
@@ -305,9 +305,8 @@ def test_native_vector_practice_requires_explicit_native_policy(tmp_path, capabi
 def test_reference_runtime_must_match_observed_executor_before_backend_work(tmp_path, changed):
     store = ContentAddressedArtifacts(tmp_path / "objects")
     backend = FakeBackend(_compile())
-    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"))
-    if changed is not None:
-        executor.runtime_identity = {**RUNTIME, changed: "different-observation"}
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"),
+        runtime_identity={**RUNTIME, changed: "different-observation"} if changed is not None else None)
     with pytest.raises(ValueError, match="reference executor.*runtime"):
         qualify_target(_spec("movement"), "reference", RUNTIME, executor, store)
     assert not backend.compile_requests and not backend.run_requests
@@ -354,3 +353,25 @@ def test_timing_requires_nonempty_retained_evidence_at_qualification_and_verific
     else:
         with pytest.raises(ValueError, match="timing evidence is empty"):
             validate()
+
+
+
+def test_runtime_observer_is_lazy_and_rechecked_before_each_qualification(tmp_path):
+    observed, observations = dict(RUNTIME), []
+    def observe():
+        observations.append(dict(observed))
+        return dict(observed)
+    backend = FakeBackend(_compile())
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "events.jsonl"), runtime_identity=observe)
+    assert not observations
+    spec = _spec("movement")
+    backend.runtime_result = _runtime(executor.prepare(spec).expected.storage)
+    store = ContentAddressedArtifacts(tmp_path / "objects")
+    qualify_target(spec, "reference", RUNTIME, executor, store)
+    assert observations == [RUNTIME]
+    assert len(backend.compile_requests) == len(backend.run_requests) == 1
+    observed["device"] = "different-device"
+    with pytest.raises(ValueError, match="reference executor runtime differs"):
+        qualify_target(spec, "reference", RUNTIME, executor, store)
+    assert len(observations) == 2
+    assert len(backend.compile_requests) == len(backend.run_requests) == 1
