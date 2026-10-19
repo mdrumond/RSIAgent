@@ -66,7 +66,8 @@ class OptimizationLoop:
             if row['status'] == 'running':
                 self.store.transition(self.key, 'stopped')
             return False
-        return row['status'] == 'running'
+        return row['status'] == 'running' or (
+            row['status'] == 'budget-exhausted' and 'pending' in self.state)
 
     def _action(self, stage, callback):
         if not self._boundary():
@@ -79,6 +80,8 @@ class OptimizationLoop:
             value = callback()
             # Persist returned evidence before clearing the in-flight marker.
             self.state['action_result'] = self._artifact(stage, value)
+            if stage in {'cases', 'optimize'}:
+                self.state['model_action'] = self.state['action_result']
             return value
         finally:
             self.store.account_time(self.key, max(0, self.clock() - started))
@@ -99,7 +102,8 @@ class OptimizationLoop:
 
     def run(self):
         row = self.store.get(self.key)
-        if row['status'] not in {'queued', 'running'}:
+        if row['status'] not in {'queued', 'running'} and not (
+                row['status'] == 'budget-exhausted' and 'pending' in self.state):
             return row
         submission = self.store.submission(self.key)
         verify_snapshot(submission['memory_snapshot'])
@@ -115,8 +119,9 @@ class OptimizationLoop:
         try:
             self._run(submission)
         except ObservationUnavailable:
-            if self.store.get(self.key)['status'] == 'running':
-                self.store.transition(self.key, 'running', stage='observation-unavailable')
+            status = self.store.get(self.key)['status']
+            if status in {'running', 'budget-exhausted'}:
+                self.store.transition(self.key, status, stage='observation-unavailable')
             raise
         except WorkerStopped:
             row = self.store.get(self.key)
@@ -158,6 +163,8 @@ class OptimizationLoop:
                                                            'summary': action['summary']})
             spec['signatures'] += accepted
             self.state['spec'] = self._artifact('frozen-reference-submission', spec)
+            self.state.pop('action_result', None)
+            self.state.pop('model_action', None)
             self._save()
         spec = self._read(self.state['spec'])
         if 'baseline' not in self.state:
@@ -178,6 +185,8 @@ class OptimizationLoop:
                             in enumerate(submission['memory_snapshot']['memory_entries'])]})
                 if action is None:
                     break
+                if not self._boundary():
+                    break
                 kind = action.get('action')
                 if kind == 'finish' and set(action) == {'action', 'summary'}:
                     self.store.add_event(self.key, 'finished', action)
@@ -195,12 +204,16 @@ class OptimizationLoop:
                 if identity in self.state['seen']:
                     self.state['history'].append({'candidate_sha256': source_sha,
                         'configuration_sha256': identity, 'block_count': action['block_count'], 'status': 'duplicate-skipped'})
+                    self.state.pop('action_result', None)
+                    self.state.pop('model_action', None)
                     self._save()
                     continue
                 pending = {**action, 'sha256': source_sha, 'configuration_sha256': identity,
                            'attempt': self.store.get(self.key)['attempts'] + 1}
                 self.state['pending'] = pending
                 self.state['candidate'] = self._artifact('candidate.cpp', action['source'])
+                self.state.pop('action_result', None)
+                self.state.pop('model_action', None)
                 self._save()
             if not self._boundary():
                 break
@@ -259,6 +272,11 @@ class OptimizationLoop:
             self._save()
 
     def _model(self, stage, context):
+        retained = self.state.get('model_action', self.state.get('action_result'))
+        if retained and retained.get('name') == stage:
+            # The caller removes this result in the same checkpoint that applies
+            # it. A crash in between must not issue another billable request.
+            return self._read(retained)
         if self.state['turn'] >= 200:
             raise ValueError('model action limit reached')
         self.state['turn'] += 1
@@ -278,4 +296,6 @@ class OptimizationLoop:
             raise ValueError('invalid tool action')
         record = self._artifact(action['action'], result)
         self.state['history'].append({'tool': action, 'result': record, 'content': result})
+        self.state.pop('action_result', None)
+        self.state.pop('model_action', None)
         self._save()
