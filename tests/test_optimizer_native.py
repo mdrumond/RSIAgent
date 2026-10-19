@@ -43,7 +43,7 @@ def test_frozen_bundle_authenticates_and_never_regenerates(tmp_path, monkeypatch
 
 def test_all_cases_pass_before_any_timing(tmp_path, monkeypatch):
     prepared = reference()
-    prepared.cases.append(prepared.cases[0])
+    prepared = prepare_reference({**prepared.spec, 'signatures': prepared.spec['signatures'] * 2}, max_cases=2)
     events = []
     def compile_case(source, contract, directory, **kwargs):
         index = len(events)
@@ -139,3 +139,19 @@ def test_padded_module_state_layout_survives_verification_and_timing(tmp_path, m
     result = native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test', benchmark=True)
     assert result['status'] == 'verified', result
     assert calls == ['run', 'run']  # verification and timed Ascend C callable
+
+
+@pytest.mark.parametrize('mutation', ['case', 'input', 'output', 'manifest'])
+def test_mutated_prepared_reference_is_rejected_before_compilation(tmp_path, monkeypatch, mutation):
+    prepared = reference()
+    if mutation == 'case':
+        prepared.cases[0]['case']['seed'] += 1
+    elif mutation == 'input':
+        prepared.cases[0]['args'][0].add_(1)
+    elif mutation == 'output':
+        prepared.cases[0]['output']['a'].add_(1)
+    else:
+        prepared.manifest['cases'][0]['inputs']['args'][0]['sha256'] = 'modified'
+    monkeypatch.setattr(native, '_compile_case', lambda *a, **k: pytest.fail('compiled mutated suite'))
+    with pytest.raises(ValueError, match='baseline'):
+        native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test')

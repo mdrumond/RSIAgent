@@ -52,19 +52,31 @@ def load_reference(directory, device):
             model.load_state_dict(frozen['state_dict'], strict=True)
             model.requires_grad_(False)
     prepared = PreparedReference(spec, model, frozen['cases'], manifest)
-    if _model_state(model) != manifest['state']:
+    _validate_prepared(prepared)
+    return prepared
+
+
+def _validate_prepared(prepared):
+    """Apply the frozen-suite contract equally to direct and serialized callers."""
+    manifest = prepared.manifest
+    if manifest['policy'] != POLICY:
+        raise ValueError('baseline comparison policy differs')
+    if _sha(prepared.spec['source'].encode()) != manifest['source_sha256']:
+        raise ValueError('baseline submission source differs')
+    if digest(manifest['cases']) != manifest['suite_sha256']:
+        raise ValueError('baseline suite digest differs')
+    if _model_state(prepared.model) != manifest['state']:
         raise ValueError('baseline model state differs')
     if len(prepared.cases) != len(manifest['cases']):
         raise ValueError('baseline case count differs')
     for row, expected in zip(prepared.cases, manifest['cases']):
-        if row['case'] != {k: expected[k] for k in row['case']}:
+        if row['case'] != {k: v for k, v in expected.items() if k not in ('inputs', 'outputs')}:
             raise ValueError('baseline case identity differs')
         if _input_state(row['args'], row['kwargs']) != expected['inputs']:
             raise ValueError('baseline inputs differ')
         outputs = {p: _tensor_identity(x) if x is not None else None for p, x in _leaves(row['output'])}
         if outputs != expected['outputs']:
             raise ValueError('baseline outputs differ')
-    return prepared
 
 
 def _inputs(row):
@@ -208,6 +220,7 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
     prepared = load_reference(reference, device) if isinstance(reference, (str, Path)) else reference
     if not isinstance(prepared, PreparedReference) or not prepared.cases:
         raise ValueError('a nonempty prepared/frozen reference is required')
+    _validate_prepared(prepared)
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'candidate.cpp').write_text(candidate)
