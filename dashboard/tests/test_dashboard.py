@@ -340,6 +340,45 @@ def test_running_wave_safely_falls_back_from_invalid_pending(campaign, tmp_path,
     assert all("wrong pending" not in text for text in texts)
 
 
+@pytest.mark.parametrize("retained_in", ["pending", "state"])
+def test_partial_approved_wave_matches_exact_origin_proposal(campaign, tmp_path, retained_in):
+    root = tmp_path / "phase1"
+    plan_path = root / "waves/wave-001/plan.json"
+    plan = json.loads(plan_path.read_text())
+    selected = {**plan["wave"]["projects"][0], "requires": []}
+    expected = {"wave_id": "wave-001", **plan["wave"], "projects": [selected]}
+    write(plan_path, {"wave": {key: value for key, value in expected.items()
+                                if key != "wave_id"}})
+    extra = {"spec": {**selected["spec"], "project_id": "valid-unselected"},
+             "requires": []}
+    admitted = {**expected, "projects": [selected, extra]}
+    malformed = json.loads(json.dumps(admitted))
+    malformed["projects"][1]["unexpected"] = "not a valid proposal project"
+    unrelated = {**expected, "projects": [extra]}
+    session = {"messages": [
+        {"role": "system", "content": "partial approval system"},
+        {"role": "user", "content": "propose a full wave"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(unrelated)},
+        {"role": "user", "content": "include the selected project"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(malformed)},
+        {"role": "user", "content": "remove the malformed extra field"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(admitted)},
+    ], "turns": 3}
+    state = json.loads((root / "state.json").read_text())
+    state["session"] = session if retained_in == "state" else {"messages": []}
+    write(root / "state.json", state)
+    if retained_in == "pending":
+        write(root / "pending.json", {"wave": expected, "session": session})
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    curriculum = [row for row in events if row["category"] == "curriculum"]
+    assert curriculum[-1]["label"] == "Curriculum admitted decision"
+    assert sum(row["label"].startswith("Curriculum assistant attempt")
+               for row in curriculum) == 2
+    admitted_body = client.get(curriculum[-1]["payload_url"]).get_json()["text"]
+    assert admitted_body == "DECISION: WAVE\n" + json.dumps(admitted)
+
+
 def test_trace_index_does_not_read_actor_payload_bodies(campaign, tmp_path, monkeypatch):
     branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
     body = b'{"nested":{"value":1}}'

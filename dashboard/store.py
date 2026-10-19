@@ -297,7 +297,37 @@ class DashboardStore:
     @classmethod
     def _matches_plan(cls, content, expected):
         response = cls._wave_response(content)
-        return isinstance(response, dict) and response == expected
+        if not isinstance(response, dict) or not isinstance(expected, dict):
+            return False
+        if response == expected:
+            return True
+        if set(response) != set(expected) or any(
+                response[key] != expected[key] for key in expected if key != "projects"):
+            return False
+        proposed, approved = response.get("projects"), expected.get("projects")
+        if (not isinstance(proposed, list) or not isinstance(approved, list) or
+                not approved or len(proposed) <= len(approved)):
+            return False
+
+        def project_id(project):
+            if (not isinstance(project, dict) or set(project) != {"spec", "requires"} or
+                    not isinstance(project["spec"], dict) or
+                    not isinstance(project["requires"], list) or
+                    any(not isinstance(item, str) for item in project["requires"]) or
+                    len(set(project["requires"])) != len(project["requires"])):
+                return None
+            value = project["spec"].get("project_id")
+            return value if isinstance(value, str) and value else None
+
+        proposed_ids = [project_id(project) for project in proposed]
+        approved_ids = [project_id(project) for project in approved]
+        if (None in proposed_ids or None in approved_ids or
+                len(set(proposed_ids)) != len(proposed_ids) or
+                len(set(approved_ids)) != len(approved_ids)):
+            return False
+        selected = set(approved_ids)
+        return [project for project, identity in zip(proposed, proposed_ids)
+                if identity in selected] == approved
 
     def _host_evidence(self, root, project_id):
         try:
