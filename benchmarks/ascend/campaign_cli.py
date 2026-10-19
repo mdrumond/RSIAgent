@@ -132,6 +132,7 @@ def build_controller(job):
                  "--project-target", str(job["project_target"]), *settings["phase1_arguments"]]
     with redirect_stdout(io.StringIO()):
         target_main(["--target", job["target"], *arguments], native_builder=capture,
+                    native_parallel=job["phase"] == 1,
                     a5_main=lambda argv: a5_main(argv, builder=capture))
     return captured[0]
 

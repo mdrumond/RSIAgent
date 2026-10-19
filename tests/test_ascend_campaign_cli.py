@@ -536,8 +536,9 @@ def test_shared_builder_dispatch_and_phase2_snapshot(tmp_path, monkeypatch, targ
     native = SimpleNamespace(**{k: v for k, v in source.items() if k != "model"}, collection=None)
     snapshot = SimpleNamespace(destination=SimpleNamespace(source_identity=source))
     monkeypatch.setattr(cli, "_snapshot", lambda *a: snapshot)
-    def old_cli(argv, *, native_builder, a5_main):
+    def old_cli(argv, *, native_builder, a5_main, native_parallel):
         assert argv[:2] == ["--target", target]
+        assert native_parallel is (phase == 1)
         native_builder(**({"config": native, "profile": SimpleNamespace(identity=model)}
                            if target == "a3" else {"cell": SimpleNamespace(model=model)}))
     monkeypatch.setattr(phase1_cli, "main", old_cli)
