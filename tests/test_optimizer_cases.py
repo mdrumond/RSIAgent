@@ -46,3 +46,11 @@ def test_representatives_never_silently_truncated():
     spec["signatures"] *= 25
     with pytest.raises(ValueError, match="representative"):
         generate_cases(spec)
+
+
+def test_padded_strides_survive_device_transfer():
+    spec = submission()
+    spec['signatures'] = [{'args': [{'shape': [2, 3], 'dtype': 'float32', 'strides': [4, 1]}]}]
+    case = generate_cases(spec)['cases'][0]
+    args, _ = materialize_case(case, device='meta')
+    assert args[0].stride() == (4, 1)
