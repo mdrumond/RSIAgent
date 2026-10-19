@@ -64,7 +64,7 @@ def test_failure_repair_slower_faster_and_budget(tmp_path):
     state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
     assert state['best']['speedup'] == 2
     assert state['best']['faster_than_torch'] is True
-    assert backend.profiles == ['slow']  # last candidate consumed final attempt
+    assert backend.profiles == ['slow', 'fast']  # reserved final attempt retains diagnostics
     assert store.get(key)['attempts'] == 3
     assert backend.prepares == 1
     assert any(e['kind'] == 'model-response' for e in store.events(key))
@@ -190,3 +190,22 @@ def test_dashboard_signature_envelope_flows_through_job_store(tmp_path):
         {'action': 'cases', 'signatures': [], 'summary': 'preserve supplied representative'},
         {'action': 'finish', 'summary': 'baseline only'}]), CheckingBackend()).run()
     assert result['status'] == 'completed'
+
+
+def test_launch_geometry_is_part_of_candidate_identity(tmp_path):
+    store, key = fixture(tmp_path, attempts=3)
+    class GeometryBackend(Backend):
+        def __init__(self):
+            super().__init__()
+            self.paths = []
+        def evaluate(self, source, directory, *, block_count):
+            self.paths.append((str(directory), block_count))
+            return super().evaluate(source, directory, block_count=block_count)
+    backend = GeometryBackend()
+    actions = [{'action': 'cases', 'signatures': [], 'summary': ''},
+               candidate('fast'), {**candidate('fast'), 'block_count': 2},
+               {**candidate('fast'), 'block_count': 2}, {'action': 'finish', 'summary': ''}]
+    result = OptimizationLoop(store, key, Agent(actions), backend).run()
+    assert result['attempts'] == 2
+    assert [count for _, count in backend.paths] == [1, 2]
+    assert backend.paths[0][0] != backend.paths[1][0]
