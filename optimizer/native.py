@@ -121,8 +121,8 @@ def render_wrapper(candidate, contract, namespace, block_count):
         strides = '{' + ','.join(map(str, item['strides'])) + '}'
         dtype = dtype_names[item['dtype'].removeprefix('torch.')]
         allocations.append(f'auto output{i} = torch::empty_strided({shape}, {strides}, options.dtype(torch::k{dtype}));')
-    pointers = ([f'(GM_ADDR)inputs[{i}].data_ptr()' for i in range(len(contract['inputs']))] +
-                [f'(GM_ADDR)state[{i}].data_ptr()' for i in range(len(contract['state']))] +
+    pointers = ([f'(GM_ADDR)owned_inputs[{i}].data_ptr()' for i in range(len(contract['inputs']))] +
+                [f'(GM_ADDR)owned_state[{i}].data_ptr()' for i in range(len(contract['state']))] +
                 [f'(GM_ADDR)output{i}.data_ptr()' for i in range(len(contract['outputs']))])
     outputs = ', '.join(f'output{i}' for i in range(len(contract['outputs'])))
     return '\n'.join(['#include "kernel_operator.h"', '#include <torch/all.h>', '#include <torch/library.h>',
@@ -130,6 +130,8 @@ def render_wrapper(candidate, contract, namespace, block_count):
         *constants, f'#define optimizer_kernel {namespace}_kernel', candidate,
         f'namespace {namespace}_host {{',
         'std::vector<torch::Tensor> launch(at::TensorList inputs, at::TensorList state) {',
+        'std::vector<torch::Tensor> owned_inputs(inputs.begin(), inputs.end());',
+        'std::vector<torch::Tensor> owned_state(state.begin(), state.end());',
         'auto options = torch::TensorOptions().device(c10::Device(c10::DeviceType::PrivateUse1, c10_npu::getCurrentNPUStream().device_index()));',
         *allocations, 'auto stream = c10_npu::getCurrentNPUStream().stream(false);',
         'auto run = [=]() -> int {', f'::optimizer_kernel<<<{block_count}, nullptr, stream>>>({", ".join(pointers)});',
