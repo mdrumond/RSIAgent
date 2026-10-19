@@ -199,7 +199,8 @@ def test_trace_index_is_compact_and_payloads_are_lazy_authenticated(campaign, tm
     assert "content" not in json.dumps(index)
     assert any(row["label"] == "Verifier prompt" and not row["available"] and
                "host-owned" in row["reason"] for row in index["events"])
-    assert sum(row["label"] == "Host verifier evidence" for row in index["events"]) == 2
+    assert sum(row["label"] == "Host verification ledger entry"
+               for row in index["events"]) == 2
     assert any(row["label"] == "Actor attempt rejection" for row in index["events"])
     assert any(row.get("sha256") == missing and not row["available"] for row in index["events"])
     payload = client.get(actor[0]["payload_url"])
@@ -294,6 +295,82 @@ def test_trace_index_does_not_read_actor_payload_bodies(campaign, tmp_path, monk
     assert event["available"] and event["size"] == len(body)
     script = client.get("/static/app.js").get_data(as_text=True)
     assert "JSON.stringify(JSON.parse(payload.text), null, 2)" in script
+
+
+def test_trace_event_urls_are_content_stable_across_growth_and_reordering(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    bodies = [b"first", b"second", b"inserted"]
+    digests = [__import__("hashlib").sha256(body).hexdigest() for body in bodies]
+    for body, digest in zip(bodies, digests):
+        obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
+        obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(body)
+    def ledger(order):
+        (branch / "evidence.jsonl").write_text("\n".join(json.dumps({"payload": {
+            "role": "provider-request", "sha256": digests[index], "turn": index}})
+            for index in order) + "\n")
+    ledger([0, 0, 1])
+    cache = tmp_path / "cache.sqlite3"
+    client = create_app(campaign, cache, refresh_seconds=0).test_client()
+    first = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    repeated = [row for row in first if row.get("sha256") == digests[0]]
+    assert len({row["id"] for row in repeated}) == 2
+    old_url = repeated[0]["payload_url"]
+
+    ledger([2, 0, 0, 1])
+    fresh = create_app(campaign, tmp_path / "fresh.sqlite3", refresh_seconds=0).test_client()
+    grown = fresh.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    assert next(row for row in grown if row.get("sha256") == digests[0])["payload_url"] == old_url
+    assert client.get(old_url).get_json()["text"] == "first"
+
+
+def test_uncached_payload_disappearance_is_404_not_digest_conflict(campaign, tmp_path, monkeypatch):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    body = b"vanishing"
+    digest = __import__("hashlib").sha256(body).hexdigest()
+    obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
+    obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(body)
+    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
+        "role": "provider-response", "sha256": digest, "turn": 1}}) + "\n")
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    event = next(row for row in client.get(
+        "/api/phase/1/project/vector-add/trace").get_json()["events"]
+        if row.get("sha256") == digest)
+    original = type(obj).read_bytes
+    def vanished(path):
+        if path == obj:
+            raise FileNotFoundError(path)
+        return original(path)
+    monkeypatch.setattr(type(obj), "read_bytes", vanished)
+    assert client.get(event["payload_url"]).status_code == 404
+
+
+def test_host_verification_chain_recovers_unattributed_rows_and_artifacts(campaign, tmp_path):
+    root = tmp_path / "phase1"
+    payloads = [{"compile": "diagnostic"}, {"classification": "host-verified"}]
+    previous = "0" * 64
+    rows = []
+    for sequence, payload in enumerate(payloads):
+        artifact = __import__("hashlib").sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        record = {"sequence": sequence, "previous_sha256": previous, "payload": {
+            "artifact_kind": "compile" if sequence == 0 else "classification",
+            "artifact_sha256": artifact, "payload": payload}}
+        if sequence == 1:
+            record["payload"]["project_id"] = "vector-add"
+        canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        record["entry_sha256"] = __import__("hashlib").sha256(canonical).hexdigest()
+        previous = record["entry_sha256"]
+        rows.append(record)
+    (root / "project-evidence.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    host = [row for row in events if row["category"] == "verification" and
+            row["label"].startswith("Host verification")]
+    assert [row["label"] for row in host] == [
+        "Host verification ledger entry", "Host verification artifact: compile",
+        "Host verification ledger entry", "Host verification artifact: classification"]
+    texts = [client.get(row["payload_url"]).get_json()["text"] for row in host]
+    assert "diagnostic" in texts[1] and "host-verified" in texts[3]
 
 
 @pytest.mark.parametrize("digest", [

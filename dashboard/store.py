@@ -236,11 +236,16 @@ class DashboardStore:
             config = json.loads(self.config_path.read_text())
         except (OSError, ValueError):
             return None
-        entry = next((row for row in config.get("campaigns", [])
-                      if row.get("phase") == phase), None)
+        if not isinstance(config, dict) or not isinstance(config.get("campaigns"), list):
+            return None
+        entry = next((row for row in config["campaigns"]
+                      if isinstance(row, dict) and row.get("phase") == phase), None)
         if entry is None:
             return None
-        root = Path(entry["root"])
+        try:
+            root = Path(entry["root"])
+        except (KeyError, TypeError):
+            return None
         for plan_path in sorted(root.glob("waves/*/plan.json")):
             plan = _json(plan_path, {}) or {}
             for item in plan.get("wave", {}).get("projects", []):
@@ -311,6 +316,55 @@ class DashboardStore:
             for item in expected.get("projects", [])]
         return normalized == expected_normalized
 
+    def _host_evidence(self, root, project_id):
+        try:
+            raw_rows = (root / "project-evidence.jsonl").read_text().splitlines()
+        except (OSError, TypeError):
+            return []
+        rows = []
+        for raw in raw_rows:
+            try:
+                rows.append((json.loads(raw), raw + "\n"))
+            except (ValueError, TypeError):
+                continue
+        by_digest = {record.get("entry_sha256"): (record, raw) for record, raw in rows
+                     if isinstance(record.get("entry_sha256"), str)}
+        terminals = [(record, raw) for record, raw in rows
+                     if record.get("payload", {}).get("project_id") == project_id]
+        if not terminals:
+            return []
+        record, raw = terminals[-1]
+        if not record.get("entry_sha256"):
+            chain = terminals
+        else:
+            chain, seen = [], set()
+            while record is not None and record.get("entry_sha256") not in seen:
+                digest = record.get("entry_sha256")
+                if digest:
+                    seen.add(digest)
+                chain.append((record, raw))
+                previous = record.get("previous_sha256")
+                if not previous or previous == "0" * 64 or previous not in by_digest:
+                    break
+                record, raw = by_digest[previous]
+            chain.reverse()
+        events = []
+        for record, raw in chain:
+            events.append(self._inline_event("Host verification ledger entry", "verification", raw))
+            payload = record.get("payload", {})
+            artifact, digest = payload.get("payload"), payload.get("artifact_sha256")
+            if artifact is None or not isinstance(digest, str):
+                continue
+            body = json.dumps(artifact, sort_keys=True, separators=(",", ":")).encode()
+            event = self._inline_event(
+                f"Host verification artifact: {payload.get('artifact_kind', 'unknown')}",
+                "verification", body)
+            if event["sha256"] != digest:
+                event.update(sha256=digest, available=False,
+                             reason="referenced artifact digest mismatch")
+            events.append(event)
+        return events
+
     def _trace_sources(self, phase, project_id):
         located = self._project_sources(phase, project_id)
         if located is None:
@@ -376,24 +430,18 @@ class DashboardStore:
             event = self._artifact_event(labels[role], "actor", source, digest,
                                          stage=payload.get("stage"), turn=payload.get("turn"))
             events.append(event)
-        try:
-            host_rows = (root / "project-evidence.jsonl").read_text().splitlines()
-        except OSError:
-            host_rows = []
-        for raw in host_rows:
-            try:
-                record = json.loads(raw)
-            except ValueError:
-                continue
-            if record.get("payload", {}).get("project_id") == project_id:
-                events.append(self._inline_event("Host verifier evidence", "verification",
-                                                 raw + "\n"))
+        events.extend(self._host_evidence(root, project_id))
         events.append(self._event("Verifier prompt", "verification", reason=(
             "unavailable: verification is deterministic and host-owned")))
         events.append(self._event("Verifier result", "verification", branch / "execution-evidence.bin"))
         events.append(self._event("Final outcome", "outcome", branch / "outcome.json"))
+        occurrences = {}
         for sequence, event in enumerate(events):
-            event["id"] = f"event-{sequence}"
+            identity = event.get("sha256") or hashlib.sha256(json.dumps(
+                {key: event.get(key) for key in ("label", "category", "stage", "turn", "reason")},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            occurrences[identity] = occurrences.get(identity, 0) + 1
+            event["id"] = f"{identity}-{occurrences[identity]}"
             event["sequence"] = sequence
         return events
 
@@ -401,7 +449,9 @@ class DashboardStore:
         with self._db() as db:
             retained = db.execute("SELECT body FROM trace_indexes WHERE phase=? AND project_id=?",
                                   (phase, project_id)).fetchone()
-        retained_catalog = json.loads(retained[0]) if retained else None
+        retained_body = json.loads(retained[0]) if retained else None
+        retained_catalog = (retained_body.get("events") if isinstance(retained_body, dict) and
+                            retained_body.get("schema") == "content-addressed-v1" else None)
         complete = retained_catalog and any(
             row["label"] == "Final outcome" and row["available"] for row in retained_catalog)
         events = None if complete else self._trace_sources(phase, project_id)
@@ -414,7 +464,8 @@ class DashboardStore:
                        for event in events]
             with self._db() as db:
                 db.execute("INSERT OR REPLACE INTO trace_indexes(phase,project_id,body) VALUES(?,?,?)",
-                           (phase, project_id, json.dumps(catalog)))
+                           (phase, project_id, json.dumps({
+                               "schema": "content-addressed-v1", "events": catalog})))
                 db.executemany("INSERT OR REPLACE INTO trace_events(phase,project_id,event_id,sha256) "
                                "VALUES(?,?,?,?)", [(phase, project_id, row["id"], row.get("sha256"))
                                                    for row in catalog])
@@ -438,14 +489,14 @@ class DashboardStore:
             return bytes(cached[0]), None
         events = self._trace_sources(phase, project_id)
         event = next((row for row in events or [] if row["id"] == event_id), None)
-        digest = event.get("sha256") if event else (retained[0] if retained else None)
+        digest = retained[0] if retained else (event.get("sha256") if event else None)
         if not digest:
             return None, "missing"
         with self._db() as db:
             cached = db.execute("SELECT body FROM payloads WHERE sha256=?", (digest,)).fetchone()
         if cached is not None:
             return bytes(cached[0]), None
-        if event is None:
+        if event is None or event.get("sha256") != digest:
             return None, "unavailable"
         if not event.get("available"):
             return None, "digest" if event.get("reason") == "content digest mismatch" else "unavailable"
@@ -453,15 +504,22 @@ class DashboardStore:
             body = event["inline"]
         else:
             located = self._project_sources(phase, project_id)
+            if located is None:
+                return None, "unavailable"
             branch = located[2]
-            if event["label"] == "Retained normalized curriculum plan":
-                body = located[1].read_bytes()
-            elif event["label"] == "Verifier result":
-                body = (branch / "execution-evidence.bin").read_bytes()
-            elif event["label"] == "Final outcome":
-                body = (branch / "outcome.json").read_bytes()
-            else:
-                body = (branch / "artifacts" / "objects" / digest[:2] / digest[2:]).read_bytes()
+            try:
+                if event["label"] == "Retained normalized curriculum plan":
+                    body = located[1].read_bytes()
+                elif event["label"] == "Verifier result":
+                    body = (branch / "execution-evidence.bin").read_bytes()
+                elif event["label"] == "Final outcome":
+                    body = (branch / "outcome.json").read_bytes()
+                elif _SHA256.fullmatch(digest):
+                    body = (branch / "artifacts" / "objects" / digest[:2] / digest[2:]).read_bytes()
+                else:
+                    return None, "unavailable"
+            except (OSError, TypeError, AttributeError):
+                return None, "unavailable"
         if hashlib.sha256(body).hexdigest() != digest:
             return None, "digest"
         with self._db() as db:
