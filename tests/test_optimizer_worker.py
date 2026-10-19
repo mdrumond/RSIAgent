@@ -52,6 +52,7 @@ def test_stop_cancels_retained_native_handle(tmp_path):
     with pytest.raises(WorkerStopped):
         transport.execute(directory, ['true'])
     assert calls[0][-2:] == ['cancel', 'remote:bz-a3-1:job:abc']
+    assert json.loads((directory / 'transport.json').read_text())['state'] == 'cancelled'
 
 
 def test_failed_profile_observer_is_terminal(tmp_path):
@@ -110,6 +111,55 @@ def test_remote_backend_hydrates_authenticated_evidence_without_resubmission(tmp
     assert first == backend.evaluate('source', directory, block_count=1)
     assert transport.executions == 1
     assert store.artifacts(job)[0]['name'] == 'candidate/result.json'
+
+
+def test_cancelled_backend_restarts_only_in_fresh_generation(tmp_path):
+    import shutil
+    from optimizer.jobs import JobStore
+    from optimizer.remote_worker import publish
+    from optimizer.worker import RemoteBackend
+    store = JobStore(tmp_path / 'jobs')
+    job = store.create('def forward(x): return x', 'forward', {}, {})['job_id']
+    completed = tmp_path / 'remote'
+    completed.mkdir()
+    publish(completed, {'status': 'verified'})
+    class Transport:
+        calls = []
+        def transfer(self, action, source, destination):
+            if action == 'download':
+                shutil.copyfile(completed / 'compact.tar.gz', destination)
+        def execute(self, directory, argv):
+            self.calls.append(directory)
+    transport = Transport()
+    backend = RemoteBackend(store, job, config(tmp_path), transport=transport)
+    directory = store.root / job / 'execution' / 'candidate'
+    directory.mkdir(parents=True)
+    (directory / 'transport.json').write_text(json.dumps({'state': 'cancelled', 'handle': 'bz-a3-1:old'}))
+    assert backend.evaluate('source', directory, block_count=1)['status'] == 'verified'
+    assert transport.calls == [directory / 'retry']
+
+
+def test_profile_observation_loss_preserves_pending_and_history_on_retry(tmp_path):
+    from test_optimizer_loop import fixture, Agent, Backend, candidate
+    from optimizer.loop import OptimizationLoop
+    store, job = fixture(tmp_path, attempts=3)
+    class LostProfile(Backend):
+        def profile(self, *args, **kwargs):
+            if not self.profiles:
+                self.profiles.append('lost')
+                raise ObservationUnavailable('pending exact handle')
+            return {'status': 'available'}
+    backend = LostProfile()
+    agent = Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast'), {'action': 'finish', 'summary': ''}])
+    with pytest.raises(ObservationUnavailable):
+        OptimizationLoop(store, job, agent, backend).run()
+    state = [e['payload'] for e in store.events(job) if e['kind'] == 'optimizer-state'][-1]
+    assert state['pending']['history_recorded']
+    assert len(state['history']) == 1
+    assert OptimizationLoop(store, job, agent, backend).run()['status'] == 'completed'
+    state = [e['payload'] for e in store.events(job) if e['kind'] == 'optimizer-state'][-1]
+    assert len(state['history']) == 1
+    assert len(backend.evaluations) == 1
 
 
 def test_pending_download_observes_original_transfer_then_fetches(tmp_path):

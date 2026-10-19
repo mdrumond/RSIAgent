@@ -97,6 +97,8 @@ class CheckedTransport:
                     atomic(directory / 'cancel.log', (result.stdout + result.stderr).encode())
                     if result.returncode:
                         raise ObservationUnavailable('cancellation unavailable; retained handle remains active')
+                    state['state'] = 'cancelled'
+                    atomic(path, canonical(state))
                 raise WorkerStopped('user requested stop')
             command = [self.config['validation_wrapper'], '--profile', self.config['profile']]
             if state.get('handle'):

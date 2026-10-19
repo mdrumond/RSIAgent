@@ -23,7 +23,8 @@ def execute(request):
     if operation == 'prepare':
         prepared = prepare_reference(request['spec'], device='npu:0', max_cases=request.get('max_cases', 24))
         manifest = freeze_reference(prepared, baseline)
-        result = {'suite_sha256': manifest['suite_sha256'], 'cases': [], 'manifest': manifest}
+        result = {'suite_sha256': manifest['suite_sha256'], 'cases': [], 'manifest': manifest,
+                  'remote_reference': str(baseline)}
         for row in prepared.cases:
             args, kwargs = copy.deepcopy((row['args'], row['kwargs']))
             fn = lambda args=args, kwargs=kwargs: prepared.invoke(*args, **kwargs)

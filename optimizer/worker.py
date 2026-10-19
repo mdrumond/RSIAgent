@@ -48,13 +48,23 @@ class RemoteBackend:
     def _operation(self, operation, directory, **payload):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
+        transport_state = directory / 'transport.json'
+        if transport_state.exists() and json.loads(transport_state.read_text()).get('state') == 'cancelled':
+            # A cancelled process may leave partial compiler/frozen files. Resume
+            # uses a fresh generation only after exact-handle cancellation succeeds.
+            return self._operation(operation, directory / 'retry', **payload)
         result_path = directory / 'result.json'
         if result_path.exists():
             return json.loads(result_path.read_text())
         relative = directory.relative_to(self.store.root / self.job_id / 'execution')
         remote_directory = self.remote / 'execution' / relative
+        baseline = self.store.root / self.job_id / 'execution' / 'baseline'
+        while (baseline / 'transport.json').exists() and json.loads((baseline / 'transport.json').read_text()).get('state') == 'cancelled':
+            baseline = baseline / 'retry'
+        reference = (json.loads((baseline / 'result.json').read_text()).get('remote_reference')
+                     if (baseline / 'result.json').exists() else None)
         request = {'operation': operation, 'directory': str(remote_directory),
-                   'baseline': str(self.remote / 'execution' / 'baseline' / 'frozen'),
+                   'baseline': str(remote_directory / 'frozen') if operation == 'prepare' else reference or str(self.remote / 'execution' / 'baseline' / 'frozen'),
                    'arch': self.config['arch'], 'max_cases': self.config.get('max_cases', 24), **payload}
         archive_path = directory / 'package.tar.gz'
         source_root = Path(__file__).resolve().parents[1]
@@ -158,6 +168,7 @@ def knowledge_query(config, directory):
 def run_worker(root, job_id, config, *, agent=None):
     from .agent import OptimizerAgent
     from .loop import OptimizationLoop
+    from .provider import BoundedAgent
     from benchmarks.a3_experiments import BackendModel
     store = JobStore(root)
     directory = store._directory(job_id)
@@ -170,6 +181,8 @@ def run_worker(root, job_id, config, *, agent=None):
         guide = Path(config['guide']).read_text()
         identity = {key: config[key] for key in ('target', 'profile', 'runtime', 'arch', 'physical_device', 'remote_workspace')}
         identity['guide_sha256'] = sha(guide.encode())
+        identity['max_cases'] = config.get('max_cases', 24)
+        identity['knowledge'] = config.get('knowledge')
         previous = next((event['payload'] for event in store.events(job_id)
                          if event['kind'] == 'worker-configuration'), None)
         if previous is not None and previous != identity:
@@ -179,6 +192,8 @@ def run_worker(root, job_id, config, *, agent=None):
         agent = agent or OptimizerAgent(guide=guide,
                                         model=BackendModel(config.get('model_profile', BackendModel.GPT_5_6_SOL.value)))
         backend = RemoteBackend(store, job_id, config)
+        agent = BoundedAgent(agent, deadline=backend.deadline,
+                             stopped=lambda: store.get(job_id)['stop_requested'])
         store.add_event(job_id, 'worker-started', {'pid': os.getpid(), 'profile': config['profile'], 'device': config['physical_device']})
         try:
             return OptimizationLoop(store, job_id, agent, backend,

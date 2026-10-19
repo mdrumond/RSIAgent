@@ -120,6 +120,12 @@ class OptimizationLoop:
             raise
         except WorkerStopped:
             row = self.store.get(self.key)
+            pending = self.state.get('pending')
+            if pending is not None and 'evaluation' not in pending:
+                self.state['history'].append({'candidate_sha256': pending['sha256'],
+                                             'status': 'cancelled', 'summary': pending['summary']})
+                self.state.pop('pending')
+                self._save()
             if row['status'] == 'running':
                 self.store.transition(self.key, 'stopped' if row['stop_requested'] else 'budget-exhausted')
             raise
@@ -212,9 +218,12 @@ class OptimizationLoop:
                        'configuration_sha256': pending.get('configuration_sha256', pending['sha256']),
                        'block_count': pending['block_count'],
                        'content': result, 'speedup': value, 'summary': pending['summary']}
-            self.state['history'].append(history)
-            self.state['seen'].append(pending.get('configuration_sha256', pending['sha256']))
-            if value is not None and value > self.state.get('best', {}).get('speedup', 0):
+            if not pending.get('history_recorded'):
+                self.state['history'].append(history)
+                self.state['seen'].append(pending.get('configuration_sha256', pending['sha256']))
+                pending['history_recorded'] = True
+            if value is not None and (pending.get('new_best') or value > self.state.get('best', {}).get('speedup', 0)):
+                pending['new_best'] = True
                 self.state['best'] = {**history, 'source': self.state['candidate'],
                                      'block_count': pending['block_count'], 'faster_than_torch': value > 1}
                 row = self.store.get(self.key)
@@ -224,6 +233,8 @@ class OptimizationLoop:
                         report = self._reserved_action(lambda: self.backend.profile(pending['source'],
                             self.directory / pending.get('configuration_sha256', pending['sha256']) / 'profile', block_count=pending['block_count']))
                         self.state['best']['profiling'] = self._artifact('profiling', report)
+                    except (ObservationUnavailable, WorkerStopped):
+                        raise
                     except Exception as exc:
                         self.store.add_event(self.key, 'profiling-unavailable', {'error': str(exc)})
                 else:

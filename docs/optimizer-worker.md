@@ -51,6 +51,12 @@ timeline reports and shared libraries are excluded. Downloaded artifacts are
 digest-checked and stored in the job artifact store. Every remote runtime call is
 bounded by the job's remaining wall-time budget. Runtime/device/workspace/guide
 identity is pinned across resume.
+Provider requests execute in a child process with streamed retained prompt/result
+records. Stop and the remaining wall-time budget terminate a stalled request.
+Successful exact-handle cancellation is persisted; resume evaluates in a fresh
+remote directory so partial compilation or baseline files cannot be reused.
+Pending diagnostic operations survive unavailable observation without permitting
+another candidate to overlap the retained operation.
 
 For a bounded production proof, create a job using the normal JobStore interface,
 then call `run_worker(root, job_id, config, agent=stub)` with an injected agent
