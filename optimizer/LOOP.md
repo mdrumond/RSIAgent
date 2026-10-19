@@ -3,6 +3,8 @@
 `OptimizationLoop(store, job_id, agent, backend, knowledge=callable).run()` is
 backend-neutral. The detached worker owns process exclusion, runtime selection,
 hard operation timeouts, transport handles, and interruption observation.
+Pass its configured `max_cases` (1–24, default 24) to the loop as well as the
+backend. Representatives are preserved; excess agent proposals are visibly rejected.
 
 * `prepare(spec, directory)` runs and freezes Torch first. Return a nonempty
   `suite_sha256` and `cases` with unique `case` identities, native `contract`, and

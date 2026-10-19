@@ -38,7 +38,11 @@ def score(baseline, result):
 
 
 class OptimizationLoop:
-    def __init__(self, store, job_id, agent, backend, *, knowledge=None, clock=time.time):
+    def __init__(self, store, job_id, agent, backend, *, knowledge=None, clock=time.time,
+                 max_cases=24):
+        if type(max_cases) is not int or not 1 <= max_cases <= 24:
+            raise ValueError('max_cases must be between one and 24')
+        self.max_cases = max_cases
         self.store, self.key, self.agent, self.backend = store, job_id, agent, backend
         self.knowledge, self.clock = knowledge, clock
         self.directory = store.root / job_id / 'execution'
@@ -143,19 +147,24 @@ class OptimizationLoop:
 
     def _run(self, submission):
         spec = self._spec(submission)
+        if len(spec['signatures']) > self.max_cases:
+            raise ValueError('supplied representatives exceed configured case budget')
         if 'spec' not in self.state:
-            action = self._model('cases', {'submission': spec})
+            action = self._model('cases', {'submission': spec, 'max_cases': self.max_cases,
+                                         'remaining_signatures': self.max_cases - len(spec['signatures'])})
             if action is None:
                 return
             if set(action) != {'action', 'signatures', 'summary'} or action['action'] != 'cases':
                 raise ValueError('first action must propose additional signatures')
             additions = action['signatures']
-            if not isinstance(additions, list) or len(spec['signatures']) + len(additions) > 24:
-                raise ValueError('case proposals exceed 24-case budget')
+            if not isinstance(additions, list):
+                raise ValueError('case proposals must be a list')
             accepted, rejected = [], []
             for signature in additions:
                 try:
                     validate_submission({**spec, 'signatures': [signature]})
+                    if len(spec['signatures']) + len(accepted) >= self.max_cases:
+                        raise ValueError(f'case proposal exceeds configured {self.max_cases}-case budget')
                     accepted.append(signature)
                 except (ValueError, TypeError, KeyError) as exc:
                     rejected.append({'signature': signature, 'error': str(exc)})
@@ -167,6 +176,8 @@ class OptimizationLoop:
             self.state.pop('model_action', None)
             self._save()
         spec = self._read(self.state['spec'])
+        if len(spec['signatures']) > self.max_cases:
+            raise ValueError('frozen representatives exceed configured case budget')
         if 'baseline' not in self.state:
             baseline = self._action('prepare', lambda: self.backend.prepare(spec, self.directory / 'baseline'))
             if baseline is None:
