@@ -139,7 +139,8 @@ def profile(fn, root, groups=None, *, identity=None):
                                     for value in metric['identity'].values()))]
                     digests.append({key: report[key] for key in ('source', 'json', 'csv')} | {'metrics': metrics})
                 item['reports'] = digests
-                if selector and not any(report['metrics'] for report in digests):
+                if selector and not any(metric['available'] for report in digests
+                                        for metric in report['metrics']):
                     item['available'] = False
                     item['reason'] = 'no requested counters for candidate kernel symbol'
             except Exception as exc:
