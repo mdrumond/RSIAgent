@@ -275,8 +275,19 @@ class OptimizationLoop:
                         report = self._reserved_action(lambda: self.backend.profile(pending['source'],
                             self.directory / pending.get('configuration_sha256', pending['sha256']) / 'profile', block_count=pending['block_count']))
                         self.state['best']['profiling'] = self._artifact('profiling', report)
-                    except (ObservationUnavailable, WorkerStopped):
+                    except ObservationUnavailable:
                         raise
+                    except WorkerStopped:
+                        row = self.store.get(self.key)
+                        if (row['stop_requested'] or (row['elapsed_seconds'] < row['max_seconds']
+                                and time.monotonic() < getattr(self.backend, 'deadline', float('inf')))):
+                            raise
+                        # Correctness/evaluation is already committed. Optional
+                        # diagnostics exhausting the deadline cannot erase it or
+                        # leave a zero-budget pending profile retry forever.
+                        self.store.add_event(self.key, 'profiling-unavailable',
+                            {'reason': 'wall-time budget exhausted after evaluation',
+                             'candidate_sha256': pending['sha256']})
                     except Exception as exc:
                         self.store.add_event(self.key, 'profiling-unavailable', {'error': str(exc)})
                 else:
@@ -332,6 +343,13 @@ class OptimizationLoop:
                 record['content_truncated'] = len(content) > size
                 history.append(record)
             context['history'] = history
+            if 'baseline' in context:
+                baseline = dict(context['baseline'])
+                profiling = baseline.get('profiling')
+                if profiling is not None and len(json.dumps(profiling, ensure_ascii=True)) > 12000:
+                    baseline['profiling'] = {'artifact': self._artifact('baseline-profiling', profiling),
+                        'preview': json.dumps(profiling, ensure_ascii=True)[:1500], 'truncated': True}
+                context['baseline'] = baseline
             for key in ('best', 'phase2'):
                 if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
                     record = self._artifact('context-' + key, context[key])

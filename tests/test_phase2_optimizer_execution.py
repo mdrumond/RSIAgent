@@ -3,7 +3,7 @@ import json
 import pytest
 
 from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
-from optimizer.control import ObservationUnavailable
+from optimizer.control import ObservationUnavailable, WorkerStopped
 from optimizer.jobs import canonical, sha
 
 
@@ -182,6 +182,21 @@ def test_large_memory_and_feedback_are_bounded_but_artifacts_remain_readable(tmp
     assert result['verified']
 
 
+def test_large_baseline_profile_is_hash_readable_not_replayed_into_actor_prompt(tmp_path):
+    execution, agent, backend = executor(tmp_path, [candidate('good')])
+    original_prepare = backend.prepare
+    def prepare(spec, directory):
+        return {**original_prepare(spec, directory), 'profiling': {'raw_report': 'metrics' * 100000}}
+    backend.prepare = prepare
+    assert execution.attempt('target-001')['verified']
+    context = agent.contexts[-1][1]
+    assert len(canonical(context)) < 20000
+    assert context['baseline']['cases'][0]['contract'] == {}
+    profile = context['baseline']['profiling']
+    assert profile['truncated']
+    assert b'raw_report' in execution.store.read_artifact(execution.job_id, profile['artifact']['sha256'])
+
+
 def test_read_artifact_pages_are_contiguous_and_visible_in_context(tmp_path):
     execution, agent, backend = executor(tmp_path, [])
     artifact = execution.store.put_artifact(execution.job_id, 'long-log', b'a' * 1500 + b'NEXT' + b'b' * 1500)
@@ -215,3 +230,63 @@ def test_task_directories_have_distinct_jobs_and_remote_workspaces(tmp_path):
     roots = [RemoteBackend(item.store, item.job_id, {'remote_workspace': '/configured/workspace'}).remote
              for item in (first, second)]
     assert roots[0] != roots[1]
+
+
+def test_completed_attempt_rejects_changed_memory_or_feedback(tmp_path):
+    execution, _, _ = executor(tmp_path, [candidate('good')])
+    memory = snapshot([{'lesson': 'original'}])
+    result = execution.attempt('target-001', memory_snapshot=memory, feedback={'failure': 'original'})
+    assert execution.attempt('target-001', memory_snapshot=memory, feedback={'failure': 'original'}) == result
+    for kwargs in ({'memory_snapshot': snapshot([{'lesson': 'changed'}]), 'feedback': {'failure': 'original'}},
+                   {'memory_snapshot': memory, 'feedback': {'failure': 'changed'}}):
+        with pytest.raises(ValueError, match='original memory and feedback'):
+            execution.attempt('target-001', **kwargs)
+
+
+@pytest.mark.parametrize('key', ['cpl_remote', 'validation_wrapper'])
+def test_transport_identity_cannot_change_on_resume(tmp_path, key):
+    execution, _, _ = executor(tmp_path, [])
+    config = {**execution.config, key: '/different/transport'}
+    with pytest.raises(ValueError, match='execution configuration changed'):
+        OptimizerTaskExecutor(execution.directory, execution.task, snapshot(), config)
+
+
+def test_attempt_input_events_contain_only_hash_references_not_bulk_memory(tmp_path):
+    execution, _, _ = executor(tmp_path, [candidate('good')])
+    memory = snapshot([{'lesson': 'x' * 1000000}])
+    feedback = {'error': 'y' * 1000000}
+    execution.attempt('target-001', memory_snapshot=memory, feedback=feedback)
+    request = execution._event('phase2-attempt-request')
+    assert len(canonical(request)) < 1000
+    for key, expected in [('memory_snapshot', memory), ('feedback', feedback)]:
+        assert json.loads(execution.store.read_artifact(execution.job_id, request[key]['sha256'])) == expected
+    assert (execution.job_directory / 'events.jsonl').stat().st_size < 250000
+
+
+def test_optional_profile_deadline_does_not_lose_verified_evaluation(tmp_path):
+    execution, agent, backend = executor(tmp_path, [candidate('good')])
+    def profile(*args, **kwargs):
+        execution.store.account_time(execution.job_id, 7201)
+        raise WorkerStopped('deadline expired during optional diagnostics')
+    backend.profile = profile
+    result = execution.attempt('target-001')
+    assert result['verified']
+    assert 'pending' not in execution._state()
+    assert execution.attempt('target-001') == result
+    assert len(backend.evaluations) == 1
+    assert any(event['kind'] == 'profiling-unavailable' for event in execution.store.events(execution.job_id))
+
+
+@pytest.mark.parametrize('failure', ['explicit-stop', 'uncertain-cancellation'])
+def test_optional_profile_honors_stop_and_uncertain_observation(tmp_path, failure):
+    execution, _, backend = executor(tmp_path, [candidate('good')])
+    def profile(*args, **kwargs):
+        if failure == 'explicit-stop':
+            execution.store.stop(execution.job_id)
+            raise WorkerStopped('explicit user stop')
+        raise ObservationUnavailable('cancellation still uncertain')
+    backend.profile = profile
+    with pytest.raises(WorkerStopped if failure == 'explicit-stop' else ObservationUnavailable):
+        execution.attempt('target-001')
+    assert 'evaluation' in execution._state()['pending']
+    assert execution._event('phase2-attempt-result') is None

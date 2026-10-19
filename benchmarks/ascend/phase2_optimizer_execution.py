@@ -37,7 +37,7 @@ class OptimizerTaskExecutor:
         self.job_directory = self.store.root / self.job_id
         identity = {'task': task, 'runtime': {key: config.get(key) for key in (
             'target', 'profile', 'runtime', 'arch', 'physical_device', 'remote_workspace',
-            'max_cases', 'knowledge', 'model_profile')}}
+            'cpl_remote', 'validation_wrapper', 'max_cases', 'knowledge', 'model_profile')}}
         if config.get('guide'):
             identity['guide_sha256'] = sha(Path(config['guide']).read_bytes())
         previous = self._event('phase2-task')
@@ -56,6 +56,12 @@ class OptimizerTaskExecutor:
 
     def _read(self, artifact):
         return json.loads(self.store.read_artifact(self.job_id, artifact['sha256']))
+
+    def _input_reference(self, name, value):
+        if value is None:
+            return None
+        data = canonical(value)
+        return {'name': name, 'sha256': sha(data), 'size': len(data)}
 
     def _loop(self):
         config = self.config
@@ -105,10 +111,16 @@ class OptimizerTaskExecutor:
                 stopped=lambda: self.store.get(self.job_id)['stop_requested']):
             events = self.store.events(self.job_id)
             results = [event['payload'] for event in events if event['kind'] == 'phase2-attempt-result']
+            request = {'attempt_id': attempt_id,
+                'memory_snapshot': self._input_reference('phase2-attempt-memory', memory_snapshot),
+                'feedback': self._input_reference('phase2-attempt-feedback', feedback)}
+            recorded = next((event['payload'] for event in events if event['kind'] == 'phase2-attempt-request'
+                             and event['payload']['attempt_id'] == attempt_id), None)
+            if recorded is not None and recorded != request:
+                raise ValueError('resume the pending attempt with its original memory and feedback')
             completed = next((row for row in results if row['attempt_id'] == attempt_id), None)
             if completed is not None:
                 return completed
-            request = {'attempt_id': attempt_id, 'memory_snapshot': memory_snapshot, 'feedback': feedback}
             active = self._event('phase2-attempt-request')
             if active is not None and active['attempt_id'] not in {row['attempt_id'] for row in results}:
                 if active != request:
@@ -124,6 +136,10 @@ class OptimizerTaskExecutor:
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'}:
                     self.store.resume(self.job_id, additional_attempts=1,
                         additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                for record, value in ((request['memory_snapshot'], memory_snapshot),
+                                      (request['feedback'], feedback)):
+                    if record is not None:
+                        self.store.put_artifact(self.job_id, record['name'], canonical(value))
                 self.store.add_event(self.job_id, 'phase2-attempt-request', request)
             loop = self._loop()
             # A crash after evaluation but before this result checkpoint is
