@@ -262,8 +262,9 @@ def _compile_case(source, contract, directory, *, arch, block_count, cache_direc
                           'build': spec, 'namespace': namespace, 'cache_key': key}
                 (root / 'compiled.json').write_text(json.dumps(record))
             finally:
-                if (root / 'compile.log').is_file():
-                    shutil.copy2(root / 'compile.log', output / 'compile.log')
+                for name in ('kernel.cpp', 'build.json', 'command.json', 'compile.log'):
+                    if (root / name).is_file():
+                        shutil.copy2(root / name, output / name)
         for name in ('kernel.cpp', 'build.json', 'command.json', 'compiled.json', 'compile.log'):
             shutil.copy2(root / name, output / name)
         library = root / 'kernel.so'

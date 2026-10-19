@@ -129,6 +129,9 @@ def test_failed_compile_not_published(tmp_path, monkeypatch, compiler):
     with pytest.raises(RuntimeError, match='compiler failed'):
         build(tmp_path, 'failed')
     assert 'diagnostic' in (tmp_path / 'failed' / 'compile.log').read_text()
+    for name in ('kernel.cpp', 'build.json', 'command.json'):
+        assert (tmp_path / 'failed' / name).is_file()
+    assert not (tmp_path / 'failed' / 'compiled.json').exists()
     assert not list((tmp_path / 'cache').glob('*/compiled.json'))
     monkeypatch.setattr(native.subprocess, 'run', original)
     assert not build(tmp_path, 'retry')[1]['cache_hit']
