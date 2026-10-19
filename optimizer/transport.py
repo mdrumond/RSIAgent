@@ -116,6 +116,10 @@ class CheckedTransport:
             with (directory / 'transport.log').open('ab') as stream:
                 stream.write(output.encode())
             for line in output.splitlines():
+                if line.startswith('BZ_A3_JOB_STATE='):
+                    observed = line.split('=', 1)[1].split()[0]
+                    if observed in {'failed', 'cancelled', 'missing'}:
+                        state['state'] = 'failed'
                 for prefix, key in [('BZ_A3_REMOTE_HANDLE=', 'native_handle'),
                                     ('CATLASS_VALIDATION_HANDLE=', 'handle'),
                                     ('CATLASS_VALIDATION_STATE=', 'state')]:

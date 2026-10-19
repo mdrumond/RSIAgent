@@ -54,6 +54,16 @@ def test_stop_cancels_retained_native_handle(tmp_path):
     assert calls[0][-2:] == ['cancel', 'remote:bz-a3-1:job:abc']
 
 
+def test_failed_profile_observer_is_terminal(tmp_path):
+    directory = tmp_path / 'op'
+    directory.mkdir()
+    (directory / 'transport.json').write_text(json.dumps({'state': 'running', 'native_handle': 'remote:bz-a3-1:job:abc', 'handle': 'bz-a3-1:abc'}))
+    def run(argv, **kwargs):
+        return SimpleNamespace(returncode=1, stdout='BZ_A3_JOB_STATE=failed exit=1', stderr='compile failed')
+    with pytest.raises(RuntimeError, match='remote operation failed'):
+        CheckedTransport(config(tmp_path), run=run).execute(directory, ['true'])
+
+
 def test_exclusive_lock_rejects_second_worker(tmp_path):
     with exclusive(tmp_path / 'lock'):
         with pytest.raises(BlockingIOError):
