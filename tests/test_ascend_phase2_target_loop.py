@@ -235,14 +235,14 @@ def test_seed_and_failed_practice_ids_are_corrected_before_execution(tmp_path):
     calls = []
     c.curriculum = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
     assert c.run_attempt()["practice_attempts"] == 1
-    initial = json.loads(calls[0][1]["content"].rsplit("\n", 1)[-1])
+    initial = json.loads(calls[0][-1]["content"].rsplit("\n", 1)[-1])
     assert c.seed_outcomes[0]["project_id"] in initial["used_project_ids"]
     assert "fresh project ID" in calls[1][-1]["content"]
     # A failed practice also reserves its ID after reloading retained state.
     calls.clear()
     replies = iter([wire("PRACTICE", first), wire("PRACTICE", practice(c, "second")), wire("READY")])
     assert c.resume()["status"] == "READY"
-    initial = json.loads(calls[0][1]["content"].rsplit("\n", 1)[-1])
+    initial = json.loads(calls[0][-1]["content"].rsplit("\n", 1)[-1])
     assert first.project_id in initial["used_project_ids"]
     assert "fresh project ID" in calls[1][-1]["content"]
     assert [r.spec.project_id for r in requests] == [c.target.spec.project_id,
@@ -345,6 +345,33 @@ def test_archive_ready_requires_final_verified_target(tmp_path, monkeypatch, bou
     _verify_adaptive_state(c.root, state)
     state["terminal"] = {"status": "READY", "reason": "unsupported readiness claim"}
     with pytest.raises(ValueError, match="READY requires a final host-verified target attempt"):
+        _verify_adaptive_state(c.root, state)
+    c._atomic_json(c.root / "state.json", state)
+    assert {"kind": "invalid-adaptive-memory-chain"} in inventory_campaign(c.root)["issues"]
+
+
+@pytest.mark.parametrize("boundary", ["initial", "completed", "pending-target", "pending-practice"])
+def test_archive_next_kind_matches_completed_history_including_pending_work(tmp_path, monkeypatch, boundary):
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state, inventory_campaign
+    def execute(request, ordinal):
+        if (boundary == "pending-target" and ordinal == 1
+                or boundary == "pending-practice" and ordinal == 2):
+            raise OSError("transport interrupted")
+        return _result(request.spec, True, "actual host verdict")
+    c, _, _ = build(tmp_path, [], execute=execute)
+    c.curriculum = TargetCurriculumAgent(lambda _: wire("PRACTICE", practice(c)))
+    if boundary in {"completed", "pending-practice"}:
+        c.run_attempt()
+    if boundary.startswith("pending-"):
+        with pytest.raises(RuntimeError):
+            c.run_attempt()
+        assert (c.root / "pending.json").exists()
+    state = c._load_state()
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    _verify_adaptive_state(c.root, state)
+    state["next_kind"] = "review" if state["next_kind"] == "target" else "target"
+    with pytest.raises(ValueError, match="next attempt kind differs"):
         _verify_adaptive_state(c.root, state)
     c._atomic_json(c.root / "state.json", state)
     assert {"kind": "invalid-adaptive-memory-chain"} in inventory_campaign(c.root)["issues"]
