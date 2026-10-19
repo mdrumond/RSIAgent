@@ -14,7 +14,7 @@ from benchmarks.a3kernels.native_candidate import native_infrastructure_failure
 from benchmarks.a3kernels.remote_candidate import _PendingObservation
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from benchmarks.ascend.production import (
-    NativeProductionConfig, NativeProjectBackend, build_native_adaptive_phase1,
+    NativeProductionConfig, NativeProjectBackend, NativeProjectWorker, build_native_adaptive_phase1,
 )
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_adaptive_production import _measurement_action
@@ -107,13 +107,24 @@ def load_native_config(path):
     """Load machine-local settings; persist content identities, never this mapping."""
     config = json.loads(Path(path).read_text())
     required = ("guide", "target", "arch", "execution_profile", "cpl_skills_revision",
-                "cpl_remote", "validation_wrapper", "remote_workspace", "physical_device", "environment_identity")
+                "cpl_remote", "validation_wrapper", "remote_workspace", "environment_identity")
     missing = [name for name in required if name not in config]
     if missing:
         raise ValueError("native runtime config missing fields: " + ", ".join(missing))
     if any(not config["environment_identity"].get(k) for k in ("cann_version", "profiler_version")):
         raise ValueError("native runtime config requires discovered CANN/profiler versions")
+    native_devices(config)
     return config
+
+
+def native_devices(config):
+    """Explicit, caller-checked device pool; omission preserves serial behavior."""
+    devices = config.get("physical_devices", [config.get("physical_device")])
+    if (not isinstance(devices, list) or not devices
+            or any(type(device) is not int or device < 0 for device in devices)
+            or len(set(devices)) != len(devices)):
+        raise ValueError("physical_devices must be a nonempty list of distinct nonnegative device IDs")
+    return devices
 
 
 def native_transport(config, root, *, factory=BZA3RemoteCandidateBackend):
@@ -172,19 +183,28 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             environment_identity=config["environment_identity"],
             profiling_mode=args.profiling,
         )
-        transport = native_transport(config, args.root, factory=transport_factory)
-        backend = NativeProjectBackend(transport, args.root / "native-measurement-evidence",
-            target=config["target"], arch=config["arch"], profile=config["execution_profile"])
-        measurements = NativeProjectMeasurements(backend, config, args.root / "measurements",
-                                                  factory=measurement_factory)
+        workers = []
+        for device in native_devices(config):
+            worker_root = (args.root / "native-workers" / f"device-{device}"
+                           if "physical_devices" in config else args.root)
+            worker_config = {**config, "physical_device": device}
+            transport = native_transport(worker_config, worker_root, factory=transport_factory)
+            backend = NativeProjectBackend(transport, worker_root / "native-measurement-evidence",
+                target=config["target"], arch=config["arch"], profile=config["execution_profile"])
+            measurements = NativeProjectMeasurements(backend, worker_config, worker_root / "measurements",
+                                                      factory=measurement_factory)
+            workers.append(NativeProjectWorker(worker_root, transport,
+                _measurement_action(measurements, profiling=True),
+                _measurement_action(measurements, profiling=False)))
+        first = workers[0]
         guidance = _guidance(config["profiling_guide"]) if args.profiling == "new" else None
         result = getattr(native_builder(
-            config=native_config, native_transport=transport, profile=profile, guide_bytes=guide,
+            config=native_config, native_transport=first.transport, profile=profile, guide_bytes=guide,
             objective=args.objective, initial_memory=memory,
             environment=environment_loader(env_file=args.env_file), provider_transport=provider_transport,
             embeddings=embeddings, project_target=args.project_target, max_projects=args.max_projects,
-            request_timing=_measurement_action(measurements, profiling=False),
-            request_profile=_measurement_action(measurements, profiling=True),
+            request_timing=first.request_timing, request_profile=first.request_profile,
+            **({"project_workers": tuple(workers)} if "physical_devices" in config else {}),
             profiling_guidance=guidance,
         ), args.action)()
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

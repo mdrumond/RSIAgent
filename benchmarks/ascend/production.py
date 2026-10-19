@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 import re
+from queue import Queue
+from threading import Lock
 
 from benchmarks.ascend.contracts import CompileObservation, RuntimeObservation
 from benchmarks.ascend.targets import a3_curriculum_policy
@@ -23,13 +25,14 @@ def compose_adaptive_controller(
     diagnostic_instructions=None,
     unavailable_capabilities=(),
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
+    project_actor=None,
 ):
     """One action loop, curriculum and progressive-memory controller for both targets."""
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
     from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
     from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 
-    project_actor = AdaptiveActorProjectExecutor(
+    project_actor = project_actor or AdaptiveActorProjectExecutor(
         executor, actor, profile, query_knowledge=query_knowledge,
         request_profile=request_profile, request_timing=request_timing,
         request_diagnostic=request_diagnostic, immutable_context=immutable_context,
@@ -84,12 +87,52 @@ class NativeProductionConfig:
         a3_curriculum_policy(dtypes=self.dtypes)
 
 
+@dataclass(frozen=True)
+class NativeProjectWorker:
+    """One exclusively assigned device's transport, evidence, and measurements."""
+
+    root: Path
+    transport: object
+    request_profile: object = None
+    request_timing: object = None
+
+
+class NativeProjectPool:
+    """Exclusive slots; stop dispatch after infrastructure/unknown exceptions."""
+
+    def __init__(self, actors):
+        self.actors = Queue()
+        self.failure = None
+        self.lock = Lock()
+        for actor in actors:
+            self.actors.put(actor)
+
+    def __call__(self, request):
+        from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+        actor = self.actors.get()
+        try:
+            with self.lock:
+                if self.failure is not None:
+                    raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
+            return actor(request)
+        except SemanticProjectFailure:
+            raise
+        except Exception as exc:
+            with self.lock:
+                if self.failure is None:
+                    self.failure = exc
+            raise
+        finally:
+            self.actors.put(actor)
+
+
 def build_native_adaptive_phase1(
     *, config, native_transport, profile, guide_bytes, objective, initial_memory,
     environment, provider_transport=None, embeddings=None, project_target=None,
     max_projects=None, request_profile=None, request_timing=None,
     profiling_guidance=None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
+    project_workers=(),
 ):
     """Compose native A3 learning without a Catlass checkout requirement.
 
@@ -103,6 +146,16 @@ def build_native_adaptive_phase1(
     from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider
     from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
     from benchmarks.a5kernels.trial import _SYSTEM_PROMPT
+    from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
+
+    if project_workers and reviewed_snapshot is not None:
+        raise ValueError("adaptive Phase 2 remains serial")
+    if project_workers:
+        request_profile = project_workers[0].request_profile
+        request_timing = project_workers[0].request_timing
+        if any((worker.request_profile is not None, worker.request_timing is not None) !=
+               (request_profile is not None, request_timing is not None) for worker in project_workers):
+            raise ValueError("native workers must support the same measurement actions")
 
     if not isinstance(guide_bytes, bytes) or not guide_bytes:
         raise ValueError("native programming guide must be non-empty bytes")
@@ -144,6 +197,12 @@ def build_native_adaptive_phase1(
                                         else {manifest.collection: manifest.fingerprint
                                               for manifest in manifests})
         query = _knowledge_action(config, embeddings)
+        # The pinned local embedding model is shared; its tokenizer/model need
+        # not support overlapping calls. SQLite readers/journals remain local.
+        query_action, query_lock = query, Lock()
+        def query(payload, context):
+            with query_lock:
+                return query_action(payload, context)
     elif config.collection is not None or embeddings is not None:
         raise ValueError("KDB-off native treatment cannot receive KDB dependencies")
     root = Path(config.root)
@@ -161,20 +220,40 @@ def build_native_adaptive_phase1(
         {"transport": provider_transport} if provider_transport is not None else {}
     ))
     actor = DirectActorDriver(provider, system_prompt=_SYSTEM_PROMPT.replace("one A5 kernel", "one A3 Ascend C kernel"))
-    backend = NativeProjectBackend(native_transport, root / "native-evidence",
-                                   target=config.target, arch=config.arch,
-                                   profile=config.execution_profile)
-    executor = ProjectExecutor(backend, EvidenceLedger(root / "project-evidence.jsonl"),
-                               binding=NativeProjectBinding(dtypes=config.dtypes))
+    executor = None
+    if not project_workers:
+        backend = NativeProjectBackend(native_transport, root / "native-evidence",
+                                       target=config.target, arch=config.arch,
+                                       profile=config.execution_profile)
+        executor = ProjectExecutor(backend, EvidenceLedger(root / "project-evidence.jsonl"),
+                                   binding=NativeProjectBinding(dtypes=config.dtypes))
+    context = canonical_bytes({"identity": identity, "programming_guide": guide_text})
+    diagnostics = "Debugger and sanitizer routes are unavailable in this native composition.\n"
+    pool = None
+    if project_workers:
+        actors = []
+        for worker in project_workers:
+            worker_backend = NativeProjectBackend(worker.transport, worker.root / "native-evidence",
+                target=config.target, arch=config.arch, profile=config.execution_profile)
+            worker_executor = ProjectExecutor(worker_backend,
+                EvidenceLedger(worker.root / "project-evidence.jsonl"),
+                binding=NativeProjectBinding(dtypes=config.dtypes))
+            actors.append(AdaptiveActorProjectExecutor(worker_executor, actor, profile,
+                query_knowledge=query, request_profile=worker.request_profile,
+                request_timing=worker.request_timing, immutable_context=context,
+                diagnostic_instructions=diagnostics, retain_semantic_failure=True,
+                **({"trace_recorder_factory": trace_recorder_factory}
+                   if trace_recorder_factory is not None else {})))
+        pool = NativeProjectPool(actors)
     _, coordinator = compose_adaptive_controller(
         root=root, objective=objective, initial_memory=initial_memory,
         executor=executor, actor=actor, profile=profile, provider=provider,
-        immutable_context=canonical_bytes({"identity": identity,
-                                            "programming_guide": guide_text}),
+        immutable_context=context,
+        project_actor=pool, max_parallel=len(project_workers) or 1,
         target_policy=policy, profiling_guidance=profiling_guidance,
         trace_recorder_factory=trace_recorder_factory,
         query_knowledge=query, request_profile=request_profile, request_timing=request_timing,
-        diagnostic_instructions="Debugger and sanitizer routes are unavailable in this native composition.\n",
+        diagnostic_instructions=diagnostics,
         project_target=project_target, max_projects=max_projects,
         reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
         unavailable_capabilities=tuple(capability for capability, action in (

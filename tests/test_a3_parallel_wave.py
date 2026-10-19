@@ -1,0 +1,236 @@
+"""Independent native device slots inside the existing publication barrier."""
+
+from concurrent.futures import ThreadPoolExecutor
+import json
+from pathlib import PurePosixPath
+from threading import Barrier, Lock, local
+import time
+
+import pytest
+
+from benchmarks.ascend.phase1_cli import main, native_devices
+from benchmarks.ascend.production import NativeProjectPool
+from benchmarks.a3kernels.candidate import CandidateCompilation
+from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt
+from benchmarks.a5kernels.evidence import canonical_digest
+from benchmarks.a5kernels.phase1_provider import DirectCompletion
+
+
+@pytest.mark.parametrize("value", [[], [1, 1], [-1], [True], "1,2", None])
+def test_pool_rejects_invalid_devices(value):
+    with pytest.raises(ValueError, match="physical_devices"):
+        native_devices({"physical_devices": value})
+
+
+def test_legacy_device_and_explicit_pool():
+    assert native_devices({"physical_device": 7}) == [7]
+    assert native_devices({"physical_device": 7, "physical_devices": [2, 3]}) == [2, 3]
+
+
+def test_failed_project_unblocks_slots_without_dispatch_until_recovered():
+    seen = []
+    def execute(request):
+        seen.append(request)
+        if request == "fail":
+            raise RuntimeError("provider interrupted")
+        return request
+    pool = NativeProjectPool([execute])
+    with pytest.raises(RuntimeError, match="interrupted"):
+        pool("fail")
+    with ThreadPoolExecutor() as threads:
+        future = threads.submit(pool, "next")
+        with pytest.raises(RuntimeError, match="settle retained operations"):
+            future.result(timeout=2)
+    assert seen == ["fail"]
+    # Explicit recovery starts a fresh pool, never reuses uncertain device state.
+    assert NativeProjectPool([execute])("next") == "next"
+
+
+def test_semantic_project_failure_does_not_stop_the_pool():
+    from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+    def execute(request):
+        if request == "fail":
+            raise SemanticProjectFailure("no valid candidate", {})
+        return request
+    pool = NativeProjectPool([execute])
+    with pytest.raises(SemanticProjectFailure):
+        pool("fail")
+    assert pool("next") == "next"
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_path, capsys, interrupt):
+    guide = tmp_path / "guide.md"
+    guide.write_text("Native guide")
+    initial = tmp_path / "initial.md"
+    initial.write_text("")
+    config = dict(guide=str(guide), target="discovered-a3", arch="discovered-arch",
+        execution_profile="bz-a3-1", cpl_skills_revision="a" * 40,
+        cpl_remote="/tools/cpl-remote", validation_wrapper="/checked/catlass-validation.sh",
+        remote_workspace="/owned", physical_devices=[2, 5],
+        environment_identity=dict(cann_version="cann", profiler_version="msprof"))
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    root = tmp_path / "campaign"
+    barrier, lock = Barrier(2), Lock()
+    transports, measurements, openings = [], [], []
+    first_run = True
+
+    class Transport:
+        def __init__(self, **kwargs):
+            self.device = kwargs["physical_device"]
+            self.state = kwargs["state_directory"]
+            self.first = True
+            transports.append(self)
+        def compile(self, plan, directory):
+            if self.first and first_run:
+                self.first = False
+                barrier.wait(timeout=5)  # Fails if the CLI silently remains serial.
+            assert f"device-{self.device}" in str(directory)
+            return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
+        def execute_receipt(self, compiled):
+            if interrupt and first_run and compiled.plan.project_id == "copy-1":
+                raise OSError("temporary host failure")
+            return ExecutionReceipt(0, compiled.plan.inputs[0].values, "synchronized")
+        def remote_candidate_directory(self, plan):
+            return PurePosixPath("/owned/.rsi-a3/candidates") / plan.execution_id
+
+    class Measurement:
+        def __init__(self, **kwargs):
+            self.plan = kwargs["compilation"].plan
+            self.device = kwargs["physical_device"]
+            assert self.device == kwargs["candidate_backend"].device
+            assert f"device-{self.device}" in str(kwargs["evidence_directory"])
+        def result(self, kind):
+            with lock:
+                measurements.append((self.plan.project_id, self.device, kind))
+            payload = dict(project=self.plan.project_id, device=self.device, kind=kind)
+            digest = canonical_digest(payload)
+            return dict(identity=dict(output=dict(shape=list(self.plan.output.shape),
+                logical_shape=list(self.plan.output.logical_shape))), summary=dict(median_us=1.0, kind=kind),
+                artifact_payloads={digest: payload})
+        def timing(self, **kwargs):
+            return self.result("timing")
+        def capture(self, metric):
+            return self.result("profile")
+
+    state = local()
+    source = 'extern "C" __global__ __aicore__ void project_kernel(GM_ADDR gm_input0, GM_ADDR gm_output) {}'
+    actions = [json.dumps({"write": {"slot": "kernel", "content": source}}),
+               '{"run":{}}', '{"request-timing":{}}', '{"request-profile":{}}', '{"submit":{}}']
+
+    def provider(**kwargs):
+        messages = kwargs["request"]["messages"]
+        if "Curriculum Agent" in messages[0]["content"]:
+            context = json.loads(messages[-1]["content"].rsplit("\n", 1)[-1])
+            projects = []
+            for i, size in enumerate((4, 8)):
+                spec = dict(project_id=f"copy-{i}", capabilities=["gm-ub-movement", "timing-sweep", "profiling"],
+                    shape=[size], dtype="float32", block_count=1, padding_multiple=1, failure_mode="none",
+                    timing_lengths=[size, size + 1], profile_metric="pipe-utilization", hypothesis="Study native movement.",
+                    graph=dict(inputs=[dict(name="x", shape=[size])], nodes=[
+                        dict(name="out", op="copy", operands=["x"], axis=None)], output="out"))
+                projects.append(dict(spec=spec, requires=[]))
+            text = "DECISION: WAVE\n" + json.dumps(dict(wave_id=context["next_wave_id"],
+                pre_wave_memory_sha256=context["pre_wave_memory_sha256"],
+                pre_wave_coverage=context["pre_wave_coverage"], projects=projects))
+        elif "Distill only" in messages[0]["content"] or "Distill only" in messages[-1]["content"]:
+            text = '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
+        else:
+            index = getattr(state, "index", 0)
+            if index == 0:
+                with lock:
+                    openings.append(messages[1]["content"])
+            text = actions[index]
+            state.index = index + 1
+        return DirectCompletion(text, 1)
+
+    args = ["--target", "a3", "run", "--root", str(root), "--objective", "Learn native measurement",
+        "--initial-memory", str(initial), "--config", str(path), "--model", "openai/gpt-5.6-sol",
+        "--knowledge", "without-kdb", "--profiling", "without-profiling-guidance",
+        "--project-target", "2", "--max-projects", "2"]
+    deps = dict(transport_factory=Transport, provider_transport=provider, measurement_factory=Measurement,
+        environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
+    if interrupt:
+        with pytest.raises(RuntimeError, match="failed before verification"):
+            main(args, **deps)
+        sibling = root / "waves/wave-001/branches/copy-0"
+        preserved = {p: p.read_bytes() for p in sibling.rglob("*") if p.is_file()}
+        assert (sibling / "outcome.json").exists()
+        first_run = False
+        main(["resume" if arg == "run" else arg for arg in args], **deps)
+        assert preserved == {p: p.read_bytes() for p in preserved}
+    else:
+        main(args, **deps)
+    assert {transport.device for transport in transports} == {2, 5}
+    assert len({transport.state for transport in transports}) == 2
+    assert all("native-workers" in str(transport.state) for transport in transports)
+    assert len(openings) == (3 if interrupt else 2)
+    # Both projects see exactly the same production context and pre-wave memory.
+    assert openings[0].split("\nPre-wave memory (immutable, readable index): ")[1] == openings[1].split(
+        "\nPre-wave memory (immutable, readable index): ")[1]
+    for project in ("copy-0", "copy-1"):
+        rows = [row for row in measurements if row[0] == project]
+        assert {row[2] for row in rows} == {"timing", "profile"}
+        assert len({row[1] for row in rows}) == 1
+    if not interrupt:
+        assert len({row[1] for row in measurements}) == 2
+    publication = root / "waves/wave-001/published.json"
+    before = {p: p.read_bytes() for p in root.glob("waves/wave-001/branches/*/*") if p.is_file()}
+    assert publication.exists()
+    assert list(json.loads(publication.read_bytes())["commits"])[0]["project_id"] == "copy-0"
+    main(["resume" if arg == "run" else arg for arg in args], **deps)
+    assert before == {p: p.read_bytes() for p in before}
+    assert len(openings) == (3 if interrupt else 2)
+
+
+def test_phase2_rejects_parallel_workers_before_opening_state(tmp_path):
+    from benchmarks.ascend.production import build_native_adaptive_phase1
+    with pytest.raises(ValueError, match="Phase 2 remains serial"):
+        build_native_adaptive_phase1(config=None, native_transport=None, profile=None,
+            guide_bytes=b"guide", objective="phase2", initial_memory=b"", environment={},
+            project_workers=(object(),), reviewed_snapshot=object())
+
+
+def test_parallel_actors_serialize_shared_kdb_query(tmp_path, monkeypatch):
+    import hashlib
+    from benchmarks.ascend.production import (
+        NativeProductionConfig, NativeProjectWorker, build_native_adaptive_phase1,
+    )
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    from test_expanded_kdb import Embeddings
+    embeddings = Embeddings()
+    source = tmp_path / "source.cpp"
+    source.write_text("Native vector example")
+    kdb = tmp_path / "kdb.sqlite3"
+    with KnowledgeDB(kdb, embeddings) as database:
+        database.index(tmp_path, [source], collection="native", language="ascend-c")
+    active, peak = 0, 0
+    lock = Lock()
+    def query(payload, context):
+        nonlocal active, peak
+        with lock:
+            active += 1
+            peak = max(peak, active)
+        time.sleep(0.02)
+        with lock:
+            active -= 1
+        return payload
+    monkeypatch.setattr("benchmarks.a5kernels.phase1_adaptive_production._knowledge_action",
+                        lambda *args: query)
+    guide = b"Native guide"
+    config = NativeProductionConfig(tmp_path / "campaign", "a3", "arch", "bz-a3-1",
+        hashlib.sha256(guide).hexdigest(), "a" * 40, kdb=kdb, collection="native")
+    coordinator = build_native_adaptive_phase1(config=config, native_transport=None,
+        profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=guide, objective="Learn native kernels",
+        initial_memory=b"", environment=dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"),
+        embeddings=embeddings, project_workers=tuple(
+            NativeProjectWorker(tmp_path / f"worker-{i}", object()) for i in range(2)))
+    actors = list(coordinator.execute_project.actors.queue)
+    with ThreadPoolExecutor(max_workers=2) as threads:
+        calls = [threads.submit(actor.query_knowledge, {"query": "copy"}, None) for actor in actors]
+        assert all(call.result(timeout=2) == {"query": "copy"} for call in calls)
+    assert peak == 1
+
