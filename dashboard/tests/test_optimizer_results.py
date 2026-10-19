@@ -1,4 +1,10 @@
 import json
+import fcntl
+from pathlib import Path
+import shutil
+import subprocess
+
+import pytest
 
 from dashboard.tests.test_optimizer_dashboard import setup, headers
 from optimizer.jobs import canonical
@@ -74,3 +80,64 @@ def test_attempts_and_missing_timings_are_not_zero(setup):
     assert result['cases'][0]['ascendc_us'] is None
     assert result['cases'][1]['torch_us'] is None
     assert result['unavailable'][0]['reason'] == 'not supported'
+
+
+def test_reserved_final_attempt_controls_follow_worker_lock(setup):
+    app, _, _ = setup
+    manager = app.extensions['optimizer']
+    store = manager.store
+    key = store.create('def f(x): return x', 'f', {}, {}, max_attempts=1)['job_id']
+    store.transition(key, 'running')
+    store.record_attempt(key, candidate_sha256='a', result='evaluating')
+    url = f'/api/optimizer/jobs/{key}'
+    client = app.test_client()
+    assert client.get(url).json['worker_active'] is False
+    with (store._directory(key) / 'worker.lock').open('wb') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state = client.get(url).json
+        assert state['status'] == 'budget-exhausted' and state['worker_active'] is True
+    assert client.get(url).json['worker_active'] is False
+
+
+def test_browser_final_attempt_stop_and_resume_controls():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node required for browser control regression')
+    source = Path(__file__).parents[1] / 'static' / 'optimizer.js'
+    script = r'''
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const source = require('node:fs').readFileSync(process.argv[1], 'utf8');
+(async () => {
+for (const active of [true, false]) {
+  const nodes = new Map();
+  const element = id => {
+    if (!nodes.has(id)) nodes.set(id, {dataset:{jobId:'job'}, addEventListener(){}, parentElement:{addEventListener(){}}});
+    return nodes.get(id);
+  };
+  vm.runInNewContext(source, {
+    document:{querySelector:id=>id==='#optimizer-create'?null:element(id)},
+    crypto:{randomUUID:()=> 'id'}, setInterval(){},
+    fetch:async()=>({ok:true,json:async()=>({status:'budget-exhausted',worker_active:active,handles:[],stop_requested:false})})
+  });
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(element('#optimizer-stop').disabled, !active);
+  assert.equal(element('#optimizer-resume').hidden, active);
+}
+})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+    subprocess.run([node, '-e', script, str(source)], check=True)
+
+
+def test_profile_attempt_uses_configuration_identity(setup):
+    app, _, _ = setup
+    store = app.extensions['optimizer'].store
+    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
+    profiling = store.put_artifact(key, 'profiling', canonical({'groups': [
+        {'group': 'Memory', 'available': True, 'reports': [{'metrics': [{'value': 1}]}]}]}))
+    history = [{'candidate_sha256': 'same-source', 'configuration_sha256': config}
+               for config in ('one-block', 'two-blocks')]
+    store.add_event(key, 'optimizer-state', {'history': history, 'best': {
+        **history[1], 'profiling': profiling}})
+    result = app.test_client().get(f'/api/optimizer/jobs/{key}/results').json
+    assert result['metrics'][0]['attempt'] == 2

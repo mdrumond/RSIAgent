@@ -61,8 +61,8 @@
       document.querySelector('#optimizer-progress').textContent = `${state.status} · ${state.stage}${state.stop_requested ? ' · stop requested' : ''}`;
       document.querySelector('#optimizer-budget').textContent = `${state.attempts} / ${state.max_attempts} attempts; ${Math.round(state.elapsed_seconds)} / ${state.max_seconds} seconds`;
       document.querySelector('#optimizer-handles').textContent = state.handles.map(row => `${row.operation}: ${row.handle}`).join('\n');
-      document.querySelector('#optimizer-stop').disabled = !['running', 'queued'].includes(state.status) || state.stop_requested;
-      document.querySelector('#optimizer-resume').hidden = !['stopped', 'failed', 'budget-exhausted'].includes(state.status);
+      document.querySelector('#optimizer-stop').disabled = !(state.worker_active || ['running', 'queued'].includes(state.status)) || state.stop_requested;
+      document.querySelector('#optimizer-resume').hidden = state.worker_active || !['stopped', 'failed', 'budget-exhausted'].includes(state.status);
     } catch (error) {message.textContent = error.message;}
   }
   document.querySelector('#optimizer-stop').addEventListener('click', async () => {

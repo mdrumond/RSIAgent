@@ -67,7 +67,9 @@ def projection(store, key):
         if record and record['sha256'] not in seen_profiles:
             seen_profiles.add(record['sha256'])
             attempt = next((i for i, row in enumerate(history, 1)
-                            if row['candidate_sha256'] == previous['candidate_sha256']), None)
+                            if (row.get('configuration_sha256') == previous['configuration_sha256']
+                                if previous.get('configuration_sha256') else
+                                row['candidate_sha256'] == previous['candidate_sha256'])), None)
             visit(read(record), {'engine': 'ascendc', 'attempt': attempt,
                                  'candidate_sha256': previous['candidate_sha256']})
     return {'cases': cases, 'attempts': attempts, 'best': None if not best else {

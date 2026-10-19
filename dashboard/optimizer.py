@@ -1,5 +1,6 @@
 """Optimizer HTTP adapter. Python submissions are only executed by detached workers."""
 import hashlib
+import fcntl
 import json
 from pathlib import Path
 import secrets
@@ -45,6 +46,19 @@ class OptimizerDashboard:
         except OSError as error:
             self.store.add_event(job_id, 'worker-launch-failed', {'error': str(error)})
             self.store.transition(job_id, 'failed', stage='worker-launch-failed')
+
+    def worker_active(self, job_id):
+        """The detached worker owns this lock even while awaiting its device."""
+        path = self.store._directory(job_id) / 'worker.lock'
+        try:
+            with path.open('rb') as stream:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return True
+                return False
+        except FileNotFoundError:
+            return False
 
     def action(self, action, job_id, data, key):
         if not key or len(key) > 200:
@@ -134,6 +148,7 @@ def register_optimizer(app, config_path, csrf_token, launcher=None):
                 result['memory_snapshot']['memory_count'] = len(snapshot.get('memory_entries', []))
             elif '/events' not in request.path:
                 result = manager.store.get(job_id)
+                result['worker_active'] = manager.worker_active(job_id)
             else:
                 manager.store.get(job_id)
                 events = manager.store.events(job_id)
