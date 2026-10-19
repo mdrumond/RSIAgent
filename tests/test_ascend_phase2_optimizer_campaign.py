@@ -192,3 +192,49 @@ def test_cli_composition_pins_worker_config_and_reviewed_treatment(tmp_path, mon
     path.write_text("{}")
     with pytest.raises(ValueError, match="configuration changed"):
         campaign_cli._optimizer_controller(job, {"optimizer_worker_config": str(path)}, None, composed, native)
+
+
+@pytest.mark.parametrize("rejection", ["bad-reference", "duplicate-id"])
+def test_rejected_practice_is_corrected_before_pending_and_target_retry(tmp_path, rejection):
+    goal, bad, practice = proposal(), proposal(), proposal()
+    bad["task_id"] = goal["task_id"] if rejection == "duplicate-id" else "invalid-practice"
+    bad["submission"]["source"] = "def forward(a,b,r): raise ValueError('shape disagreement')"
+    practice["task_id"] = "corrected-practice"
+    responses = iter([goal, dict(action="practice", reason="repair residual layout"), bad, practice,
+                      dict(action="ready", reason="practice passed"), dict(action="ready", reason="target passed")])
+    messages, attempts = [], []
+    def complete(prompt):
+        messages.append(prompt)
+        return json.dumps(next(responses))
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.task = task
+        def prepare(self):
+            if "raise" in self.task["submission"]["source"]:
+                assert not (tmp_path / "pending.json").exists()
+                raise ValueError("representative shape disagreement")
+            return {}
+        def attempt(self, key, **kwargs):
+            attempts.append(self.task["task_id"])
+            return {"verified": len(attempts) > 1}
+    result = OptimizerPhase2Coordinator(tmp_path, "new", seed(), complete, Executor).resume()
+    assert result["status"] == "READY"
+    assert attempts == [goal["task_id"], practice["task_id"], goal["task_id"]]
+    assert json.loads((tmp_path / "curriculum/practice-001/selection.json").read_bytes())["proposal_count"] == 2
+
+
+def test_curriculum_sees_optimizer_learning_after_large_phase1_index(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.agent_presentation import memory_presentation
+    import base64
+    entries = [{"project_spec": {"project_id": f"seed-{i}"},
+                "agent_lessons": [{"claim": "historical lesson " * 100}]} for i in range(64)]
+    entries.append({"task_id": "practice-residual", "statement": "Frozen suite passed",
+                    "interpretation": "Use physical row strides for residual reads"})
+    raw = json.dumps(dict(initial_memory_base64=base64.b64encode(json.dumps(
+        {"phase1_memory": entries}).encode()).decode(), project_memory_base64=[])).encode()
+    view = memory_presentation(raw, ContentAddressedArtifacts(tmp_path / "cas"))
+    latest = view["projects"][-1]
+    assert latest["project_id"] == "practice-residual"
+    assert latest["host_fact"] == "Frozen suite passed"
+    assert "physical row strides" in latest["interpretation"]

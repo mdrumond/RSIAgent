@@ -100,12 +100,7 @@ class OptimizerPhase2Coordinator:
         name = f"curriculum/review-{len(state['attempts']):03d}.json"
         if (self.root / name).exists():
             return self._read(name)
-        recent = []
-        for row in state["attempts"][-3:]:
-            result = row["result"]
-            recent.append({**{k: row[k] for k in ("attempt_id", "kind", "task_id", "verified")},
-                "feedback": {k: result.get(k) for k in ("classification", "summary", "speedup", "result_artifact")},
-                "host_report": json.dumps(result.get("result"), sort_keys=True)[:12000]})
+        recent = [self._feedback(row) for row in state["attempts"][-3:]]
         context = dict(objective=self.objective, target=state["target"], recent_attempts=recent,
                        targets_remaining=self.target_budget-state["target_attempts"],
                        practices_remaining=self.practice_budget-state["practice_since_target"])
@@ -123,6 +118,13 @@ class OptimizerPhase2Coordinator:
             raise ValueError("invalid Phase 2 review decision")
         self._write(name, decision)
         return decision
+
+    @staticmethod
+    def _feedback(row):
+        result = row["result"]
+        return {**{k: row[k] for k in ("attempt_id", "kind", "task_id", "verified")},
+            "feedback": {k: result.get(k) for k in ("classification", "summary", "speedup", "result_artifact")},
+            "host_report": json.dumps(result.get("result"), sort_keys=True)[:12000]}
 
     def _select(self, state):
         pending = self.root / "pending.json"
@@ -146,13 +148,22 @@ class OptimizerPhase2Coordinator:
                     and state["practice_since_target"] < self.practice_budget
                     and state["target_attempts"] < self.target_budget):
                 kind = "practice"
-                task = self.selector(complete=self.complete, snapshot=self._memory(state),
-                    objective=self.objective, root=self.root / "curriculum" / f"practice-{len(state['attempts']):03d}",
-                    kind="practice", context=dict(target=state["target"], feedback=latest,
-                    reason=decision["reason"], used_task_ids=[state["target"]["task_id"],
-                        *[row["task_id"] for row in state["attempts"]]]), query_knowledge=self.knowledge)
-                if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
-                    raise ValueError("practice must have a fresh task ID")
+                directory = self.root / "curriculum" / f"practice-{len(state['attempts']):03d}"
+                while True:
+                    task = self.selector(complete=self.complete, snapshot=self._memory(state),
+                        objective=self.objective, root=directory, kind="practice",
+                        context=dict(target=state["target"], feedback=self._feedback(latest),
+                        reason=decision["reason"], used_task_ids=[state["target"]["task_id"],
+                            *[row["task_id"] for row in state["attempts"]]]), query_knowledge=self.knowledge)
+                    try:
+                        if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
+                            raise ValueError("practice must have a fresh task ID")
+                        self.factory(self.root / self._directory(task), task, self.seed).prepare()
+                    except (ValueError, TypeError, KeyError) as error:
+                        from .phase2_optimizer_tasks import reject_optimizer_task
+                        reject_optimizer_task(directory, str(error))
+                        continue
+                    break
         if kind == "target" and state["target_attempts"] >= self.target_budget:
             state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Target attempt budget exhausted")
             return None
