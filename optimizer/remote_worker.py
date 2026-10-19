@@ -12,7 +12,7 @@ def execute(request):
     import torch
     import torch_npu
     from .measurement import benchmark
-    from .native import describe_case, evaluate, load_reference
+    from .native import compile_candidate, describe_case, evaluate, load_reference
     from .reference import freeze_reference, prepare_reference
     from .profiles import profile
     torch.npu.set_device('npu:0')
@@ -30,6 +30,9 @@ def execute(request):
             fn = lambda args=args, kwargs=kwargs: prepared.invoke(*args, **kwargs)
             timing = benchmark(fn, directory / (row['case']['id'] + '-torch-timing'))
             result['cases'].append({'case': row['case']['id'], 'contract': describe_case(prepared, row), 'timing': {'torch': timing}})
+    elif operation == 'compile':
+        result = compile_candidate(baseline, request['source'], directory / 'compilation',
+                                   arch=request['arch'], block_count=request['block_count'])
     elif operation == 'evaluate' or request.get('source') is not None:
         result = evaluate(baseline, request['source'], directory / 'evaluation', arch=request['arch'],
                           block_count=request['block_count'], benchmark=operation == 'evaluate', profile=operation == 'profile')

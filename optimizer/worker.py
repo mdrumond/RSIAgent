@@ -143,6 +143,9 @@ class RemoteBackend:
     def evaluate(self, source, directory, *, block_count):
         return self._operation('evaluate', directory, source=source, block_count=block_count)
 
+    def compile(self, source, directory, *, block_count):
+        return self._operation('compile', directory, source=source, block_count=block_count)
+
     def profile(self, source, directory, *, block_count=1):
         return self._operation('profile', directory, source=source, block_count=block_count)
 
