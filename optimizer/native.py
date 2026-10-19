@@ -233,6 +233,11 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
         except Exception as exc:
             result['status'] = 'incorrect'
             record['error'] = f'{type(exc).__name__}: {exc}'
+            log = root / f'case-{i}' / 'compile.log'
+            if log.is_file():
+                # The complete log remains an artifact; include bounded diagnostics
+                # in actor-visible results so compiler failures can be repaired.
+                record['compiler_diagnostics'] = log.read_text(errors='replace')[-24000:]
     if result['status'] == 'verified':
         for record, (row, run) in zip(result['cases'], runners):
             # All input copies happen before capture; verified kernels cannot mutate them.

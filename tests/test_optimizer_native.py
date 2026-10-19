@@ -104,3 +104,14 @@ def test_compile_failure_retained_without_timing(tmp_path, monkeypatch):
     result = native.evaluate(reference(), 'bad', tmp_path, device='cpu', arch='test', benchmark=True)
     assert result['status'] == 'incorrect'
     assert 'compile failed' in result['cases'][0]['error']
+
+
+def test_compiler_diagnostics_are_returned_for_agent_repair(tmp_path, monkeypatch):
+    import subprocess
+    def fail(source, contract, directory, **kwargs):
+        directory.mkdir()
+        (directory / 'compile.log').write_text('kernel.cpp:7: error: unknown identifier MissingApi\n')
+        raise subprocess.CalledProcessError(1, ['bisheng', 'kernel.cpp'])
+    monkeypatch.setattr(native, '_compile_case', fail)
+    result = native.evaluate(reference(), 'bad', tmp_path, device='cpu', arch='test')
+    assert 'unknown identifier MissingApi' in result['cases'][0]['compiler_diagnostics']
