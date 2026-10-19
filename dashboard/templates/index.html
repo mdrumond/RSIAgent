@@ -19,7 +19,7 @@
 {% if proposal.status == 'running' %}<button data-proposal-action="run-approved">Resume/reconcile</button>{% endif %}</form></article>{% endfor %}
 <div id="operation-status">{% for operation in operations %}<p class="operation {{ operation.status }}"><b>{{ operation.action }}</b> {{ operation.status }}{% if operation.error %}: {{ operation.error }}{% endif %}</p>{% endfor %}</div>
 </section>{% endif %}
-<section class="grid">{% for campaign in view.campaigns %}<a class="card" href="{{ url_for('phase_page', number=campaign.phase) }}">
+<section class="grid">{% for campaign in view.campaigns %}<a class="card" href="{{ demo_campaign_urls[loop.index0] if demo_campaign_urls else url_for('phase_page', number=campaign.phase) }}">
 <div class="row"><span class="tag">PHASE {{ campaign.phase }}</span><span class="status {{ campaign.status }}">{{ campaign.status }}</span></div>
 <h2>{{ campaign.name }}</h2><div class="metrics"><b>{{ campaign.stats.attempted }}</b><span>attempted</span><b>{{ campaign.stats.verified }}</b><span>verified</span><b>{{ campaign.stats.published }}</b><span>published</span></div>
 </a>{% endfor %}</section>{% endblock %}

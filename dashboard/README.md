@@ -156,7 +156,16 @@ remote/model work occurs. Missing phases and optimizer jobs stay genuinely empty
 The exporter works even if an optimizer worker configuration is no longer present.
 
 Import later Phase 2 or real optimizer results by rerunning with the same config
-and a **new** output directory; existing snapshots are never overwritten. Local
+and a **new** output directory; existing snapshots are never overwritten.
+Configurations may list several campaigns with the same phase number, including
+production goals, failed goal history and explicitly labeled smoke runs. Static
+campaign pages and their project/trace/performance routes are isolated, so shared
+attempt IDs never overwrite one another. The current `optimizer-phase2` campaign
+format includes committed attempt measurements, source and retained trace data.
+Keep distinct descriptive names in the config; the exporter does not relabel
+validation runs as production. Campaign ordering follows the config.
+
+Local
 campaign artifacts are refreshed against a private SQLite cache backup; cached
 trace payloads remain available if their originals are gone. No worker config,
 credentials, timeline/tensor/binary downloads, or artifact payloads over 20 MiB

@@ -94,21 +94,50 @@ def export_demo(config_path, cache_dir, output):
         store = _ExportStore(private_config, database)
         snapshot = store.refresh()
         app = create_app(private_config, database, refresh_seconds=float('inf'), dashboard_store=store)
-        app.context_processor(lambda: {'demo_timestamp': timestamp})
+        # The live route has one campaign per phase. A portable snapshot may
+        # contain multiple goals/smokes with identical attempt IDs, so give every
+        # campaign its own isolated reader, trace cache and public namespace.
+        repeated_phases = len({row['phase'] for row in snapshot['campaigns']}) != len(snapshot['campaigns'])
+        scopes = [f'/campaign/{index}' if repeated_phases else ''
+                  for index, _ in enumerate(snapshot['campaigns'])]
+        campaign_urls = [scope + f'/phase/{row["phase"]}'
+                         for scope, row in zip(scopes, snapshot['campaigns'])]
+        app.context_processor(lambda: {'demo_timestamp': timestamp,
+                                       'demo_campaign_urls': campaign_urls})
         client = app.test_client()
         pages = ['/', '/memory', '/optimizer']
         endpoints = ['/api/status', '/api/optimizer/jobs']
-        for campaign in snapshot['campaigns']:
+        readers = []
+        campaign_routes = []
+        for index, campaign in enumerate(snapshot['campaigns']):
+            scope = scopes[index]
+            campaign_client, campaign_store = client, store
+            if scope:
+                isolated_config = {**config, 'campaigns': [config['campaigns'][index]]}
+                isolated_path = temporary / f'campaign-{index}.json'
+                isolated_path.write_text(json.dumps(isolated_config))
+                campaign_store = _ExportStore(isolated_path, temporary / f'campaign-{index}.sqlite3')
+                campaign_store._ledgers = store._ledgers
+                campaign_store.refresh()
+                isolated_app = create_app(isolated_path, campaign_store.cache_path,
+                    refresh_seconds=float('inf'), dashboard_store=campaign_store)
+                isolated_app.context_processor(lambda: {'demo_timestamp': timestamp})
+                readers.append(isolated_app)
+                campaign_client = isolated_app.test_client()
+            local_pages, local_endpoints = [], []
             phase = campaign['phase']
-            pages.append(f'/phase/{phase}')
+            local_pages.append(f'/phase/{phase}')
             for project in campaign['projects']:
                 base = f'/api/phase/{phase}/project/{project["id"]}'
-                pages.append(f'/phase/{phase}/project/{project["id"]}')
-                endpoints.extend([base + '/performance', base + '/trace'])
-                trace = store.trace_index(phase, project['id'])
+                local_pages.append(f'/phase/{phase}/project/{project["id"]}')
+                local_endpoints.extend([base + '/performance', base + '/trace'])
+                trace = campaign_store.trace_index(phase, project['id'])
                 for event in (trace or {}).get('events', []):
                     if event.get('available'):
-                        endpoints.extend([event['payload_url'], event['download_url']])
+                        local_endpoints.extend([event['payload_url'], event['download_url']])
+            campaign_routes.extend((scope + route, route, campaign_client, scope)
+                                   for route in dict.fromkeys(local_pages + local_endpoints))
+            pages.extend(scope + route for route in local_pages)
         manager = app.extensions['optimizer']
         for job in manager.store.list():
             key = job['job_id']
@@ -129,9 +158,17 @@ def export_demo(config_path, cache_dir, output):
         (stage / 'data').mkdir(parents=True)
         shutil.copytree(Path(__file__).parent / 'static', stage / 'static')
         manifest, bodies = {}, {}
-        for route in dict.fromkeys(pages + endpoints):
-            response = client.get(route)
+        routes = [(route, route, client, '') for route in dict.fromkeys(pages + endpoints)
+                  if not route.startswith('/campaign/') and not route.startswith(('/phase/', '/api/phase/'))]
+        routes.extend(campaign_routes)
+        for route, local_route, reader, scope in routes:
+            response = reader.get(local_route)
             body, status = response.data, response.status_code
+            if scope and (route in pages or local_route.endswith('/trace')):
+                # Rewrite navigation, lazy data attributes and trace JSON URLs,
+                # but never alter retained raw/download evidence bytes.
+                body = body.replace(b'"/phase/', ('"' + scope + '/phase/').encode())
+                body = body.replace(b'"/api/phase/', ('"' + scope + '/api/phase/').encode())
             try:
                 metadata = '/events' in route or route.endswith('/submission')
                 compact = (metadata or len(body) <= 20 * 1024 * 1024) and '\x00' not in body.decode('utf-8')
@@ -169,6 +206,8 @@ def export_demo(config_path, cache_dir, output):
         (stage / 'requirements.txt').write_text('# Playback uses Python 3 standard library only.\n')
         (stage / 'README.md').write_text(_README)
         app.extensions['dashboard_controls'].close()
+        for reader in readers:
+            reader.extensions['dashboard_controls'].close()
         # Cross-filesystem-safe final publication; destination is exclusively ours.
         shutil.copytree(stage, output)
     return output

@@ -153,3 +153,59 @@ def test_export_ledger_authentication_shared_and_invalidated(campaign, tmp_path,
     assert store._authenticated_ledger(ledger)[1] == 'retained evidence ledger unavailable'
     assert calls[ledger] == 3
     app.extensions['dashboard_controls'].close()
+
+
+def test_multiple_optimizer_phase2_campaigns_keep_attempts_and_traces_distinct(tmp_path):
+    campaigns = []
+    expected = []
+    for index, name in enumerate(('Production goal', 'Completed goal', 'Validation smoke')):
+        root = tmp_path / f'campaign-{index}'
+        jobs = JobStore(root / 'tasks/shared-task/jobs')
+        key = jobs.create('torch reference', 'forward', {}, {})['job_id']
+        source = f'// distinct native kernel {index}'
+        artifact = jobs.put_artifact(key, 'candidate.cpp', canonical(source))
+        baseline = jobs.put_artifact(key, 'baseline', canonical({'cases': [
+            {'case': 'small', 'timing': {'torch': {'latency_us': 12 + index}}}]}))
+        task = {'task_id': 'shared-task', 'submission': {'source': 'torch reference'},
+                'rationale': name}
+        result = {'job_id': key, 'classification': 'host-verified',
+                  'summary': name, 'candidate': artifact, 'baseline': baseline,
+                  'lessons': [{'category': 'movement', 'claim': name, 'confidence': 'verified'}],
+                  'result': {'cases': [{'case': 'small', 'timing': {
+                      'ascendc': {'latency_us': 6 + index}}}]}}
+        jobs.add_event(key, 'phase2-attempt-result', result)
+        attempt = {'attempt_id': 'attempt-001', 'task_id': 'shared-task',
+                   'kind': 'target', 'task': task, 'verified': True,
+                   'execution_directory': 'tasks/shared-task', 'result': result}
+        (root / 'attempts').mkdir()
+        (root / 'attempts/attempt-001.json').write_bytes(canonical(attempt))
+        (root / 'state.json').write_bytes(canonical({
+            'phase': 'optimizer-phase2', 'attempts': [attempt], 'target': task,
+            'terminal': {'status': 'READY'}, 'memory_entries': [{'lesson': name}]}))
+        campaigns.append({'id': f'goal-{index}', 'name': name, 'phase': 2, 'root': str(root)})
+        expected.append((source, artifact['sha256']))
+    config = tmp_path / 'config.json'
+    config.write_bytes(canonical({'campaigns': campaigns}))
+    output = export_demo(config, tmp_path / 'cache', tmp_path / 'demo')
+    manifest = json.loads((output / 'snapshot.json').read_text())['routes']
+    index_page = route(output, '/')[1]
+    for index, (source, digest) in enumerate(expected):
+        scope = f'/campaign/{index}'
+        phase = scope + '/phase/2'
+        assert manifest[phase]['file'].encode() in index_page
+        project = phase + '/project/attempt-001'
+        assert manifest[project]['file'].encode() in route(output, phase)[1]
+        assert manifest[project]['file'].encode() in route(output, '/memory')[1]
+        page = route(output, project)[1]
+        assert f'distinct native kernel {index}'.encode() in page
+        assert f'distinct native kernel {(index + 1) % 3}'.encode() not in page
+        assert (scope + '/api/phase/2/project/attempt-001/performance').encode() in page
+        assert b'Optimizer measurements' in page
+        trace_url = scope + '/api/phase/2/project/attempt-001/trace'
+        trace = json.loads(route(output, trace_url)[1])
+        event = next(row for row in trace['events'] if row['label'] == 'candidate.cpp')
+        assert event['download_url'].startswith(scope + '/')
+        raw = route(output, event['download_url'])[1]
+        assert hashlib.sha256(raw).hexdigest() == digest
+        assert json.loads(raw) == source
+    assert '/phase/2/project/attempt-001' not in manifest
