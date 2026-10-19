@@ -1,6 +1,7 @@
 """Explicit phase campaigns, independent artifact collection, portable checkpoints."""
 import argparse
 from contextlib import redirect_stdout
+from functools import wraps
 import fcntl
 import hashlib
 import io
@@ -159,6 +160,21 @@ def _approval(job, proposal_id):
     return record
 
 
+def _serialized_approval(function):
+    """Serialize public control mutations, including direct Python callers."""
+    @wraps(function)
+    def locked(job, *args, **kwargs):
+        control = Path(job["control"])
+        with (control / "campaign.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise RuntimeError("campaign control is busy; retry after the active operation") from error
+            return function(job, *args, **kwargs)
+    return locked
+
+
+@_serialized_approval
 def sample_curriculum(job, *, builder=build_controller):
     """Retain one model-selected proposal without making it executable."""
     _require_approval_mode(job)
@@ -177,6 +193,7 @@ def sample_curriculum(job, *, builder=build_controller):
     return record
 
 
+@_serialized_approval
 def approve_curriculum(job, project_ids, proposal_id, *, builder=build_controller):
     _require_approval_mode(job)
     record = _approval(job, proposal_id)
@@ -196,6 +213,7 @@ def approve_curriculum(job, project_ids, proposal_id, *, builder=build_controlle
     return record
 
 
+@_serialized_approval
 def reject_curriculum(job, proposal_id, *, builder=build_controller):
     _require_approval_mode(job)
     record = _approval(job, proposal_id)
@@ -203,12 +221,19 @@ def reject_curriculum(job, proposal_id, *, builder=build_controller):
         return record
     if record["status"] != "proposed":
         raise ValueError("only a proposed curriculum can be rejected")
-    builder(job).validate_proposal(record["proposal"])
+    builder(job).discard_proposal(record["proposal"])
     record = {**record, "status": "rejected", "rejected": time.time()}
     _write(_approval_path(job), record)
     return record
 
 
+def _worker_status(result):
+    return ("complete" if result.get("status") in {
+        "TARGET_REACHED", "PROJECT_LIMIT_REACHED", "SATURATED", "STALLED",
+    } else "waiting-approval")
+
+
+@_serialized_approval
 def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
     _require_approval_mode(job)
     record = _approval(job, proposal_id)
@@ -224,14 +249,25 @@ def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
             record = {**record, "status": "complete", "result": current,
                       "finished": time.time(), "recovered": True}
             _write(_approval_path(job), record)
+            _write(Path(job["control"]) / "worker.json", {
+                "status": _worker_status(current), "finished": time.time(), "result": current})
             return record
         if current["wave_index"] != base_wave:
             raise ValueError("approved wave completion cannot be reconciled")
     record = {**record, "status": "running", "started": time.time()}
     _write(_approval_path(job), record)
-    result = coordinator.run_approved_wave()
+    control = Path(job["control"])
+    _write(control / "worker.json", {"status": "running", "started": time.time()})
+    try:
+        result = coordinator.run_approved_wave()
+    except Exception as error:
+        _write(control / "worker.json", {"status": "failed", "finished": time.time(),
+                                         "error": str(error)})
+        raise
     record = {**record, "status": "complete", "result": result, "finished": time.time()}
     _write(_approval_path(job), record)
+    _write(control / "worker.json", {"status": _worker_status(result),
+                                      "finished": time.time(), "result": result})
     return record
 
 
@@ -257,7 +293,8 @@ def campaign_worker(job, *, builder=build_controller):
                 public["project_target"] = job["project_target"]
                 _write(public_path, public)
             result = coordinator.report() if job.get("approval_mode") else coordinator.resume()
-            _write(control / "worker.json", {"status": "complete", "finished": time.time(),
+            worker_status = _worker_status(result) if job.get("approval_mode") else "complete"
+            _write(control / "worker.json", {"status": worker_status, "finished": time.time(),
                                              "result": result})
             return result
         except Exception as error:
