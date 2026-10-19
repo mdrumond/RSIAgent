@@ -22,6 +22,11 @@ the Torch-NPU `AiCMetrics` enum; each capture confirms availability. Unsupported
 groups and capture failures have explicit reasons. Counter values preserve
 vendor names and units; missing values are null and measured zero is zero.
 Ratios without documented units are not converted to percentages or bandwidth.
+Group availability requires at least one finite counter belonging to that group;
+ordinary task durations and cycle totals do not qualify. `counter_columns` names
+the qualifying columns and `counter_schema` identifies the supported CANN 9.1
+summary names and retained long-name aliases. Unknown or all-unavailable schemas
+remain downloadable with `available=false` and `no group counters exported`.
 
 Full profiler trees remain at the remote `raw_report` locations. Only generated
 compact JSON/CSV artifacts and manifests should be downloaded; no timeline
