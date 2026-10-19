@@ -89,6 +89,7 @@ class AdaptiveProjectRequest:
     branch_root: Path
     inputs: tuple[HostTensor, ...]
     oracle: ReferenceOutput
+    memory_root: Path | None = None
 
 
 @dataclass(frozen=True)

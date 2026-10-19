@@ -1,7 +1,17 @@
 {% extends "base.html" %}{% block title %}{{ campaign.name }} · RSI{% endblock %}{% block body %}
 <div class="eyebrow">PHASE {{ campaign.phase }}</div><h1>{{ campaign.name }}</h1>
+<p><b>{{ campaign.status }}</b>{% if campaign.terminal.reason %} — {{ campaign.terminal.reason }}{% endif %}</p>
+{% if campaign.learner_stage %}<p>Current learner stage: {{ campaign.learner_stage }}</p>{% endif %}
+{% if campaign.worker.error and not campaign.terminal %}<p>Worker failure: {{ campaign.worker.error }}</p>{% endif %}
+{% if campaign.bootstrap %}<section><h2>Goal bootstrap: {{ campaign.bootstrap.stage }}</h2>
+<p>Proposal {{ campaign.bootstrap.proposal_count or 0 }} · Reference qualification is separate from learner verification.</p>
+{% if campaign.bootstrap.candidate.spec %}<h3>{{ campaign.bootstrap.candidate.spec.project_id }}</h3><p>{{ campaign.bootstrap.candidate.spec.hypothesis }}</p>{% endif %}
+<p>{{ campaign.bootstrap.candidate.rationale or '' }}</p>
+{% if campaign.bootstrap.candidate.citations %}<pre>{{ campaign.bootstrap.candidate.citations|tojson(indent=2) }}</pre>{% endif %}
+{% if campaign.bootstrap.diagnostic %}<p>{{ campaign.bootstrap.diagnostic }}</p>{% endif %}
+{% if campaign.bootstrap.qualified_target_id %}<p>Qualified reference: {{ campaign.bootstrap.qualified_target_id }}</p>{% endif %}</section>{% endif %}
 <div class="metrics hero"><b>{{ campaign.stats.attempted }}</b><span>attempted</span><b>{{ campaign.stats.verified }}</b><span>verified</span><b>{{ campaign.stats.published }}</b><span>published</span></div>
 <section class="list">{% for project in campaign.projects %}<a href="{{ url_for('project_page', number=campaign.phase, project_id=project.id) }}">
-<div><span class="status {{ 'complete' if project.verified else 'failed' }}">{{ project.classification }}</span><h2>{{ project.id }}</h2><p>{{ project.question }}</p></div>
+<div><span class="status {{ 'complete' if project.verified else 'failed' }}">{{ project.classification }}</span><h2>{{ project.id }}</h2>{% if project.kind %}<small>{{ project.kind }} · {{ project.attempt }}</small>{% endif %}<p>{{ project.question }}</p></div>
 <strong>{{ project.performance|length }} perf samples →</strong></a>{% else %}<p>No attempted projects yet.</p>{% endfor %}</section>
 {% if campaign.planned %}<h2>Planned next</h2><section class="list">{% for project in campaign.planned %}<article><span class="tag">PLANNED</span><h3>{{ project.id }}</h3><p>{{ project.question }}</p></article>{% endfor %}</section>{% endif %}{% endblock %}

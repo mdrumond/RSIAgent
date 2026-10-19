@@ -1023,18 +1023,39 @@ def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_pa
                for row in manifest["files"]) == 2
 
 
-def test_new_phase2_requires_goal_and_rejects_approval_mode_before_writes(tmp_path, capsys):
+def test_new_phase2_rejects_approval_mode_before_writes(tmp_path, capsys):
     argv = ["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),
             "--target", "a3", "--phase", "2", "--objective", "fixed copy", "--config", "absent",
             "--initial-memory", "absent", "--project-target", "1", "--phase1-root", "absent", "--review", "absent"]
     with pytest.raises(SystemExit):
-        cli.main(argv)
-    assert "requires --target-goal" in capsys.readouterr().err
+        cli.main([*argv, "--approval-mode"])
+    assert "does not support --approval-mode" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         cli.main([*argv, "--target-goal", "absent", "--approval-mode"])
     assert "does not support --approval-mode" in capsys.readouterr().err
     assert not (tmp_path / "control").exists()
     assert not (tmp_path / "campaign").exists()
+
+
+def test_new_phase2_without_contract_persists_autonomous_bootstrap(tmp_path):
+    manifest = write(tmp_path / "sources.json", {"schema": "ascend-sft-sources-v2", "sources": [{
+        "name": "native", "repository": "https://example.invalid/native", "revision": "a" * 40,
+        "license": "Apache-2.0", "include": ["**/*.cpp"]}]})
+    settings = write(tmp_path / "settings.json", {"model": "openai/gpt-5.6-sol",
+        "phase1_arguments": [], "source_manifest": str(manifest)})
+    memory = tmp_path / "seed"
+    memory.write_bytes(b"seed")
+    control, root = tmp_path / "control", tmp_path / "campaign"
+    cli.main(["start", "--control", str(control), "--root", str(root), "--target", "a3",
+        "--phase", "2", "--objective", "new goal", "--config", str(settings),
+        "--initial-memory", str(memory), "--project-target", "1", "--phase1-root", "old",
+        "--review", "review"], screen=lambda *args: "session")
+    job = cli._read(control / "job.json")
+    assert job["autonomous_goal"] is True and "target_goal" not in job
+    assert job["target_attempt_budget"] == 3 and job["practice_attempt_budget"] == 2
+    assert cli._read(root / "campaign-run.json")["autonomous_goal"] is True
+    with pytest.raises(SystemExit):
+        cli.main(["continue", "--control", str(control), "--project-target", "2"])
 
 
 def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_path, monkeypatch):
