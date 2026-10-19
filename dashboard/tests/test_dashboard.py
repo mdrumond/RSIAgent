@@ -394,6 +394,37 @@ def test_reject_uses_only_the_retained_proposal(tmp_path):
                             "--proposal-id", "reject-me"]
 
 
+def test_terminal_proposal_summary_and_zero_project_approval(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"coverage": [], "prior_outcomes": [], "wave_index": 3})
+    write(control / "curriculum-approval.json", {"status": "proposed", "phase": 1,
+          "proposal_id": "terminal", "proposal": {"base_wave_index": 3,
+          "base_memory_sha256": "a" * 64, "session": {"messages": [
+              {"content": "private terminal reasoning"}]},
+          "terminal": {"status": "SATURATED", "reason": "Coverage is complete."}}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=run).test_client()
+    status = client.get("/api/status").get_json()
+    proposal = status["controls"]["proposals"][0]
+    assert proposal["terminal"] == {"status": "SATURATED", "reason": "Coverage is complete."}
+    assert "private terminal reasoning" not in json.dumps(status)
+    csrf = client.get("/api/csrf").get_json()["token"]
+    response = client.post("/api/control/approve", json={"campaign_id": "phase1",
+        "proposal_id": "terminal", "project_ids": [],
+        "confirmation": "approve:terminal"}, headers={"X-CSRF-Token": csrf,
+        "Idempotency-Key": "terminal"})
+    assert response.status_code == 202
+    assert wait_operation(client, response.get_json()["operation_id"])["status"] == "succeeded"
+    assert calls == [[pytest.importorskip("sys").executable,
+                      "/repo/run_ascend_campaign.py", "approve", "--control", str(control),
+                      "--proposal-id", "terminal"]]
+
+
 def test_background_failure_is_sanitized_and_visible(tmp_path):
     config, _, _ = controlled_config(tmp_path)
     def fail(*args, **kwargs):

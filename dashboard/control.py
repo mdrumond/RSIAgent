@@ -104,10 +104,13 @@ class ControlManager:
                              "novelty_summary": ("New project information" if novel
                                                  else "Repeats prior project information"),
                              "learning_focus": list(spec.get("learning_focus", []))})
+        terminal = proposal.get("terminal")
+        safe_terminal = ({"status": terminal.get("status"), "reason": terminal.get("reason")}
+                         if isinstance(terminal, dict) else None)
         return {"campaign_id": campaign_id, "phase": campaign["phase"],
                 "proposal_id": record.get("proposal_id"), "status": record.get("status"),
                 "selected_project_ids": record.get("selected_project_ids", []),
-                "projects": projects}
+                "projects": projects, "terminal": safe_terminal}
 
     def proposals(self):
         return [proposal for campaign_id in self.campaigns
@@ -147,8 +150,14 @@ class ControlManager:
             raise ControlError("proposal is stale relative to campaign state")
         if action == "approve":
             selected = payload.get("project_ids")
-            if not isinstance(selected, list) or not selected or len(set(selected)) != len(selected):
-                raise ControlError("project selection must be non-empty and unique")
+            if not isinstance(selected, list) or len(set(selected)) != len(selected):
+                raise ControlError("project selection must be unique")
+            if proposal["terminal"] is not None:
+                if selected:
+                    raise ControlError("terminal approval requires zero selected projects")
+                return identifier
+            if not selected:
+                raise ControlError("wave approval requires at least one selected project")
             available = {row["project_id"] for row in proposal["projects"]}
             if any(not isinstance(item, str) for item in selected) or not set(selected) <= available:
                 raise ControlError("selection contains a project outside the proposal")

@@ -37,5 +37,6 @@ queued or in-flight operation interrupted rather than submitting it again. The r
 campaign approval record remains authoritative for a deliberate retry.
 
 The proposal view exposes the hypothesis plus deterministic novelty and coverage
-comparisons. Provider messages and hidden reasoning are never copied into the
-cache or API response.
+comparisons. A terminal proposal exposes only its status and concise reason and
+can be approved without selecting a project. Provider messages and hidden
+reasoning are never copied into the cache or API response.

@@ -10,6 +10,7 @@
 <button data-action="sample" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Sample {{ campaign.name or ('Phase ' ~ campaign.phase) }}</button>{% endfor %}</div>
 {% for proposal in proposals %}<article class="proposal"><div class="row"><h3>{{ proposal.campaign_id }} proposal</h3><span class="status {{ proposal.status }}">{{ proposal.status }}</span></div>
 <form data-proposal-form data-campaign-id="{{ proposal.campaign_id }}" data-proposal-id="{{ proposal.proposal_id }}">
+{% if proposal.terminal %}<p><b>{{ proposal.terminal.status }}</b> — {{ proposal.terminal.reason }}</p>{% endif %}
 {% for project in proposal.projects %}<label class="proposal-project"><input type="checkbox" name="project_id" value="{{ project.project_id }}">
 <span><b>{{ project.project_id }}</b> — {{ project.hypothesis }}<small>{{ project.novelty_summary }}{% if project.new_coverage %}; new coverage: {{ project.new_coverage|join(', ') }}{% endif %}</small></span></label>{% endfor %}
 {% if proposal.status == 'proposed' %}<button data-proposal-action="approve">Approve selected</button><button data-proposal-action="reject">Reject</button>{% endif %}
