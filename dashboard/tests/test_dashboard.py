@@ -405,6 +405,46 @@ def test_host_verification_chain_stops_at_prior_project_attribution(campaign, tm
     assert all("other-terminal" not in text for text in texts)
 
 
+def test_completed_trace_catalog_refreshes_when_partial_sync_finishes(campaign, tmp_path):
+    root = tmp_path / "phase1"
+    branch = root / "waves/wave-001/branches/vector-add"
+    actor_body = b'{"response":"arrived later"}'
+    actor_digest = __import__("hashlib").sha256(actor_body).hexdigest()
+    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
+        "role": "provider-response", "sha256": actor_digest, "turn": 1}}) + "\n")
+    cache = tmp_path / "cache.sqlite3"
+    store = DashboardStore(campaign, cache)
+    initial = store.trace_index(1, "vector-add")["events"]
+    initial_actor = next(row for row in initial if row.get("sha256") == actor_digest)
+    assert not initial_actor["available"]
+    assert not any(row["label"].startswith("Host verification") for row in initial)
+
+    obj = branch / "artifacts/objects" / actor_digest[:2] / actor_digest[2:]
+    obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(actor_body)
+    artifact_payload = {"classification": "host-verified"}
+    artifact_digest = __import__("hashlib").sha256(json.dumps(
+        artifact_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    record = {"sequence": 0, "previous_sha256": "0" * 64, "payload": {
+        "project_id": "vector-add", "artifact_kind": "classification",
+        "artifact_sha256": artifact_digest, "payload": artifact_payload}}
+    record["entry_sha256"] = __import__("hashlib").sha256(json.dumps(
+        record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    (root / "project-evidence.jsonl").write_text(json.dumps(record) + "\n")
+
+    refreshed = store.trace_index(1, "vector-add")["events"]
+    refreshed_actor = next(row for row in refreshed if row.get("sha256") == actor_digest)
+    assert refreshed_actor["available"]
+    assert sum(row["label"].startswith("Host verification") for row in refreshed) == 2
+
+
+def test_unchanged_completed_trace_reuses_catalog(campaign, tmp_path, monkeypatch):
+    store = DashboardStore(campaign, tmp_path / "cache.sqlite3")
+    expected = store.trace_index(1, "vector-add")
+    monkeypatch.setattr(store, "_trace_sources", lambda *_: pytest.fail(
+        "unchanged completed source should reuse compact catalog"))
+    assert store.trace_index(1, "vector-add") == expected
+
+
 @pytest.mark.parametrize("digest", [
     "g" * 64,
     "A" * 64,

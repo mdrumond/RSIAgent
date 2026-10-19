@@ -351,6 +351,45 @@ class DashboardStore:
             events.append(event)
         return events
 
+    @staticmethod
+    def _metadata(path):
+        try:
+            stat = path.stat()
+            return [stat.st_size, stat.st_mtime_ns, stat.st_mode]
+        except (OSError, TypeError, AttributeError):
+            return None
+
+    def _trace_fingerprint(self, phase, project_id):
+        """Fingerprint cheap trace metadata without reading actor object bodies."""
+        located = self._project_sources(phase, project_id)
+        if located is None:
+            return None
+        root, plan_path, branch, _ = located
+        ledger = branch / "evidence.jsonl"
+        manifest = {"root": str(root), "files": {
+            "plan": self._metadata(plan_path),
+            "state": self._metadata(root / "state.json"),
+            "actor-ledger": self._metadata(ledger),
+            "host-ledger": self._metadata(root / "project-evidence.jsonl"),
+            "outcome": self._metadata(branch / "outcome.json"),
+            "verifier-result": self._metadata(branch / "execution-evidence.bin"),
+            "memory": self._metadata(branch / "memory-delta.bin"),
+        }, "objects": {}}
+        try:
+            rows = ledger.read_text().splitlines()
+        except (OSError, TypeError):
+            rows = []
+        for raw in rows:
+            try:
+                digest = json.loads(raw).get("payload", {}).get("sha256")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(digest, str) and _SHA256.fullmatch(digest):
+                source = branch / "artifacts" / "objects" / digest[:2] / digest[2:]
+                manifest["objects"][digest] = self._metadata(source)
+        return hashlib.sha256(json.dumps(
+            manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
     def _trace_sources(self, phase, project_id):
         located = self._project_sources(phase, project_id)
         if located is None:
@@ -437,10 +476,13 @@ class DashboardStore:
                                   (phase, project_id)).fetchone()
         retained_body = json.loads(retained[0]) if retained else None
         retained_catalog = (retained_body.get("events") if isinstance(retained_body, dict) and
-                            retained_body.get("schema") == "content-addressed-v1" else None)
-        complete = retained_catalog and any(
-            row["label"] == "Final outcome" and row["available"] for row in retained_catalog)
-        events = None if complete else self._trace_sources(phase, project_id)
+                            retained_body.get("schema") in {
+                                "content-addressed-v1", "source-fingerprint-v1"} else None)
+        source_fingerprint = self._trace_fingerprint(phase, project_id)
+        unchanged = (retained_catalog is not None and source_fingerprint is not None and
+                     retained_body.get("source_fingerprint") == source_fingerprint)
+        events = None if unchanged or source_fingerprint is None else self._trace_sources(
+            phase, project_id)
         if events is None:
             if retained_catalog is None:
                 return None
@@ -451,7 +493,9 @@ class DashboardStore:
             with self._db() as db:
                 db.execute("INSERT OR REPLACE INTO trace_indexes(phase,project_id,body) VALUES(?,?,?)",
                            (phase, project_id, json.dumps({
-                               "schema": "content-addressed-v1", "events": catalog})))
+                               "schema": "source-fingerprint-v1",
+                               "source_fingerprint": source_fingerprint,
+                               "events": catalog})))
                 db.executemany("INSERT OR REPLACE INTO trace_events(phase,project_id,event_id,sha256) "
                                "VALUES(?,?,?,?)", [(phase, project_id, row["id"], row.get("sha256"))
                                                    for row in catalog])
