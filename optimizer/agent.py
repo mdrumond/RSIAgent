@@ -8,7 +8,8 @@ from benchmarks.a3_model_profiles import complete_a3, load_a3_model_profile
 SYSTEM = '''Optimize deterministic inference Torch code using Ascend C on A3.
 Return exactly one JSON object. First stage: {"action":"cases","signatures":[],
 "summary":"why these additional corner cases matter"}. Supply additional signatures
-only; never alter supplied representatives/source/initialization. At most 24 total.
+only; never alter supplied representatives/source/initialization. Respect the
+configured max_cases and remaining_signatures supplied in context (at most 24 total).
 Optimization actions: {"action":"candidate","source":"Ascend C device source",
 "block_count":1,"summary":"change and expected effect"},
 {"action":"query-knowledge","query":"..."},

@@ -288,3 +288,40 @@ def test_finish_respects_stop_or_time_boundary_after_model_returns(tmp_path):
             {'action': 'cases', 'signatures': [], 'summary': ''},
             {'action': 'finish', 'summary': 'done'}]), Backend()).run()
         assert result['status'] == ('stopped' if boundary == 'stop' else 'budget-exhausted')
+
+
+def test_configured_case_cap_is_shared_with_model_and_filters_excess(tmp_path):
+    store, key = fixture(tmp_path, attempts=1)
+    extra = [{'args': [{'shape': [size], 'dtype': 'float32'}]} for size in (7, 9, 11)]
+    class CappedAgent(Agent):
+        def complete(self, stage, context, record):
+            if stage == 'cases':
+                assert context['max_cases'] == 2
+                assert context['remaining_signatures'] == 1
+            return super().complete(stage, context, record)
+    class CappedBackend(Backend):
+        def prepare(self, spec, directory):
+            assert len(spec['signatures']) == 2
+            assert spec['signatures'][1] == extra[0]
+            return super().prepare(spec, directory)
+    result = OptimizationLoop(store, key, CappedAgent([
+        {'action': 'cases', 'signatures': extra, 'summary': 'corners'},
+        {'action': 'finish', 'summary': ''}]), CappedBackend(), max_cases=2).run()
+    assert result['status'] == 'completed'
+    proposals = next(e['payload'] for e in store.events(key) if e['kind'] == 'case-proposals')
+    assert len(proposals['accepted']) == 1 and len(proposals['rejected']) == 2
+    assert all('2-case budget' in row['error'] for row in proposals['rejected'])
+
+
+def test_case_cap_validation_preserves_all_representatives(tmp_path):
+    import pytest
+    store, key = fixture(tmp_path)
+    for maximum in (0, 25, True):
+        with pytest.raises(ValueError, match='max_cases'):
+            OptimizationLoop(store, key, Agent([]), Backend(), max_cases=maximum)
+    body = {'files': {}, 'memory_entries': []}
+    signatures = [{'args': [{'shape': [n], 'dtype': 'float32'}]} for n in (3, 5)]
+    key = store.create('def f(x): return x', 'f', {'signatures': signatures},
+                       {**body, 'snapshot_id': sha(canonical(body))})['job_id']
+    with pytest.raises(ValueError, match='representatives exceed'):
+        OptimizationLoop(store, key, Agent([]), Backend(), max_cases=1).run()
