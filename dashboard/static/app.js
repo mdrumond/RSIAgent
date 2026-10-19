@@ -1,5 +1,5 @@
 // Keep live status useful without reloading long code pages.
-if (document.querySelector('.status.running, .operation.running, .operation.queued')) setTimeout(() => location.reload(), 5000);
+if (!globalThis.RSI_DEMO && document.querySelector('.status.running, .operation.running, .operation.queued')) setTimeout(() => location.reload(), 5000);
 
 const csrf = document.body.dataset.csrf;
 async function control(action, subject, body) {

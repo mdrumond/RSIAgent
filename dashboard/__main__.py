@@ -27,6 +27,10 @@ def _loopback(host):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Serve the read-only RSI campaign dashboard")
     commands = parser.add_subparsers(dest="command", required=True)
+    export = commands.add_parser("export-demo", help="Export a portable read-only snapshot")
+    export.add_argument("--config", type=Path, required=True)
+    export.add_argument("--cache-dir", type=Path, required=True)
+    export.add_argument("--output", type=Path, required=True)
     serve = commands.add_parser("serve")
     serve.add_argument("--config", type=Path, required=True)
     serve.add_argument("--cache-dir", type=Path, required=True)
@@ -34,6 +38,11 @@ def main(argv=None):
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--refresh-seconds", type=int, default=30)
     args = parser.parse_args(argv)
+    if args.command == "export-demo":
+        from .demo import export_demo
+        export_demo(args.config, args.cache_dir, args.output)
+        print(args.output.resolve())
+        return
     if _controls_enabled(args.config) and not _loopback(args.host):
         parser.error("controls-enabled dashboard must bind to a loopback host (including optimizer)")
     app = create_app(args.config, args.cache_dir / "dashboard.sqlite3",

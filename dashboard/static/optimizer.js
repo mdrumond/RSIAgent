@@ -66,6 +66,9 @@
       document.querySelector('#optimizer-recover').hidden = state.worker_active || !['running', 'budget-exhausted'].includes(state.status) || state.stage !== 'observation-unavailable';
     } catch (error) {message.textContent = error.message;}
   }
+  if (globalThis.RSI_DEMO) {
+    // Snapshot templates omit all execution controls.
+  } else {
   document.querySelector('#optimizer-stop').addEventListener('click', async () => {
     if (!confirm('Request this job to stop? Retained evidence will remain available.')) return;
     try {await action(`${base}/stop`, {}, key()); await refresh();}
@@ -87,6 +90,7 @@
     try {await action(`${base}/resume`, payload, resumeIdentity); resumeIdentity = key(); await refresh();}
     catch (error) {message.textContent = error.message;}
   });
+  }
   const trace = document.querySelector('#optimizer-trace');
   const submission = document.querySelector('#optimizer-submission');
   submission.parentElement.addEventListener('toggle', async () => {
@@ -132,5 +136,5 @@
     } catch (error) {message.textContent = error.message;}
   }
   trace.addEventListener('toggle', refreshTrace);
-  refresh(); setInterval(() => {refresh(); refreshTrace();}, 3000);
+  if (!globalThis.RSI_DEMO) { refresh(); setInterval(() => {refresh(); refreshTrace();}, 3000); }
 })();

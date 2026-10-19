@@ -136,3 +136,36 @@ python run_ascend_campaign.py adopt \
   --profiling without-profiling-guidance \
   --legacy-revision 0123456789abcdef0123456789abcdef01234567
 ```
+# Static demo branch (do not merge)
+
+Export the current locally available evidence without starting work or touching
+the live dashboard's configuration/cache:
+
+```bash
+python -m dashboard export-demo --config /path/to/dashboard-config.json \
+  --cache-dir /path/to/dashboard-cache --output /path/to/new-demo-snapshot
+python /path/to/new-demo-snapshot/serve.py --port 8080
+```
+
+The exporter needs the dashboard's usual Python dependencies; playback needs
+only Python's standard library. Each output is a standalone folder containing
+all pages, compact retained evidence, assets, `serve.py`, `requirements.txt` and
+instructions. Serve at the HTTP root, not as `file://` or under a subdirectory.
+Snapshot statuses are frozen, execution controls are absent, and no polling or
+remote/model work occurs. Missing phases and optimizer jobs stay genuinely empty.
+The exporter works even if an optimizer worker configuration is no longer present.
+
+Import later Phase 2 or real optimizer results by rerunning with the same config
+and a **new** output directory; existing snapshots are never overwritten. Local
+campaign artifacts are refreshed against a private SQLite cache backup; cached
+trace payloads remain available if their originals are gone. No worker config,
+credentials, timeline/tensor/binary downloads, or artifact payloads over 20 MiB
+are bundled. Full retained event metadata is preserved. Source and prompts can
+still be private: inspect before sharing.
+
+```bash
+tar -czf dashboard-static-demo.tar.gz -C /path/to new-demo-snapshot
+```
+
+Extract the entire archive elsewhere and run its `serve.py`. The live service
+and campaigns do not need to be available during playback.
