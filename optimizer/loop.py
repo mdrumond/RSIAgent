@@ -12,6 +12,7 @@ import copy
 import base64
 import json
 import math
+import re
 import time
 
 from .cases import validate_submission
@@ -357,6 +358,24 @@ class OptimizationLoop:
         return self._action(stage, lambda: self.agent.complete(stage, context, self._record))
 
     def _tool(self, action, snapshot):
+        # Model request mistakes are feedback, not evidence/transport failures.
+        # Validate before accessing storage so corruption exceptions still escape.
+        error = None
+        if action['action'] == 'read-artifact':
+            if set(action) != {'action', 'sha256', 'offset'}:
+                error = 'read-artifact requires exactly action, sha256 and offset'
+            elif not isinstance(action['sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', action['sha256']):
+                error = 'sha256 must be the exact 64-character lowercase hexadecimal artifact digest; do not abbreviate or guess'
+            elif type(action['offset']) is not int or action['offset'] < 0:
+                error = 'offset must be a nonnegative integer'
+        elif action['action'] == 'read-memory':
+            if set(action) != {'action', 'index'}:
+                error = 'read-memory requires exactly action and index'
+            elif type(action['index']) is not int or not 0 <= action['index'] < len(snapshot['memory_entries']):
+                error = 'index must be an integer listed in memory_summary'
+        if error:
+            self._tool_result(action, {'status': 'tool-error', 'error': error})
+            return
         if action['action'] == 'compile' and set(action) == {'action', 'source', 'block_count', 'summary'}:
             if (not isinstance(action['source'], str) or not action['source'].strip()
                     or type(action['block_count']) is not int or not 1 <= action['block_count'] <= 65535):
@@ -371,10 +390,16 @@ class OptimizationLoop:
             try:
                 data = self.store.read_artifact(self.key, action['sha256'])
             except FileNotFoundError:
+                if any(row['sha256'] == action['sha256'] for row in self.store.artifacts(self.key)):
+                    # A recorded artifact disappearing is evidence loss, not an
+                    # unknown reference invented by the model.
+                    raise
                 record = next((row for row in snapshot['files'].values()
                                if row['sha256'] == action['sha256']), None)
                 if record is None:
-                    raise ValueError('artifact is absent from job and authenticated memory snapshot')
+                    self._tool_result(action, {'status': 'tool-error', 'error':
+                        'artifact is absent from job and authenticated memory snapshot; use an exact retained reference or read-memory index'})
+                    return
                 data = base64.b64decode(record['base64'], validate=True)
             raw = data.decode('utf-8')
             result = {'offset': offset, 'text': raw[offset:offset + 1500],
@@ -389,6 +414,9 @@ class OptimizationLoop:
                                   if self.knowledge else {'status': 'unavailable'})
         else:
             raise ValueError('invalid tool action')
+        self._tool_result(action, result)
+
+    def _tool_result(self, action, result):
         record = self._artifact(action['action'], result)
         self.state['history'].append({'tool': action, 'result': record, 'content': result})
         self.state.pop('action_result', None)
