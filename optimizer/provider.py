@@ -2,7 +2,7 @@
 import multiprocessing
 import time
 
-from .transport import WorkerStopped
+from .control import WorkerStopped
 
 
 def _complete(agent, stage, context, pipe):

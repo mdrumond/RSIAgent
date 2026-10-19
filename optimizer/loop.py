@@ -16,7 +16,7 @@ import time
 from .cases import validate_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
-from .transport import ObservationUnavailable, WorkerStopped
+from .control import ObservationUnavailable, WorkerStopped
 
 
 def score(baseline, result):

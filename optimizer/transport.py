@@ -8,14 +8,7 @@ import subprocess
 import time
 
 from .jobs import atomic, canonical
-
-
-class ObservationUnavailable(RuntimeError):
-    pass
-
-
-class WorkerStopped(RuntimeError):
-    pass
+from .control import ObservationUnavailable, WorkerStopped
 
 
 @contextmanager
