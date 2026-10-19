@@ -175,7 +175,8 @@ def test_wide_diagnostic_stays_bounded_and_plain_initial_seed_is_visible(tmp_pat
         b"Use measured host results.").decode("ascii"), "project_memory_base64": []})
     assert memory_presentation(raw, store)["initial_memory_preview"] == "Use measured host results."
 @pytest.mark.parametrize("reviewed", [False, True])
-def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_path, reviewed):
+@pytest.mark.parametrize("private", [False, True])
+def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_path, reviewed, private):
     import base64
     from types import SimpleNamespace
     from benchmarks.ascend.agent_presentation import MemoryArtifactReader, artifact_page_presentation
@@ -192,11 +193,13 @@ def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_pat
         initial = canonical_bytes({"schema": "ascend-phase2-curriculum-seed-v1",
                                   "snapshot_id": snapshot.snapshot_id, "phase1_memory": [memory]})
         entries = []
-    current = ContentAddressedArtifacts(root / "waves/wave-02/branches/next/artifacts")
+    current = ContentAddressedArtifacts((tmp_path / "control/bootstrap/reference" if private
+                                        else root / "waves/wave-02/branches/next") / "artifacts")
     raw = canonical_bytes({"schema": MEMORY_SCHEMA,
                           "initial_memory_base64": base64.b64encode(initial).decode(),
                           "project_memory_base64": entries})
-    request = SimpleNamespace(pre_wave_memory=raw, branch_root=current.root.parent)
+    request = SimpleNamespace(pre_wave_memory=raw, branch_root=current.root.parent,
+                              memory_root=root if private else None)
     reader = MemoryArtifactReader(request, current)
     assert reader.read_bytes(memory["source_revision"]) == b"actual candidate source"
     evidence = memory["host_facts"][0]["evidence_sha256"]
