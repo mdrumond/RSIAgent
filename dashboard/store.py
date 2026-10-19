@@ -339,6 +339,9 @@ class DashboardStore:
         else:
             chain, seen = [], set()
             while record is not None and record.get("entry_sha256") not in seen:
+                attributed = record.get("payload", {}).get("project_id")
+                if attributed is not None and attributed != project_id:
+                    break
                 digest = record.get("entry_sha256")
                 if digest:
                     seen.add(digest)

@@ -373,6 +373,37 @@ def test_host_verification_chain_recovers_unattributed_rows_and_artifacts(campai
     assert "diagnostic" in texts[1] and "host-verified" in texts[3]
 
 
+def test_host_verification_chain_stops_at_prior_project_attribution(campaign, tmp_path):
+    root = tmp_path / "phase1"
+    definitions = [
+        ("other-project", {"project": "other-terminal"}),
+        ("vector-add", {"project": "selected-start"}),
+        (None, {"project": "selected-unattributed"}),
+        ("vector-add", {"project": "selected-terminal"}),
+    ]
+    previous, rows = "0" * 64, []
+    for sequence, (project_id, artifact_payload) in enumerate(definitions):
+        artifact = __import__("hashlib").sha256(json.dumps(
+            artifact_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        payload = {"artifact_kind": f"kind-{sequence}", "artifact_sha256": artifact,
+                   "payload": artifact_payload}
+        if project_id is not None:
+            payload["project_id"] = project_id
+        record = {"sequence": sequence, "previous_sha256": previous, "payload": payload}
+        canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        record["entry_sha256"] = __import__("hashlib").sha256(canonical).hexdigest()
+        previous = record["entry_sha256"]
+        rows.append(record)
+    (root / "project-evidence.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    host = [row for row in events if row["label"] == "Host verification ledger entry"]
+    assert len(host) == 3
+    texts = [client.get(row["payload_url"]).get_json()["text"] for row in host]
+    assert all("selected" in text for text in texts)
+    assert all("other-terminal" not in text for text in texts)
+
+
 @pytest.mark.parametrize("digest", [
     "g" * 64,
     "A" * 64,
