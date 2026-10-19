@@ -30,6 +30,8 @@ before the provider loop starts.
 Optional `lock_directory` coordinates optimizer workers sharing a device. Its
 default is `.optimizer-locks` beside the configured validation wrapper. Existing
 campaign/device admission remains an operator prerequisite.
+Optional `max_cases` bounds the frozen suite to 1–24 cases (default 24); supplied
+representatives are never discarded, so a bound below their count is rejected.
 
 Each backend method is idempotent for its local execution directory. Source and
 request packages upload through cpl-remote; initial native dispatch uses the

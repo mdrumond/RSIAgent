@@ -21,7 +21,7 @@ def execute(request):
     baseline = Path(request['baseline'])
     operation = request['operation']
     if operation == 'prepare':
-        prepared = prepare_reference(request['spec'], device='npu:0', max_cases=24)
+        prepared = prepare_reference(request['spec'], device='npu:0', max_cases=request.get('max_cases', 24))
         manifest = freeze_reference(prepared, baseline)
         result = {'suite_sha256': manifest['suite_sha256'], 'cases': [], 'manifest': manifest}
         for row in prepared.cases:

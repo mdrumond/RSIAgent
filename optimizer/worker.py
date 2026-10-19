@@ -23,6 +23,8 @@ def load_config(path):
         raise ValueError('target/runtime must match checked native A3 route')
     if type(config['physical_device']) is not int or config['physical_device'] < 0:
         raise ValueError('physical_device must be a nonnegative integer')
+    if type(config.get('max_cases', 24)) is not int or not 1 <= config.get('max_cases', 24) <= 24:
+        raise ValueError('max_cases must be between one and 24')
     if not all(Path(config[key]).is_absolute() for key in ('cpl_remote', 'validation_wrapper', 'remote_workspace', 'guide')):
         raise ValueError('worker paths must be absolute')
     return config
@@ -53,7 +55,7 @@ class RemoteBackend:
         remote_directory = self.remote / 'execution' / relative
         request = {'operation': operation, 'directory': str(remote_directory),
                    'baseline': str(self.remote / 'execution' / 'baseline' / 'frozen'),
-                   'arch': self.config['arch'], **payload}
+                   'arch': self.config['arch'], 'max_cases': self.config.get('max_cases', 24), **payload}
         archive_path = directory / 'package.tar.gz'
         source_root = Path(__file__).resolve().parents[1]
         with tarfile.open(archive_path, 'w:gz') as archive:
