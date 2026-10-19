@@ -57,6 +57,12 @@ Successful exact-handle cancellation is persisted; resume evaluates in a fresh
 remote directory so partial compilation or baseline files cannot be reused.
 Pending diagnostic operations survive unavailable observation without permitting
 another candidate to overlap the retained operation.
+All local transport clients poll Stop and the remaining job deadline; stalled
+clients have a separate 120-second cap (`transport_timeout_seconds` can override
+it). Cancellation gets a bounded 30-second cleanup window even after Stop or
+the job deadline. Interrupting a local client does not prove its remote job was
+cancelled: retained handles and uncertain-dispatch sentinels remain available for
+recovery, and the worker never automatically resubmits an unknown operation.
 
 For a bounded production proof, create a job using the normal JobStore interface,
 then call `run_worker(root, job_id, config, agent=stub)` with an injected agent

@@ -2,13 +2,19 @@
 from contextlib import contextmanager
 import fcntl
 import json
+import math
 import os
+import signal
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 
 from .jobs import atomic, canonical
 from .control import ObservationUnavailable, WorkerStopped
+
+CLIENT_TIMEOUT = 120
+CANCEL_TIMEOUT = 30
 
 
 @contextmanager
@@ -30,9 +36,54 @@ def exclusive(path, *, wait=False, stopped=lambda: False):
 
 
 class CheckedTransport:
-    def __init__(self, config, *, run=subprocess.run, retain=lambda handle: None,
-                 stopped=lambda: False):
+    def __init__(self, config, *, run=None, retain=lambda handle: None,
+                 stopped=lambda: False, deadline=float('inf')):
         self.config, self.run, self.retain, self.stopped = config, run, retain, stopped
+        self.deadline = deadline
+        self.client_timeout = float(config.get('transport_timeout_seconds', CLIENT_TIMEOUT))
+        if not math.isfinite(self.client_timeout) or self.client_timeout <= 0:
+            raise ValueError('transport_timeout_seconds must be finite and positive')
+
+    def _invoke(self, argv, *, cleanup=False, **kwargs):
+        if self.run is not None:
+            return self.run(argv, capture_output=True, text=True, **kwargs)
+        # Files avoid pipe-buffer deadlocks while polling Stop. Kill only this
+        # local client's private process group, never assume its remote job died.
+        limit = time.monotonic() + (CANCEL_TIMEOUT if cleanup else self.client_timeout)
+        if not cleanup:
+            limit = min(limit, self.deadline)
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            process = subprocess.Popen(argv, stdout=stdout, stderr=stderr,
+                                       start_new_session=True, **kwargs)
+            interrupted = False
+            try:
+                while process.poll() is None:
+                    if time.monotonic() >= limit or (not cleanup and self.stopped()):
+                        interrupted = True
+                        break
+                    time.sleep(.1)
+            finally:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        process.wait(timeout=.5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    try:
+                        # The leader may exit before a stalled SSH child does.
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+            stdout.seek(0)
+            stderr.seek(0)
+            result = subprocess.CompletedProcess(argv, process.returncode,
+                        stdout.read().decode(errors='replace'), stderr.read().decode(errors='replace'))
+            result.interrupted = interrupted
+            return result
 
     def cancel_pending(self, directory):
         """Recover Stop against the exact retained operation, never a new dispatch."""
@@ -43,8 +94,7 @@ class CheckedTransport:
             return
         if not state.get('native_handle'):
             raise ObservationUnavailable('cannot cancel uncertain dispatch without its native handle')
-        result = self.run([self.config['cpl_remote'], '--json', 'cancel', state['native_handle']],
-                          capture_output=True, text=True)
+        result = self._invoke([self.config['cpl_remote'], '--json', 'cancel', state['native_handle']], cleanup=True)
         atomic(directory / 'cancel.log', (result.stdout + result.stderr).encode())
         if result.returncode:
             raise ObservationUnavailable('cancellation unavailable; retained handle remains active')
@@ -62,9 +112,8 @@ class CheckedTransport:
             raise ObservationUnavailable('uncertain transfer; inspect ' + str(marker))
         if not state:
             atomic(marker, canonical({'state': 'dispatching'}))
-            result = self.run([self.config['cpl_remote'], '--json', action,
-                               self.config['target'], str(source), str(destination)],
-                              capture_output=True, text=True)
+            result = self._invoke([self.config['cpl_remote'], '--json', action,
+                                   self.config['target'], str(source), str(destination)])
             atomic(local.with_name(local.name + '.' + action + '.log'),
                    (f'returncode={result.returncode}\n' + result.stdout + '\n' + result.stderr).encode())
             try:
@@ -74,13 +123,18 @@ class CheckedTransport:
             if state.get('handle'):
                 self.retain(state['handle'])
             atomic(marker, canonical(state))
+            if getattr(result, 'interrupted', False):
+                raise ObservationUnavailable('transfer client interrupted; inspect ' + str(marker))
         while state.get('state') not in {'completed', 'failed', 'cancelled'}:
             if not state.get('handle'):
                 raise ObservationUnavailable('transfer returned no handle')
             if self.stopped():
                 raise WorkerStopped('stopped while observing transfer')
-            result = self.run([self.config['cpl_remote'], '--json', 'observe', state['handle'],
-                               '--wait', '--timeout', '5'], capture_output=True, text=True)
+            result = self._invoke([self.config['cpl_remote'], '--json', 'observe', state['handle'],
+                                   '--wait', '--timeout', '5'])
+            atomic(local.with_name(local.name + '.' + action + '.observe.log'), (result.stdout + result.stderr).encode())
+            if getattr(result, 'interrupted', False):
+                raise ObservationUnavailable('transfer observation interrupted; retained handle remains active')
             try:
                 state = json.loads(result.stdout)
             except ValueError:
@@ -89,9 +143,12 @@ class CheckedTransport:
         if state['state'] != 'completed':
             raise RuntimeError('transfer failed: ' + str(marker))
         if action == 'download' and not local.exists():
-            result = self.run([self.config['cpl_remote'], '--json', 'fetch', state['handle'], str(local)], capture_output=True, text=True)
+            staging = local.with_name(local.name + '.fetching')
+            result = self._invoke([self.config['cpl_remote'], '--json', 'fetch', state['handle'], str(staging)])
+            atomic(local.with_name(local.name + '.fetch.log'), (result.stdout + result.stderr).encode())
             if result.returncode:
                 raise ObservationUnavailable('completed transfer fetch unavailable')
+            os.replace(staging, local)
 
     def execute(self, directory, argv):
         directory = Path(directory)
@@ -119,8 +176,7 @@ class CheckedTransport:
                 command += ['--operation', 'optimizer-' + directory.name[:40], 'run', '--native',
                             '--runtime', self.config['runtime'], '--device', str(self.config['physical_device']),
                             '--timeout', '5', '--', *argv]
-            result = self.run(command, capture_output=True, text=True,
-                              env={**os.environ, 'CPL_REMOTE': self.config['cpl_remote']})
+            result = self._invoke(command, env={**os.environ, 'CPL_REMOTE': self.config['cpl_remote']})
             output = result.stdout + '\n' + result.stderr
             with (directory / 'transport.log').open('ab') as stream:
                 stream.write(output.encode())
@@ -142,6 +198,8 @@ class CheckedTransport:
             if not result.returncode:
                 state['state'] = 'completed'
             atomic(path, canonical(state))
+            if getattr(result, 'interrupted', False):
+                raise ObservationUnavailable('local command client interrupted; observe retained handle or recover dispatch')
             if state.get('deadline_expired'):
                 state['state'] = 'cancelled'
                 state['reason'] = 'wall-time budget exhausted'

@@ -37,7 +37,7 @@ class RemoteBackend:
         self.started = time.monotonic()
         remaining = store.get(job_id)['max_seconds'] - store.get(job_id)['elapsed_seconds']
         self.deadline = self.started + remaining
-        self.transport = transport or CheckedTransport(config, retain=self._retain, stopped=self._stopped)
+        self.transport = transport or CheckedTransport(config, retain=self._retain, stopped=self._stopped, deadline=self.deadline)
 
     def _retain(self, handle):
         self.store.retain_handle(self.job_id, handle, operation='optimizer')

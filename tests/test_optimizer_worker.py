@@ -7,6 +7,96 @@ import pytest
 from optimizer.transport import CheckedTransport, ObservationUnavailable, WorkerStopped, exclusive
 
 
+@pytest.mark.parametrize('boundary', ['stop', 'deadline'])
+def test_stalled_client_is_bounded_and_preserves_unknown_dispatch(tmp_path, boundary):
+    import sys
+    import time
+    wrapper = tmp_path / 'wrapper'
+    wrapper.write_text('#!' + sys.executable + '\nimport time\nprint("client started", flush=True)\ntime.sleep(30)\n')
+    wrapper.chmod(0o755)
+    settings = config(tmp_path) | {'validation_wrapper': str(wrapper)}
+    start = time.monotonic()
+    transport = CheckedTransport(settings, stopped=lambda: boundary == 'stop' and time.monotonic() - start > .2,
+                                 deadline=start + (.2 if boundary == 'deadline' else 30))
+    with pytest.raises(ObservationUnavailable, match='interrupted'):
+        with exclusive(tmp_path / 'worker.lock'):
+            transport.execute(tmp_path / 'op', ['true'])
+    assert time.monotonic() - start < 3
+    assert json.loads((tmp_path / 'op/transport.json').read_text())['state'] == 'dispatching'
+    assert 'client started' in (tmp_path / 'op/transport.log').read_text()
+    with exclusive(tmp_path / 'worker.lock'):
+        pass
+
+
+def test_interrupted_client_retains_partial_handles(tmp_path):
+    import sys
+    import time
+    wrapper = tmp_path / 'wrapper'
+    wrapper.write_text('#!' + sys.executable + '\nimport time\nprint("BZ_A3_REMOTE_HANDLE=remote:bz-a3-1:job:abc", flush=True)\nprint("CATLASS_VALIDATION_HANDLE=bz-a3-1:abc", flush=True)\ntime.sleep(30)\n')
+    wrapper.chmod(0o755)
+    handles = []
+    with pytest.raises(ObservationUnavailable, match='interrupted'):
+        CheckedTransport(config(tmp_path) | {'validation_wrapper': str(wrapper)},
+                         deadline=time.monotonic() + .2, retain=handles.append).execute(tmp_path / 'op', ['true'])
+    assert handles == ['remote:bz-a3-1:job:abc', 'bz-a3-1:abc']
+    assert json.loads((tmp_path / 'op/transport.json').read_text())['native_handle'] == handles[0]
+
+
+def test_stalled_upload_preserves_sentinel_and_diagnostics(tmp_path):
+    import sys
+    import time
+    client = tmp_path / 'client'
+    client.write_text('#!' + sys.executable + '\nimport time\nprint("upload started", flush=True)\ntime.sleep(30)\n')
+    client.chmod(0o755)
+    source = tmp_path / 'package'
+    source.write_bytes(b'bytes')
+    transport = CheckedTransport(config(tmp_path) | {'cpl_remote': str(client)}, deadline=time.monotonic() + .2)
+    with pytest.raises(ObservationUnavailable):
+        transport.transfer('upload', source, '/work/package')
+    assert json.loads((tmp_path / 'package.upload.json').read_text()) == {'state': 'dispatching'}
+    assert 'upload started' in (tmp_path / 'package.upload.log').read_text()
+    with pytest.raises(ObservationUnavailable, match='uncertain transfer'):
+        transport.transfer('upload', source, '/work/package')
+
+
+def test_cancel_cleanup_ignores_stop_but_has_its_own_bound(tmp_path, monkeypatch):
+    import sys
+    import time
+    import optimizer.transport as module
+    monkeypatch.setattr(module, 'CANCEL_TIMEOUT', .2)
+    client = tmp_path / 'client'
+    client.write_text('#!' + sys.executable + '\nimport time\nprint("cancel attempted", flush=True)\ntime.sleep(30)\n')
+    client.chmod(0o755)
+    directory = tmp_path / 'op'
+    directory.mkdir()
+    original = {'state': 'running', 'handle': 'bz-a3-1:abc', 'native_handle': 'remote:bz-a3-1:job:abc'}
+    (directory / 'transport.json').write_text(json.dumps(original))
+    start = time.monotonic()
+    with pytest.raises(ObservationUnavailable, match='cancellation unavailable'):
+        CheckedTransport(config(tmp_path) | {'cpl_remote': str(client)},
+                         stopped=lambda: True, deadline=start - 1).cancel_pending(directory)
+    assert time.monotonic() - start < 3
+    assert 'cancel attempted' in (directory / 'cancel.log').read_text()
+    assert json.loads((directory / 'transport.json').read_text()) == original
+
+
+def test_interrupted_fetch_never_publishes_partial_destination(tmp_path):
+    import sys
+    import time
+    client = tmp_path / 'client'
+    client.write_text('#!' + sys.executable + '\nimport sys,time\nfrom pathlib import Path\nPath(sys.argv[-1]).write_bytes(b"partial")\ntime.sleep(30)\n')
+    client.chmod(0o755)
+    destination = tmp_path / 'compact.tar.gz'
+    marker = tmp_path / 'compact.tar.gz.download.json'
+    marker.write_text(json.dumps({'state': 'completed', 'handle': 'remote:bz-a3-1:transfer:abc'}))
+    with pytest.raises(ObservationUnavailable, match='fetch unavailable'):
+        CheckedTransport(config(tmp_path) | {'cpl_remote': str(client)},
+                         deadline=time.monotonic() + .2).transfer('download', '/work/compact.tar.gz', destination)
+    assert not destination.exists()
+    assert (tmp_path / 'compact.tar.gz.fetching').read_bytes() == b'partial'
+    assert json.loads(marker.read_text())['handle'] == 'remote:bz-a3-1:transfer:abc'
+
+
 def config(tmp_path):
     return dict(profile='bz-a3-1', target='bz-a3-1', runtime='py311-torch',
                 physical_device=10, arch='dav-2201', cpl_remote='/remote',
