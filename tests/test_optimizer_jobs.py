@@ -62,3 +62,26 @@ def test_manifest_recovers_from_committed_event_and_queued_stop(tmp_path):
     assert store.get(key)['handles'][0]['handle'] == 'bz-a3-1:retained'
     assert store.stop(key)['status'] == 'stopped'
     assert store.resume(key, additional_attempts=1, additional_seconds=1)['status'] == 'queued'
+
+
+@pytest.mark.parametrize('terminal', ['completed', 'failed', 'stopped'])
+def test_late_accounting_preserves_terminal_status(tmp_path, terminal):
+    store = JobStore(tmp_path)
+    key = create(store, max_seconds=1)['job_id']
+    store.transition(key, 'running')
+    store.transition(key, terminal)
+    store.account_time(key, 2)
+    assert store.get(key)['status'] == terminal
+
+
+def test_published_job_parent_is_synced(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    synced = []
+    original = os.fsync
+    def track(descriptor):
+        synced.append(Path(os.readlink('/proc/self/fd/' + str(descriptor))))
+        original(descriptor)
+    monkeypatch.setattr(os, 'fsync', track)
+    create(JobStore(tmp_path))
+    assert synced[-1] == tmp_path
