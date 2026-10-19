@@ -135,13 +135,19 @@ def test_submission_digest_invalidated_by_same_size_tamper(tmp_path, replacement
 
 
 def test_submission_modified_during_hash_is_not_cached(tmp_path, monkeypatch):
+    import os
     store = JobStore(tmp_path)
     key = create(store)['job_id']
     path = tmp_path / key / 'submission.json'
     original = store._hash_submission
     def mutate(stream):
         digest = original(stream)
+        before = path.stat()
         path.write_bytes(path.read_bytes().replace(b'snapshot_id', b'snapshot_XX'))
+        # Some remote filesystems round adjacent writes to the same clock tick.
+        # Explicitly advance metadata so this tests observed-change rejection,
+        # rather than assuming a particular filesystem timestamp resolution.
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000))
         return digest
     monkeypatch.setattr(store, '_hash_submission', mutate)
     with pytest.raises(ValueError, match='changed during digest verification'):
