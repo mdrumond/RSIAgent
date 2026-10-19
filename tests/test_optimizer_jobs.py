@@ -85,3 +85,58 @@ def test_published_job_parent_is_synced(tmp_path, monkeypatch):
     monkeypatch.setattr(os, 'fsync', track)
     create(JobStore(tmp_path))
     assert synced[-1] == tmp_path
+
+
+def test_large_artifact_batch_authenticates_and_rewrites_once(tmp_path, monkeypatch):
+    import time
+    import optimizer.jobs as jobs
+    store = JobStore(tmp_path)
+    # Representative Phase 2 memory size and observed profiling-file count.
+    key = store.create('def forward(x): return x', 'forward', {},
+                       {'memory': 'x' * (56 * 1024 * 1024)})['job_id']
+    counts = dict(get=0, chain_write=0)
+    real_get, real_atomic = store.get, jobs.atomic
+    def get(job):
+        counts['get'] += 1
+        return real_get(job)
+    def atomic(path, data):
+        if path.name == 'events.jsonl':
+            counts['chain_write'] += 1
+        return real_atomic(path, data)
+    monkeypatch.setattr(store, 'get', get)
+    monkeypatch.setattr(jobs, 'atomic', atomic)
+    started = time.monotonic()
+    records = store.put_artifacts(key, ((f'profile/{i}.csv', f'value,{i}\n'.encode())
+                                        for i in range(10000)))
+    print(f'10000 artifacts / 56 MiB submission: {time.monotonic() - started:.3f}s')
+    assert counts == dict(get=1, chain_write=1)
+    assert len(records) == 10000
+    # Existing consumers see individual artifact records, not a new batch schema.
+    assert JobStore(tmp_path).artifacts(key) == records
+    assert store.read_artifact(key, records[-1]['sha256']) == b'value,9999\n'
+    assert len(store.events(key)) == 10001
+
+
+def test_artifact_batch_failure_never_publishes_partial_inventory(tmp_path, monkeypatch):
+    import optimizer.jobs as jobs
+    store = JobStore(tmp_path)
+    key = create(store)['job_id']
+    first = store.put_artifact(key, 'old', b'old')
+    def incomplete():
+        yield 'new', b'new'
+        raise ValueError('archive truncated')
+    with pytest.raises(ValueError, match='truncated'):
+        store.put_artifacts(key, incomplete())
+    assert store.artifacts(key) == [first]
+    original = jobs.atomic
+    def interrupted(path, data):
+        if path.name == 'events.jsonl':
+            raise OSError('disk full')
+        return original(path, data)
+    monkeypatch.setattr(jobs, 'atomic', interrupted)
+    with pytest.raises(OSError, match='disk full'):
+        store.put_artifacts(key, [('new', b'new')])
+    assert store.artifacts(key) == [first]
+    monkeypatch.setattr(jobs, 'atomic', original)
+    store.put_artifacts(key, [('new', b'new')])
+    assert [record['name'] for record in store.artifacts(key)] == ['old', 'new']

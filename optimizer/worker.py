@@ -108,24 +108,32 @@ class RemoteBackend:
                       'operation': operation, 'cases': [], 'remote_directory': str(remote_directory)}
             if (directory / 'transport.log').exists():
                 result['runtime_log_tail'] = (directory / 'transport.log').read_text(errors='replace')[-12000:]
-            atomic(result_path, canonical(result))
             self.store.put_artifact(self.job_id, str(relative / 'result.json'), canonical(result))
+            atomic(result_path, canonical(result))
             return result
         with tarfile.open(compact) as archive:
             rows = json.load(archive.extractfile('files.json'))
-            for row in rows:
-                name = Path(row['path'])
-                if name.is_absolute() or '..' in name.parts:
-                    raise ValueError('invalid compact artifact path')
-                data = archive.extractfile(row['path']).read()
-                if sha(data) != row['sha256'] or len(data) != row['size']:
-                    raise ValueError('compact artifact digest differs')
-                self.store.put_artifact(self.job_id, str(relative / name), data)
-                if name == Path('result.json'):
-                    atomic(result_path, data)
-        if not result_path.exists():
-            raise ValueError('remote compact archive has no result')
-        return json.loads(result_path.read_text())
+            result_data = None
+            def artifacts():
+                nonlocal result_data
+                for row in rows:
+                    name = Path(row['path'])
+                    if name.is_absolute() or '..' in name.parts:
+                        raise ValueError('invalid compact artifact path')
+                    data = archive.extractfile(row['path']).read()
+                    if sha(data) != row['sha256'] or len(data) != row['size']:
+                        raise ValueError('compact artifact digest differs')
+                    if name == Path('result.json'):
+                        # Validate before the batch commits; publish the local
+                        # completion marker only after all other files succeed.
+                        json.loads(data)
+                        result_data = data
+                    yield str(relative / name), data
+                if result_data is None:
+                    raise ValueError('remote compact archive has no result')
+            self.store.put_artifacts(self.job_id, artifacts())
+        atomic(result_path, result_data)
+        return json.loads(result_data)
 
     def prepare(self, spec, directory):
         result = self._operation('prepare', directory, spec=spec)

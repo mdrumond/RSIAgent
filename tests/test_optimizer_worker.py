@@ -361,6 +361,52 @@ def test_terminal_candidate_crash_without_archive_is_feedback_not_job_crash(tmp_
     assert {row['name'] for row in store.artifacts(job)} == {'candidate/transport.log', 'candidate/result.json'}
 
 
+@pytest.mark.parametrize('failure', ['bad-digest', 'missing-result', 'commit'])
+def test_compact_import_failure_does_not_publish_result_and_can_retry(tmp_path, monkeypatch, failure):
+    import io
+    import shutil
+    import tarfile
+    from optimizer.jobs import JobStore, canonical, sha
+    from optimizer.worker import RemoteBackend
+    store = JobStore(tmp_path / 'jobs')
+    job = store.create('def forward(x): return x', 'forward', {}, {})['job_id']
+    compact = tmp_path / 'remote.tar.gz'
+    def publish(valid):
+        files = {'result.json': canonical({'status': 'verified'}), 'metrics.csv': b'metric,1'}
+        if not valid and failure == 'missing-result':
+            files.pop('result.json')
+        rows = [dict(path=name, sha256=sha(data), size=len(data)) for name, data in files.items()]
+        if not valid and failure == 'bad-digest':
+            rows[-1]['sha256'] = '0' * 64
+        with tarfile.open(compact, 'w:gz') as archive:
+            for name, data in [*files.items(), ('files.json', canonical(rows))]:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+    class Transport:
+        def transfer(self, action, source, destination):
+            if action == 'download':
+                shutil.copyfile(compact, destination)
+        def execute(self, directory, argv):
+            pass
+    backend = RemoteBackend(store, job, config(tmp_path), transport=Transport())
+    directory = store.root / job / 'execution' / 'candidate'
+    publish(False)
+    batch = store._event_batch
+    if failure == 'commit':
+        def fail(*args):
+            raise OSError('interrupted artifact commit')
+        monkeypatch.setattr(store, '_event_batch', fail)
+    with pytest.raises((ValueError, OSError)):
+        backend.evaluate('source', directory, block_count=1)
+    assert not (directory / 'result.json').exists()
+    assert store.artifacts(job) == []
+    monkeypatch.setattr(store, '_event_batch', batch)
+    publish(True)
+    assert backend.evaluate('source', directory, block_count=1) == {'status': 'verified'}
+    assert len(store.artifacts(job)) == 2
+
+
 def test_profile_observation_loss_preserves_pending_and_history_on_retry(tmp_path):
     from test_optimizer_loop import fixture, Agent, Backend, candidate
     from optimizer.loop import OptimizationLoop
