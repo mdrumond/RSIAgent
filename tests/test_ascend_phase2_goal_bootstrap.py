@@ -42,14 +42,16 @@ def setup(tmp_path, responses, *, failure=None, query=None):
         response = responses.pop(0)
         if isinstance(response, Exception):
             raise response
-        return response
+        return response(prompt) if callable(response) else response
     coordinator = SimpleNamespace(snapshot=snapshot(), execute_project=actor,
         curriculum=CurriculumAgent(complete, target_policy=a3_curriculum_policy()))
     root = tmp_path / "campaign"
     root.mkdir()
+    coordinator.root = root
     def run():
         return bootstrap_goal(coordinator, root=root, private_root=tmp_path / "control" / "bootstrap",
                               objective="Optimize a new task", available_tools=())
+    run.coordinator = coordinator
     return run, root, calls, messages, actor, backend
 
 
@@ -132,3 +134,32 @@ def test_gated_kdb_queries_are_retained_replayed_and_cited(tmp_path):
     assert len(queries) == 1
     assert "REFERENCE EXAMPLE" in messages[-1][-1]["content"]
     assert json.loads((root / "goal-selection.json").read_bytes())["candidate"]["citations"] == [citation]
+
+
+def test_64_large_memories_and_tool_reads_fit_provider_budget_without_losing_seed(tmp_path):
+    import base64
+    from benchmarks.ascend.agent_presentation import memory_presentation
+    def page(messages):
+        index = json.loads(messages[1]["content"])["phase1_memory"]
+        assert len(index["projects"]) == 64
+        return json.dumps({"read_artifact": {"sha256": index["projects"][0]["sha256"], "limit": 8192}})
+    def query(payload, context):
+        return SimpleNamespace(observation={"results": [{"citation": {"path": "kernel.cpp"},
+            "text": "huge reference code " * 2000}] * 3})
+    run, _, calls, messages, _, _ = setup(tmp_path,
+        [json.dumps({"query": "vector code"})] * 3 + [page] * 3 + [proposal(100)], query=query)
+    memories = []
+    for index in range(64):
+        memory = deepcopy(snapshot().memory_entries()[0])
+        memory["project_spec"] = project(index)
+        memory["agent_lessons"] = [{"statement": "Useful measured lesson " * 100}] * (4 if index < 26 else 3)
+        memories.append(memory)
+    run.coordinator.snapshot.memory_entries = lambda: memories
+    run()
+    assert len(messages) == 7
+    assert max(len(json.dumps(request).encode()) for request in messages) < 192 * 1024
+    envelope = json.loads(calls[0].pre_wave_memory)
+    assert json.loads(base64.b64decode(envelope["initial_memory_base64"]))["phase1_memory"] == memories
+    assert calls[0].memory_root == run.coordinator.root
+    readable = memory_presentation(calls[0].pre_wave_memory, ContentAddressedArtifacts(tmp_path / "presentation"))
+    assert len(readable["projects"]) == 64 and "preview" not in readable

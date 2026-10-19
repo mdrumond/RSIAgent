@@ -26,7 +26,7 @@ class MemoryArtifactReader:
             return
         if not isinstance(envelope, dict) or "project_memory_base64" not in envelope:
             return
-        root = Path(request.branch_root).parents[3]
+        root = Path(request.memory_root) if getattr(request, "memory_root", None) else Path(request.branch_root).parents[3]
         entries = [(base64.b64decode(row, validate=True), None)
                    for row in envelope["project_memory_base64"]]
         try:

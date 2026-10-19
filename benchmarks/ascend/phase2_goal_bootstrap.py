@@ -1,5 +1,6 @@
 """Resumable curriculum-authored goals, qualified outside learner memory."""
 from copy import copy
+import base64
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from benchmarks.a5kernels.phase1_curriculum_selector import _grammar, _HELD_OUT_
 from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
 from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
 from .phase2_targets import TargetContract, qualify_target
+from .agent_presentation import memory_presentation, compact_observation, artifact_page_presentation
 
 
 def executable_identity(spec):
@@ -44,8 +46,10 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
     policy = coordinator.curriculum.target_policy
     snapshot = coordinator.snapshot
     entries = list(snapshot.memory_entries())
-    seed = canonical_bytes(dict(schema="ascend-phase2-curriculum-seed-v1",
-                               snapshot_id=snapshot.snapshot_id, phase1_memory=entries))
+    initial_seed = canonical_bytes(dict(schema="ascend-phase2-curriculum-seed-v1",
+                                       snapshot_id=snapshot.snapshot_id, phase1_memory=entries))
+    seed = canonical_bytes(dict(schema="a5-phase1-adaptive-memory-v1",
+        initial_memory_base64=base64.b64encode(initial_seed).decode(), project_memory_base64=[]))
     identity = dict(snapshot_id=snapshot.snapshot_id, runtime=dict(runtime), objective=objective,
                     available_tools=list(available_tools))
     state_path = private_root / "selection.json"
@@ -98,11 +102,12 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
         "Not a renamed Phase1 task. Do not name held-out benchmarks. Reference source "
         "will be independently constructed and host-qualified. Return JSON only: "
         '{"query":"specific kernel code search"} or '
+        '{"read_artifact":{"sha256":"hash","offset":0,"limit":8192}} or '
         '{"project":{ProjectSpec},"rationale":"why this is useful and new"}. '
-        "At most three code searches per proposal; use only actual available tools. "
+        "At most six tool reads including three code searches per proposal. "
+        "Memory index is presentation only; original memories and observations are hash-addressed. "
         "When KDB is available, search it before proposing the goal.")}
-    memory = [{"spec": spec.as_dict(), "lessons": row.get("agent_lessons", [])[:2]}
-              for spec, row in zip(prior_specs, entries)]
+    memory = memory_presentation(seed, store)
     while state["proposal_count"] < 3 or state["stage"] == "qualification":
         if state["stage"] == "selection":
             messages = [system, {"role": "user", "content": json.dumps(dict(
@@ -113,7 +118,8 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
             citations = []
             # Persist each completed model turn/query before another provider request.
             turns = state.setdefault("selection_turns", [])
-            for query_index in range(4):
+            query_count = 0
+            for query_index in range(7):
                 if query_index < len(turns):
                     response = turns[query_index]
                 else:
@@ -123,7 +129,15 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                 messages.append({"role": "assistant", "content": response})
                 try:
                     value = json.loads(response)
-                    if isinstance(value, dict) and set(value) == {"query"} and query_index < 3:
+                    if isinstance(value, dict) and set(value) == {"read_artifact"} and query_index < 6:
+                        try:
+                            result = artifact_page_presentation(value["read_artifact"], store)
+                        except FileNotFoundError as error:
+                            raise ValueError("requested memory artifact was not retained") from error
+                        messages.append({"role": "user", "content": json.dumps(result)})
+                        continue
+                    if isinstance(value, dict) and set(value) == {"query"} and query_index < 6 and query_count < 3:
+                        query_count += 1
                         if not isinstance(value["query"], str) or not value["query"].strip():
                             raise ValueError("knowledge query must be nonempty text")
                         query_path = private_root / f"query-{state['proposal_count']}-{query_index}.json"
@@ -134,11 +148,11 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                             result = dict(actor.query_knowledge({"query": value["query"], "limit": 3}, context).observation)
                             _write(query_path, result)
                         citations.extend(row["citation"] for row in result.get("results", []))
-                        messages.append({"role": "user", "content": json.dumps(result)})
+                        messages.append({"role": "user", "content": json.dumps(compact_observation(result, store))})
                         continue
                     if not isinstance(value, dict) or set(value) != {"project", "rationale"}:
                         raise ValueError("expected project and rationale after at most three searches")
-                    if knowledge_enabled and query_index == 0:
+                    if knowledge_enabled and query_count == 0:
                         raise ValueError("KDB-enabled goal selection must query kernel code first")
                     spec = ProjectSpec.from_mapping(value["project"])
                     if not isinstance(value["rationale"], str) or not value["rationale"].strip():
@@ -180,7 +194,7 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
             else:
                 inputs = materialize_inputs(spec)
                 result = reference_actor(AdaptiveProjectRequest(spec, 0, seed, branch,
-                    inputs, evaluate_reference(spec, inputs)))
+                    inputs, evaluate_reference(spec, inputs), memory_root=coordinator.root))
                 if not result.evidence.verified:
                     raise ValueError("private reference Actor did not pass host verification: " + result.summary)
                 source_sha = json.loads(result.evidence_payload)["source_sha256"]
