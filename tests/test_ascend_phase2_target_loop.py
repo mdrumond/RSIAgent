@@ -224,3 +224,44 @@ def test_terminal_attempt_metadata_must_match_retained_branch(tmp_path, monkeypa
         row[field]["detail"] = "different observed diagnostic"
     with pytest.raises(ValueError, match="retained host outcome"):
         _verify_adaptive_state(c.root, changed)
+
+
+def test_seed_and_failed_practice_ids_are_corrected_before_execution(tmp_path):
+    c, _, requests = build(tmp_path, [], execute=lambda r, n: _result(r.spec, n != 2, "host verdict"))
+    c.run_attempt()
+    first = practice(c, "first")
+    replies = iter([wire("PRACTICE", replace(first, project_id=c.seed_outcomes[0]["project_id"])),
+                    wire("PRACTICE", first)])
+    calls = []
+    c.curriculum = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
+    assert c.run_attempt()["practice_attempts"] == 1
+    initial = json.loads(calls[0][1]["content"].rsplit("\n", 1)[-1])
+    assert c.seed_outcomes[0]["project_id"] in initial["used_project_ids"]
+    assert "fresh project ID" in calls[1][-1]["content"]
+    # A failed practice also reserves its ID after reloading retained state.
+    calls.clear()
+    replies = iter([wire("PRACTICE", first), wire("PRACTICE", practice(c, "second")), wire("READY")])
+    assert c.resume()["status"] == "READY"
+    initial = json.loads(calls[0][1]["content"].rsplit("\n", 1)[-1])
+    assert first.project_id in initial["used_project_ids"]
+    assert "fresh project ID" in calls[1][-1]["content"]
+    assert [r.spec.project_id for r in requests] == [c.target.spec.project_id,
+        first.project_id, "practice-second", c.target.spec.project_id]
+
+
+def test_duplicate_practice_correction_is_bounded_without_consuming_attempts(tmp_path):
+    c, _, requests = build(tmp_path, [])
+    c.run_attempt()
+    calls = []
+    duplicate = replace(practice(c), project_id=c.seed_outcomes[0]["project_id"])
+    c.curriculum = TargetCurriculumAgent(lambda messages: (
+        calls.append(messages), wire("PRACTICE", duplicate))[1])
+    with pytest.raises(ValueError, match="after 3 attempts.*fresh project ID"):
+        c.resume()
+    assert len(calls) == 3
+    assert len(requests) == 1
+    assert not (c.root / "pending.json").exists()
+    assert c.report()["practice_attempts"] == 0
+    c.curriculum = TargetCurriculumAgent(lambda _: wire("READY"))
+    assert c.resume()["status"] == "READY"
+    assert len(requests) == 1

@@ -70,7 +70,9 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
             tuple([*self._curriculum_feedback(state),
                    *[row for row in state["attempts"][-2:] if row["kind"] == "practice"]]),
             self.max_target_attempts - state["target_attempts"],
-            self.max_practice_attempts - state["practice_since_target"], self.available_tools)
+            self.max_practice_attempts - state["practice_since_target"], self.available_tools,
+            used_project_ids=tuple(sorted({row["project_id"]
+                for row in [*self.seed_outcomes, *state["attempts"]]})))
 
     def _select_pending(self, state):
         snapshot = self._memory_snapshot(state)
