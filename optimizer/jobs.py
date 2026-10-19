@@ -43,6 +43,32 @@ class JobStore:
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._submission_digests = {}
+
+    @staticmethod
+    def _file_identity(stat):
+        return (stat.st_dev, stat.st_ino, stat.st_size,
+                stat.st_mtime_ns, stat.st_ctime_ns)
+
+    @staticmethod
+    def _hash_submission(stream):
+        return hashlib.file_digest(stream, 'sha256').hexdigest()
+
+    def _submission_digest(self, path):
+        """Reuse the actual digest only while the immutable file is unchanged."""
+        before = self._file_identity(path.stat())
+        previous = self._submission_digests.get(path)
+        if previous is not None and previous[0] == before:
+            return previous[1]
+        self._submission_digests.pop(path, None)
+        with path.open('rb') as stream:
+            opened = self._file_identity(os.fstat(stream.fileno()))
+            digest = self._hash_submission(stream)
+            after = self._file_identity(os.fstat(stream.fileno()))
+        if not before == opened == after == self._file_identity(path.stat()):
+            raise ValueError('submission changed during digest verification')
+        self._submission_digests[path] = before, digest
+        return digest
 
     def _directory(self, job_id):
         if not re.fullmatch(r'[0-9a-f]{32}', job_id):
@@ -106,7 +132,7 @@ class JobStore:
             if 'manifest' in event['payload']:
                 manifest = event['payload']['manifest']
                 break
-        if sha((directory / 'submission.json').read_bytes()) != manifest['submission_sha256']:
+        if self._submission_digest(directory / 'submission.json') != manifest['submission_sha256']:
             raise ValueError('submission digest mismatch')
         return manifest
 

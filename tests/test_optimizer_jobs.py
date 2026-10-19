@@ -85,3 +85,65 @@ def test_published_job_parent_is_synced(tmp_path, monkeypatch):
     monkeypatch.setattr(os, 'fsync', track)
     create(JobStore(tmp_path))
     assert synced[-1] == tmp_path
+
+
+def test_submission_digest_reused_but_expected_digest_always_checked(tmp_path, monkeypatch):
+    import json
+    store = JobStore(tmp_path)
+    job = create(store)
+    key = job['job_id']
+    calls = []
+    original = store._hash_submission
+    def count(stream):
+        calls.append(stream.name)
+        return original(stream)
+    monkeypatch.setattr(store, '_hash_submission', count)
+    store.get(key)
+    store.get(key)
+    store.put_artifact(key, 'small-result', b'{}')
+    assert len(calls) == 1
+    manifest = tmp_path / key / 'manifest.json'
+    manifest.write_text(json.dumps({**job, 'submission_sha256': '0' * 64}))
+    with pytest.raises(ValueError, match='submission digest mismatch'):
+        store.get(key)
+    assert len(calls) == 1
+    # Cache is per store, not shared globally between worker processes.
+    with pytest.raises(ValueError, match='submission digest mismatch'):
+        JobStore(tmp_path).get(key)
+
+
+@pytest.mark.parametrize('replacement', [False, True])
+def test_submission_digest_invalidated_by_same_size_tamper(tmp_path, replacement):
+    import os
+    store = JobStore(tmp_path)
+    key = create(store)['job_id']
+    store.get(key)
+    path = tmp_path / key / 'submission.json'
+    before = path.stat()
+    changed = path.read_bytes().replace(b'snapshot_id', b'snapshot_XX')
+    assert len(changed) == before.st_size
+    if replacement:
+        other = path.with_suffix('.replacement')
+        other.write_bytes(changed)
+        other.replace(path)
+    else:
+        path.write_bytes(changed)
+    # Even restoring mtime cannot hide ordinary mutation: ctime/inode changes.
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(ValueError, match='submission digest mismatch'):
+        store.get(key)
+
+
+def test_submission_modified_during_hash_is_not_cached(tmp_path, monkeypatch):
+    store = JobStore(tmp_path)
+    key = create(store)['job_id']
+    path = tmp_path / key / 'submission.json'
+    original = store._hash_submission
+    def mutate(stream):
+        digest = original(stream)
+        path.write_bytes(path.read_bytes().replace(b'snapshot_id', b'snapshot_XX'))
+        return digest
+    monkeypatch.setattr(store, '_hash_submission', mutate)
+    with pytest.raises(ValueError, match='changed during digest verification'):
+        store.get(key)
+    assert path not in store._submission_digests
