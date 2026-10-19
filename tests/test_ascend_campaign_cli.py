@@ -712,7 +712,8 @@ def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_pa
     model = MODEL_IDENTITIES[0]
     config = write(tmp_path / "settings.json", {"model": model.backend_model.value,
         "phase1_arguments": [], "source_manifest": str(manifest),
-        "target_artifact_store": str(store.root), "target_runtime": RUNTIME})
+        "target_artifact_store": str(store.root), "target_runtime": RUNTIME,
+        "target_available_tools": ["msprof", "msdebug", "mssanitizer"]})
     memory = tmp_path / "seed"
     memory.write_bytes(b"seed")
     control, root = tmp_path / "control", tmp_path / "campaign"
@@ -741,4 +742,22 @@ def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_pa
     controller = cli.build_controller(job)
     assert isinstance(controller, TargetDrivenPhase2Coordinator)
     assert controller.target.target_id == goal.target_id
+    assert controller.available_tools == ()
     assert hashlib.sha256(config.read_bytes()).hexdigest() == job["config_sha256"]
+
+
+@pytest.mark.parametrize("profile,timing,diagnostic", [(False, False, False), (True, False, False),
+                                                      (False, True, False), (False, False, True)])
+def test_target_tools_come_from_bound_actions_not_settings(profile, timing, diagnostic):
+    from benchmarks.a5kernels.phase1_adaptive_actor import disabled_profile_action, disabled_diagnostic_action
+    def active(*args):
+        return None
+    actor = SimpleNamespace(request_profile=active if profile else disabled_profile_action,
+                            request_timing=active if timing else disabled_profile_action,
+                            request_diagnostic=active if diagnostic else disabled_diagnostic_action)
+    tools = cli._target_available_tools(actor)
+    assert ("request-profile" in tools) is profile
+    assert ("request-timing" in tools) is timing
+    assert ("request-debug" in tools) is diagnostic
+    assert ("request-sanitizer" in tools) is diagnostic
+    assert cli._target_available_tools(lambda _: None) == ()

@@ -76,6 +76,23 @@ def _snapshot(job, options):
     return snapshot
 
 
+def _target_available_tools(actor):
+    """Advertise composed routes, never tools invented by campaign settings."""
+    from benchmarks.a5kernels.phase1_adaptive_actor import (
+        disabled_profile_action, disabled_diagnostic_action,
+    )
+    tools = []
+    for attribute, disabled, names in (
+        ("request_profile", disabled_profile_action, ("request-profile",)),
+        ("request_timing", disabled_profile_action, ("request-timing",)),
+        ("request_diagnostic", disabled_diagnostic_action, ("request-debug", "request-sanitizer")),
+    ):
+        route = getattr(actor, attribute, None)
+        if callable(route) and route is not disabled:
+            tools.extend(names)
+    return tuple(tools)
+
+
 def build_controller(job):
     """Reuse the existing native/Catlass CLI bindings, replacing only execution."""
     from .phase1_cli import main as target_main
@@ -140,7 +157,7 @@ def build_controller(job):
                 target_policy=coordinator.curriculum.target_policy,
                 max_target_attempts=job["target_attempt_budget"],
                 max_practice_attempts=job["practice_attempt_budget"],
-                available_tools=settings.get("target_available_tools", ()),
+                available_tools=_target_available_tools(coordinator.execute_project),
                 trace_hook=coordinator.trace_hook,
             )
         captured.append(coordinator)

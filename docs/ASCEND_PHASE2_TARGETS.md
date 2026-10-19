@@ -70,13 +70,12 @@ Add these keys to the ignored existing campaign settings JSON alongside its
     "toolchain": "observed-toolchain-version",
     "product": "observed-product",
     "compiler": "observed-compiler-revision"
-  },
-  "target_available_tools": []
+  }
 }
 ```
 
-Use observed runtime values, not the illustrative strings above. Only list tools
-that the selected backend can actually execute. A5 uses the same workflow with an
+Use observed runtime values, not the illustrative strings above. Tool availability is derived from the composed profiling, timing, and diagnostic
+actions; settings cannot advertise unconfigured routes. A5 uses the same workflow with an
 A5-qualified contract and A5 configuration.
 
 ```bash
