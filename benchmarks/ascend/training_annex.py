@@ -257,6 +257,11 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None):
             state["target_attempts"] != target_attempts
             or state["practice_since_target"] != practice_since_target):
         raise ValueError("target budget counters differ from retained completed attempts")
+    if (state.get("phase") == "target-driven-phase2"
+            and (state.get("terminal") or {}).get("status") == "READY"
+            and (not state["attempts"] or state["attempts"][-1]["kind"] != "target"
+                 or state["attempts"][-1]["verified"] is not True)):
+        raise ValueError("READY requires a final host-verified target attempt")
     if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
         raise ValueError("adaptive state differs from ordered published deltas")
     if state.get("phase") != "adaptive-phase2" and failures != state.get("failed_outcomes", []):

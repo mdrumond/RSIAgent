@@ -327,3 +327,24 @@ def test_archive_budget_counters_exclude_infrastructure_pending_attempts(tmp_pat
     assert c.resume()["status"] == "READY"
     assert len(requests) == 5
     _verify_adaptive_state(c.root, c._load_state())
+
+
+@pytest.mark.parametrize("boundary", ["empty", "failed-target", "practice-after-passing-target"])
+def test_archive_ready_requires_final_verified_target(tmp_path, monkeypatch, boundary):
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state, inventory_campaign
+    c, _, _ = build(tmp_path, [], execute=lambda r, n: _result(
+        r.spec, boundary != "failed-target", "actual host verdict"))
+    if boundary != "empty":
+        c.run_attempt()
+    if boundary == "practice-after-passing-target":
+        c.curriculum = TargetCurriculumAgent(lambda _: wire("PRACTICE", practice(c)))
+        c.run_attempt()
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    state = c._load_state()
+    _verify_adaptive_state(c.root, state)
+    state["terminal"] = {"status": "READY", "reason": "unsupported readiness claim"}
+    with pytest.raises(ValueError, match="READY requires a final host-verified target attempt"):
+        _verify_adaptive_state(c.root, state)
+    c._atomic_json(c.root / "state.json", state)
+    assert {"kind": "invalid-adaptive-memory-chain"} in inventory_campaign(c.root)["issues"]
