@@ -199,19 +199,24 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None):
     seed = root / "initial-memory.bin"
     initial = (Path(external_initial_memory).read_bytes() if external_initial_memory else
                seed.read_bytes() if seed.is_file() else None)
-    if state.get("phase") == "adaptive-phase2":
+    if state.get("phase") in {"adaptive-phase2", "target-driven-phase2"}:
         from .phase2_curriculum import reviewed_seed
         initial, _ = reviewed_seed(root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
+    if state.get("phase") == "target-driven-phase2" and len(state["attempts"]) != len(state["completed_waves"]):
+        raise ValueError("target attempt count differs from completed waves")
     memories, outcomes, failures = [], [], []
-    for wave_id in state["completed_waves"]:
+    target_attempts = practice_since_target = 0
+    for ordinal, wave_id in enumerate(state["completed_waves"]):
         wave_root = root / "waves" / wave_id
         wave = WaveSpec.from_mapping(json.loads((wave_root / "plan.json").read_bytes())["wave"])
         if initial is not None:
             snapshot = {"schema": MEMORY_SCHEMA,
                         "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
                         "project_memory_base64": memories}
+            if state.get("phase") == "target-driven-phase2":
+                snapshot["phase2_feedback"] = state["attempts"][max(0, ordinal - 2):ordinal]
             if wave.pre_wave_memory_sha256 != _sha(_json(snapshot)):
                 raise ValueError("published pre-wave memory chain differs")
         publication = json.loads((wave_root / "published.json").read_bytes())
@@ -228,6 +233,38 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None):
             outcomes.append({"project_id": project.spec.project_id,
                              "spec": project.spec.as_dict(), "verified": True,
                              "summary": delta["summary"]})
+        if state.get("phase") == "target-driven-phase2":
+            from .phase2_target_loop import TargetDrivenPhase2Coordinator
+            if len(wave.projects) != 1:
+                raise ValueError("target attempts must contain one project")
+            project = wave.projects[0].spec
+            branch = wave_root / "branches" / project.project_id
+            verified = json.loads((branch / "outcome.json").read_bytes())["verified"]
+            retained = (outcomes if verified else failures)[-1]
+            kind = "target" if project.as_dict() == state["goal_identity"]["target"]["spec"] else "practice"
+            expected_attempt = {**retained, "kind": kind, "wave_id": wave_id,
+                                "host_feedback": TargetDrivenPhase2Coordinator._host_feedback(branch)}
+            recorded_attempt = {key: value for key, value in state["attempts"][ordinal].items()
+                                if key != "attempt_root"}
+            if recorded_attempt != expected_attempt:
+                raise ValueError("target attempt differs from retained host outcome")
+            if kind == "target":
+                target_attempts += 1
+                practice_since_target = 0
+            else:
+                practice_since_target += 1
+    if state.get("phase") == "target-driven-phase2" and (
+            state["target_attempts"] != target_attempts
+            or state["practice_since_target"] != practice_since_target):
+        raise ValueError("target budget counters differ from retained completed attempts")
+    if state.get("phase") == "target-driven-phase2" and state["next_kind"] != (
+            "review" if state["attempts"] else "target"):
+        raise ValueError("next attempt kind differs from retained completed attempts")
+    if (state.get("phase") == "target-driven-phase2"
+            and (state.get("terminal") or {}).get("status") == "READY"
+            and (not state["attempts"] or state["attempts"][-1]["kind"] != "target"
+                 or state["attempts"][-1]["verified"] is not True)):
+        raise ValueError("READY requires a final host-verified target attempt")
     if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
         raise ValueError("adaptive state differs from ordered published deltas")
     if state.get("phase") != "adaptive-phase2" and failures != state.get("failed_outcomes", []):
@@ -332,8 +369,8 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
     if state.get("schema") == STATE_SCHEMA:
         # Phase 2 uses its separately authenticated reviewed snapshot as seed;
         # this file is the Phase 1 launcher's portable seed convention.
-        if (state.get("phase") != "adaptive-phase2" and not (root / "initial-memory.bin").is_file()
-                and external_initial_memory is None):
+        if (state.get("phase") not in {"adaptive-phase2", "target-driven-phase2"}
+                and not (root / "initial-memory.bin").is_file() and external_initial_memory is None):
             issues.append({"kind": "missing-initial-memory"})
         try:
             _verify_adaptive_state(root, state, external_initial_memory=external_initial_memory)

@@ -177,6 +177,8 @@ def memory_presentation(raw, artifacts):
         if len(canonical_bytes(result)) > 8192:
             result.pop("preview")
         return result
+    if "phase2_feedback" in value:
+        result["phase2_feedback"] = _preview(value["phase2_feedback"])
     initial = base64.b64decode(value["initial_memory_base64"], validate=True)
     result["initial_memory_sha256"] = artifacts.put_bytes(initial)
     try:

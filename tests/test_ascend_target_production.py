@@ -101,6 +101,10 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, select
         assert identity["phase"] == "adaptive-phase2"
         assert identity["snapshot_id"] == "reviewed-seed"
     assert build_native_adaptive_phase1(**kwargs).project_target == 64
+    # New goal qualification may observe a compiler without changing reviewed seed pins.
+    observed = build_native_adaptive_phase1(**dict(kwargs, config=replace(config, compiler_version="observed-compiler")))
+    assert json.loads((tmp_path / "campaign-identity.json").read_bytes()) == identity
+    assert observed.snapshot.snapshot_id == "reviewed-seed" if phase2 else True
     from benchmarks.ascend.training_traces import recorder_factory
     factory = recorder_factory(phase="phase1", round_id="native-builder-round",
                                model="fixture", source_manifest_sha256="b" * 64)
@@ -118,3 +122,26 @@ def test_native_binding_does_not_label_vector_reduction_as_simt():
     value["capabilities"] = ["vector-reduction"]
     value["graph"]["nodes"][0].update(op="reduce-sum", axis=0)
     assert NativeProjectBinding().family(ProjectSpec.from_mapping(value)).value == "vector-reduction-mask"
+
+
+def test_parallel_native_composition_preserves_each_workers_runtime_on_resume(tmp_path):
+    from benchmarks.ascend.production import NativeProjectWorker, native_target_runtime
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+
+    guide = b"Native Ascend C guide"
+    config = NativeProductionConfig(tmp_path, "observed-product", "observed-arch", "bz-a3-1",
+        hashlib.sha256(guide).hexdigest(), "a" * 40,
+        environment_identity={"cann_version": "observed-cann"}, compiler_version="observed-compiler")
+    workers = tuple(NativeProjectWorker(tmp_path / f"worker-{device}",
+        SimpleNamespace(_device=device, profile="bz-a3-1")) for device in (2, 5))
+    for _ in range(2):
+        controller = build_native_adaptive_phase1(config=config, native_transport=workers[0].transport,
+            profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=guide,
+            objective="Learn native kernels", initial_memory=b"",
+            environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
+            project_workers=workers)
+        assert controller.max_parallel == 2
+        actors = tuple(controller.execute_project.actors.queue)
+        assert [actor.executor.runtime_identity for actor in actors] == [
+            native_target_runtime(config, worker.transport) for worker in workers]

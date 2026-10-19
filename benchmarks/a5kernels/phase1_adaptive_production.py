@@ -319,6 +319,20 @@ def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=No
         raise ValueError("campaign identity could not be retained") from exc
 
 
+def catlass_target_runtime(paths, command):
+    """Bind goals to this Catlass A5 family and the already-probed compiler stack."""
+    observed = dict(command.runtime_provenance)
+    required = {"execution_profile", "cann_version", "ascendnpu_ir_install_commit"}
+    if not required <= observed.keys():
+        return None
+    result = {"target": "a5", "runtime": observed["execution_profile"],
+              "device": str(paths.device), "product": "Ascend950",
+              "toolchain": observed["cann_version"], "compiler": observed["ascendnpu_ir_install_commit"]}
+    result.update({key: observed[key] for key in (
+        "catlass_revision", "manifest_sha256", "bridge_sha256", "ascendnpu_ir_gitlink") if key in observed})
+    return result
+
+
 def build_adaptive_phase1(
     *,
     cell: A5Phase1Cell,
@@ -367,7 +381,8 @@ def build_adaptive_phase1(
         device=paths.device,
     )
     executor = ProjectExecutor(
-        backend, EvidenceLedger(paths.root / "project-evidence.jsonl")
+        backend, EvidenceLedger(paths.root / "project-evidence.jsonl"),
+        runtime_identity=lambda: catlass_target_runtime(paths, command),
     )
     from benchmarks.a5kernels.phase1_project_measurements import ProjectMeasurementBackend
     measurements = ProjectMeasurementBackend(

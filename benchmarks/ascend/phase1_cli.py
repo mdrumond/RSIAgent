@@ -183,7 +183,7 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             hashlib.sha256(guide).hexdigest(), config["cpl_skills_revision"],
             tuple(config.get("dtypes", ["float32"])), kdb, collection,
             environment_identity=config["environment_identity"],
-            profiling_mode=args.profiling,
+            profiling_mode=args.profiling, compiler_version=config.get("compiler_version"),
         )
         workers = []
         parallel = native_parallel and "physical_devices" in config

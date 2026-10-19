@@ -33,6 +33,7 @@ class TargetCurriculumContext:
     remaining_target_attempts: int
     remaining_practice_attempts: int
     available_tools: tuple[str, ...] = ()
+    used_project_ids: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not isinstance(self.target, TargetContract):
@@ -106,7 +107,8 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
     return ("Choose PRACTICE with exactly one ProjectSpec, RETRY_TARGET to apply lessons, "
         "READY only after a verified target and no further useful practice, or STALLED "
         "when useful work is blocked. STALLED is not success. Do not return READY for "
-        "practice success. Use only available tools; missing tools are unavailable, "
+        "practice success. Each practice project_id must be fresh: never reuse any "
+        "used_project_ids or the fixed target ID. Use only available tools; missing tools are unavailable, "
         "never zero. Separate debug/print/sanitizer runs from device timing. Sync "
         "practice must test correctness and compare performance only for correct variants.\n"
         "Wire forms:\nDECISION: PRACTICE\n"
@@ -120,7 +122,8 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
             "latest_target_attempt": dict(context.latest_attempt), "lessons": list(context.lessons),
             "remaining_target_attempts": context.remaining_target_attempts,
             "remaining_practice_attempts": context.remaining_practice_attempts,
-            "available_tools": list(context.available_tools), "project_grammar": grammar}, sort_keys=True))
+            "available_tools": list(context.available_tools),
+            "used_project_ids": list(context.used_project_ids), "project_grammar": grammar}, sort_keys=True))
 
 
 class TargetCurriculumAgent:
@@ -182,6 +185,8 @@ class TargetCurriculumAgent:
             project = ProjectSpec.from_mapping(value["project"])
             if project.project_id == context.target.spec.project_id:
                 raise ValueError("practice must not replace the target")
+            if project.project_id in context.used_project_ids:
+                raise ValueError("practice requires a fresh project ID; this ID was already used")
             names = (*(value[key] for key in fields - {"project"}),
                      project.project_id, project.hypothesis, project.graph.output,
                      *(item.name for item in project.graph.inputs),

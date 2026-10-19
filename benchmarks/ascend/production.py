@@ -17,6 +17,19 @@ from benchmarks.a5kernels.phase1_project import ProjectOp
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutionFamily, ProjectKernelABI
 
 
+def native_target_runtime(config, transport):
+    """Canonical goal identity from the selected native transport and observations."""
+    environment = config.environment_identity or {}
+    compiler = getattr(config, "compiler_version", None) or environment.get("compiler_version")
+    if (not compiler or not environment.get("cann_version")
+            or not hasattr(transport, "_device") or not hasattr(transport, "profile")):
+        return None
+    return {"target": "a3", "runtime": "py311-torch", "device": str(transport._device),
+            "toolchain": environment["cann_version"], "compiler": compiler,
+            "product": config.target, "architecture": config.arch,
+            "execution_profile": transport.profile}
+
+
 def compose_adaptive_controller(
     *, root, objective, initial_memory, executor, actor, profile, provider,
     immutable_context, max_parallel=1, project_target=None, max_projects=None,
@@ -74,6 +87,7 @@ class NativeProductionConfig:
     collection: str | tuple[str, ...] | list[str] | None = None
     environment_identity: dict | None = None
     profiling_mode: str | None = None
+    compiler_version: str | None = None
 
     def __post_init__(self):
         if self.execution_profile not in {"bz-a3-1", "bz-a3-2"}:
@@ -226,7 +240,8 @@ def build_native_adaptive_phase1(
                                        target=config.target, arch=config.arch,
                                        profile=config.execution_profile)
         executor = ProjectExecutor(backend, EvidenceLedger(root / "project-evidence.jsonl"),
-                                   binding=NativeProjectBinding(dtypes=config.dtypes))
+                                   binding=NativeProjectBinding(dtypes=config.dtypes),
+                                   runtime_identity=native_target_runtime(config, native_transport))
     context = canonical_bytes({"identity": identity, "programming_guide": guide_text})
     diagnostics = "Debugger and sanitizer routes are unavailable in this native composition.\n"
     pool = None
@@ -237,7 +252,8 @@ def build_native_adaptive_phase1(
                 target=config.target, arch=config.arch, profile=config.execution_profile)
             worker_executor = ProjectExecutor(worker_backend,
                 EvidenceLedger(worker.root / "project-evidence.jsonl"),
-                binding=NativeProjectBinding(dtypes=config.dtypes))
+                binding=NativeProjectBinding(dtypes=config.dtypes),
+                runtime_identity=native_target_runtime(config, worker.transport))
             actors.append(AdaptiveActorProjectExecutor(worker_executor, actor, profile,
                 query_knowledge=query, request_profile=worker.request_profile,
                 request_timing=worker.request_timing, immutable_context=context,
