@@ -1,6 +1,8 @@
 # Target-driven Phase 2 contracts
 
-`benchmarks.ascend.phase2_targets.qualify_target` executes a working reference
+`benchmarks.ascend.phase2_targets.qualify_target` requires the executor’s observed
+`runtime_identity` to match the requested runtime before any backend work, then
+executes a working reference
 through the selected `ProjectExecutor`. It enables the fixed `ProjectSpec` only
 when the existing quantitative host oracle passes, retaining the reference
 source, complete output, inputs, and oracle in `ContentAddressedArtifacts`.
