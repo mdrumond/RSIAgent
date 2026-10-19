@@ -250,6 +250,148 @@ def _memory(branch: Path):
     return delta, memory, performance
 
 
+def _percentile(values, fraction):
+    """Linear sample percentile (the common R-7 definition), including singleton samples."""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower, upper = math.floor(position), math.ceil(position)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+_PIPE_COLUMNS = {
+    "aic_mac": ("aic", "Cube / MAC"), "aic_scalar": ("aic", "Scalar"),
+    "aic_mte1": ("aic", "MTE1"), "aic_mte2": ("aic", "MTE2"),
+    "aic_fixpipe": ("aic", "FIX"), "aiv_vec": ("aiv", "Vector"),
+    "aiv_scalar": ("aiv", "Scalar"), "aiv_mte2": ("aiv", "MTE2"),
+    "aiv_mte3": ("aiv", "MTE3"),
+}
+
+
+def _finite_number(value):
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def _logical_io_elements(spec, shape):
+    """Declared input plus output traffic for shapes whose graph semantics are known."""
+    graph = spec.get("graph")
+    if not isinstance(graph, dict):
+        return math.prod(shape) * 2  # Legacy single-input fixtures/specs.
+    inputs, nodes = graph.get("inputs"), graph.get("nodes")
+    if not isinstance(inputs, list) or not isinstance(nodes, list) or not nodes:
+        return None
+    if shape == spec.get("shape"):
+        validated = _validated_graph(graph)
+        if validated:
+            input_shapes, output_shape, _, _ = validated
+            return sum(map(math.prod, input_shapes)) + math.prod(output_shape)
+    operations = {node.get("op") for node in nodes if isinstance(node, dict)}
+    if operations <= {"copy", "add", "multiply", "relu", "mask-positive"}:
+        return math.prod(shape) * (len(inputs) + 1)
+    if operations == {"matmul"} and len(shape) == 3:
+        m, k, n = shape
+        return m * k + k * n + m * n
+    if operations == {"reduce-sum"} and len(inputs) == 1:
+        axis = nodes[-1].get("axis")
+        if type(axis) is int and 0 <= axis < len(shape):
+            return math.prod(shape) + math.prod(shape) // shape[axis]
+    return None
+
+
+def _performance(project):
+    """Build the bounded, presentation-only performance wire response."""
+    captures, seen = [], set()
+    for raw in project.get("performance", []):
+        if not isinstance(raw, dict):
+            continue
+        samples = raw.get("samples_us")
+        shape = raw.get("shape")
+        if (not isinstance(samples, list) or not samples or
+                not all(_finite_number(item) for item in samples) or
+                not isinstance(shape, list) or not shape or
+                not all(type(item) is int and item > 0 for item in shape)):
+            continue
+        try:
+            identity = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            continue
+        if identity in seen:
+            continue
+        seen.add(identity)
+        values = [float(item) for item in samples]
+        stats = {"count": len(values), "min_us": min(values),
+                 "q1_us": _percentile(values, .25), "median_us": _percentile(values, .5),
+                 "q3_us": _percentile(values, .75), "max_us": max(values)}
+        physical = raw.get("physical_shape")
+        physical = (physical if isinstance(physical, list) and physical and
+                    all(type(item) is int and item > 0 for item in physical) else None)
+        boundary = raw.get("measurement") if isinstance(raw.get("measurement"), str) else None
+        bandwidth = None
+        spec = project.get("spec", {})
+        if (len(shape) == len(spec.get("shape", shape)) and boundary == "launch-plus-synchronize"
+                and stats["median_us"] > 0):
+            dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4,
+                           "float8_e4m3fn": 1, "float8_e5m2": 1,
+                           "mxfp8_e4m3fn": 1, "mxfp8_e5m2": 1}.get(
+                               spec.get("dtype", "float32"))
+            logical_elements = _logical_io_elements(spec, shape)
+            if dtype_bytes and logical_elements is not None:
+                logical_bytes = logical_elements * dtype_bytes
+                bandwidth = logical_bytes / (stats["median_us"] * 1e-6) / (1024 ** 3)
+        captures.append({"attempt": len(captures) + 1, "boundary": boundary,
+                         "instrumented": raw.get("instrumented") is True,
+                         "logical_shape": shape, "physical_shape": physical,
+                         "shape_axis": ({"kind": "log-length", "value": shape[0]}
+                                        if len(shape) == 1 else
+                                        {"kind": "category", "value": "×".join(map(str, shape))}),
+                         "statistics": stats, "useful_logical_io_gib_s": bandwidth,
+                         "evidence_sha256": hashlib.sha256(identity.encode()).hexdigest()})
+
+    profiles, seen_profiles = [], set()
+    expected = [(f"{engine}-{name.replace(' / MAC', '').lower()}", engine, label, prefix)
+                for prefix, (engine, label) in _PIPE_COLUMNS.items() for name in [label]]
+    for fact_index, fact in enumerate(project.get("memory", {}).get("facts", [])):
+        if fact.get("category") != "profiling":
+            continue
+        try:
+            raw = json.loads(fact["statement"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not isinstance(raw, dict) or raw.get("metric") != "PipeUtilization":
+            continue
+        try:
+            identity = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            continue
+        if identity in seen_profiles:
+            continue
+        seen_profiles.add(identity)
+        columns = {}
+        for item in raw.get("metric_values", []):
+            if (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)
+                    and _finite_number(item[1])):
+                match = re.search(r":(aic|aiv)_(mac|scalar|mte1|mte2|mte3|vec|fixpipe)_(ratio|time\(us\)):\d+\Z",
+                                  item[0])
+                if match:
+                    columns[f"{match.group(1)}_{match.group(2)}_{match.group(3)}"] = float(item[1])
+        metrics = []
+        for metric_id, engine, label, prefix in expected:
+            ratio, duration = columns.get(prefix + "_ratio"), columns.get(prefix + "_time(us)")
+            percentage = (ratio * 100 if ratio is not None and 0 <= ratio <= 1 else
+                          ratio if ratio is not None and 1 < ratio <= 100 else None)
+            metrics.append({"id": metric_id, "engine": engine.upper(), "label": label,
+                            "unit": "%", "value": percentage,
+                            "time_us": duration if duration is None or duration >= 0 else None,
+                            "available": percentage is not None})
+        profiles.append({"capture": len(profiles) + 1, "metric": "PipeUtilization",
+                         "instrumented": raw.get("instrumented") is True,
+                         "duration_semantics": raw.get("duration_semantics"), "metrics": metrics,
+                         "evidence": {"fact_index": fact_index,
+                                      "sha256": hashlib.sha256(fact["statement"].encode()).hexdigest()}})
+    return {"captures": captures, "profiles": profiles,
+            "mte_bandwidth": {"available": False, "value": None, "unit": "GiB/s",
+                              "reason": "No retained Memory profiler capture."}}
+
+
 def _revisions(branch: Path, final_digest: str):
     ordered, inline = [], {}
     for ledger in sorted(branch.glob("**/evidence.jsonl")):
@@ -368,6 +510,9 @@ class DashboardStore:
         with self._db() as db:
             row = db.execute("SELECT body FROM snapshots WHERE id=1").fetchone()
         return json.loads(row[0]) if row else {"generated_at": None, "stale": True, "campaigns": []}
+
+    def performance(self, project):
+        return _performance(project)
 
     def _save(self, view):
         with self._db() as db:

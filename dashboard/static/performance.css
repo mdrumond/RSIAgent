@@ -1,0 +1,20 @@
+.performance-plots { display: grid; gap: 18px; }
+.performance-plots figure { margin: 0; padding: 14px; border: 1px solid var(--line); background: #070a09; }
+.performance-plots figcaption { color: var(--cyan); font-weight: 700; }
+.performance-chart { display: block; width: 100%; min-height: 220px; }
+.axis, .whisker { stroke: var(--muted); stroke-width: 1; }
+.quartile { fill: #58e6d244; }
+.plot-point { fill: var(--acid); stroke: var(--acid); stroke-width: 2; }
+.plot-point.unavailable { fill: transparent; stroke: var(--muted); }
+.plot-point:focus { outline: none; stroke: #fff; stroke-width: 4; }
+.tick { fill: var(--muted); font-size: 9px; text-anchor: middle; }
+.tick.aic { fill: var(--acid); }
+.tick.aiv { fill: var(--cyan); }
+.performance-table { overflow: auto; }
+.performance-table table { width: 100%; border-collapse: collapse; }
+.performance-table th, .performance-table td { padding: 8px; border-bottom: 1px solid var(--line); text-align: right; }
+.performance-table th:first-child, .performance-table td:first-child { text-align: left; }
+.bandwidth-note { color: var(--muted); font-size: 12px; }
+.pipe-controls { display: flex; gap: 6px; margin-top: 8px; }
+.pipe-controls button { color: var(--ink); background: var(--panel); border: 1px solid var(--line); cursor: pointer; }
+.pipe-controls button:focus { border-color: var(--acid); }

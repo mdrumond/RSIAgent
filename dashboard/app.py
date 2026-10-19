@@ -68,6 +68,13 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
         trace = store.trace_index(number, project_id)
         return jsonify(trace) if trace is not None else abort(404)
 
+    @app.get("/api/phase/<int:number>/project/<project_id>/performance")
+    def api_performance(number, project_id):
+        campaign = phase(number)
+        project = next((row for row in campaign["projects"] if row["id"] == project_id),
+                       None) if campaign else None
+        return jsonify(store.performance(project)) if project is not None else abort(404)
+
     @app.get("/api/phase/<int:number>/project/<project_id>/trace/<event_id>")
     def api_trace_payload(number, project_id, event_id):
         body, error = store.trace_payload(number, project_id, event_id)
