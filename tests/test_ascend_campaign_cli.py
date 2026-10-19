@@ -282,6 +282,14 @@ def test_approval_mutations_are_serialized_for_non_cli_callers(tmp_path):
     thread.join(2)
     assert not thread.is_alive()
 
+    class ReentrantCoordinator:
+        def propose_wave(self):
+            return cli.sample_curriculum(job, builder=lambda _job: self)
+
+    (Path(job["control"]) / "curriculum-approval.json").unlink()
+    with pytest.raises(RuntimeError, match="campaign control is busy"):
+        cli.sample_curriculum(job, builder=lambda _job: ReentrantCoordinator())
+
 
 def test_interrupted_approval_can_be_rejected_then_resampled(tmp_path, monkeypatch):
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
