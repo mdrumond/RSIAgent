@@ -200,6 +200,9 @@ class DashboardStore:
             db.execute("""CREATE TABLE IF NOT EXISTS trace_events (
                 phase INTEGER NOT NULL, project_id TEXT NOT NULL, event_id TEXT NOT NULL,
                 sha256 TEXT, PRIMARY KEY(phase, project_id, event_id))""")
+            db.execute("""CREATE TABLE IF NOT EXISTS trace_indexes (
+                phase INTEGER NOT NULL, project_id TEXT NOT NULL, body TEXT NOT NULL,
+                PRIMARY KEY(phase, project_id))""")
             db.execute("PRAGMA journal_mode=WAL")
 
     def _db(self):
@@ -266,34 +269,89 @@ class DashboardStore:
                 "sha256": hashlib.sha256(body).hexdigest(), "size": len(body),
                 "available": True, "reason": None, "inline": body}
 
+    @staticmethod
+    def _artifact_event(label, category, source, digest, *, stage=None, turn=None):
+        try:
+            size = source.stat().st_size
+            available, reason = source.is_file(), None
+        except (OSError, AttributeError):
+            size, available, reason = None, False, "retained payload unavailable"
+        return {"label": label, "category": category, "stage": stage, "turn": turn,
+                "sha256": digest, "size": size, "available": available,
+                "reason": reason}
+
+    @staticmethod
+    def _wave_response(content):
+        if not isinstance(content, str) or not content.startswith("DECISION: WAVE"):
+            return None
+        try:
+            return json.loads(content[content.index("{"):])
+        except (ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _matches_plan(cls, content, expected):
+        response = cls._wave_response(content)
+        if not isinstance(response, dict):
+            return False
+        normalized = {key: response.get(key) for key in (
+            "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage")}
+        projects = []
+        for item in response.get("projects", []):
+            if not isinstance(item, dict) or not isinstance(item.get("spec"), dict):
+                return False
+            spec = dict(item["spec"])
+            requires = item.get("requires", spec.pop("requires", []))
+            projects.append({"spec": spec, "requires": requires})
+        normalized["projects"] = projects
+        expected_normalized = {key: expected.get(key) for key in (
+            "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage")}
+        expected_normalized["projects"] = [
+            {"spec": item.get("spec", item), "requires": item.get("requires", [])}
+            for item in expected.get("projects", [])]
+        return normalized == expected_normalized
+
     def _trace_sources(self, phase, project_id):
         located = self._project_sources(phase, project_id)
         if located is None:
             return None
         root, plan_path, branch, spec = located
-        wave_id = plan_path.parent.name
+        plan = _json(plan_path, {}) or {}
+        expected_wave = {"wave_id": plan_path.parent.name, **plan.get("wave", {})}
         session = (_json(root / "state.json", {}) or {}).get("session", {})
         messages = session.get("messages", []) if isinstance(session, dict) else []
         decision_index = next((index for index, message in enumerate(messages)
                                if message.get("role") == "assistant" and
-                               wave_id in str(message.get("content", ""))), None)
+                               self._matches_plan(message.get("content"), expected_wave)), None)
         if decision_index is None:
             events = [self._event("Curriculum system prompt", "curriculum", reason="not retained"),
                       self._event("Curriculum user prompt", "curriculum", reason="not retained"),
-                      self._event("Curriculum decision", "curriculum", plan_path)]
+                      self._event("Retained normalized curriculum plan", "curriculum", plan_path)]
         else:
-            system = next((message.get("content", "") for message in reversed(messages[:decision_index])
-                           if message.get("role") == "system"), None)
-            user = next((message.get("content", "") for message in reversed(messages[:decision_index])
-                         if message.get("role") == "user"), None)
-            events = [(self._inline_event("Curriculum system prompt", "curriculum", system)
-                       if system is not None else self._event(
-                           "Curriculum system prompt", "curriculum", reason="not retained")),
-                      (self._inline_event("Curriculum user prompt", "curriculum", user)
-                       if user is not None else self._event(
-                           "Curriculum user prompt", "curriculum", reason="not retained")),
-                      self._inline_event("Curriculum decision", "curriculum",
-                                         messages[decision_index].get("content", ""))]
+            expected_id = expected_wave.get("wave_id")
+            previous_decision = max((index for index, message in enumerate(messages[:decision_index])
+                                     if message.get("role") == "assistant" and
+                                     (self._wave_response(message.get("content")) or {}).get(
+                                         "wave_id") not in (None, expected_id)),
+                                    default=-1)
+            relevant = [message for index, message in enumerate(messages[:decision_index + 1])
+                        if index > previous_decision or message.get("role") == "system"]
+            events, attempts, users = [], 0, 0
+            for message in relevant:
+                role, content = message.get("role"), message.get("content", "")
+                if role == "system":
+                    label = "Curriculum system prompt"
+                elif role == "user":
+                    label = "Curriculum user prompt" if users == 0 else "Curriculum user correction"
+                    users += 1
+                elif message is messages[decision_index]:
+                    label = "Curriculum admitted decision"
+                elif role == "assistant":
+                    attempts += 1
+                    label = f"Curriculum assistant attempt {attempts}"
+                else:
+                    label = f"Curriculum {role or 'unknown'} message"
+                events.append(self._inline_event(label, "curriculum", content))
         spec_body = (json.dumps(spec, indent=2, sort_keys=True) + "\n").encode()
         events.append(self._inline_event("Complete project specification", "project", spec_body))
         ledger = branch / "evidence.jsonl"
@@ -315,13 +373,8 @@ class DashboardStore:
                 continue
             source = (branch / "artifacts" / "objects" / digest[:2] / digest[2:]
                       if isinstance(digest, str) and _SHA256.fullmatch(digest) else None)
-            event = self._event(labels[role], "actor", source, stage=payload.get("stage"),
-                                turn=payload.get("turn"), reason="retained payload unavailable")
-            # The ledger digest is authoritative; a mismatched object remains discoverable but invalid.
-            actual_digest = event["sha256"]
-            event["sha256"] = digest if isinstance(digest, str) else None
-            if actual_digest is not None and event["sha256"] != actual_digest:
-                event["available"], event["reason"] = False, "content digest mismatch"
+            event = self._artifact_event(labels[role], "actor", source, digest,
+                                         stage=payload.get("stage"), turn=payload.get("turn"))
             events.append(event)
         try:
             host_rows = (root / "project-evidence.jsonl").read_text().splitlines()
@@ -345,20 +398,33 @@ class DashboardStore:
         return events
 
     def trace_index(self, phase, project_id):
-        events = self._trace_sources(phase, project_id)
+        with self._db() as db:
+            retained = db.execute("SELECT body FROM trace_indexes WHERE phase=? AND project_id=?",
+                                  (phase, project_id)).fetchone()
+        retained_catalog = json.loads(retained[0]) if retained else None
+        complete = retained_catalog and any(
+            row["label"] == "Final outcome" and row["available"] for row in retained_catalog)
+        events = None if complete else self._trace_sources(phase, project_id)
         if events is None:
-            return None
+            if retained_catalog is None:
+                return None
+            catalog = retained_catalog
+        else:
+            catalog = [{key: value for key, value in event.items() if key != "inline"}
+                       for event in events]
+            with self._db() as db:
+                db.execute("INSERT OR REPLACE INTO trace_indexes(phase,project_id,body) VALUES(?,?,?)",
+                           (phase, project_id, json.dumps(catalog)))
+                db.executemany("INSERT OR REPLACE INTO trace_events(phase,project_id,event_id,sha256) "
+                               "VALUES(?,?,?,?)", [(phase, project_id, row["id"], row.get("sha256"))
+                                                   for row in catalog])
         public = []
-        for event in events:
-            item = {key: value for key, value in event.items() if key != "inline"}
+        for item in catalog:
+            item = dict(item)
             if item["available"]:
                 base = f"/api/phase/{phase}/project/{project_id}/trace/{item['id']}"
                 item.update(payload_url=base, download_url=base + "/download")
             public.append(item)
-        with self._db() as db:
-            db.executemany("INSERT OR REPLACE INTO trace_events(phase,project_id,event_id,sha256) "
-                           "VALUES(?,?,?,?)", [(phase, project_id, row["id"], row.get("sha256"))
-                                               for row in public])
         return {"events": public}
 
     def trace_payload(self, phase, project_id, event_id):
@@ -388,7 +454,7 @@ class DashboardStore:
         else:
             located = self._project_sources(phase, project_id)
             branch = located[2]
-            if event["label"] == "Curriculum decision":
+            if event["label"] == "Retained normalized curriculum plan":
                 body = located[1].read_bytes()
             elif event["label"] == "Verifier result":
                 body = (branch / "execution-evidence.bin").read_bytes()

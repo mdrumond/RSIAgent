@@ -30,7 +30,9 @@ document.querySelectorAll('.trace-event[data-trace-url]').forEach(section => sec
   try {
     const response = await fetch(section.dataset.traceUrl);
     if (!response.ok) throw new Error(`payload unavailable (${response.status})`);
-    output.textContent = (await response.json()).text;
+    const payload = await response.json();
+    try { output.textContent = JSON.stringify(JSON.parse(payload.text), null, 2); }
+    catch { output.textContent = payload.text; }
     section.dataset.loaded = 'true';
   } catch (error) {
     output.textContent = error.message;

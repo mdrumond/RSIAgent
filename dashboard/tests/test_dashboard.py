@@ -226,10 +226,17 @@ def test_trace_payload_survives_backing_artifact_removal_after_cache(campaign, t
     (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
         "role": "provider-response", "sha256": digest, "stage": "action", "turn": 1}}) + "\n")
     client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
-    event = next(row for row in client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    original_index = client.get("/api/phase/1/project/vector-add/trace").get_json()
+    event = next(row for row in original_index["events"]
                  if row.get("sha256") == digest)
     assert client.get(event["download_url"]).data == raw
     shutil.rmtree(tmp_path / "phase1")
+    campaign.unlink()
+    retained = client.get("/api/phase/1/project/vector-add/trace")
+    assert retained.status_code == 200
+    assert [row["label"] for row in retained.get_json()["events"]] == [
+        row["label"] for row in original_index["events"]
+    ]
     assert client.get(event["download_url"]).data == raw
     assert client.get(event["payload_url"]).status_code == 415
 
@@ -237,21 +244,56 @@ def test_trace_payload_survives_backing_artifact_removal_after_cache(campaign, t
 def test_trace_uses_matching_retained_curriculum_session(campaign, tmp_path):
     state_path = tmp_path / "phase1/state.json"
     state = json.loads(state_path.read_text())
+    plan = json.loads((tmp_path / "phase1/waves/wave-001/plan.json").read_text())
+    admitted = {"wave_id": "wave-001", **plan["wave"]}
+    invalid = json.loads(json.dumps(admitted))
+    invalid["projects"][0]["spec"]["hypothesis"] = "wrong response with wave-001 substring"
     state["session"] = {"messages": [
         {"role": "system", "content": "curriculum system"},
         {"role": "user", "content": "choose wave-001"},
-        {"role": "assistant", "content": 'DECISION: WAVE {"wave_id":"wave-001"}'},
-        {"role": "user", "content": "choose wave-002"},
-        {"role": "assistant", "content": 'DECISION: WAVE {"wave_id":"wave-002"}'},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(invalid)},
+        {"role": "user", "content": "correct the invalid hypothesis"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(admitted)},
     ], "turns": 2}
     write(state_path, state)
-    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    app = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0)
+    client = app.test_client()
     events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
+    curriculum = [row for row in events if row["category"] == "curriculum"]
+    assert [row["label"] for row in curriculum] == [
+        "Curriculum system prompt", "Curriculum user prompt",
+        "Curriculum assistant attempt 1", "Curriculum user correction",
+        "Curriculum admitted decision"]
     for label, expected in [("Curriculum system prompt", "curriculum system"),
                             ("Curriculum user prompt", "choose wave-001"),
-                            ("Curriculum decision", '"wave_id":"wave-001"')]:
+                            ("Curriculum assistant attempt 1", "wrong response"),
+                            ("Curriculum user correction", "correct the invalid"),
+                            ("Curriculum admitted decision", '"wave_id": "wave-001"')]:
         event = next(row for row in events if row["label"] == label)
         assert expected in client.get(event["payload_url"]).get_json()["text"]
+
+
+def test_trace_index_does_not_read_actor_payload_bodies(campaign, tmp_path, monkeypatch):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    body = b'{"nested":{"value":1}}'
+    digest = __import__("hashlib").sha256(body).hexdigest()
+    obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
+    obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(body)
+    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
+        "role": "provider-response", "sha256": digest, "stage": "action", "turn": 1}}) + "\n")
+    original = type(obj).read_bytes
+    def guarded_read(path):
+        if "artifacts/objects" in str(path):
+            raise AssertionError("trace index eagerly read actor payload")
+        return original(path)
+    monkeypatch.setattr(type(obj), "read_bytes", guarded_read)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    index = client.get("/api/phase/1/project/vector-add/trace")
+    assert index.status_code == 200
+    event = next(row for row in index.get_json()["events"] if row.get("sha256") == digest)
+    assert event["available"] and event["size"] == len(body)
+    script = client.get("/static/app.js").get_data(as_text=True)
+    assert "JSON.stringify(JSON.parse(payload.text), null, 2)" in script
 
 
 @pytest.mark.parametrize("digest", [
