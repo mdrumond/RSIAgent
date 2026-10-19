@@ -28,6 +28,10 @@ def test_optimizer_attempts_sources_downloads_and_measurements(tmp_path):
             "result": {"job_id": key, "classification": "host-verified" if verified else "host-mismatch",
                 "summary": "Target result", "candidate": artifact, "baseline": base,
                 "result": {"cases": [{"case": "case-0", "timing": {"ascendc": {"latency_us": 6}}}]}}}
+        # Retrying the same candidate reuses its old source artifact: the new
+        # attempt's event window contains other artifacts but no candidate event.
+        store.put_artifact(key, "attempt-note.json", canonical({"attempt": index}))
+        store.add_event(key, "phase2-attempt-result", row["result"])
         attempts.append(row)
         write(root / "attempts" / (row["attempt_id"] + ".json"), row)
     write(root / "state.json", {"phase": "optimizer-phase2", "attempts": attempts,
@@ -38,7 +42,7 @@ def test_optimizer_attempts_sources_downloads_and_measurements(tmp_path):
     assert not view["stale"]
     assert view["campaigns"][0]["stats"] == {"attempted": 2, "verified": 1, "published": 1}
     assert [p["id"] for p in view["campaigns"][0]["projects"]] == ["attempt-001", "attempt-002"]
-    assert view["campaigns"][0]["projects"][1]["source"] == source
+    assert [p["source"] for p in view["campaigns"][0]["projects"]] == [source, source]
     client = create_app(config, tmp_path / "webcache", refresh_seconds=0).test_client()
     page = client.get("/phase/2/project/attempt-002")
     assert page.status_code == 200

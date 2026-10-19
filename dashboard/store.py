@@ -487,8 +487,9 @@ def _optimizer_projects(root, state):
         key = result["job_id"]
         events = _optimizer_attempt_events(store, key, result)
         artifacts = [e["payload"] for e in events if e["kind"] == "artifact"]
-        if not artifacts and result.get("candidate"):
-            artifacts = [result["candidate"]]
+        if result.get("candidate") and not any(
+                a["sha256"] == result["candidate"]["sha256"] for a in artifacts):
+            artifacts.append(result["candidate"])
         revisions = []
         for artifact in artifacts:
             if artifact["name"] not in {"candidate.cpp", "candidate.py"}:

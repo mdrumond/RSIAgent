@@ -13,7 +13,7 @@ def write(path, value):
     path.write_bytes(canonical(value))
 
 
-def campaign(root):
+def campaign(root, *, job_seed=None):
     root.mkdir(parents=True, exist_ok=True)
     seed = {"schema": "optimizer-memory-snapshot-v1", "source_identity": {"target": "a3"},
             "memory_entries": [{"lesson": "historical learning"}], "files": {}}
@@ -23,7 +23,8 @@ def campaign(root):
             "submission": {"source": "def f(x): return x", "entrypoint": "f",
                            "signatures": [{"args": [{"shape": [4, 4], "dtype": "float32"}]}]}, "citations": []}
     store = JobStore(root / "tasks/matmul-residual/jobs")
-    job = store.create("def f(x): return x", "f", {"signatures": task["submission"]["signatures"]}, seed)
+    job = store.create("def f(x): return x", "f", {"signatures": task["submission"]["signatures"]},
+                       seed if job_seed is None else job_seed)
     key = job["job_id"]
     source = "// real candidate for this attempt"
     candidate = store.put_artifact(key, "candidate.cpp", canonical(source))
@@ -96,6 +97,49 @@ def test_incomplete_campaign_can_be_inventoried_but_not_exported(tmp_path):
     write(root / "state.json", state)
     verify_campaign(root)
     with pytest.raises(ValueError, match="final target"):
+        freeze_campaign(root)
+
+
+@pytest.mark.parametrize("authenticated", [False, True])
+def test_task_job_must_use_authenticated_reviewed_seed(tmp_path, authenticated):
+    other = {"schema": "optimizer-memory-snapshot-v1", "source_identity": {"target": "a3"},
+             "memory_entries": [{"lesson": "a different campaign"}], "files": {}}
+    other["snapshot_id"] = sha(canonical(other)) if authenticated else "not-authenticated"
+    root = tmp_path / "campaign"
+    campaign(root, job_seed=other)
+    with pytest.raises(ValueError, match="snapshot digest|reviewed Phase 2 seed"):
+        freeze_campaign(root)
+
+
+def test_snapshot_reads_each_retained_file_once(tmp_path, monkeypatch):
+    from benchmarks.ascend import training_annex
+    root = tmp_path / "campaign"
+    campaign(root)
+    calls = []
+
+    class Retained:
+        def read_bytes(self):
+            calls.append(True)
+            return b"single consistent payload"
+
+    monkeypatch.setattr(training_annex, "_retained", lambda root: [("capture.bin", Retained())])
+    frozen = freeze_campaign(root)
+    assert len(calls) == 1
+    verify_snapshot(frozen)
+
+
+def test_snapshot_revalidates_if_evidence_changes_while_reading(tmp_path, monkeypatch):
+    from benchmarks.ascend import training_annex
+    root = tmp_path / "campaign"
+    state, store, key = campaign(root)
+    original = training_annex._retained
+
+    def changed(directory):
+        yield from original(directory)
+        store.artifact_path(key, state["attempts"][0]["result"]["candidate"]["sha256"]).write_bytes(b"changed")
+
+    monkeypatch.setattr(training_annex, "_retained", changed)
+    with pytest.raises(ValueError, match="artifact digest mismatch"):
         freeze_campaign(root)
 
 
