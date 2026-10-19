@@ -78,7 +78,8 @@ class OptimizerDashboard:
                     job = self.store.stop(job_id)
                 elif action == 'recover':
                     job = self.store.get(job_id)
-                    if (job['status'] != 'running' or job['stage'] != 'observation-unavailable'
+                    if (job['status'] not in {'running', 'budget-exhausted'}
+                            or job['stage'] != 'observation-unavailable'
                             or self.worker_active(job_id)):
                         raise ValueError('recover requires an inactive worker awaiting observation')
                     self.launch(job_id)

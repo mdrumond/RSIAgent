@@ -63,7 +63,7 @@
       document.querySelector('#optimizer-handles').textContent = state.handles.map(row => `${row.operation}: ${row.handle}`).join('\n');
       document.querySelector('#optimizer-stop').disabled = !(state.worker_active || ['running', 'queued'].includes(state.status)) || state.stop_requested;
       document.querySelector('#optimizer-resume').hidden = state.worker_active || !['stopped', 'failed', 'budget-exhausted'].includes(state.status);
-      document.querySelector('#optimizer-recover').hidden = state.worker_active || state.status !== 'running' || state.stage !== 'observation-unavailable';
+      document.querySelector('#optimizer-recover').hidden = state.worker_active || !['running', 'budget-exhausted'].includes(state.status) || state.stage !== 'observation-unavailable';
     } catch (error) {message.textContent = error.message;}
   }
   document.querySelector('#optimizer-stop').addEventListener('click', async () => {

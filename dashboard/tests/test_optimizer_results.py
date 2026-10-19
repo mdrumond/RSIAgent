@@ -110,6 +110,8 @@ const vm = require('node:vm');
 const source = require('node:fs').readFileSync(process.argv[1], 'utf8');
 (async () => {
 for (const active of [true, false]) {
+for (const status of ['running', 'budget-exhausted']) {
+for (const stage of ['evaluating', 'observation-unavailable']) {
   const nodes = new Map();
   const element = id => {
     if (!nodes.has(id)) nodes.set(id, {dataset:{jobId:'job'}, addEventListener(){}, parentElement:{addEventListener(){}}});
@@ -118,11 +120,14 @@ for (const active of [true, false]) {
   vm.runInNewContext(source, {
     document:{querySelector:id=>id==='#optimizer-create'?null:element(id)},
     crypto:{randomUUID:()=> 'id'}, setInterval(){},
-    fetch:async()=>({ok:true,json:async()=>({status:'budget-exhausted',worker_active:active,handles:[],stop_requested:false})})
+    fetch:async()=>({ok:true,json:async()=>({status,stage,worker_active:active,handles:[],stop_requested:false})})
   });
   await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(element('#optimizer-stop').disabled, !active);
-  assert.equal(element('#optimizer-resume').hidden, active);
+  assert.equal(element('#optimizer-stop').disabled, !(active || status === 'running'));
+  assert.equal(element('#optimizer-resume').hidden, active || status === 'running');
+  assert.equal(element('#optimizer-recover').hidden, active || stage !== 'observation-unavailable');
+}
+}
 }
 })().catch(error=>{console.error(error);process.exitCode=1;});
 '''
@@ -143,11 +148,17 @@ def test_profile_attempt_uses_configuration_identity(setup):
     assert result['metrics'][0]['attempt'] == 2
 
 
-def test_reconnect_only_relaunches_inactive_observation_without_budget(setup):
+@pytest.mark.parametrize('exhausted', [False, True])
+def test_reconnect_only_relaunches_inactive_observation_without_budget(setup, exhausted):
     app, _, launched = setup
     store = app.extensions['optimizer'].store
-    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
-    store.transition(key, 'running', stage='observation-unavailable')
+    key = store.create('def f(x): return x', 'f', {}, {}, max_attempts=1)['job_id']
+    store.transition(key, 'running')
+    if exhausted:
+        store.record_attempt(key, candidate_sha256='a', result='evaluating')
+        store.add_event(key, 'optimizer-state', {'pending': {'candidate_sha256': 'a'}})
+    store._update(key, 'observation-unavailable',
+                  lambda row: row.update(stage='observation-unavailable'))
     client = app.test_client()
     url = f'/api/optimizer/jobs/{key}/recover'
     with (store._directory(key) / 'worker.lock').open('wb') as stream:
@@ -159,5 +170,5 @@ def test_reconnect_only_relaunches_inactive_observation_without_budget(setup):
     assert store.get(key) == before
     assert client.post(url, json={}, headers=headers(client, 'recover')).status_code == 202
     assert len(launched) == 1
-    store.transition(key, 'running', stage='evaluating')
+    store._update(key, 'evaluating', lambda row: row.update(stage='evaluating'))
     assert client.post(url, json={}, headers=headers(client, 'not-pending')).status_code == 409
