@@ -215,7 +215,8 @@ def run_worker(root, job_id, config, *, agent=None):
                 for marker in sorted((directory / 'execution').rglob('transport.json')):
                     backend.transport.cancel_pending(marker.parent)
             return OptimizationLoop(store, job_id, agent, backend,
-                                    knowledge=knowledge_query(config, directory)).run()
+                                    knowledge=knowledge_query(config, directory),
+                                    max_cases=config.get('max_cases', 24)).run()
         except WorkerStopped:
             row = store.get(job_id)
             if row['status'] in {'running', 'failed'}:
