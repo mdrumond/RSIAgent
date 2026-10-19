@@ -106,7 +106,7 @@ def test_performance_api_normalizes_attempts_statistics_bandwidth_and_pipe_metri
     memory = json.loads(base64.b64decode(delta["memory_base64"]))
     timing = {"measurement": "launch-plus-synchronize", "instrumented": False,
               "shape": [1003], "physical_shape": [1024],
-              "samples_us": [0, 10, 20, 30, 40]}
+              "samples_us": [1, 10, 20, 30, 40]}
     distinct = {**timing, "samples_us": [10, 20, 30]}
     profile = {"metric": "PipeUtilization", "instrumented": True,
                "duration_semantics": "instrumented diagnostic; not canonical latency",
@@ -133,7 +133,7 @@ def test_performance_api_normalizes_attempts_statistics_bandwidth_and_pipe_metri
     assert len(body["captures"]) == 2
     assert body["captures"][0]["attempt"] == 1
     assert body["captures"][0]["statistics"] == {
-        "count": 5, "min_us": 0.0, "q1_us": 10.0, "median_us": 20.0,
+        "count": 5, "min_us": 1.0, "q1_us": 10.0, "median_us": 20.0,
         "q3_us": 30.0, "max_us": 40.0}
     assert body["captures"][0]["logical_shape"] == [1003]
     assert body["captures"][0]["physical_shape"] == [1024]
@@ -166,6 +166,10 @@ def test_performance_api_rejects_malformed_values_and_handles_shapes(campaign, t
              "samples_us": [1, "bad", 2]},
             {"measurement": "launch-plus-synchronize", "shape": [5],
              "samples_us": [float("inf")]},
+            {"measurement": "launch-plus-synchronize", "shape": [6],
+             "samples_us": [0, 1]},
+            {"measurement": "launch-plus-synchronize", "shape": [7],
+             "samples_us": [-1, 1]},
         ]})}]
     delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
     write(branch / "memory-delta.bin", delta)
@@ -178,6 +182,38 @@ def test_performance_api_rejects_malformed_values_and_handles_shapes(campaign, t
     assert client.get("/api/phase/1/project/missing/performance").status_code == 404
 
 
+@pytest.mark.parametrize(("spec_shape", "input_shapes", "output_shape", "node", "expected"), [
+    ([33, 257], [[33, 257]], [33],
+     {"name": "sum", "op": "reduce-sum", "operands": ["x"], "axis": 1},
+     33 * 257 + 33),
+    ([63, 65, 79], [[63, 65], [65, 79]], [63, 79],
+     {"name": "product", "op": "matmul", "operands": ["x", "y"], "axis": None},
+     63 * 65 + 65 * 79 + 63 * 79),
+])
+def test_performance_bandwidth_accepts_validated_graph_output_shape(
+        campaign, tmp_path, spec_shape, input_shapes, output_shape, node, expected):
+    plan_path = tmp_path / "phase1/waves/wave-001/plan.json"
+    plan = json.loads(plan_path.read_text())
+    spec = plan["wave"]["projects"][0]["spec"]
+    spec.update({"shape": spec_shape, "dtype": "float32", "graph": {
+        "inputs": [{"name": "x", "shape": input_shapes[0]}] +
+                  ([{"name": "y", "shape": input_shapes[1]}] if len(input_shapes) == 2 else []),
+        "nodes": [node], "output": node["name"]}})
+    write(plan_path, plan)
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    memory["host_facts"] = [{"category": "performance-study", "statement": json.dumps({
+        "timing": [{"measurement": "launch-plus-synchronize", "shape": output_shape,
+                    "samples_us": [10]}]})}]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    body = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client().get(
+        "/api/phase/1/project/vector-add/performance").get_json()
+    assert body["captures"][0]["useful_logical_io_gib_s"] == pytest.approx(
+        expected * 4 / 10e-6 / 1024 ** 3)
+
+
 def test_project_performance_is_lazy_and_has_accessible_plot_scaffolds(campaign, tmp_path):
     client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
     detail = client.get("/phase/1/project/vector-add")
@@ -186,6 +222,7 @@ def test_project_performance_is_lazy_and_has_accessible_plot_scaffolds(campaign,
     assert b'data-performance-chart="shapes"' in detail.data
     assert b'data-performance-chart="pipes"' in detail.data
     assert b'data-pipe-engine="AIC"' in detail.data and b'data-pipe-engine="AIV"' in detail.data
+    assert b'class="pipe-table"' in detail.data
     assert b"Performance data loads when this section opens." in detail.data
     assert b"12.500" not in detail.data
 

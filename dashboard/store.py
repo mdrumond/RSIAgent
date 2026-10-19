@@ -275,25 +275,20 @@ def _logical_io_elements(spec, shape):
     """Declared input plus output traffic for shapes whose graph semantics are known."""
     graph = spec.get("graph")
     if not isinstance(graph, dict):
-        return math.prod(shape) * 2  # Legacy single-input fixtures/specs.
+        return math.prod(shape) * 2 if shape == spec.get("shape") else None
     inputs, nodes = graph.get("inputs"), graph.get("nodes")
     if not isinstance(inputs, list) or not isinstance(nodes, list) or not nodes:
         return None
-    if shape == spec.get("shape"):
-        validated = _validated_graph(graph)
-        if validated:
-            input_shapes, output_shape, _, _ = validated
+    validated = _validated_graph(graph)
+    if validated:
+        input_shapes, output_shape, _, _ = validated
+        if shape == list(output_shape):
             return sum(map(math.prod, input_shapes)) + math.prod(output_shape)
     operations = {node.get("op") for node in nodes if isinstance(node, dict)}
-    if operations <= {"copy", "add", "multiply", "relu", "mask-positive"}:
+    timing_lengths = spec.get("timing_lengths", [])
+    if (len(shape) == 1 and shape[0] in timing_lengths and
+            operations <= {"copy", "add", "multiply", "relu", "mask-positive"}):
         return math.prod(shape) * (len(inputs) + 1)
-    if operations == {"matmul"} and len(shape) == 3:
-        m, k, n = shape
-        return m * k + k * n + m * n
-    if operations == {"reduce-sum"} and len(inputs) == 1:
-        axis = nodes[-1].get("axis")
-        if type(axis) is int and 0 <= axis < len(shape):
-            return math.prod(shape) + math.prod(shape) // shape[axis]
     return None
 
 
@@ -306,7 +301,7 @@ def _performance(project):
         samples = raw.get("samples_us")
         shape = raw.get("shape")
         if (not isinstance(samples, list) or not samples or
-                not all(_finite_number(item) for item in samples) or
+                not all(_finite_number(item) and item > 0 for item in samples) or
                 not isinstance(shape, list) or not shape or
                 not all(type(item) is int and item > 0 for item in shape)):
             continue
@@ -327,8 +322,7 @@ def _performance(project):
         boundary = raw.get("measurement") if isinstance(raw.get("measurement"), str) else None
         bandwidth = None
         spec = project.get("spec", {})
-        if (len(shape) == len(spec.get("shape", shape)) and boundary == "launch-plus-synchronize"
-                and stats["median_us"] > 0):
+        if boundary == "launch-plus-synchronize":
             dtype_bytes = {"float16": 2, "bfloat16": 2, "float32": 4,
                            "float8_e4m3fn": 1, "float8_e5m2": 1,
                            "mxfp8_e4m3fn": 1, "mxfp8_e5m2": 1}.get(

@@ -10,10 +10,10 @@
 .tick { fill: var(--muted); font-size: 9px; text-anchor: middle; }
 .tick.aic { fill: var(--acid); }
 .tick.aiv { fill: var(--cyan); }
-.performance-table { overflow: auto; }
-.performance-table table { width: 100%; border-collapse: collapse; }
-.performance-table th, .performance-table td { padding: 8px; border-bottom: 1px solid var(--line); text-align: right; }
-.performance-table th:first-child, .performance-table td:first-child { text-align: left; }
+.performance-table, .pipe-table { overflow: auto; }
+.performance-table table, .pipe-table table { width: 100%; border-collapse: collapse; }
+.performance-table th, .performance-table td, .pipe-table th, .pipe-table td { padding: 8px; border-bottom: 1px solid var(--line); text-align: right; }
+.performance-table th:first-child, .performance-table td:first-child, .pipe-table th:first-child, .pipe-table td:first-child { text-align: left; }
 .bandwidth-note { color: var(--muted); font-size: 12px; }
 .pipe-controls { display: flex; gap: 6px; margin-top: 8px; }
 .pipe-controls button { color: var(--ink); background: var(--panel); border: 1px solid var(--line); cursor: pointer; }

@@ -84,11 +84,26 @@ function renderPipes(target, profiles, engine = 'all') {
   metrics.forEach((metric, index) => {
     const x = 70 + (metrics.length === 1 ? 305 : index / (metrics.length - 1) * 610);
     const value = metric.available ? metric.value : 0, y = 220 - Math.min(Math.max(value, 0), 100) * 1.9;
-    const title = metric.available ? `${metric.engine} ${metric.label}: ${value.toFixed(3)}%` : `${metric.engine} ${metric.label}: NA`;
+    const duration = metric.time_us == null ? 'time NA' : `time ${metric.time_us.toFixed(3)} µs`;
+    const title = metric.available ? `${metric.engine} ${metric.label}: ${value.toFixed(3)}%; ${duration}` : `${metric.engine} ${metric.label}: NA; ${duration}`;
     point(svg, x, y, title, !metric.available);
     svg.append(svgNode('text', {x, y: 242, class: `tick ${metric.engine.toLowerCase()}`}, `${metric.engine} ${metric.label}`));
   });
   target.replaceChildren(svg);
+}
+function pipeTable(target, profiles) {
+  if (!profiles.length) return;
+  const table = document.createElement('table');
+  table.innerHTML = '<caption>Retained pipe values</caption><thead><tr><th>Capture</th><th>Engine</th><th>Metric</th><th>Ratio</th><th>Time µs</th></tr></thead>';
+  const body = document.createElement('tbody');
+  profiles.forEach(profile => profile.metrics.forEach(metric => {
+    const values = [profile.capture, metric.engine, metric.label,
+      metric.available ? `${metric.value.toFixed(3)}%` : 'NA',
+      metric.time_us == null ? 'NA' : metric.time_us.toFixed(3)];
+    const tr = document.createElement('tr');
+    values.forEach(value => { const td = document.createElement('td'); td.textContent = value; tr.append(td); });
+    body.append(tr);
+  })); table.append(body); target.replaceChildren(table);
 }
 function performanceTable(target, captures) {
   if (!captures.length) return;
@@ -111,6 +126,7 @@ document.querySelectorAll('.performance-view[data-performance-url]').forEach(sec
     renderTiming(section.querySelector('[data-performance-chart="attempts"]'), data.captures, false);
     renderTiming(section.querySelector('[data-performance-chart="shapes"]'), data.captures, true);
     renderPipes(section.querySelector('[data-performance-chart="pipes"]'), data.profiles);
+    pipeTable(section.querySelector('.pipe-table'), data.profiles);
     section.querySelectorAll('[data-pipe-engine]').forEach(button => button.addEventListener('click', () =>
       renderPipes(section.querySelector('[data-performance-chart="pipes"]'), data.profiles, button.dataset.pipeEngine)));
     performanceTable(section.querySelector('.performance-table'), data.captures);
