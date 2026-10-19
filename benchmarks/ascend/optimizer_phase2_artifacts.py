@@ -36,6 +36,9 @@ def verify_campaign(root, *, require_ready=False):
         store, key = JobStore(directory / "jobs"), result["job_id"]
         store.get(key)
         submission = store.submission(key)
+        verify_snapshot(submission["memory_snapshot"])
+        if submission["memory_snapshot"]["snapshot_id"] != seed["snapshot_id"]:
+            raise ValueError("optimizer task memory differs from reviewed Phase 2 seed")
         task_submission = row["task"]["submission"]
         if (any(submission.get(k) != task_submission.get(k) for k in ("source", "entrypoint"))
                 or submission["signature"] != {"signatures": task_submission["signatures"]}
@@ -87,9 +90,11 @@ def freeze_campaign(root):
     root = Path(root)
     before = (root / "state.json").read_bytes()
     state, seed = verify_campaign(root, require_ready=True)
-    files = {name: {"sha256": sha(path.read_bytes()),
-                    "base64": base64.b64encode(path.read_bytes()).decode()}
-             for name, path in _retained(root)}
+    files = {}
+    for name, path in _retained(root):
+        data = path.read_bytes()
+        files[name] = {"sha256": sha(data), "base64": base64.b64encode(data).decode()}
+    verify_campaign(root, require_ready=True)
     if (root / "state.json").read_bytes() != before or (root / "pending.json").exists():
         raise ValueError("Phase 2 changed during snapshot")
     body = dict(schema="optimizer-memory-snapshot-v1", source_identity=seed["source_identity"],
