@@ -209,3 +209,41 @@ def test_multiple_optimizer_phase2_campaigns_keep_attempts_and_traces_distinct(t
         assert hashlib.sha256(raw).hexdigest() == digest
         assert json.loads(raw) == source
     assert '/phase/2/project/attempt-001' not in manifest
+
+
+def test_duplicate_phase_retains_missing_root_cache_without_cross_campaign_trace(campaign, tmp_path):
+    config = json.loads(campaign.read_text())
+    original = Path(config['campaigns'][0]['root'])
+    second = tmp_path / 'distinct-campaign'
+    shutil.copytree(original, second)
+    config['campaigns'].append({**config['campaigns'][0], 'root': str(second),
+                                'name': 'Independent duplicate phase'})
+    campaign.write_text(json.dumps(config))
+    cache = tmp_path / 'cache'
+    store = DashboardStore(campaign, cache / 'dashboard.sqlite3')
+    view = store.refresh()
+    project = view['campaigns'][0]['projects'][0]['id']
+    trace = store.trace_index(1, project)
+    retained = {}
+    for event in trace['events']:
+        if event['available']:
+            body, error = store.trace_payload(1, project, event['id'])
+            if body is not None and error is None:
+                retained[event['id']] = body
+    assert retained
+    original.rename(original.with_name(original.name + '-offline'))
+    second.rename(second.with_name(second.name + '-offline'))
+    output = export_demo(campaign, cache, tmp_path / 'demo')
+    for index in (0, 2):
+        entry, page = route(output, f'/campaign/{index}/phase/1/project/{project}')
+        assert entry['status'] == 200 and project.encode() in page
+    base = f'/campaign/0/api/phase/1/project/{project}/trace'
+    assert json.loads(route(output, base)[1])['events']
+    for event_id, body in retained.items():
+        entry, exported = route(output, base + '/' + event_id + '/download')
+        assert entry['status'] == 200 and exported == body
+        assert hashlib.sha256(exported).hexdigest() == hashlib.sha256(body).hexdigest()
+    # Same project ID in the independently cached second root must not acquire
+    # the first root's catalog or payload URLs when neither root is accessible.
+    other = f'/campaign/2/api/phase/1/project/{project}/trace'
+    assert route(output, other)[0]['status'] == 404

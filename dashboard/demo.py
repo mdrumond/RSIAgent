@@ -52,6 +52,34 @@ def _compact(path):
         return False
 
 
+def _seed_campaign_cache(source, cached, campaign, target, *, trace_owner):
+    """Retain only this exact campaign's snapshot and attributable trace keys."""
+    matching = next((row for row in cached['campaigns']
+                     if row['phase'] == campaign['phase'] and row['root'] == campaign['root']), None)
+    if matching is None:
+        return
+    target._save({**cached, 'campaigns': [matching]})
+    if not trace_owner:
+        return
+    # Legacy trace keys have phase/project IDs, not campaign roots. They belong
+    # only to the first configured campaign for a phase, provided the original
+    # cached snapshot agrees on that first root. Never infer ownership from an
+    # overlapping project ID in another campaign.
+    first = next((row for row in cached['campaigns'] if row['phase'] == campaign['phase']), None)
+    if first is None or first['root'] != campaign['root']:
+        return
+    with source._db() as original, target._db() as destination:
+        for project in matching['projects']:
+            key = campaign['phase'], project['id']
+            for row in original.execute('SELECT phase,project_id,body FROM trace_indexes WHERE phase=? AND project_id=?', key):
+                destination.execute('INSERT OR REPLACE INTO trace_indexes VALUES(?,?,?)', row)
+            for row in original.execute('SELECT phase,project_id,event_id,sha256 FROM trace_events WHERE phase=? AND project_id=?', key):
+                destination.execute('INSERT OR REPLACE INTO trace_events VALUES(?,?,?,?)', row)
+                payload = original.execute('SELECT body FROM payloads WHERE sha256=?', (row[3],)).fetchone()
+                if payload is not None and hashlib.sha256(payload[0]).hexdigest() == row[3]:
+                    destination.execute('INSERT OR IGNORE INTO payloads VALUES(?,?)', (row[3], payload[0]))
+
+
 def export_demo(config_path, cache_dir, output):
     """Export into a *new* directory. Never replace or modify a source directory."""
     output = Path(output).absolute()
@@ -92,6 +120,7 @@ def export_demo(config_path, cache_dir, output):
         private_config = temporary / 'config.json'
         private_config.write_text(json.dumps(config))
         store = _ExportStore(private_config, database)
+        cached = store.cached()
         snapshot = store.refresh()
         app = create_app(private_config, database, refresh_seconds=float('inf'), dashboard_store=store)
         # The live route has one campaign per phase. A portable snapshot may
@@ -118,6 +147,10 @@ def export_demo(config_path, cache_dir, output):
                 isolated_path.write_text(json.dumps(isolated_config))
                 campaign_store = _ExportStore(isolated_path, temporary / f'campaign-{index}.sqlite3')
                 campaign_store._ledgers = store._ledgers
+                first_for_phase = next(row for row in config['campaigns']
+                                       if row['phase'] == campaign['phase'])
+                _seed_campaign_cache(store, cached, campaign, campaign_store,
+                                     trace_owner=first_for_phase['root'] == campaign['root'])
                 campaign_store.refresh()
                 isolated_app = create_app(isolated_path, campaign_store.cache_path,
                     refresh_seconds=float('inf'), dashboard_store=campaign_store)

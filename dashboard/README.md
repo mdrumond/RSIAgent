@@ -167,7 +167,12 @@ validation runs as production. Campaign ordering follows the config.
 
 Local
 campaign artifacts are refreshed against a private SQLite cache backup; cached
-trace payloads remain available if their originals are gone. No worker config,
+trace payloads remain available if their originals are gone. For configurations
+with repeated phases, cached snapshots are matched by exact campaign root and
+phase. Legacy phase/project-only trace cache entries are retained only for the
+first campaign of that phase when the cached root agrees; ambiguous traces for
+other roots remain unavailable rather than being attached to the wrong goal.
+No worker config,
 credentials, timeline/tensor/binary downloads, or artifact payloads over 20 MiB
 are bundled. Full retained event metadata is preserved. Source and prompts can
 still be private: inspect before sharing.
