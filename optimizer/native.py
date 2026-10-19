@@ -319,7 +319,8 @@ def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, 
 
 
 def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_count=1,
-             benchmark=False, profile=False, cache_directory=None):
+             benchmark=False, profile=False, cache_directory=None,
+             profile_policy=None, diagnostic_only=False):
     """Evaluate exactly a prepared/frozen suite; timing starts after all cases pass.
 
     One process per candidate is required: device crashes cannot be recovered here.
@@ -333,14 +334,21 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
     if not isinstance(prepared, PreparedReference) or not prepared.cases:
         raise ValueError('a nonempty prepared/frozen reference is required')
     _validate_prepared(prepared)
+    from .profile_policy import select
+    selected, coverage = select(prepared, profile_policy) if profile else ([], None)
+    if diagnostic_only and (not profile or benchmark):
+        raise ValueError('diagnostic_only requires profiling without canonical timing')
+    cases = selected if diagnostic_only else prepared.cases
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     (root / 'candidate.cpp').write_text(candidate)
     result = {'status': 'verified', 'candidate_sha256': _sha(candidate.encode()),
               'suite_sha256': prepared.manifest['suite_sha256'], 'arch': arch,
               'device': device, 'block_count': block_count, 'cases': []}
+    if profile:
+        result['profiling_coverage'] = coverage
     runners = []
-    for i, row in enumerate(prepared.cases):
+    for i, row in enumerate(cases):
         record = {'case': row['case']['id'], 'contract': describe_case(prepared, row)}
         result['cases'].append(record)
         try:
@@ -378,6 +386,10 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
             states = _copy_state(prepared)
             functions = {'torch': lambda args=args, kwargs=kwargs: prepared.invoke(*args, **kwargs),
                          'ascendc': lambda run=run, tensors=tensors, states=states: run(tensors, states)}
+            if diagnostic_only:
+                # Baseline preparation already captured the same reference case.
+                functions.pop('torch')
+                result['profiling_coverage']['implementations'] = ['ascendc']
             identity = {k: result[k] for k in ('candidate_sha256', 'suite_sha256', 'arch', 'device')}
             identity['case'] = record['case']
             for name, fn in functions.items():
@@ -388,15 +400,23 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
                         timing = {'status': 'unavailable', 'latency_us': None,
                                   'error': f'{type(exc).__name__}: {exc}'}
                     record.setdefault('timing', {})[name] = timing
-                if profile:
+                if profile and record['case'] in coverage['selected_cases']:
                     from .profiles import profile as capture
                     try:
-                        diagnostic = capture(fn, root / f'{record["case"]}-{name}-profile', identity=identity)
+                        profile_identity = {**identity, 'implementation': name}
+                        if name == 'ascendc':
+                            profile_identity.update(record['compilation'])
+                            if record['compilation'].get('namespace'):
+                                profile_identity['kernel_symbol'] = record['compilation']['namespace'] + '_kernel'
+                        diagnostic = capture(fn, root / f'{record["case"]}-{name}-profile',
+                                             groups=coverage['policy']['groups'], identity=profile_identity)
                     except Exception as exc:
                         diagnostic = {'status': 'unavailable', 'error': f'{type(exc).__name__}: {exc}'}
                     record.setdefault('profiling', {})[name] = diagnostic
             if benchmark:
                 a, b = (record['timing'][key]['latency_us'] for key in ('torch', 'ascendc'))
                 record['speedup'] = a / b if a is not None and b is not None and b > 0 else None
+    if diagnostic_only and result['status'] == 'verified':
+        result['status'] = 'diagnostic'
     (root / 'result.json').write_text(json.dumps(result, indent=2, allow_nan=False))
     return result
