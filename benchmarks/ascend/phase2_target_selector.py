@@ -86,6 +86,8 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
                              policy: CurriculumPolicy | None = None) -> str:
     grammar = _grammar()
     if policy is not None:
+        if policy.target != context.target.runtime["target"]:
+            raise ValueError("target policy and runtime differ")
         grammar = policy.grammar(grammar)
     available = _available_tools(context)
     grammar["capabilities"] = [name for name in grammar["capabilities"]
@@ -152,6 +154,8 @@ class TargetCurriculumAgent:
         raise AssertionError("unreachable")
 
     def parse(self, text, context):
+        if self.target_policy is not None and self.target_policy.target != context.target.runtime["target"]:
+            raise ValueError("target policy and runtime differ")
         if not isinstance(text, str) or "\n" not in text:
             raise ValueError("expected exact decision and JSON")
         header, raw = text.split("\n", 1)
@@ -178,7 +182,8 @@ class TargetCurriculumAgent:
                 raise ValueError("practice must not replace the target")
             if project.project_id in context.used_project_ids:
                 raise ValueError("practice requires a fresh project ID; this ID was already used")
-            names = (project.project_id, project.hypothesis, project.graph.output,
+            names = (*(value[key] for key in fields - {"project"}),
+                     project.project_id, project.hypothesis, project.graph.output,
                      *(item.name for item in project.graph.inputs),
                      *(item.name for item in project.graph.nodes))
             if any(_HELD_OUT_WORDS.search(name) for name in names):
