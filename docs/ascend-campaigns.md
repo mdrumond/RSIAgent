@@ -65,7 +65,9 @@ In the ignored native runtime JSON, use `"physical_devices": [0, 1]` instead
 of `"physical_device": 0` to opt into two concurrent project workers. The list
 must contain distinct nonnegative device IDs; select devices only after checking
 current capacity through the registered target. The list takes precedence over
-the legacy scalar. Omitting it preserves serial execution and existing paths.
+the legacy scalar for Phase 1. Phase 2 stays serial on the explicit
+`physical_device`, or the first pool device if that scalar is omitted.
+Omitting the pool preserves serial execution and existing paths.
 This is an explicit device pool, not an automatic idle-device scheduler or a
 persistent lease system. Do not assign its devices to another campaign.
 

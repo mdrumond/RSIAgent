@@ -27,6 +27,45 @@ def test_legacy_device_and_explicit_pool():
     assert native_devices({"physical_device": 7, "physical_devices": [2, 3]}) == [2, 3]
 
 
+@pytest.mark.parametrize("explicit_device, expected", [(None, 2), (7, 7)])
+def test_phase1_pool_config_hands_off_to_one_serial_phase2_device(tmp_path, monkeypatch, explicit_device, expected):
+    from types import SimpleNamespace
+    from benchmarks.ascend import phase1_cli, phase2_cli
+    guide, initial = tmp_path / "guide.md", tmp_path / "initial.md"
+    guide.write_text("Native guide")
+    initial.write_bytes(b"")
+    config = dict(guide=str(guide), target="a3", arch="arch", execution_profile="bz-a3-1",
+        cpl_skills_revision="a" * 40, cpl_remote="/tools/cpl-remote",
+        validation_wrapper="/checked/catlass-validation.sh", remote_workspace="/owned",
+        physical_devices=[2, 5], environment_identity=dict(cann_version="cann", profiler_version="msprof"))
+    if explicit_device is not None:
+        config["physical_device"] = explicit_device
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    snapshot = SimpleNamespace(destination=SimpleNamespace(source_identity=config))
+    monkeypatch.setattr(phase2_cli, "admit_native_snapshot", lambda *args: snapshot)
+    monkeypatch.setattr("benchmarks.a5kernels.phase1_production.load_direct_environment", lambda *args, **kwargs: {})
+    transports = []
+    class Transport:
+        def __init__(self, **kwargs):
+            transports.append(kwargs)
+    native_transport = phase1_cli.native_transport
+    monkeypatch.setattr(phase1_cli, "native_transport",
+        lambda config, root: native_transport(config, root, factory=Transport))
+    runner = object()
+    def build(admitted, guide_bytes, transport, **kwargs):
+        assert admitted is snapshot and guide_bytes == b"Native guide"
+        assert isinstance(transport, Transport)
+        return runner
+    monkeypatch.setattr(phase2_cli, "build_native_phase2", build)
+    args = SimpleNamespace(config=path, phase1_root=tmp_path / "phase1", initial_memory=initial,
+        review=tmp_path / "review.json", root=tmp_path / "phase2", env_file=None)
+    assert phase2_cli.native_runner(args) is runner
+    assert len(transports) == 1
+    assert transports[0]["physical_device"] == expected
+    assert transports[0]["state_directory"] == args.root / "transport-state"
+
+
 def test_failed_project_unblocks_slots_without_dispatch_until_recovered():
     seen = []
     def execute(request):
