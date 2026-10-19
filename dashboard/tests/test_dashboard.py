@@ -33,7 +33,7 @@ def campaign(tmp_path):
     root = tmp_path / "phase1"
     branch = root / "waves/wave-001/branches/vector-add"
     spec = {"project_id": "vector-add", "hypothesis": "Measure a bounded vector add.",
-            "capabilities": ["simd-vector"], "shape": [1003]}
+            "capabilities": ["simd-vector"], "shape": [1003], "dtype": "float32"}
     write(root / "state.json", {"completed_waves": ["wave-001"], "prior_outcomes": [{}],
                                  "failed_outcomes": [], "project_target": 2})
     planned = {"project_id": "planned-only", "hypothesis": "Not started yet."}
@@ -97,6 +97,184 @@ def test_refresh_extracts_projects_memory_performance_and_revisions(campaign, tm
     assert all(row["diff"].startswith("---") for row in project["transitions"])
     assert view["campaigns"][0]["worker"]["status"] == "running"
     assert [row["id"] for row in view["campaigns"][0]["planned"]] == ["planned-only"]
+
+
+def test_performance_api_normalizes_attempts_statistics_bandwidth_and_pipe_metrics(
+        campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    timing = {"measurement": "launch-plus-synchronize", "instrumented": False,
+              "shape": [1003], "physical_shape": [1024],
+              "samples_us": [1, 10, 20, 30, 40]}
+    distinct = {**timing, "samples_us": [10, 20, 30]}
+    profile = {"metric": "PipeUtilization", "instrumented": True,
+               "duration_semantics": "instrumented diagnostic; not canonical latency",
+               "metric_values": [
+                   ["report.csv:aiv_vec_ratio:0", 0.0],
+                   ["report.csv:aiv_mte2_ratio:0", 0.361],
+                   ["report.csv:aiv_mte2_time(us):0", 3.048],
+                   ["report.csv:aic_mac_ratio:0", 0.25],
+                   ["report.csv:aic_scalar_ratio:0", 25.0],
+               ]}
+    memory["host_facts"] = [
+        {"category": "performance-study", "statement": json.dumps({"timing": [timing]})},
+        {"category": "performance-study", "statement": json.dumps({"timing": [timing, distinct]})},
+        {"category": "profiling", "statement": json.dumps(profile)},
+        {"category": "profiling", "statement": json.dumps(profile)},
+    ]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+
+    response = client.get("/api/phase/1/project/vector-add/performance")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert len(body["captures"]) == 2
+    assert body["captures"][0]["attempt"] == 1
+    assert body["captures"][0]["statistics"] == {
+        "count": 5, "min_us": 1.0, "q1_us": 10.0, "median_us": 20.0,
+        "q3_us": 30.0, "max_us": 40.0}
+    assert body["captures"][0]["logical_shape"] == [1003]
+    assert body["captures"][0]["physical_shape"] == [1024]
+    # One float32 input and one output, divided by the ordinary host boundary.
+    expected = (1003 * 2 * 4) / (20e-6) / (1024 ** 3)
+    assert body["captures"][0]["useful_logical_io_gib_s"] == pytest.approx(expected)
+    assert body["captures"][0]["boundary"] == "launch-plus-synchronize"
+    assert len(body["profiles"]) == 1
+    metrics = {row["id"]: row for row in body["profiles"][0]["metrics"]}
+    assert metrics["aiv-vector"]["value"] == 0.0
+    assert metrics["aiv-vector"]["available"] is True
+    assert metrics["aiv-mte2"]["value"] == pytest.approx(36.1)
+    assert metrics["aiv-mte2"]["time_us"] == pytest.approx(3.048)
+    assert metrics["aic-cube"]["value"] == pytest.approx(25.0)
+    assert metrics["aic-scalar"]["value"] == pytest.approx(25.0)
+    assert metrics["aiv-mte3"]["value"] is None
+    assert metrics["aiv-mte3"]["available"] is False
+    assert body["mte_bandwidth"]["available"] is False
+
+
+def test_performance_api_rejects_malformed_values_and_handles_shapes(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    memory["host_facts"] = [{"category": "performance-study", "statement": json.dumps({
+        "timing": [
+            {"measurement": "launch-plus-synchronize", "shape": [3, 7],
+             "samples_us": [7]},
+            {"measurement": "launch-plus-synchronize", "shape": [4],
+             "samples_us": [1, "bad", 2]},
+            {"measurement": "launch-plus-synchronize", "shape": [5],
+             "samples_us": [float("inf")]},
+            {"measurement": "launch-plus-synchronize", "shape": [6],
+             "samples_us": [0, 1]},
+            {"measurement": "launch-plus-synchronize", "shape": [7],
+             "samples_us": [-1, 1]},
+        ]})}]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    body = client.get("/api/phase/1/project/vector-add/performance").get_json()
+    assert len(body["captures"]) == 1
+    assert body["captures"][0]["shape_axis"] == {"kind": "category", "value": "3×7"}
+    assert body["captures"][0]["statistics"]["q1_us"] == 7.0
+    assert body["captures"][0]["useful_logical_io_gib_s"] is None
+    assert client.get("/api/phase/1/project/missing/performance").status_code == 404
+
+
+@pytest.mark.parametrize("metric_values", [None, 7, {"bad": "shape"}, ["not-a-pair"]])
+def test_performance_api_ignores_malformed_profile_facts(campaign, tmp_path, metric_values):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    memory["host_facts"] = [None, 3, ["wrong"],
+        {"category": "profiling", "statement": json.dumps(
+            {"metric": "PipeUtilization", "metric_values": metric_values})}]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    response = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client().get(
+        "/api/phase/1/project/vector-add/performance")
+    assert response.status_code == 200
+    assert response.get_json()["profiles"] == []
+
+
+@pytest.mark.parametrize("dtype", [None, "unknown"])
+def test_performance_bandwidth_requires_supported_explicit_dtype(campaign, tmp_path, dtype):
+    plan_path = tmp_path / "phase1/waves/wave-001/plan.json"
+    plan = json.loads(plan_path.read_text())
+    spec = plan["wave"]["projects"][0]["spec"]
+    if dtype is None:
+        spec.pop("dtype")
+    else:
+        spec["dtype"] = dtype
+    write(plan_path, plan)
+    body = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client().get(
+        "/api/phase/1/project/vector-add/performance").get_json()
+    assert body["captures"][0]["useful_logical_io_gib_s"] is None
+
+
+def test_multiple_profile_captures_keep_capture_identity(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    profiles = [{"metric": "PipeUtilization", "metric_values": [
+        ["one.csv:aiv_vec_ratio:0", ratio]]} for ratio in (.1, .2)]
+    memory["host_facts"] = [{"category": "profiling", "statement": json.dumps(row)}
+                             for row in profiles]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    body = client.get("/api/phase/1/project/vector-add/performance").get_json()
+    assert [row["capture"] for row in body["profiles"]] == [1, 2]
+    script = client.get("/static/app.js").data
+    assert b"Capture ${metric.capture}" in script
+
+
+@pytest.mark.parametrize(("spec_shape", "input_shapes", "output_shape", "node", "expected"), [
+    ([33, 257], [[33, 257]], [33],
+     {"name": "sum", "op": "reduce-sum", "operands": ["x"], "axis": 1},
+     33 * 257 + 33),
+    ([63, 65, 79], [[63, 65], [65, 79]], [63, 79],
+     {"name": "product", "op": "matmul", "operands": ["x", "y"], "axis": None},
+     63 * 65 + 65 * 79 + 63 * 79),
+])
+def test_performance_bandwidth_accepts_validated_graph_output_shape(
+        campaign, tmp_path, spec_shape, input_shapes, output_shape, node, expected):
+    plan_path = tmp_path / "phase1/waves/wave-001/plan.json"
+    plan = json.loads(plan_path.read_text())
+    spec = plan["wave"]["projects"][0]["spec"]
+    spec.update({"shape": spec_shape, "dtype": "float32", "graph": {
+        "inputs": [{"name": "x", "shape": input_shapes[0]}] +
+                  ([{"name": "y", "shape": input_shapes[1]}] if len(input_shapes) == 2 else []),
+        "nodes": [node], "output": node["name"]}})
+    write(plan_path, plan)
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    memory["host_facts"] = [{"category": "performance-study", "statement": json.dumps({
+        "timing": [{"measurement": "launch-plus-synchronize", "shape": output_shape,
+                    "samples_us": [10]}]})}]
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    body = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client().get(
+        "/api/phase/1/project/vector-add/performance").get_json()
+    assert body["captures"][0]["useful_logical_io_gib_s"] == pytest.approx(
+        expected * 4 / 10e-6 / 1024 ** 3)
+
+
+def test_project_performance_is_lazy_and_has_accessible_plot_scaffolds(campaign, tmp_path):
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    detail = client.get("/phase/1/project/vector-add")
+    assert b'data-performance-url="/api/phase/1/project/vector-add/performance"' in detail.data
+    assert b'data-performance-chart="attempts"' in detail.data
+    assert b'data-performance-chart="shapes"' in detail.data
+    assert b'data-performance-chart="pipes"' in detail.data
+    assert b'data-performance-chart="attempts" role="img"' not in detail.data
+    assert b'data-performance-chart="pipes" role="img"' not in detail.data
+    assert b'data-pipe-engine="AIC"' in detail.data and b'data-pipe-engine="AIV"' in detail.data
+    assert b'class="pipe-table"' in detail.data
+    assert b"Performance data loads when this section opens." in detail.data
+    assert b"12.500" not in detail.data
 
 
 def test_planned_projects_do_not_inflate_attempts_or_published(campaign, tmp_path):

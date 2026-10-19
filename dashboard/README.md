@@ -29,6 +29,15 @@ payload is added to the SQLite cache. UTF-8 payloads are returned as escaped
 text, while every retained payload is available through the raw download route.
 Missing prompts or artifacts are explicitly marked unavailable.
 
+Opening a project's performance section lazily loads retained timing and
+`PipeUtilization` facts. The local SVG views show attempt distributions, shape
+sweeps, and AIC/AIV pipe ratios, with the exact normalized values in an HTML
+table. Useful logical-I/O bandwidth is a derived value based on declared tensor
+bytes and ordinary launch-plus-synchronize latency; it is not device MTE
+bandwidth. Missing metrics are shown as `NA`, distinct from a measured zero,
+and MTE bandwidth remains unavailable unless a future campaign retains a
+dedicated `Memory` profiler capture.
+
 ## Optional campaign controls
 
 Set `controls.enabled` to `true` only for a loopback listener. The CLI enforces
