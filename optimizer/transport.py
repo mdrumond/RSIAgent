@@ -34,6 +34,23 @@ class CheckedTransport:
                  stopped=lambda: False):
         self.config, self.run, self.retain, self.stopped = config, run, retain, stopped
 
+    def cancel_pending(self, directory):
+        """Recover Stop against the exact retained operation, never a new dispatch."""
+        directory = Path(directory)
+        path = directory / 'transport.json'
+        state = json.loads(path.read_text())
+        if state.get('state') in {'completed', 'failed', 'cancelled'}:
+            return
+        if not state.get('native_handle'):
+            raise ObservationUnavailable('cannot cancel uncertain dispatch without its native handle')
+        result = self.run([self.config['cpl_remote'], '--json', 'cancel', state['native_handle']],
+                          capture_output=True, text=True)
+        atomic(directory / 'cancel.log', (result.stdout + result.stderr).encode())
+        if result.returncode:
+            raise ObservationUnavailable('cancellation unavailable; retained handle remains active')
+        state['state'] = 'cancelled'
+        atomic(path, canonical(state))
+
     def transfer(self, action, source, destination):
         # Transfer sentinels also prevent duplicate uncertain submission.
         local = Path(source if action == 'upload' else destination)
@@ -88,12 +105,7 @@ class CheckedTransport:
         while True:
             if self.stopped():
                 if state.get('native_handle'):
-                    result = self.run([self.config['cpl_remote'], '--json', 'cancel', state['native_handle']], capture_output=True, text=True)
-                    atomic(directory / 'cancel.log', (result.stdout + result.stderr).encode())
-                    if result.returncode:
-                        raise ObservationUnavailable('cancellation unavailable; retained handle remains active')
-                    state['state'] = 'cancelled'
-                    atomic(path, canonical(state))
+                    self.cancel_pending(directory)
                 raise WorkerStopped('user requested stop')
             command = [self.config['validation_wrapper'], '--profile', self.config['profile']]
             if state.get('handle'):

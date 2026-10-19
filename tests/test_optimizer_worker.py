@@ -69,6 +69,52 @@ def test_stop_cancels_retained_native_handle(tmp_path):
     assert json.loads((directory / 'transport.json').read_text())['state'] == 'cancelled'
 
 
+def test_reconnect_retries_failed_cancellation_before_marking_stopped(tmp_path, monkeypatch):
+    from optimizer.jobs import JobStore, canonical, sha
+    from optimizer.worker import run_worker
+    import optimizer.worker as module
+    store = JobStore(tmp_path / 'jobs')
+    body = {'files': {}, 'memory_entries': []}
+    key = store.create('def f(x): return x', 'f', {},
+                       {**body, 'snapshot_id': sha(canonical(body))})['job_id']
+    store.transition(key, 'running', stage='observation-unavailable')
+    store.stop(key)
+    operation = store.root / key / 'execution' / 'candidate'
+    operation.mkdir(parents=True)
+    marker = operation / 'transport.json'
+    marker.write_text(json.dumps({'state': 'running', 'handle': 'bz-a3-1:original',
+                                  'native_handle': 'remote:bz-a3-1:job:original'}))
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=1 if len(calls) == 1 else 0, stdout='{}', stderr='')
+    monkeypatch.setattr(module, 'CheckedTransport', lambda config, **kwargs:
+                        CheckedTransport(config, run=run, **kwargs))
+    settings = config(tmp_path)
+    settings['guide'] = str(tmp_path / 'guide')
+    Path(settings['guide']).write_text('guide')
+    settings['lock_directory'] = str(tmp_path / 'locks')
+    agent = SimpleNamespace(identity={'model': 'unused'})
+    with pytest.raises(ObservationUnavailable):
+        run_worker(store.root, key, settings, agent=agent)
+    assert store.get(key)['status'] == 'running'
+    assert json.loads(marker.read_text())['state'] == 'running'
+    assert run_worker(store.root, key, settings, agent=agent)['status'] == 'stopped'
+    assert len(calls) == 2
+    assert all(argv[-2:] == ['cancel', 'remote:bz-a3-1:job:original'] for argv in calls)
+    assert json.loads(marker.read_text())['state'] == 'cancelled'
+
+
+def test_stop_recovery_does_not_claim_unknown_dispatch_cancelled(tmp_path):
+    directory = tmp_path / 'operation'
+    directory.mkdir()
+    marker = directory / 'transport.json'
+    marker.write_text('{"state":"dispatching"}')
+    with pytest.raises(ObservationUnavailable):
+        CheckedTransport(config(tmp_path)).cancel_pending(directory)
+    assert json.loads(marker.read_text())['state'] == 'dispatching'
+
+
 def test_failed_profile_observer_is_terminal(tmp_path):
     directory = tmp_path / 'op'
     directory.mkdir()

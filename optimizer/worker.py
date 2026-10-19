@@ -209,6 +209,11 @@ def run_worker(root, job_id, config, *, agent=None):
                              stopped=lambda: store.get(job_id)['stop_requested'])
         store.add_event(job_id, 'worker-started', {'pid': os.getpid(), 'profile': config['profile'], 'device': config['physical_device']})
         try:
+            if store.get(job_id)['stop_requested']:
+                # A previous Stop may have lost its cancellation response. Drain
+                # retained operations before the loop can mark the job stopped.
+                for marker in sorted((directory / 'execution').rglob('transport.json')):
+                    backend.transport.cancel_pending(marker.parent)
             return OptimizationLoop(store, job_id, agent, backend,
                                     knowledge=knowledge_query(config, directory)).run()
         except WorkerStopped:
@@ -221,6 +226,8 @@ def run_worker(root, job_id, config, *, agent=None):
                     store.transition(job_id, 'stopped')
             return store.get(job_id)
         except ObservationUnavailable as exc:
+            if store.get(job_id)['status'] == 'running':
+                store.transition(job_id, 'running', stage='observation-unavailable')
             store.add_event(job_id, 'observation-unavailable', {'error': str(exc)})
             raise
 
