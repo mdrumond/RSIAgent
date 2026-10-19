@@ -173,3 +173,20 @@ def test_direct_agent_retains_exact_provider_payload_and_usage():
     assert action['action'] == 'finish'
     assert records[0][0] == 'request'
     assert records[1][1]['completion_tokens'] == 7
+
+
+def test_dashboard_signature_envelope_flows_through_job_store(tmp_path):
+    body = {'files': {}, 'memory_entries': []}
+    snapshot = {**body, 'snapshot_id': sha(canonical(body))}
+    store = JobStore(tmp_path)
+    signature = {'args': [{'shape': [33], 'dtype': 'float32'}]}
+    key = store.create('def forward(x): return x', 'forward',
+                       {'signatures': [signature]}, snapshot)['job_id']
+    class CheckingBackend(Backend):
+        def prepare(self, spec, directory):
+            assert spec['signatures'] == [signature]
+            return super().prepare(spec, directory)
+    result = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': 'preserve supplied representative'},
+        {'action': 'finish', 'summary': 'baseline only'}]), CheckingBackend()).run()
+    assert result['status'] == 'completed'

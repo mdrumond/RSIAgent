@@ -23,6 +23,10 @@ checks budgets and Stop at action boundaries and charges elapsed provider, prep,
 evaluation, profiling, and KDB time. In-flight downtime counts on recovery.
 
 Job events contain immutable state checkpoints and digest-authenticated artifacts.
+Submission signatures use `{"signatures": [...]}` as the dashboard contract;
+legacy CLI lists and single-case objects remain accepted. Source artifacts are
+canonical JSON string bytes; decode JSON to recover the exact UTF-8 source for
+display/download. The artifact digest authenticates the stored JSON bytes.
 Resume uses `JobStore.resume` with explicit additional attempts/time. It preserves
 the reference submission, selected memory, suite, model identity, and source
 history. The final reserved attempt is evaluated even though its reservation

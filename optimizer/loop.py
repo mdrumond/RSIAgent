@@ -86,7 +86,13 @@ class OptimizationLoop:
 
     def _spec(self, submission):
         signature = submission['signature']
-        signatures = signature if isinstance(signature, list) else [signature]
+        if isinstance(signature, dict) and 'signatures' in signature:
+            if set(signature) != {'signatures'}:
+                raise ValueError('signature envelope contains unexpected fields')
+            signatures = signature['signatures']
+        else:
+            # Preserve jobs created by the original CLI's list/single-case API.
+            signatures = signature if isinstance(signature, list) else [signature]
         return validate_submission({k: submission[k] for k in ('source', 'entrypoint', 'init_args', 'init_kwargs')}
                                    | {'signatures': signatures})
 
