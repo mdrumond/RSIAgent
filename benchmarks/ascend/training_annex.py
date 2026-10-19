@@ -46,10 +46,10 @@ _ROOT_FILES = {"state.json", "pending.json", "campaign-identity.json",
                "campaign-run.json", "goal-selection.json",
                "project-evidence.jsonl", "initial-memory.bin", "memory.jsonl",
                "terminal.json", "protocol.json", "review.json", "snapshot.json",
-               "phase1-memory.jsonl", "phase1-terminal.json"}
+               "phase1-memory.jsonl", "phase1-terminal.json", "seed-memory.json"}
 _TREES = {"waves", "native-evidence", "measurements", "cells", "attempts",
           "provider", "provider-evidence", "source-evidence", "artifacts", "traces",
-          "sft-traces", "snapshot", "project-bundles", "measurement-evidence"}
+          "sft-traces", "snapshot", "project-bundles", "measurement-evidence", "tasks", "curriculum"}
 
 
 def _retained(root):
@@ -323,7 +323,7 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
                     if not (directory / name).is_file():
                         issues.append({"kind": "missing-project-bundle-file", "origin": origin,
                                        "path": str((directory / name).relative_to(root))})
-            if (row.get("kind") == "artifact" and isinstance(row.get("payload"), dict)
+            if (not relative.startswith("tasks/") and row.get("kind") == "artifact" and isinstance(row.get("payload"), dict)
                     and "sha256" in row["payload"]):
                 digest = row["payload"].get("sha256", "")
                 objects = path.parent / "artifacts" / "objects"
@@ -352,6 +352,12 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
                 reports.append(descriptor)
 
     state = documents.get("state.json", [{}])[0]
+    if state.get("phase") == "optimizer-phase2":
+        from .optimizer_phase2_artifacts import verify_campaign
+        try:
+            verify_campaign(root)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            issues.append({"kind": "invalid-optimizer-phase2-evidence", "reason": str(error)})
     identity = documents.get("campaign-identity.json", [{}])[0]
     if not state and not any(p.endswith("protocol.json") for p in documents):
         issues.append({"kind": "missing-campaign-state"})

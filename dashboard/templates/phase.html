@@ -6,6 +6,7 @@
 {% if campaign.bootstrap %}<section><h2>Goal bootstrap: {{ campaign.bootstrap.stage }}</h2>
 <p>Proposal {{ campaign.bootstrap.proposal_count or 0 }} · Reference qualification is separate from learner verification.</p>
 {% if campaign.bootstrap.candidate.spec %}<h3>{{ campaign.bootstrap.candidate.spec.project_id }}</h3><p>{{ campaign.bootstrap.candidate.spec.hypothesis }}</p>{% endif %}
+{% if campaign.bootstrap.candidate.task_id %}<h3>{{ campaign.bootstrap.candidate.task_id }}</h3><p>Optimizer Torch reference · {{ campaign.bootstrap.candidate.submission.entrypoint }}</p>{% endif %}
 <p>{{ campaign.bootstrap.candidate.rationale or '' }}</p>
 {% if campaign.bootstrap.candidate.citations %}<pre>{{ campaign.bootstrap.candidate.citations|tojson(indent=2) }}</pre>{% endif %}
 {% if campaign.bootstrap.diagnostic %}<p>{{ campaign.bootstrap.diagnostic }}</p>{% endif %}
