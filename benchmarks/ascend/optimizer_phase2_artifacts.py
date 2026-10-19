@@ -16,6 +16,15 @@ def _relative(root, name):
     return root / path
 
 
+def _artifact(store, key, digest):
+    # The caller has authenticated this job and its event chain. Do not rehash
+    # the large immutable submission once per compact profiler CSV.
+    data = store.artifact_path(key, digest).read_bytes()
+    if sha(data) != digest:
+        raise ValueError("Phase 2 artifact digest mismatch")
+    return data
+
+
 def verify_campaign(root, *, require_ready=False):
     """Check seed identity, committed rows, and immutable optimizer evidence."""
     root = Path(root)
@@ -48,11 +57,11 @@ def verify_campaign(root, *, require_ready=False):
         if row["kind"] == "target" and row["task"] != state["target"]:
             raise ValueError("Phase 2 target changed between attempts")
         events = store.events(key)
-        for artifact in store.artifacts(key):
-            store.read_artifact(key, artifact["sha256"])
+        for digest in {artifact["sha256"] for artifact in store.artifacts(key)}:
+            _artifact(store, key, digest)
         if not any(e["kind"] == "phase2-attempt-result" and e["payload"] == result for e in events):
             raise ValueError("Phase 2 attempt result missing from optimizer event chain")
-        body = json.loads(store.read_artifact(key, result["result_artifact"]["sha256"]))
+        body = json.loads(_artifact(store, key, result["result_artifact"]["sha256"]))
         if body != {k: v for k, v in result.items() if k != "result_artifact"}:
             raise ValueError("Phase 2 result artifact mismatch")
         if result["attempt_id"] != row["attempt_id"] or result["task_id"] != row["task_id"]:
@@ -61,8 +70,8 @@ def verify_campaign(root, *, require_ready=False):
             raise ValueError("Phase 2 verified flag mismatch")
         if row.get("verified"):
             native = result["result"]
-            source = json.loads(store.read_artifact(key, result["candidate"]["sha256"]))
-            baseline = json.loads(store.read_artifact(key, result["baseline"]["sha256"]))
+            source = json.loads(_artifact(store, key, result["candidate"]["sha256"]))
+            baseline = json.loads(_artifact(store, key, result["baseline"]["sha256"]))
             if (not isinstance(source, str) or sha(source.encode()) != result["source_sha256"]
                     or native.get("candidate_sha256") != result["source_sha256"]
                     or native.get("status") != "verified"

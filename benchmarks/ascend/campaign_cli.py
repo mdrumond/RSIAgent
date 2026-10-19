@@ -153,7 +153,9 @@ def build_controller(job):
                     if key != "schema" and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
-        if job.get("target_goal") is not None or job.get("autonomous_goal"):
+        if job.get("optimizer_goal"):
+            coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
+        elif job.get("target_goal") is not None or job.get("autonomous_goal"):
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
             from .phase2_targets import TargetContract
             from .phase2_target_selector import TargetCurriculumAgent
@@ -193,6 +195,43 @@ def build_controller(job):
                     native_parallel=job["phase"] == 1,
                     a5_main=lambda argv: a5_main(argv, builder=capture))
     return captured[0]
+
+
+def _optimizer_controller(job, settings, snapshot, composed, native):
+    """Bind the merged optimizer worker to the reviewed native campaign lineage."""
+    from optimizer.memory import freeze_reviewed_phase1
+    from optimizer.worker import load_config, knowledge_query
+    from .phase2_optimizer_execution import OptimizerTaskExecutor
+    from .phase2_optimizer_campaign import OptimizerPhase2Coordinator
+
+    path = settings.get("optimizer_worker_config")
+    if not path:
+        raise ValueError("optimizer Phase 2 requires optimizer_worker_config in ignored campaign settings")
+    data = Path(path).read_bytes()
+    if hashlib.sha256(data).hexdigest() != job["optimizer_worker_config_sha256"]:
+        raise ValueError("optimizer worker configuration changed on resume")
+    config = load_config(path)
+    runtime = getattr(getattr(composed.execute_project, "executor", None), "runtime_identity", None)
+    if (config["profile"] != native.execution_profile or config["arch"] != native.arch
+            or runtime is None or str(config["physical_device"]) != str(runtime["device"])
+            or hashlib.sha256(Path(config["guide"]).read_bytes()).hexdigest() != native.guide_sha256
+            or config.get("model_profile", "openai/gpt-5.6-sol") != job["model"]):
+        raise ValueError("optimizer runtime, device, guide or model differs from reviewed composition")
+    selected = config.get("knowledge")
+    if bool(selected) != bool(native.collection) or (selected and selected.get("collection") != native.collection):
+        raise ValueError("optimizer KDB treatment differs from reviewed composition")
+    if selected:
+        reviewed = snapshot.destination.source_identity
+        if ("manifest" not in selected or "kdb_manifest" not in reviewed
+                or selected["manifest"] != reviewed["kdb_manifest"]):
+            raise ValueError("optimizer KDB manifest differs from reviewed Phase 1")
+    query = knowledge_query(config, Path(job["root"]) / "curriculum")
+    return OptimizerPhase2Coordinator(job["root"], job["objective"], freeze_reviewed_phase1(snapshot),
+        composed.curriculum._complete,
+        lambda directory, task, memory: OptimizerTaskExecutor(directory, task, memory, config),
+        query_knowledge=(lambda text: {"results": query(text)}) if query else None,
+        max_target_attempts=job["target_attempt_budget"],
+        max_practice_attempts=job["practice_attempt_budget"])
 
 
 def _approval_path(job):
@@ -703,10 +742,15 @@ def status(job):
     state = _read(root / "state.json") if (root / "state.json").exists() else {}
     outcomes = [_read(p) for p in root.glob("waves/*/branches/*/outcome.json")]
     published = len(state.get("prior_outcomes", []))
+    attempted = len(list(root.glob("waves/*/branches/*")))
+    if state.get("phase") == "optimizer-phase2":
+        outcomes = state.get("attempts", [])
+        attempted = len(outcomes)
+        published = len(state.get("memory_entries", []))
     elapsed = max(time.time() - job["created"], 1) / 3600
     inventory = inventory_campaign(root, artifact_store=control / "reports", **_annex_options(job))
     return {"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
-            "attempted": len(list(root.glob("waves/*/branches/*"))),
+            "attempted": attempted,
             "verified": sum(o.get("verified") is True for o in outcomes),
             "published": published, "published_per_hour": published / elapsed,
             "artifact_pending": sum(r["status"] != "available" for r in inventory["remote_reports"]),
@@ -823,6 +867,8 @@ def main(argv=None, *, screen=start_screen):
         elif args.phase == 2:
             public.update(autonomous_goal=True, target_attempt_budget=args.target_attempt_budget,
                           practice_attempt_budget=args.practice_attempt_budget)
+            if args.target == "a3":
+                public["optimizer_goal"] = True
         if args.approval_mode:
             public["approval_mode"] = True
         _write(root / "campaign-run.json", public)
@@ -830,6 +876,9 @@ def main(argv=None, *, screen=start_screen):
                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
                "phase1_root": str(args.phase1_root.resolve()) if args.phase1_root else None,
                "review": str(args.review.resolve()) if args.review else None}
+        if job.get("optimizer_goal") and settings.get("optimizer_worker_config"):
+            job["optimizer_worker_config_sha256"] = hashlib.sha256(
+                Path(settings["optimizer_worker_config"]).read_bytes()).hexdigest()
         if goal is not None:
             source_store = ContentAddressedArtifacts(Path(settings["target_artifact_store"]))
             pinned_store = ContentAddressedArtifacts(control / "target-artifacts")
