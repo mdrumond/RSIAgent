@@ -1,0 +1,153 @@
+"""Pin published native Phase 2 learning using the campaign's production readers."""
+from __future__ import annotations
+
+import base64
+import json
+from pathlib import Path, PurePosixPath
+
+from .jobs import canonical, sha
+
+
+def _read(root, relative):
+    path = PurePosixPath(relative)
+    if path.is_absolute() or '..' in path.parts:
+        raise ValueError('memory reference must be campaign-relative')
+    resolved = root.joinpath(*path.parts)
+    if any(parent.is_symlink() for parent in [resolved, *resolved.parents] if parent != root.parent):
+        raise ValueError('memory reference contains symlink')
+    return resolved.read_bytes()
+
+
+def freeze_source(root, *, snapshot_roots=()):
+    """Authenticate and return a self-contained snapshot, never just a terminal flag.
+
+    Only configured roots are passed here; discovery never scans parent folders.
+    Profiler report trees are not needed to consume learning and are not copied.
+    """
+    from benchmarks.ascend.phase2_curriculum import reviewed_seed
+    from benchmarks.ascend.phase2 import _native_identity
+    from benchmarks.ascend.training_annex import _verify_adaptive_state, _verify_wave
+    from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+
+    root = Path(root).absolute()
+    state_bytes = _read(root, 'state.json')
+    state = json.loads(state_bytes)
+    phase = state.get('phase')
+    if phase not in {'adaptive-phase2', 'target-driven-phase2'}:
+        raise ValueError('unsupported legacy Phase 2 format; native reviewed adaptive lineage required')
+    if (root / 'pending.json').exists():
+        raise ValueError('Phase 2 has a pending attempt')
+    terminal = (state.get('terminal') or {}).get('status')
+    if phase == 'target-driven-phase2':
+        if (terminal != 'READY' or not state.get('goal_identity')
+                or not state.get('attempts') or state['attempts'][-1].get('kind') != 'target'
+                or state['attempts'][-1].get('verified') is not True):
+            raise ValueError('target-driven Phase 2 has not reached READY')
+    elif (not state.get('prior_outcomes') or not (
+            len(state['prior_outcomes']) >= state.get('project_target', float('inf'))
+            or terminal == 'SATURATED')):
+        raise ValueError('adaptive Phase 2 has no compatible completed boundary')
+
+    # Validate all snapshot references before invoking the production reader.
+    matches = []
+    for seed_root in dict.fromkeys([root, *(Path(path).absolute() for path in snapshot_roots)]):
+        for path in seed_root.glob('cells/*/snapshot/snapshot.json'):
+            relative = path.relative_to(seed_root).as_posix()
+            manifest = json.loads(_read(seed_root, relative))
+            if manifest.get('snapshot_id') == state['snapshot_id']:
+                for name in manifest['files']:
+                    _read(path.parent, name)
+                matches.append((seed_root, path.parent, manifest))
+    if len(matches) != 1:
+        raise ValueError('reviewed seed missing or ambiguous')
+    seed_root, directory, manifest = matches[0]
+    destination = manifest['destination_identity']
+    identity = destination['source_identity']
+    _native_identity(identity)
+    if destination.get('language') != 'ascend-c' or destination.get('target') != 'a3':
+        raise ValueError('Phase 2 reviewed source is not compatible A3 Ascend C memory')
+    seed, checked_directory = reviewed_seed(seed_root, state['snapshot_id'])
+    assert directory == checked_directory
+    _verify_adaptive_state(root, state, reviewed_seed_root=seed_root)
+    files = {'state.json': state_bytes}
+    prefix = 'reviewed-seed'
+    for name in [*manifest['files'], 'snapshot.json']:
+        data = _read(directory, name)
+        if name in manifest['files'] and sha(data) != manifest['files'][name]:
+            raise ValueError('reviewed memory changed during snapshot')
+        files[f'{prefix}/{name}'] = data
+
+    entries = json.loads(seed)['phase1_memory']
+    for wave_id in state['completed_waves']:
+        wave_root = root / 'waves' / wave_id
+        _verify_wave(wave_root)
+        plan = json.loads(_read(root, f'waves/{wave_id}/plan.json'))
+        for name in ('plan.json', 'published.json', 'consolidated-memory.json'):
+            relative = f'waves/{wave_id}/{name}'
+            files[relative] = _read(root, relative)
+        for project in plan['wave']['projects']:
+            # WaveProject's wire form nests the project spec.
+            project_id = project['spec']['project_id']
+            branch = f'waves/{wave_id}/branches/{project_id}'
+            for name in ('outcome.json', 'memory-delta.bin', 'execution-evidence.bin'):
+                relative = f'{branch}/{name}'
+                files[relative] = _read(root, relative)
+            outcome = json.loads(files[f'{branch}/outcome.json'])
+            if not outcome['verified']:
+                continue
+            delta = json.loads(files[f'{branch}/memory-delta.bin'])
+            entry = json.loads(base64.b64decode(delta['memory_base64'], validate=True))
+            memory = Phase1ProjectMemory.from_mapping(entry)
+            digests = {memory.source_revision, *memory.admitted_artifact_sha256,
+                       *(fact.evidence_sha256 for fact in memory.host_facts)}
+            for digest in digests:
+                relative = f'{branch}/{memory.artifact_store or "artifacts"}/objects/{digest[:2]}/{digest[2:]}'
+                data = _read(root, relative)
+                if sha(data) != digest:
+                    raise ValueError('published memory artifact digest mismatch')
+                files[relative] = data
+    entries += [json.loads(base64.b64decode(payload, validate=True))
+                for payload in state['memory_bytes_base64']]
+    # Authenticate seed CAS as well as manifest hashes; all memory references travel.
+    for entry in json.loads(seed)['phase1_memory']:
+        memory = Phase1ProjectMemory.from_mapping(entry)
+        for digest in {memory.source_revision, *memory.admitted_artifact_sha256,
+                       *(fact.evidence_sha256 for fact in memory.host_facts)}:
+            data = _read(directory, f'artifacts/objects/{digest[:2]}/{digest[2:]}')
+            if sha(data) != digest:
+                raise ValueError('reviewed memory artifact digest mismatch')
+    if _read(root, 'state.json') != state_bytes or (root / 'pending.json').exists():
+        raise ValueError('Phase 2 changed during snapshot')
+    body = dict(schema='optimizer-memory-snapshot-v1', source_identity=identity,
+                phase=phase, terminal=state.get('terminal'),
+                phase1_snapshot_id=state['snapshot_id'], memory_entries=entries,
+                files={name: {'sha256': sha(data), 'base64': base64.b64encode(data).decode()}
+                       for name, data in sorted(files.items())})
+    return {**body, 'snapshot_id': sha(canonical(body))}
+
+
+def verify_snapshot(snapshot):
+    body = {key: value for key, value in snapshot.items() if key != 'snapshot_id'}
+    if sha(canonical(body)) != snapshot.get('snapshot_id'):
+        raise ValueError('optimizer memory snapshot digest mismatch')
+    for name, record in snapshot['files'].items():
+        path = PurePosixPath(name)
+        if path.is_absolute() or '..' in path.parts or sha(base64.b64decode(
+                record['base64'], validate=True)) != record['sha256']:
+            raise ValueError('optimizer memory snapshot file digest mismatch')
+
+
+def discover_sources(configured_roots, *, snapshot_roots=()):
+    """Return explicit availability for exactly the configured roots."""
+    result = []
+    for configured in configured_roots:
+        root = Path(configured).absolute()
+        try:
+            snapshot = freeze_source(root, snapshot_roots=snapshot_roots)
+            result.append(dict(root=str(root), available=True,
+                               snapshot_id=snapshot['snapshot_id'], phase=snapshot['phase'],
+                               memory_count=len(snapshot['memory_entries']),
+                               source_identity=snapshot['source_identity']))
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            result.append(dict(root=str(root), available=False, reason=str(error)))
+    return result
