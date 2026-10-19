@@ -114,7 +114,8 @@ class TargetContract:
         if not verdict.verified:
             raise ValueError("target reference is not host-verified")
         for timing in _timings(reference["timings"]):
-            artifacts.read_bytes(timing["evidence_sha256"])
+            if not artifacts.read_bytes(timing["evidence_sha256"]):
+                raise ValueError("reference timing evidence is empty")
 
 
 def qualify_target(spec: ProjectSpec, reference_source: str, runtime: Mapping[str, str],
