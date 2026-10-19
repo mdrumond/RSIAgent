@@ -444,42 +444,93 @@ def _project(branch: Path, spec: dict, failed=None):
             "transitions": transitions}
 
 
+def _goal_selection(root):
+    """Only publish the bootstrap's public metadata, never reference artifacts."""
+    value = _json(root / "goal-selection.json")
+    if not isinstance(value, dict) or value.get("stage") not in {
+            "selection", "qualification", "qualified", "failed"}:
+        return None
+    candidate = value.get("candidate")
+    candidate = candidate if isinstance(candidate, dict) else {}
+    return {"stage": value["stage"], "proposal_count": value.get("proposal_count"),
+            "candidate": {key: candidate[key] for key in ("spec", "rationale", "citations")
+                          if key in candidate},
+            "diagnostic": value.get("diagnostic"),
+            "qualified_target_id": value.get("qualified_target_id")}
+
+
+def _attempt_id(wave, project):
+    return f"{wave}--{project}"
+
+
 def _campaign(entry):
     root = Path(entry["root"])
     if not root.is_dir():
         raise FileNotFoundError(f"campaign root unavailable: {root}")
     state = _json(root / "state.json")
+    bootstrap = _goal_selection(root) if int(entry["phase"]) == 2 else None
+    if not isinstance(state, dict) and bootstrap is not None:
+        state = {}
     if not isinstance(state, dict):
         raise ValueError(f"campaign state unavailable: {root / 'state.json'}")
+    target_driven = state.get("phase") == "target-driven-phase2"
+    pending = _json(root / "pending.json", {}) or {}
     specs = {}
+    attempts = {row["wave_id"]: row for row in state.get("attempts", [])}
     for plan_path in sorted(root.glob("waves/*/plan.json")):
         plan = _json(plan_path, {}) or {}
         for item in plan.get("wave", {}).get("projects", []):
             spec = item.get("spec", item)
             if spec.get("project_id"):
-                specs[spec["project_id"]] = spec
+                identity = (_attempt_id(plan_path.parent.name, spec["project_id"])
+                            if target_driven else spec["project_id"])
+                specs[identity] = spec
     failures = {row.get("project_id"): row for row in state.get("failed_outcomes", [])}
     branches = {}
     for branch in sorted(root.glob("waves/*/branches/*")):
         if branch.is_dir():
-            branches[branch.name] = branch
+            identity = (_attempt_id(branch.parent.parent.name, branch.name)
+                        if target_driven else branch.name)
+            branches[identity] = branch
+    if target_driven:
+        failures = {_attempt_id(wave, row["project_id"]): row
+                    for wave, row in attempts.items() if not row.get("verified")}
     executed = set(branches) | {project_id for project_id in failures if project_id}
     projects = []
     for project_id, spec in specs.items():
         if project_id in executed:
-            projects.append(_project(branches.get(project_id, root), spec, failures.get(project_id)))
+            project = _project(branches.get(project_id, root), spec, failures.get(project_id))
+            if target_driven:
+                wave = project_id.split("--", 1)[0]
+                kind = attempts.get(wave, {}).get("kind")
+                if kind is None and pending.get("wave", {}).get("wave_id") == wave:
+                    kind = pending.get("kind")
+                project.update(id=project_id, project_id=spec["project_id"],
+                               attempt=wave, kind=kind or "pending")
+            projects.append(project)
     # Retain failures even if their old plan is temporarily unavailable.
     for project_id, failure in failures.items():
         if project_id and project_id not in specs:
-            projects.append(_project(branches.get(project_id, root),
-                                     failure.get("spec", {"project_id": project_id}), failure))
+            project = _project(branches.get(project_id, root),
+                               failure.get("spec", {"project_id": project_id}), failure)
+            if target_driven:
+                project.update(id=project_id, project_id=failure["project_id"],
+                               attempt=failure["wave_id"], kind=failure["kind"])
+            projects.append(project)
     control = Path(entry["control"]) if entry.get("control") else root.parent / "control"
     worker = _json(control / "worker.json")
     published = (len(state["prior_outcomes"]) if "prior_outcomes" in state else
                  sum(1 for project in projects if project["verified"]))
     planned = [{"id": project_id, **_description(spec.get("hypothesis", "")), "spec": spec}
                for project_id, spec in specs.items() if project_id not in executed]
+    terminal = state.get("terminal") or {}
+    learner_stage = ((pending.get("kind") or state.get("next_kind", "target"))
+                     if target_driven and not terminal else None)
+    status = terminal.get("status") or (worker or {}).get("status") or (
+        bootstrap["stage"] if bootstrap and not target_driven else learner_stage or "idle")
     return {"phase": int(entry["phase"]), "name": entry.get("name", f"Phase {entry['phase']}"),
+            "status": status, "terminal": terminal, "bootstrap": bootstrap,
+            "learner_stage": learner_stage,
             "root": str(root), "available": root.is_dir(), "worker": worker,
             "stats": {"attempted": len(projects),
                       "verified": sum(project["verified"] for project in projects),
@@ -545,12 +596,16 @@ class DashboardStore:
             root = Path(entry["root"])
         except (KeyError, TypeError):
             return None
+        state = _json(root / "state.json", {}) or {}
         for plan_path in sorted(root.glob("waves/*/plan.json")):
             plan = _json(plan_path, {}) or {}
             for item in plan.get("wave", {}).get("projects", []):
                 spec = item.get("spec", item)
-                if spec.get("project_id") == project_id:
-                    branch = plan_path.parent / "branches" / project_id
+                identity = spec.get("project_id")
+                if state.get("phase") == "target-driven-phase2":
+                    identity = _attempt_id(plan_path.parent.name, identity)
+                if identity == project_id:
+                    branch = plan_path.parent / "branches" / spec["project_id"]
                     if branch.is_dir():
                         return root, plan_path, branch, spec
         return None
@@ -830,7 +885,14 @@ class DashboardStore:
                 event = self._artifact_event(labels[role], "actor", source, digest,
                                              stage=payload.get("stage"), turn=payload.get("turn"))
                 events.append(event)
-        events.extend(self._host_evidence(root, project_id))
+        if state.get("phase") == "target-driven-phase2":
+            # The root ledger is keyed by project, not attempt: repeated target
+            # retries cannot safely be attributed from it. The branch verifier
+            # result below remains the authoritative attempt-specific evidence.
+            events.append(self._event("Shared host ledger", "verification",
+                                     reason="project-wide ledger; see attempt verifier result"))
+        else:
+            events.extend(self._host_evidence(root, project_id))
         events.append(self._event("Verifier prompt", "verification", reason=(
             "unavailable: verification is deterministic and host-owned")))
         events.append(self._event("Verifier result", "verification", branch / "execution-evidence.bin"))

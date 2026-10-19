@@ -51,6 +51,21 @@ payload is added to the SQLite cache. UTF-8 payloads are returned as escaped
 text, while every retained payload is available through the raw download route.
 Missing prompts or artifacts are explicitly marked unavailable.
 
+Fresh autonomous Phase 2 campaigns appear before learner `state.json` exists
+when `goal-selection.json` publishes selection or reference-qualification progress.
+Only its public candidate specification, rationale, citations, proposal count,
+diagnostic and qualified target ID are shown. Reference qualification is not
+counted as learner verification; private reference source and conversations are
+never indexed by the viewer.
+
+Target-driven Phase 2 rows and API routes use `attempt-NNN--project-id`, so target
+retries retain distinct source, traces and performance. Existing Phase 1 and
+legacy Phase 2 project routes are unchanged. The project-wide host ledger cannot
+distinguish target retries; these rows expose each branch's exact verifier result
+instead of attributing another attempt's ledger entries. Terminal readiness,
+stalls and budget exhaustion take precedence over an old worker status; running
+target/practice/review stages and worker failures remain visible separately.
+
 Opening a project's performance section lazily loads retained timing and
 `PipeUtilization` facts. The local SVG views show attempt distributions, shape
 sweeps, and AIC/AIV pipe ratios, with the exact normalized values in an HTML

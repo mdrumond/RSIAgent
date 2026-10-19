@@ -20,6 +20,6 @@
 <div id="operation-status">{% for operation in operations %}<p class="operation {{ operation.status }}"><b>{{ operation.action }}</b> {{ operation.status }}{% if operation.error %}: {{ operation.error }}{% endif %}</p>{% endfor %}</div>
 </section>{% endif %}
 <section class="grid">{% for campaign in view.campaigns %}<a class="card" href="{{ url_for('phase_page', number=campaign.phase) }}">
-<div class="row"><span class="tag">PHASE {{ campaign.phase }}</span><span class="status {{ campaign.worker.status if campaign.worker else 'idle' }}">{{ campaign.worker.status if campaign.worker else 'idle' }}</span></div>
+<div class="row"><span class="tag">PHASE {{ campaign.phase }}</span><span class="status {{ campaign.status }}">{{ campaign.status }}</span></div>
 <h2>{{ campaign.name }}</h2><div class="metrics"><b>{{ campaign.stats.attempted }}</b><span>attempted</span><b>{{ campaign.stats.verified }}</b><span>verified</span><b>{{ campaign.stats.published }}</b><span>published</span></div>
 </a>{% endfor %}</section>{% endblock %}
