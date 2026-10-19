@@ -62,11 +62,41 @@ class TargetDecision:
         return result
 
 
+_TOOL_ALIASES = {
+    "request-profile": {"request-profile", "msprof"},
+    "request-debug": {"request-debug", "msdebug"},
+    "request-sanitizer": {"request-sanitizer", "mssanitizer"},
+    "request-timing": {"request-timing"},
+    "debug-print": {"debug-print", "tla.print"},
+}
+_TOOL_FIELDS = {
+    "profiling": "request-profile", "tool-msprof": "request-profile",
+    "tool-msdebug": "request-debug", "tool-mssanitizer": "request-sanitizer",
+    "debug-print": "debug-print", "timing-sweep": "request-timing",
+}
+
+
+def _available_tools(context):
+    actual = set(context.available_tools)
+    return {name for name, aliases in _TOOL_ALIASES.items() if actual.intersection(aliases)}
+
+
 def target_curriculum_prompt(context: TargetCurriculumContext,
                              policy: CurriculumPolicy | None = None) -> str:
     grammar = _grammar()
     if policy is not None:
         grammar = policy.grammar(grammar)
+    available = _available_tools(context)
+    grammar["capabilities"] = [name for name in grammar["capabilities"]
+                               if _TOOL_FIELDS.get(name, "") in available or name not in _TOOL_FIELDS]
+    grammar["optional_project_fields"]["learning_focus"] = [
+        name for name in grammar["optional_project_fields"]["learning_focus"]
+        if _TOOL_FIELDS.get(name, "") in available or name not in _TOOL_FIELDS]
+    if "request-profile" not in available:
+        grammar["profile_metrics"] = []
+        grammar["profile_metric_rule"] = "null; profiling tool is unavailable"
+    if "request-timing" not in available:
+        grammar["timing_lengths"] = "[]; timing tool is unavailable"
     for key in ("wave_project_fields_exactly", "wave_fields_exactly", "requires"):
         grammar.pop(key, None)
     grammar["names"] = "graph input/node names match [a-z][a-z0-9]{0,15}; graph.output is one name string, never an object"
@@ -150,6 +180,10 @@ class TargetCurriculumAgent:
                 raise ValueError("practice exposes a held-out benchmark name")
             if project_information_sha256(project) in self._held_out:
                 raise ValueError("practice matches a held-out contract or shape")
+            requested = {item.value for item in project.capabilities} | set(project.learning_focus)
+            missing = {_TOOL_FIELDS[name] for name in requested if name in _TOOL_FIELDS} - _available_tools(context)
+            if missing:
+                raise ValueError("practice requires unavailable tools: " + ", ".join(sorted(missing)))
             if self.target_policy is not None:
                 self.target_policy.admit(project)
             value["project"] = project

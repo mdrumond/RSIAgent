@@ -198,3 +198,51 @@ def test_configured_held_out_signatures_apply_only_to_practice(tmp_path):
                        context(target)).action == "retry-target"
     with pytest.raises(ValueError, match="SHA-256"):
         TargetCurriculumAgent(lambda _: "", held_out_information_sha256=("invalid",))
+
+
+@pytest.mark.parametrize("focus,tool", [("tool-msprof", "request-profile"),
+    ("tool-msdebug", "request-debug"), ("tool-mssanitizer", "request-sanitizer"),
+    ("debug-print", "debug-print")])
+def test_practice_tool_focus_requires_available_route(tmp_path, focus, tool):
+    target, _, _ = qualified(tmp_path)
+    value = json.loads(practice_wire().split("\n", 1)[1])
+    value["project"]["learning_focus"] = [focus]
+    wire = "DECISION: PRACTICE\n" + json.dumps(value)
+    agent = TargetCurriculumAgent(lambda _: wire)
+    absent = replace(context(target), available_tools=())
+    with pytest.raises(ValueError, match="unavailable tools"):
+        agent.parse(wire, absent)
+    assert agent.parse(wire, replace(absent, available_tools=(tool,))).action == "practice"
+    grammar = json.loads(target_curriculum_prompt(absent).rsplit("\n", 1)[-1])["project_grammar"]
+    assert focus not in grammar["optional_project_fields"]["learning_focus"]
+
+
+@pytest.mark.parametrize("capability,tool", [("profiling", "request-profile"),
+                                           ("timing-sweep", "request-timing")])
+def test_tool_dependent_capabilities_are_rejected_and_model_can_repair(tmp_path, capability, tool):
+    target, _, _ = qualified(tmp_path)
+    value = json.loads(practice_wire().split("\n", 1)[1])
+    project = value["project"]
+    project["capabilities"].append(capability)
+    if capability == "profiling":
+        project["profile_metric"] = "pipe-utilization"
+    else:
+        # Timing sweeps require unpadded, one-dimensional graph inputs.
+        project["capabilities"].remove("padded-tail")
+        project["shape"] = [16]
+        project["padding_multiple"] = 1
+        project["timing_lengths"] = [16, 32]
+        for item in project["graph"]["inputs"]:
+            item["shape"] = [16]
+    wire = "DECISION: PRACTICE\n" + json.dumps(value)
+    absent = replace(context(target), available_tools=())
+    agent = TargetCurriculumAgent(lambda _: wire)
+    with pytest.raises(ValueError, match="unavailable tools"):
+        agent.parse(wire, absent)
+    assert agent.parse(wire, replace(absent, available_tools=(tool,))).action == "practice"
+    replies = iter([wire, practice_wire()])
+    decision, session = TargetCurriculumAgent(lambda _: next(replies)).select(absent)
+    assert decision.action == "practice" and session.turns == 2
+    grammar = json.loads(target_curriculum_prompt(absent).rsplit("\n", 1)[-1])["project_grammar"]
+    assert capability not in grammar["capabilities"]
+    assert grammar["profile_metrics"] == []
