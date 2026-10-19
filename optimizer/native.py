@@ -206,6 +206,30 @@ def _benchmark(*args, **kwargs):
     return benchmark(*args, **kwargs)
 
 
+def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, block_count=1):
+    """Compile all frozen case wrappers, but never launch the candidate kernel."""
+    prepared = load_reference(reference, device) if isinstance(reference, (str, Path)) else reference
+    _validate_prepared(prepared)
+    root = Path(directory)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / 'candidate.cpp').write_text(candidate)
+    result = {'status': 'compiled', 'candidate_sha256': _sha(candidate.encode()),
+              'suite_sha256': prepared.manifest['suite_sha256'], 'cases': []}
+    for i, row in enumerate(prepared.cases):
+        case_root = root / f'case-{i}'
+        record = {'case': row['case']['id']}
+        result['cases'].append(record)
+        try:
+            _, record['compilation'] = _compile_case(candidate, describe_case(prepared, row),
+                case_root, arch=arch, block_count=block_count)
+        except Exception as exc:
+            result['status'] = 'compile-error'
+            record['error'] = f'{type(exc).__name__}: {exc}'
+            if (case_root / 'compile.log').is_file():
+                record['compiler_diagnostics'] = (case_root / 'compile.log').read_text(errors='replace')[-24000:]
+    return result
+
+
 def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_count=1,
              benchmark=False, profile=False):
     """Evaluate exactly a prepared/frozen suite; timing starts after all cases pass.

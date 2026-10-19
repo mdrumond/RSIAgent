@@ -9,6 +9,7 @@ call MUST be idempotent for its directory and observe existing handles on retry.
 from __future__ import annotations
 
 import copy
+import base64
 import json
 import math
 import time
@@ -104,13 +105,23 @@ class OptimizationLoop:
         return validate_submission({k: submission[k] for k in ('source', 'entrypoint', 'init_args', 'init_kwargs')}
                                    | {'signatures': signatures})
 
-    def run(self):
+    def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
+        """Optionally stop at Phase 2's preparation or single-evaluation boundary.
+
+        These boundaries reuse this job's durable state, reference and pending
+        native operation. They do not create a fresh optimizer search.
+        """
+        self.prepare_only, self.single_evaluation = prepare_only, single_evaluation
+        self.context = context or {}
         row = self.store.get(self.key)
         if row['status'] not in {'queued', 'running'} and not (
                 row['status'] == 'budget-exhausted' and 'pending' in self.state):
             return row
         submission = self.store.submission(self.key)
         verify_snapshot(submission['memory_snapshot'])
+        if memory_snapshot is not None:
+            verify_snapshot(memory_snapshot)
+            submission = {**submission, 'memory_snapshot': memory_snapshot}
         identity = self.agent.identity
         if 'model' in self.state and self.state['model'] != identity:
             raise ValueError('optimizer model identity changed')
@@ -187,6 +198,8 @@ class OptimizationLoop:
             self.state['baseline'] = self._artifact('baseline', baseline)
             self._save()
         baseline = self._read(self.state['baseline'])
+        if self.prepare_only:
+            return
         while self._boundary():
             pending = self.state.get('pending')
             if pending is None:
@@ -201,9 +214,14 @@ class OptimizationLoop:
                 kind = action.get('action')
                 if kind == 'finish' and set(action) == {'action', 'summary'}:
                     self.store.add_event(self.key, 'finished', action)
+                    if self.single_evaluation:
+                        self.state.pop('action_result', None)
+                        self.state.pop('model_action', None)
+                        self._save()
+                        return
                     self.store.transition(self.key, 'completed')
                     break
-                if kind in {'query-knowledge', 'read-memory'}:
+                if kind in {'query-knowledge', 'read-memory', 'read-artifact', 'compile'}:
                     self._tool(action, submission['memory_snapshot'])
                     continue
                 if (set(action) != {'action', 'source', 'block_count', 'summary'} or kind != 'candidate'
@@ -257,8 +275,19 @@ class OptimizationLoop:
                         report = self._reserved_action(lambda: self.backend.profile(pending['source'],
                             self.directory / pending.get('configuration_sha256', pending['sha256']) / 'profile', block_count=pending['block_count']))
                         self.state['best']['profiling'] = self._artifact('profiling', report)
-                    except (ObservationUnavailable, WorkerStopped):
+                    except ObservationUnavailable:
                         raise
+                    except WorkerStopped:
+                        row = self.store.get(self.key)
+                        if (row['stop_requested'] or (row['elapsed_seconds'] < row['max_seconds']
+                                and time.monotonic() < getattr(self.backend, 'deadline', float('inf')))):
+                            raise
+                        # Correctness/evaluation is already committed. Optional
+                        # diagnostics exhausting the deadline cannot erase it or
+                        # leave a zero-budget pending profile retry forever.
+                        self.store.add_event(self.key, 'profiling-unavailable',
+                            {'reason': 'wall-time budget exhausted after evaluation',
+                             'candidate_sha256': pending['sha256']})
                     except Exception as exc:
                         self.store.add_event(self.key, 'profiling-unavailable', {'error': str(exc)})
                 else:
@@ -266,6 +295,8 @@ class OptimizationLoop:
                                          {'reason': 'budget or stop boundary', 'candidate_sha256': pending['sha256']})
             self.state.pop('pending')
             self._save()
+            if self.single_evaluation:
+                return
 
     def _evaluate_reserved(self, pending):
         return self._reserved_action(lambda: self.backend.evaluate(pending['source'],
@@ -292,10 +323,63 @@ class OptimizationLoop:
             raise ValueError('model action limit reached')
         self.state['turn'] += 1
         self._save()
+        context = {**context, **self.context}
+        if self.single_evaluation or self.prepare_only:
+            # Keep every lesson addressable, but don't replay hundreds of full
+            # entries or accumulated compiler/profiler logs on every turn.
+            rows = context.get('memory_summary', [])
+            limit = max(16, min(1200, 16000 // max(1, len(rows))))
+            context['memory_summary'] = [{**row, 'summary': row['summary'][:limit]} for row in rows]
+            history = []
+            recent = context.get('history', [])[-12:]
+            for index, row in enumerate(recent):
+                record = {key: value for key, value in row.items() if key != 'content'}
+                if len(json.dumps(record, ensure_ascii=True)) > 3000:
+                    record = {'metadata_artifact': self._artifact('history-entry', row),
+                              'result': row.get('result'), 'summary': str(row.get('summary', ''))[:500]}
+                content = json.dumps(row.get('content'), ensure_ascii=True)
+                size = 12000 if index == len(recent) - 1 and 'tool' in row else 1500
+                record['content_preview'] = content[:size]
+                record['content_truncated'] = len(content) > size
+                history.append(record)
+            context['history'] = history
+            if 'baseline' in context:
+                baseline = dict(context['baseline'])
+                profiling = baseline.get('profiling')
+                if profiling is not None and len(json.dumps(profiling, ensure_ascii=True)) > 12000:
+                    baseline['profiling'] = {'artifact': self._artifact('baseline-profiling', profiling),
+                        'preview': json.dumps(profiling, ensure_ascii=True)[:1500], 'truncated': True}
+                context['baseline'] = baseline
+            for key in ('best', 'phase2'):
+                if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
+                    record = self._artifact('context-' + key, context[key])
+                    context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
         return self._action(stage, lambda: self.agent.complete(stage, context, self._record))
 
     def _tool(self, action, snapshot):
-        if action['action'] == 'read-memory' and set(action) == {'action', 'index'}:
+        if action['action'] == 'compile' and set(action) == {'action', 'source', 'block_count', 'summary'}:
+            if (not isinstance(action['source'], str) or not action['source'].strip()
+                    or type(action['block_count']) is not int or not 1 <= action['block_count'] <= 65535):
+                raise ValueError('invalid compile action')
+            identity = sha(canonical({'source': action['source'], 'block_count': action['block_count']}))
+            result = self._action('compile', lambda: self.backend.compile(action['source'],
+                self.directory / 'compile' / identity, block_count=action['block_count']))
+        elif action['action'] == 'read-artifact' and set(action) == {'action', 'sha256', 'offset'}:
+            offset = action['offset']
+            if type(offset) is not int or offset < 0:
+                raise ValueError('invalid artifact offset')
+            try:
+                data = self.store.read_artifact(self.key, action['sha256'])
+            except FileNotFoundError:
+                record = next((row for row in snapshot['files'].values()
+                               if row['sha256'] == action['sha256']), None)
+                if record is None:
+                    raise ValueError('artifact is absent from job and authenticated memory snapshot')
+                data = base64.b64decode(record['base64'], validate=True)
+            raw = data.decode('utf-8')
+            result = {'offset': offset, 'text': raw[offset:offset + 1500],
+                      'next_offset': offset + 1500 if len(raw) > offset + 1500 else None}
+        elif action['action'] == 'read-memory' and set(action) == {'action', 'index'}:
             index = action['index']
             if type(index) is not int or not 0 <= index < len(snapshot['memory_entries']):
                 raise ValueError('invalid memory index')
