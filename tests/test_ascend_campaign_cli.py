@@ -919,6 +919,26 @@ def test_edited_configuration_refused_and_status_separates_verified_from_publish
     assert result["published_per_hour"] > 0
 
 
+def test_optimizer_phase2_status_counts_committed_attempts_and_learning(tmp_path, monkeypatch):
+    root, control = tmp_path / "campaign", tmp_path / "control"
+    root.mkdir()
+    control.mkdir()
+    job = dict(root=str(root), control=str(control), phase=2, target="a3",
+               project_target=1, created=cli.time.time() - 3600)
+    monkeypatch.setattr(cli, "inventory_campaign", lambda *a, **k: {"remote_reports": []})
+    state = dict(phase="optimizer-phase2", attempts=[], memory_entries=[])
+    for kind, verified, counts in (("target", False, (1, 0, 0)),
+                                   ("practice", True, (2, 1, 1)),
+                                   ("target", True, (3, 2, 2))):
+        state["attempts"].append(dict(kind=kind, verified=verified))
+        if verified:
+            state["memory_entries"].append(dict(category="host-verification"))
+        write(root / "state.json", state)
+        result = cli.status(job)
+        assert tuple(result[key] for key in ("attempted", "verified", "published")) == counts
+        assert (result["published_per_hour"] > 0) is bool(counts[2])
+
+
 def test_invalid_phase2_or_identity_override_fails_before_start(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),

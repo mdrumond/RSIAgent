@@ -220,6 +220,11 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
     selected = config.get("knowledge")
     if bool(selected) != bool(native.collection) or (selected and selected.get("collection") != native.collection):
         raise ValueError("optimizer KDB treatment differs from reviewed composition")
+    if selected:
+        reviewed = snapshot.destination.source_identity
+        if ("manifest" not in selected or "kdb_manifest" not in reviewed
+                or selected["manifest"] != reviewed["kdb_manifest"]):
+            raise ValueError("optimizer KDB manifest differs from reviewed Phase 1")
     query = knowledge_query(config, Path(job["root"]) / "curriculum")
     return OptimizerPhase2Coordinator(job["root"], job["objective"], freeze_reviewed_phase1(snapshot),
         composed.curriculum._complete,
@@ -737,10 +742,15 @@ def status(job):
     state = _read(root / "state.json") if (root / "state.json").exists() else {}
     outcomes = [_read(p) for p in root.glob("waves/*/branches/*/outcome.json")]
     published = len(state.get("prior_outcomes", []))
+    attempted = len(list(root.glob("waves/*/branches/*")))
+    if state.get("phase") == "optimizer-phase2":
+        outcomes = state.get("attempts", [])
+        attempted = len(outcomes)
+        published = len(state.get("memory_entries", []))
     elapsed = max(time.time() - job["created"], 1) / 3600
     inventory = inventory_campaign(root, artifact_store=control / "reports", **_annex_options(job))
     return {"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
-            "attempted": len(list(root.glob("waves/*/branches/*"))),
+            "attempted": attempted,
             "verified": sum(o.get("verified") is True for o in outcomes),
             "published": published, "published_per_hour": published / elapsed,
             "artifact_pending": sum(r["status"] != "available" for r in inventory["remote_reports"]),
