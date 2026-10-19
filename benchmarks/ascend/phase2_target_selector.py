@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import json
 from typing import Mapping
 
-from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import Capability, ProjectSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import (
     CurriculumSession, _grammar, _HELD_OUT_WORDS, _digest, project_information_sha256,
 )
@@ -191,5 +191,8 @@ class TargetCurriculumAgent:
                 raise ValueError("practice requires unavailable tools: " + ", ".join(sorted(missing)))
             if self.target_policy is not None:
                 self.target_policy.admit(project)
+            elif any(item in {Capability.VECTOR_REDUCTION, Capability.VECTOR_MASK}
+                     for item in project.capabilities):
+                raise ValueError("native vector capability requires an explicit target policy")
             value["project"] = project
         return TargetDecision(action=action, **value)
