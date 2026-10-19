@@ -248,7 +248,8 @@ def test_trace_uses_matching_retained_curriculum_session(campaign, tmp_path):
     plan = json.loads((tmp_path / "phase1/waves/wave-001/plan.json").read_text())
     admitted = {"wave_id": "wave-001", **plan["wave"]}
     invalid = json.loads(json.dumps(admitted))
-    invalid["projects"][0]["spec"]["hypothesis"] = "wrong response with wave-001 substring"
+    invalid["unexpected_top_level"] = "must be rejected"
+    invalid["projects"][0]["unexpected_project_field"] = "must also be rejected"
     state["session"] = {"messages": [
         {"role": "system", "content": "curriculum system"},
         {"role": "user", "content": "choose wave-001"},
@@ -267,7 +268,7 @@ def test_trace_uses_matching_retained_curriculum_session(campaign, tmp_path):
         "Curriculum admitted decision"]
     for label, expected in [("Curriculum system prompt", "curriculum system"),
                             ("Curriculum user prompt", "choose wave-001"),
-                            ("Curriculum assistant attempt 1", "wrong response"),
+                            ("Curriculum assistant attempt 1", "unexpected_top_level"),
                             ("Curriculum user correction", "correct the invalid"),
                             ("Curriculum admitted decision", '"wave_id": "wave-001"')]:
         event = next(row for row in events if row["label"] == label)

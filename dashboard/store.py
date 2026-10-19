@@ -297,24 +297,7 @@ class DashboardStore:
     @classmethod
     def _matches_plan(cls, content, expected):
         response = cls._wave_response(content)
-        if not isinstance(response, dict):
-            return False
-        normalized = {key: response.get(key) for key in (
-            "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage")}
-        projects = []
-        for item in response.get("projects", []):
-            if not isinstance(item, dict) or not isinstance(item.get("spec"), dict):
-                return False
-            spec = dict(item["spec"])
-            requires = item.get("requires", spec.pop("requires", []))
-            projects.append({"spec": spec, "requires": requires})
-        normalized["projects"] = projects
-        expected_normalized = {key: expected.get(key) for key in (
-            "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage")}
-        expected_normalized["projects"] = [
-            {"spec": item.get("spec", item), "requires": item.get("requires", [])}
-            for item in expected.get("projects", [])]
-        return normalized == expected_normalized
+        return isinstance(response, dict) and response == expected
 
     def _host_evidence(self, root, project_id):
         try:
