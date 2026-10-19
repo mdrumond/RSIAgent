@@ -1,5 +1,6 @@
 import base64
 import json
+import shutil
 
 import pytest
 
@@ -20,7 +21,9 @@ def campaign(tmp_path):
             "capabilities": ["simd-vector"], "shape": [1003]}
     write(root / "state.json", {"completed_waves": ["wave-001"], "prior_outcomes": [{}],
                                  "failed_outcomes": [], "project_target": 2})
-    write(root / "waves/wave-001/plan.json", {"wave": {"projects": [{"spec": spec}]}})
+    planned = {"project_id": "planned-only", "hypothesis": "Not started yet."}
+    write(root / "waves/wave-001/plan.json", {"wave": {"projects": [
+        {"spec": spec}, {"spec": planned}]}})
     write(root / "waves/wave-001/published.json", {"projects": ["vector-add"]})
     write(branch / "outcome.json", {"project_id": "vector-add", "verified": True,
                                      "classification": "host-verified"})
@@ -52,10 +55,12 @@ def campaign(tmp_path):
     control = tmp_path / "control"
     write(control / "worker.json", {"status": "running", "started": 10})
     config = tmp_path / "dashboard.json"
+    phase2 = tmp_path / "phase2"
+    write(phase2 / "state.json", {"completed_waves": [], "prior_outcomes": []})
     write(config, {"campaigns": [{"phase": 1, "name": "A3 Phase 1", "root": str(root),
                                    "control": str(control)},
                                   {"phase": 2, "name": "A3 Phase 2",
-                                   "root": str(tmp_path / "missing")}]})
+                                   "root": str(phase2)}]})
     return config
 
 
@@ -70,17 +75,44 @@ def test_refresh_extracts_projects_memory_performance_and_revisions(campaign, tm
     assert project["memory"]["lessons"][0]["claim"] == "Tail remained bounded."
     assert project["revisions"][-1]["source"].startswith("extern C")
     assert "first_draft" in project["revisions"][0]["source"]
-    assert project["diff"].startswith("---")
+    assert len(project["transitions"]) == 2
+    assert all(row["diff"].startswith("---") for row in project["transitions"])
     assert view["campaigns"][0]["worker"]["status"] == "running"
+    assert [row["id"] for row in view["campaigns"][0]["planned"]] == ["planned-only"]
+
+
+def test_planned_projects_do_not_inflate_attempts_or_published(campaign, tmp_path):
+    config = json.loads(campaign.read_text())
+    state_path = tmp_path / "phase1/state.json"
+    state = json.loads(state_path.read_text())
+    state["prior_outcomes"] = []
+    write(state_path, state)
+    view = DashboardStore(campaign, tmp_path / "cache.sqlite3").refresh()
+    phase = view["campaigns"][0]
+    assert phase["stats"] == {"attempted": 1, "verified": 1, "published": 0}
+    assert [project["id"] for project in phase["projects"]] == ["vector-add"]
+    assert phase["planned"][0]["id"] == "planned-only"
+
+    del state["prior_outcomes"]
+    write(state_path, state)
+    assert DashboardStore(campaign, tmp_path / "legacy.sqlite3").refresh()[
+        "campaigns"][0]["stats"]["published"] == 1
 
 
 def test_refresh_failure_serves_last_cached_snapshot(campaign, tmp_path):
     store = DashboardStore(campaign, tmp_path / "cache.sqlite3")
     assert store.refresh()["stale"] is False
-    campaign.write_text("not json")
+    root = tmp_path / "phase1"
+    shutil.rmtree(root)
     stale = store.refresh()
     assert stale["stale"] is True
     assert stale["campaigns"][0]["projects"][0]["id"] == "vector-add"
+    assert store.cached()["stale"] is True
+
+    app = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0)
+    client = app.test_client()
+    assert b"last cached snapshot" in client.get("/").data
+    assert b"last cached snapshot" in client.get("/").data
 
 
 def test_routes_render_escaped_data_and_project_views(campaign, tmp_path):
@@ -93,6 +125,8 @@ def test_routes_render_escaped_data_and_project_views(campaign, tmp_path):
     assert detail.status_code == 200
     assert b"Historic code evolution" in detail.data and b"Tail remained bounded" in detail.data
     assert b"void kernel" in detail.data and b"language-cpp" in detail.data
+    assert detail.data.count(b"Revision 1") == 1 and detail.data.count(b"Revision 2") == 1
+    assert b"first_draft" in detail.data and b"old_kernel" in detail.data
     assert client.get("/memory").status_code == 200
     assert client.get("/api/status").json["campaigns"][0]["worker"]["status"] == "running"
     assert client.get("/phase/1/project/../../etc/passwd").status_code == 404
