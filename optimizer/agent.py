@@ -14,6 +14,14 @@ Optimization actions: {"action":"candidate","source":"Ascend C device source",
 "block_count":1,"summary":"change and expected effect"},
 {"action":"query-knowledge","query":"..."},
 {"action":"read-memory","index":0}, or {"action":"finish","summary":"..."}.
+Read full retained evidence or truncated memory using
+{"action":"read-artifact","sha256":"artifact digest","offset":0}; advance
+the returned next_offset to page through JSON text (1,500 characters per page).
+Compile without executing or spending an evaluated candidate trial with
+{"action":"compile","source":"Ascend C device source","block_count":1,"summary":"..."}.
+In Phase 2 single-evaluation mode, submit one candidate after any compile repairs;
+finish without a candidate does not establish correctness. Curriculum feedback and
+updated memory, when supplied, describe learning since this task was frozen.
 Candidates define extern "C" __global__ __aicore__ void optimizer_kernel(...)
 with GM_ADDR arguments in inputs, frozen state, outputs order. Host defines
 Declare the kernel task type explicitly inside optimizer_kernel with
