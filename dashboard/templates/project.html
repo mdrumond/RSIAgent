@@ -3,5 +3,5 @@
 <p class="lede">{{ project.description }}</p><aside><b>Outcome</b><p>{{ project.summary }}</p></aside>
 <h2>Performance over attempts</h2><div class="perf">{% for row in project.performance %}<article><b>{{ '%.3f'|format(row.median_us) }} µs</b><span>{{ row.measurement }}</span><small>shape {{ row.shape }} · {{ row.samples_us|length }} samples</small></article>{% else %}<p>No timing study retained.</p>{% endfor %}</div>
 <h2>Final code</h2><div class="code language-cpp">{{ source }}</div>
-<h2>Historic code evolution</h2><p>{{ project.revisions|length }} content-addressed revision{{ '' if project.revisions|length == 1 else 's' }} retained.</p><div class="code diff">{{ diff }}</div>
+<h2>Historic code evolution</h2><p>{{ project.revisions|length }} content-addressed revision{{ '' if project.revisions|length == 1 else 's' }} retained.</p>{% for row in transitions %}<h3>Revision {{ loop.index }} → {{ loop.index + 1 }} <small>{{ row.from[:12] }} → {{ row.to[:12] }}</small></h3><div class="code diff">{{ row.html }}</div>{% else %}<p>No earlier source revision retained.</p>{% endfor %}
 <h2>Memory gained</h2>{% for lesson in project.memory.lessons %}<article class="lesson"><span class="tag">{{ lesson.category }}</span><p>{{ lesson.claim }}</p><small>{{ lesson.confidence }}</small></article>{% else %}<p>No published lessons retained.</p>{% endfor %}{% endblock %}

@@ -54,9 +54,11 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
         project = next((row for row in campaign["projects"] if row["id"] == project_id), None) if campaign else None
         if project is None:
             abort(404)
+        transitions = [{**row, "html": code(row["diff"], DiffLexer())}
+                       for row in project["transitions"]]
         return render_template("project.html", campaign=campaign, project=project,
                                source=code(project["source"], CppLexer()),
-                               diff=code(project["diff"] or "No earlier source revision retained.\n", DiffLexer()))
+                               transitions=transitions)
 
     @app.get("/memory")
     def memory_page():

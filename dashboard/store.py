@@ -101,11 +101,12 @@ def _project(branch: Path, spec: dict, failed=None):
     outcome = _json(branch / "outcome.json", failed or {}) or {}
     delta, memory, performance = _memory(branch)
     revisions = _revisions(branch, memory.get("source_revision", ""))
-    diff = ""
-    if len(revisions) > 1:
-        diff = "".join(difflib.unified_diff(
-            revisions[-2]["source"].splitlines(True), revisions[-1]["source"].splitlines(True),
-            fromfile=revisions[-2]["sha256"][:12], tofile=revisions[-1]["sha256"][:12]))
+    transitions = []
+    for before, after in zip(revisions, revisions[1:]):
+        transitions.append({"from": before["sha256"], "to": after["sha256"],
+                            "diff": "".join(difflib.unified_diff(
+                                before["source"].splitlines(True), after["source"].splitlines(True),
+                                fromfile=before["sha256"][:12], tofile=after["sha256"][:12]))})
     lessons = memory.get("agent_lessons", memory.get("lessons", []))
     return {"id": spec.get("project_id", branch.name),
             "description": spec.get("hypothesis", "No project description retained."),
@@ -116,12 +117,16 @@ def _project(branch: Path, spec: dict, failed=None):
             "memory": {"actions": memory.get("actions", []), "facts": memory.get("host_facts", []),
                        "lessons": lessons, "interpretations": memory.get("agent_interpretations", [])},
             "revisions": revisions, "source": revisions[-1]["source"] if revisions else "",
-            "diff": diff}
+            "transitions": transitions}
 
 
 def _campaign(entry):
     root = Path(entry["root"])
-    state = _json(root / "state.json", {}) or {}
+    if not root.is_dir():
+        raise FileNotFoundError(f"campaign root unavailable: {root}")
+    state = _json(root / "state.json")
+    if not isinstance(state, dict):
+        raise ValueError(f"campaign state unavailable: {root / 'state.json'}")
     specs = {}
     for plan_path in sorted(root.glob("waves/*/plan.json")):
         plan = _json(plan_path, {}) or {}
@@ -130,27 +135,31 @@ def _campaign(entry):
             if spec.get("project_id"):
                 specs[spec["project_id"]] = spec
     failures = {row.get("project_id"): row for row in state.get("failed_outcomes", [])}
+    branches = {}
+    for branch in sorted(root.glob("waves/*/branches/*")):
+        if branch.is_dir():
+            branches[branch.name] = branch
+    executed = set(branches) | {project_id for project_id in failures if project_id}
     projects = []
     for project_id, spec in specs.items():
-        matches = list(root.glob(f"waves/*/branches/{project_id}"))
-        branch = matches[-1] if matches else root / "waves/unstarted/branches" / project_id
-        projects.append(_project(branch, spec, failures.get(project_id)))
+        if project_id in executed:
+            projects.append(_project(branches.get(project_id, root), spec, failures.get(project_id)))
     # Retain failures even if their old plan is temporarily unavailable.
     for project_id, failure in failures.items():
         if project_id and project_id not in specs:
-            matches = list(root.glob(f"waves/*/branches/{project_id}"))
-            branch = matches[-1] if matches else root
-            projects.append(_project(branch, failure.get("spec", {"project_id": project_id}), failure))
+            projects.append(_project(branches.get(project_id, root),
+                                     failure.get("spec", {"project_id": project_id}), failure))
     control = Path(entry["control"]) if entry.get("control") else root.parent / "control"
     worker = _json(control / "worker.json")
-    published = len(state.get("prior_outcomes", []))
-    if not published:
-        published = sum(1 for project in projects if project["verified"])
+    published = (len(state["prior_outcomes"]) if "prior_outcomes" in state else
+                 sum(1 for project in projects if project["verified"]))
+    planned = [{"id": project_id, "description": spec.get("hypothesis", ""), "spec": spec}
+               for project_id, spec in specs.items() if project_id not in executed]
     return {"phase": int(entry["phase"]), "name": entry.get("name", f"Phase {entry['phase']}"),
             "root": str(root), "available": root.is_dir(), "worker": worker,
             "stats": {"attempted": len(projects),
                       "verified": sum(project["verified"] for project in projects),
-                      "published": published}, "projects": projects}
+                      "published": published}, "projects": projects, "planned": planned}
 
 
 class DashboardStore:
@@ -169,17 +178,20 @@ class DashboardStore:
             row = db.execute("SELECT body FROM snapshots WHERE id=1").fetchone()
         return json.loads(row[0]) if row else {"generated_at": None, "stale": True, "campaigns": []}
 
+    def _save(self, view):
+        with self._db() as db:
+            db.execute("INSERT INTO snapshots(id,body) VALUES(1,?) "
+                       "ON CONFLICT(id) DO UPDATE SET body=excluded.body", (json.dumps(view),))
+
     def refresh(self):
         try:
             config = json.loads(self.config_path.read_text())
             view = {"generated_at": time.time(), "stale": False,
                     "campaigns": [_campaign(entry) for entry in config["campaigns"]]}
-            body = json.dumps(view)
-            with self._db() as db:
-                db.execute("INSERT INTO snapshots(id,body) VALUES(1,?) "
-                           "ON CONFLICT(id) DO UPDATE SET body=excluded.body", (body,))
+            self._save(view)
             return view
         except (OSError, ValueError, KeyError, TypeError):
             view = self.cached()
             view["stale"] = True
+            self._save(view)
             return view
