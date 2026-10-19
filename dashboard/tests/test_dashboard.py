@@ -5,7 +5,7 @@ import shutil
 import pytest
 
 from dashboard.app import create_app
-from dashboard.store import DashboardStore
+from dashboard.store import DashboardStore, _source
 
 
 def write(path, value):
@@ -130,6 +130,36 @@ def test_routes_render_escaped_data_and_project_views(campaign, tmp_path):
     assert client.get("/memory").status_code == 200
     assert client.get("/api/status").json["campaigns"][0]["worker"]["status"] == "running"
     assert client.get("/phase/1/project/../../etc/passwd").status_code == 404
+
+
+@pytest.mark.parametrize("digest", [
+    "g" * 64,
+    "A" * 64,
+    "." * 64,
+    "aa/" + "x" * 61,
+    "../" + "x" * 61,
+])
+def test_artifact_source_rejects_noncanonical_digest_before_io(monkeypatch, tmp_path, digest):
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("untrusted digest reached filesystem read")
+
+    monkeypatch.setattr(type(tmp_path), "read_text", unexpected_read)
+    assert _source(tmp_path, digest) is None
+
+
+def test_invalid_source_revision_is_gracefully_unavailable(campaign, tmp_path):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    delta = json.loads((branch / "memory-delta.bin").read_text())
+    memory = json.loads(base64.b64decode(delta["memory_base64"]))
+    memory["source_revision"] = "aa/" + "x" * 61
+    delta["memory_base64"] = base64.b64encode(json.dumps(memory).encode()).decode()
+    write(branch / "memory-delta.bin", delta)
+    (branch / "evidence.jsonl").unlink()
+
+    client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
+    detail = client.get("/phase/1/project/vector-add")
+    assert detail.status_code == 200
+    assert b"Source unavailable" in detail.data
 
 
 def test_default_bind_is_loopback(monkeypatch, campaign, tmp_path):
