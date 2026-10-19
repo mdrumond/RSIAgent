@@ -31,3 +31,32 @@ submission. Budget changes require a fresh campaign.
 Retained legacy campaigns keep their original implementation. Explicit legacy
 `--target-goal` contracts and A5 entrypoints are unchanged. New A3 validation does
 not establish A5 compiler/device support for this optimizer path.
+
+## Successive goals
+
+Keep each goal in a fresh campaign root: a retained campaign never changes its
+fixed target. To reuse authenticated learning, set this in the next campaign's
+ignored settings (the settings file is pinned by the ordinary campaign launcher):
+
+```json
+{"optimizer_prior_campaigns": [
+  {"root": "/absolute/previous/campaign", "state_sha256": "sha256-of-state.json-bytes"}
+]}
+```
+
+The predecessor must be READY with a committed host-verified final target and no
+pending attempt. Startup authenticates its original reviewed Phase 1 binding,
+task/job events, and candidate/result/profile evidence. Changed state, incompatible
+source treatment, and stalled/incomplete predecessors are rejected rather than
+silently treated as success. Normally list only the latest READY predecessor: its
+seed already contains earlier learning. A stalled goal can be retained for review
+while the next fresh goal uses the most recent READY predecessor instead.
+Once initialized, resume authenticates the retained portable `seed-memory.json`
+without reopening predecessor folders; those folders may be archived or moved.
+The retained seed must preserve every original reviewed lesson/file unchanged,
+and inherited lessons must retain their committed attempt and artifact evidence.
+
+`compose_prior_campaigns(reviewed_seed, predecessors)` returns a portable seed
+with cumulative lessons and content-addressed evidence, without recursively
+embedding raw job submissions or complete campaign archives. Artifact annexes in
+the original campaign roots remain available for archival/training export.
