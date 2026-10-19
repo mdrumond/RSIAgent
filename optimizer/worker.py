@@ -106,6 +106,8 @@ class RemoteBackend:
                 raise
             result = {'status': 'error', 'error': failure + '; no compact result was published',
                       'operation': operation, 'cases': [], 'remote_directory': str(remote_directory)}
+            if (directory / 'transport.log').exists():
+                result['runtime_log_tail'] = (directory / 'transport.log').read_text(errors='replace')[-12000:]
             atomic(result_path, canonical(result))
             self.store.put_artifact(self.job_id, str(relative / 'result.json'), canonical(result))
             return result
