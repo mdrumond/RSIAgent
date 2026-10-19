@@ -345,8 +345,18 @@ def test_partial_approved_wave_matches_exact_origin_proposal(campaign, tmp_path,
     root = tmp_path / "phase1"
     plan_path = root / "waves/wave-001/plan.json"
     plan = json.loads(plan_path.read_text())
-    selected = {**plan["wave"]["projects"][0], "requires": []}
-    expected = {"wave_id": "wave-001", **plan["wave"], "projects": [selected]}
+    spec = {"project_id": "vector-add", "capabilities": ["simd-vector"],
+            "shape": [1003], "dtype": "float32", "block_count": 1,
+            "padding_multiple": 32, "failure_mode": "none", "timing_lengths": [],
+            "profile_metric": None, "hypothesis": "Measure a bounded vector add.",
+            "graph": {"inputs": [{"name": "x", "shape": [1003]},
+                                  {"name": "y", "shape": [1003]}],
+                      "nodes": [{"name": "sum", "op": "add",
+                                 "operands": ["x", "y"], "axis": None}],
+                      "output": "sum"}}
+    selected = {"spec": spec, "requires": []}
+    expected = {"wave_id": "wave-001", **plan["wave"], "pre_wave_coverage": [],
+                "projects": [selected]}
     write(plan_path, {"wave": {key: value for key, value in expected.items()
                                 if key != "wave_id"}})
     extra = {"spec": {**selected["spec"], "project_id": "valid-unselected"},
@@ -355,15 +365,27 @@ def test_partial_approved_wave_matches_exact_origin_proposal(campaign, tmp_path,
     malformed = json.loads(json.dumps(admitted))
     malformed["projects"][1]["unexpected"] = "not a valid proposal project"
     unrelated = {**expected, "projects": [extra]}
+    bad_spec_field = json.loads(json.dumps(admitted))
+    bad_spec_field["projects"][1]["spec"]["unexpected"] = "not in ProjectSpec"
+    bad_shape_type = json.loads(json.dumps(admitted))
+    bad_shape_type["projects"][1]["spec"]["shape"] = [True]
+    bad_dtype = json.loads(json.dumps(admitted))
+    bad_dtype["projects"][1]["spec"]["dtype"] = "int8"
     session = {"messages": [
         {"role": "system", "content": "partial approval system"},
         {"role": "user", "content": "propose a full wave"},
         {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(unrelated)},
         {"role": "user", "content": "include the selected project"},
         {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(malformed)},
-        {"role": "user", "content": "remove the malformed extra field"},
+        {"role": "user", "content": "remove the malformed wrapper field"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(bad_spec_field)},
+        {"role": "user", "content": "remove the malformed spec field"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(bad_shape_type)},
+        {"role": "user", "content": "repair the invalid shape type"},
+        {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(bad_dtype)},
+        {"role": "user", "content": "repair the unregistered dtype"},
         {"role": "assistant", "content": "DECISION: WAVE\n" + json.dumps(admitted)},
-    ], "turns": 3}
+    ], "turns": 6}
     state = json.loads((root / "state.json").read_text())
     state["session"] = session if retained_in == "state" else {"messages": []}
     write(root / "state.json", state)
@@ -374,7 +396,7 @@ def test_partial_approved_wave_matches_exact_origin_proposal(campaign, tmp_path,
     curriculum = [row for row in events if row["category"] == "curriculum"]
     assert curriculum[-1]["label"] == "Curriculum admitted decision"
     assert sum(row["label"].startswith("Curriculum assistant attempt")
-               for row in curriculum) == 2
+               for row in curriculum) == 5
     admitted_body = client.get(curriculum[-1]["payload_url"]).get_json()["text"]
     assert admitted_body == "DECISION: WAVE\n" + json.dumps(admitted)
 

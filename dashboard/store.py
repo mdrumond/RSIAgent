@@ -6,6 +6,7 @@ import base64
 import difflib
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import sqlite3
@@ -14,6 +15,161 @@ import time
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _DESCRIPTION_LABELS = ("Question", "Controlled change", "Tools", "Measurements",
                        "Expected lesson")
+_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}\Z")
+_NAME = re.compile(r"[a-z][a-z0-9]{0,15}\Z")
+_CAPABILITIES = {"gm-ub-movement", "simd-vector", "padded-tail", "simt-reduction",
+                 "simt-mask", "vector-reduction", "vector-mask", "cube-tiling",
+                 "failure-repair", "timing-sweep", "profiling"}
+_DTYPES = {"float16", "bfloat16", "float32", "float8_e4m3fn", "float8_e5m2",
+           "mxfp8_e4m3fn", "mxfp8_e5m2"}
+_OPS = {"copy", "add", "multiply", "relu", "mask-positive", "reduce-sum", "matmul"}
+_LEARNING_FOCI = {"pipe-scalar", "pipe-vector", "pipe-cube", "pipe-mte1", "pipe-mte2",
+                   "pipe-mte3", "pipe-fix", "inter-pipe-sync", "simd-barrier",
+                   "simt-barrier", "cross-core-sync", "sync-correctness",
+                   "sync-performance", "tool-msprof", "tool-msdebug", "tool-mssanitizer",
+                   "debug-print"}
+_PROJECT_FIELDS = {"project_id", "capabilities", "shape", "dtype", "block_count",
+                   "padding_multiple", "failure_mode", "timing_lengths", "profile_metric",
+                   "hypothesis", "graph"}
+
+
+def _integer_shape(value, *, maximum=4096):
+    return (isinstance(value, list) and 1 <= len(value) <= 3 and
+            all(type(item) is int and 1 <= item <= maximum for item in value))
+
+
+def _validated_graph(value):
+    """Return graph shapes/operations, or None for a non-canonical ProjectGraph wire value."""
+    if not isinstance(value, dict) or set(value) != {"inputs", "nodes", "output"}:
+        return None
+    inputs, nodes, output = value["inputs"], value["nodes"], value["output"]
+    if (not isinstance(inputs, list) or not 1 <= len(inputs) <= 3 or
+            not isinstance(nodes, list) or not 1 <= len(nodes) <= 12 or
+            not isinstance(output, str)):
+        return None
+    shapes, input_shapes, node_names, operations = {}, [], set(), set()
+    for item in inputs:
+        if (not isinstance(item, dict) or set(item) != {"name", "shape"} or
+                not isinstance(item["name"], str) or not _NAME.fullmatch(item["name"]) or
+                not _integer_shape(item["shape"]) or math.prod(item["shape"]) > 65536 or
+                item["name"] in shapes):
+            return None
+        shape = tuple(item["shape"]); shapes[item["name"]] = shape; input_shapes.append(shape)
+    for item in nodes:
+        if (not isinstance(item, dict) or set(item) != {"name", "op", "operands", "axis"} or
+                not isinstance(item["name"], str) or not _NAME.fullmatch(item["name"]) or
+                item["name"] in shapes or not isinstance(item["op"], str) or
+                item["op"] not in _OPS or
+                not isinstance(item["operands"], list) or
+                any(not isinstance(name, str) or not _NAME.fullmatch(name)
+                    for name in item["operands"]) or
+                item["axis"] is not None and type(item["axis"]) is not int):
+            return None
+        try:
+            operands = [shapes[name] for name in item["operands"]]
+        except KeyError:
+            return None
+        op, axis = item["op"], item["axis"]
+        if op in {"copy", "relu", "mask-positive"}:
+            inferred = operands[0] if len(operands) == 1 and axis is None else None
+        elif op in {"add", "multiply"}:
+            inferred = (operands[0] if len(operands) == 2 and operands[0] == operands[1]
+                        and axis is None else None)
+        elif op == "reduce-sum":
+            inferred = (operands[0][:axis] + operands[0][axis + 1:] or (1,)
+                        if len(operands) == 1 and type(axis) is int and
+                        0 <= axis < len(operands[0]) else None)
+        else:
+            inferred = ((operands[0][0], operands[1][1])
+                        if len(operands) == 2 and axis is None and
+                        len(operands[0]) == len(operands[1]) == 2 and
+                        operands[0][1] == operands[1][0] and
+                        operands[0][0] * operands[0][1] * operands[1][1] <= 2_000_000
+                        else None)
+        if inferred is None or math.prod(inferred) > 65536:
+            return None
+        shapes[item["name"]] = inferred; node_names.add(item["name"]); operations.add(op)
+    if output not in node_names:
+        return None
+    by_name = {item["name"]: item for item in nodes}; reachable, pending = {output}, [output]
+    while pending:
+        for operand in by_name[pending.pop()]["operands"]:
+            if operand in by_name and operand not in reachable:
+                reachable.add(operand); pending.append(operand)
+    if reachable != node_names:
+        return None
+    return tuple(input_shapes), tuple(shapes[output]), operations, nodes
+
+
+def _valid_project_spec(value):
+    """Local wire validator equivalent to the closed ProjectSpec admission contract."""
+    if (not isinstance(value, dict) or set(value) - {"learning_focus"} != _PROJECT_FIELDS or
+            not isinstance(value.get("project_id"), str) or not _ID.fullmatch(value["project_id"])):
+        return False
+    capabilities = value["capabilities"]
+    focus = value.get("learning_focus", [])
+    timing = value["timing_lengths"]
+    if (not isinstance(capabilities, list) or not capabilities or
+            any(not isinstance(item, str) or item not in _CAPABILITIES
+                for item in capabilities) or
+            len(set(capabilities)) != len(capabilities) or
+            not _integer_shape(value["shape"], maximum=16384) or
+            not isinstance(value["dtype"], str) or value["dtype"] not in _DTYPES or
+            type(value["block_count"]) is not int or
+            not 1 <= value["block_count"] <= 32 or type(value["padding_multiple"]) is not int or
+            value["padding_multiple"] not in {1, 16, 32, 64, 128, 256} or
+            not isinstance(value["failure_mode"], str) or
+            value["failure_mode"] not in {"none", "compile", "host-mismatch"} or
+            not isinstance(timing, list) or len(timing) > 8 or
+            any(type(item) is not int or not 1 <= item <= 4096 for item in timing) or
+            timing != sorted(set(timing)) or
+            (value["profile_metric"] is not None and
+             (not isinstance(value["profile_metric"], str) or
+              value["profile_metric"] not in {"pipe-utilization", "memory-throughput",
+                                               "timeline"})) or
+            not isinstance(value["hypothesis"], str) or not value["hypothesis"].strip() or
+            value["hypothesis"] != value["hypothesis"].strip() or
+            not isinstance(focus, list) or len(set(focus)) != len(focus) or
+            any(not isinstance(item, str) or item not in _LEARNING_FOCI for item in focus)):
+        return False
+    graph = _validated_graph(value["graph"])
+    if graph is None:
+        return False
+    inputs, output, operations, nodes = graph
+    selected = set(capabilities)
+    if (("cube-tiling" in selected) != ("matmul" in operations) or
+            ("simd-vector" in selected) != bool({"add", "multiply", "relu"} & operations) or
+            len({"simt-reduction", "vector-reduction"} & selected) != int("reduce-sum" in operations) or
+            len({"simt-mask", "vector-mask"} & selected) != int("mask-positive" in operations)):
+        return False
+    shape = tuple(value["shape"])
+    if "matmul" in operations:
+        if (len(shape) != 3 or inputs != ((shape[0], shape[1]), (shape[1], shape[2])) or
+                output != (shape[0], shape[2])):
+            return False
+    elif any(item != shape for item in inputs):
+        return False
+    low_precision = value["dtype"].startswith("mxfp8_") or (
+        value["dtype"].startswith("float8_") and "matmul" in operations)
+    if low_precision and (len(nodes) != 1 or nodes[0]["op"] != "matmul" or
+                          nodes[0]["operands"] != [item["name"]
+                                                   for item in value["graph"]["inputs"]] or
+                          "padded-tail" in selected):
+        return False
+    if (("failure-repair" in selected) != (value["failure_mode"] != "none") or
+            (("timing-sweep" in selected) and len(timing) < 2) or
+            ("timing-sweep" not in selected and timing) or
+            (("profiling" in selected) != (value["profile_metric"] is not None))):
+        return False
+    if "padded-tail" in selected:
+        if output[-1] % value["padding_multiple"] == 0:
+            return False
+        for item in inputs + (output,):
+            padded = ((item[-1] + value["padding_multiple"] - 1) //
+                      value["padding_multiple"] * value["padding_multiple"])
+            if math.prod(item[:-1]) * padded > 65536:
+                return False
+    return True
 
 
 def _description_fields(value):
@@ -308,13 +464,25 @@ class DashboardStore:
         if (not isinstance(proposed, list) or not isinstance(approved, list) or
                 not approved or len(proposed) <= len(approved)):
             return False
+        coverage = response.get("pre_wave_coverage")
+        if (not isinstance(coverage, list) or
+                any(not isinstance(item, str) or item not in _CAPABILITIES for item in coverage) or
+                len(set(coverage)) != len(coverage)):
+            return False
 
         def project_id(project):
-            if (not isinstance(project, dict) or set(project) != {"spec", "requires"} or
-                    not isinstance(project["spec"], dict) or
+            try:
+                valid_spec = (isinstance(project, dict) and
+                              set(project) == {"spec", "requires"} and
+                              _valid_project_spec(project["spec"]))
+            except (KeyError, TypeError, ValueError):
+                valid_spec = False
+            if (not valid_spec or
                     not isinstance(project["requires"], list) or
-                    any(not isinstance(item, str) for item in project["requires"]) or
-                    len(set(project["requires"])) != len(project["requires"])):
+                    any(not isinstance(item, str) or item not in _CAPABILITIES
+                        for item in project["requires"]) or
+                    len(set(project["requires"])) != len(project["requires"]) or
+                    not set(project["requires"]) <= set(coverage)):
                 return None
             value = project["spec"].get("project_id")
             return value if isinstance(value, str) and value else None
