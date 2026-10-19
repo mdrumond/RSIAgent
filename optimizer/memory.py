@@ -30,6 +30,8 @@ def freeze_reviewed_phase1(admitted):
     files = {}
     for name in [*admitted.manifest['files'], 'snapshot.json']:
         data = _read(admitted.root, name)
+        if name == 'snapshot.json' and json.loads(data) != admitted.manifest:
+            raise ValueError('reviewed Phase 1 manifest changed during snapshot')
         if name in admitted.manifest['files'] and sha(data) != admitted.manifest['files'][name]:
             raise ValueError('reviewed Phase 1 changed during snapshot')
         files[f'reviewed-seed/{name}'] = dict(sha256=sha(data), base64=base64.b64encode(data).decode())

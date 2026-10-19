@@ -80,6 +80,8 @@ def select_optimizer_task(*, complete, snapshot, objective, root, kind='goal',
     identity = dict(snapshot_id=snapshot['snapshot_id'], objective=objective,
                     kind=kind, context=context or {}, kdb=query_knowledge is not None,
                     max_proposals=max_proposals)
+    # Compare the persisted wire identity, not Python-only tuple/key forms.
+    identity = json.loads(canonical(identity))
     state = (json.loads(path.read_bytes()) if path.exists() else dict(
         identity=identity, stage='selection', proposal_count=0, selected=None,
         history=[], diagnostic=None, messages=None, pending=None))

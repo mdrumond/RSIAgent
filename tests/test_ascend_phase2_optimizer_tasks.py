@@ -100,6 +100,12 @@ def test_practice_has_same_submission_format_and_weakness_context(tmp_path):
     assert select(tmp_path, complete, kind='practice', context=dict(weakness='strided residual'))['submission']
 
 
+def test_selection_resumes_with_json_normalized_context(tmp_path):
+    context = {'shape': (4, 16), 'attempts': {1: ('compile', 'verify')}}
+    expected = select(tmp_path, lambda _: json.dumps(proposal()), context=context)
+    assert select(tmp_path, lambda _: pytest.fail('resume must reuse selection'), context=context) == expected
+
+
 def test_reference_is_never_executed_in_curriculum(tmp_path):
     result = select(tmp_path, lambda _: json.dumps(proposal('raise RuntimeError("worker only")')))
     assert result['submission']['source'].startswith('raise')
@@ -138,3 +144,15 @@ def test_phase1_corrupted_publication_rejected(tmp_path):
     next(source.glob('waves/*/published.json')).write_text('{}')
     with pytest.raises((ValueError, KeyError)):
         freeze_phase1_source(source, b'', review, snapshot_root=tmp_path / 'seed')
+
+
+def test_phase1_export_rejects_changed_manifest(tmp_path):
+    from benchmarks.ascend.phase2 import admit_native_snapshot
+    from optimizer.memory import freeze_reviewed_phase1
+    from tests.test_a3_reviewed_phase2 import native_source
+    source, review, _ = native_source(tmp_path)
+    admitted = admit_native_snapshot(source, b'', review, tmp_path / 'seed')
+    manifest = admitted.root / 'snapshot.json'
+    manifest.write_text('{}')
+    with pytest.raises(ValueError, match='manifest changed'):
+        freeze_reviewed_phase1(admitted)
