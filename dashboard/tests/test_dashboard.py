@@ -15,6 +15,19 @@ def write(path, value):
     path.write_text(json.dumps(value))
 
 
+def evidence_ledger_rows(payloads):
+    previous, rows = "0" * 64, []
+    for sequence, payload in enumerate(payloads):
+        record = {"sequence": sequence, "kind": "artifact", "payload": payload,
+                  "previous_sha256": previous}
+        canonical = json.dumps(record, sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=True, allow_nan=False).encode()
+        record["entry_sha256"] = __import__("hashlib").sha256(canonical).hexdigest()
+        previous = record["entry_sha256"]
+        rows.append(record)
+    return rows
+
+
 @pytest.fixture()
 def campaign(tmp_path):
     root = tmp_path / "phase1"
@@ -185,11 +198,13 @@ def test_trace_index_is_compact_and_payloads_are_lazy_authenticated(campaign, tm
         json.dumps({"payload": {"role": "host-observation", "sha256": missing,
                                 "turn": 2}}),
     ]) + "\n")
-    (tmp_path / "phase1/project-evidence.jsonl").write_text("\n".join([
-        json.dumps({"payload": {"project_id": "vector-add", "event": "verification"}}),
-        json.dumps({"payload": {"project_id": "vector-add", "event": "verification"}}),
-        json.dumps({"payload": {"project_id": "other", "event": "verification"}}),
-    ]) + "\n")
+    host_rows = evidence_ledger_rows([
+        {"project_id": "vector-add", "event": "verification"},
+        {"project_id": "vector-add", "event": "verification"},
+        {"project_id": "other", "event": "verification"},
+    ])
+    (tmp_path / "phase1/project-evidence.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in host_rows) + "\n")
     cache = tmp_path / "cache.sqlite3"
     client = create_app(campaign, cache, refresh_seconds=0).test_client()
     index = client.get("/api/phase/1/project/vector-add/trace").get_json()
@@ -403,7 +418,8 @@ def test_host_verification_chain_recovers_unattributed_rows_and_artifacts(campai
     for sequence, payload in enumerate(payloads):
         artifact = __import__("hashlib").sha256(json.dumps(
             payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        record = {"sequence": sequence, "previous_sha256": previous, "payload": {
+        record = {"sequence": sequence, "kind": "artifact",
+                  "previous_sha256": previous, "payload": {
             "artifact_kind": "compile" if sequence == 0 else "classification",
             "artifact_sha256": artifact, "payload": payload}}
         if sequence == 1:
@@ -424,6 +440,39 @@ def test_host_verification_chain_recovers_unattributed_rows_and_artifacts(campai
     assert "diagnostic" in texts[1] and "host-verified" in texts[3]
 
 
+@pytest.mark.parametrize("damage", ["digest", "sequence", "previous"])
+def test_host_verification_rejects_corrupt_ledger_and_recovers(campaign, tmp_path, damage):
+    root = tmp_path / "phase1"
+    payloads = [
+        {"artifact_kind": "compile", "artifact_sha256": __import__("hashlib").sha256(
+            b'{"ok":true}').hexdigest(), "payload": {"ok": True}},
+        {"project_id": "vector-add", "artifact_kind": "classification",
+         "artifact_sha256": __import__("hashlib").sha256(
+             b'{"verified":true}').hexdigest(), "payload": {"verified": True}},
+    ]
+    valid = evidence_ledger_rows(payloads)
+    corrupt = json.loads(json.dumps(valid))
+    if damage == "digest":
+        corrupt[1]["entry_sha256"] = "f" * 64
+    elif damage == "sequence":
+        corrupt[1]["sequence"] = 4
+    else:
+        corrupt[1]["previous_sha256"] = "e" * 64
+    ledger = root / "project-evidence.jsonl"
+    ledger.write_text("\n".join(json.dumps(row) for row in corrupt) + "\n")
+    store = DashboardStore(campaign, tmp_path / "cache.sqlite3")
+    broken = store.trace_index(1, "vector-add")["events"]
+    unavailable = [row for row in broken if row["label"] == "Host verification unavailable"]
+    assert len(unavailable) == 1 and not unavailable[0]["available"]
+    assert "integrity" in unavailable[0]["reason"]
+    assert not any(row["label"] == "Host verification ledger entry" for row in broken)
+
+    ledger.write_text("\n".join(json.dumps(row) for row in valid) + "\n")
+    repaired = store.trace_index(1, "vector-add")["events"]
+    assert not any(row["label"] == "Host verification unavailable" for row in repaired)
+    assert sum(row["label"] == "Host verification ledger entry" for row in repaired) == 2
+
+
 def test_host_verification_chain_stops_at_prior_project_attribution(campaign, tmp_path):
     root = tmp_path / "phase1"
     definitions = [
@@ -440,7 +489,8 @@ def test_host_verification_chain_stops_at_prior_project_attribution(campaign, tm
                    "payload": artifact_payload}
         if project_id is not None:
             payload["project_id"] = project_id
-        record = {"sequence": sequence, "previous_sha256": previous, "payload": payload}
+        record = {"sequence": sequence, "kind": "artifact",
+                  "previous_sha256": previous, "payload": payload}
         canonical = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
         record["entry_sha256"] = __import__("hashlib").sha256(canonical).hexdigest()
         previous = record["entry_sha256"]
@@ -457,18 +507,14 @@ def test_host_verification_chain_stops_at_prior_project_attribution(campaign, tm
 
 def test_host_verification_collects_interleaved_project_chains(campaign, tmp_path):
     root = tmp_path / "phase1"
-    rows, heads = [], {"vector-add": "0" * 64, "sibling": "0" * 64,
-                       "vector-reset": "0" * 64}
     definitions = [
-        ("vector-add", "selected-one"), ("sibling", "sibling-one"),
-        (None, "selected-unattributed"), (None, "sibling-unattributed"),
-        ("vector-add", "selected-two"), ("sibling", "sibling-two"),
+        ("vector-add", "selected-one"), (None, "selected-unattributed"),
+        ("vector-add", "selected-two"), ("sibling", "sibling-one"),
+        (None, "sibling-unattributed"), ("sibling", "sibling-two"),
         ("vector-add", "selected-reset"),
     ]
-    # Unattributed rows are linked into their owning project's independent hash chain.
-    owners = ["vector-add", "sibling", "vector-add", "sibling", "vector-add", "sibling",
-              "vector-reset"]
-    for sequence, ((attributed, marker), owner) in enumerate(zip(definitions, owners)):
+    payloads = []
+    for attributed, marker in definitions:
         artifact_payload = {"marker": marker}
         artifact = __import__("hashlib").sha256(json.dumps(
             artifact_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -476,11 +522,8 @@ def test_host_verification_collects_interleaved_project_chains(campaign, tmp_pat
                    "payload": artifact_payload}
         if attributed:
             payload["project_id"] = attributed
-        record = {"sequence": sequence, "previous_sha256": heads[owner], "payload": payload}
-        record["entry_sha256"] = __import__("hashlib").sha256(json.dumps(
-            record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        heads[owner] = record["entry_sha256"]
-        rows.append(record)
+        payloads.append(payload)
+    rows = evidence_ledger_rows(payloads)
     (root / "project-evidence.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n")
     client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
     events = client.get("/api/phase/1/project/vector-add/trace").get_json()["events"]
@@ -506,14 +549,15 @@ def test_completed_trace_catalog_refreshes_when_partial_sync_finishes(campaign, 
     initial = store.trace_index(1, "vector-add")["events"]
     initial_actor = next(row for row in initial if row.get("sha256") == actor_digest)
     assert not initial_actor["available"]
-    assert not any(row["label"].startswith("Host verification") for row in initial)
+    assert any(row["label"] == "Host verification unavailable" for row in initial)
 
     obj = branch / "artifacts/objects" / actor_digest[:2] / actor_digest[2:]
     obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(actor_body)
     artifact_payload = {"classification": "host-verified"}
     artifact_digest = __import__("hashlib").sha256(json.dumps(
         artifact_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    record = {"sequence": 0, "previous_sha256": "0" * 64, "payload": {
+    record = {"sequence": 0, "kind": "artifact",
+              "previous_sha256": "0" * 64, "payload": {
         "project_id": "vector-add", "artifact_kind": "classification",
         "artifact_sha256": artifact_digest, "payload": artifact_payload}}
     record["entry_sha256"] = __import__("hashlib").sha256(json.dumps(
@@ -523,6 +567,7 @@ def test_completed_trace_catalog_refreshes_when_partial_sync_finishes(campaign, 
     refreshed = store.trace_index(1, "vector-add")["events"]
     refreshed_actor = next(row for row in refreshed if row.get("sha256") == actor_digest)
     assert refreshed_actor["available"]
+    assert not any(row["label"] == "Host verification unavailable" for row in refreshed)
     assert sum(row["label"].startswith("Host verification") for row in refreshed) == 2
 
 

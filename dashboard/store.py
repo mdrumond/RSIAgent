@@ -303,13 +303,37 @@ class DashboardStore:
         try:
             raw_rows = (root / "project-evidence.jsonl").read_text().splitlines()
         except (OSError, TypeError):
-            return []
+            return [self._event("Host verification unavailable", "verification",
+                                reason="retained host evidence ledger unavailable")]
         rows = []
+        previous = "0" * 64
         for position, raw in enumerate(raw_rows):
             try:
-                rows.append((json.loads(raw), raw + "\n", position))
-            except (ValueError, TypeError):
-                continue
+                record = json.loads(raw, parse_constant=lambda value: (_ for _ in ()).throw(
+                    ValueError(f"non-finite value: {value}")))
+                if not isinstance(record, dict) or set(record) != {
+                        "sequence", "kind", "payload", "previous_sha256", "entry_sha256"}:
+                    raise ValueError("invalid row shape")
+                if (isinstance(record["sequence"], bool) or
+                        not isinstance(record["sequence"], int) or
+                        record["sequence"] != position or
+                        record["kind"] not in {"request", "action", "artifact", "result"} or
+                        not isinstance(record["payload"], dict) or
+                        record["previous_sha256"] != previous or
+                        not isinstance(record["entry_sha256"], str) or
+                        not _SHA256.fullmatch(record["entry_sha256"])):
+                    raise ValueError("invalid row types or chain")
+                body = {key: record[key] for key in (
+                    "sequence", "kind", "payload", "previous_sha256")}
+                canonical = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                                       ensure_ascii=True, allow_nan=False).encode("utf-8")
+                if hashlib.sha256(canonical).hexdigest() != record["entry_sha256"]:
+                    raise ValueError("invalid row digest")
+                previous = record["entry_sha256"]
+                rows.append((record, raw + "\n", position))
+            except (ValueError, TypeError, KeyError):
+                return [self._event("Host verification unavailable", "verification",
+                                    reason="host evidence ledger integrity verification failed")]
         by_digest = {record.get("entry_sha256"): (record, raw, position)
                      for record, raw, position in rows
                      if isinstance(record.get("entry_sha256"), str)}
