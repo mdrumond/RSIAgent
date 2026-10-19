@@ -1,5 +1,7 @@
 import json
 import io
+import hashlib
+import base64
 import threading
 import shutil
 import subprocess
@@ -61,6 +63,212 @@ def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session", seed=b"se
         argv += ["--phase1-root", str(tmp_path / "old"), "--review", str(tmp_path / "review.json")]
     cli.main(argv, screen=screen)
     return cli._read(tmp_path / "control" / "job.json")
+
+
+def completed_legacy(tmp_path, *, with_trace=False):
+    """A minimal completed A3 Phase 1 boundary with external launch evidence."""
+    from benchmarks.a5kernels.phase1_adaptive import STATE_SCHEMA
+    root = tmp_path / "legacy"
+    root.mkdir()
+    memory = tmp_path / "legacy-seed.bin"
+    memory.write_bytes(b"seed")
+    identity = {"schema": "ascend-native-adaptive-identity-v1", "target": "native-a3",
+                "arch": "ascend910b", "execution_profile": "bz-a3-1",
+                "language": "ascend-c", "guide_sha256": "1" * 64,
+                "cpl_skills_revision": "2" * 40, "dtypes": ["float32"],
+                "model": {"backend_model": "openai/gpt-5.6-sol"},
+                "profiling_guidance": None, "profiling_mode": "without-profiling-guidance",
+                "measurement_actions": {"profiling": False, "timing": False},
+                "kdb_collection": None, "environment_identity": {"cann": "fixture"}}
+    write(root / "campaign-identity.json", identity)
+    project_memory = {"source_revision": "3" * 64, "host_facts": [],
+                      "agent_lessons": [], "no_new_knowledge": True}
+    write(root / "state.json", {"schema": STATE_SCHEMA, "objective": "Learn kernels",
+          "initial_memory_sha256": hashlib.sha256(b"seed").hexdigest(),
+          "project_target": 1, "terminal": None, "wave_index": 1,
+          "completed_waves": [], "prior_outcomes": [{"project_id": "done", "verified": True, "summary": "done",
+          "spec": {"capabilities": []}}], "failed_outcomes": [],
+          "coverage": [], "memory_bytes_base64": [base64.b64encode(
+              json.dumps(project_memory).encode()).decode()],
+          "session": {"messages": [], "turns": 0}, "max_projects": None})
+    manifest = write(tmp_path / "legacy-sources.json", {
+        "schema": "ascend-sft-sources-v2", "sources": [{"name": "catlass",
+        "repository": "https://example.invalid/catlass", "revision": "a" * 40,
+        "license": "Apache-2.0", "include": ["**/*.py"]}]})
+    from benchmarks.a5kernels.sft_dataset import SourceManifest
+    source_sha = SourceManifest.load(manifest).sha256
+    if with_trace:
+        trace = root / "waves/wave/sft-traces/trace.jsonl"
+        trace.parent.mkdir(parents=True)
+        trace.write_text(json.dumps({"kind": "header", "payload": {"phase": "phase1",
+            "model": "openai/gpt-5.6-sol", "source_manifest_sha256": source_sha}}) + "\n")
+    runtime = write(tmp_path / "legacy-runtime.json", {
+        "model": "openai/gpt-5.6-sol", "source_manifest": str(manifest),
+        "phase1_arguments": ["--config", str(tmp_path / "native.json"), "--model",
+          "openai/gpt-5.6-sol", "--knowledge", "without-kdb", "--profiling",
+          "without-profiling-guidance"]})
+    write(tmp_path / "native.json", {"target": "native-a3", "arch": "ascend910b",
+        "execution_profile": "bz-a3-1", "guide": str(tmp_path / "guide.md"),
+        "cpl_skills_revision": "2" * 40, "environment_identity": {"cann": "fixture"}})
+    (tmp_path / "guide.md").write_text("guide")
+    identity["guide_sha256"] = hashlib.sha256(b"guide").hexdigest()
+    write(root / "campaign-identity.json", identity)
+    return root, memory, runtime
+
+
+def test_adopt_completed_legacy_campaign_is_external_atomic_and_provenanced(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path)
+    control = tmp_path / "adopted-control"
+    before = {path.relative_to(root): hashlib.sha256(path.read_bytes()).hexdigest()
+              for path in root.rglob("*") if path.is_file()}
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    result = cli.adopt_campaign(root, control, "Learn kernels", memory, runtime,
+                                "a" * 40)
+    job = cli._read(control / "job.json")
+    assert result["status"] == "adopted"
+    assert job["approval_mode"] is True and job["adopted"] is True
+    assert job["legacy_harness_revision"] == "a" * 40
+    assert job["adopting_harness_revision"] == "b" * 40
+    assert job["initial_memory"] == str(memory.resolve())
+    assert job["source_manifest"] == str((tmp_path / "legacy-sources.json").resolve())
+    assert job["historical_source_provenance"] == "unavailable"
+    assert job["source_provenance_scope"] == "post-adoption"
+    assert job["source_provenance_activation_wave"] == 1
+    assert job["historical_code_provenance"] == "a" * 40
+    assert not (root / "initial-memory.bin").exists()
+    assert not (root / "campaign-run.json").exists()
+    assert before == {path.relative_to(root): hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in root.rglob("*") if path.is_file()}
+
+
+@pytest.mark.parametrize("mutation,match", [
+    ("pending", "pending"), ("incomplete", "TARGET_REACHED"),
+    ("terminal", "TARGET_REACHED"), ("identity", "identity"),
+    ("objective", "objective"), ("memory", "initial memory"),
+    ("model", "model"), ("runtime", "runtime"), ("source", "source"),
+])
+def test_adopt_rejects_unfinished_or_mismatched_legacy_campaign(tmp_path, mutation, match):
+    root, memory, runtime = completed_legacy(tmp_path, with_trace=mutation == "source")
+    state = cli._read(root / "state.json")
+    identity = cli._read(root / "campaign-identity.json")
+    if mutation == "pending": write(root / "pending.json", {})
+    elif mutation == "incomplete": state["project_target"] = 2; write(root / "state.json", state)
+    elif mutation == "terminal": state["terminal"] = {"status": "STALLED", "reason": "done"}; write(root / "state.json", state)
+    elif mutation == "identity": identity["language"] = "catlass-dsl"; write(root / "campaign-identity.json", identity)
+    elif mutation == "objective": state["objective"] = "Other"; write(root / "state.json", state)
+    elif mutation == "memory": memory.write_bytes(b"other")
+    elif mutation == "model": identity["model"]["backend_model"] = "other"; write(root / "campaign-identity.json", identity)
+    elif mutation == "runtime": identity["arch"] = "other"; write(root / "campaign-identity.json", identity)
+    elif mutation == "source":
+        trace = next(root.rglob("*.jsonl")); row = json.loads(trace.read_text())
+        row["payload"]["source_manifest_sha256"] = "invalid"; trace.write_text(json.dumps(row) + "\n")
+    with pytest.raises(ValueError, match=match):
+        cli.adopt_campaign(root, tmp_path / "control", "Learn kernels", memory,
+                           runtime, "a" * 40)
+    assert not (tmp_path / "control").exists()
+
+
+def test_adopt_validates_available_historical_trace_provenance(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path, with_trace=True)
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    cli.adopt_campaign(root, tmp_path / "control", "Learn kernels", memory,
+                       runtime, "a" * 40)
+    job = cli._read(tmp_path / "control/job.json")
+    assert job["historical_source_provenance"] == "validated"
+    assert job["source_provenance_scope"] == "historical-and-post-adoption"
+
+
+def test_adopt_records_distinct_valid_historical_source_without_misattribution(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path, with_trace=True)
+    trace = next(root.rglob("*.jsonl")); row = json.loads(trace.read_text())
+    row["payload"]["source_manifest_sha256"] = "f" * 64
+    trace.write_text(json.dumps(row) + "\n")
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    cli.adopt_campaign(root, tmp_path / "control", "Learn kernels", memory,
+                       runtime, "a" * 40)
+    job = cli._read(tmp_path / "control/job.json")
+    assert job["historical_source_manifest_sha256"] == "f" * 64
+    assert job["historical_source_provenance"] == "validated"
+    assert job["source_provenance_scope"] == "post-adoption"
+    assert job["source_manifest_sha256"] != job["historical_source_manifest_sha256"]
+
+
+def test_adopt_rejects_active_legacy_compute_process_before_writes(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path)
+    monkeypatch.setattr(cli, "_active_campaign_processes",
+                        lambda campaign_root: [{"pid": 42, "command": "python legacy --root ..."}])
+    with pytest.raises(ValueError, match="active legacy campaign process"):
+        cli.adopt_campaign(root, tmp_path / "control", "Learn kernels", memory,
+                           runtime, "a" * 40)
+    assert not (tmp_path / "control").exists()
+
+
+def test_active_process_probe_is_bounded_to_python_process_naming_exact_root(tmp_path):
+    proc = tmp_path / "proc"; proc.mkdir()
+    root = tmp_path / "campaign"; root.mkdir()
+    commands = {
+        10: ["python", "run_ascend_phase1.py", "--root", str(root)],
+        11: ["python", "other.py", "--root", str(root) + "-similar"],
+        12: ["bash", "-lc", f"echo {root}"],
+        13: ["python", "run_ascend_phase1.py", "--root", str(root)],
+    }
+    for pid, argv in commands.items():
+        directory = proc / str(pid); directory.mkdir()
+        (directory / "cmdline").write_bytes(b"\0".join(item.encode() for item in argv) + b"\0")
+    assert cli._active_campaign_processes(root, proc_root=proc, current_pid=13) == [{
+        "pid": 10, "command": f"python run_ascend_phase1.py --root {root}"}]
+
+
+def test_adopt_rejects_existing_control(tmp_path):
+    root, memory, runtime = completed_legacy(tmp_path)
+    control = tmp_path / "control"; control.mkdir()
+    with pytest.raises(FileExistsError):
+        cli.adopt_campaign(root, control, "Learn kernels", memory, runtime, "a" * 40)
+
+
+def test_completed_fixture_adopt_extend_sample_approve_run(tmp_path, monkeypatch):
+    root, memory, runtime = completed_legacy(tmp_path)
+    control = tmp_path / "control"
+    monkeypatch.setattr(cli, "_harness_revision", lambda: "b" * 40)
+    cli.adopt_campaign(root, control, "Learn kernels", memory, runtime, "a" * 40)
+    job = cli._read(control / "job.json")
+    job["continue_target"] = 9
+    cli._write(control / "job.json", job)
+
+    class Coordinator:
+        project_target = 1
+        def continue_campaign(self, target, **kwargs):
+            state = cli._read(root / "state.json")
+            cli._write(root / "state.json", {**state, "project_target": target})
+            self.project_target = target
+        def report(self):
+            state = cli._read(root / "state.json")
+            return {"status": "RUNNING", "wave_index": state["wave_index"],
+                    "project_target": state["project_target"]}
+        def propose_wave(self):
+            return {"base_wave_index": 1, "base_memory_sha256": "c" * 64,
+                    "wave": {"wave_id": "wave-002", "projects": [
+                        {"spec": {"project_id": "next"}}]}}
+        def approve_wave(self, proposal, selected):
+            assert selected == ("next",)
+            return proposal
+        def run_approved_proposal(self, proposal):
+            state = cli._read(root / "state.json")
+            cli._write(root / "state.json", {**state, "wave_index": 2})
+            return {"status": "RUNNING", "wave_index": 2, "project_target": 9}
+
+    coordinator = Coordinator()
+    cli.campaign_worker(job, builder=lambda _job: coordinator)
+    adopted = cli._read(control / "job.json")
+    assert adopted["project_target"] == 9 and "continue_target" not in adopted
+    assert not (root / "campaign-run.json").exists()
+    proposed = cli.sample_curriculum(adopted, builder=lambda _job: coordinator)
+    approved = cli.approve_curriculum(adopted, ["next"], proposed["proposal_id"],
+                                      builder=lambda _job: coordinator)
+    completed = cli.run_approved_curriculum(adopted, proposed["proposal_id"],
+                                            builder=lambda _job: coordinator)
+    assert approved["selected_project_ids"] == ["next"]
+    assert completed["status"] == "complete" and completed["result"]["wave_index"] == 2
 
 
 def test_start_retains_public_provenance_not_private_settings_and_separate_workers(tmp_path):

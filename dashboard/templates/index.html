@@ -7,6 +7,7 @@
 <div class="control-actions">{% for preset in controls.presets.values() %}
 <button data-action="start" data-subject="{{ preset.id }}" data-preset-id="{{ preset.id }}">Start phase {{ preset.phase }}</button>{% endfor %}
 {% for campaign_id, campaign in controls.campaigns.items() %}
+{% if campaign.phase == 1 %}<button data-action="extend" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Extend {{ campaign.name or ('Phase ' ~ campaign.phase) }} by {{ controls.settings.extension_step }}</button>{% endif %}
 <button data-action="sample" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Sample {{ campaign.name or ('Phase ' ~ campaign.phase) }}</button>{% endfor %}</div>
 {% for proposal in proposals %}<article class="proposal"><div class="row"><h3>{{ proposal.campaign_id }} proposal</h3><span class="status {{ proposal.status }}">{{ proposal.status }}</span></div>
 <form data-proposal-form data-campaign-id="{{ proposal.campaign_id }}" data-proposal-id="{{ proposal.proposal_id }}">

@@ -41,7 +41,7 @@ def _information(spec):
 class ControlManager:
     """Validate commands, persist their lifecycle and execute one at a time."""
 
-    ACTIONS = {"start", "sample", "approve", "reject", "run-approved"}
+    ACTIONS = {"start", "extend", "sample", "approve", "reject", "run-approved"}
 
     def __init__(self, config_path, database, runner=subprocess.run):
         self.config_path, self.database = Path(config_path), Path(database)
@@ -124,7 +124,7 @@ class ControlManager:
         identifier = payload.get("preset_id") if action == "start" else payload.get("campaign_id")
         if not isinstance(identifier, str):
             raise ControlError("campaign identifier is required")
-        subject = identifier if action in {"start", "sample"} else payload.get("proposal_id")
+        subject = identifier if action in {"start", "extend", "sample"} else payload.get("proposal_id")
         if payload.get("confirmation") != f"{action}:{subject}":
             raise ControlError("confirmation does not match the requested action")
         if action == "start":
@@ -136,6 +136,27 @@ class ControlManager:
                 raise ControlError("only A3 Phase 1 and Phase 2 presets are allowed")
             return identifier
         campaign = self._campaign(identifier)
+        if action == "extend":
+            step = self.settings.get("extension_step")
+            if type(step) is not int or step != 8:
+                raise ControlError("campaign extension step must be exactly 8")
+            root, control = Path(campaign["root"]), Path(campaign["control"])
+            state = _read(root / "state.json", {}) or {}
+            job = _read(control / "job.json", {}) or {}
+            worker = _read(control / "worker.json", {}) or {}
+            approval = _read(control / "curriculum-approval.json")
+            target = state.get("project_target")
+            if (campaign["phase"] != 1 or job.get("approval_mode") is not True
+                    or type(target) is not int or target != job.get("project_target")
+                    or len(state.get("prior_outcomes", [])) != target
+                    or state.get("terminal") is not None or (root / "pending.json").exists()
+                    or worker.get("status") != "waiting-approval"
+                    or worker.get("result", {}).get("status") != "TARGET_REACHED"
+                    or isinstance(approval, dict) and approval.get("status") in {
+                        "proposed", "approved", "running"}):
+                raise ControlError("campaign must be at a clean TARGET_REACHED boundary")
+            payload["_validated_project_target"] = target + step
+            return identifier
         if action == "sample":
             return identifier
         proposal = self.proposal(identifier)
@@ -189,6 +210,10 @@ class ControlManager:
                          "--review", str(preset["review"])]
             return argv
         campaign = self.campaigns[payload["campaign_id"]]
+        if action == "extend":
+            target = payload["_validated_project_target"]
+            return [sys.executable, runner, "continue", "--control", str(campaign["control"]),
+                    "--project-target", str(target)]
         argv = [sys.executable, runner, action, "--control", str(campaign["control"])]
         if action in {"approve", "reject", "run-approved"}:
             argv += ["--proposal-id", payload["proposal_id"]]
@@ -224,6 +249,11 @@ class ControlManager:
                 if old[0] != fingerprint:
                     raise ControlError("idempotency key was already used for a different request")
                 return old[1]
+            active = db.execute("SELECT 1 FROM operations WHERE campaign_id=? "
+                                "AND status IN ('queued','running') LIMIT 1",
+                                (campaign_id,)).fetchone()
+            if active:
+                raise ControlError("another campaign operation is already queued or running")
             db.execute("INSERT INTO operations(id,action,campaign_id,status,request,created) "
                        "VALUES(?,?,?,?,?,?)", (operation_id, action, campaign_id, "queued",
                                                json.dumps(payload, sort_keys=True), now))
