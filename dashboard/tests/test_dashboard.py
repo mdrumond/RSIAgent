@@ -1,6 +1,8 @@
 import base64
 import json
 import shutil
+import subprocess
+import time
 
 import pytest
 
@@ -169,3 +171,331 @@ def test_default_bind_is_loopback(monkeypatch, campaign, tmp_path):
         "App", (), {"run": lambda self, **kw: called.update(kw)})())
     __main__.main(["serve", "--config", str(campaign), "--cache-dir", str(tmp_path)])
     assert called["host"] == "127.0.0.1" and called["port"] == 8080
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])
+def test_controlled_cli_accepts_only_unambiguous_loopback_hosts(monkeypatch, tmp_path, host):
+    from dashboard import __main__
+    config, _, _ = controlled_config(tmp_path)
+    called = {}
+    monkeypatch.setattr(__main__, "create_app", lambda *a, **k: type(
+        "App", (), {"run": lambda self, **kw: called.update(kw)})())
+    __main__.main(["serve", "--config", str(config), "--cache-dir", str(tmp_path),
+                   "--host", host])
+    assert called["host"] == host
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "192.0.2.1", "example.invalid"])
+def test_controlled_cli_rejects_non_loopback_bind(monkeypatch, tmp_path, host):
+    from dashboard import __main__
+    config, _, _ = controlled_config(tmp_path)
+    monkeypatch.setattr(__main__, "create_app", lambda *a, **k:
+                        pytest.fail("app must not be created for unsafe bind"))
+    with pytest.raises(SystemExit):
+        __main__.main(["serve", "--config", str(config), "--cache-dir", str(tmp_path),
+                       "--host", host])
+
+
+def test_read_only_cli_retains_explicit_host_override(monkeypatch, campaign, tmp_path):
+    from dashboard import __main__
+    called = {}
+    monkeypatch.setattr(__main__, "create_app", lambda *a, **k: type(
+        "App", (), {"run": lambda self, **kw: called.update(kw)})())
+    __main__.main(["serve", "--config", str(campaign), "--cache-dir", str(tmp_path),
+                   "--host", "0.0.0.0"])
+    assert called["host"] == "0.0.0.0"
+
+
+def controlled_config(tmp_path, *, phase=1):
+    root, control = tmp_path / f"phase{phase}", tmp_path / f"control{phase}"
+    config = tmp_path / "controlled.json"
+    preset = {"id": f"phase{phase}", "target": "a3", "phase": phase, "root": str(root),
+              "control": str(control), "config": str(tmp_path / "runtime.json"),
+              "initial_memory": str(tmp_path / "memory.bin"), "objective": "Learn A3",
+              "project_target": 4}
+    if phase == 2:
+        preset.update(phase1_root=str(tmp_path / "phase1"), review=str(tmp_path / "review.json"))
+    write(config, {"campaigns": [{"id": f"phase{phase}", "target": "a3", "phase": phase,
+                                   "root": str(root), "control": str(control)}],
+                   "controls": {"enabled": True, "runner": "/repo/run_ascend_campaign.py",
+                                "presets": [preset]}})
+    return config, root, control
+
+
+def wait_operation(client, operation_id):
+    for _ in range(100):
+        operation = client.get(f"/api/operations/{operation_id}").get_json()
+        if operation["status"] not in {"queued", "running"}:
+            return operation
+        time.sleep(.01)
+    raise AssertionError("operation did not finish")
+
+
+def test_controls_disabled_by_default_and_csrf_required(campaign, tmp_path):
+    app = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0)
+    client = app.test_client()
+    assert b"Start phase" not in client.get("/").data
+    assert client.post("/api/control/sample", json={"campaign_id": "phase1"}).status_code == 403
+
+    config, _, _ = controlled_config(tmp_path)
+    client = create_app(config, tmp_path / "controlled.sqlite3", command_runner=lambda *a, **k: None).test_client()
+    assert client.post("/api/control/start", json={"preset_id": "phase1",
+                       "confirmation": "start:phase1"}).status_code == 403
+
+
+def test_operation_details_are_hidden_when_controls_are_disabled(campaign, tmp_path):
+    config, _, _ = controlled_config(tmp_path)
+    cache = tmp_path / "operations.sqlite3"
+    enabled = create_app(config, cache, command_runner=lambda *a, **k: None)
+    operation_id = enabled.extensions["dashboard_controls"]._insert_for_test(
+        "sample", "phase1", "failed")
+    assert enabled.test_client().get(f"/api/operations/{operation_id}").status_code == 200
+    disabled = create_app(campaign, cache)
+    assert disabled.test_client().get(f"/api/operations/{operation_id}").status_code == 403
+
+
+def test_a5_campaign_and_preset_are_rejected_before_invocation(tmp_path):
+    config, _, _ = controlled_config(tmp_path)
+    settings = json.loads(config.read_text())
+    settings["campaigns"][0]["target"] = "a5"
+    settings["controls"]["presets"][0]["target"] = "a5"
+    write(config, settings)
+    calls = []
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=lambda *a, **k: calls.append(a)).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "a5"}
+    assert client.post("/api/control/sample", json={"campaign_id": "phase1",
+        "confirmation": "sample:phase1"}, headers=headers).status_code == 409
+    assert client.post("/api/control/start", json={"preset_id": "phase1",
+        "confirmation": "start:phase1"}, headers={**headers,
+        "Idempotency-Key": "a5-start"}).status_code == 409
+    assert calls == []
+
+
+def test_start_is_async_allowlisted_and_idempotent(tmp_path):
+    config, _, _ = controlled_config(tmp_path, phase=2)
+    calls = []
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, '{"session":"test"}\n', "")
+    app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
+    client = app.test_client()
+    assert b"Start phase 2" in client.get("/").data
+    csrf = client.get("/api/csrf").get_json()["token"]
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "start-once"}
+    body = {"preset_id": "phase2", "confirmation": "start:phase2"}
+    first = client.post("/api/control/start", json=body, headers=headers)
+    second = client.post("/api/control/start", json=body, headers=headers)
+    assert first.status_code == second.status_code == 202
+    assert first.get_json()["operation_id"] == second.get_json()["operation_id"]
+    assert wait_operation(client, first.get_json()["operation_id"])["status"] == "succeeded"
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv[:3] == [pytest.importorskip("sys").executable, "/repo/run_ascend_campaign.py", "start"]
+    assert "--target" in argv and argv[argv.index("--target") + 1] == "a3"
+    assert "--approval-mode" in argv and "--phase1-root" in argv and "--review" in argv
+    assert kwargs["shell"] is False
+    conflict = client.post("/api/control/start", json={**body, "confirmation": "wrong"}, headers=headers)
+    assert conflict.status_code == 409
+
+
+def test_sample_summary_approve_and_run_without_raw_provider_content(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"coverage": ["gm-ub-movement"], "prior_outcomes": [],
+                                  "wave_index": 1})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        command = argv[2]
+        if command == "sample":
+            proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                        "session": {"messages": [{"content": "private reasoning"}]},
+                        "wave": {"projects": [
+                            {"spec": {"project_id": "copy", "hypothesis": "Measure copy.",
+                                      "capabilities": ["gm-ub-movement"]}},
+                            {"spec": {"project_id": "vector", "hypothesis": "Measure vector.",
+                                      "capabilities": ["simd-vector"]}}]}}
+            write(control / "curriculum-approval.json", {"status": "proposed", "phase": 1,
+                  "proposal_id": "proposal-1", "proposal": proposal})
+        elif command == "approve":
+            record = json.loads((control / "curriculum-approval.json").read_text())
+            write(control / "curriculum-approval.json", {**record, "status": "approved",
+                  "selected_project_ids": [argv[argv.index("--project-id") + 1]]})
+        return subprocess.CompletedProcess(argv, 0, "{}\n", "")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=run).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    def post(action, body, key):
+        response = client.post(f"/api/control/{action}", json=body,
+            headers={"X-CSRF-Token": csrf, "Idempotency-Key": key})
+        assert response.status_code == 202
+        return wait_operation(client, response.get_json()["operation_id"])
+    assert post("sample", {"campaign_id": "phase1", "confirmation": "sample:phase1"}, "s")["status"] == "succeeded"
+    status = client.get("/api/status").get_json()
+    proposals = status["controls"]["proposals"]
+    assert proposals[0]["projects"][1]["new_coverage"] == ["simd-vector"]
+    assert proposals[0]["projects"][0]["hypothesis"] == "Measure copy."
+    assert "private reasoning" not in json.dumps(status)
+    approval_body = {"campaign_id": "phase1", "proposal_id": "proposal-1",
+                     "project_ids": ["vector"], "confirmation": "approve:proposal-1"}
+    assert post("approve", approval_body, "a")["status"] == "succeeded"
+    replay = client.post("/api/control/approve", json=approval_body,
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "a"})
+    assert replay.status_code == 202
+    assert post("run-approved", {"campaign_id": "phase1", "proposal_id": "proposal-1",
+        "confirmation": "run-approved:proposal-1"}, "r")["status"] == "succeeded"
+    assert calls[-1][2] == "run-approved"
+
+
+@pytest.mark.parametrize("already_published", [False, True])
+def test_running_approval_retry_and_reconciliation_are_idempotent(tmp_path, already_published):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    state = {"coverage": [], "prior_outcomes": [], "wave_index": 1}
+    write(root / "state.json", state)
+    proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                "wave": {"projects": [{"spec": {"project_id": "one",
+                    "hypothesis": "One", "capabilities": []}}]}}
+    write(control / "curriculum-approval.json", {"status": "approved", "phase": 1,
+          "proposal_id": "retry", "proposal": proposal, "selected_project_ids": ["one"]})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        record = json.loads((control / "curriculum-approval.json").read_text())
+        if len(calls) == 1:
+            write(control / "curriculum-approval.json", {**record, "status": "running"})
+            raise OSError("worker connection lost")
+        write(control / "curriculum-approval.json", {**record, "status": "complete",
+              "recovered": already_published})
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=run).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    body = {"campaign_id": "phase1", "proposal_id": "retry",
+            "confirmation": "run-approved:retry"}
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "first"}
+    first = client.post("/api/control/run-approved", json=body, headers=headers)
+    first_id = first.get_json()["operation_id"]
+    assert wait_operation(client, first_id)["status"] == "failed"
+    restarted = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                           command_runner=run)
+    client = restarted.test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "first"}
+    replay = client.post("/api/control/run-approved", json=body, headers=headers)
+    assert replay.get_json()["operation_id"] == first_id and len(calls) == 1
+    if already_published:
+        write(root / "state.json", {**state, "wave_index": 2,
+                                     "prior_outcomes": [{"project_id": "one"}]})
+    page = client.get("/")
+    assert b"Resume/reconcile" in page.data
+    retry = client.post("/api/control/run-approved", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "explicit-retry"})
+    assert retry.status_code == 202
+    assert wait_operation(client, retry.get_json()["operation_id"])["status"] == "succeeded"
+    assert len(calls) == 2
+
+
+def test_selection_staleness_phase2_cardinality_failures_and_restart(tmp_path):
+    config, root, control = controlled_config(tmp_path, phase=2)
+    root.mkdir()
+    write(root / "state.json", {"coverage": [], "prior_outcomes": [], "wave_index": 2})
+    write(control / "curriculum-approval.json", {"status": "proposed", "phase": 2,
+          "proposal_id": "p2", "proposal": {"base_wave_index": 1,
+          "base_memory_sha256": "a" * 64, "wave": {"projects": [
+              {"spec": {"project_id": "one", "hypothesis": "One", "capabilities": []}},
+              {"spec": {"project_id": "two", "hypothesis": "Two", "capabilities": []}}]}}})
+    cache = tmp_path / "cache.sqlite3"
+    app = create_app(config, cache, refresh_seconds=0, command_runner=lambda *a, **k: None)
+    client = app.test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "approval"}
+    body = {"campaign_id": "phase2", "proposal_id": "p2", "project_ids": ["one", "two"],
+            "confirmation": "approve:p2"}
+    assert client.post("/api/control/approve", json=body, headers=headers).status_code == 409
+    body["project_ids"] = ["one"]
+    assert client.post("/api/control/approve", json=body,
+        headers={**headers, "Idempotency-Key": "stale"}).status_code == 409
+
+    manager = app.extensions["dashboard_controls"]
+    running = manager._insert_for_test("sample", "phase2", "running")
+    queued = manager._insert_for_test("sample", "phase2", "queued")
+    manager.close()
+    restarted = create_app(config, cache, refresh_seconds=0, command_runner=lambda *a, **k: None)
+    client = restarted.test_client()
+    for operation in (running, queued):
+        interrupted = client.get(f"/api/operations/{operation}").get_json()
+        assert interrupted["status"] == "failed" and "interrupted" in interrupted["error"]
+
+
+def test_reject_uses_only_the_retained_proposal(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"coverage": [], "prior_outcomes": [], "wave_index": 1})
+    write(control / "curriculum-approval.json", {"status": "proposed", "phase": 1,
+          "proposal_id": "reject-me", "proposal": {"base_wave_index": 1,
+          "base_memory_sha256": "a" * 64, "wave": {"projects": [
+              {"spec": {"project_id": "one", "hypothesis": "One", "capabilities": []}}]}}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=run).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    response = client.post("/api/control/reject", json={"campaign_id": "phase1",
+        "proposal_id": "reject-me", "confirmation": "reject:reject-me"},
+        headers={"X-CSRF-Token": csrf, "Idempotency-Key": "reject"})
+    assert response.status_code == 202
+    assert wait_operation(client, response.get_json()["operation_id"])["status"] == "succeeded"
+    assert calls[0][2:] == ["reject", "--control", str(control),
+                            "--proposal-id", "reject-me"]
+
+
+def test_terminal_proposal_summary_and_zero_project_approval(tmp_path):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    write(root / "state.json", {"coverage": [], "prior_outcomes": [], "wave_index": 3})
+    write(control / "curriculum-approval.json", {"status": "proposed", "phase": 1,
+          "proposal_id": "terminal", "proposal": {"base_wave_index": 3,
+          "base_memory_sha256": "a" * 64, "session": {"messages": [
+              {"content": "private terminal reasoning"}]},
+          "terminal": {"status": "SATURATED", "reason": "Coverage is complete."}}})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=run).test_client()
+    status = client.get("/api/status").get_json()
+    proposal = status["controls"]["proposals"][0]
+    assert proposal["terminal"] == {"status": "SATURATED", "reason": "Coverage is complete."}
+    assert "private terminal reasoning" not in json.dumps(status)
+    csrf = client.get("/api/csrf").get_json()["token"]
+    response = client.post("/api/control/approve", json={"campaign_id": "phase1",
+        "proposal_id": "terminal", "project_ids": [],
+        "confirmation": "approve:terminal"}, headers={"X-CSRF-Token": csrf,
+        "Idempotency-Key": "terminal"})
+    assert response.status_code == 202
+    assert wait_operation(client, response.get_json()["operation_id"])["status"] == "succeeded"
+    assert calls == [[pytest.importorskip("sys").executable,
+                      "/repo/run_ascend_campaign.py", "approve", "--control", str(control),
+                      "--proposal-id", "terminal"]]
+
+
+def test_background_failure_is_sanitized_and_visible(tmp_path):
+    config, _, _ = controlled_config(tmp_path)
+    def fail(*args, **kwargs):
+        raise OSError("provider unavailable SECRET_TOKEN")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=fail).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    response = client.post("/api/control/sample", json={"campaign_id": "phase1",
+        "confirmation": "sample:phase1"}, headers={"X-CSRF-Token": csrf,
+        "Idempotency-Key": "failure"})
+    operation = wait_operation(client, response.get_json()["operation_id"])
+    assert operation["status"] == "failed"
+    assert "provider unavailable" in operation["error"]
+    assert "SECRET_TOKEN" not in operation["error"]
