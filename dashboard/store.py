@@ -7,8 +7,11 @@ import difflib
 import hashlib
 import json
 from pathlib import Path
+import re
 import sqlite3
 import time
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
 
 def _json(path: Path, default=None):
@@ -19,7 +22,8 @@ def _json(path: Path, default=None):
 
 
 def _source(branch: Path, digest: str):
-    if not isinstance(digest, str) or len(digest) != 64:
+    # Artifact identifiers are canonical lowercase SHA-256, never path input.
+    if not isinstance(digest, str) or _SHA256.fullmatch(digest) is None:
         return None
     path = branch / "artifacts" / "objects" / digest[:2] / digest[2:]
     try:
