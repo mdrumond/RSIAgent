@@ -136,9 +136,14 @@ class TargetCurriculumAgent:
         session = CurriculumSession() if session is None else session
         system = {"role": "system", "content": SYSTEM}
         history = list(session.messages) if session.messages else [system]
-        turn = [{"role": "user", "content": target_curriculum_prompt(context, self.target_policy)}]
+        prompt = target_curriculum_prompt(context, self.target_policy)
+        if session.messages:
+            prompt = ("Previous accepted curriculum decision for interpreting practice results; "
+                      "the current context below owns the goal, budgets and host verdicts:\n"
+                      + session.messages[-1]["content"] + "\n" + prompt)
+        turn = [{"role": "user", "content": prompt}]
         for attempt in range(1, 4):
-            response = self.complete([*history, *turn])
+            response = self.complete([system, *turn])
             turn.append({"role": "assistant", "content": response})
             try:
                 decision = self.parse(response, context)
