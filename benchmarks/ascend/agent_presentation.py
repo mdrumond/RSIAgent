@@ -194,11 +194,19 @@ def memory_presentation(raw, artifacts):
     entries.extend((base64.b64decode(encoded, validate=True), "progressive")
                    for encoded in value["project_memory_base64"])
     remaining = 8192
+    optimizer_remaining = 8192
     for content, origin in entries:
         project = json.loads(content)
         row = {"sha256": artifacts.put_bytes(content),
                "origin": origin,
-               "project_id": project.get("project_spec", {}).get("project_id")}
+               "project_id": project.get("project_spec", {}).get("project_id", project.get("task_id"))}
+        if project.get("task_id"):
+            summary = {"host_fact": str(project.get("statement", ""))[:500],
+                       "interpretation": str(project.get("interpretation", ""))[:800]}
+            size = len(canonical_bytes(summary))
+            if size <= optimizer_remaining:
+                row.update(summary, origin="optimizer-phase2")
+                optimizer_remaining -= size
         lessons = _preview(project.get("agent_lessons", []))
         size = len(canonical_bytes(lessons))
         if size <= remaining:

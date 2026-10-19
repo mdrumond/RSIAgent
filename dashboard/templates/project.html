@@ -4,6 +4,14 @@
 <details open class="project-section"><summary>Project overview and outcome</summary>
 <dl class="description-fields">{% for field in project.description_fields %}<dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>{% endfor %}</dl>
 <aside><b>Outcome</b><p>{{ project.summary }}</p></aside></details>
+{% if project.optimizer_results %}
+<details class="project-section" open><summary>Optimizer measurements</summary>
+<table><thead><tr><th>Case</th><th>Torch µs</th><th>Ascend C µs</th><th>Speedup</th></tr></thead><tbody>
+{% for row in project.optimizer_results.cases %}<tr><td>{{ row.case }}</td><td>{{ row.torch_us if row.torch_us is not none else 'unavailable' }}</td><td>{{ row.ascendc_us if row.ascendc_us is not none else 'unavailable' }}</td><td>{{ row.speedup if row.speedup is not none else 'unavailable' }}</td></tr>{% endfor %}
+</tbody></table>
+{% for row in project.optimizer_results.metrics %}<p>{{ row.group }} · {{ row.name }}: {{ row.value }} {{ row.unit }}</p>{% endfor %}
+{% for row in project.optimizer_results.unavailable %}<p>{{ row.group }}: {{ row.reason }}</p>{% endfor %}
+</details>{% endif %}
 <details class="project-section performance-view" data-performance-url="{{ url_for('api_performance', number=campaign.phase, project_id=project.id) }}"><summary>Performance over attempts</summary>
 <p class="performance-status">Performance data loads when this section opens.</p>
 <div class="performance-plots" hidden>

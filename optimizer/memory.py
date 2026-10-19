@@ -8,6 +8,40 @@ from pathlib import Path, PurePosixPath
 from .jobs import canonical, sha
 
 
+def freeze_phase1_source(source_root, initial_memory, review_path, *, snapshot_root):
+    """Admit reviewed Phase 1 directly, without fabricating a completed Phase 2.
+
+    The existing admission reader authenticates publication, review, treatment,
+    and every retained source/evidence object. snapshot_root is the destination
+    for that immutable portable admission, not a legacy campaign state root.
+    """
+    from benchmarks.ascend.phase2 import admit_native_snapshot
+    admitted = admit_native_snapshot(source_root, initial_memory, review_path, snapshot_root)
+    return freeze_reviewed_phase1(admitted)
+
+
+def freeze_reviewed_phase1(admitted):
+    """Export an already admitted native Phase 1 seed in optimizer wire format."""
+    admitted.verify()
+    destination = admitted.destination.as_dict()
+    if destination.get('language') != 'ascend-c' or destination.get('target') != 'a3':
+        raise ValueError('optimizer seed requires reviewed A3 Ascend C memory')
+    entries = list(admitted.memory_entries())
+    files = {}
+    for name in [*admitted.manifest['files'], 'snapshot.json']:
+        data = _read(admitted.root, name)
+        if name == 'snapshot.json' and json.loads(data) != admitted.manifest:
+            raise ValueError('reviewed Phase 1 manifest changed during snapshot')
+        if name in admitted.manifest['files'] and sha(data) != admitted.manifest['files'][name]:
+            raise ValueError('reviewed Phase 1 changed during snapshot')
+        files[f'reviewed-seed/{name}'] = dict(sha256=sha(data), base64=base64.b64encode(data).decode())
+    admitted.verify()
+    body = dict(schema='optimizer-memory-snapshot-v1', phase='reviewed-phase1',
+                source_identity=destination['source_identity'], terminal=None,
+                phase1_snapshot_id=admitted.snapshot_id, memory_entries=entries, files=files)
+    return {**body, 'snapshot_id': sha(canonical(body))}
+
+
 def _read(root, relative):
     path = PurePosixPath(relative)
     if path.is_absolute() or '..' in path.parts:
@@ -33,6 +67,9 @@ def freeze_source(root, *, snapshot_roots=()):
     state_bytes = _read(root, 'state.json')
     state = json.loads(state_bytes)
     phase = state.get('phase')
+    if phase == 'optimizer-phase2':
+        from benchmarks.ascend.optimizer_phase2_artifacts import freeze_campaign
+        return freeze_campaign(root)
     if phase not in {'adaptive-phase2', 'target-driven-phase2'}:
         raise ValueError('unsupported legacy Phase 2 format; native reviewed adaptive lineage required')
     if (root / 'pending.json').exists():
