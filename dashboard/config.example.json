@@ -6,6 +6,7 @@
   "controls": {
     "enabled": false,
     "runner": "/path/to/RSIAgent/run_ascend_campaign.py",
+    "extension_step": 8,
     "presets": [
       {"id": "phase1", "target": "a3", "phase": 1, "root": "/path/to/new-phase1", "control": "/path/to/new-phase1-control", "config": "/path/to/runtime.json", "initial_memory": "/path/to/initial-memory.bin", "objective": "Learn A3 kernels", "project_target": 64},
       {"id": "phase2", "target": "a3", "phase": 2, "root": "/path/to/new-phase2", "control": "/path/to/new-phase2-control", "config": "/path/to/runtime.json", "initial_memory": "/path/to/initial-memory.bin", "objective": "Extend reviewed A3 learning", "project_target": 1, "phase1_root": "/path/to/reviewed-phase1", "review": "/path/to/review.json"}

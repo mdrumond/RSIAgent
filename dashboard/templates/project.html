@@ -1,7 +1,19 @@
 {% extends "base.html" %}{% block title %}{{ project.id }} · RSI{% endblock %}{% block body %}
 <a href="{{ url_for('phase_page', number=campaign.phase) }}">← {{ campaign.name }}</a><div class="eyebrow">PROJECT</div><h1>{{ project.id }}</h1>
-<p class="lede">{{ project.description }}</p><aside><b>Outcome</b><p>{{ project.summary }}</p></aside>
-<h2>Performance over attempts</h2><div class="perf">{% for row in project.performance %}<article><b>{{ '%.3f'|format(row.median_us) }} µs</b><span>{{ row.measurement }}</span><small>shape {{ row.shape }} · {{ row.samples_us|length }} samples</small></article>{% else %}<p>No timing study retained.</p>{% endfor %}</div>
-<h2>Final code</h2><div class="code language-cpp">{{ source }}</div>
-<h2>Historic code evolution</h2><p>{{ project.revisions|length }} content-addressed revision{{ '' if project.revisions|length == 1 else 's' }} retained.</p>{% for row in transitions %}<h3>Revision {{ loop.index }} → {{ loop.index + 1 }} <small>{{ row.from[:12] }} → {{ row.to[:12] }}</small></h3><div class="code diff">{{ row.html }}</div>{% else %}<p>No earlier source revision retained.</p>{% endfor %}
-<h2>Memory gained</h2>{% for lesson in project.memory.lessons %}<article class="lesson"><span class="tag">{{ lesson.category }}</span><p>{{ lesson.claim }}</p><small>{{ lesson.confidence }}</small></article>{% else %}<p>No published lessons retained.</p>{% endfor %}{% endblock %}
+<details open class="project-section"><summary>Project overview and outcome</summary>
+<dl class="description-fields">{% for field in project.description_fields %}<dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>{% endfor %}</dl>
+<aside><b>Outcome</b><p>{{ project.summary }}</p></aside></details>
+<details class="project-section performance-view" data-performance-url="{{ url_for('api_performance', number=campaign.phase, project_id=project.id) }}"><summary>Performance over attempts</summary>
+<p class="performance-status">Performance data loads when this section opens.</p>
+<div class="performance-plots" hidden>
+<figure><figcaption>Measurement attempts</figcaption><div data-performance-chart="attempts"></div></figure>
+<figure><figcaption>Shape sweep</figcaption><div data-performance-chart="shapes"></div></figure>
+<figure><figcaption>Pipe utilization</figcaption><div class="pipe-controls" aria-label="Pipe metric family"><button type="button" data-pipe-engine="all">All</button><button type="button" data-pipe-engine="AIC">AIC</button><button type="button" data-pipe-engine="AIV">AIV</button></div><div data-performance-chart="pipes"></div><div class="pipe-table"></div></figure>
+<p class="bandwidth-note"></p><div class="performance-table"></div></div></details>
+<details class="project-section"><summary>Final code</summary><div class="code language-cpp">{{ source }}</div></details>
+<details class="project-section"><summary>Historic code evolution</summary><p>{{ project.revisions|length }} content-addressed revision{{ '' if project.revisions|length == 1 else 's' }} retained.</p>{% for row in transitions %}<h3>Revision {{ loop.index }} → {{ loop.index + 1 }} <small>{{ row.from[:12] }} → {{ row.to[:12] }}</small></h3><div class="code diff">{{ row.html }}</div>{% else %}<p>No earlier source revision retained.</p>{% endfor %}</details>
+<details open class="project-section"><summary>Memory gained</summary>{% for lesson in project.memory.lessons %}<article class="lesson"><span class="tag">{{ lesson.category }}</span><p>{{ lesson.claim }}</p><small>{{ lesson.confidence }}</small></article>{% else %}<p>No published lessons retained.</p>{% endfor %}</details>
+<details class="project-section trace"><summary>Execution trace</summary>
+{% for event in trace.events %}<details class="trace-event"{% if event.available %} data-trace-url="{{ event.payload_url }}"{% endif %}><summary><b>{{ event.label }}</b>{% if event.turn is not none %} · turn {{ event.turn }}{% endif %}{% if event.stage %} · {{ event.stage }}{% endif %}</summary>
+{% if event.available %}<p><small>{{ event.size }} bytes · SHA-256 {{ event.sha256 }}</small> · <a href="{{ event.download_url }}">download raw</a></p><pre class="trace-payload">Open to load retained payload.</pre>{% else %}<p class="unavailable">Unavailable{% if event.reason %}: {{ event.reason }}{% endif %}</p>{% endif %}</details>{% endfor %}
+</details>{% endblock %}
