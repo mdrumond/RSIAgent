@@ -41,7 +41,7 @@ def _leaves(value, path="output"):
     if isinstance(value, (tuple, list)):
         return [leaf for i, child in enumerate(value) for leaf in _leaves(child, f"{path}[{i}]")]
     if isinstance(value, dict) and all(isinstance(k, str) for k in value):
-        return [leaf for k, child in value.items() for leaf in _leaves(child, f"{path}.{k}")]
+        return [leaf for k, child in value.items() for leaf in _leaves(child, f"{path}[{json.dumps(k)}]")]
     raise ReferenceError(f"{path}: only tensors, None, and nested tensor containers are supported")
 
 
@@ -66,7 +66,8 @@ def compare_outputs(expected, actual, inputs=(), non_compute=False):
             if len(a) != len(b) or (isinstance(a, dict) and set(a) != set(b)):
                 raise ReferenceError(f"{path}: output structure differs")
             for key in (a if isinstance(a, dict) else range(len(a))):
-                compare(a[key], b[key], f"{path}.{key}")
+                suffix = json.dumps(key) if isinstance(a, dict) else str(key)
+                compare(a[key], b[key], f"{path}[{suffix}]")
             return
         if a is None:
             return
@@ -90,7 +91,12 @@ def compare_outputs(expected, actual, inputs=(), non_compute=False):
                 passed = torch.equal(a, b)
                 metrics["category"] = "exact"
             elif not a.dtype.is_floating_point:
-                passed = bool(((a.to(torch.int64) - b.to(torch.int64)).abs() <= 1).all())
+                integers_a, integers_b = a.to(torch.int64), b.to(torch.int64)
+                # Ordered adjacency avoids signed subtraction/abs overflow at
+                # int64 extrema without losing precision by converting to float.
+                passed = bool(((integers_a == integers_b)
+                    | ((integers_a > integers_b) & (integers_a - 1 == integers_b))
+                    | ((integers_a < integers_b) & (integers_a + 1 == integers_b))).all())
                 metrics["category"] = "quant_fp_to_int"
             elif a.numel() == 0:
                 passed = True
@@ -144,8 +150,10 @@ def _model_state(model):
                             if not k.startswith("__") and not callable(v) and not isinstance(v, ModuleType)},
                 "closure": [_value_state(cell.cell_contents) for cell in (getattr(model, "__closure__", None) or [])]}
     attributes = {}
+    framework_attributes = set(vars(torch.nn.Module())) - {"training"}
     for name, module in model.named_modules():
-        attributes[name] = {k: _value_state(v) for k, v in vars(module).items() if not k.startswith("_")}
+        attributes[name] = {k: _value_state(v) for k, v in vars(module).items()
+                            if k not in framework_attributes}
     return {"tensors": {k: _tensor_identity(v) for k, v in model.state_dict().items()}, "attributes": attributes}
 
 

@@ -1,7 +1,7 @@
 import json
 
 import pytest
-import torch
+torch = pytest.importorskip("torch")
 
 from optimizer.reference import ReferenceError, compare_outputs, freeze_reference, prepare_reference
 
@@ -93,3 +93,24 @@ def test_generated_invalid_shape_is_reported_and_representative_is_kept():
     prepared = prepare_reference(submission)
     assert prepared.cases[0]["case"]["representative"]
     assert any("reshape" in rejected["error"] or "shape" in rejected["error"] for rejected in prepared.manifest["rejected"])
+
+
+def test_private_module_state_mutation_is_rejected():
+    with pytest.raises(ReferenceError, match="mutat"):
+        prepare_reference(spec("import torch\nclass Model(torch.nn.Module):\n def __init__(self):\n  super().__init__(); self._count = 0\n def forward(self, x):\n  self._count += 1\n  return x + 1", "Model"))
+
+
+def test_quantized_int64_comparison_cannot_overflow():
+    limits = torch.iinfo(torch.int64)
+    for a, b in [(limits.min, 0), (limits.min, limits.max), (0, limits.min)]:
+        with pytest.raises(ReferenceError):
+            compare_outputs(torch.tensor([a]), torch.tensor([b]), inputs=[torch.ones(1)])
+    for a, b in [(limits.min, limits.min + 1), (limits.max, limits.max - 1)]:
+        compare_outputs(torch.tensor([a]), torch.tensor([b]), inputs=[torch.ones(1)])
+
+
+def test_dict_output_paths_do_not_collide():
+    prepared = prepare_reference(spec("def kernel(x): return {'a.b': x, 'a': {'b': x + 1}, 'a[0]': x + 2}"), max_cases=1)
+    outputs = prepared.manifest['cases'][0]['outputs']
+    assert len(outputs) == 3
+    assert len({row['sha256'] for row in outputs.values()}) == 3
