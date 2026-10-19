@@ -13,6 +13,33 @@ from .app import create_app
 from .store import DashboardStore
 
 
+class _ExportStore(DashboardStore):
+    """Share authenticated ledgers across this export's many lazy payload reads."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self._ledgers = {}
+
+    @staticmethod
+    def _ledger_fingerprint(path):
+        try:
+            stat = path.stat()
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        except OSError:
+            return None
+
+    def _authenticated_ledger(self, path):
+        path = Path(path)
+        fingerprint = self._ledger_fingerprint(path)
+        previous = self._ledgers.get(path)
+        if previous is not None and previous[0] == fingerprint:
+            return previous[1]
+        result = super()._authenticated_ledger(path)
+        if self._ledger_fingerprint(path) == fingerprint:
+            self._ledgers[path] = fingerprint, result
+        return result
+
+
 def _compact(path):
     """Only human-readable compact evidence belongs in a portable demo."""
     if any(word in path.name.lower() for word in ('timeline', '.pt', '.so', '.db')):
@@ -64,9 +91,9 @@ def export_demo(config_path, cache_dir, output):
                                'worker_config': str(worker), 'memory_roots': []}
         private_config = temporary / 'config.json'
         private_config.write_text(json.dumps(config))
-        store = DashboardStore(private_config, database)
+        store = _ExportStore(private_config, database)
         snapshot = store.refresh()
-        app = create_app(private_config, database, refresh_seconds=float('inf'))
+        app = create_app(private_config, database, refresh_seconds=float('inf'), dashboard_store=store)
         app.context_processor(lambda: {'demo_timestamp': timestamp})
         client = app.test_client()
         pages = ['/', '/memory', '/optimizer']

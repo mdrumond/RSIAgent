@@ -18,9 +18,9 @@ from .control import ControlError, ControlManager
 
 
 def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None,
-               optimizer_launcher=None):
+               optimizer_launcher=None, dashboard_store=None):
     app = Flask(__name__)
-    store = DashboardStore(config_path, cache_path)
+    store = dashboard_store if dashboard_store is not None else DashboardStore(config_path, cache_path)
     controls = ControlManager(config_path, cache_path, **(
         {"runner": command_runner} if command_runner is not None else {}))
     app.extensions["dashboard_controls"] = controls

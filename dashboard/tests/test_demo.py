@@ -1,6 +1,7 @@
 """Portable exports retain real read views without their execution dependencies."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -111,3 +112,44 @@ def test_cli_help_and_playback_syntax():
         from dashboard.demo import _PLAYBACK
         subprocess.run([node, '--check'], input=_PLAYBACK.replace('__MANIFEST__', '{}'),
                        text=True, check=True)
+
+
+def test_export_ledger_authentication_shared_and_invalidated(campaign, tmp_path, monkeypatch):
+    from collections import Counter
+    from dashboard.app import create_app
+    from dashboard.demo import _ExportStore
+    from dashboard.tests.test_dashboard import evidence_ledger_rows
+    original = DashboardStore._authenticated_ledger
+    calls = Counter()
+    def authenticate(path):
+        calls[path] += 1
+        return original(path)
+    monkeypatch.setattr(DashboardStore, '_authenticated_ledger', staticmethod(authenticate))
+    store = _ExportStore(campaign, tmp_path / 'private.sqlite3')
+    snapshot = store.refresh()
+    project = snapshot['campaigns'][0]['projects'][0]['id']
+    trace = store.trace_index(1, project)
+    app = create_app(campaign, store.cache_path, refresh_seconds=float('inf'), dashboard_store=store)
+    client = app.test_client()
+    client.get(f'/phase/1/project/{project}')
+    for event in trace['events']:
+        if event['available']:
+            client.get(event['payload_url'])
+            client.get(event['download_url'])
+    assert calls and all(count == 1 for count in calls.values())
+    ledger = tmp_path / 'changing.jsonl'
+    ledger.write_text('\n'.join(json.dumps(row) for row in evidence_ledger_rows([{'message': 'first'}])) + '\n')
+    first = store._authenticated_ledger(ledger)
+    assert first[1] is None
+    assert store._authenticated_ledger(ledger) is first
+    assert calls[ledger] == 1
+    previous_stat = ledger.stat()
+    ledger.write_text(ledger.read_text().replace('first', 'wrong'))  # same length, bad digest
+    # Some local filesystems round sub-millisecond writes to the same timestamp.
+    os.utime(ledger, ns=(previous_stat.st_atime_ns, previous_stat.st_mtime_ns + 1_000_000_000))
+    assert store._authenticated_ledger(ledger)[1] == 'evidence ledger integrity verification failed'
+    assert calls[ledger] == 2
+    ledger.unlink()
+    assert store._authenticated_ledger(ledger)[1] == 'retained evidence ledger unavailable'
+    assert calls[ledger] == 3
+    app.extensions['dashboard_controls'].close()
