@@ -11,6 +11,28 @@ python -m pip install -r dashboard/requirements.txt
 python -m dashboard serve --config dashboard/config.json --cache-dir .dashboard-cache
 ```
 
+## Kernel Optimizer
+
+The Kernel Optimizer tab is always visible. Configure its independent
+`optimizer` block using `config.example.json`: an absolute job `root`, explicitly
+listed native A3 Phase 2 `memory_roots`, reviewed seed `snapshot_roots`, and an
+existing absolute ignored `worker_config`. Set `enabled` only when the optimizer
+worker is installed and configured. Enabled optimizer controls require a
+loopback bind, independently of campaign controls.
+
+Paste Python or upload a `.py` file, select the function/class entrypoint, enter
+representative input signatures and optional constructor arguments, and choose
+eligible completed memory. Discovery shows unavailable sources with their reason;
+creation authenticates the source again and pins its snapshot. Defaults are 25
+candidate attempts and 7200 seconds. Resume requires explicit additional budget.
+
+Jobs run in detached `python -m optimizer.worker` processes. The dashboard does
+not execute submitted Python and restarting Flask does not launch jobs again.
+Worker output remains in each job's `worker.log`; durable manifests, authenticated
+events and immutable submissions supply status and lazy trace details. Lifecycle
+POST requests require a CSRF token and persistent `Idempotency-Key`; repeating the
+same action after a dashboard restart does not add budget or launch twice.
+
 The default listener is `127.0.0.1:8080`; use an SSH tunnel for remote demos.
 Every refresh is materialized into a SQLite WAL snapshot. If artifact storage
 is slow or temporarily unavailable, requests continue serving the last good
