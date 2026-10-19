@@ -64,9 +64,12 @@ def campaign(tmp_path):
     response_obj.parent.mkdir(parents=True)
     response_obj.write_text(json.dumps({"write": {"slot": "kernel", "content":
                                                    "extern C { void first_draft() {} }\n"}}))
+    actor_rows = evidence_ledger_rows([
+        {"role": "provider-response", "sha256": response},
+        {"event": "candidate", "source_sha256": old},
+    ])
     (branch / "evidence.jsonl").write_text(
-        json.dumps({"payload": {"role": "provider-response", "sha256": response}}) + "\n" +
-        json.dumps({"payload": {"event": "candidate", "source_sha256": old}}) + "\n")
+        "\n".join(json.dumps(row) for row in actor_rows) + "\n")
     control = tmp_path / "control"
     write(control / "worker.json", {"status": "running", "started": 10})
     config = tmp_path / "dashboard.json"
@@ -188,16 +191,15 @@ def test_trace_index_is_compact_and_payloads_are_lazy_authenticated(campaign, tm
     obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
     obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(request)
     missing = "d" * 64
-    (branch / "evidence.jsonl").write_text("\n".join([
-        json.dumps({"payload": {"role": "provider-request", "sha256": digest,
-                                "stage": "action", "turn": 1}}),
-        json.dumps({"payload": {"role": "provider-request", "sha256": digest,
-                                "stage": "action", "turn": 2}}),
-        json.dumps({"payload": {"role": "provider-attempt-rejection", "sha256": digest,
-                                "stage": "action", "turn": 2}}),
-        json.dumps({"payload": {"role": "host-observation", "sha256": missing,
-                                "turn": 2}}),
-    ]) + "\n")
+    actor_rows = evidence_ledger_rows([
+        {"role": "provider-request", "sha256": digest, "stage": "action", "turn": 1},
+        {"role": "provider-request", "sha256": digest, "stage": "action", "turn": 2},
+        {"role": "provider-attempt-rejection", "sha256": digest,
+         "stage": "action", "turn": 2},
+        {"role": "host-observation", "sha256": missing, "turn": 2},
+    ])
+    (branch / "evidence.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in actor_rows) + "\n")
     host_rows = evidence_ledger_rows([
         {"project_id": "vector-add", "event": "verification"},
         {"project_id": "vector-add", "event": "verification"},
@@ -239,8 +241,9 @@ def test_trace_payload_survives_backing_artifact_removal_after_cache(campaign, t
     digest = __import__("hashlib").sha256(raw).hexdigest()
     obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
     obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(raw)
-    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
-        "role": "provider-response", "sha256": digest, "stage": "action", "turn": 1}}) + "\n")
+    (branch / "evidence.jsonl").write_text(json.dumps(evidence_ledger_rows([{
+        "role": "provider-response", "sha256": digest,
+        "stage": "action", "turn": 1}])[0]) + "\n")
     client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
     original_index = client.get("/api/phase/1/project/vector-add/trace").get_json()
     event = next(row for row in original_index["events"]
@@ -407,8 +410,9 @@ def test_trace_index_does_not_read_actor_payload_bodies(campaign, tmp_path, monk
     digest = __import__("hashlib").sha256(body).hexdigest()
     obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
     obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(body)
-    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
-        "role": "provider-response", "sha256": digest, "stage": "action", "turn": 1}}) + "\n")
+    (branch / "evidence.jsonl").write_text(json.dumps(evidence_ledger_rows([{
+        "role": "provider-response", "sha256": digest,
+        "stage": "action", "turn": 1}])[0]) + "\n")
     original = type(obj).read_bytes
     def guarded_read(path):
         if "artifacts/objects" in str(path):
@@ -424,6 +428,45 @@ def test_trace_index_does_not_read_actor_payload_bodies(campaign, tmp_path, monk
     assert "JSON.stringify(JSON.parse(payload.text), null, 2)" in script
 
 
+@pytest.mark.parametrize("damage", ["forged-object", "sequence", "previous", "digest"])
+def test_actor_trace_rejects_corrupt_ledger_and_recovers(campaign, tmp_path, damage):
+    branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
+    legitimate, unrelated = b"legitimate actor response", b"unrelated retained object"
+    legitimate_digest = __import__("hashlib").sha256(legitimate).hexdigest()
+    unrelated_digest = __import__("hashlib").sha256(unrelated).hexdigest()
+    for body, digest in ((legitimate, legitimate_digest), (unrelated, unrelated_digest)):
+        source = branch / "artifacts/objects" / digest[:2] / digest[2:]
+        source.parent.mkdir(parents=True, exist_ok=True); source.write_bytes(body)
+    valid = evidence_ledger_rows([
+        {"role": "provider-response", "sha256": legitimate_digest, "turn": 1},
+        {"role": "host-observation", "sha256": legitimate_digest, "turn": 1},
+    ])
+    corrupt = json.loads(json.dumps(valid))
+    if damage == "forged-object":
+        corrupt[0]["payload"]["sha256"] = unrelated_digest
+    elif damage == "sequence":
+        corrupt[1]["sequence"] = 9
+    elif damage == "previous":
+        corrupt[1]["previous_sha256"] = "e" * 64
+    else:
+        corrupt[1]["entry_sha256"] = "f" * 64
+    ledger = branch / "evidence.jsonl"
+    ledger.write_text("\n".join(json.dumps(row) for row in corrupt) + "\n")
+    store = DashboardStore(campaign, tmp_path / "cache.sqlite3")
+    broken = store.trace_index(1, "vector-add")["events"]
+    unavailable = [row for row in broken if row["label"] == "Actor trace unavailable"]
+    assert len(unavailable) == 1 and not unavailable[0]["available"]
+    assert "integrity" in unavailable[0]["reason"]
+    assert not any(row["category"] == "actor" and row.get("sha256") in {
+        legitimate_digest, unrelated_digest} for row in broken)
+
+    ledger.write_text("\n".join(json.dumps(row) for row in valid) + "\n")
+    repaired = store.trace_index(1, "vector-add")["events"]
+    assert not any(row["label"] == "Actor trace unavailable" for row in repaired)
+    actor = [row for row in repaired if row["category"] == "actor"]
+    assert len(actor) == 2 and {row["sha256"] for row in actor} == {legitimate_digest}
+
+
 def test_trace_event_urls_are_content_stable_across_growth_and_reordering(campaign, tmp_path):
     branch = tmp_path / "phase1/waves/wave-001/branches/vector-add"
     bodies = [b"first", b"second", b"inserted"]
@@ -432,9 +475,11 @@ def test_trace_event_urls_are_content_stable_across_growth_and_reordering(campai
         obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
         obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(body)
     def ledger(order):
-        (branch / "evidence.jsonl").write_text("\n".join(json.dumps({"payload": {
-            "role": "provider-request", "sha256": digests[index], "turn": index}})
-            for index in order) + "\n")
+        rows = evidence_ledger_rows([
+            {"role": "provider-request", "sha256": digests[index], "turn": index}
+            for index in order])
+        (branch / "evidence.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in rows) + "\n")
     ledger([0, 0, 1])
     cache = tmp_path / "cache.sqlite3"
     client = create_app(campaign, cache, refresh_seconds=0).test_client()
@@ -456,8 +501,8 @@ def test_uncached_payload_disappearance_is_404_not_digest_conflict(campaign, tmp
     digest = __import__("hashlib").sha256(body).hexdigest()
     obj = branch / "artifacts/objects" / digest[:2] / digest[2:]
     obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(body)
-    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
-        "role": "provider-response", "sha256": digest, "turn": 1}}) + "\n")
+    (branch / "evidence.jsonl").write_text(json.dumps(evidence_ledger_rows([{
+        "role": "provider-response", "sha256": digest, "turn": 1}])[0]) + "\n")
     client = create_app(campaign, tmp_path / "cache.sqlite3", refresh_seconds=0).test_client()
     event = next(row for row in client.get(
         "/api/phase/1/project/vector-add/trace").get_json()["events"]
@@ -603,8 +648,8 @@ def test_completed_trace_catalog_refreshes_when_partial_sync_finishes(campaign, 
     branch = root / "waves/wave-001/branches/vector-add"
     actor_body = b'{"response":"arrived later"}'
     actor_digest = __import__("hashlib").sha256(actor_body).hexdigest()
-    (branch / "evidence.jsonl").write_text(json.dumps({"payload": {
-        "role": "provider-response", "sha256": actor_digest, "turn": 1}}) + "\n")
+    (branch / "evidence.jsonl").write_text(json.dumps(evidence_ledger_rows([{
+        "role": "provider-response", "sha256": actor_digest, "turn": 1}])[0]) + "\n")
     cache = tmp_path / "cache.sqlite3"
     store = DashboardStore(campaign, cache)
     initial = store.trace_index(1, "vector-add")["events"]

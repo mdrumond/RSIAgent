@@ -497,14 +497,14 @@ class DashboardStore:
         return [project for project, identity in zip(proposed, proposed_ids)
                 if identity in selected] == approved
 
-    def _host_evidence(self, root, project_id):
+    @staticmethod
+    def _authenticated_ledger(path):
+        """Authenticate an EvidenceLedger-compatible JSONL without execution imports."""
         try:
-            raw_rows = (root / "project-evidence.jsonl").read_text().splitlines()
+            raw_rows = path.read_text().splitlines()
         except (OSError, TypeError):
-            return [self._event("Host verification unavailable", "verification",
-                                reason="retained host evidence ledger unavailable")]
-        rows = []
-        previous = "0" * 64
+            return None, "retained evidence ledger unavailable"
+        rows, previous = [], "0" * 64
         for position, raw in enumerate(raw_rows):
             try:
                 record = json.loads(raw, parse_constant=lambda value: (_ for _ in ()).throw(
@@ -530,8 +530,14 @@ class DashboardStore:
                 previous = record["entry_sha256"]
                 rows.append((record, raw + "\n", position))
             except (ValueError, TypeError, KeyError):
-                return [self._event("Host verification unavailable", "verification",
-                                    reason="host evidence ledger integrity verification failed")]
+                return None, "evidence ledger integrity verification failed"
+        return rows, None
+
+    def _host_evidence(self, root, project_id):
+        rows, error = self._authenticated_ledger(root / "project-evidence.jsonl")
+        if error:
+            return [self._event("Host verification unavailable", "verification",
+                                reason="host " + error)]
         by_digest = {record.get("entry_sha256"): (record, raw, position)
                      for record, raw, position in rows
                      if isinstance(record.get("entry_sha256"), str)}
@@ -601,15 +607,9 @@ class DashboardStore:
             "verifier-result": self._metadata(branch / "execution-evidence.bin"),
             "memory": self._metadata(branch / "memory-delta.bin"),
         }, "objects": {}}
-        try:
-            rows = ledger.read_text().splitlines()
-        except (OSError, TypeError):
-            rows = []
-        for raw in rows:
-            try:
-                digest = json.loads(raw).get("payload", {}).get("sha256")
-            except (ValueError, TypeError):
-                continue
+        rows, _ = self._authenticated_ledger(ledger)
+        for record, _, _ in rows or []:
+            digest = record["payload"].get("sha256")
             if isinstance(digest, str) and _SHA256.fullmatch(digest):
                 source = branch / "artifacts" / "objects" / digest[:2] / digest[2:]
                 manifest["objects"][digest] = self._metadata(source)
@@ -668,27 +668,25 @@ class DashboardStore:
         spec_body = (json.dumps(spec, indent=2, sort_keys=True) + "\n").encode()
         events.append(self._inline_event("Complete project specification", "project", spec_body))
         ledger = branch / "evidence.jsonl"
-        try:
-            rows = ledger.read_text().splitlines()
-        except OSError:
-            rows = []
+        rows, actor_error = self._authenticated_ledger(ledger)
         labels = {"provider-request": "Actor prompt", "provider-response": "Actor response",
                   "host-observation": "Host observation",
                   "provider-response-failure": "Actor response failure",
                   "provider-attempt-rejection": "Actor attempt rejection"}
-        for raw in rows:
-            try:
-                payload = json.loads(raw).get("payload", {})
-            except ValueError:
-                continue
-            role, digest = payload.get("role"), payload.get("sha256")
-            if role not in labels:
-                continue
-            source = (branch / "artifacts" / "objects" / digest[:2] / digest[2:]
-                      if isinstance(digest, str) and _SHA256.fullmatch(digest) else None)
-            event = self._artifact_event(labels[role], "actor", source, digest,
-                                         stage=payload.get("stage"), turn=payload.get("turn"))
-            events.append(event)
+        if actor_error:
+            events.append(self._event("Actor trace unavailable", "actor",
+                                      reason="actor " + actor_error))
+        else:
+            for record, _, _ in rows:
+                payload = record["payload"]
+                role, digest = payload.get("role"), payload.get("sha256")
+                if role not in labels:
+                    continue
+                source = (branch / "artifacts" / "objects" / digest[:2] / digest[2:]
+                          if isinstance(digest, str) and _SHA256.fullmatch(digest) else None)
+                event = self._artifact_event(labels[role], "actor", source, digest,
+                                             stage=payload.get("stage"), turn=payload.get("turn"))
+                events.append(event)
         events.extend(self._host_evidence(root, project_id))
         events.append(self._event("Verifier prompt", "verification", reason=(
             "unavailable: verification is deterministic and host-owned")))
