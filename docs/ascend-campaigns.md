@@ -95,10 +95,28 @@ Phase 2 additionally requires `--phase1-root` and `--review` at `start` (and the
 original Phase 1 initial memory as `--initial-memory`). The existing usefulness,
 diversity, and profiler-guidance review must pass. The launcher copies and
 verifies the reviewed snapshot once, then continues from that immutable copy:
-later Phase 1 continuation cannot silently change a Phase 2 lineage. Phase 2
-selects fresh projects serially, learning from both the reviewed seed and its own
-verified results. Existing fixed attention benchmarks remain separate compatibility
-entrypoints. A different reviewed seed requires a new Phase 2 campaign root.
+later Phase 1 continuation cannot silently change a Phase 2 lineage.
+
+New Phase 2 starts use `--project-target 1`. Without `--target-goal`, the curriculum
+authors a new bounded kernel goal using reviewed Phase 1 lessons and gated KDB
+searches when enabled. It rejects renamed Phase 1 tasks and unavailable tools.
+An independent Actor constructs a private reference; the host then executes it
+again through `qualify_target` before freezing the target. At most three candidate
+proposals are allowed, with actual reference failures fed back to the curriculum.
+Provider/transport interruptions retain the proposal and handles for `resume`;
+they do not consume another proposal. `goal-selection.json` exposes selection,
+qualification and terminal status before ordinary Phase 2 state exists. Private
+source, conversations and reference-generated lessons stay in the control
+directory's `bootstrap/`, never learner memory. Retain that directory alongside
+campaign archives to preserve qualification evidence.
+
+The learner attempts that fixed goal, performs focused curriculum-selected
+practice and retries, using three target attempts and at most two practice
+attempts between targets by default. Practice success alone is not readiness.
+An explicit `--target-goal` still accepts an already host-qualified contract;
+existing campaigns keep their retained behavior on resume. Fixed attention
+benchmarks remain separate compatibility entrypoints. A different reviewed seed
+requires a new Phase 2 campaign root.
 
 Collection discovers pending raw profiler reports, transfers one at a time,
 retains supported transport handles, backs off on poor links, and checks hashes;
