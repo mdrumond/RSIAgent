@@ -17,13 +17,16 @@ from .store import DashboardStore
 from .control import ControlError, ControlManager
 
 
-def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None):
+def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None,
+               optimizer_launcher=None):
     app = Flask(__name__)
     store = DashboardStore(config_path, cache_path)
     controls = ControlManager(config_path, cache_path, **(
         {"runner": command_runner} if command_runner is not None else {}))
     app.extensions["dashboard_controls"] = controls
     csrf_token = secrets.token_urlsafe(32)
+    from .optimizer import register_optimizer
+    register_optimizer(app, config_path, csrf_token, optimizer_launcher)
     last = [0.0]
 
     def view():

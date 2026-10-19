@@ -8,7 +8,9 @@ from .app import create_app
 
 def _controls_enabled(path):
     try:
-        return json.loads(Path(path).read_text()).get("controls", {}).get("enabled") is True
+        config = json.loads(Path(path).read_text())
+        return any(config.get(name, {}).get('enabled') is True
+                   for name in ('controls', 'optimizer'))
     except (OSError, ValueError, AttributeError):
         return False
 
@@ -33,7 +35,7 @@ def main(argv=None):
     serve.add_argument("--refresh-seconds", type=int, default=30)
     args = parser.parse_args(argv)
     if _controls_enabled(args.config) and not _loopback(args.host):
-        parser.error("controls-enabled dashboard must bind to a loopback host")
+        parser.error("controls-enabled dashboard must bind to a loopback host (including optimizer)")
     app = create_app(args.config, args.cache_dir / "dashboard.sqlite3",
                      refresh_seconds=args.refresh_seconds)
     app.run(host=args.host, port=args.port)

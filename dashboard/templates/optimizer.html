@@ -1,0 +1,23 @@
+{% extends 'base.html' %}{% block body %}
+<link rel="stylesheet" href="{{ url_for('static', filename='optimizer.css') }}">
+<div class="eyebrow">A3 / ASCEND C</div><h1>Kernel Optimizer</h1>
+<p class="lede">Optimize a Torch inference kernel using completed Phase 2 memory.</p>
+{% if not optimizer.enabled %}<aside class="warning">{{ optimizer.reason }}</aside>{% else %}
+<details open class="optimizer-panel"><summary>New optimization job</summary>
+<form id="optimizer-create">
+<label>Job name<input name="name" placeholder="My Torch kernel"></label>
+<label>Python source<textarea name="source" rows="10" spellcheck="false" placeholder="def forward(x):&#10;    return x + 1"></textarea></label>
+<label>Or upload Python file<input type="file" name="source_file" accept=".py,text/x-python"></label>
+<label>Function or class entrypoint<input name="entrypoint" required placeholder="forward or Model"></label>
+<label>Representative input signatures (JSON array)<textarea name="signature" rows="4" required spellcheck="false" placeholder='[{"args": [{"shape": [1024], "dtype": "float32"}]}]'></textarea></label>
+<div class="optimizer-grid"><label>Constructor arguments (JSON array)<input name="init_args" value="[]"></label>
+<label>Constructor keyword arguments (JSON object)<input name="init_kwargs" value="{}"></label></div>
+<label>Phase 2 memory<select name="memory_root" id="optimizer-memory" required disabled><option>Loading eligible memory…</option></select></label>
+<div id="optimizer-memory-status" aria-live="polite"></div>
+<div class="optimizer-grid"><label>Candidate attempts<input name="max_attempts" type="number" min="1" value="25" required></label>
+<label>Time budget (seconds)<input name="max_seconds" type="number" min="1" value="7200" required></label></div>
+<button id="optimizer-start" disabled>Start optimization</button><p id="optimizer-message" role="status"></p>
+</form></details>
+<section><h2>Jobs</h2><div id="optimizer-jobs">{% for job in jobs %}<a class="card" href="{{ url_for('optimizer_job', job_id=job.job_id) }}"><b>{{ job.name or job.job_id }}</b> — {{ job.status }} / {{ job.stage }}</a>{% else %}<p>No optimization jobs yet.</p>{% endfor %}</div></section>
+{% endif %}<script src="{{ url_for('static', filename='optimizer.js') }}" defer></script>
+{% endblock %}
