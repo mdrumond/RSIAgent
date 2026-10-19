@@ -1,5 +1,6 @@
 """Resumable curriculum-authored goals, qualified outside learner memory."""
 from copy import copy
+from dataclasses import replace
 import base64
 import json
 from pathlib import Path
@@ -8,7 +9,7 @@ from types import SimpleNamespace
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
-from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum import Capability, FailureMode, ProjectSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import _grammar, _HELD_OUT_WORDS
 from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
 from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
@@ -208,9 +209,16 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
             if source_path.exists():
                 source = store.read_bytes(_read(source_path)["source_sha256"]).decode()
             else:
-                inputs = materialize_inputs(spec)
-                result = reference_actor(AdaptiveProjectRequest(spec, 0, seed, branch,
-                    inputs, evaluate_reference(spec, inputs), memory_root=coordinator.root))
+                # The private construction task needs numerical feasibility, not
+                # teaching exercises or measurements. Re-execute the ORIGINAL
+                # spec below: its deterministic inputs and oracle remain frozen.
+                reference_spec = replace(spec, capabilities=tuple(item for item in spec.capabilities
+                    if item not in {Capability.PROFILING, Capability.TIMING_SWEEP, Capability.FAILURE_REPAIR})
+                    or (Capability.GM_UB_MOVEMENT,),
+                    failure_mode=FailureMode.NONE, timing_lengths=(), profile_metric=None, learning_focus=())
+                inputs = materialize_inputs(reference_spec)
+                result = reference_actor(AdaptiveProjectRequest(reference_spec, 0, seed, branch,
+                    inputs, evaluate_reference(reference_spec, inputs), memory_root=coordinator.root))
                 if not result.evidence.verified:
                     raise ValueError("private reference Actor did not pass host verification: " + result.summary)
                 source_sha = json.loads(result.evidence_payload)["source_sha256"]

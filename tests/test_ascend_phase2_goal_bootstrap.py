@@ -54,7 +54,7 @@ def setup(tmp_path, responses, *, failure=None, query=None):
     coordinator.root = root
     def run():
         return bootstrap_goal(coordinator, root=root, private_root=tmp_path / "control" / "bootstrap",
-                              objective="Optimize a new task", available_tools=())
+                              objective="Optimize a new task", available_tools=getattr(run, "available_tools", ()))
     run.coordinator = coordinator
     return run, root, calls, messages, actor, backend
 
@@ -197,3 +197,40 @@ def test_goal_can_follow_memory_hashes_to_historical_source_and_host_evidence_on
     assert "actual candidate source" in json.dumps(messages[-1])
     assert json.loads(json.loads(messages[-1][-1]["content"])["text"])["host"] == "verified"
     assert json.loads((root / "goal-selection.json").read_bytes())["proposal_count"] == 1
+
+
+def test_actual_reference_actor_can_submit_profile_timing_goal_without_measurements(tmp_path):
+    from dataclasses import replace
+    from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
+    from benchmarks.a5kernels.phase1_memory import parse_agent_distillation
+    from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
+    from benchmarks.a5kernels.trial import ActorOutcome
+    from tests.test_a5_phase2_adaptive_memory import _source
+    class Driver:
+        def __call__(self, instruction, *, turn_parser, action_executor, **kwargs):
+            assert "Private reference" in instruction
+            for ordinal, text in enumerate(('{"write":{"slot":"kernel","content":"fixed source"}}',
+                                             '{"run":{}}', '{"submit":{}}'), 1):
+                outcome = action_executor(turn_parser(text))
+            assert outcome.terminal and outcome.status == "host-verified"
+            return ActorOutcome(outcome.status, ordinal, 10)
+        def distill(self, outcome, *, admitted_artifacts, **kwargs):
+            text = '{"distillation":{"no_new_knowledge":true,"lessons":[]}}'
+            return replace(outcome, terminal_response=text,
+                           distillation=parse_agent_distillation(text, admitted_artifacts))
+    value = project(1)
+    value.update(capabilities=[*value["capabilities"], "profiling", "timing-sweep", "failure-repair"],
+                 profile_metric="pipe-utilization", timing_lengths=[257, 258], failure_mode="compile",
+                 learning_focus=["sync-performance"])
+    run, root, _, _, actor, backend = setup(tmp_path, [json.dumps({"project": value, "rationale": "new timed goal"})])
+    _, source, review, _ = _source(tmp_path / "history")
+    run.coordinator.snapshot = admit_adaptive_snapshot(tmp_path / "history/adaptive", b"", review, source, root)
+    def forbidden(*args):
+        raise AssertionError("reference measurement leaked to learner")
+    run.coordinator.execute_project = AdaptiveActorProjectExecutor(actor.executor, Driver(), object(),
+        request_profile=forbidden, request_timing=forbidden, request_diagnostic=forbidden)
+    run.available_tools = ("request-profile", "request-timing")
+    target, _ = run()
+    assert target.spec.as_dict() == value
+    assert backend.compile_requests[-1].spec == target.spec
+    assert backend.compile_requests[0].spec.timing_lengths == ()
