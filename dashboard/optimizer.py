@@ -60,6 +60,36 @@ class OptimizerDashboard:
         except FileNotFoundError:
             return False
 
+    def resume_action(self, job_id, data, receipt, intent):
+        """Replay a durable launch intent without granting the budget twice."""
+        job = self.store.get(job_id)
+        if intent.get('state') != 'resume-prepared':
+            if self.worker_active(job_id):
+                raise ValueError('cannot resume while the worker is active')
+            self.store._budget(data.get('additional_attempts'), data.get('additional_seconds'))
+            if job['status'] not in {'stopped', 'budget-exhausted', 'failed'}:
+                raise ValueError('job must be stopped before resume')
+            intent.update(state='resume-prepared',
+                before=[job['max_attempts'], job['max_seconds']],
+                expected=[job['max_attempts'] + data['additional_attempts'],
+                          job['max_seconds'] + data['additional_seconds']])
+            atomic(receipt, canonical(intent))
+        budget = [job['max_attempts'], job['max_seconds']]
+        if budget == intent['before']:
+            if self.worker_active(job_id):
+                raise ValueError('cannot resume while the worker is active')
+            job = self.store.resume(job_id,
+                additional_attempts=data['additional_attempts'],
+                additional_seconds=data['additional_seconds'])
+        elif budget != intent['expected']:
+            raise ValueError('resume intent conflicts with the current job budget')
+        # A prior launch may have succeeded before the completed receipt landed.
+        # The worker lock prevents concurrent execution if launch is retried.
+        if job['status'] == 'queued' and not self.worker_active(job_id):
+            self.launch(job_id)
+        atomic(receipt, canonical({'fingerprint': intent['fingerprint'], 'job_id': job_id}))
+        return self.store.get(job_id)
+
     def action(self, action, job_id, data, key):
         if not key or len(key) > 200:
             raise ValueError('Idempotency-Key is required (maximum 200 characters)')
@@ -71,6 +101,8 @@ class OptimizerDashboard:
                 previous = json.loads(receipt.read_bytes())
                 if previous['fingerprint'] != fingerprint:
                     raise ValueError('idempotency key reused with different action')
+                if previous.get('state') == 'resume-prepared':
+                    return self.resume_action(job_id, data, receipt, previous)
                 return self.store.get(previous['job_id'])
             # Creation takes its own store lock, so release it before creating.
             if action != 'create':
@@ -84,10 +116,8 @@ class OptimizerDashboard:
                         raise ValueError('recover requires an inactive worker awaiting observation')
                     self.launch(job_id)
                 else:
-                    job = self.store.resume(job_id,
-                        additional_attempts=data.get('additional_attempts'),
-                        additional_seconds=data.get('additional_seconds'))
-                    self.launch(job_id)
+                    return self.resume_action(job_id, data, receipt,
+                        {'fingerprint': fingerprint, 'job_id': job_id})
                 atomic(receipt, canonical({'fingerprint': fingerprint, 'job_id': job_id}))
                 return self.store.get(job_id)
         source = data.get('source', '')

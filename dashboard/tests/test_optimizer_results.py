@@ -172,3 +172,49 @@ def test_reconnect_only_relaunches_inactive_observation_without_budget(setup, ex
     assert len(launched) == 1
     store._update(key, 'evaluating', lambda row: row.update(stage='evaluating'))
     assert client.post(url, json={}, headers=headers(client, 'not-pending')).status_code == 409
+
+
+def test_resume_rejects_active_final_worker_without_mutation(setup):
+    app, _, launched = setup
+    store = app.extensions['optimizer'].store
+    key = store.create('def f(x): return x', 'f', {}, {}, max_attempts=1)['job_id']
+    store.transition(key, 'running')
+    store.record_attempt(key, candidate_sha256='a', result='evaluating')
+    before = store.get(key)
+    client = app.test_client()
+    with (store._directory(key) / 'worker.lock').open('wb') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        response = client.post(f'/api/optimizer/jobs/{key}/resume',
+            json={'additional_attempts': 2, 'additional_seconds': 30},
+            headers=headers(client, 'resume-active'))
+    assert response.status_code == 409
+    assert store.get(key) == before and launched == []
+
+
+@pytest.mark.parametrize('transition_applied', [False, True])
+def test_resume_retries_after_transition_before_launch(setup, monkeypatch, transition_applied):
+    app, config, launched = setup
+    manager = app.extensions['optimizer']
+    store = manager.store
+    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
+    store.stop(key)
+    before = store.get(key)
+    original = store.resume
+    def crash(*args, **kwargs):
+        if transition_applied:
+            original(*args, **kwargs)
+        raise RuntimeError('dashboard process lost around durable resume')
+    monkeypatch.setattr(store, 'resume', crash)
+    data = {'additional_attempts': 2, 'additional_seconds': 30}
+    with pytest.raises(RuntimeError):
+        manager.action('resume', key, data, 'resume-crash')
+    assert store.get(key)['status'] == ('queued' if transition_applied else 'stopped')
+    assert not launched
+    # Reconstruct the manager just as a dashboard restart does.
+    restarted = type(manager)(config, launcher=manager.launcher)
+    result = restarted.action('resume', key, data, 'resume-crash')
+    assert len(launched) == 1
+    assert result['max_attempts'] == before['max_attempts'] + 2
+    assert result['max_seconds'] == before['max_seconds'] + 30
+    assert restarted.action('resume', key, data, 'resume-crash') == result
+    assert len(launched) == 1
