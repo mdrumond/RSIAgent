@@ -115,3 +115,27 @@ def test_compiler_diagnostics_are_returned_for_agent_repair(tmp_path, monkeypatc
     monkeypatch.setattr(native, '_compile_case', fail)
     result = native.evaluate(reference(), 'bad', tmp_path, device='cpu', arch='test')
     assert 'unknown identifier MissingApi' in result['cases'][0]['compiler_diagnostics']
+
+
+def test_padded_module_state_layout_survives_verification_and_timing(tmp_path, monkeypatch):
+    spec = {'source': 'class Model(torch.nn.Module):\n def __init__(self):\n  super().__init__()\n  self.register_buffer("weight", torch.arange(8.).reshape(2, 4)[:, :3])\n def forward(self, x): return x + self.weight',
+            'entrypoint': 'Model', 'signatures': [{'args': [{'shape': [2, 3], 'dtype': 'float32'}]}]}
+    prepared = prepare_reference(spec, max_cases=1)
+    calls = []
+
+    def compile_case(source, contract, directory, **kwargs):
+        def run(inputs, states):
+            assert list(states[0].stride()) == contract['state'][0]['strides'] == [4, 1]
+            calls.append('run')
+            return [inputs[0] + states[0]]
+        return run, {}
+
+    def benchmark(fn, directory, **kwargs):
+        fn()
+        return {'latency_us': 1}
+
+    monkeypatch.setattr(native, '_compile_case', compile_case)
+    monkeypatch.setattr(native, '_benchmark', benchmark)
+    result = native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test', benchmark=True)
+    assert result['status'] == 'verified', result
+    assert calls == ['run', 'run']  # verification and timed Ascend C callable

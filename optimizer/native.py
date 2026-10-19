@@ -76,6 +76,13 @@ def _state(prepared):
     return list(prepared.model.state_dict().items()) if isinstance(prepared.model, torch.nn.Module) else []
 
 
+def _copy_state(prepared):
+    import torch
+    # clone() compacts padded views, invalidating the advertised STATE_STRIDE ABI.
+    return [torch.empty_strided(x.shape, x.stride(), dtype=x.dtype, device=x.device).copy_(x)
+            for _, x in _state(prepared)]
+
+
 def describe_case(prepared, row):
     """Ordered ABI: tensor inputs, module-state tensors, then tensor outputs.
 
@@ -217,7 +224,7 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
             def fresh(row=row, run=run):
                 args, kwargs = copy.deepcopy((row['args'], row['kwargs']))
                 tensors = [x for x in list(args) + list(kwargs.values()) if isinstance(x, torch.Tensor)]
-                states = [x.clone() for _, x in _state(prepared)]
+                states = _copy_state(prepared)
                 before = _input_state(args, kwargs), [_tensor_identity(x) for x in states]
                 output = list(run(tensors, states))
                 if device.startswith('npu'):
@@ -243,7 +250,7 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
             # All input copies happen before capture; verified kernels cannot mutate them.
             args, kwargs = copy.deepcopy((row['args'], row['kwargs']))
             tensors = [x for x in list(args) + list(kwargs.values()) if isinstance(x, torch.Tensor)]
-            states = [x.clone() for _, x in _state(prepared)]
+            states = _copy_state(prepared)
             functions = {'torch': lambda args=args, kwargs=kwargs: prepared.invoke(*args, **kwargs),
                          'ascendc': lambda run=run, tensors=tensors, states=states: run(tensors, states)}
             identity = {k: result[k] for k in ('candidate_sha256', 'suite_sha256', 'arch', 'device')}
