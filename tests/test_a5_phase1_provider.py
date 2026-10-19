@@ -186,7 +186,7 @@ def test_openai_transport_bounds_each_attempt_and_disables_sdk_retries(monkeypat
     assert constructor == [{
         "api_key": "secret",
         "base_url": "https://provider.invalid",
-        "timeout": 120,
+        "timeout": 600,
         "max_retries": 0,
     }]
 
