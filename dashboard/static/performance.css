@@ -8,6 +8,8 @@
 .plot-point.unavailable { fill: transparent; stroke: var(--muted); }
 .plot-point:focus { outline: none; stroke: #fff; stroke-width: 4; }
 .tick { fill: var(--muted); font-size: 9px; text-anchor: middle; }
+.axis-label { fill: var(--ink); font-size: 11px; text-anchor: middle; }
+.axis-value { fill: var(--muted); font-size: 9px; text-anchor: end; }
 .tick.aic { fill: var(--acid); }
 .tick.aiv { fill: var(--cyan); }
 .performance-table, .pipe-table { overflow: auto; }
