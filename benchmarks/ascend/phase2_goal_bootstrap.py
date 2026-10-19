@@ -13,7 +13,7 @@ from benchmarks.a5kernels.phase1_curriculum_selector import _grammar, _HELD_OUT_
 from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
 from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
 from .phase2_targets import TargetContract, qualify_target
-from .agent_presentation import memory_presentation, compact_observation, artifact_page_presentation
+from .agent_presentation import MemoryArtifactReader, memory_presentation, compact_observation, artifact_page_presentation
 
 
 def executable_identity(spec):
@@ -38,7 +38,9 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
     root, private_root = Path(root), Path(private_root)
     private_root.mkdir(parents=True, exist_ok=True)
     actor = coordinator.execute_project
-    from benchmarks.a5kernels.phase1_adaptive_actor import disabled_knowledge_action
+    from benchmarks.a5kernels.phase1_adaptive_actor import (
+        disabled_knowledge_action, disabled_profile_action, disabled_diagnostic_action,
+    )
     knowledge_enabled = actor.query_knowledge is not disabled_knowledge_action
     runtime = actor.executor.runtime_identity
     if runtime is None:
@@ -87,6 +89,12 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
     # Reference and learner get separate conversations, artifacts, evidence and ledger.
     reference_actor = copy(actor)
     reference_actor.trace_recorder_factory = None
+    reference_actor.request_profile = reference_actor.request_timing = disabled_profile_action
+    reference_actor.request_diagnostic = disabled_diagnostic_action
+    reference_actor.diagnostic_instructions = (
+        "Private reference construction establishes numerical feasibility only. "
+        "Timing, profiling, debugger and sanitizer actions are disabled here; "
+        "do not request them. Write, compile, run, inspect host errors, then submit.\n")
     reference_actor.executor = copy(actor.executor)
     from benchmarks.a5kernels.evidence import EvidenceLedger
     reference_actor.executor._ledger = EvidenceLedger(private_root / "reference-evidence.jsonl")
@@ -108,6 +116,7 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
         "Memory index is presentation only; original memories and observations are hash-addressed. "
         "When KDB is available, search it before proposing the goal.")}
     memory = memory_presentation(seed, store)
+    historical_reader = None
     while state["proposal_count"] < 3 or state["stage"] == "qualification":
         if state["stage"] == "selection":
             messages = [system, {"role": "user", "content": json.dumps(dict(
@@ -132,8 +141,15 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                     if isinstance(value, dict) and set(value) == {"read_artifact"} and query_index < 6:
                         try:
                             result = artifact_page_presentation(value["read_artifact"], store)
-                        except FileNotFoundError as error:
-                            raise ValueError("requested memory artifact was not retained") from error
+                        except FileNotFoundError:
+                            if historical_reader is None:
+                                historical_reader = MemoryArtifactReader(SimpleNamespace(
+                                    pre_wave_memory=seed, memory_root=coordinator.root,
+                                    branch_root=private_root), store)
+                            try:
+                                result = artifact_page_presentation(value["read_artifact"], historical_reader)
+                            except FileNotFoundError as error:
+                                raise ValueError("requested memory artifact was not retained") from error
                         messages.append({"role": "user", "content": json.dumps(result)})
                         continue
                     if isinstance(value, dict) and set(value) == {"query"} and query_index < 6 and query_count < 3:

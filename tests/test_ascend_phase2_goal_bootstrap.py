@@ -30,6 +30,10 @@ def setup(tmp_path, responses, *, failure=None, query=None):
         def __call__(self, request):
             calls.append(request)
             assert self.trace_recorder_factory is None
+            if getattr(self, "check_private_routes", False):
+                for name in ("request_profile", "request_timing", "request_diagnostic"):
+                    assert getattr(self, name)({}, None).observation["available"] is False
+                assert "do not request" in self.diagnostic_instructions
             if failure:
                 failure(len(calls))
             digest = ContentAddressedArtifacts(request.branch_root / "artifacts").put_bytes(b"PRIVATE SOURCE")
@@ -163,3 +167,33 @@ def test_64_large_memories_and_tool_reads_fit_provider_budget_without_losing_see
     assert calls[0].memory_root == run.coordinator.root
     readable = memory_presentation(calls[0].pre_wave_memory, ContentAddressedArtifacts(tmp_path / "presentation"))
     assert len(readable["projects"]) == 64 and "preview" not in readable
+
+
+def test_reference_never_invokes_measurement_routes_bound_to_learner(tmp_path):
+    run, root, _, _, actor, _ = setup(tmp_path, [proposal()])
+    def learner_route(payload, context):
+        (root / "LEAKED-REFERENCE-SOURCE").write_text("must not happen")
+        raise AssertionError("private reference invoked learner measurement route")
+    actor.request_profile = actor.request_timing = actor.request_diagnostic = learner_route
+    actor.check_private_routes = True
+    run()
+    assert not (root / "LEAKED-REFERENCE-SOURCE").exists()
+    assert actor.request_profile is actor.request_timing is actor.request_diagnostic is learner_route
+
+
+def test_goal_can_follow_memory_hashes_to_historical_source_and_host_evidence_on_resume(tmp_path):
+    from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
+    from tests.test_a5_phase2_adaptive_memory import _source
+    _, source, review, memory = _source(tmp_path / "history")
+    source_read = json.dumps({"read_artifact": {"sha256": memory["source_revision"]}})
+    evidence_read = json.dumps({"read_artifact": {"sha256": memory["host_facts"][0]["evidence_sha256"]}})
+    run, root, _, messages, _, _ = setup(tmp_path,
+        [source_read, OSError("provider unavailable"), evidence_read, proposal()])
+    reviewed = admit_adaptive_snapshot(tmp_path / "history/adaptive", b"", review, source, root)
+    run.coordinator.snapshot = reviewed
+    with pytest.raises(OSError):
+        run()
+    run()
+    assert "actual candidate source" in json.dumps(messages[-1])
+    assert json.loads(json.loads(messages[-1][-1]["content"])["text"])["host"] == "verified"
+    assert json.loads((root / "goal-selection.json").read_bytes())["proposal_count"] == 1
