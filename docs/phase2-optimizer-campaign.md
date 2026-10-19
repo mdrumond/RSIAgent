@@ -51,6 +51,10 @@ source treatment, and stalled/incomplete predecessors are rejected rather than
 silently treated as success. Normally list only the latest READY predecessor: its
 seed already contains earlier learning. A stalled goal can be retained for review
 while the next fresh goal uses the most recent READY predecessor instead.
+Once initialized, resume authenticates the retained portable `seed-memory.json`
+without reopening predecessor folders; those folders may be archived or moved.
+The retained seed must preserve every original reviewed lesson/file unchanged,
+and inherited lessons must retain their committed attempt and artifact evidence.
 
 `compose_prior_campaigns(reviewed_seed, predecessors)` returns a portable seed
 with cumulative lessons and content-addressed evidence, without recursively

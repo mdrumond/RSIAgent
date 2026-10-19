@@ -203,7 +203,7 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
     from optimizer.worker import load_config, knowledge_query
     from .phase2_optimizer_execution import OptimizerTaskExecutor
     from .phase2_optimizer_campaign import OptimizerPhase2Coordinator
-    from .phase2_optimizer_continuation import compose_prior_campaigns
+    from .phase2_optimizer_continuation import campaign_seed
 
     path = settings.get("optimizer_worker_config")
     if not path:
@@ -227,8 +227,8 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
                 or selected["manifest"] != reviewed["kdb_manifest"]):
             raise ValueError("optimizer KDB manifest differs from reviewed Phase 1")
     query = knowledge_query(config, Path(job["root"]) / "curriculum")
-    seed = compose_prior_campaigns(freeze_reviewed_phase1(snapshot),
-                                  settings.get("optimizer_prior_campaigns", []))
+    seed = campaign_seed(job["root"], freeze_reviewed_phase1(snapshot),
+                         settings.get("optimizer_prior_campaigns", []))
     return OptimizerPhase2Coordinator(job["root"], job["objective"], seed,
         composed.curriculum._complete,
         lambda directory, task, memory: OptimizerTaskExecutor(directory, task, memory, config),
