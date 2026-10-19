@@ -240,8 +240,8 @@ def build_native_adaptive_phase1(
                                        target=config.target, arch=config.arch,
                                        profile=config.execution_profile)
         executor = ProjectExecutor(backend, EvidenceLedger(root / "project-evidence.jsonl"),
-                                   binding=NativeProjectBinding(dtypes=config.dtypes))
-        executor.runtime_identity = native_target_runtime(config, native_transport)
+                                   binding=NativeProjectBinding(dtypes=config.dtypes),
+                                   runtime_identity=native_target_runtime(config, native_transport))
     context = canonical_bytes({"identity": identity, "programming_guide": guide_text})
     diagnostics = "Debugger and sanitizer routes are unavailable in this native composition.\n"
     pool = None
@@ -252,8 +252,8 @@ def build_native_adaptive_phase1(
                 target=config.target, arch=config.arch, profile=config.execution_profile)
             worker_executor = ProjectExecutor(worker_backend,
                 EvidenceLedger(worker.root / "project-evidence.jsonl"),
-                binding=NativeProjectBinding(dtypes=config.dtypes))
-            worker_executor.runtime_identity = native_target_runtime(config, worker.transport)
+                binding=NativeProjectBinding(dtypes=config.dtypes),
+                runtime_identity=native_target_runtime(config, worker.transport))
             actors.append(AdaptiveActorProjectExecutor(worker_executor, actor, profile,
                 query_knowledge=query, request_profile=worker.request_profile,
                 request_timing=worker.request_timing, immutable_context=context,

@@ -381,9 +381,9 @@ def build_adaptive_phase1(
         device=paths.device,
     )
     executor = ProjectExecutor(
-        backend, EvidenceLedger(paths.root / "project-evidence.jsonl")
+        backend, EvidenceLedger(paths.root / "project-evidence.jsonl"),
+        runtime_identity=lambda: catlass_target_runtime(paths, command),
     )
-    executor.runtime_identity = lambda: catlass_target_runtime(paths, command)
     from benchmarks.a5kernels.phase1_project_measurements import ProjectMeasurementBackend
     measurements = ProjectMeasurementBackend(
         backend,

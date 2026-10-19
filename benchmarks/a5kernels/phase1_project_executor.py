@@ -261,15 +261,6 @@ class ProjectExecutor:
         self._runtime_identity = identity
 
     @property
-    def runtime_identity(self):
-        identity = getattr(self, "_runtime_identity", None)
-        return identity() if callable(identity) else identity
-
-    @runtime_identity.setter
-    def runtime_identity(self, identity):
-        self._runtime_identity = identity
-
-    @property
     def supported_tools(self):
         return tuple(getattr(self._binding, "supported_tools", ()))
 
