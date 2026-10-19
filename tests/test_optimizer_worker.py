@@ -307,6 +307,9 @@ def test_remote_backend_hydrates_authenticated_evidence_without_resubmission(tmp
                 shutil.copyfile(remote_result / 'compact.tar.gz', destination)
         def execute(self, directory, argv):
             self.executions += 1
+            # Keep the workload in its retained command's process group so
+            # exact-handle cancellation also reaches Python/compiler children.
+            assert 'timeout --foreground --signal=TERM' in argv[-1]
     transport = Transport()
     backend = RemoteBackend(store, job, config(tmp_path), transport=transport)
     directory = store.root / job / 'execution' / 'candidate'
@@ -554,3 +557,34 @@ def test_injected_worker_routes_stop_and_pins_transport_identity(tmp_path):
     settings['transport_identity'] = 'test-transport-v2'
     with pytest.raises(ValueError, match='changed on resume'):
         run_worker(store.root, key, settings, agent=agent, transport_factory=factory)
+
+
+@pytest.mark.parametrize('boundary', ['deadline', 'stop', 'client-timeout', 'failed-cancel', 'unknown-dispatch'])
+def test_interrupted_observation_cancels_only_known_operation_at_real_stop(tmp_path, boundary):
+    import time
+    stopped = False
+    calls = []
+    transport = None
+    def run(argv, **kwargs):
+        nonlocal stopped
+        calls.append(argv)
+        if 'cancel' in argv:
+            return SimpleNamespace(returncode=1 if boundary == 'failed-cancel' else 0, stdout='', stderr='')
+        stopped = boundary != 'client-timeout'
+        if boundary == 'deadline':
+            transport.deadline = time.monotonic() - 1
+        output = '' if boundary == 'unknown-dispatch' else (
+            'BZ_A3_REMOTE_HANDLE=remote:bz-a3-1:job:deadline-test\n'
+            'CATLASS_VALIDATION_HANDLE=bz-a3-1:deadline-test\n')
+        return SimpleNamespace(returncode=-15, stdout=output, stderr='', interrupted=True)
+    transport = CheckedTransport(config(tmp_path), run=run,
+        stopped=lambda: stopped or time.monotonic() >= transport.deadline)
+    error = WorkerStopped if boundary in {'deadline', 'stop'} else ObservationUnavailable
+    with pytest.raises(error):
+        transport.execute(tmp_path / 'profile', ['true'])
+    cancelled = [argv for argv in calls if 'cancel' in argv]
+    assert bool(cancelled) == (boundary in {'deadline', 'stop', 'failed-cancel'})
+    if cancelled:
+        assert cancelled[0][-1] == 'remote:bz-a3-1:job:deadline-test'
+    state = json.loads((tmp_path / 'profile/transport.json').read_text())
+    assert (state['state'] == 'cancelled') == (boundary in {'deadline', 'stop'})

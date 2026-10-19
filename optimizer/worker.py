@@ -98,7 +98,7 @@ class RemoteBackend:
         command = (f'test -d {quoted(self.config["remote_workspace"])} && mkdir -p {quoted(str(remote_directory))} '
                    f'&& tar -xzf {quoted(str(upload))} -C {quoted(str(remote_directory))} '
                    f'&& cd {quoted(str(remote_directory / "source"))} '
-                   f'&& timeout --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
+                   f'&& timeout --foreground --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
                    f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
         failure = None
         try:
