@@ -161,6 +161,9 @@ class AdaptivePhase1Coordinator:
         return json.loads(path.read_bytes()).get("project_target", 64) if path.exists() else 64
 
     def run(self) -> dict[str, object]:
+        return self._run()
+
+    def _run(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
         pending = self._load_pending(state)
         if pending is not None and (
@@ -172,6 +175,7 @@ class AdaptivePhase1Coordinator:
             raise ValueError("use continue_campaign to change the retained project target")
         state = {**state, "project_target": self.project_target}
         self._atomic_json(self.root / "state.json", state)
+        executed_waves = 0
         while True:
             if state["terminal"] is not None:
                 return self._report(state)
@@ -181,6 +185,8 @@ class AdaptivePhase1Coordinator:
             pending = self._load_pending(state)
             completed = self._completed_attempts(state)
             if pending is None:
+                if approved_only:
+                    raise ValueError("no approved wave is pending")
                 if self.max_projects is not None and completed >= self.max_projects:
                     state = {**state, "terminal": {
                         "status": "PROJECT_LIMIT_REACHED",
@@ -239,6 +245,117 @@ class AdaptivePhase1Coordinator:
             state = self._publish(state, wave, pending, deltas)
             self._atomic_json(self.root / "state.json", state)
             (self.root / "pending.json").unlink(missing_ok=True)
+            executed_waves += 1
+            if wave_limit is not None and executed_waves >= wave_limit:
+                return self._report(state)
+
+    def propose_wave(self):
+        """Select a wave without admitting it for execution."""
+        state = self._load_state()
+        if self._load_pending(state) is not None:
+            raise ValueError("a pending wave already exists")
+        if state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target:
+            raise ValueError("campaign cannot accept another proposal")
+        snapshot = self._memory_snapshot(state)
+        completed = self._completed_attempts(state)
+        decision, session = self.curriculum.select(
+            self._context(state, snapshot), self._session(state),
+            remaining_projects=min(
+                self.project_target - len(state["prior_outcomes"]),
+                self.max_projects - completed if self.max_projects is not None
+                else self.project_target,
+            ),
+        )
+        if isinstance(decision, TerminalDecision):
+            return {"terminal": {"status": decision.status, "reason": decision.reason},
+                    "base_wave_index": state["wave_index"],
+                    "base_memory_sha256": hashlib.sha256(snapshot).hexdigest(),
+                    "session": self._session_dict(session)}
+        return {"schema": PENDING_SCHEMA, "base_wave_index": state["wave_index"],
+                "base_memory_sha256": hashlib.sha256(snapshot).hexdigest(),
+                "wave": decision.wave.as_dict(), "session": self._session_dict(session)}
+
+    def validate_proposal(self, proposal):
+        state = self._load_state()
+        snapshot = self._memory_snapshot(state)
+        if (proposal.get("base_wave_index") != state["wave_index"]
+                or proposal.get("base_memory_sha256") != hashlib.sha256(snapshot).hexdigest()):
+            raise ValueError("proposal no longer matches published memory")
+        if "wave" in proposal:
+            WaveSpec.from_mapping(proposal["wave"])
+        return state
+
+    def approve_wave(self, proposal, selected_project_ids):
+        """Admit a selected proposal subset as the coordinator's pending wave."""
+        self.validate_proposal(proposal)
+        selected = tuple(selected_project_ids)
+        if "terminal" in proposal:
+            if selected:
+                raise ValueError("terminal approval requires zero project IDs")
+            return proposal
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("approved project IDs must be non-empty and unique")
+        wave = proposal["wave"]
+        available = {row["spec"]["project_id"] for row in wave["projects"]}
+        if not set(selected) <= available:
+            raise ValueError("approved project ID is not in the proposal")
+        if getattr(self, "approval_cardinality", None) is not None and len(selected) != self.approval_cardinality:
+            raise ValueError("Phase 2 approval requires exactly one project")
+        approved = {**proposal, "wave": {**wave, "projects": [
+            row for row in wave["projects"] if row["spec"]["project_id"] in selected
+        ]}}
+        WaveSpec.from_mapping(approved["wave"])
+        retained = self._proposal_pending(proposal)
+        if retained is not None:
+            retained_ids = tuple(row["spec"]["project_id"] for row in retained["wave"]["projects"])
+            approved_ids = tuple(row["spec"]["project_id"] for row in approved["wave"]["projects"])
+            if retained_ids != approved_ids:
+                raise ValueError("proposal already has a different approved subset")
+            return retained
+        self._atomic_json(self.root / "pending.json", approved)
+        return approved
+
+    def _proposal_pending(self, proposal):
+        state = self.validate_proposal(proposal)
+        pending = self._load_pending(state)
+        if pending is None:
+            return None
+        proposed_wave, pending_wave = proposal.get("wave"), pending.get("wave")
+        if proposed_wave is None or pending_wave is None:
+            raise ValueError("pending wave does not belong to the retained proposal")
+        proposed = {row["spec"]["project_id"]: row for row in proposed_wave["projects"]}
+        pending_projects = pending_wave["projects"]
+        same_wave = ({key: value for key, value in proposed_wave.items() if key != "projects"}
+                     == {key: value for key, value in pending_wave.items() if key != "projects"})
+        if (not same_wave or pending.get("session") != proposal.get("session")
+                or not pending_projects
+                or any(proposed.get(row["spec"]["project_id"]) != row
+                       for row in pending_projects)):
+            raise ValueError("pending wave does not belong to the retained proposal")
+        return pending
+
+    def discard_proposal(self, proposal):
+        """Remove only a pending subset authenticated as part of this proposal."""
+        pending = self._proposal_pending(proposal)
+        if pending is not None:
+            (self.root / "pending.json").unlink()
+
+    def run_approved_wave(self):
+        return self._run(wave_limit=1, approved_only=True)
+
+    def run_approved_proposal(self, proposal):
+        """Commit one approved wave or a bound terminal curriculum decision."""
+        if "terminal" not in proposal:
+            return self.run_approved_wave()
+        state = self.validate_proposal(proposal)
+        if state["terminal"] is not None:
+            if state["terminal"] != proposal["terminal"]:
+                raise ValueError("campaign has a different terminal decision")
+            return self._report(state)
+        state = {**state, "session": proposal["session"],
+                 "terminal": proposal["terminal"]}
+        self._atomic_json(self.root / "state.json", state)
+        return self._report(state)
 
     def resume(self) -> dict[str, object]:
         return self.run()

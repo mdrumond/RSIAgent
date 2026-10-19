@@ -130,6 +130,52 @@ def test_invalid_curriculum_selection_is_corrected_before_execution_and_publicat
     assert len(calls) == 3
 
 
+def test_proposal_subset_executes_one_wave_without_selecting_again(tmp_path):
+    calls = []
+    executed = []
+
+    def complete(messages):
+        calls.append(messages)
+        return _wave(messages[-1]["content"], [
+            _project("one", "gm-ub-movement"),
+            _project("two", "padded-tail"),
+        ])
+
+    def execute(request):
+        executed.append(request.spec.project_id)
+        return _result(request.spec, True, "verified")
+
+    coordinator = AdaptivePhase1Coordinator(
+        tmp_path / "approved", "Learn bounded skills.", SEED,
+        CurriculumAgent(complete), execute, max_parallel=1, project_target=4,
+    )
+    proposal = coordinator.propose_wave()
+    coordinator.approve_wave(proposal, ("two",))
+    result = coordinator.run_approved_wave()
+    assert result["published_projects"] == ["two"]
+    assert executed == ["two"]
+    assert len(calls) == 1
+    with pytest.raises(ValueError, match="approved wave"):
+        coordinator.run_approved_wave()
+
+
+def test_proposal_is_bound_to_current_state(tmp_path):
+    root = tmp_path / "stale"
+    coordinator = AdaptivePhase1Coordinator(
+        root, "Learn bounded skills.", SEED,
+        CurriculumAgent(lambda messages: _wave(messages[-1]["content"], [
+            _project("one", "gm-ub-movement")
+        ])), lambda request: _result(request.spec, True, "verified"),
+        max_parallel=1, project_target=2,
+    )
+    proposal = coordinator.propose_wave()
+    state = json.loads((root / "state.json").read_text())
+    state["wave_index"] = 2
+    (root / "state.json").write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="published memory"):
+        coordinator.approve_wave(proposal, ("one",))
+
+
 def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     calls = []
     stop_after_first = False
