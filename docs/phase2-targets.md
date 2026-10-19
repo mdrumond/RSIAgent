@@ -9,6 +9,11 @@ source, complete output, inputs, and oracle in `ContentAddressedArtifacts`.
 The runtime identity must pin target, named runtime, product, compiler,
 toolchain, and device. Revalidate after any of these or the project changes.
 The host owns this configuration; a curriculum proposal cannot qualify itself.
+Construct `ProjectExecutor(backend, ledger, runtime_identity=observed_runtime)`
+with an observed runtime mapping, or pass a zero-argument observer callable for
+fresh runtime observations at qualification. The optional keyword defaults to
+`None` for legacy Phase 1 callers; qualifying a target requires an identity.
+Qualification checks the resolved executor identity before compiling or launching.
 
 The contract fixes the complete project, including shape, dtype, deterministic
 inputs, output shape, padding, and existing dtype tolerances. A passing reference
