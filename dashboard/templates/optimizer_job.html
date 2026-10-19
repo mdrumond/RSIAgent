@@ -9,8 +9,18 @@
 <button id="optimizer-stop">Stop</button>
 <form id="optimizer-resume"><div class="optimizer-grid"><label>Additional attempts<input name="additional_attempts" type="number" min="1" value="25" required></label><label>Additional seconds<input name="additional_seconds" type="number" min="1" value="7200" required></label></div><button>Resume with additional budget</button></form>
 <p id="optimizer-message" role="status"></p></section>
-<section id="optimizer-results"><h2>Results</h2><p>Verified results and measurement evidence appear as the worker records them.</p></section>
+<section id="optimizer-results"><h2>Results</h2>
+<button id="optimizer-load-results">Load / refresh results</button>
+<p id="optimizer-result-summary" role="status">Results are loaded on demand. Missing measurements are unavailable, never zero.</p>
+<div id="optimizer-case-plot"></div><div id="optimizer-speedup-plot"></div><div id="optimizer-attempt-plot"></div>
+<details id="optimizer-profiles"><summary>Diagnostic profiler metrics</summary>
+<p>Separate diagnostic replays, not canonical benchmark timings. Vendor names and units are preserved.</p>
+<label>Metric / group / units<select id="optimizer-metric"></select></label>
+<div id="optimizer-metric-plot"></div><pre id="optimizer-unavailable"></pre></details>
+<details id="optimizer-source-history"><summary>Kernel source history and diffs</summary><div id="optimizer-source-list"></div></details>
+</section>
 <details><summary>Memory provenance and submission</summary><p>The reference, representative signatures and completed Phase 2 memory snapshot are pinned when the job starts.</p><div id="optimizer-submission"></div></details>
 <details id="optimizer-trace"><summary>Execution trace</summary><p>Expand an event to retrieve its retained details.</p><div id="optimizer-events"></div></details>
 <script src="{{ url_for('static', filename='optimizer.js') }}" defer></script>
+<script src="{{ url_for('static', filename='optimizer_results.js') }}" defer></script>
 {% endblock %}

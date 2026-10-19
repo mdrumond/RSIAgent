@@ -107,6 +107,19 @@
           try {
             const data = await read(`${base}/events/${event.sequence}`);
             const pre = document.createElement('pre'); pre.textContent = JSON.stringify(data.payload, null, 2); detail.append(pre);
+            if (data.payload?.sha256 && data.payload?.name) {
+              const button = document.createElement('button'); button.textContent = `Load retained ${data.payload.name}`;
+              button.addEventListener('click', async () => {
+                try {
+                  const response = await fetch(`${base}/artifacts/${data.payload.sha256}`);
+                  if (!response.ok) throw Error(`Artifact unavailable (${response.status})`);
+                  const body = await response.text();
+                  try {pre.textContent = JSON.stringify(JSON.parse(body), null, 2);}
+                  catch (_) {pre.textContent = body;}
+                  button.remove();
+                } catch (error) {message.textContent = error.message;}
+              }); detail.append(button);
+            }
           } catch (error) {message.textContent = error.message;}
         }); container.append(detail);
       }

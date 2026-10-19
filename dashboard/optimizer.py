@@ -93,6 +93,8 @@ class OptimizerDashboard:
 def register_optimizer(app, config_path, csrf_token, launcher=None):
     manager = OptimizerDashboard(config_path, launcher)
     app.extensions['optimizer'] = manager
+    from .optimizer_results import register_results
+    register_results(app, manager)
 
     @app.get('/optimizer')
     def optimizer_page():
