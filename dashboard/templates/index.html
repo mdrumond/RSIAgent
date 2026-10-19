@@ -13,7 +13,7 @@
 <form data-proposal-form data-campaign-id="{{ proposal.campaign_id }}" data-proposal-id="{{ proposal.proposal_id }}">
 {% if proposal.terminal %}<p><b>{{ proposal.terminal.status }}</b> — {{ proposal.terminal.reason }}</p>{% endif %}
 {% for project in proposal.projects %}<label class="proposal-project"><input type="checkbox" name="project_id" value="{{ project.project_id }}">
-<span><b>{{ project.project_id }}</b> — {{ project.hypothesis }}<small>{{ project.novelty_summary }}{% if project.new_coverage %}; new coverage: {{ project.new_coverage|join(', ') }}{% endif %}</small></span></label>{% endfor %}
+<span><b>{{ project.project_id }}</b><dl class="description-fields compact">{% for field in project.description_fields %}<dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>{% endfor %}</dl><small>{{ project.novelty_summary }}{% if project.new_coverage %}; new coverage: {{ project.new_coverage|join(', ') }}{% endif %}</small></span></label>{% endfor %}
 {% if proposal.status == 'proposed' %}<button data-proposal-action="approve">Approve selected</button><button data-proposal-action="reject">Reject</button>{% endif %}
 {% if proposal.status == 'approved' %}<button data-proposal-action="run-approved">Run approved</button>{% endif %}
 {% if proposal.status == 'running' %}<button data-proposal-action="run-approved">Resume/reconcile</button>{% endif %}</form></article>{% endfor %}

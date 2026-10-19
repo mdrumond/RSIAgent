@@ -18,6 +18,17 @@ snapshot and label it stale. Source is read only through the content-addressed
 digests retained by each project; unavailable source is reported rather than
 guessed.
 
+Project hypotheses that use the curriculum's ordered `Question`, `Controlled
+change`, `Tools`, `Measurements`, and `Expected lesson` convention are rendered
+as labeled fields; historical free-form text remains unchanged. Project detail
+sections are collapsible, and the final section indexes the complete retained
+curriculum, actor, host-verification, and outcome trace. Trace payloads are not
+included in page HTML or `/api/status`: opening an event fetches its exact bytes
+through a project-scoped identifier. SHA-256 is checked before the immutable
+payload is added to the SQLite cache. UTF-8 payloads are returned as escaped
+text, while every retained payload is available through the raw download route.
+Missing prompts or artifacts are explicitly marked unavailable.
+
 ## Optional campaign controls
 
 Set `controls.enabled` to `true` only for a loopback listener. The CLI enforces
