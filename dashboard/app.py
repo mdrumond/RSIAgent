@@ -78,6 +78,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
 
     @app.get("/api/operations/<operation_id>")
     def api_operation(operation_id):
+        if not controls.enabled:
+            abort(403)
         operation = controls.operation(operation_id)
         return jsonify(operation) if operation else abort(404)
 

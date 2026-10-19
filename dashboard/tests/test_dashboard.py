@@ -243,6 +243,17 @@ def test_controls_disabled_by_default_and_csrf_required(campaign, tmp_path):
                        "confirmation": "start:phase1"}).status_code == 403
 
 
+def test_operation_details_are_hidden_when_controls_are_disabled(campaign, tmp_path):
+    config, _, _ = controlled_config(tmp_path)
+    cache = tmp_path / "operations.sqlite3"
+    enabled = create_app(config, cache, command_runner=lambda *a, **k: None)
+    operation_id = enabled.extensions["dashboard_controls"]._insert_for_test(
+        "sample", "phase1", "failed")
+    assert enabled.test_client().get(f"/api/operations/{operation_id}").status_code == 200
+    disabled = create_app(campaign, cache)
+    assert disabled.test_client().get(f"/api/operations/{operation_id}").status_code == 403
+
+
 def test_a5_campaign_and_preset_are_rejected_before_invocation(tmp_path):
     config, _, _ = controlled_config(tmp_path)
     settings = json.loads(config.read_text())
@@ -336,6 +347,55 @@ def test_sample_summary_approve_and_run_without_raw_provider_content(tmp_path):
     assert post("run-approved", {"campaign_id": "phase1", "proposal_id": "proposal-1",
         "confirmation": "run-approved:proposal-1"}, "r")["status"] == "succeeded"
     assert calls[-1][2] == "run-approved"
+
+
+@pytest.mark.parametrize("already_published", [False, True])
+def test_running_approval_retry_and_reconciliation_are_idempotent(tmp_path, already_published):
+    config, root, control = controlled_config(tmp_path)
+    root.mkdir()
+    state = {"coverage": [], "prior_outcomes": [], "wave_index": 1}
+    write(root / "state.json", state)
+    proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                "wave": {"projects": [{"spec": {"project_id": "one",
+                    "hypothesis": "One", "capabilities": []}}]}}
+    write(control / "curriculum-approval.json", {"status": "approved", "phase": 1,
+          "proposal_id": "retry", "proposal": proposal, "selected_project_ids": ["one"]})
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        record = json.loads((control / "curriculum-approval.json").read_text())
+        if len(calls) == 1:
+            write(control / "curriculum-approval.json", {**record, "status": "running"})
+            raise OSError("worker connection lost")
+        write(control / "curriculum-approval.json", {**record, "status": "complete",
+              "recovered": already_published})
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+    client = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                        command_runner=run).test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    body = {"campaign_id": "phase1", "proposal_id": "retry",
+            "confirmation": "run-approved:retry"}
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "first"}
+    first = client.post("/api/control/run-approved", json=body, headers=headers)
+    first_id = first.get_json()["operation_id"]
+    assert wait_operation(client, first_id)["status"] == "failed"
+    restarted = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0,
+                           command_runner=run)
+    client = restarted.test_client()
+    csrf = client.get("/api/csrf").get_json()["token"]
+    headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "first"}
+    replay = client.post("/api/control/run-approved", json=body, headers=headers)
+    assert replay.get_json()["operation_id"] == first_id and len(calls) == 1
+    if already_published:
+        write(root / "state.json", {**state, "wave_index": 2,
+                                     "prior_outcomes": [{"project_id": "one"}]})
+    page = client.get("/")
+    assert b"Resume/reconcile" in page.data
+    retry = client.post("/api/control/run-approved", json=body, headers={
+        "X-CSRF-Token": csrf, "Idempotency-Key": "explicit-retry"})
+    assert retry.status_code == 202
+    assert wait_operation(client, retry.get_json()["operation_id"])["status"] == "succeeded"
+    assert len(calls) == 2
 
 
 def test_selection_staleness_phase2_cardinality_failures_and_restart(tmp_path):

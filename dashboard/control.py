@@ -141,12 +141,19 @@ class ControlManager:
         proposal = self.proposal(identifier)
         if proposal is None or proposal["proposal_id"] != payload.get("proposal_id"):
             raise ControlError("proposal does not match the retained campaign proposal")
-        expected_status = "proposed" if action in {"approve", "reject"} else "approved"
-        if proposal["status"] != expected_status:
-            raise ControlError(f"proposal must be {expected_status}")
+        allowed_statuses = ({"proposed"} if action in {"approve", "reject"}
+                            else {"approved", "running"})
+        if proposal["status"] not in allowed_statuses:
+            raise ControlError(f"proposal must be {' or '.join(sorted(allowed_statuses))}")
         retained = _read(Path(campaign["control"]) / "curriculum-approval.json", {})
         state = _read(Path(campaign["root"]) / "state.json", {}) or {}
-        if retained.get("proposal", {}).get("base_wave_index") != state.get("wave_index"):
+        base_wave = retained.get("proposal", {}).get("base_wave_index")
+        current_wave = state.get("wave_index")
+        running_wave_retry = (action == "run-approved" and proposal["status"] == "running"
+                              and proposal["terminal"] is None
+                              and isinstance(base_wave, int)
+                              and current_wave in {base_wave, base_wave + 1})
+        if base_wave != current_wave and not running_wave_retry:
             raise ControlError("proposal is stale relative to campaign state")
         if action == "approve":
             selected = payload.get("project_ids")

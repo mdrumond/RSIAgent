@@ -32,9 +32,14 @@ be controlled.
 
 Mutation requests require the page's CSRF token, an explicit confirmation, and
 an idempotency key. They are serialized by one background worker and persisted
-in the same SQLite WAL database as the read cache. A dashboard restart marks an
+in the same SQLite WAL database as the read cache. A dashboard restart marks a
 queued or in-flight operation interrupted rather than submitting it again. The retained
 campaign approval record remains authoritative for a deliberate retry.
+Repeating the same idempotency key returns the original operation; use a new key
+to explicitly resume or reconcile a retained `running` approval after an
+interrupted command. Operation details are unavailable when controls are
+disabled, including when the read-only dashboard is intentionally bound beyond
+loopback.
 
 The proposal view exposes the hypothesis plus deterministic novelty and coverage
 comparisons. A terminal proposal exposes only its status and concise reason and
