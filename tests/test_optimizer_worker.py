@@ -361,7 +361,7 @@ def test_terminal_candidate_crash_without_archive_is_feedback_not_job_crash(tmp_
     assert {row['name'] for row in store.artifacts(job)} == {'candidate/transport.log', 'candidate/result.json'}
 
 
-@pytest.mark.parametrize('failure', ['bad-digest', 'missing-result', 'commit'])
+@pytest.mark.parametrize('failure', ['bad-digest', 'missing-result', 'commit', 'result-marker'])
 def test_compact_import_failure_does_not_publish_result_and_can_retry(tmp_path, monkeypatch, failure):
     import io
     import shutil
@@ -393,6 +393,14 @@ def test_compact_import_failure_does_not_publish_result_and_can_retry(tmp_path, 
     directory = store.root / job / 'execution' / 'candidate'
     publish(False)
     batch = store._event_batch
+    from optimizer import worker
+    original_atomic = worker.atomic
+    if failure == 'result-marker':
+        def fail_marker(path, data):
+            if path == directory / 'result.json':
+                raise OSError('interrupted after inventory commit')
+            return original_atomic(path, data)
+        monkeypatch.setattr(worker, 'atomic', fail_marker)
     if failure == 'commit':
         def fail(*args):
             raise OSError('interrupted artifact commit')
@@ -400,8 +408,9 @@ def test_compact_import_failure_does_not_publish_result_and_can_retry(tmp_path, 
     with pytest.raises((ValueError, OSError)):
         backend.evaluate('source', directory, block_count=1)
     assert not (directory / 'result.json').exists()
-    assert store.artifacts(job) == []
+    assert len(store.artifacts(job)) == (2 if failure == 'result-marker' else 0)
     monkeypatch.setattr(store, '_event_batch', batch)
+    monkeypatch.setattr(worker, 'atomic', original_atomic)
     publish(True)
     assert backend.evaluate('source', directory, block_count=1) == {'status': 'verified'}
     assert len(store.artifacts(job)) == 2

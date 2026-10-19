@@ -233,16 +233,18 @@ class JobStore:
     def put_artifact(self, job_id, name, data):
         return self.put_artifacts(job_id, [(name, data)])[0]
 
-    def put_artifacts(self, job_id, entries):
+    def put_artifacts(self, job_id, entries, *, deduplicate=False):
         """Publish an iterable of (name, bytes) as one atomic inventory commit.
 
         Content blobs precede the event commit. A failed iterator or interrupted
         write may leave unreferenced blobs, never a partially published batch.
         Existing artifact events and readers retain exactly the same schema.
+        Compact-operation retries may deduplicate exact name/content records.
         """
         directory = self._directory(job_id)
         with self._lock(directory):
             self.get(job_id)
+            known = {(r['name'], r['sha256'], r['size']) for r in self.artifacts(job_id)} if deduplicate else set()
             records = []
             for name, data in entries:
                 digest = sha(data)
@@ -250,7 +252,10 @@ class JobStore:
                 path.parent.mkdir(exist_ok=True)
                 atomic(path, data)
                 records.append(dict(name=name, sha256=digest, size=len(data)))
-            self._event_batch(directory, [('artifact', record) for record in records])
+            additions = [('artifact', r) for r in records
+                         if (r['name'], r['sha256'], r['size']) not in known]
+            if additions:
+                self._event_batch(directory, additions)
             return records
 
     def read_artifact(self, job_id, digest):

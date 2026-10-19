@@ -131,7 +131,7 @@ class RemoteBackend:
                     yield str(relative / name), data
                 if result_data is None:
                     raise ValueError('remote compact archive has no result')
-            self.store.put_artifacts(self.job_id, artifacts())
+            self.store.put_artifacts(self.job_id, artifacts(), deduplicate=True)
         atomic(result_path, result_data)
         return json.loads(result_data)
 
