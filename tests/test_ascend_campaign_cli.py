@@ -1052,6 +1052,7 @@ def test_new_phase2_without_contract_persists_autonomous_bootstrap(tmp_path):
         "--review", "review"], screen=lambda *args: "session")
     job = cli._read(control / "job.json")
     assert job["autonomous_goal"] is True and "target_goal" not in job
+    assert job["optimizer_goal"] is True
     assert job["target_attempt_budget"] == 3 and job["practice_attempt_budget"] == 2
     assert cli._read(root / "campaign-run.json")["autonomous_goal"] is True
     with pytest.raises(SystemExit):
