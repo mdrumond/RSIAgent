@@ -17,6 +17,18 @@ from benchmarks.a5kernels.phase1_project import ProjectOp
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutionFamily, ProjectKernelABI
 
 
+def native_target_runtime(config, transport):
+    """Canonical goal identity from the selected native transport and observations."""
+    environment = config.environment_identity or {}
+    if (not environment.get("compiler_version") or not environment.get("cann_version")
+            or not hasattr(transport, "_device") or not hasattr(transport, "profile")):
+        return None
+    return {"target": "a3", "runtime": "py311-torch", "device": str(transport._device),
+            "toolchain": environment["cann_version"], "compiler": environment["compiler_version"],
+            "product": config.target, "architecture": config.arch,
+            "execution_profile": transport.profile}
+
+
 def compose_adaptive_controller(
     *, root, objective, initial_memory, executor, actor, profile, provider,
     immutable_context, max_parallel=1, project_target=None, max_projects=None,
@@ -227,6 +239,7 @@ def build_native_adaptive_phase1(
                                        profile=config.execution_profile)
         executor = ProjectExecutor(backend, EvidenceLedger(root / "project-evidence.jsonl"),
                                    binding=NativeProjectBinding(dtypes=config.dtypes))
+    executor.runtime_identity = native_target_runtime(config, native_transport)
     context = canonical_bytes({"identity": identity, "programming_guide": guide_text})
     diagnostics = "Debugger and sanitizer routes are unavailable in this native composition.\n"
     pool = None

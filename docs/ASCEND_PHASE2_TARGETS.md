@@ -33,8 +33,9 @@ from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.ascend.phase2_targets import qualify_target
 
 # executor and target_policy come from the selected native/Catlass composition.
-# runtime_identity records observed target, runtime, device, toolchain, product,
-# and compiler identities from that same selected runtime.
+# The composition exposes executor.runtime_identity from its selected backend;
+# use it verbatim, including any architecture/profile/revision pins.
+runtime_identity = executor.runtime_identity
 spec = ProjectSpec.from_mapping(json.loads(Path("copy-spec.json").read_text()))
 store = ContentAddressedArtifacts(Path("private-reference-artifacts"))
 goal = qualify_target(spec, Path("working-copy-source.txt").read_text(),
@@ -69,13 +70,29 @@ Add these keys to the ignored existing campaign settings JSON alongside its
     "device": "selected-device",
     "toolchain": "observed-toolchain-version",
     "product": "observed-product",
-    "compiler": "observed-compiler-revision"
+    "compiler": "observed-compiler-revision",
+    "architecture": "observed-architecture",
+    "execution_profile": "bz-a3-1"
   }
 }
 ```
 
+Copy `executor.runtime_identity` verbatim into `target_runtime`; the launcher
+compares it with the newly composed executor before any target execution. It
+rejects matching goal/settings dictionaries if the selected executor differs.
+For native composition, the selected transport fixes runtime `py311-torch`,
+physical device and execution profile; configuration supplies the discovered
+product/architecture and CANN/compiler observations. Goal mode requires
+`environment_identity.compiler_version` as well as `cann_version`; older Phase 1
+and legacy Phase 2 configurations remain valid without the compiler observation.
+For Catlass, the identity uses the already-probed CANN/compiler commit, selected
+physical device, profile, and available Catlass/manifest pins. `Ascend950` denotes
+the existing Catlass binding's required product family; this adds no hardware
+probe. Both qualification and execution must use that same binding.
 Use observed runtime values, not the illustrative strings above. Tool availability is derived from the composed profiling, timing, and diagnostic
-actions; settings cannot advertise unconfigured routes. A5 uses the same workflow with an
+actions and the binding-supported `debug-print` capability; settings cannot
+advertise unconfigured routes. Catlass exposes print support; native currently
+does not. A5 uses the same workflow with an
 A5-qualified contract and A5 configuration.
 
 ```bash

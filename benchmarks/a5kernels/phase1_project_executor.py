@@ -218,6 +218,8 @@ class ProjectTargetBinding(Protocol):
 class CatlassProjectBinding:
     """Compatibility binding preserving the established A5 public contract."""
 
+    supported_tools = ("debug-print",)
+
     def abi(
         self, spec: ProjectSpec, inputs: tuple[HostTensor, ...],
     ) -> ProjectKernelABI:
@@ -246,6 +248,19 @@ class ProjectExecutor:
         self._backend = backend
         self._ledger = ledger
         self._binding = binding if binding is not None else CatlassProjectBinding()
+
+    @property
+    def runtime_identity(self):
+        identity = getattr(self, "_runtime_identity", None)
+        return identity() if callable(identity) else identity
+
+    @runtime_identity.setter
+    def runtime_identity(self, identity):
+        self._runtime_identity = identity
+
+    @property
+    def supported_tools(self):
+        return tuple(getattr(self._binding, "supported_tools", ()))
 
     def prepare(self, spec: ProjectSpec) -> PreparedProject:
         if not isinstance(spec, ProjectSpec):

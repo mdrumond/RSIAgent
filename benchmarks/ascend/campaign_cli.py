@@ -81,7 +81,7 @@ def _target_available_tools(actor):
     from benchmarks.a5kernels.phase1_adaptive_actor import (
         disabled_profile_action, disabled_diagnostic_action,
     )
-    tools = []
+    tools = list(getattr(getattr(actor, "executor", None), "supported_tools", ()))
     for attribute, disabled, names in (
         ("request_profile", disabled_profile_action, ("request-profile",)),
         ("request_timing", disabled_profile_action, ("request-timing",)),
@@ -91,6 +91,15 @@ def _target_available_tools(actor):
         if callable(route) and route is not disabled:
             tools.extend(names)
     return tuple(tools)
+
+
+def _composed_target_runtime(actor, declared):
+    actual = getattr(getattr(actor, "executor", None), "runtime_identity", None)
+    if actual is None:
+        raise ValueError("target goals require observed compiler/runtime identity on the composed executor")
+    if dict(actual) != declared:
+        raise ValueError("qualified target runtime differs from the composed executor")
+    return dict(actual)
 
 
 def build_controller(job):
@@ -153,7 +162,7 @@ def build_controller(job):
                 coordinator.execute_project,
                 target=TargetContract.from_mapping(job["target_goal"]),
                 artifacts=ContentAddressedArtifacts(Path(job["target_artifact_store"])),
-                runtime=settings["target_runtime"],
+                runtime=_composed_target_runtime(coordinator.execute_project, settings["target_runtime"]),
                 target_policy=coordinator.curriculum.target_policy,
                 max_target_attempts=job["target_attempt_budget"],
                 max_practice_attempts=job["practice_attempt_budget"],

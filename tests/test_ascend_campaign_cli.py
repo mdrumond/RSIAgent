@@ -736,13 +736,19 @@ def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_pa
     native = SimpleNamespace(**{k: v for k, v in source.items() if k != "model"}, collection=None)
     monkeypatch.setattr(phase1_cli, "main", lambda argv, **kw: kw["native_builder"](
         config=native, profile=SimpleNamespace(identity=model)))
+    def execute(request):
+        return None
+    execute.executor = SimpleNamespace(runtime_identity=RUNTIME)
     monkeypatch.setattr(production, "build_native_adaptive_phase1", lambda **kw: SimpleNamespace(
         curriculum=CurriculumAgent(lambda _: 'DECISION: READY\n{"reason":"done"}'),
-        execute_project=lambda _: None, trace_hook=None))
+        execute_project=execute, trace_hook=None))
     controller = cli.build_controller(job)
     assert isinstance(controller, TargetDrivenPhase2Coordinator)
     assert controller.target.target_id == goal.target_id
     assert controller.available_tools == ()
+    execute.executor.runtime_identity = {**RUNTIME, "device": "another-selected-device"}
+    with pytest.raises(ValueError, match="differs from the composed executor"):
+        cli.build_controller(job)
     assert hashlib.sha256(config.read_bytes()).hexdigest() == job["config_sha256"]
 
 
@@ -761,3 +767,36 @@ def test_target_tools_come_from_bound_actions_not_settings(profile, timing, diag
     assert ("request-debug" in tools) is diagnostic
     assert ("request-sanitizer" in tools) is diagnostic
     assert cli._target_available_tools(lambda _: None) == ()
+
+
+def test_binding_print_capability_and_native_runtime_observations(tmp_path):
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.ascend.production import NativeProjectBinding, native_target_runtime
+    from benchmarks.a5kernels.phase1_adaptive_production import catlass_target_runtime
+    catlass = ProjectExecutor(None, EvidenceLedger(tmp_path / "a5.jsonl"))
+    native = ProjectExecutor(None, EvidenceLedger(tmp_path / "a3.jsonl"), binding=NativeProjectBinding())
+    assert "debug-print" in cli._target_available_tools(SimpleNamespace(executor=catlass))
+    assert "debug-print" not in cli._target_available_tools(SimpleNamespace(executor=native))
+    config = SimpleNamespace(target="observed-product", arch="observed-arch",
+        environment_identity={"cann_version": "observed-cann", "compiler_version": "observed-compiler"})
+    transport = SimpleNamespace(_device=3, profile="bz-a3-2")
+    actual = native_target_runtime(config, transport)
+    assert actual == {"target": "a3", "runtime": "py311-torch", "device": "3", "product": "observed-product",
+        "architecture": "observed-arch", "execution_profile": "bz-a3-2",
+        "toolchain": "observed-cann", "compiler": "observed-compiler"}
+    actor = SimpleNamespace(executor=SimpleNamespace(runtime_identity=actual))
+    assert cli._composed_target_runtime(actor, actual) == actual
+    for field in actual:
+        with pytest.raises(ValueError, match="composed executor"):
+            cli._composed_target_runtime(actor, {**actual, field: "stale"})
+    config.environment_identity.pop("compiler_version")
+    assert native_target_runtime(config, transport) is None
+    with pytest.raises(ValueError, match="require observed"):
+        cli._composed_target_runtime(SimpleNamespace(executor=native), actual)
+    a5 = catlass_target_runtime(SimpleNamespace(device=5), SimpleNamespace(runtime_provenance=(
+        ("execution_profile", "bz-a5"), ("cann_version", "observed-cann"),
+        ("ascendnpu_ir_install_commit", "a" * 40), ("catlass_revision", "b" * 40),
+        ("manifest_sha256", "c" * 64))))
+    assert a5["device"] == "5" and a5["product"] == "Ascend950"
+    assert a5["compiler"] == "a" * 40 and a5["catlass_revision"] == "b" * 40
