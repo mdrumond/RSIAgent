@@ -1,4 +1,5 @@
 import json
+import pytest
 
 from optimizer.jobs import JobStore, canonical, sha
 from optimizer.loop import OptimizationLoop
@@ -52,6 +53,101 @@ class Backend:
 
 def candidate(source):
     return {'action': 'candidate', 'source': source, 'block_count': 1, 'summary': source}
+
+
+@pytest.mark.parametrize('action', [
+    {'action': 'read-artifact', 'sha256': '01d481b2410940ecfb8c6765cc4d70c22ef72d73bde972', 'offset': 0},
+    {'action': 'read-artifact', 'sha256': 'a' * 64, 'offset': 0},
+    {'action': 'read-artifact', 'sha256': 'a' * 64, 'offset': -1},
+    {'action': 'read-artifact', 'offset': 0},
+    {'action': 'read-memory', 'index': 99},
+    {'action': 'read-memory'},
+])
+def test_bad_evidence_read_returns_feedback_before_candidate(tmp_path, action):
+    store, key = fixture(tmp_path, attempts=1)
+    backend = Backend()
+
+    class RepairAgent(Agent):
+        def complete(self, stage, context, record):
+            if context.get('history'):
+                assert context['history'][-1]['content']['status'] == 'tool-error'
+            return super().complete(stage, context, record)
+
+    agent = RepairAgent([{'action': 'cases', 'signatures': [], 'summary': ''},
+                         action, candidate('fast')])
+    result = OptimizationLoop(store, key, agent, backend).run()
+    assert result['attempts'] == 1
+    assert backend.evaluations == ['fast']
+    state = OptimizationLoop(store, key, Agent([]), backend).state
+    assert 'model_action' not in state
+    assert state['history'][0]['tool'] == action
+
+
+def test_bad_read_replay_is_cleared_only_with_persisted_feedback(tmp_path, monkeypatch):
+    store, key = fixture(tmp_path, attempts=1)
+    backend = Backend()
+    bad = {'action': 'read-artifact', 'sha256': 'abc123', 'offset': 0}
+    loop = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': ''}, bad]), backend)
+    def interrupted(action, result):
+        # Simulate process death before the feedback checkpoint.
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(loop, '_tool_result', interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        loop.run()
+    resumed = OptimizationLoop(store, key, Agent([candidate('fast')]), backend)
+    assert resumed._read(resumed.state['model_action']) == bad
+    resumed.run()
+    state = OptimizationLoop(store, key, Agent([]), backend).state
+    assert state['history'][0]['content']['status'] == 'tool-error'
+    assert 'model_action' not in state
+    assert backend.evaluations == ['fast']
+
+
+def test_resume_pre_fix_failed_job_replays_bad_read_as_feedback(tmp_path):
+    store, key = fixture(tmp_path, attempts=1)
+    backend = Backend()
+    loop = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': ''}]), backend)
+    loop.run(prepare_only=True)
+    bad = {'action': 'read-artifact',
+           'sha256': '01d481b2410940ecfb8c6765cc4d70c22ef72d73bde972', 'offset': 0}
+    retained = loop._artifact('optimize', bad)
+    loop.state.update(action_result=retained, model_action=retained)
+    loop._save()
+    store.transition(key, 'failed')
+    store.resume(key, additional_attempts=1, additional_seconds=1)
+    OptimizationLoop(store, key, Agent([candidate('fast')]), backend).run(single_evaluation=True)
+    state = OptimizationLoop(store, key, Agent([]), backend).state
+    assert state['history'][0]['tool'] == bad
+    assert state['history'][0]['content']['status'] == 'tool-error'
+    assert backend.prepares == 1
+    assert backend.evaluations == ['fast']
+
+
+def test_corrupt_retained_artifact_is_not_model_feedback(tmp_path):
+    store, key = fixture(tmp_path)
+    artifact = store.put_artifact(key, 'evidence', b'original')
+    store.artifact_path(key, artifact['sha256']).write_bytes(b'corrupt')
+    loop = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': ''},
+        {'action': 'read-artifact', 'sha256': artifact['sha256'], 'offset': 0}]), Backend())
+    with pytest.raises(ValueError, match='artifact digest mismatch'):
+        loop.run()
+    assert store.get(key)['status'] == 'failed'
+
+
+def test_missing_recorded_artifact_is_not_model_feedback(tmp_path):
+    store, key = fixture(tmp_path)
+    artifact = store.put_artifact(key, 'evidence', b'original')
+    store.artifact_path(key, artifact['sha256']).unlink()
+    loop = OptimizationLoop(store, key, Agent([
+        {'action': 'cases', 'signatures': [], 'summary': ''},
+        {'action': 'read-artifact', 'sha256': artifact['sha256'], 'offset': 0}]), Backend())
+    with pytest.raises(FileNotFoundError):
+        loop.run()
+    assert store.get(key)['status'] == 'failed'
 
 
 def test_failure_repair_slower_faster_and_budget(tmp_path):

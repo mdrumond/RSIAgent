@@ -13,7 +13,11 @@ Optimization-stage actions: {"action":"candidate","source":"Ascend C device sour
 {"action":"query-knowledge","query":"..."},
 {"action":"read-memory","index":0}, or {"action":"finish","summary":"..."}.
 Read full retained evidence or truncated memory using
-{"action":"read-artifact","sha256":"artifact digest","offset":0}; advance
+{"action":"read-artifact","sha256":"artifact digest","offset":0}; copy the exact
+64-character lowercase hexadecimal sha256 from a retained artifact record, never
+abbreviate or guess it. If unsure, use read-memory with an index from memory_summary
+to retrieve the entry and its exact artifact references. Invalid or missing reads
+return tool-error feedback; repair the request rather than repeating it. Advance
 the returned next_offset to page through JSON text (1,500 characters per page).
 Compile without executing or spending an evaluated candidate trial with
 {"action":"compile","source":"Ascend C device source","block_count":1,"summary":"..."}.
