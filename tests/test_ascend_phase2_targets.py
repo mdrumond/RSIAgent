@@ -316,14 +316,20 @@ def test_reference_runtime_must_match_observed_executor_before_backend_work(tmp_
 def test_selector_retains_previous_practice_rationale_with_latest_result(tmp_path):
     target, _, _ = qualified(tmp_path)
     calls = []
-    replies = iter([practice_wire(), 'DECISION: RETRY_TARGET\n{"reason":"apply learned tail ownership"}'])
+    invalid = json.loads(practice_wire().split("\n", 1)[1])
+    invalid["reason"] = "Reconstruct held-out BSA"
+    replies = iter(["DECISION: PRACTICE\n" + json.dumps(invalid), practice_wire(),
+                    'DECISION: RETRY_TARGET\n{"reason":"apply learned tail ownership"}'])
     agent = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
     decision, session = agent.select(context(target))
     latest = replace(context(target), lessons=({"project_id": decision.project.project_id,
         "verified": True, "host_feedback": "padded output now matches"},))
     followup, updated = agent.select(latest, session)
-    assert followup.action == "retry-target" and updated.turns == 2
-    assert calls[1][:-1] == list(session.messages)
-    assert calls[1][-2]["content"] == practice_wire()
-    assert "compare tail ownership with one fixed launch" in calls[1][-2]["content"]
-    assert "padded output now matches" in calls[1][-1]["content"]
+    assert followup.action == "retry-target" and updated.turns == 3
+    assert len(calls[-1]) == 2
+    prompt = calls[-1][-1]["content"]
+    assert practice_wire() in prompt
+    assert "compare tail ownership with one fixed launch" in prompt
+    assert "padded output now matches" in prompt
+    assert "BSA" not in prompt and "Invalid proposal" not in prompt
+    assert "BSA" in json.dumps(session.messages)
