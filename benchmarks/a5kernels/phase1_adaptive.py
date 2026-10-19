@@ -303,8 +303,40 @@ class AdaptivePhase1Coordinator:
             row for row in wave["projects"] if row["spec"]["project_id"] in selected
         ]}}
         WaveSpec.from_mapping(approved["wave"])
+        retained = self._proposal_pending(proposal)
+        if retained is not None:
+            retained_ids = tuple(row["spec"]["project_id"] for row in retained["wave"]["projects"])
+            approved_ids = tuple(row["spec"]["project_id"] for row in approved["wave"]["projects"])
+            if retained_ids != approved_ids:
+                raise ValueError("proposal already has a different approved subset")
+            return retained
         self._atomic_json(self.root / "pending.json", approved)
         return approved
+
+    def _proposal_pending(self, proposal):
+        state = self.validate_proposal(proposal)
+        pending = self._load_pending(state)
+        if pending is None:
+            return None
+        proposed_wave, pending_wave = proposal.get("wave"), pending.get("wave")
+        if proposed_wave is None or pending_wave is None:
+            raise ValueError("pending wave does not belong to the retained proposal")
+        proposed = {row["spec"]["project_id"]: row for row in proposed_wave["projects"]}
+        pending_projects = pending_wave["projects"]
+        same_wave = ({key: value for key, value in proposed_wave.items() if key != "projects"}
+                     == {key: value for key, value in pending_wave.items() if key != "projects"})
+        if (not same_wave or pending.get("session") != proposal.get("session")
+                or not pending_projects
+                or any(proposed.get(row["spec"]["project_id"]) != row
+                       for row in pending_projects)):
+            raise ValueError("pending wave does not belong to the retained proposal")
+        return pending
+
+    def discard_proposal(self, proposal):
+        """Remove only a pending subset authenticated as part of this proposal."""
+        pending = self._proposal_pending(proposal)
+        if pending is not None:
+            (self.root / "pending.json").unlink()
 
     def run_approved_wave(self):
         return self._run(wave_limit=1, approved_only=True)

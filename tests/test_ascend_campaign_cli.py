@@ -1,5 +1,6 @@
 import json
 import io
+import threading
 import shutil
 import subprocess
 import tarfile
@@ -209,7 +210,7 @@ def test_approval_lifecycle_rejects_stale_or_wrong_proposal(tmp_path):
             return {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
                     "wave": {"projects": [{"spec": {"project_id": "one"}}]},
                     "session": {"messages": [], "turns": 0}}
-        def validate_proposal(self, proposal):
+        def discard_proposal(self, proposal):
             raise ValueError("proposal no longer matches published memory")
 
     sampled = cli.sample_curriculum(job, builder=lambda _job: Coordinator())
@@ -256,6 +257,110 @@ def test_run_approved_recovers_after_wave_published_before_control_update(tmp_pa
     recovered = cli.run_approved_curriculum(
         job, proposal_id, builder=lambda _job: coordinator)
     assert recovered["status"] == "complete" and recovered["recovered"] is True
+
+
+def test_approval_mutations_are_serialized_for_non_cli_callers(tmp_path):
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    cli._write(Path(job["control"]) / "job.json", job)
+    entered, release = threading.Event(), threading.Event()
+
+    class Coordinator:
+        def propose_wave(self):
+            entered.set()
+            assert release.wait(2)
+            return {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                    "wave": {"projects": [{"spec": {"project_id": "one"}}]}}
+
+    thread = threading.Thread(target=lambda: cli.sample_curriculum(
+        job, builder=lambda _job: Coordinator()))
+    thread.start()
+    assert entered.wait(2)
+    with pytest.raises(RuntimeError, match="campaign control is busy"):
+        cli.sample_curriculum(job, builder=lambda _job: Coordinator())
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive()
+
+    class ReentrantCoordinator:
+        def propose_wave(self):
+            return cli.sample_curriculum(job, builder=lambda _job: self)
+
+    (Path(job["control"]) / "curriculum-approval.json").unlink()
+    with pytest.raises(RuntimeError, match="campaign control is busy"):
+        cli.sample_curriculum(job, builder=lambda _job: ReentrantCoordinator())
+
+
+def test_interrupted_approval_can_be_rejected_then_resampled(tmp_path, monkeypatch):
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from tests.test_a5_phase1_adaptive import SEED, _project, _result, _wave
+
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    cli._write(Path(job["control"]) / "job.json", job)
+    selections = iter(["one", "two"])
+    coordinator = AdaptivePhase1Coordinator(
+        Path(job["root"]), "Learn kernels", SEED,
+        CurriculumAgent(lambda messages: _wave(messages[-1]["content"], [
+            _project(next(selections), "gm-ub-movement")
+        ])), lambda request: _result(request.spec, True, "verified"),
+        max_parallel=1, project_target=2)
+    builder = lambda _job: coordinator
+    sampled = cli.sample_curriculum(job, builder=builder)
+    original_write = cli._write
+
+    def interrupt(path, value):
+        if Path(path) == Path(job["control"]) / "curriculum-approval.json" \
+                and value.get("status") == "approved":
+            raise OSError("control write interrupted")
+        original_write(path, value)
+
+    monkeypatch.setattr(cli, "_write", interrupt)
+    with pytest.raises(OSError, match="interrupted"):
+        cli.approve_curriculum(job, ["one"], sampled["proposal_id"], builder=builder)
+    assert (Path(job["root"]) / "pending.json").is_file()
+    monkeypatch.setattr(cli, "_write", original_write)
+    rejected = cli.reject_curriculum(job, sampled["proposal_id"], builder=builder)
+    assert rejected["status"] == "rejected"
+    assert not (Path(job["root"]) / "pending.json").exists()
+    replacement = cli.sample_curriculum(job, builder=builder)
+    assert replacement["projects"][0]["project_id"] == "two"
+
+
+def test_approval_worker_waits_and_collector_packages_only_after_final_run(tmp_path, monkeypatch):
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    control = Path(job["control"])
+    cli._write(control / "job.json", job)
+    coordinator = SimpleNamespace(report=lambda: {"status": "RUNNING"})
+    cli.campaign_worker(job, builder=lambda _job: coordinator)
+    assert cli._read(control / "worker.json")["status"] == "waiting-approval"
+
+    class Downloader:
+        def __init__(self, *args, **kwargs):
+            pass
+        def collect_once(self):
+            return {"counts": {}}
+
+    packaged = []
+    monkeypatch.setattr(cli, "package_campaign", lambda *args, **kwargs: packaged.append(args))
+    cli.collector_worker(job, once=True, factory=Downloader)
+    assert packaged == []
+    proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
+                "wave": {"projects": [{"spec": {"project_id": "one"}}]}}
+    proposal_id = cli._proposal_id(proposal)
+    cli._write(control / "curriculum-approval.json", {
+        "proposal_id": proposal_id, "status": "approved", "proposal": proposal,
+    })
+    runner = SimpleNamespace(run_approved_wave=lambda: {
+        "status": "TARGET_REACHED", "wave_index": 2})
+    cli.run_approved_curriculum(job, proposal_id, builder=lambda _job: runner)
+    assert cli._read(control / "worker.json")["status"] == "complete"
+    monkeypatch.setattr(cli, "inventory_campaign", lambda *args, **kwargs: {
+        "complete": True, "inventory_sha256": "a" * 64, "remote_reports": []})
+    cli.collector_worker(job, once=True, factory=Downloader)
+    assert len(packaged) == 1
 
 
 def test_worker_failure_and_unavailable_downloader_are_independent(tmp_path):
