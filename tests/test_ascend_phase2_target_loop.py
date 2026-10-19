@@ -1,0 +1,181 @@
+"""Target attempts remain separate from practice and preserve retained execution."""
+import json
+from dataclasses import replace
+
+import pytest
+
+from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
+from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
+from test_ascend_phase2_targets import qualified, RUNTIME
+from test_ascend_phase2_curriculum import snapshot
+from test_a5_phase1_adaptive import _result
+
+
+def build(tmp_path, decisions, execute=None, **kwargs):
+    target, store, _ = qualified(tmp_path / "reference")
+    contexts, requests = [], []
+    responses = iter(decisions)
+
+    def select(messages):
+        contexts.append(json.loads(messages[-1]["content"].rsplit("\n", 1)[-1]))
+        return next(responses)
+
+    def run(request):
+        requests.append(request)
+        return execute(request, len(requests)) if execute else _result(request.spec, True, "host pass")
+
+    coordinator = TargetDrivenPhase2Coordinator(tmp_path / "campaign", "fixed copy", snapshot(),
+        TargetCurriculumAgent(select), run, target=target, artifacts=store, runtime=RUNTIME, **kwargs)
+    return coordinator, contexts, requests
+
+
+def wire(action, project=None):
+    value = {"reason": "diagnose target behavior"}
+    if project is not None:
+        value.update(project=project.as_dict(), weakness="tail mismatch", control="isolate padded copy",
+                     evidence="host output comparison", retry_plan="apply tail repair to target")
+    return f"DECISION: {action}\n" + json.dumps(value)
+
+
+def practice(coordinator, suffix="tail"):
+    return replace(coordinator.target.spec, project_id=f"practice-{suffix}")
+
+
+def test_target_first_failure_practice_learning_and_unchanged_retry(tmp_path):
+    decisions = []
+    c, contexts, requests = build(tmp_path, decisions,
+        execute=lambda r, n: _result(r.spec, n != 1, "tail mismatch" if n == 1 else "fixed tail"))
+    # Supply responses lazily after constructing the fixed contract.
+    c.curriculum = TargetCurriculumAgent(lambda messages: (
+        contexts.append(json.loads(messages[-1]["content"].rsplit("\n", 1)[-1])) or
+        [wire("PRACTICE", practice(c)), wire("RETRY_TARGET"), wire("READY")][len(contexts)-1]))
+    assert c.run()["status"] == "READY"
+    assert [r.spec.project_id for r in requests] == [c.target.spec.project_id, "practice-tail", c.target.spec.project_id]
+    assert contexts[0]["latest_target_attempt"]["verified"] is False
+    assert len(json.loads(requests[-1].pre_wave_memory)["project_memory_base64"]) == 1
+    assert c.resume()["target_attempts"] == 2
+    assert len(requests) == 3
+
+
+def test_practice_success_after_passing_target_requires_fresh_target(tmp_path):
+    c, _, requests = build(tmp_path, [])
+    responses = iter([wire("PRACTICE", practice(c)), wire("READY"), wire("READY")])
+    c.curriculum = TargetCurriculumAgent(lambda _: next(responses))
+    report = c.run()
+    assert report["status"] == "READY"
+    assert report["target_attempts"] == 2
+    assert report["practice_attempts"] == 1
+    assert requests[-1].spec == c.target.spec
+
+
+def test_failed_practice_counts_and_forces_retry_after_two_attempts(tmp_path):
+    c, _, requests = build(tmp_path, [], execute=lambda r, n: _result(r.spec, n == 4, "host verdict"))
+    responses = iter([wire("PRACTICE", practice(c, "one")), wire("PRACTICE", practice(c, "two")), wire("READY")])
+    c.curriculum = TargetCurriculumAgent(lambda _: next(responses))
+    report = c.run()
+    assert report["status"] == "READY" and report["practice_attempts"] == 2
+    assert [r.spec == c.target.spec for r in requests] == [True, False, False, True]
+
+
+def test_budget_and_stalled_are_not_success(tmp_path):
+    c, _, _ = build(tmp_path, [], max_target_attempts=1,
+                    execute=lambda r, n: _result(r.spec, False, "mismatch"))
+    assert c.run()["status"] == "BUDGET_EXHAUSTED"
+    other, _, _ = build(tmp_path / "other", [wire("STALLED")])
+    assert other.run()["status"] == "STALLED"
+
+
+def test_infrastructure_resume_reuses_exact_pending_branch_without_selection(tmp_path):
+    def execute(request, count):
+        retained = request.branch_root / "transport-handle.txt"
+        if count == 1:
+            retained.write_text("retained-handle")
+            raise OSError("observation unavailable")
+        assert retained.read_text() == "retained-handle"
+        return _result(request.spec, True, "observed same operation")
+
+    c, contexts, requests = build(tmp_path, [wire("READY")], execute=execute)
+    with pytest.raises(RuntimeError):
+        c.run()
+    assert not contexts
+    assert c.report()["status"] == "RECOVERY_REQUIRED"
+    assert c.report()["target_attempts"] == 0
+    assert c.resume()["status"] == "READY"
+    assert requests[0].branch_root == requests[1].branch_root
+
+
+def test_resume_rejects_changed_target_budget_runtime_and_legacy_conversion(tmp_path):
+    c, _, _ = build(tmp_path, [])
+    c.run_attempt()
+    c.max_target_attempts += 1
+    with pytest.raises(ValueError, match="budgets changed"):
+        c.report()
+    c.max_target_attempts -= 1
+    c.runtime = {**RUNTIME, "compiler": "different"}
+    with pytest.raises(ValueError, match="runtime changed"):
+        c.report()
+    c.runtime = RUNTIME
+    path = c.root / "state.json"
+    state = json.loads(path.read_text())
+    state["phase"] = "adaptive-phase2"
+    path.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="budgets changed"):
+        c.report()
+
+
+def test_completed_outcome_is_reused_after_crash_before_state_publication(tmp_path, monkeypatch):
+    c, _, requests = build(tmp_path, [wire("READY")])
+    publish = c._publish
+    monkeypatch.setattr(c, "_publish", lambda *args: (_ for _ in ()).throw(OSError("disk interrupted")))
+    with pytest.raises(OSError, match="disk interrupted"):
+        c.run()
+    assert c.report()["status"] == "RECOVERY_REQUIRED"
+    monkeypatch.setattr(c, "_publish", publish)
+    assert c.resume()["status"] == "READY"
+    assert len(requests) == 1
+
+
+def test_no_practice_novelty_gate_on_repeated_target_spec(tmp_path):
+    c, _, requests = build(tmp_path, [wire("RETRY_TARGET"), wire("READY")])
+    assert c.run()["status"] == "READY"
+    assert requests[0].spec == requests[1].spec == c.target.spec
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.agent_presentation import memory_presentation
+    view = memory_presentation(requests[1].pre_wave_memory, ContentAddressedArtifacts(tmp_path / "view"))
+    assert view["phase2_feedback"][0]["kind"] == "target"
+    assert view["phase2_feedback"][0]["host_feedback"]
+
+
+def test_host_diagnostics_reach_curriculum_and_private_reference_does_not(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import canonical_bytes
+
+    def execute(request, count):
+        store = ContentAddressedArtifacts(request.branch_root / "artifacts")
+        result = _result(request.spec, True, "host verified")
+        observed = store.put_json({"compile_diagnostic": "actual compiler observation",
+                                  "runtime_diagnostic": "actual runtime observation",
+                                  "output": [0., 2.]})
+        expected = store.put_json({"storage": [0., 1.]})
+        return replace(result, evidence_payload=canonical_bytes({"classification": "host-verified",
+            "detail": "actual host detail", "artifacts": {"observed": observed, "expected": expected}}))
+
+    c, contexts, _ = build(tmp_path, [wire("READY")], execute=execute)
+    c.run()
+    actual = contexts[0]["latest_target_attempt"]["host_feedback"]
+    assert actual["compile_diagnostic"] == "actual compiler observation"
+    assert actual["runtime_diagnostic"] == "actual runtime observation"
+    assert actual["detail"] == "actual host detail"
+    assert actual["numerical_summary"]
+    assert "private working reference" not in json.dumps(contexts)
+
+
+def test_archive_memory_chain_uses_reviewed_seed_not_launcher_input(tmp_path, monkeypatch):
+    from benchmarks.ascend import phase2_curriculum
+    from benchmarks.ascend.training_annex import _verify_adaptive_state
+    c, _, _ = build(tmp_path, [wire("RETRY_TARGET"), wire("READY")],
+        execute=lambda r, n: _result(r.spec, n != 1, "actual host verdict"))
+    c.run()
+    (c.root / "initial-memory.bin").write_bytes(b"original Phase 1 launcher input")
+    monkeypatch.setattr(phase2_curriculum, "reviewed_seed", lambda root, identity: (c.initial_memory, None))
+    _verify_adaptive_state(c.root, json.loads((c.root / "state.json").read_bytes()))

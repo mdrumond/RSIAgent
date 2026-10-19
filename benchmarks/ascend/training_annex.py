@@ -198,19 +198,21 @@ def _verify_adaptive_state(root, state):
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
     seed = root / "initial-memory.bin"
     initial = seed.read_bytes() if seed.is_file() else None
-    if state.get("phase") == "adaptive-phase2":
+    if state.get("phase") in {"adaptive-phase2", "target-driven-phase2"}:
         from .phase2_curriculum import reviewed_seed
         initial, _ = reviewed_seed(root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
     memories, outcomes, failures = [], [], []
-    for wave_id in state["completed_waves"]:
+    for ordinal, wave_id in enumerate(state["completed_waves"]):
         wave_root = root / "waves" / wave_id
         wave = WaveSpec.from_mapping(json.loads((wave_root / "plan.json").read_bytes())["wave"])
         if initial is not None:
             snapshot = {"schema": MEMORY_SCHEMA,
                         "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
                         "project_memory_base64": memories}
+            if state.get("phase") == "target-driven-phase2":
+                snapshot["phase2_feedback"] = state["attempts"][max(0, ordinal - 2):ordinal]
             if wave.pre_wave_memory_sha256 != _sha(_json(snapshot)):
                 raise ValueError("published pre-wave memory chain differs")
         publication = json.loads((wave_root / "published.json").read_bytes())
@@ -329,7 +331,7 @@ def inventory_campaign(root, *, artifact_store=None):
     if state.get("schema") == STATE_SCHEMA:
         # Phase 2 uses its separately authenticated reviewed snapshot as seed;
         # this file is the Phase 1 launcher's portable seed convention.
-        if state.get("phase") != "adaptive-phase2" and not (root / "initial-memory.bin").is_file():
+        if state.get("phase") not in {"adaptive-phase2", "target-driven-phase2"} and not (root / "initial-memory.bin").is_file():
             issues.append({"kind": "missing-initial-memory"})
         try:
             _verify_adaptive_state(root, state)

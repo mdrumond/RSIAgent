@@ -55,12 +55,20 @@ def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session", seed=b"se
     memory = tmp_path / "seed"
     memory.write_bytes(seed)
     argv = ["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),
-            "--target", "a3", "--phase", str(phase), "--objective", "Learn kernels",
+            "--target", "a3", "--phase", "1", "--objective", "Learn kernels",
             "--config", str(config), "--initial-memory", str(memory), "--project-target", "2"]
     if phase == 2:
         argv += ["--phase1-root", str(tmp_path / "old"), "--review", str(tmp_path / "review.json")]
     cli.main(argv, screen=screen)
-    return cli._read(tmp_path / "control" / "job.json")
+    job = cli._read(tmp_path / "control" / "job.json")
+    if phase == 2:
+        # Retained pre-goal campaigns remain resumable; new Phase 2 starts require goals.
+        job.update(phase=2, phase1_root=str(tmp_path / "old"), review=str(tmp_path / "review.json"))
+        write(tmp_path / "control" / "job.json", job)
+        public = cli._read(tmp_path / "campaign" / "campaign-run.json")
+        public["phase"] = 2
+        write(tmp_path / "campaign" / "campaign-run.json", public)
+    return job
 
 
 def test_start_retains_public_provenance_not_private_settings_and_separate_workers(tmp_path):
@@ -671,3 +679,66 @@ def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_pa
     assert any(row["path"].endswith("closed-failure.json") for row in manifest["files"])
     assert sum(row["path"].startswith("waves/") and row["path"].endswith("outcome.json")
                for row in manifest["files"]) == 2
+
+
+def test_new_phase2_requires_goal_and_rejects_approval_mode_before_writes(tmp_path, capsys):
+    argv = ["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),
+            "--target", "a3", "--phase", "2", "--objective", "fixed copy", "--config", "absent",
+            "--initial-memory", "absent", "--project-target", "1", "--phase1-root", "absent", "--review", "absent"]
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+    assert "requires --target-goal" in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        cli.main([*argv, "--target-goal", "absent", "--approval-mode"])
+    assert "does not support --approval-mode" in capsys.readouterr().err
+    assert not (tmp_path / "control").exists()
+    assert not (tmp_path / "campaign").exists()
+
+
+def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_path, monkeypatch):
+    import hashlib
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.ascend import phase1_cli, production
+    from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
+    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_ascend_phase2_curriculum import snapshot
+    goal, store, _ = qualified(tmp_path / "reference")
+    contract = write(tmp_path / "goal.json", goal.as_dict())
+    manifest = write(tmp_path / "sources.json", {"schema": "ascend-sft-sources-v2", "sources": [{
+        "name": "native", "repository": "https://example.invalid/native", "revision": "a" * 40,
+        "license": "Apache-2.0", "include": ["**/*.cpp"]}]})
+    model = MODEL_IDENTITIES[0]
+    config = write(tmp_path / "settings.json", {"model": model.backend_model.value,
+        "phase1_arguments": [], "source_manifest": str(manifest),
+        "target_artifact_store": str(store.root), "target_runtime": RUNTIME})
+    memory = tmp_path / "seed"
+    memory.write_bytes(b"seed")
+    control, root = tmp_path / "control", tmp_path / "campaign"
+    cli.main(["start", "--control", str(control), "--root", str(root), "--target", "a3", "--phase", "2",
+              "--objective", "fixed copy", "--config", str(config), "--initial-memory", str(memory),
+              "--project-target", "1", "--phase1-root", "old", "--review", "review",
+              "--target-goal", str(contract)], screen=lambda *args: "session")
+    job = cli._read(control / "job.json")
+    assert job["target_goal"] == goal.as_dict()
+    pinned = ContentAddressedArtifacts(Path(job["target_artifact_store"]))
+    shutil.rmtree(store.root)
+    goal.verify(pinned, RUNTIME)
+    assert "private working reference" not in (root / "campaign-run.json").read_text()
+    source = dict(target="native", arch="arch", execution_profile="bz-a3-1", guide_sha256="a" * 64,
+                  cpl_skills_revision="b" * 40, environment_identity={}, model=model.as_dict(),
+                  profiling_mode="without-profiling-guidance")
+    reviewed = snapshot()
+    reviewed.destination = SimpleNamespace(source_identity=source)
+    monkeypatch.setattr(cli, "_snapshot", lambda *args: reviewed)
+    native = SimpleNamespace(**{k: v for k, v in source.items() if k != "model"}, collection=None)
+    monkeypatch.setattr(phase1_cli, "main", lambda argv, **kw: kw["native_builder"](
+        config=native, profile=SimpleNamespace(identity=model)))
+    monkeypatch.setattr(production, "build_native_adaptive_phase1", lambda **kw: SimpleNamespace(
+        curriculum=CurriculumAgent(lambda _: 'DECISION: READY\n{"reason":"done"}'),
+        execute_project=lambda _: None, trace_hook=None))
+    controller = cli.build_controller(job)
+    assert isinstance(controller, TargetDrivenPhase2Coordinator)
+    assert controller.target.target_id == goal.target_id
+    assert hashlib.sha256(config.read_bytes()).hexdigest() == job["config_sha256"]

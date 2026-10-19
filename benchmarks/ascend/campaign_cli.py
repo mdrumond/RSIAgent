@@ -123,7 +123,27 @@ def build_controller(job):
                 for key, value in snapshot.destination.source_identity.items():
                     if key != "schema" and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
-        captured.append(getattr(built, "coordinator", built))
+        coordinator = getattr(built, "coordinator", built)
+        if job.get("target_goal") is not None:
+            from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+            from .phase2_targets import TargetContract
+            from .phase2_target_selector import TargetCurriculumAgent
+            from .phase2_target_loop import TargetDrivenPhase2Coordinator
+            coordinator = TargetDrivenPhase2Coordinator(
+                job["root"], job["objective"], snapshot,
+                TargetCurriculumAgent(coordinator.curriculum._complete,
+                                      target_policy=coordinator.curriculum.target_policy),
+                coordinator.execute_project,
+                target=TargetContract.from_mapping(job["target_goal"]),
+                artifacts=ContentAddressedArtifacts(Path(job["target_artifact_store"])),
+                runtime=settings["target_runtime"],
+                target_policy=coordinator.curriculum.target_policy,
+                max_target_attempts=job["target_attempt_budget"],
+                max_practice_attempts=job["practice_attempt_budget"],
+                available_tools=settings.get("target_available_tools", ()),
+                trace_hook=coordinator.trace_hook,
+            )
+        captured.append(coordinator)
         # The old CLI calls run() after composing. Capture without executing it.
         return type("Deferred", (), {"run": lambda self: {"deferred": True}})()
 
@@ -403,6 +423,10 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--initial-memory", type=Path, required=True)
             sub.add_argument("--config", type=Path, required=True)
             sub.add_argument("--project-target", type=int, required=True)
+            sub.add_argument("--target-goal", type=Path,
+                             help="host-qualified fixed TargetContract JSON; required for new Phase 2")
+            sub.add_argument("--target-attempt-budget", type=int, default=3)
+            sub.add_argument("--practice-attempt-budget", type=int, default=2)
             sub.add_argument("--phase1-root", type=Path)
             sub.add_argument("--review", type=Path)
             sub.add_argument("--approval-mode", action="store_true")
@@ -426,6 +450,14 @@ def main(argv=None, *, screen=start_screen):
             parser.error("--project-target must be positive")
         if args.phase == 2 and (args.phase1_root is None or args.review is None):
             parser.error("phase 2 requires --phase1-root and --review")
+        if args.phase == 2 and args.target_goal is None:
+            parser.error("new phase 2 requires --target-goal; existing campaigns use resume")
+        if args.phase == 1 and args.target_goal is not None:
+            parser.error("--target-goal is only supported for phase 2")
+        if args.target_goal is not None and args.approval_mode:
+            parser.error("target-driven phase 2 does not support --approval-mode")
+        if args.target_attempt_budget < 1 or args.practice_attempt_budget < 1:
+            parser.error("target and practice attempt budgets must be positive")
         root = args.root.resolve()
         if root == control or root in control.parents or control in root.parents:
             parser.error("campaign and control directories must be separate")
@@ -439,6 +471,15 @@ def main(argv=None, *, screen=start_screen):
             parser.error("phase1_arguments must be a string list")
         if any(a.split("=", 1)[0] in reserved for a in arguments):
             parser.error("phase1_arguments cannot override campaign identity/budget")
+        goal = None
+        if args.target_goal is not None:
+            from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+            from .phase2_targets import TargetContract
+            goal = TargetContract.from_mapping(_read(args.target_goal))
+            goal.verify(ContentAddressedArtifacts(Path(settings["target_artifact_store"])),
+                        settings["target_runtime"])
+            if goal.runtime["target"] != args.target:
+                parser.error("goal runtime target differs from --target")
         source_path = Path(settings["source_manifest"])
         source = SourceManifest.load(source_path)
         revision = _harness_revision()
@@ -451,6 +492,9 @@ def main(argv=None, *, screen=start_screen):
                   "objective": args.objective, "project_target": args.project_target,
                   "model": settings["model"], "source_manifest_sha256": source.sha256,
                   "harness_revision": revision, "created": time.time(), "round_id": control.name}
+        if goal is not None:
+            public.update(target_goal=goal.as_dict(), target_attempt_budget=args.target_attempt_budget,
+                          practice_attempt_budget=args.practice_attempt_budget)
         if args.approval_mode:
             public["approval_mode"] = True
         _write(root / "campaign-run.json", public)
@@ -458,6 +502,16 @@ def main(argv=None, *, screen=start_screen):
                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
                "phase1_root": str(args.phase1_root.resolve()) if args.phase1_root else None,
                "review": str(args.review.resolve()) if args.review else None}
+        if goal is not None:
+            source_store = ContentAddressedArtifacts(Path(settings["target_artifact_store"]))
+            pinned_store = ContentAddressedArtifacts(control / "target-artifacts")
+            reference = source_store.read_json(goal.reference_sha256)
+            digests = [goal.reference_sha256, reference["source_sha256"],
+                       *reference["artifacts"].values(),
+                       *(row["evidence_sha256"] for row in reference["timings"])]
+            for digest in digests:
+                pinned_store.put_bytes(source_store.read_bytes(digest))
+            job["target_artifact_store"] = str(pinned_store.root)
         _write(control / "job.json", job)
     else:
         job = _read(control / "job.json")
@@ -468,6 +522,8 @@ def main(argv=None, *, screen=start_screen):
             except BlockingIOError:
                 parser.error("campaign is already running; use status")
         if args.command == "continue":
+            if job.get("target_goal") is not None:
+                parser.error("target-driven budgets are fixed; start a new campaign to change them")
             if args.project_target <= job["project_target"]:
                 parser.error("continuation must increase project target")
             job.update(continue_target=args.project_target, reopen_terminal=args.reopen_terminal)
