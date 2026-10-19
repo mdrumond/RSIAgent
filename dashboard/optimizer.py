@@ -78,7 +78,8 @@ class OptimizerDashboard:
         if not isinstance(data.get('init_args', []), list) or not isinstance(data.get('init_kwargs', {}), dict):
             raise ValueError('constructor arguments must be a JSON array and object')
         snapshot = freeze_source(root, snapshot_roots=self.settings.get('snapshot_roots', []))
-        job = self.store.create(source, data.get('entrypoint'), data['signature'], snapshot,
+        job = self.store.create(source, data.get('entrypoint'),
+            {'signatures': data['signature']}, snapshot,
             name=data.get('name', ''), init_args=data.get('init_args'),
             init_kwargs=data.get('init_kwargs'), idempotency_key=key,
             max_attempts=data.get('max_attempts', 25), max_seconds=data.get('max_seconds', 7200))

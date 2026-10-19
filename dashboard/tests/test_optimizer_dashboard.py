@@ -43,6 +43,7 @@ def test_upload_lifecycle_and_restart(setup, tmp_path):
     assert 'optimizer.worker' in launched[0][0][0]
     store = app.extensions['optimizer'].store
     assert store.submission(job_id)['memory_snapshot']['snapshot_id'] == 'snapshot'
+    assert store.submission(job_id)['signature'] == {'signatures': [{'shape': [3]}]}
     store.transition(job_id, 'running', stage='checking-correctness')
     store.add_event(job_id, 'provider', {'prompt': 'large hidden prompt'})
     status = client.get(f'/api/optimizer/jobs/{job_id}').json

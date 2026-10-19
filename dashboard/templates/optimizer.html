@@ -10,6 +10,7 @@
 <label>Or upload Python file<input type="file" name="source_file" accept=".py,text/x-python"></label>
 <label>Function or class entrypoint<input name="entrypoint" required placeholder="forward or Model"></label>
 <label>Representative input signatures (JSON array)<textarea name="signature" rows="4" required spellcheck="false" placeholder='[{"args": [{"shape": [1024], "dtype": "float32"}]}]'></textarea></label>
+<small>Describe tensor arguments with shape and float16, bfloat16 or float32 dtype; use {"scalar": 1} for a scalar. Each signature contains args and optional kwargs.</small>
 <div class="optimizer-grid"><label>Constructor arguments (JSON array)<input name="init_args" value="[]"></label>
 <label>Constructor keyword arguments (JSON object)<input name="init_kwargs" value="{}"></label></div>
 <label>Phase 2 memory<select name="memory_root" id="optimizer-memory" required disabled><option>Loading eligible memory…</option></select></label>
