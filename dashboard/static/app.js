@@ -46,10 +46,17 @@ const svgNode = (name, attrs = {}, text = '') => {
   node.textContent = text;
   return node;
 };
-function chartFrame(label) {
-  const svg = svgNode('svg', {viewBox: '0 0 720 260', class: 'performance-chart', role: 'img', 'aria-label': label});
+function chartFrame(label, xLabel, yLabel, maximum) {
+  const svg = svgNode('svg', {viewBox: '0 0 720 290', class: 'performance-chart', role: 'img', 'aria-label': `${label}; ${xLabel}; ${yLabel}`});
   svg.append(svgNode('line', {x1: 55, y1: 220, x2: 700, y2: 220, class: 'axis'}));
   svg.append(svgNode('line', {x1: 55, y1: 20, x2: 55, y2: 220, class: 'axis'}));
+  svg.append(svgNode('text', {x: 377, y: 278, class: 'axis-label'}, xLabel));
+  svg.append(svgNode('text', {transform: 'translate(13 120) rotate(-90)', class: 'axis-label'}, yLabel));
+  [0, maximum / 2, maximum].forEach(value => {
+    const y = 220 - value / maximum * 190;
+    svg.append(svgNode('line', {x1: 51, y1: y, x2: 55, y2: y, class: 'axis'}));
+    svg.append(svgNode('text', {x: 47, y: y + 3, class: 'axis-value'}, Number(value.toPrecision(3)).toString()));
+  });
   return svg;
 }
 function point(svg, x, y, title, unavailable = false, extraClass = '') {
@@ -58,13 +65,14 @@ function point(svg, x, y, title, unavailable = false, extraClass = '') {
   mark.append(svgNode('title', {}, title)); svg.append(mark);
 }
 function renderTiming(target, captures, shapeMode) {
-  const svg = chartFrame(shapeMode ? 'Latency by logical shape' : 'Latency over attempts');
   if (!captures.length) { target.textContent = 'No retained timing captures.'; return; }
   const maximum = Math.max(...captures.map(row => row.statistics.max_us), 1);
   const y = value => 220 - value / maximum * 190;
   const ordered = [...captures];
   if (shapeMode) ordered.sort((a, b) => a.shape_axis.kind === 'log-length' && b.shape_axis.kind === 'log-length' ? a.shape_axis.value - b.shape_axis.value : String(a.shape_axis.value).localeCompare(String(b.shape_axis.value)));
   const allLog = shapeMode && ordered.every(row => row.shape_axis.kind === 'log-length');
+  const xLabel = !shapeMode ? 'Measurement attempt (#)' : allLog ? 'Logical length (elements, log scale)' : 'Logical shape (elements per dimension)';
+  const svg = chartFrame(shapeMode ? 'Latency by logical shape' : 'Latency over attempts', xLabel, 'Latency (µs)', maximum);
   const logs = allLog ? ordered.map(row => Math.log10(row.shape_axis.value)) : [];
   const x = (row, index) => allLog && Math.max(...logs) !== Math.min(...logs) ? 70 + (Math.log10(row.shape_axis.value) - Math.min(...logs)) / (Math.max(...logs) - Math.min(...logs)) * 610 : 70 + (ordered.length === 1 ? 305 : index / (ordered.length - 1) * 610);
   ordered.forEach((row, index) => {
@@ -78,7 +86,7 @@ function renderTiming(target, captures, shapeMode) {
   target.replaceChildren(svg);
 }
 function renderPipes(target, profiles, engine = 'all') {
-  const svg = chartFrame('AIC and AIV pipe utilization');
+  const svg = chartFrame('AIC and AIV pipe utilization', 'Pipe / profiling capture (category)', 'Utilization (%)', 100);
   const metrics = profiles.flatMap(row => row.metrics.map(metric => ({...metric, capture: row.capture}))).filter(metric => engine === 'all' || metric.engine === engine);
   if (!metrics.length) { target.textContent = 'No retained PipeUtilization capture.'; return; }
   metrics.forEach((metric, index) => {
