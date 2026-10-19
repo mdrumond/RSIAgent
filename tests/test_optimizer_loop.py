@@ -209,3 +209,82 @@ def test_launch_geometry_is_part_of_candidate_identity(tmp_path):
     assert result['attempts'] == 2
     assert [count for _, count in backend.paths] == [1, 2]
     assert backend.paths[0][0] != backend.paths[1][0]
+
+
+def test_final_reserved_attempt_reconnects_without_added_budget(tmp_path):
+    import pytest
+    from optimizer.control import ObservationUnavailable
+    store, key = fixture(tmp_path, attempts=1)
+    class LostBackend(Backend):
+        def evaluate(self, *args, **kwargs):
+            if not self.evaluations:
+                self.evaluations.append('lost')
+                raise ObservationUnavailable('same retained handle')
+            return super().evaluate(*args, **kwargs)
+    backend = LostBackend()
+    with pytest.raises(ObservationUnavailable):
+        OptimizationLoop(store, key, Agent([{'action': 'cases', 'signatures': [], 'summary': ''},
+                                           candidate('fast')]), backend).run()
+    assert store.get(key)['status'] == 'budget-exhausted'
+    assert store.get(key)['stage'] == 'observation-unavailable'
+    OptimizationLoop(store, key, Agent([]), backend).run()
+    state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
+    assert state['best']['speedup'] == 2
+    assert store.get(key)['attempts'] == store.get(key)['max_attempts'] == 1
+
+
+def test_replay_persisted_cases_and_candidate_actions_without_model_calls(tmp_path):
+    for stage in ('cases', 'optimize'):
+        store, key = fixture(tmp_path / stage, attempts=1)
+        backend = Backend()
+        loop = OptimizationLoop(store, key, Agent([]), backend)
+        store.transition(key, 'running', stage=stage)
+        action = {'action': 'cases', 'signatures': [], 'summary': ''} if stage == 'cases' else candidate('fast')
+        if stage == 'optimize':
+            loop.state['spec'] = loop._artifact('spec', loop._spec(store.submission(key)))
+            loop.state['baseline'] = loop._artifact('baseline', backend.prepare({}, tmp_path))
+        loop.state['action_result'] = loop._artifact(stage, action)
+        loop._save()  # crash after _action returned evidence, before caller checkpoint
+        actions = [candidate('fast')] if stage == 'cases' else []
+        OptimizationLoop(store, key, Agent(actions), backend).run()
+        assert store.get(key)['attempts'] == 1
+        assert backend.evaluations == ['fast']
+
+
+def test_final_reserved_profile_reconnect_does_not_repeat_evaluation(tmp_path):
+    import pytest
+    from optimizer.control import ObservationUnavailable
+    store, key = fixture(tmp_path, attempts=1)
+    class LostProfile(Backend):
+        def profile(self, *args, **kwargs):
+            if not self.profiles:
+                self.profiles.append('lost')
+                raise ObservationUnavailable('retained profile handle')
+            return {'status': 'available'}
+    backend = LostProfile()
+    with pytest.raises(ObservationUnavailable):
+        OptimizationLoop(store, key, Agent([
+            {'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend).run()
+    OptimizationLoop(store, key, Agent([]), backend).run()
+    state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
+    assert len(state['history']) == len(backend.evaluations) == 1
+    assert 'profiling' in state['best']
+    assert store.get(key)['attempts'] == store.get(key)['max_attempts'] == 1
+
+
+def test_finish_respects_stop_or_time_boundary_after_model_returns(tmp_path):
+    for boundary in ('stop', 'time'):
+        store, key = fixture(tmp_path / boundary)
+        class BoundaryAgent(Agent):
+            def complete(self, stage, context, record):
+                action = super().complete(stage, context, record)
+                if stage == 'optimize':
+                    if boundary == 'stop':
+                        store.stop(key)
+                    else:
+                        store.account_time(key, 7200)
+                return action
+        result = OptimizationLoop(store, key, BoundaryAgent([
+            {'action': 'cases', 'signatures': [], 'summary': ''},
+            {'action': 'finish', 'summary': 'done'}]), Backend()).run()
+        assert result['status'] == ('stopped' if boundary == 'stop' else 'budget-exhausted')
