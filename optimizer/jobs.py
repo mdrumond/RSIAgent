@@ -160,7 +160,8 @@ class JobStore:
 
     def transition(self, job_id, status, *, stage=None):
         allowed = {'queued': {'running', 'stopped', 'failed'},
-                   'running': {'running', 'completed', 'failed', 'stopped', 'budget-exhausted'}}
+                   'running': {'running', 'completed', 'failed', 'stopped', 'budget-exhausted'},
+                   'budget-exhausted': {'budget-exhausted'}}
         def change(row):
             if status not in allowed.get(row['status'], set()):
                 raise ValueError('invalid job transition')
