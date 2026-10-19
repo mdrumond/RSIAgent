@@ -13,6 +13,48 @@ def config(tmp_path):
                 validation_wrapper='/profiles/catlass-validation.sh', remote_workspace='/work')
 
 
+@pytest.mark.parametrize('failure', ['config', 'guide'])
+def test_cli_bootstrap_failure_is_durable(tmp_path, failure):
+    import subprocess
+    import sys
+    from optimizer.jobs import JobStore
+    store = JobStore(tmp_path / 'jobs')
+    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
+    invalid = tmp_path / 'invalid.json'
+    settings = config(tmp_path)
+    settings['guide'] = str(tmp_path / 'missing-guide')
+    settings['lock_directory'] = str(tmp_path / 'locks')
+    invalid.write_text(json.dumps({} if failure == 'config' else settings))
+    result = subprocess.run([sys.executable, '-m', 'optimizer.worker', '--root', str(store.root),
+                             '--job-id', key, '--config', str(invalid)], capture_output=True, text=True)
+    assert result.returncode != 0 and 'Traceback' in result.stderr
+    assert store.get(key)['status'] == 'failed'
+    error = next(row['payload'] for row in store.events(key) if row['kind'] == 'worker-startup-error')
+    assert error['type'] == ('ValueError' if failure == 'config' else 'FileNotFoundError')
+    assert ('checked A3 profile' if failure == 'config' else 'missing-guide') in error['message']
+
+
+def test_duplicate_cli_startup_cannot_fail_active_job(tmp_path):
+    import subprocess
+    import sys
+    from optimizer.jobs import JobStore
+    store = JobStore(tmp_path / 'jobs')
+    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
+    settings = config(tmp_path)
+    settings['arch'] = 'dav2201'
+    settings['guide'] = str(tmp_path / 'guide')
+    settings['lock_directory'] = str(tmp_path / 'locks')
+    Path(settings['guide']).write_text('guide')
+    path = tmp_path / 'worker.json'
+    path.write_text(json.dumps(settings))
+    with exclusive(store.root / key / 'worker.lock'):
+        result = subprocess.run([sys.executable, '-m', 'optimizer.worker', '--root', str(store.root),
+                                 '--job-id', key, '--config', str(path)], capture_output=True, text=True)
+    assert result.returncode != 0 and 'BlockingIOError' in result.stderr
+    assert store.get(key)['status'] == 'queued'
+    assert not any(row['kind'] == 'worker-startup-error' for row in store.events(key))
+
+
 def test_uncertain_dispatch_is_never_submitted_twice(tmp_path):
     calls = []
     def run(argv, **kwargs):

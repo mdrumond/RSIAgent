@@ -238,7 +238,25 @@ def main(argv=None):
     parser.add_argument('--job-id', required=True)
     parser.add_argument('--config', required=True, type=Path)
     args = parser.parse_args(argv)
-    print(json.dumps(run_worker(args.root, args.job_id, load_config(args.config))))
+    try:
+        print(json.dumps(run_worker(args.root, args.job_id, load_config(args.config))))
+    except (ObservationUnavailable, WorkerStopped, BlockingIOError):
+        # Recovery boundaries and a duplicate worker losing its lock are not
+        # startup failures and must not overwrite the active job's status.
+        raise
+    except Exception as exc:
+        store = JobStore(args.root)
+        try:
+            with exclusive(store._directory(args.job_id) / 'worker.lock'):
+                store.add_event(args.job_id, 'worker-startup-error',
+                                {'type': type(exc).__name__, 'message': str(exc)})
+                if store.get(args.job_id)['status'] in {'queued', 'running'}:
+                    store.transition(args.job_id, 'failed', stage='worker-startup-error')
+        except (BlockingIOError, OSError, ValueError):
+            # Another worker may already have claimed the job, or the supplied
+            # identity may not exist. Preserve the original stderr traceback.
+            pass
+        raise
 
 
 if __name__ == '__main__':
