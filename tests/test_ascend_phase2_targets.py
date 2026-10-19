@@ -159,3 +159,42 @@ def test_reference_input_changes_are_rejected_even_when_saved_output_matches(tmp
     reference["artifacts"]["inputs"] = store.put_json(inputs)
     with pytest.raises(ValueError, match="inputs or oracle changed"):
         replace(target, reference_sha256=store.put_json(reference)).verify(store, RUNTIME)
+
+
+@pytest.mark.parametrize("field", ["project_id", "hypothesis", "graph-input", "graph-node"])
+def test_practice_rejects_held_out_names(tmp_path, field):
+    target, _, _ = qualified(tmp_path)
+    value = json.loads(practice_wire().split("\n", 1)[1])
+    project = value["project"]
+    if field == "project_id":
+        project["project_id"] = "practice-bsa"
+    elif field == "hypothesis":
+        project["hypothesis"] = "Reconstruct the held-out GDN kernel from this target failure."
+    elif field == "graph-input":
+        old = project["graph"]["inputs"][0]["name"]
+        project["graph"]["inputs"][0]["name"] = "bsa"
+        for node in project["graph"]["nodes"]:
+            node["operands"] = ["bsa" if name == old else name for name in node["operands"]]
+    else:
+        project["graph"]["nodes"][-1]["name"] = "gdn"
+        project["graph"]["output"] = "gdn"
+    with pytest.raises(ValueError, match="held-out benchmark name"):
+        TargetCurriculumAgent(lambda _: "").parse(
+            "DECISION: PRACTICE\n" + json.dumps(value), context(target))
+
+
+def test_configured_held_out_signatures_apply_only_to_practice(tmp_path):
+    from benchmarks.a5kernels.phase1_curriculum_selector import project_information_sha256
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    target, _, _ = qualified(tmp_path)
+    value = json.loads(practice_wire().split("\n", 1)[1])
+    digest = project_information_sha256(ProjectSpec.from_mapping(value["project"]))
+    agent = TargetCurriculumAgent(lambda _: "", held_out_information_sha256=(digest,))
+    # Learning focus and new IDs cannot evade executable held-out matching.
+    value["project"]["learning_focus"] = ["pipe-vector"]
+    with pytest.raises(ValueError, match="held-out contract"):
+        agent.parse("DECISION: PRACTICE\n" + json.dumps(value), context(target))
+    assert agent.parse('DECISION: RETRY_TARGET\n{"reason":"retry unchanged goal"}',
+                       context(target)).action == "retry-target"
+    with pytest.raises(ValueError, match="SHA-256"):
+        TargetCurriculumAgent(lambda _: "", held_out_information_sha256=("invalid",))

@@ -6,7 +6,9 @@ import json
 from typing import Mapping
 
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumSession, _grammar
+from benchmarks.a5kernels.phase1_curriculum_selector import (
+    CurriculumSession, _grammar, _HELD_OUT_WORDS, _digest, project_information_sha256,
+)
 from benchmarks.ascend.phase2_targets import TargetContract
 from benchmarks.ascend.targets import CurriculumPolicy
 
@@ -18,7 +20,8 @@ target. Practice is useful only when it addresses a specific observed weakness.
 Difficulty or broad coverage alone is not a reason to select practice. A passing
 target may still benefit from practice, but every practice requires a fresh target
 attempt. Never relax correctness, change the target, invent measurements or impose
-an unmeasured speedup threshold. Reference source is intentionally private.
+an unmeasured speedup threshold. Never mention or reconstruct held-out benchmarks
+in practice projects. Reference source is intentionally private.
 Return one exact decision wire form and JSON, without Markdown or extra text."""
 
 
@@ -89,11 +92,13 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
 
 
 class TargetCurriculumAgent:
-    def __init__(self, complete, *, target_policy=None):
+    def __init__(self, complete, *, target_policy=None, held_out_information_sha256=()):
         if not callable(complete):
             raise TypeError("complete must be callable")
         self.complete = complete
         self.target_policy = target_policy
+        self._held_out = frozenset(_digest(item, "held-out information identity")
+                                   for item in held_out_information_sha256)
 
     def select(self, context, session=None):
         session = CurriculumSession() if session is None else session
@@ -138,6 +143,13 @@ class TargetCurriculumAgent:
             project = ProjectSpec.from_mapping(value["project"])
             if project.project_id == context.target.spec.project_id:
                 raise ValueError("practice must not replace the target")
+            names = (project.project_id, project.hypothesis, project.graph.output,
+                     *(item.name for item in project.graph.inputs),
+                     *(item.name for item in project.graph.nodes))
+            if any(_HELD_OUT_WORDS.search(name) for name in names):
+                raise ValueError("practice exposes a held-out benchmark name")
+            if project_information_sha256(project) in self._held_out:
+                raise ValueError("practice matches a held-out contract or shape")
             if self.target_policy is not None:
                 self.target_policy.admit(project)
             value["project"] = project
