@@ -288,9 +288,11 @@ class AdaptivePhase1Coordinator:
     def approve_wave(self, proposal, selected_project_ids):
         """Admit a selected proposal subset as the coordinator's pending wave."""
         self.validate_proposal(proposal)
-        if "wave" not in proposal:
-            raise ValueError("terminal curriculum decisions cannot be approved")
         selected = tuple(selected_project_ids)
+        if "terminal" in proposal:
+            if selected:
+                raise ValueError("terminal approval requires zero project IDs")
+            return proposal
         if not selected or len(set(selected)) != len(selected):
             raise ValueError("approved project IDs must be non-empty and unique")
         wave = proposal["wave"]
@@ -340,6 +342,20 @@ class AdaptivePhase1Coordinator:
 
     def run_approved_wave(self):
         return self._run(wave_limit=1, approved_only=True)
+
+    def run_approved_proposal(self, proposal):
+        """Commit one approved wave or a bound terminal curriculum decision."""
+        if "terminal" not in proposal:
+            return self.run_approved_wave()
+        state = self.validate_proposal(proposal)
+        if state["terminal"] is not None:
+            if state["terminal"] != proposal["terminal"]:
+                raise ValueError("campaign has a different terminal decision")
+            return self._report(state)
+        state = {**state, "session": proposal["session"],
+                 "terminal": proposal["terminal"]}
+        self._atomic_json(self.root / "state.json", state)
+        return self._report(state)
 
     def resume(self) -> dict[str, object]:
         return self.run()

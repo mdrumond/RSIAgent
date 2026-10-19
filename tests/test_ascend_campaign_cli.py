@@ -259,6 +259,64 @@ def test_run_approved_recovers_after_wave_published_before_control_update(tmp_pa
     assert recovered["status"] == "complete" and recovered["recovered"] is True
 
 
+def test_running_published_proposal_cannot_be_overwritten_before_reconciliation(tmp_path):
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    control = Path(job["control"])
+    cli._write(control / "job.json", job)
+    proposal = {"base_wave_index": 3, "base_memory_sha256": "a" * 64,
+                "wave": {"projects": [{"spec": {"project_id": "one"}}]}}
+    proposal_id = cli._proposal_id(proposal)
+    cli._write(control / "curriculum-approval.json", {
+        "proposal_id": proposal_id, "status": "running", "proposal": proposal,
+    })
+    coordinator = SimpleNamespace(report=lambda: {"wave_index": 4, "status": "RUNNING"})
+    with pytest.raises(ValueError, match="resolve the retained"):
+        cli.sample_curriculum(job, builder=lambda _job: pytest.fail("must not sample"))
+    recovered = cli.run_approved_curriculum(
+        job, proposal_id, builder=lambda _job: coordinator)
+    assert recovered["status"] == "complete" and recovered["recovered"] is True
+
+
+def test_terminal_proposal_requires_empty_approval_and_commits_without_wave(tmp_path):
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from tests.test_a5_phase1_adaptive import SEED, _project, _result, _wave
+
+    job = start(tmp_path)
+    job["approval_mode"] = True
+    cli._write(Path(job["control"]) / "job.json", job)
+    selections, executions = [], []
+
+    def select(messages):
+        selections.append(1)
+        if len(selections) == 1:
+            return _wave(messages[-1]["content"], [
+                _project("observed", "gm-ub-movement")])
+        return 'DECISION: STALLED\n{"reason":"no useful next experiment"}'
+
+    coordinator = AdaptivePhase1Coordinator(
+        Path(job["root"]), "Learn kernels", SEED, CurriculumAgent(select),
+        lambda request: executions.append(request) or _result(
+            request.spec, True, "verified"), max_parallel=1, project_target=2)
+    first = coordinator.propose_wave()
+    coordinator.approve_wave(first, ("observed",))
+    coordinator.run_approved_proposal(first)
+    builder = lambda _job: coordinator
+    sampled = cli.sample_curriculum(job, builder=builder)
+    assert sampled["projects"] == [] and sampled["proposal"]["terminal"]["status"] == "STALLED"
+    with pytest.raises(ValueError, match="zero project IDs"):
+        cli.approve_curriculum(job, ["unexpected"], sampled["proposal_id"], builder=builder)
+    approved = cli.approve_curriculum(job, [], sampled["proposal_id"], builder=builder)
+    assert approved["status"] == "approved"
+    completed = cli.run_approved_curriculum(job, sampled["proposal_id"], builder=builder)
+    assert completed["result"]["status"] == "STALLED"
+    assert len(executions) == 1
+    assert len(list((Path(job["root"]) / "waves").iterdir())) == 1
+    assert coordinator.resume()["status"] == "STALLED"
+    assert len(selections) == 2
+
+
 def test_approval_mutations_are_serialized_for_non_cli_callers(tmp_path):
     job = start(tmp_path)
     job["approval_mode"] = True

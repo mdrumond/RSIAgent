@@ -179,7 +179,7 @@ def sample_curriculum(job, *, builder=build_controller):
     """Retain one model-selected proposal without making it executable."""
     _require_approval_mode(job)
     path = _approval_path(job)
-    if path.exists() and _read(path).get("status") in {"proposed", "approved"}:
+    if path.exists() and _read(path).get("status") in {"proposed", "approved", "running"}:
         raise ValueError("resolve the retained curriculum proposal before sampling again")
     proposal = builder(job).propose_wave()
     identity = _proposal_id(proposal)
@@ -204,11 +204,18 @@ def approve_curriculum(job, project_ids, proposal_id, *, builder=build_controlle
     if record["status"] != "proposed":
         raise ValueError("only a proposed curriculum can be approved")
     selected = tuple(project_ids)
-    if job["phase"] == 2 and len(selected) != 1:
+    terminal = "terminal" in record["proposal"]
+    if terminal and selected:
+        raise ValueError("terminal approval requires zero project IDs")
+    if not terminal and not selected:
+        raise ValueError("wave approval requires at least one project ID")
+    if not terminal and job["phase"] == 2 and len(selected) != 1:
         raise ValueError("Phase 2 approval requires exactly one project")
     approved = builder(job).approve_wave(record["proposal"], selected)
     record = {**record, "status": "approved", "selected_project_ids": list(selected),
-              "approved_wave": approved["wave"], "approved": time.time()}
+              **({"approved_wave": approved["wave"]} if "wave" in approved else {
+                  "approved_terminal": approved["terminal"]}),
+              "approved": time.time()}
     _write(_approval_path(job), record)
     return record
 
@@ -245,7 +252,11 @@ def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
     base_wave = record["proposal"]["base_wave_index"]
     if record["status"] == "running":
         current = coordinator.report()
-        if current["wave_index"] == base_wave + 1:
+        terminal = record["proposal"].get("terminal")
+        reconciled = (current["wave_index"] == base_wave + 1 if terminal is None
+                      else current["wave_index"] == base_wave
+                      and current["status"] == terminal["status"])
+        if reconciled:
             record = {**record, "status": "complete", "result": current,
                       "finished": time.time(), "recovered": True}
             _write(_approval_path(job), record)
@@ -259,7 +270,9 @@ def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
     control = Path(job["control"])
     _write(control / "worker.json", {"status": "running", "started": time.time()})
     try:
-        result = coordinator.run_approved_wave()
+        run_proposal = getattr(coordinator, "run_approved_proposal", None)
+        result = (run_proposal(record["proposal"]) if run_proposal is not None
+                  else coordinator.run_approved_wave())
     except Exception as error:
         _write(control / "worker.json", {"status": "failed", "finished": time.time(),
                                          "error": str(error)})
@@ -403,7 +416,7 @@ def main(argv=None, *, screen=start_screen):
         if command in {"approve", "reject", "run-approved"}:
             sub.add_argument("--proposal-id", required=True)
         if command == "approve":
-            sub.add_argument("--project-id", action="append", required=True)
+            sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
     control = args.control.resolve()
     if args.command == "start":
