@@ -255,6 +255,8 @@ class ControlManager:
             if (state['status'] in {'resolved', 'deferred'}
                     or outcome['category'] in {'verified-success', 'verified-timing-unknown', 'interrupted'}):
                 raise ControlError('select an unresolved, non-infrastructure failure')
+            if action == 'investigate' and state.get('classification') in {'infrastructure', 'provider'}:
+                raise ControlError('infrastructure/provider observations are not kernel investigations')
             if action == 'retry-feedback' and not outcome.get('task'):
                 raise ControlError('retry requires the retained original task')
         if action == 'investigate':

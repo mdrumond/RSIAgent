@@ -121,6 +121,31 @@ def test_deferred_and_resolved_visible_but_not_selected(feedback, status):
     assert not calls
 
 
+@pytest.mark.parametrize('classification', ['infrastructure', 'provider'])
+def test_classified_infrastructure_not_offered_for_kernel_investigation(feedback, classification):
+    client, app, config, row, calls = feedback
+    row['outcome'].update(category='incorrect', verified=False)
+    row['investigation'].update(classification=classification, reason='not a kernel defect')
+    write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
+    page = client.get('/feedback').get_data(as_text=True)
+    assert 'not a kernel defect' in page and 'name="feedback_id"' not in page
+    assert submit(client, 'investigate', dict(preset_id='phase1',
+        feedback_ids=[row['feedback_id']], project_target=2)).status_code == 409
+    assert not calls
+    # An explicit original-target retry is still permitted; only investigation is excluded.
+    completed(client, submit(client, 'retry-feedback', dict(
+        preset_id='phase2', feedback_ids=[row['feedback_id']])))
+
+
+def test_unclassified_budget_failure_remains_available_for_curriculum_triage(feedback):
+    client, app, config, row, calls = feedback
+    row['outcome'].update(category='budget-exhausted', verified=False)
+    write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
+    assert 'name="feedback_id"' in client.get('/feedback').get_data(as_text=True)
+    completed(client, submit(client, 'investigate', dict(preset_id='phase1',
+        feedback_ids=[row['feedback_id']], project_target=2)))
+
+
 def test_lineage_projects_and_retries_are_linked_without_changing_results(feedback):
     client, app, config, row, calls = feedback
     root = config.parent / 'investigation'

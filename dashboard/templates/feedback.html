@@ -12,7 +12,7 @@
 {% endif %}
 {% for row in records %}{% set outcome = row.outcome %}{% set state = row.investigation %}
 <article class="card" id="{{ row.feedback_id }}">
-{% if controls.enabled and controls.feedback.root and state.status not in ['resolved', 'deferred'] and outcome.category not in ['interrupted', 'verified-success', 'verified-timing-unknown'] %}<label><input name="feedback_id" type="checkbox" value="{{ row.feedback_id }}"> Select failure</label>{% endif %}
+{% if controls.enabled and controls.feedback.root and state.status not in ['resolved', 'deferred'] and state.classification not in ['infrastructure', 'provider'] and outcome.category not in ['interrupted', 'verified-success', 'verified-timing-unknown'] %}<label><input name="feedback_id" type="checkbox" value="{{ row.feedback_id }}"> Select failure</label>{% endif %}
 <h2>{{ outcome.task.task_id or outcome.attempt_id }}</h2>
 <p>{{ outcome.target }} / {{ outcome.language }} · {{ outcome.category }} · original attempt {{ outcome.attempt_id }}{% if not outcome.completed %} (interrupted, not completed){% endif %}</p>
 <p><b>Host correctness:</b> {{ 'verified' if outcome.verified else 'not verified' }}. <b>Performance:</b> {% if outcome.category == 'verified-slow' %}shortfall{% elif outcome.category == 'verified-success' %}goal met{% else %}unknown / not established{% endif %}{% if outcome.result.speedup is defined %} ({{ outcome.result.speedup }}×){% endif %}.</p>
