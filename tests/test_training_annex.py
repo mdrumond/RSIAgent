@@ -65,6 +65,24 @@ def test_portable_package_preserves_memory_failed_attempts_and_sources(campaign,
         assert json.load(archive.extractfile("campaign/native-evidence/failure.json"))["exit_code"] == 1
 
 
+def test_package_preserves_feedback_and_investigation_lineage(campaign, tmp_path):
+    feedback = {'feedback_id': 'observation', 'outcome': {'completed': False},
+                'investigation': {'status': 'deferred', 'reason': 'isolate padded shape',
+                                  'retries': ['original-target-retry']}}
+    phase1_feedback = {'selected_ids': ['observation'], 'source_root': '/original/feedback'}
+    investigations = {'projects': [{'project_id': 'probe-1', 'feedback_id': 'observation'}]}
+    files = {'feedback/observation.json': feedback, 'phase2-feedback.json': phase1_feedback,
+             'failure-investigations.json': investigations}
+    for path, value in files.items():
+        write(campaign, path, value)
+    destination = tmp_path / 'feedback.tar.gz'
+    result = package_campaign(campaign, destination)
+    assert result['complete']
+    with tarfile.open(destination) as archive:
+        for path, value in files.items():
+            assert json.load(archive.extractfile('campaign/' + path)) == value
+
+
 @pytest.mark.parametrize("mutation", [None, "missing-bundle", "corrupt-object"])
 def test_a5_production_bundle_and_measurement_trees_are_portable(campaign, tmp_path, mutation):
     from benchmarks.a5kernels.evidence import EvidenceLedger

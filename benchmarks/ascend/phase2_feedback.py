@@ -95,6 +95,9 @@ class FeedbackStore:
                     and not value.get('retries')):
                 raise ValueError('resolution requires a linked successful original-task retry')
             if value['status'] == 'resolved' and not control:
+                if (record['outcome']['target'] not in {'a3', 'a5'}
+                        or record['outcome']['language'] not in {'ascend-c', 'catlass-dsl'}):
+                    raise ValueError('resolution requires known target and language identity')
                 retries = [_read(self.root / (key + '.json'), {}) for key in value['retries']]
                 if not any(r.get('outcome', {}).get('verified') is True
                            and r['outcome']['task'] == record['outcome']['task']
