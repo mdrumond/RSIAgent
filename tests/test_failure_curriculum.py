@@ -37,7 +37,7 @@ def test_selection_controls_and_compatibility(tmp_path):
     assert len(selection['selected']) == len(selection['controls']) == 1
     assert selection['controls'][0]['outcome']['verified']
     with pytest.raises(ValueError, match='incompatible'):
-        select_feedback(store.root, 'a5')
+        select_feedback(store.root, 'a5', [selection['selected'][0]['feedback_id']])
     with pytest.raises(ValueError, match='unknown'):
         select_feedback(store.root, 'a3', ['missing'])
     context = feedback.context({})
@@ -259,3 +259,20 @@ def test_cli_pins_feedback_and_rejects_incompatible_before_launch(tmp_path):
     with pytest.raises(SystemExit):
         cli.main(args, screen=lambda *args: pytest.fail('must reject before launch'))
     assert not (tmp_path/'bad-control').exists() and not (tmp_path/'bad-root').exists()
+
+
+def test_default_selection_filters_shared_store_without_relabeling_other_targets(tmp_path):
+    store, original, _ = setup(tmp_path)
+    for target, language in [('a5', 'catlass-dsl'), ('unknown', 'unknown')]:
+        root = tmp_path / target
+        campaign(root)
+        write(root/'seed-memory.json', dict(source_identity=dict(target=target, language=language)))
+        store.import_campaign(root)
+    before = store.records()
+    selected = select_feedback(store.root, 'a3')
+    assert selected['selected'] == original['selected']
+    for row in before:
+        if row['outcome']['target'] != 'a3':
+            with pytest.raises(ValueError, match='incompatible'):
+                select_feedback(store.root, 'a3', [row['feedback_id']])
+    assert store.records() == before

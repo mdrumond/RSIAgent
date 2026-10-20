@@ -40,8 +40,13 @@ def select_feedback(root, target, ids=(), *, retry_id=None):
         raise ValueError('feedback root does not exist')
     records = FeedbackStore(root).records()
     by_id = {row['feedback_id']: row for row in records}
+    language = 'ascend-c' if target == 'a3' else 'catlass-dsl'
+    def compatible(outcome):
+        normalized = {'native-a3': 'a3', 'native-a5': 'a5'}.get(outcome['target'], outcome['target'])
+        return normalized == target and outcome['language'] == language
     selected = list(ids) if ids else [row['feedback_id'] for row in records
-        if row['investigation']['status'] in {'open', 'investigating', 'ready-to-retry'}]
+        if row['investigation']['status'] in {'open', 'investigating', 'ready-to-retry'}
+        and compatible(row['outcome'])]
     if retry_id:
         selected = [retry_id]
     if not selected:
@@ -52,15 +57,12 @@ def select_feedback(root, target, ids=(), *, retry_id=None):
             raise ValueError('unknown Phase 2 feedback ID: ' + key)
         row = by_id[key]
         outcome = row['outcome']
-        normalized = {'native-a3': 'a3', 'native-a5': 'a5'}.get(outcome['target'], outcome['target'])
-        language = 'ascend-c' if target == 'a3' else 'catlass-dsl'
-        if normalized != target or outcome['language'] != language:
+        if not compatible(outcome):
             raise ValueError('feedback target/language incompatible with selected campaign')
         result.append(row)
     # Successful siblings are context, never additional investigation obligations.
     controls = [row for row in records if row['outcome']['verified'] and
-        row['outcome']['target'] == result[0]['outcome']['target'] and
-        row['outcome']['language'] == result[0]['outcome']['language'] and
+        compatible(row['outcome']) and
         row['feedback_id'] not in selected][:8]
     return dict(selected=result, controls=controls)
 
