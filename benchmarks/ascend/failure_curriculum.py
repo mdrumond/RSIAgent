@@ -235,9 +235,12 @@ def link_retry(job):
     original = next(r for r in store.records() if r['feedback_id'] == job['retry_feedback_id'])
     retries = [r for r in store.records() if r['outcome']['source_root'] == str(Path(job['root']).resolve())
                and r['outcome']['task'] == original['outcome']['task']]
-    ids = list(dict.fromkeys([*original['investigation']['retries'], *(r['feedback_id'] for r in retries)]))
-    updates = dict(retries=ids)
-    if any(r['outcome']['verified'] and (original['outcome']['category'] != 'verified-slow' or
-           r['outcome']['category'] == 'verified-success') for r in retries):
-        updates['status'] = 'resolved'
-    store.update_investigation(original['feedback_id'], **updates)
+    def merge(current):
+        ids = list(dict.fromkeys([*current['retries'], *(r['feedback_id'] for r in retries)]))
+        updates = dict(retries=ids)
+        if current['status'] != 'resolved' and any(r['outcome']['verified'] and (
+                original['outcome']['category'] != 'verified-slow' or
+                r['outcome']['category'] == 'verified-success') for r in retries):
+            updates['status'] = 'resolved'
+        return updates
+    store.update_investigation(original['feedback_id'], merge=merge)

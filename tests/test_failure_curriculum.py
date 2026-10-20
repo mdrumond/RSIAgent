@@ -509,3 +509,31 @@ def test_concurrent_campaigns_merge_feedback_without_lost_lineage(tmp_path, monk
     assert {row['campaign_root'] for row in original['investigation']['projects']} == {
         str(first.root), str(second.root)}
     assert len(original['investigation']['evidence']) == 2
+
+
+def test_concurrent_successful_and_failed_retries_preserve_union_and_resolution(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    campaign(tmp_path/'original', result={'verified': False})
+    store = FeedbackStore(tmp_path/'feedback')
+    store.import_campaign(tmp_path/'original')
+    original = store.records()[0]
+    for name, verified in [('success', True), ('failed', False)]:
+        campaign(tmp_path/name, task=original['outcome']['task'],
+                 result=dict(verified=verified, speedup=2 if verified else None))
+        store.import_campaign(tmp_path/name)
+    stale = store.records()
+    # Force both callers to observe the original pre-union state; lock-protected
+    # merging must not depend on these external context snapshots being fresh.
+    monkeypatch.setattr(FeedbackStore, 'records', lambda _: stale)
+    barrier = Barrier(2)
+    def publish(name):
+        barrier.wait(timeout=5)
+        link_retry(dict(root=str(tmp_path/name), feedback_root=str(store.root),
+                        retry_feedback_id=original['feedback_id']))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(publish, ['success', 'failed']))
+    actual = json.loads((store.root/(original['feedback_id']+'.json')).read_bytes())
+    assert actual['investigation']['status'] == 'resolved'
+    expected = {r['feedback_id'] for r in stale if r['feedback_id'] != original['feedback_id']}
+    assert set(actual['investigation']['retries']) == expected
