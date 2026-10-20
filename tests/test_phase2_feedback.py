@@ -589,3 +589,26 @@ def test_interrupted_retry_does_not_inherit_previous_candidate(tmp_path, new_can
     else:
         assert 'candidate' not in interrupted['evidence']
         assert any('candidate ownership' in warning for warning in report['warnings'])
+
+
+def test_multisource_cli_reports_corrupt_copies_and_imports_valid_outcomes(tmp_path, capsys):
+    from benchmarks.ascend.campaign_cli import main
+    first, second = tmp_path / 'first', tmp_path / 'second'
+    campaign(first, result={'verified': False})
+    campaign(second, result={'verified': True})
+    malformed = first / 'attempts' / 'truncated.json'
+    malformed.parent.mkdir()
+    malformed.write_text('{"attempt_id":')
+    write(first / 'attempts' / 'wrong-shape.json', {'unexpected': 'copied partial metadata'})
+    (first / 'campaign-run.json').write_text('{')
+    (first / 'pending.json').write_text('{')
+    main(['feedback-phase2', '--feedback-root', str(tmp_path / 'feedback'),
+          '--source-root', str(first), '--source-root', str(second)])
+    reports = json.loads(capsys.readouterr().out)['reports']
+    assert [report['imported'] for report in reports] == [1, 1]
+    warnings = reports[0]['warnings']
+    assert any('truncated.json' in warning for warning in warnings)
+    assert any('wrong-shape.json' in warning for warning in warnings)
+    assert any('campaign-run.json' in warning for warning in warnings)
+    assert any('pending.json' in warning for warning in warnings)
+    assert len(FeedbackStore(tmp_path / 'feedback').records()) == 2

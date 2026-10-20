@@ -27,7 +27,10 @@ that reuse deterministic job IDs. Older feedback without this incarnation marker
 keeps its existing identity with an explicit ambiguity warning.
 Unsupported legacy layouts and missing
 evidence are reported. Interrupted jobs are explicitly incomplete observations;
-they do not increment completed attempts. Full profiler trees stay remote; only
+they do not increment completed attempts.
+Malformed copied attempt files and optional metadata/pending JSON are reported
+per file; they do not abort valid retained outcomes or other selected sources.
+Full profiler trees stay remote; only
 existing compact result objects and artifact/hash references enter feedback.
 Initial reference qualification failures are importable from `qualification.json`
 even when no campaign state or semantic attempt has been committed yet.

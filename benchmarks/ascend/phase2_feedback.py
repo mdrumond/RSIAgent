@@ -17,6 +17,17 @@ def _read(path, default=None):
     return json.loads(path.read_bytes()) if path.is_file() else default
 
 
+def _read_import(path, warnings, default=None):
+    try:
+        value = _read(path, default)
+        if value is not None and not isinstance(value, dict):
+            raise ValueError('expected a JSON object')
+        return value
+    except (ValueError, OSError) as error:
+        warnings.append(f'{path}: unreadable retained record: {error}')
+        return default
+
+
 def _observation_identity(outcome):
     identity = {key: outcome[key] for key in ('attempt_id', 'completed')}
     job_id = outcome['result'].get('job_id')
@@ -210,10 +221,8 @@ class FeedbackStore:
         paths = sorted(root.rglob('state.json')) + sorted(root.rglob('qualification.json'))
         supported = 0
         for path in paths:
-            try:
-                state = _read(path)
-            except (ValueError, OSError) as error:
-                report['warnings'].append(f'{path}: unreadable state: {error}')
+            state = _read_import(path, report['warnings'])
+            if state is None:
                 continue
             qualification = path.name == 'qualification.json'
             if qualification and (path.parent / 'state.json').exists() and not state.get('active'):
@@ -222,22 +231,41 @@ class FeedbackStore:
                 continue
             supported += 1
             campaign = path.parent
-            metadata = _read(campaign / 'campaign-identity.json', {})
-            seed = _read(campaign / 'seed-memory.json', {})
+            metadata = _read_import(campaign / 'campaign-identity.json', report['warnings'], {})
+            seed = _read_import(campaign / 'seed-memory.json', report['warnings'], {})
             metadata = {**seed.get('source_identity', {}), **metadata,
-                        **_read(campaign / 'campaign-run.json', {})}
-            rows = {row['attempt_id']: row for row in state.get('attempts', [])}
+                        **_read_import(campaign / 'campaign-run.json', report['warnings'], {})}
+            rows = {}
+            for row in state.get('attempts', []):
+                try:
+                    rows[row['attempt_id']] = row
+                except (KeyError, TypeError) as error:
+                    report['warnings'].append(f'{path}: unreadable attempt row: {error}')
             for retained in ([] if qualification else sorted((campaign / 'attempts').glob('*.json'))):
-                row = _read(retained)
-                rows.setdefault(row['attempt_id'], row)
+                row = _read_import(retained, report['warnings'])
+                if row is None:
+                    continue
+                try:
+                    rows.setdefault(row['attempt_id'], row)
+                except (KeyError, TypeError) as error:
+                    report['warnings'].append(f'{retained}: unreadable attempt record: {error}')
             for row in rows.values():
-                result = row['result']
-                outcome = self._outcome(campaign, row, metadata, report)
-                outcome.update(category=_category(row['task'], result), completed=True)
-                report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
-            pending = state.get('pending') if qualification else _read(campaign / 'pending.json')
-            if pending and pending['attempt_id'] not in rows:
-                relative = 'tasks/' + pending['task']['task_id'] + '-' + sha(canonical(pending['task']))[:12]
+                try:
+                    result = row['result']
+                    outcome = self._outcome(campaign, row, metadata, report)
+                    outcome.update(category=_category(row['task'], result), completed=True)
+                    report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+                except (KeyError, TypeError, ValueError, OSError) as error:
+                    report['warnings'].append(f'{campaign}: unreadable attempt record: {error}')
+            pending = state.get('pending') if qualification else _read_import(campaign / 'pending.json', report['warnings'])
+            if pending:
+                try:
+                    if pending['attempt_id'] in rows:
+                        continue
+                    relative = 'tasks/' + pending['task']['task_id'] + '-' + sha(canonical(pending['task']))[:12]
+                except (KeyError, TypeError, ValueError) as error:
+                    report['warnings'].append(f'{campaign}: unreadable pending record: {error}')
+                    continue
                 jobs = campaign / relative / 'jobs'
                 manifests = sorted(jobs.glob('*/manifest.json'))
                 # A pending selection is not evidence of an interrupted execution.
