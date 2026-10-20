@@ -524,8 +524,6 @@ class CurriculumAgent:
                     ),
                 })
                 continue
-            if self.failure_feedback is not None:
-                self.failure_feedback.record(decision.failure_investigations)
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise AssertionError("unreachable selection attempt")
 

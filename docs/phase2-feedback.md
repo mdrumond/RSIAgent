@@ -44,6 +44,9 @@ Campaign packages retain the default `feedback/` tree and Phase 1's
 state and retry links. Original absolute evidence locations remain provenance;
 packaging does not make missing remote artifacts locally available. Unknown
 target or language identity cannot establish retry-based resolution.
+Resolution also authenticates both retained baseline artifacts and requires the
+same frozen expanded-suite hash and comparison policy. Missing or corrupt baseline
+evidence leaves the observation unresolved; it does not discard the observation.
 
 This command does not start investigations or restart either phase. Curriculum
 integration and explicit bounded retry controls are separate follow-up changes.

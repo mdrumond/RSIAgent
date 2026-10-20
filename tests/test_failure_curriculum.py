@@ -82,13 +82,19 @@ def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
     from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
     from test_ascend_phase2_optimizer_tasks import seed
     task = original['outcome']['task']
+    original_baseline = json.loads(store.read_evidence(original['outcome']['evidence']['baseline']['sha256'])['text'])
     class Retry:
         def __init__(self, directory, selected, memory):
             assert selected == task
+            from optimizer.jobs import JobStore
+            self.jobs = JobStore(directory/'jobs')
+            self.job = self.jobs.create('def forward(x): return x', 'forward', {}, {})
+            self.baseline = self.jobs.put_artifact(self.job['job_id'], 'baseline.json', canonical(original_baseline))
         def prepare(self):
             return {'suite_sha256': 'fixture-original-suite'}
         def attempt(self, key, **kwargs):
-            return dict(verified=True, summary='scripted host fixture', speedup=2)
+            return dict(verified=True, summary='scripted host fixture', speedup=2,
+                        job_id=self.job['job_id'], baseline=self.baseline)
     retry_root = tmp_path / 'new-retry'
     reviewed = seed()
     reviewed['source_identity'] = dict(target='a3', language='ascend-c')
@@ -285,8 +291,65 @@ def test_initial_infrastructure_feedback_can_defer_without_kernel_projects(tmp_p
     agent = CurriculumAgent(lambda _: 'DECISION: STALLED\n' + json.dumps(dict(
         reason='infrastructure must recover first', failure_investigations=[deferred])))
     agent.failure_feedback = feedback
-    context = CurriculumContext('investigate', 1, 'a'*64, (), (),
-                                phase2_feedback=feedback.context({}))
-    decision, _ = agent.select(context)
-    assert decision.status == 'STALLED'
+    runner = AdaptivePhase1Coordinator(feedback.root, 'investigate', b'{}', agent,
+        lambda _: pytest.fail('infrastructure deferral must not execute kernels'),
+        max_parallel=1, project_target=1)
+    runner.failure_feedback = feedback
+    assert runner.resume()['status'] == 'STALLED'
     assert next(r for r in store.records() if r['feedback_id'] == deferred['feedback_id'])['investigation']['status'] == 'deferred'
+
+
+@pytest.mark.parametrize('terminal', [False, True])
+def test_proposals_and_rejections_do_not_commit_failure_feedback(tmp_path, terminal):
+    store, selection, feedback = setup(tmp_path)
+    def complete(messages):
+        row = investigation(selection)
+        if terminal:
+            row.update(status='deferred', classification='infrastructure', reason='remote failure')
+            return 'DECISION: STALLED\n' + json.dumps(dict(reason='remote unavailable', failure_investigations=[row]))
+        payload = json.loads(_wave(messages[-1]['content'], [_project('probe', 'padded-tail'),
+            _project('control', 'gm-ub-movement')]).split('\n', 1)[1])
+        return 'DECISION: WAVE\n' + json.dumps(dict(payload, failure_investigations=[row]))
+    agent = CurriculumAgent(complete)
+    agent.failure_feedback = feedback
+    runner = AdaptivePhase1Coordinator(feedback.root, 'investigate', b'{}', agent,
+        lambda request: _result(request.spec, True, 'host fixture passed'), max_parallel=2, project_target=2)
+    runner.failure_feedback = feedback
+    before = store.records()
+    proposal = runner.propose_wave()
+    assert store.records() == before and not feedback.path.exists()
+    runner.discard_proposal(proposal)
+    assert store.records() == before and not feedback.path.exists()
+    if not terminal:
+        with pytest.raises(ValueError, match='working control'):
+            runner.approve_wave(proposal, ['probe'])
+        assert store.records() == before
+    approved = runner.approve_wave(proposal, [] if terminal else ['probe', 'control'])
+    assert store.records() == before and not feedback.path.exists()
+    runner.run_approved_proposal(approved)
+    changed = next(r for r in store.records() if r['feedback_id'] in feedback.ids)
+    assert changed['investigation']['status'] == ('deferred' if terminal else 'investigating')
+
+
+def test_retry_normalizes_omitted_max_cases_in_retained_runtime(tmp_path):
+    from test_phase2_optimizer_execution import executor, snapshot
+    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    fixture, agent, backend = executor(tmp_path, [])
+    config = {k:v for k,v in fixture.config.items() if k != 'max_cases'}
+    source = tmp_path/'original-campaign'
+    execution = OptimizerTaskExecutor(source/'task', fixture.task, snapshot(), config,
+                                     agent=agent, backend=backend)
+    original = backend.prepare
+    backend.prepare = lambda spec, directory: {**original(spec, directory), 'manifest': {
+        'policy': {'name': 'fixture'}, 'submission': execution.task['submission']}}
+    execution.prepare()
+    baseline = execution._state()['baseline']
+    row = campaign(source, task=execution.task, result=dict(verified=False,
+        baseline=baseline, job_id=execution.job_id))
+    row['execution_directory'] = 'task'
+    write(source/'state.json', dict(phase='optimizer-phase2', target=execution.task, attempts=[row]))
+    store = FeedbackStore(tmp_path/'feedback')
+    store.import_campaign(source)
+    selection = select_feedback(store.root, 'a3')
+    assert selection['selected'][0]['outcome']['runtime']['max_cases'] is None
+    assert retry_spec(selection, 'a3')['max_cases'] == 24

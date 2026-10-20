@@ -12,10 +12,19 @@ def write(path, value):
     path.write_bytes(canonical(value))
 
 
-def campaign(root, *, result=None, task=None, attempt='attempt-001'):
+def campaign(root, *, result=None, task=None, attempt='attempt-001', baseline=True):
     task = task or dict(task_id='relu', submission={'source': 'reference'}, rationale='learn')
     row = dict(attempt_id=attempt, kind='target', task=task,
                result=result or dict(verified=False, summary='agent hypothesis'))
+    if baseline and not row['result'].get('job_id'):
+        from optimizer.jobs import JobStore
+        jobs = JobStore(root / 'execution' / 'jobs')
+        job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key='fixture')
+        value = baseline if isinstance(baseline, dict) else dict(suite_sha256='1' * 64,
+            manifest=dict(policy=dict(name='host-policy', rtol=.01)))
+        ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(value))
+        row.update(execution_directory='execution')
+        row['result'].update(job_id=job['job_id'], baseline=ref)
     write(root / 'state.json', dict(phase='optimizer-phase2', target=task, attempts=[row]))
     write(root / 'seed-memory.json', dict(source_identity=dict(target='a3', language='ascend-c')))
     return row
@@ -72,7 +81,8 @@ def test_resolution_requires_successful_original_task_retry(tmp_path):
     store.update_investigation(failed, status='ready-to-retry', evidence=['host-probe-report'])
     with pytest.raises(ValueError, match='retry'):
         store.update_investigation(failed, status='resolved')
-    campaign(tmp_path / 'retry', task=task, result={'verified': True, 'speedup': 1.2})
+    campaign(tmp_path / 'retry', task=task, result={'verified': True, 'speedup': 1.2},
+             baseline=dict(suite_sha256='1' * 64, policy=dict(name='host-policy', rtol=.01)))
     store.import_campaign(tmp_path / 'retry')
     retry = next(r['feedback_id'] for r in store.records() if r['outcome']['verified'])
     store.update_investigation(failed, status='resolved', retries=[retry])
@@ -211,5 +221,42 @@ def test_unknown_identity_cannot_resolve_even_when_equal(tmp_path, unknown):
         store.import_campaign(root)
     records = {r['outcome']['verified']: r for r in store.records()}
     with pytest.raises(ValueError, match='known target and language'):
+        store.update_investigation(records[False]['feedback_id'], status='resolved',
+                                   retries=[records[True]['feedback_id']])
+
+
+@pytest.mark.parametrize('mutation', ['suite', 'policy', 'missing', 'corrupt'])
+def test_resolution_requires_same_authenticated_frozen_suite_policy(tmp_path, mutation):
+    store = FeedbackStore(tmp_path / 'feedback')
+    campaign(tmp_path / 'failure', result={'verified': False})
+    baseline = dict(suite_sha256='1' * 64, policy=dict(name='host-policy', rtol=.01))
+    if mutation == 'suite':
+        baseline['suite_sha256'] = '2' * 64
+    if mutation == 'policy':
+        baseline['policy']['rtol'] = .5
+    row = campaign(tmp_path / 'retry', result={'verified': True}, baseline=baseline)
+    ref = row['result']['baseline']
+    path = tmp_path / 'retry' / 'execution' / 'jobs' / row['result']['job_id'] / 'artifacts' / ref['sha256']
+    if mutation == 'missing':
+        path.unlink()
+    if mutation == 'corrupt':
+        path.write_bytes(b'corrupt')
+    store.import_campaign(tmp_path / 'failure')
+    store.import_campaign(tmp_path / 'retry')
+    records = {r['outcome']['verified']: r for r in store.records()}
+    with pytest.raises(ValueError, match='successful original-task retry'):
+        store.update_investigation(records[False]['feedback_id'], status='resolved',
+                                   retries=[records[True]['feedback_id']])
+    assert records[False]['investigation']['status'] == 'open'
+
+
+def test_resolution_rejects_missing_original_baseline_but_keeps_observation(tmp_path):
+    store = FeedbackStore(tmp_path / 'feedback')
+    campaign(tmp_path / 'failure', result={'verified': False}, baseline=False)
+    campaign(tmp_path / 'retry', result={'verified': True})
+    store.import_campaign(tmp_path / 'failure')
+    store.import_campaign(tmp_path / 'retry')
+    records = {r['outcome']['verified']: r for r in store.records()}
+    with pytest.raises(ValueError, match='authenticated frozen suite'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
                                    retries=[records[True]['feedback_id']])
