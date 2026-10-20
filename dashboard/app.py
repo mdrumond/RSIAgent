@@ -27,6 +27,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     csrf_token = secrets.token_urlsafe(32)
     from .optimizer import register_optimizer
     register_optimizer(app, config_path, csrf_token, optimizer_launcher)
+    from .feedback import register_feedback
+    register_feedback(app, controls, csrf_token)
     last = [0.0]
 
     def view():

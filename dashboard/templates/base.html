@@ -6,5 +6,5 @@
 <link rel="stylesheet" href="{{ url_for('static', filename='trace.css') }}">
 <link rel="stylesheet" href="{{ url_for('static', filename='performance.css') }}"></head>
 <body{% if csrf_token %} data-csrf="{{ csrf_token }}"{% endif %}><header><a href="{{ url_for('index') }}" class="brand">RSI / Ascend</a>
-<nav><a href="{{ url_for('index') }}">Campaigns</a><a href="{{ url_for('memory_page') }}">Memory</a><a href="{{ url_for('optimizer_page') }}">Kernel Optimizer</a></nav></header>
+<nav><a href="{{ url_for('index') }}">Campaigns</a><a href="{{ url_for('memory_page') }}">Memory</a><a href="{{ url_for('feedback_page') }}">Failure feedback</a><a href="{{ url_for('optimizer_page') }}">Kernel Optimizer</a></nav></header>
 <main>{% block body %}{% endblock %}</main><script src="{{ url_for('static', filename='app.js') }}"></script></body></html>
