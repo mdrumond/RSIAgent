@@ -1,5 +1,7 @@
 import hashlib
+import io
 import json
+from contextlib import redirect_stdout
 import subprocess
 import time
 
@@ -178,3 +180,53 @@ def test_missing_feedback_root_not_created(feedback):
     app.extensions['dashboard_controls'].feedback.root = absent
     assert client.get('/api/feedback').get_json() == []
     assert not absent.exists()
+
+
+@pytest.mark.parametrize('action,phase', [('investigate', 1), ('retry-feedback', 2),
+                                         ('import-feedback', None)])
+def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback, action, phase):
+    from benchmarks.ascend import campaign_cli
+    from optimizer.jobs import JobStore
+    client, app, config, row, calls = feedback
+    root = config.parent
+    manifest = root / 'sources.json'
+    write(manifest, dict(schema='ascend-sft-sources-v2', sources=[dict(name='catlass',
+        repository='https://example.invalid/catlass', revision='a' * 40,
+        license='Apache-2.0', include=['**/*.py'])]))
+    settings = root / 'runtime.json'
+    write(settings, dict(model='openai/gpt-5.6-sol', phase1_arguments=[], source_manifest=str(manifest)))
+    seed = root / 'seed.bin'
+    seed.write_bytes(b'{}')
+    manager = app.extensions['dashboard_controls']
+    for preset in manager.presets.values():
+        preset.update(config=str(settings), initial_memory=str(seed))
+    # Retry pins exactly this locally retained original suite; it does not generate one.
+    row['outcome']['task']['submission'] = {'source': 'original reference'}
+    frozen = json.dumps(dict(suite_sha256='d' * 64, manifest=dict(
+        policy={'rtol': 1e-5}, submission={'signatures': [{'shape': [8]}]}))).encode()
+    jobs = JobStore(root / 'jobs')
+    job_id = jobs.create('def relu(x): return x', 'relu', {'signatures': []}, {})['job_id']
+    baseline = jobs.put_artifact(job_id, 'baseline.json', frozen)
+    row['outcome']['evidence']['baseline'] = dict(baseline, job_root=str(root / 'jobs'), job_id=job_id)
+    write(root / 'feedback' / (row['feedback_id'] + '.json'), row)
+    screens = []
+
+    def real_cli(argv, **kwargs):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            campaign_cli.main(argv[2:], screen=lambda job, role: screens.append(role) or 'not-started')
+        return subprocess.CompletedProcess(argv, 0, output.getvalue(), '')
+
+    manager.runner = real_cli
+    payload = {} if phase is None else dict(preset_id=f'phase{phase}',
+        feedback_ids=[row['feedback_id']], project_target=2)
+    completed(client, submit(client, action, payload))
+    if phase:
+        job = json.loads((root / f'control{phase}' / 'job.json').read_text())
+        assert job['failure_ids'] == [row['feedback_id']]
+        assert job['project_target'] == (2 if phase == 1 else 1)
+        assert job.get('approval_mode', False) is (phase == 1)
+        assert bool(job.get('retry_feedback_id')) is (phase == 2)
+        assert screens == ['collector', 'campaign']  # callbacks only; no processes launched
+    else:
+        assert not screens
