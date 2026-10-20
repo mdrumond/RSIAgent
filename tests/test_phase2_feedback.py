@@ -1,0 +1,132 @@
+import json
+
+import pytest
+
+from benchmarks.ascend.phase2_feedback import FeedbackStore
+from optimizer.jobs import canonical, sha
+
+
+def write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(canonical(value))
+
+
+def campaign(root, *, result=None, task=None, attempt='attempt-001'):
+    task = task or dict(task_id='relu', submission={'source': 'reference'}, rationale='learn')
+    row = dict(attempt_id=attempt, kind='target', task=task,
+               result=result or dict(verified=False, summary='agent hypothesis'))
+    write(root / 'state.json', dict(phase='optimizer-phase2', target=task, attempts=[row]))
+    write(root / 'seed-memory.json', dict(source_identity=dict(target='a3', language='ascend-c')))
+    return row
+
+
+@pytest.mark.parametrize('result,category', [
+    ({'verified': True, 'speedup': .4}, 'verified-slow'),
+    ({'verified': True, 'speedup': 1.1}, 'verified-success'),
+    ({'verified': True}, 'verified-timing-unknown'),
+    ({'verified': True, 'speedup': 0}, 'verified-timing-unknown'),
+    ({'verified': False, 'source_sha256': 'abc'}, 'incorrect'),
+    ({'verified': False}, 'no-candidate'),
+    ({'verified': False, 'result': {'status': 'compile-error'}}, 'compile-failure'),
+    ({'verified': False, 'classification': 'budget-exhausted'}, 'budget-exhausted'),
+])
+def test_outcomes_are_observations(tmp_path, result, category):
+    source = tmp_path / 'source'
+    campaign(source, result=result)
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(source)['imported'] == 1
+    record = store.records()[0]
+    assert record['outcome']['category'] == category
+    assert record['outcome']['target'] == 'a3'
+    assert record['outcome']['language'] == 'ascend-c'
+    assert record['outcome']['completed'] is True
+    assert record['investigation']['status'] == ('resolved' if category in
+        {'verified-success', 'verified-timing-unknown'} else 'open')
+
+
+def test_numeric_goal_preserved_and_dedup_does_not_reset_investigation(tmp_path):
+    source = tmp_path / 'source'
+    task = dict(task_id='relu', performance_goal={'speedup': 2})
+    campaign(source, task=task, result={'verified': True, 'speedup': 1.5})
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(source)
+    record = store.records()[0]
+    assert record['outcome']['category'] == 'verified-slow'
+    store.update_investigation(record['feedback_id'], status='investigating', projects=['probe-1'])
+    assert store.import_campaign(source)['existing'] == 1
+    assert store.records()[0]['investigation']['projects'] == ['probe-1']
+    assert store.records()[0]['outcome'] == record['outcome']
+
+
+def test_resolution_requires_successful_original_task_retry(tmp_path):
+    store = FeedbackStore(tmp_path / 'feedback')
+    task = {'task_id': 'relu', 'submission': {'source': 'original'}}
+    campaign(tmp_path / 'failed', task=task, result={'verified': False})
+    store.import_campaign(tmp_path / 'failed')
+    failed = store.records()[0]['feedback_id']
+    with pytest.raises(ValueError, match='evidence'):
+        store.update_investigation(failed, status='ready-to-retry')
+    with pytest.raises(ValueError, match='reason'):
+        store.update_investigation(failed, status='deferred')
+    store.update_investigation(failed, status='ready-to-retry', evidence=['host-probe-report'])
+    with pytest.raises(ValueError, match='retry'):
+        store.update_investigation(failed, status='resolved')
+    campaign(tmp_path / 'retry', task=task, result={'verified': True, 'speedup': 1.2})
+    store.import_campaign(tmp_path / 'retry')
+    retry = next(r['feedback_id'] for r in store.records() if r['outcome']['verified'])
+    store.update_investigation(failed, status='resolved', retries=[retry])
+    assert next(r for r in store.records() if r['feedback_id'] == failed)['investigation']['status'] == 'resolved'
+
+
+def test_pending_job_import_is_not_completed_attempt(tmp_path):
+    source = tmp_path / 'source'
+    row = campaign(source)
+    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
+    relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
+    write(source / relative / 'jobs' / ('a' * 32) / 'manifest.json',
+          dict(job_id='a' * 32, status='stopped', handles=[{'handle': 'remote:exact'}]))
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(source)
+    outcome = store.records()[0]['outcome']
+    assert outcome['completed'] is False
+    assert outcome['category'] == 'interrupted'
+    assert outcome['result']['handles'] == [{'handle': 'remote:exact'}]
+
+
+def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
+    source = tmp_path / 'source'
+    row = campaign(source, result=dict(verified=False, job_id='a' * 32,
+                                     candidate={'sha256': 'b' * 64, 'name': 'candidate'}))
+    (source / 'seed-memory.json').unlink()
+    store = FeedbackStore(tmp_path / 'feedback')
+    report = store.import_campaign(source)
+    assert any('missing candidate evidence' in message for message in report['warnings'])
+    assert store.records()[0]['outcome']['target'] == 'unknown'
+    assert store.records()[0]['outcome']['evidence']['candidate']['sha256'] == 'b' * 64
+    write(tmp_path / 'legacy' / 'state.json', dict(phase='a5-phase2'))
+    assert 'legacy' in store.import_campaign(tmp_path / 'legacy')['warnings'][0]
+
+
+def test_backfill_nested_roots_cli_and_recovery_publication(tmp_path, capsys):
+    from benchmarks.ascend.campaign_cli import main
+    source = tmp_path / 'source'
+    row = campaign(source / 'goal-0001')
+    write(source / 'goal-0001' / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'goal-0001' / 'attempts' / 'attempt-001.json', row)
+    config = tmp_path / 'dashboard.json'
+    write(config, dict(campaigns=[dict(root=str(source), phase=2),
+                                 dict(root='/ignore-phase1', phase=1)]))
+    main(['feedback-phase2', '--feedback-root', str(tmp_path / 'feedback'), '--dashboard-config', str(config)])
+    assert json.loads(capsys.readouterr().out)['reports'][0]['imported'] == 1
+    main(['feedback-phase2', '--feedback-root', str(tmp_path / 'feedback'), '--source-root', str(source)])
+    assert json.loads(capsys.readouterr().out)['reports'][0]['existing'] == 1
+
+
+def test_coordinator_automatically_retains_failures(tmp_path):
+    from test_ascend_phase2_optimizer_campaign import setup
+    build, _, _, _ = setup(tmp_path, verdicts=(False, True), decisions=('retry-target', 'ready'))
+    assert build().resume()['status'] == 'READY'
+    records = FeedbackStore(tmp_path / 'feedback').records()
+    assert len(records) == 2
+    assert {r['outcome']['verified'] for r in records} == {False, True}

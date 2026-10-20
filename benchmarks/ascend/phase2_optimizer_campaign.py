@@ -12,7 +12,7 @@ from optimizer.memory import verify_snapshot
 class OptimizerPhase2Coordinator:
     def __init__(self, root, objective, snapshot, complete, execution_factory, *,
                  query_knowledge=None, max_target_attempts=3, max_practice_attempts=2,
-                 selector=None):
+                 selector=None, feedback_root=None):
         if any(type(n) is not int or n < 1
                for n in (max_target_attempts, max_practice_attempts)):
             raise ValueError("target and practice budgets must be positive")
@@ -22,6 +22,8 @@ class OptimizerPhase2Coordinator:
         verify_snapshot(snapshot)
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        from .phase2_feedback import FeedbackStore
+        self.feedback = FeedbackStore(feedback_root or self.root / 'feedback')
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
         self.target_budget, self.practice_budget = max_target_attempts, max_practice_attempts
@@ -177,6 +179,7 @@ class OptimizerPhase2Coordinator:
 
     def _run(self, limit=None):
         state, completed = self._bootstrap(), 0
+        self.feedback.import_campaign(self.root)
         while not state["terminal"]:
             pending = self._select(state)
             self._write("state.json", state)
@@ -186,8 +189,12 @@ class OptimizerPhase2Coordinator:
             relative = self._directory(task)
             executor = self.factory(self.root / relative, task, self.seed)
             executor.prepare()
-            result = executor.attempt(key, memory_snapshot=self._memory(state),
-                                      feedback=state["attempts"][-2:])
+            try:
+                result = executor.attempt(key, memory_snapshot=self._memory(state),
+                                          feedback=state["attempts"][-2:])
+            except Exception:
+                self.feedback.import_campaign(self.root)
+                raise
             row = dict(attempt_id=key, kind=pending["kind"], task_id=task["task_id"],
                        task=task, result=result, verified=result["verified"], execution_directory=relative)
             # Publication precedes state advancement. Executor attempt IDs make recovery idempotent.
@@ -206,6 +213,7 @@ class OptimizerPhase2Coordinator:
                     interpretation=result.get("summary", "")))
             state["next_kind"] = "review"
             self._write("state.json", state)
+            self.feedback.import_campaign(self.root)
             (self.root / "pending.json").unlink()
             completed += 1
             if limit is not None and completed >= limit:
