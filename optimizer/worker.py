@@ -31,13 +31,16 @@ def load_config(path):
 
 
 class RemoteBackend:
-    def __init__(self, store, job_id, config, *, transport=None):
+    def __init__(self, store, job_id, config, *, transport=None, transport_factory=None):
+        if transport is not None and transport_factory is not None:
+            raise ValueError('supply transport or transport_factory, not both')
         self.store, self.job_id, self.config = store, job_id, config
         self.remote = Path(config['remote_workspace']) / ('optimizer-' + job_id)
         self.started = time.monotonic()
         remaining = store.get(job_id)['max_seconds'] - store.get(job_id)['elapsed_seconds']
         self.deadline = self.started + remaining
-        self.transport = transport or CheckedTransport(config, retain=self._retain, stopped=self._stopped, deadline=self.deadline)
+        self.transport = transport if transport is not None else (transport_factory or CheckedTransport)(
+            config, retain=self._retain, stopped=self._stopped, deadline=self.deadline)
 
     def _retain(self, handle):
         self.store.retain_handle(self.job_id, handle, operation='optimizer')
@@ -181,14 +184,21 @@ def knowledge_query(config, directory):
     return lambda text: [dataclasses.asdict(row) for row in gate.query(KnowledgeQuery(query=text))]
 
 
-def run_worker(root, job_id, config, *, agent=None):
+def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
     from .agent import OptimizerAgent
     from .loop import OptimizationLoop
     from .provider import BoundedAgent
     from benchmarks.a3_experiments import BackendModel
+    if transport_factory is not None and not config.get('lock_directory'):
+        raise ValueError('injected transport requires an explicit lock_directory')
+    if transport_factory is not None:
+        if not isinstance(config.get('transport_identity'), str) or not config['transport_identity'].strip():
+            raise ValueError('injected transport requires a transport_identity')
     store = JobStore(root)
     directory = store._directory(job_id)
-    device_lock = Path(config.get('lock_directory', Path(config['validation_wrapper']).parent / '.optimizer-locks')) / f'{config["target"]}-{config["physical_device"]}.lock'
+    lock_directory = (Path(config['lock_directory']) if config.get('lock_directory')
+                      else Path(config['validation_wrapper']).parent / '.optimizer-locks')
+    device_lock = lock_directory / f'{config["target"]}-{config["physical_device"]}.lock'
     with exclusive(directory / 'worker.lock'), exclusive(device_lock, wait=True,
                               stopped=lambda: store.get(job_id)['stop_requested']):
         if config.get('env_file'):
@@ -199,6 +209,10 @@ def run_worker(root, job_id, config, *, agent=None):
         identity['guide_sha256'] = sha(guide.encode())
         identity['max_cases'] = config.get('max_cases', 24)
         identity['knowledge'] = config.get('knowledge')
+        # Separate custom execution routes from the default on resume. The
+        # caller pins a versioned identity; callable names are not stable IDs.
+        if transport_factory is not None:
+            identity['transport_identity'] = config['transport_identity']
         previous = next((event['payload'] for event in store.events(job_id)
                          if event['kind'] == 'worker-configuration'), None)
         if previous is not None and previous != identity:
@@ -207,7 +221,7 @@ def run_worker(root, job_id, config, *, agent=None):
             store.add_event(job_id, 'worker-configuration', identity)
         agent = agent or OptimizerAgent(guide=guide,
                                         model=BackendModel(config.get('model_profile', BackendModel.DEEPSEEK_FLASH.value)))
-        backend = RemoteBackend(store, job_id, config)
+        backend = RemoteBackend(store, job_id, config, transport_factory=transport_factory)
         agent = BoundedAgent(agent, deadline=backend.deadline,
                              stopped=lambda: store.get(job_id)['stop_requested'])
         store.add_event(job_id, 'worker-started', {'pid': os.getpid(), 'profile': config['profile'], 'device': config['physical_device']})

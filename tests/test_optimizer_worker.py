@@ -440,3 +440,62 @@ def test_final_reserved_profile_respects_stop_and_elapsed_deadline(tmp_path, bou
     backend = BoundBackend()
     OptimizationLoop(store, job, Agent([{'action': 'cases', 'signatures': [], 'summary': ''}, candidate('fast')]), backend).run()
     assert backend.profiles == []
+
+
+def test_injected_transport_receives_host_controls_and_retains_handle(tmp_path):
+    import time
+    from optimizer.jobs import JobStore
+    from optimizer.worker import RemoteBackend
+    store = JobStore(tmp_path / 'jobs')
+    key = store.create('def f(x): return x', 'f', {}, {})['job_id']
+    captured = {}
+    sentinel = object()
+    def factory(settings, **controls):
+        captured.update(controls)
+        return sentinel
+    backend = RemoteBackend(store, key, config(tmp_path), transport_factory=factory)
+    assert backend.transport is sentinel
+    assert captured['deadline'] > time.monotonic()
+    assert not captured['stopped']()
+    captured['retain']('custom:retained')
+    assert store.get(key)['handles'][0]['handle'] == 'custom:retained'
+    store.stop(key)
+    assert captured['stopped']()
+    with pytest.raises(ValueError, match='not both'):
+        RemoteBackend(store, key, config(tmp_path), transport=sentinel, transport_factory=factory)
+
+
+def test_injected_worker_requires_explicit_lock_directory(tmp_path):
+    from optimizer.worker import run_worker
+    with pytest.raises(ValueError, match='lock_directory'):
+        run_worker(tmp_path / 'jobs', 'unused', {}, transport_factory=lambda **kw: None)
+
+
+def test_injected_worker_routes_stop_and_pins_transport_identity(tmp_path):
+    from optimizer.jobs import JobStore, canonical, sha
+    from optimizer.worker import run_worker
+    store = JobStore(tmp_path / 'jobs')
+    body = {'files': {}, 'memory_entries': []}
+    key = store.create('def f(x): return x', 'f', {},
+                       {**body, 'snapshot_id': sha(canonical(body))})['job_id']
+    store.transition(key, 'running')
+    store.stop(key)
+    directory = store.root / key / 'execution' / 'candidate'
+    directory.mkdir(parents=True)
+    (directory / 'transport.json').write_text('{"state":"running","handle":"custom:one"}')
+    guide = tmp_path / 'guide'
+    guide.write_text('guide')
+    settings = {k: v for k, v in config(tmp_path).items()
+                if k not in {'validation_wrapper', 'cpl_remote'}}
+    settings.update(guide=str(guide), lock_directory=str(tmp_path / 'locks'),
+                    transport_identity='test-transport-v1')
+    calls = []
+    def factory(settings, **controls):
+        return SimpleNamespace(cancel_pending=lambda path: calls.append(path))
+    agent = SimpleNamespace(identity={'model': 'unused'})
+    assert run_worker(store.root, key, settings, agent=agent,
+                      transport_factory=factory)['status'] == 'stopped'
+    assert calls == [directory]
+    settings['transport_identity'] = 'test-transport-v2'
+    with pytest.raises(ValueError, match='changed on resume'):
+        run_worker(store.root, key, settings, agent=agent, transport_factory=factory)

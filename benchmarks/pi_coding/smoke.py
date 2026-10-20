@@ -53,32 +53,54 @@ def main(argv=None):
     for key in ("cpl_remote", "validation_wrapper", "guide"):
         if not Path(config[key]).is_file():
             parser.error(f"configured {key} is unavailable")
+    report = run_smoke(config=config, budget_ledger=args.budget_ledger,
+                       root=args.root, window=args.window, budget_usd=args.budget_usd,
+                       knowledge_file=args.knowledge_file, check_only=args.check_only)
+    print(json.dumps(report))
+    return 0 if args.check_only or report["host_verified"] else 2
+
+
+def run_smoke(*, config, budget_ledger, root, window, budget_usd=2,
+              knowledge_file=None, check_only=False, transport_factory=None):
+    """Run the fixed smoke with caller-validated runtime/transport configuration.
+
+    Custom transports are trusted host code, injected only through this Python
+    API. The CLI retains the checked production route and its config validator.
+    """
+    if not 0 < budget_usd <= 2:
+        raise ValueError("incremental budget must be in (0, 2] USD")
+    runtime_preflight()
+    budget_ledger, root = Path(budget_ledger), Path(root)
+    knowledge_file = Path(knowledge_file) if knowledge_file else None
+    if transport_factory is not None:
+        if not config.get("lock_directory") or not config.get("transport_identity"):
+            raise ValueError("injected transport requires lock_directory and transport_identity")
     # The provider/model and fixed case count are part of this smoke's contract.
     if config.get("model_profile", "deepseek-flash") != "deepseek-flash":
-        parser.error("this smoke requires the registered deepseek-flash profile")
+        raise ValueError("this smoke requires the registered deepseek-flash profile")
     config = {**config, "max_cases": 3, "model_profile": "deepseek-flash"}
-    existing = json.loads(args.budget_ledger.read_text())
-    budget = Budget(args.budget_ledger, existing["limit_usd"],
-                    window=args.window, window_limit=args.budget_usd)
-    if args.check_only:
-        print(json.dumps({"status": "local-preflight-passed", "remote_validated": False,
+    existing = json.loads(budget_ledger.read_text())
+    budget = Budget(budget_ledger, existing["limit_usd"],
+                    window=window, window_limit=budget_usd)
+    if check_only:
+        return {"status": "local-preflight-passed", "remote_validated": False,
                           "max_requests": 20, "max_candidates": 4, "max_seconds": 1200,
-                          "incremental_bound_usd": args.budget_usd}))
-        return 0
+                          "incremental_bound_usd": budget_usd}
     guide = Path(config["guide"]).read_text() + "\n" + TASK
-    if args.knowledge_file:
-        guide += "\nStarting knowledge:\n" + args.knowledge_file.read_text()
+    if knowledge_file:
+        guide += "\nStarting knowledge:\n" + knowledge_file.read_text()
     body = {"files": {}, "memory_entries": []}
     memory = {**body, "snapshot_id": sha(canonical(body))}
-    with allocation_lock(args.budget_ledger.parent):
-        store = JobStore(args.root)
+    with allocation_lock(budget_ledger.parent):
+        store = JobStore(root)
         row = store.create(REFERENCE, "forward", signatures(), memory,
-                           name="Pi tiled matmul-add smoke", idempotency_key=args.window,
+                           name="Pi tiled matmul-add smoke", idempotency_key=window,
                            max_attempts=4, max_seconds=1200)
         agent = OptimizerAgent(guide=guide, max_provider_calls=20, budget=budget)
         failure = None
         try:
-            result = run_worker(args.root, row["job_id"], config, agent=agent)
+            result = run_worker(root, row["job_id"], config, agent=agent,
+                                transport_factory=transport_factory)
         except Exception as exc:
             failure = type(exc).__name__
             result = store.get(row["job_id"])
@@ -101,9 +123,8 @@ def main(argv=None):
         report = {"status": result["status"], "host_verified": bool(state.get("best")),
                   "source_inspection": "pending", "usage": usage_totals(records),
                   "evaluated_candidates": result["attempts"], "failure_type": failure}
-        (args.root / "smoke-summary.json").write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps(report))
-        return 0 if report["host_verified"] else 2
+        (root / "smoke-summary.json").write_text(json.dumps(report, indent=2) + "\n")
+        return report
 
 
 if __name__ == "__main__":

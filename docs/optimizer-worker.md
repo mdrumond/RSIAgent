@@ -69,3 +69,21 @@ whose identity is fixed and whose `complete(stage,context,record)` returns cases
 one Ascend C candidate, and finish. This still executes the actual production
 transport, freezing, compiler, CANNBot timing, profiling and hydration. Repeat
 without `agent=stub` for the configured real provider.
+
+For another trusted execution environment, a host launcher can call
+`run_worker(..., transport_factory=factory)` with its own validated configuration.
+The factory receives `(config, *, retain, stopped, deadline)` and returns a
+transport implementing `transfer(action, source, destination)`,
+`execute(directory, argv)`, and `cancel_pending(directory)`. It must preserve
+retained handles, dispatch sentinels, exact-operation cancellation, and resume
+without replaying an uncertain dispatch. Execution success requires confirmed
+remote completion; a submission acknowledgement is insufficient.
+
+Injected configurations require an explicit `lock_directory` and a versioned
+`transport_identity`, pinned across resume alongside the runtime and device.
+They need no checked-wrapper paths. The normal CLI still validates and uses the
+existing checked transport. No transport is loaded dynamically from config.
+Machine-specific launchers and credentials belong in ignored local storage.
+The fixed Pi smoke is also callable through
+`benchmarks.pi_coding.smoke.run_smoke(config=..., transport_factory=..., ...)`;
+its CLI, budget caps, and numerical verification policy remain the same.
