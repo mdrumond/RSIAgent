@@ -40,6 +40,16 @@ class CurriculumPolicy:
         if any(item not in self.learning_foci for item in spec.learning_focus):
             raise ValueError(f"learning focus unavailable for {self.target} curriculum")
 
+    def operation_capabilities(self) -> dict[str, tuple[str, ...]]:
+        """Map target operation metadata to the shared semantic graph."""
+        native = self.target == "a3"
+        return {
+            "simd-vector": ("add", "multiply", "relu"),
+            "vector-reduction" if native else "simt-reduction": ("reduce-sum",),
+            "vector-mask" if native else "simt-mask": ("mask-positive",),
+            "cube-tiling": ("matmul",),
+        }
+
     def grammar(self, legacy: dict[str, object]) -> dict[str, object]:
         grammar = deepcopy(legacy)
         grammar["capabilities"] = list(self.capabilities)
@@ -50,9 +60,9 @@ class CurriculumPolicy:
         if self.target == "a3":
             grammar["profile_metrics"] = ["pipe-utilization"]
         rules = grammar["capability_operation_rules"]
-        rules["vector-reduction"] = rules.pop("simt-reduction")
-        rules["vector-mask"] = rules.pop("simt-mask")
-        rules["rule"] = "Each operation capability must agree with its graph operations; these are curriculum metadata rules, not API restrictions."
+        for label in ("simd-vector", "simt-reduction", "simt-mask", "cube-tiling"):
+            rules.pop(label, None)
+        rules.update({label: list(ops) for label, ops in self.operation_capabilities().items()})
         return grammar
 
 

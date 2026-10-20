@@ -110,7 +110,9 @@ def test_invalid_curriculum_selection_is_corrected_before_execution_and_publicat
             invalid["graph"]["nodes"][0]["operands"] = ["lhs"]
             return _wave(messages[-1]["content"], [invalid])
         if len(calls) == 2:
-            assert "simd-vector" in messages[-1]["content"]
+            # A copy graph loses the stray operation label and still needs
+            # an authored capability before it can be executed or published.
+            assert "capabilities must be non-empty" in messages[-1]["content"]
             return _wave(messages[1]["content"], [
                 _project("valid-copy", "gm-ub-movement"),
             ])

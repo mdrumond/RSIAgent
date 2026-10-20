@@ -163,8 +163,8 @@ class ProjectGraph:
             if node.name in shapes:
                 raise ValueError("tensor names must be unique")
             shapes[node.name] = _infer(node, shapes)
-        if self.output not in {node.name for node in self.nodes}:
-            raise ValueError("graph output must name a computed node")
+        if not isinstance(self.output, str) or self.output not in {node.name for node in self.nodes}:
+            raise ValueError("graph output must be a string naming a computed node")
         node_by_name = {node.name: node for node in self.nodes}
         reachable = {self.output}
         pending = [self.output]

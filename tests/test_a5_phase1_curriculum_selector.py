@@ -162,7 +162,7 @@ def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
 
 @pytest.mark.parametrize("invalid", [
     "DECISION: WAVE\n{broken",
-    wave([project(capabilities=["gm-ub-movement", "simd-vector"])]),
+    wave([project(capabilities=["gm-ub-movement", "unknown"])]),
 ])
 def test_invalid_selection_is_corrected_with_full_session_history(invalid):
     calls = []
@@ -192,9 +192,9 @@ def test_selection_validation_exhaustion_is_bounded_and_diagnostic():
 
     def complete(messages):
         calls.append(messages)
-        return wave([project(capabilities=["simd-vector"])])
+        return wave([project(capabilities=["unknown"])])
 
-    with pytest.raises(ValueError, match="3 attempts.*simd-vector"):
+    with pytest.raises(ValueError, match="3 attempts.*unregistered capability"):
         CurriculumAgent(complete).select(context())
     assert len(calls) == 3
     assert [len(messages) for messages in calls] == [2, 4, 6]
@@ -621,7 +621,11 @@ def test_documented_mxfp8_example_matches_published_grammar():
     spec = ProjectSpec.from_mapping(example)
     assert spec.dtype.value == "mxfp8_e4m3fn"
     decision, _ = CurriculumAgent(lambda _: wave([example])).select(context())
-    assert decision.wave.projects[0].spec == spec
+    normalized = decision.wave.projects[0].spec
+    assert set(normalized.capabilities) == set(spec.capabilities)
+    assert {k: v for k, v in normalized.as_dict().items() if k != "capabilities"} == {
+        k: v for k, v in spec.as_dict().items() if k != "capabilities"
+    }
 
 
 def test_small_adaptive_waves_are_bounded_by_remaining_target():
