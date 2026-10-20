@@ -117,6 +117,17 @@ def direct_profile(identity: A5ModelIdentity) -> DirectModelProfile:
     )
 
 
+class _EmptyTextCompletion(ValueError):
+    """A rejected textual completion whose raw text and usage remain available."""
+
+    def __init__(self, text, completion_tokens):
+        if (not isinstance(text, str) or text.strip()
+                or type(completion_tokens) is not int or completion_tokens < 1):
+            raise ValueError("empty completion requires text and positive token usage")
+        self.text, self.completion_tokens = text, completion_tokens
+        super().__init__("provider completion must contain non-empty text")
+
+
 @dataclass(frozen=True)
 class DirectCompletion:
     text: str
@@ -125,11 +136,12 @@ class DirectCompletion:
     def __post_init__(self) -> None:
         if (
             not isinstance(self.text, str)
-            or not self.text.strip()
             or type(self.completion_tokens) is not int
             or self.completion_tokens < 1
         ):
             raise ValueError("provider completion must contain text and token usage")
+        if not self.text.strip():
+            raise _EmptyTextCompletion(self.text, self.completion_tokens)
 
 
 Transport = Callable[..., DirectCompletion]
@@ -170,9 +182,11 @@ def openai_compatible_transport(*, base_url, api_key, request) -> DirectCompleti
     )
     try:
         return DirectCompletion(
-            response.choices[0].message.content or "",
+            response.choices[0].message.content,
             response.usage.completion_tokens,
         )
+    except _EmptyTextCompletion:
+        raise
     except (AttributeError, IndexError, TypeError, ValueError):
         raise ValueError("provider response is missing content or token usage") from None
 
@@ -410,6 +424,10 @@ class DirectActorDriver:
             self._request(recorder, profile, messages, stage="compaction", turn=turn)
             try:
                 completion = self._complete(recorder, profile, messages, stage="compaction", turn=turn)
+            except _EmptyTextCompletion as exc:
+                # Only compaction treats empty textual output as correctable.
+                # Ordinary Actor/provider calls still reject this ValueError.
+                completion = exc
             except Exception as exc:
                 recorder.failure(exc, stage="compaction", turn=turn)
                 if isinstance(exc, ProviderRejectionError):
