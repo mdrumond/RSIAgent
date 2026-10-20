@@ -13,13 +13,20 @@ def write(path, value):
 
 
 def campaign(root, *, result=None, task=None, attempt='attempt-001', baseline=True):
-    task = task or dict(task_id='relu', submission={'source': 'reference'}, rationale='learn')
+    task = task or dict(task_id='relu', submission={'source': 'reference', 'entrypoint': 'forward', 'signatures': []}, rationale='learn')
+    task = json.loads(canonical(task))
+    spec = task.setdefault('submission', {'source': 'reference'})
+    spec.setdefault('entrypoint', 'forward')
+    spec.setdefault('signatures', [])
     row = dict(attempt_id=attempt, kind='target', task=task,
                result=result or dict(verified=False, summary='agent hypothesis'))
     if baseline and not row['result'].get('job_id'):
         from optimizer.jobs import JobStore
         jobs = JobStore(root / 'execution' / 'jobs')
-        job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key=str(root))
+        spec = task.get('submission', {'source': 'reference'})
+        job = jobs.create(spec['source'], spec.get('entrypoint', 'forward'),
+            {'signatures': spec.get('signatures', [])}, {}, idempotency_key=str(root),
+            init_args=spec.get('init_args'), init_kwargs=spec.get('init_kwargs'))
         value = baseline if isinstance(baseline, dict) else dict(suite_sha256='1' * 64,
             manifest=dict(policy=dict(name='host-policy', rtol=.01)))
         value.setdefault('cases', [dict(case='case-0')])
@@ -110,6 +117,7 @@ def test_pending_job_import_is_not_completed_attempt(tmp_path):
     jobs = JobStore(source / relative / 'jobs')
     job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
     jobs.retain_handle(job['job_id'], 'remote:exact', operation='evaluate')
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
     jobs.transition(job['job_id'], 'stopped')
     store = FeedbackStore(tmp_path / 'feedback')
     store.import_campaign(source)
@@ -130,6 +138,7 @@ def test_pending_import_replays_terminal_event_over_stale_manifest(tmp_path, sta
     jobs = JobStore(source / relative / 'jobs')
     job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
     jobs.transition(job['job_id'], 'running')
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
     path = jobs.root / job['job_id'] / 'manifest.json'
     stale = path.read_bytes()
     jobs.transition(job['job_id'], status)
@@ -164,6 +173,45 @@ def test_completed_attempt_event_precedes_interruption_synthesis(tmp_path, verif
     assert outcome['verified'] is verified
     assert outcome['category'] == ('verified-success' if verified else 'incorrect')
     assert store.import_campaign(source)['existing'] == 1
+
+
+@pytest.mark.parametrize('retry_policy', ['matching', 'different-suite', 'different-policy'])
+def test_prepared_interruption_retains_frozen_baseline_for_retry_resolution(tmp_path, retry_policy):
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'interrupted'
+    row = campaign(root, baseline=False)
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(root / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
+    relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
+    jobs = JobStore(root / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='interrupted')
+    baseline = dict(suite_sha256='1' * 64, cases=[dict(case='case-0')],
+                    manifest=dict(policy=dict(name='host-policy', rtol=.01)))
+    baseline_ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(baseline))
+    candidate_ref = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('unfinished candidate'))
+    jobs.add_event(job['job_id'], 'optimizer-state', dict(baseline=baseline_ref, candidate=candidate_ref))
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
+    jobs.transition(job['job_id'], 'stopped')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(root)
+    original = store.records()[0]
+    assert original['outcome']['completed'] is False
+    assert original['outcome']['verified'] is False
+    assert original['outcome']['evidence']['baseline']['sha256'] == baseline_ref['sha256']
+    assert original['outcome']['evidence']['candidate']['sha256'] == candidate_ref['sha256']
+    if retry_policy == 'different-suite':
+        baseline['suite_sha256'] = '2' * 64
+    if retry_policy == 'different-policy':
+        baseline['manifest']['policy']['rtol'] = .5
+    campaign(tmp_path / 'retry', task=row['task'], result={'verified': True}, baseline=baseline)
+    store.import_campaign(tmp_path / 'retry')
+    retry = next(record for record in store.records() if record['outcome']['verified'])
+    if retry_policy == 'matching':
+        assert store.update_investigation(original['feedback_id'], status='resolved',
+            retries=[retry['feedback_id']])['investigation']['status'] == 'resolved'
+    else:
+        with pytest.raises(ValueError, match='successful original-task retry'):
+            store.update_investigation(original['feedback_id'], status='resolved', retries=[retry['feedback_id']])
 
 
 def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
@@ -408,6 +456,56 @@ def test_retry_resolution_authenticates_retained_native_verdict(tmp_path, mismat
     store.import_campaign(tmp_path / 'failure')
     store.import_campaign(root)
     records = {r['outcome']['verified']: r for r in store.records()}
+    with pytest.raises(ValueError, match='successful original-task retry'):
+        store.update_investigation(records[False]['feedback_id'], status='resolved',
+                                   retries=[records[True]['feedback_id']])
+
+
+def test_new_pending_does_not_own_previous_attempt_terminal_status(tmp_path):
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'source'
+    old = campaign(root, baseline=False)
+    relative = 'tasks/relu-' + sha(canonical(old['task']))[:12]
+    jobs = JobStore(root / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
+    jobs.transition(job['job_id'], 'running')
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id='attempt-001'))
+    jobs.transition(job['job_id'], 'budget-exhausted')
+    old.update(execution_directory=relative)
+    old['result'].update(job_id=job['job_id'], attempt_id='attempt-001')
+    jobs.add_event(job['job_id'], 'phase2-attempt-result', old['result'])
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[old]))
+    write(root / 'pending.json', dict(attempt_id='attempt-002', kind='target', task=old['task']))
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(root)['imported'] == 1
+    assert len(store.records()) == 1
+    jobs.add_event(job['job_id'], 'phase2-prepare-request', dict(attempt_id='attempt-002'))
+    assert store.import_campaign(root)['imported'] == 0  # Old terminal predates this preparation boundary.
+    jobs.resume(job['job_id'], additional_attempts=1, additional_seconds=60)
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id='attempt-002'))
+    jobs.transition(job['job_id'], 'failed')
+    assert store.import_campaign(root)['imported'] == 1
+    interrupted = next(row for row in store.records() if row['outcome']['attempt_id'] == 'attempt-002')
+    assert interrupted['outcome']['completed'] is False
+
+
+@pytest.mark.parametrize('field,value', [
+    ('source', 'another reference'), ('entrypoint', 'another_entry'),
+    ('signatures', [{'args': [{'shape': [99], 'dtype': 'float32'}]}]),
+    ('init_args', [2]), ('init_kwargs', {'mode': 'different'}),
+])
+def test_resolution_rejects_misattached_frozen_task_submission(tmp_path, field, value):
+    root = tmp_path / 'retry'
+    row = campaign(root, result={'verified': True})
+    changed_task = json.loads(canonical(row['task']))
+    changed_task['submission'][field] = value
+    row['task'] = changed_task  # Ordinary stale/misattached campaign row, same task ID.
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    campaign(tmp_path / 'failure', task=changed_task, result={'verified': False})
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(tmp_path / 'failure')
+    store.import_campaign(root)
+    records = {record['outcome']['verified']: record for record in store.records()}
     with pytest.raises(ValueError, match='successful original-task retry'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
                                    retries=[records[True]['feedback_id']])

@@ -25,10 +25,18 @@ def _artifact(store, key, digest):
     return data
 
 
-def verify_attempt_result(store, result, *, attempt_id, task_id):
+def verify_task_submission(submission, task_submission):
+    if (any(submission.get(k) != task_submission.get(k) for k in ('source', 'entrypoint'))
+            or submission['signature'] != {'signatures': task_submission['signatures']}
+            or submission['init_args'] != task_submission.get('init_args', [])
+            or submission['init_kwargs'] != task_submission.get('init_kwargs', {})):
+        raise ValueError('Phase 2 task differs from frozen optimizer submission')
+
+
+def verify_attempt_result(store, result, *, attempt_id, task_id, task_submission):
     """Authenticate a retained attempt verdict against native execution evidence."""
     key = result['job_id']
-    store.get(key)
+    verify_task_submission(store.submission(key), task_submission)
     events = store.events(key)
     if not any(e['kind'] == 'phase2-attempt-result' and e['payload'] == result for e in events):
         raise ValueError('Phase 2 attempt result missing from optimizer event chain')
@@ -73,17 +81,12 @@ def verify_campaign(root, *, require_ready=False):
         verify_snapshot(submission["memory_snapshot"])
         if submission["memory_snapshot"]["snapshot_id"] != seed["snapshot_id"]:
             raise ValueError("optimizer task memory differs from reviewed Phase 2 seed")
-        task_submission = row["task"]["submission"]
-        if (any(submission.get(k) != task_submission.get(k) for k in ("source", "entrypoint"))
-                or submission["signature"] != {"signatures": task_submission["signatures"]}
-                or submission["init_args"] != task_submission.get("init_args", [])
-                or submission["init_kwargs"] != task_submission.get("init_kwargs", {})):
-            raise ValueError("Phase 2 task differs from frozen optimizer submission")
         if row["kind"] == "target" and row["task"] != state["target"]:
             raise ValueError("Phase 2 target changed between attempts")
         for digest in {artifact["sha256"] for artifact in store.artifacts(key)}:
             _artifact(store, key, digest)
-        verify_attempt_result(store, result, attempt_id=row['attempt_id'], task_id=row['task_id'])
+        verify_attempt_result(store, result, attempt_id=row['attempt_id'], task_id=row['task_id'],
+                              task_submission=row['task']['submission'])
         if row.get("verified") != result.get("verified"):
             raise ValueError("Phase 2 verified flag mismatch")
     evidence = {sha(canonical(row)) for row in attempts}

@@ -66,7 +66,8 @@ def _verified_retry(outcome):
         if not Path(ref['job_root']).is_dir():
             return False
         verify_attempt_result(JobStore(ref['job_root']), outcome['result'],
-                              attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'])
+                              attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'],
+                              task_submission=outcome['task']['submission'])
         return outcome['result'].get('verified') is True
     except (KeyError, OSError, ValueError, TypeError):
         return False
@@ -252,7 +253,8 @@ class FeedbackStore:
                     try:
                         store = JobStore(jobs)
                         job = store.get(manifest.parent.name)
-                        completed = next((event['payload'] for event in reversed(store.events(job['job_id']))
+                        events = store.events(job['job_id'])
+                        completed = next((event['payload'] for event in reversed(events)
                             if event['kind'] == 'phase2-attempt-result'
                             and event['payload'].get('attempt_id') == pending['attempt_id']), None)
                     except (ValueError, OSError) as error:
@@ -266,9 +268,22 @@ class FeedbackStore:
                         continue
                     if job.get('status') not in {'failed', 'stopped', 'budget-exhausted'}:
                         continue
+                    if pending.get('kind') not in {'qualification', 'practice-qualification'}:
+                        boundary = next((event['sequence'] for event in reversed(events)
+                            if event['kind'] in {'phase2-attempt-request', 'phase2-prepare-request'}
+                            and event['payload'].get('attempt_id') == pending['attempt_id']), None)
+                        terminal = next((event['sequence'] for event in reversed(events)
+                            if event['payload'].get('manifest', {}).get('status') == job['status']), -1)
+                        if boundary is None or terminal <= boundary:
+                            report['warnings'].append(f'{campaign}:{pending["attempt_id"]}: '
+                                'no matching execution boundary followed by terminal evidence; pending selection not imported')
+                            continue  # A new pending selection does not own a previous attempt's stop.
+                    prepared = next((event['payload'] for event in reversed(events)
+                                     if event['kind'] == 'optimizer-state'), {})
                     row = {**pending, 'execution_directory': relative,
                            'result': dict(job_id=job['job_id'], verified=False,
-                               classification=job['status'], handles=job.get('handles', []))}
+                               classification=job['status'], handles=job.get('handles', []),
+                               **{role: prepared[role] for role in ('baseline', 'candidate') if role in prepared})}
                     outcome = self._outcome(campaign, row, metadata, report)
                     outcome.update(completed=False, category='budget-exhausted' if job['status'] == 'budget-exhausted'
                                    else 'interrupted', job_status=job)
