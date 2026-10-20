@@ -256,19 +256,21 @@ def test_rejected_cases_visible_and_profile_failure_preserves_best(tmp_path):
     assert any(e['kind'] == 'profiling-unavailable' for e in events)
 
 
-def test_direct_agent_retains_exact_provider_payload_and_usage():
+def test_pi_agent_retains_provider_usage_and_host_action():
     from optimizer.agent import OptimizerAgent
-    from benchmarks.a3_model_profiles import A3Completion
     records = []
-    def complete(system, user, *, model):
-        assert 'guide-text' in user
-        return A3Completion(text='{"action":"finish","summary":"done"}', completion_tokens=7,
-                            provenance={'test': True})
-    agent = OptimizerAgent(guide='guide-text', complete=complete)
+    class Session:
+        def __init__(self, **kwargs): pass
+        def next_action(self, context, allowed, record, **kwargs):
+            assert context['guide'] == 'guide-text'
+            record('pi-provider', {'usage': {'completion_tokens': 7}})
+            return 'finish', {'summary': 'done'}
+        def close(self): pass
+    agent = OptimizerAgent(guide='guide-text', session_factory=Session)
     action = agent.complete('optimize', {}, lambda kind, body: records.append((kind, body)))
     assert action['action'] == 'finish'
-    assert records[0][0] == 'request'
-    assert records[1][1]['completion_tokens'] == 7
+    assert records[0][0] == 'pi-provider'
+    assert records[0][1]['usage']['completion_tokens'] == 7
 
 
 def test_dashboard_signature_envelope_flows_through_job_store(tmp_path):

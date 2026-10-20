@@ -107,6 +107,15 @@ class OptimizationLoop:
                                    | {'signatures': signatures})
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
+        try:
+            return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
+                             memory_snapshot=memory_snapshot, context=context)
+        finally:
+            close = getattr(self.agent, "close", None)
+            if close is not None:
+                close()
+
+    def _run_owned(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         """Optionally stop at Phase 2's preparation or single-evaluation boundary.
 
         These boundaries reuse this job's durable state, reference and pending
@@ -325,6 +334,11 @@ class OptimizationLoop:
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        if self.agent.identity.get('coding_engine') == 'pi':
+            # Count durable pre-HTTP intentions, including uncertain requests.
+            used = sum(e['kind'] == 'model-pi-provider-request' for e in self.store.events(self.key))
+            context['remaining_provider_requests'] = max(0, self.agent.identity.get('provider_request_limit', 200)-used)
+            context['knowledge_available'] = self.knowledge is not None
         if self.single_evaluation or self.prepare_only:
             # Keep every lesson addressable, but don't replay hundreds of full
             # entries or accumulated compiler/profiler logs on every turn.

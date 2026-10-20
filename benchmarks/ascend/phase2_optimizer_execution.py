@@ -75,7 +75,7 @@ class OptimizerTaskExecutor:
                 load_dotenv(config['env_file'], override=False)
             from benchmarks.a3_experiments import BackendModel
             agent = OptimizerAgent(guide=Path(config['guide']).read_text(),
-                model=BackendModel(config.get('model_profile', BackendModel.GPT_5_6_SOL.value)))
+                model=BackendModel(config.get('model_profile', BackendModel.DEEPSEEK_FLASH.value)))
             remaining = self.store.get(self.job_id)['max_seconds'] - self.store.get(self.job_id)['elapsed_seconds']
             agent = BoundedAgent(agent, deadline=getattr(backend, 'deadline', time.monotonic() + remaining),
                                  stopped=lambda: self.store.get(self.job_id)['stop_requested'])

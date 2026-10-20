@@ -206,7 +206,7 @@ def run_worker(root, job_id, config, *, agent=None):
         if previous is None:
             store.add_event(job_id, 'worker-configuration', identity)
         agent = agent or OptimizerAgent(guide=guide,
-                                        model=BackendModel(config.get('model_profile', BackendModel.GPT_5_6_SOL.value)))
+                                        model=BackendModel(config.get('model_profile', BackendModel.DEEPSEEK_FLASH.value)))
         backend = RemoteBackend(store, job_id, config)
         agent = BoundedAgent(agent, deadline=backend.deadline,
                              stopped=lambda: store.get(job_id)['stop_requested'])

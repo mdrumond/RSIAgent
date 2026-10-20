@@ -38,3 +38,44 @@ def test_hanging_provider_is_terminated_on_stop_or_remaining_budget(stop):
     assert time.monotonic() - started < 2
     assert set(multiprocessing.active_children()) == before
     assert records[0][0] == 'request'
+
+
+def test_child_keeps_agent_state_between_host_actions():
+    class Stateful(Agent):
+        calls = 0
+        def complete(self, stage, context, record):
+            self.calls += 1
+            return {'calls': self.calls}
+    agent = BoundedAgent(Stateful(), deadline=time.monotonic()+5, stopped=lambda: False)
+    try:
+        assert agent.complete('cases', {}, lambda *_: None) == {'calls':1}
+        pid = agent.process.pid
+        assert agent.complete('optimize', {}, lambda *_: None) == {'calls':2}
+        assert agent.process.pid == pid
+    finally:
+        agent.close()
+
+
+def test_stop_kills_provider_descendants(tmp_path):
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    class Spawning(Agent):
+        def complete(self, stage, context, record):
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+            record('child', {'pid': child.pid})
+            time.sleep(30)
+    started, descendants = time.monotonic(), []
+    agent = BoundedAgent(Spawning(), deadline=started+5, stopped=lambda: time.monotonic()-started > .3)
+    with pytest.raises(WorkerStopped):
+        agent.complete('optimize', {}, lambda kind,data: descendants.append(data['pid']))
+    assert descendants
+    for pid in descendants:
+        stat = Path(f'/proc/{pid}/stat')
+        try:
+            state = stat.read_text().split()[2]
+        except FileNotFoundError:
+            continue  # The killed descendant was reaped between observations.
+        assert state == 'Z'
+    assert agent.process is None

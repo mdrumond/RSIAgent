@@ -262,7 +262,7 @@ def test_cli_composition_pins_worker_config_and_reviewed_treatment(tmp_path, mon
     from optimizer.jobs import sha, canonical
     guide = tmp_path / "guide.md"
     guide.write_text("Ascend C programming")
-    config = dict(profile="bz-a3-1", target="bz-a3-1", runtime="py311-torch", physical_device=10,
+    config = dict(model_profile="openai/gpt-5.6-sol", profile="bz-a3-1", target="bz-a3-1", runtime="py311-torch", physical_device=10,
                   arch="dav-2201", cpl_remote="/configured/transport", validation_wrapper="/configured/adapter",
                   remote_workspace="/configured/workspace", guide=str(guide))
     path = tmp_path / "worker.json"
