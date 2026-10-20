@@ -82,13 +82,19 @@ def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
     from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
     from test_ascend_phase2_optimizer_tasks import seed
     task = original['outcome']['task']
+    original_baseline = json.loads(store.read_evidence(original['outcome']['evidence']['baseline']['sha256'])['text'])
     class Retry:
         def __init__(self, directory, selected, memory):
             assert selected == task
+            from optimizer.jobs import JobStore
+            self.jobs = JobStore(directory/'jobs')
+            self.job = self.jobs.create('def forward(x): return x', 'forward', {}, {})
+            self.baseline = self.jobs.put_artifact(self.job['job_id'], 'baseline.json', canonical(original_baseline))
         def prepare(self):
             return {'suite_sha256': 'fixture-original-suite'}
         def attempt(self, key, **kwargs):
-            return dict(verified=True, summary='scripted host fixture', speedup=2)
+            return dict(verified=True, summary='scripted host fixture', speedup=2,
+                        job_id=self.job['job_id'], baseline=self.baseline)
     retry_root = tmp_path / 'new-retry'
     reviewed = seed()
     reviewed['source_identity'] = dict(target='a3', language='ascend-c')
