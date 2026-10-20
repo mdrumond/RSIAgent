@@ -197,3 +197,19 @@ def test_compiler_diagnostics_classify_native_incorrect_report(tmp_path):
     store = FeedbackStore(tmp_path / 'feedback')
     store.import_campaign(root)
     assert store.records()[0]['outcome']['category'] == 'compile-failure'
+
+
+@pytest.mark.parametrize('unknown', ['target', 'language'])
+def test_unknown_identity_cannot_resolve_even_when_equal(tmp_path, unknown):
+    store = FeedbackStore(tmp_path / 'feedback')
+    for name, verified in [('failure', False), ('retry', True)]:
+        root = tmp_path / name
+        campaign(root, result={'verified': verified})
+        identity = dict(target='a3', language='ascend-c')
+        identity[unknown] = 'unknown'
+        write(root / 'seed-memory.json', dict(source_identity=identity))
+        store.import_campaign(root)
+    records = {r['outcome']['verified']: r for r in store.records()}
+    with pytest.raises(ValueError, match='known target and language'):
+        store.update_investigation(records[False]['feedback_id'], status='resolved',
+                                   retries=[records[True]['feedback_id']])
