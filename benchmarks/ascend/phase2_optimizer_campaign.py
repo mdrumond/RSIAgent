@@ -12,7 +12,7 @@ from optimizer.memory import verify_snapshot
 class OptimizerPhase2Coordinator:
     def __init__(self, root, objective, snapshot, complete, execution_factory, *,
                  query_knowledge=None, max_target_attempts=3, max_practice_attempts=2,
-                 selector=None):
+                 selector=None, feedback_root=None):
         if any(type(n) is not int or n < 1
                for n in (max_target_attempts, max_practice_attempts)):
             raise ValueError("target and practice budgets must be positive")
@@ -22,6 +22,8 @@ class OptimizerPhase2Coordinator:
         verify_snapshot(snapshot)
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        from .phase2_feedback import FeedbackStore
+        self.feedback = FeedbackStore(feedback_root or self.root / 'feedback')
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
         self.target_budget, self.practice_budget = max_target_attempts, max_practice_attempts
@@ -41,6 +43,16 @@ class OptimizerPhase2Coordinator:
 
     def _read(self, name):
         return json.loads((self.root / name).read_bytes())
+
+    def _qualify(self, task, kind):
+        self._write('qualification.json', dict(phase='optimizer-phase2', active=True, attempts=[], pending=dict(
+            attempt_id=kind + '-' + sha(canonical(task))[:12], kind=kind, task=task)))
+        try:
+            self.factory(self.root / self._directory(task), task, self.seed).prepare()
+        except Exception:
+            self.feedback.import_campaign(self.root)
+            raise
+        (self.root / 'qualification.json').unlink()
 
     def _bootstrap(self):
         path = self.root / "state.json"
@@ -62,7 +74,7 @@ class OptimizerPhase2Coordinator:
             self._write("goal-selection.json", dict(stage="qualification", candidate=task))
             try:
                 # Torch reference is the oracle. No native teacher is constructed.
-                self.factory(self.root / self._directory(task), task, self.seed).prepare()
+                self._qualify(task, 'qualification')
             except (ValueError, TypeError, KeyError) as error:
                 from .phase2_optimizer_tasks import reject_optimizer_task
                 reject_optimizer_task(directory, str(error))
@@ -158,7 +170,7 @@ class OptimizerPhase2Coordinator:
                     try:
                         if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
                             raise ValueError("practice must have a fresh task ID")
-                        self.factory(self.root / self._directory(task), task, self.seed).prepare()
+                        self._qualify(task, 'practice-qualification')
                     except (ValueError, TypeError, KeyError) as error:
                         from .phase2_optimizer_tasks import reject_optimizer_task
                         reject_optimizer_task(directory, str(error))
@@ -177,6 +189,7 @@ class OptimizerPhase2Coordinator:
 
     def _run(self, limit=None):
         state, completed = self._bootstrap(), 0
+        self.feedback.import_campaign(self.root)
         while not state["terminal"]:
             pending = self._select(state)
             self._write("state.json", state)
@@ -185,9 +198,15 @@ class OptimizerPhase2Coordinator:
             task, key = pending["task"], pending["attempt_id"]
             relative = self._directory(task)
             executor = self.factory(self.root / relative, task, self.seed)
-            executor.prepare()
-            result = executor.attempt(key, memory_snapshot=self._memory(state),
-                                      feedback=state["attempts"][-2:])
+            try:
+                if getattr(executor, 'job_id', None) is not None:
+                    executor.store.add_event(executor.job_id, 'phase2-prepare-request', dict(attempt_id=key))
+                executor.prepare()
+                result = executor.attempt(key, memory_snapshot=self._memory(state),
+                                          feedback=state["attempts"][-2:])
+            except Exception:
+                self.feedback.import_campaign(self.root)
+                raise
             row = dict(attempt_id=key, kind=pending["kind"], task_id=task["task_id"],
                        task=task, result=result, verified=result["verified"], execution_directory=relative)
             # Publication precedes state advancement. Executor attempt IDs make recovery idempotent.
@@ -206,6 +225,7 @@ class OptimizerPhase2Coordinator:
                     interpretation=result.get("summary", "")))
             state["next_kind"] = "review"
             self._write("state.json", state)
+            self.feedback.import_campaign(self.root)
             (self.root / "pending.json").unlink()
             completed += 1
             if limit is not None and completed >= limit:

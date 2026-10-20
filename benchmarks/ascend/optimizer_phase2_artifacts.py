@@ -25,6 +25,39 @@ def _artifact(store, key, digest):
     return data
 
 
+def verify_task_submission(submission, task_submission):
+    if (any(submission.get(k) != task_submission.get(k) for k in ('source', 'entrypoint'))
+            or submission['signature'] != {'signatures': task_submission['signatures']}
+            or submission['init_args'] != task_submission.get('init_args', [])
+            or submission['init_kwargs'] != task_submission.get('init_kwargs', {})):
+        raise ValueError('Phase 2 task differs from frozen optimizer submission')
+
+
+def verify_attempt_result(store, result, *, attempt_id, task_id, task_submission):
+    """Authenticate a retained attempt verdict against native execution evidence."""
+    key = result['job_id']
+    verify_task_submission(store.submission(key), task_submission)
+    events = store.events(key)
+    if not any(e['kind'] == 'phase2-attempt-result' and e['payload'] == result for e in events):
+        raise ValueError('Phase 2 attempt result missing from optimizer event chain')
+    body = json.loads(_artifact(store, key, result['result_artifact']['sha256']))
+    if body != {k: v for k, v in result.items() if k != 'result_artifact'}:
+        raise ValueError('Phase 2 result artifact mismatch')
+    if result['attempt_id'] != attempt_id or result['task_id'] != task_id:
+        raise ValueError('Phase 2 execution identity mismatch')
+    if result.get('verified'):
+        native = result['result']
+        source = json.loads(_artifact(store, key, result['candidate']['sha256']))
+        baseline = json.loads(_artifact(store, key, result['baseline']['sha256']))
+        if (not isinstance(source, str) or sha(source.encode()) != result['source_sha256']
+                or native.get('candidate_sha256') != result['source_sha256']
+                or native.get('status') != 'verified'
+                or native.get('suite_sha256') != baseline['suite_sha256']
+                or not baseline['cases']
+                or sorted(c['case'] for c in native['cases']) != sorted(c['case'] for c in baseline['cases'])):
+            raise ValueError('verified attempt does not match frozen suite and candidate')
+
+
 def verify_campaign(root, *, require_ready=False):
     """Check seed identity, committed rows, and immutable optimizer evidence."""
     root = Path(root)
@@ -48,38 +81,14 @@ def verify_campaign(root, *, require_ready=False):
         verify_snapshot(submission["memory_snapshot"])
         if submission["memory_snapshot"]["snapshot_id"] != seed["snapshot_id"]:
             raise ValueError("optimizer task memory differs from reviewed Phase 2 seed")
-        task_submission = row["task"]["submission"]
-        if (any(submission.get(k) != task_submission.get(k) for k in ("source", "entrypoint"))
-                or submission["signature"] != {"signatures": task_submission["signatures"]}
-                or submission["init_args"] != task_submission.get("init_args", [])
-                or submission["init_kwargs"] != task_submission.get("init_kwargs", {})):
-            raise ValueError("Phase 2 task differs from frozen optimizer submission")
         if row["kind"] == "target" and row["task"] != state["target"]:
             raise ValueError("Phase 2 target changed between attempts")
-        events = store.events(key)
         for digest in {artifact["sha256"] for artifact in store.artifacts(key)}:
             _artifact(store, key, digest)
-        if not any(e["kind"] == "phase2-attempt-result" and e["payload"] == result for e in events):
-            raise ValueError("Phase 2 attempt result missing from optimizer event chain")
-        body = json.loads(_artifact(store, key, result["result_artifact"]["sha256"]))
-        if body != {k: v for k, v in result.items() if k != "result_artifact"}:
-            raise ValueError("Phase 2 result artifact mismatch")
-        if result["attempt_id"] != row["attempt_id"] or result["task_id"] != row["task_id"]:
-            raise ValueError("Phase 2 execution identity mismatch")
+        verify_attempt_result(store, result, attempt_id=row['attempt_id'], task_id=row['task_id'],
+                              task_submission=row['task']['submission'])
         if row.get("verified") != result.get("verified"):
             raise ValueError("Phase 2 verified flag mismatch")
-        if row.get("verified"):
-            native = result["result"]
-            source = json.loads(_artifact(store, key, result["candidate"]["sha256"]))
-            baseline = json.loads(_artifact(store, key, result["baseline"]["sha256"]))
-            if (not isinstance(source, str) or sha(source.encode()) != result["source_sha256"]
-                    or native.get("candidate_sha256") != result["source_sha256"]
-                    or native.get("status") != "verified"
-                    or native.get("suite_sha256") != baseline["suite_sha256"]
-                    or not baseline["cases"]
-                    or sorted(c["case"] for c in native["cases"]) != sorted(
-                        c["case"] for c in baseline["cases"])):
-                raise ValueError("verified attempt does not match frozen suite and candidate")
     evidence = {sha(canonical(row)) for row in attempts}
     for entry in state.get("memory_entries", []):
         if entry.get("evidence_sha256") not in evidence:

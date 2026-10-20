@@ -98,6 +98,98 @@ def test_infrastructure_keeps_pending_without_semantic_charge(tmp_path):
     assert calls[0][0] == json.loads(pending)["attempt_id"]
 
 
+def test_prepare_stop_imports_feedback_before_propagating(tmp_path):
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.control import WorkerStopped
+    from optimizer.jobs import JobStore
+    prepared = []
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.store = JobStore(directory / 'jobs')
+            self.job = self.store.create('def f(x): return x', 'f', {}, {}, idempotency_key='prepare')
+            self.job_id = self.job['job_id']
+        def prepare(self):
+            prepared.append(True)
+            if len(prepared) > 1:
+                self.store.transition(self.job['job_id'], 'stopped')
+                raise WorkerStopped('reference preparation stopped')
+            return {}
+        def attempt(self, *args, **kwargs):
+            raise AssertionError('stopped preparation must not attempt')
+    coordinator = OptimizerPhase2Coordinator(tmp_path, 'objective', seed(), lambda _: '', Executor,
+        selector=lambda **kwargs: proposal())
+    with pytest.raises(WorkerStopped, match='reference preparation'):
+        coordinator.run_attempt()
+    records = FeedbackStore(tmp_path / 'feedback').records()
+    assert len(records) == 1
+    assert records[0]['outcome']['completed'] is False
+    assert records[0]['outcome']['job_status']['status'] == 'stopped'
+
+
+def test_initial_qualification_stop_is_retained_and_historically_importable(tmp_path):
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.control import WorkerStopped
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'campaign'
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.jobs = JobStore(directory / 'jobs')
+            self.job = self.jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='qualification')
+        def prepare(self):
+            self.jobs.transition(self.job['job_id'], 'stopped')
+            raise WorkerStopped('initial qualification stopped')
+    coordinator = OptimizerPhase2Coordinator(root, 'objective', seed(), lambda _: '', Executor,
+        selector=lambda **kwargs: proposal())
+    with pytest.raises(WorkerStopped, match='initial qualification'):
+        coordinator.run_attempt()
+    assert not (root / 'state.json').exists()
+    record = FeedbackStore(root / 'feedback').records()[0]
+    assert record['outcome']['kind'] == 'qualification'
+    assert record['outcome']['completed'] is False
+    historical = FeedbackStore(tmp_path / 'historical-feedback')
+    assert historical.import_campaign(root)['imported'] == 1
+    assert historical.records()[0]['outcome'] == record['outcome']
+
+
+@pytest.mark.parametrize('status', ['stopped', 'failed'])
+def test_practice_qualification_failure_is_retained_before_pending(tmp_path, status):
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.control import WorkerStopped
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'campaign'
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.task = task
+            self.jobs = JobStore(directory / 'jobs')
+            self.job = self.jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key=task['task_id'])
+        def prepare(self):
+            if self.task['task_id'] == 'practice-copy':
+                self.jobs.transition(self.job['job_id'], status)
+                error = WorkerStopped if status == 'stopped' else ObservationUnavailable
+                raise error('practice reference interrupted')
+        def attempt(self, key, **kwargs):
+            return dict(verified=False, job_id=self.job['job_id'])
+    def selector(**kwargs):
+        task = proposal()
+        if kwargs['kind'] == 'practice':
+            task['task_id'] = 'practice-copy'
+        return task
+    coordinator = OptimizerPhase2Coordinator(root, 'objective', seed(),
+        lambda _: json.dumps(dict(action='practice', reason='isolate failure')), Executor, selector=selector)
+    with pytest.raises((WorkerStopped, ObservationUnavailable), match='practice reference'):
+        coordinator.resume()
+    assert not (root / 'pending.json').exists()
+    state = json.loads((root / 'state.json').read_bytes())
+    assert len(state['attempts']) == 1 and state['target_attempts'] == 1
+    record = next(row for row in FeedbackStore(root / 'feedback').records()
+                  if row['outcome']['kind'] == 'practice-qualification')
+    assert record['outcome']['completed'] is False
+    assert record['outcome']['job_status']['status'] == status
+    historical = FeedbackStore(tmp_path / 'historical')
+    historical.import_campaign(root)
+    assert any(row['outcome'] == record['outcome'] for row in historical.records())
+
+
 def test_resume_after_state_commit_before_pending_cleanup(tmp_path):
     build, calls, _, _ = setup(tmp_path)
     assert build().run_attempt()["status"] == "RUNNING"

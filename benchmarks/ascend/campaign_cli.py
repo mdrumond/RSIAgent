@@ -234,7 +234,8 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
         lambda directory, task, memory: OptimizerTaskExecutor(directory, task, memory, config),
         query_knowledge=(lambda text: {"results": query(text)}) if query else None,
         max_target_attempts=job["target_attempt_budget"],
-        max_practice_attempts=job["practice_attempt_budget"])
+        max_practice_attempts=job["practice_attempt_budget"],
+        feedback_root=settings.get("phase2_feedback_root"))
 
 
 def _approval_path(job):
@@ -763,6 +764,11 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    feedback = commands.add_parser('feedback-phase2', help='import retained Phase 2 observations without running agents')
+    feedback.add_argument('--feedback-root', type=Path, required=True)
+    sources = feedback.add_mutually_exclusive_group(required=True)
+    sources.add_argument('--source-root', type=Path, action='append')
+    sources.add_argument('--dashboard-config', type=Path)
     for command in ("start", "adopt", "resume", "continue", "status", "collect", "package",
                     "sample", "approve", "reject", "run-approved", "_campaign", "_collector"):
         sub = commands.add_parser(command)
@@ -807,6 +813,15 @@ def main(argv=None, *, screen=start_screen):
         if command == "approve":
             sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
+    if args.command == 'feedback-phase2':
+        from .phase2_feedback import FeedbackStore
+        roots = args.source_root
+        if args.dashboard_config:
+            roots = [row['root'] for row in _read(args.dashboard_config).get('campaigns', [])
+                     if row.get('phase') in (2, '2')]
+        store = FeedbackStore(args.feedback_root)
+        print(json.dumps({'reports': [store.import_campaign(root) for root in roots]}))
+        return
     control = args.control.resolve()
     if args.command == "adopt":
         print(json.dumps(adopt_campaign(args.root, control, args.objective,
