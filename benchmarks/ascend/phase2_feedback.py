@@ -21,12 +21,21 @@ def _observation_identity(outcome):
     identity = {key: outcome[key] for key in ('attempt_id', 'completed')}
     job_id = outcome['result'].get('job_id')
     identity['job_id' if job_id else 'source_root'] = job_id or outcome['source_root']
+    if job_id and outcome.get('job_incarnation'):
+        identity['job_incarnation'] = outcome['job_incarnation']
     return identity
+
+
+def _same_observation(old, new):
+    previous, current = _observation_identity(old), _observation_identity(new)
+    if not old.get('job_incarnation'):
+        current.pop('job_incarnation', None)  # Older records cannot distinguish recreated jobs.
+    return previous == current
 
 
 def _logical_outcome(outcome):
     # Moving retained files changes locations, not the historical observation.
-    return {**{key: value for key, value in outcome.items() if key not in {'source_root', 'evidence'}},
+    return {**{key: value for key, value in outcome.items() if key not in {'source_root', 'evidence', 'job_incarnation'}},
             'evidence': {role: {key: value for key, value in ref.items() if key != 'job_root'}
                          for role, ref in outcome['evidence'].items()}}
 
@@ -174,8 +183,10 @@ class FeedbackStore:
             # Keep IDs and investigation work from older path-keyed feedback files.
             if not path.exists():
                 existing = next((row for row in self.records()
-                                 if _observation_identity(row['outcome']) == identity), None)
+                                 if _same_observation(row['outcome'], outcome)), None)
                 if existing is not None:
+                    if outcome.get('job_incarnation') and not existing['outcome'].get('job_incarnation'):
+                        warnings.append('legacy feedback lacks job incarnation; preserving its existing identity')
                     path = self.root / (existing['feedback_id'] + '.json')
             if path.exists():
                 if _logical_outcome(_read(path)['outcome']) != _logical_outcome(outcome):
@@ -195,7 +206,8 @@ class FeedbackStore:
         if not root.is_dir():
             report['warnings'].append('source root is missing')
             return report
-        paths = sorted(root.rglob('state.json'))
+        paths = sorted(root.rglob('state.json')) + [path for path in sorted(root.rglob('qualification.json'))
+                                                   if not (path.parent / 'state.json').exists()]
         supported = 0
         for path in paths:
             try:
@@ -220,7 +232,7 @@ class FeedbackStore:
                 outcome = self._outcome(campaign, row, metadata, report)
                 outcome.update(category=_category(row['task'], result), completed=True)
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
-            pending = _read(campaign / 'pending.json')
+            pending = _read(campaign / 'pending.json', state.get('pending'))
             if pending and pending['attempt_id'] not in rows:
                 relative = 'tasks/' + pending['task']['task_id'] + '-' + sha(canonical(pending['task']))[:12]
                 jobs = campaign / relative / 'jobs'
@@ -259,10 +271,12 @@ class FeedbackStore:
         result = row['result']
         directory = campaign / row.get('execution_directory', '')
         runtime = {}
+        incarnation = None
         job_id = result.get('job_id')
         if job_id and (directory / 'jobs' / job_id / 'events.jsonl').is_file():
             try:
                 events = JobStore(directory / 'jobs').events(job_id)
+                incarnation = events[0]['sha256'] if events else None
                 runtime = next((e['payload']['runtime'] for e in events if e['kind'] == 'phase2-task'), {})
             except (ValueError, OSError, KeyError) as error:
                 report['warnings'].append(f'{directory}: runtime evidence unreadable: {error}')
@@ -287,5 +301,5 @@ class FeedbackStore:
         return dict(source_root=str(campaign), attempt_id=row['attempt_id'],
             kind=row.get('kind', 'target'), target=target,
             language=metadata.get('language', runtime.get('language', 'unknown')),
-            runtime=runtime, task=row['task'], verified=result.get('verified') is True,
+            runtime=runtime, job_incarnation=incarnation, task=row['task'], verified=result.get('verified') is True,
             result=result, evidence=evidence, interpretation='Observation, not verified reusable knowledge')

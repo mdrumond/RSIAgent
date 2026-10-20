@@ -22,10 +22,15 @@ deduplicate retained optimizer job/attempt identities. Restored campaigns retain
 their existing feedback IDs and investigation state, including older path-keyed
 records. Historical records without a retained job ID fall back to source-root
 identity and explicitly report that relocation deduplication is unavailable.
+The immutable initial job-event hash distinguishes deleted/recreated campaigns
+that reuse deterministic job IDs. Older feedback without this incarnation marker
+keeps its existing identity with an explicit ambiguity warning.
 Unsupported legacy layouts and missing
 evidence are reported. Interrupted jobs are explicitly incomplete observations;
 they do not increment completed attempts. Full profiler trees stay remote; only
 existing compact result objects and artifact/hash references enter feedback.
+Initial reference qualification failures are importable from `qualification.json`
+even when no campaign state or semantic attempt has been committed yet.
 Target identity comes from campaign metadata or explicit `ascend-a3`/`ascend-a5`
 seed identities, never from a transport host label. Missing identity stays unknown.
 

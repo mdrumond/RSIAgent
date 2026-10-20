@@ -125,6 +125,31 @@ def test_prepare_stop_imports_feedback_before_propagating(tmp_path):
     assert records[0]['outcome']['job_status']['status'] == 'stopped'
 
 
+def test_initial_qualification_stop_is_retained_and_historically_importable(tmp_path):
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.control import WorkerStopped
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'campaign'
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.jobs = JobStore(directory / 'jobs')
+            self.job = self.jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='qualification')
+        def prepare(self):
+            self.jobs.transition(self.job['job_id'], 'stopped')
+            raise WorkerStopped('initial qualification stopped')
+    coordinator = OptimizerPhase2Coordinator(root, 'objective', seed(), lambda _: '', Executor,
+        selector=lambda **kwargs: proposal())
+    with pytest.raises(WorkerStopped, match='initial qualification'):
+        coordinator.run_attempt()
+    assert not (root / 'state.json').exists()
+    record = FeedbackStore(root / 'feedback').records()[0]
+    assert record['outcome']['kind'] == 'qualification'
+    assert record['outcome']['completed'] is False
+    historical = FeedbackStore(tmp_path / 'historical-feedback')
+    assert historical.import_campaign(root)['imported'] == 1
+    assert historical.records()[0]['outcome'] == record['outcome']
+
+
 def test_resume_after_state_commit_before_pending_cleanup(tmp_path):
     build, calls, _, _ = setup(tmp_path)
     assert build().run_attempt()["status"] == "RUNNING"

@@ -374,6 +374,21 @@ def test_stable_reimport_does_not_scan_feedback_records(tmp_path, monkeypatch):
     assert store.import_campaign(root)['existing'] == 1
 
 
+def test_recreated_campaign_same_path_job_id_is_distinct_incarnation(tmp_path):
+    import shutil
+    root = tmp_path / 'campaign'
+    store = FeedbackStore(tmp_path / 'external-feedback')
+    first = campaign(root, result={'verified': False})
+    store.import_campaign(root)
+    shutil.rmtree(root)
+    second = campaign(root, result={'verified': True})
+    assert first['result']['job_id'] == second['result']['job_id']
+    assert store.import_campaign(root)['imported'] == 1
+    records = store.records()
+    assert len(records) == 2
+    assert len({row['outcome']['job_incarnation'] for row in records}) == 2
+
+
 @pytest.mark.parametrize('mismatch', ['stale-flag', 'missing-native-case'])
 def test_retry_resolution_authenticates_retained_native_verdict(tmp_path, mismatch):
     from optimizer.jobs import JobStore

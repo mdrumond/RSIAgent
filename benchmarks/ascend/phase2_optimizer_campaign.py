@@ -62,10 +62,15 @@ class OptimizerPhase2Coordinator:
                 self._write("goal-selection.json", dict(stage="failed", diagnostic=str(error)))
                 raise
             self._write("goal-selection.json", dict(stage="qualification", candidate=task))
+            self._write('qualification.json', dict(phase='optimizer-phase2', attempts=[], pending=dict(
+                attempt_id='qualification-' + sha(canonical(task))[:12], kind='qualification', task=task)))
             try:
                 # Torch reference is the oracle. No native teacher is constructed.
                 self.factory(self.root / self._directory(task), task, self.seed).prepare()
-            except (ValueError, TypeError, KeyError) as error:
+            except Exception as error:
+                self.feedback.import_campaign(self.root)
+                if not isinstance(error, (ValueError, TypeError, KeyError)):
+                    raise
                 from .phase2_optimizer_tasks import reject_optimizer_task
                 reject_optimizer_task(directory, str(error))
                 continue
