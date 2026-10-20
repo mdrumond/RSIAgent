@@ -17,6 +17,25 @@ def _read(path, default=None):
     return json.loads(path.read_bytes()) if path.is_file() else default
 
 
+def _baseline_identity(outcome):
+    """Read only retained, authenticated suite and comparison-policy evidence."""
+    try:
+        ref = outcome['evidence']['baseline']
+        path = Path(ref['job_root']) / ref['job_id'] / 'artifacts' / ref['sha256']
+        data = path.read_bytes()
+        if sha(data) != ref['sha256']:
+            return None
+        value = json.loads(data)
+        manifest = value.get('manifest', value)
+        suite = value.get('suite_sha256', manifest.get('suite_sha256'))
+        policy = manifest.get('policy')
+        if isinstance(suite, str) and len(suite) == 64 and isinstance(policy, dict) and policy:
+            return suite, policy
+    except (KeyError, OSError, ValueError, TypeError):
+        pass
+    return None
+
+
 def _category(task, result):
     if result.get('verified') is True:
         speedup = result.get('speedup')
@@ -98,11 +117,15 @@ class FeedbackStore:
                 if (record['outcome']['target'] not in {'a3', 'a5'}
                         or record['outcome']['language'] not in {'ascend-c', 'catlass-dsl'}):
                     raise ValueError('resolution requires known target and language identity')
+                baseline = _baseline_identity(record['outcome'])
+                if baseline is None:
+                    raise ValueError('resolution requires authenticated frozen suite and comparison policy')
                 retries = [_read(self.root / (key + '.json'), {}) for key in value['retries']]
                 if not any(r.get('outcome', {}).get('verified') is True
                            and r['outcome']['task'] == record['outcome']['task']
                            and r['outcome']['target'] == record['outcome']['target']
                            and r['outcome']['language'] == record['outcome']['language']
+                           and _baseline_identity(r['outcome']) == baseline
                            and (record['outcome']['category'] != 'verified-slow'
                                 or _category(record['outcome']['task'], r['outcome']['result']) == 'verified-success')
                            for r in retries):
