@@ -17,6 +17,20 @@ def _read(path, default=None):
     return json.loads(path.read_bytes()) if path.is_file() else default
 
 
+def _observation_identity(outcome):
+    identity = {key: outcome[key] for key in ('attempt_id', 'completed')}
+    job_id = outcome['result'].get('job_id')
+    identity['job_id' if job_id else 'source_root'] = job_id or outcome['source_root']
+    return identity
+
+
+def _logical_outcome(outcome):
+    # Moving retained files changes locations, not the historical observation.
+    return {**{key: value for key, value in outcome.items() if key not in {'source_root', 'evidence'}},
+            'evidence': {role: {key: value for key, value in ref.items() if key != 'job_root'}
+                         for role, ref in outcome['evidence'].items()}}
+
+
 def _baseline_identity(outcome):
     """Read only retained, authenticated suite and comparison-policy evidence."""
     try:
@@ -34,6 +48,19 @@ def _baseline_identity(outcome):
     except (KeyError, OSError, ValueError, TypeError):
         pass
     return None
+
+
+def _verified_retry(outcome):
+    from .optimizer_phase2_artifacts import verify_attempt_result
+    try:
+        ref = outcome['evidence']['result_artifact']
+        if not Path(ref['job_root']).is_dir():
+            return False
+        verify_attempt_result(JobStore(ref['job_root']), outcome['result'],
+                              attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'])
+        return outcome['result'].get('verified') is True
+    except (KeyError, OSError, ValueError, TypeError):
+        return False
 
 
 def _category(task, result):
@@ -128,8 +155,10 @@ class FeedbackStore:
                 baseline = _baseline_identity(record['outcome'])
                 if baseline is None:
                     raise ValueError('resolution requires authenticated frozen suite and comparison policy')
-                retries = [_read(self.root / (key + '.json'), {}) for key in value['retries']]
+                known = {row['feedback_id']: row for row in self.records()}
+                retries = [known.get(key, {}) for key in value['retries']]
                 if not any(r.get('outcome', {}).get('verified') is True
+                           and _verified_retry(r['outcome'])
                            and r['outcome']['task'] == record['outcome']['task']
                            and r['outcome']['target'] == record['outcome']['target']
                            and r['outcome']['language'] == record['outcome']['language']
@@ -143,12 +172,21 @@ class FeedbackStore:
             return record
 
     def _put(self, outcome, warnings):
-        identity = {k: outcome[k] for k in ('source_root', 'attempt_id', 'completed')}
+        identity = _observation_identity(outcome)
+        if not outcome['result'].get('job_id'):
+            warnings.append(f'{outcome["source_root"]}:{outcome["attempt_id"]}: '
+                            'no retained job identity; relocation deduplication unavailable')
         key = sha(canonical(identity))
         path = self.root / (key + '.json')
         with exclusive(self.root / '.lock', wait=True):
+            # Keep IDs and investigation work from older path-keyed feedback files.
+            if not path.exists():
+                existing = next((row for row in self.records()
+                                 if _observation_identity(row['outcome']) == identity), None)
+                if existing is not None:
+                    path = self.root / (existing['feedback_id'] + '.json')
             if path.exists():
-                if _read(path)['outcome'] != outcome:
+                if _logical_outcome(_read(path)['outcome']) != _logical_outcome(outcome):
                     warnings.append(f'{outcome["source_root"]}:{outcome["attempt_id"]}: '
                                     'source outcome changed; immutable imported observation preserved')
                 return False
@@ -198,9 +236,19 @@ class FeedbackStore:
                 # A pending selection is not evidence of an interrupted execution.
                 for manifest in manifests:
                     try:
-                        job = JobStore(jobs).get(manifest.parent.name)
+                        store = JobStore(jobs)
+                        job = store.get(manifest.parent.name)
+                        completed = next((event['payload'] for event in reversed(store.events(job['job_id']))
+                            if event['kind'] == 'phase2-attempt-result'
+                            and event['payload'].get('attempt_id') == pending['attempt_id']), None)
                     except (ValueError, OSError) as error:
                         report['warnings'].append(f'{manifest}: retained job unreadable: {error}')
+                        continue
+                    if completed is not None:
+                        row = {**pending, 'execution_directory': relative, 'result': completed}
+                        outcome = self._outcome(campaign, row, metadata, report)
+                        outcome.update(completed=True, category=_category(pending['task'], completed))
+                        report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
                         continue
                     if job.get('status') not in {'failed', 'stopped', 'budget-exhausted'}:
                         continue

@@ -18,7 +18,11 @@ python run_ascend_campaign.py feedback-phase2 --feedback-root /data/feedback \
 ```
 
 Imports scan retained optimizer states, including nested goal directories, and
-deduplicate source-root/attempt identities. Unsupported legacy layouts and missing
+deduplicate retained optimizer job/attempt identities. Restored campaigns retain
+their existing feedback IDs and investigation state, including older path-keyed
+records. Historical records without a retained job ID fall back to source-root
+identity and explicitly report that relocation deduplication is unavailable.
+Unsupported legacy layouts and missing
 evidence are reported. Interrupted jobs are explicitly incomplete observations;
 they do not increment completed attempts. Full profiler trees stay remote; only
 existing compact result objects and artifact/hash references enter feedback.
@@ -47,6 +51,11 @@ target or language identity cannot establish retry-based resolution.
 Resolution also authenticates both retained baseline artifacts and requires the
 same frozen expanded-suite hash and comparison policy. Missing or corrupt baseline
 evidence leaves the observation unresolved; it does not discard the observation.
+Retry IDs must refer to observations already retained in the same feedback store.
+Retry-based resolution also uses the existing native-attempt evidence checks:
+durable result event, matching result artifact, candidate digest, verified native
+verdict and complete frozen-case coverage. A stale imported verified flag alone
+cannot resolve a failure.
 
 This command does not start investigations or restart either phase. Curriculum
 integration and explicit bounded retry controls are separate follow-up changes.

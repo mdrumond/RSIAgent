@@ -19,12 +19,23 @@ def campaign(root, *, result=None, task=None, attempt='attempt-001', baseline=Tr
     if baseline and not row['result'].get('job_id'):
         from optimizer.jobs import JobStore
         jobs = JobStore(root / 'execution' / 'jobs')
-        job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key='fixture')
+        job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key=str(root))
         value = baseline if isinstance(baseline, dict) else dict(suite_sha256='1' * 64,
             manifest=dict(policy=dict(name='host-policy', rtol=.01)))
+        value.setdefault('cases', [dict(case='case-0')])
         ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(value))
         row.update(execution_directory='execution')
         row['result'].update(job_id=job['job_id'], baseline=ref)
+        if row['result'].get('verified'):
+            source = 'actual candidate source'
+            candidate = jobs.put_artifact(job['job_id'], 'candidate.json', canonical(source))
+            row['result'].update(candidate=candidate, source_sha256=sha(source.encode()),
+                result=dict(status='verified', candidate_sha256=sha(source.encode()),
+                    suite_sha256=value['suite_sha256'], cases=[dict(case='case-0')]))
+        row['result'].update(attempt_id=attempt, task_id=task['task_id'])
+        result_ref = jobs.put_artifact(job['job_id'], 'result.json', canonical(row['result']))
+        row['result']['result_artifact'] = result_ref
+        jobs.add_event(job['job_id'], 'phase2-attempt-result', row['result'])
     write(root / 'state.json', dict(phase='optimizer-phase2', target=task, attempts=[row]))
     write(root / 'seed-memory.json', dict(source_identity=dict(target='a3', language='ascend-c')))
     return row
@@ -129,6 +140,30 @@ def test_pending_import_replays_terminal_event_over_stale_manifest(tmp_path, sta
     assert outcome['completed'] is False
     assert outcome['job_status']['status'] == status
     assert outcome['category'] == ('budget-exhausted' if status == 'budget-exhausted' else 'interrupted')
+
+
+@pytest.mark.parametrize('verified', [False, True])
+def test_completed_attempt_event_precedes_interruption_synthesis(tmp_path, verified):
+    from optimizer.jobs import JobStore
+    source = tmp_path / 'source'
+    row = campaign(source)
+    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
+    relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
+    jobs = JobStore(source / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
+    jobs.transition(job['job_id'], 'running')
+    jobs.transition(job['job_id'], 'budget-exhausted')
+    result = dict(attempt_id=row['attempt_id'], job_id=job['job_id'], verified=verified,
+                  speedup=1.1, source_sha256='actual-candidate')
+    jobs.add_event(job['job_id'], 'phase2-attempt-result', result)
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(source)['imported'] == 1
+    outcome = store.records()[0]['outcome']
+    assert outcome['completed'] is True
+    assert outcome['verified'] is verified
+    assert outcome['category'] == ('verified-success' if verified else 'incorrect')
+    assert store.import_campaign(source)['existing'] == 1
 
 
 def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
@@ -284,5 +319,80 @@ def test_resolution_rejects_missing_original_baseline_but_keeps_observation(tmp_
     store.import_campaign(tmp_path / 'retry')
     records = {r['outcome']['verified']: r for r in store.records()}
     with pytest.raises(ValueError, match='authenticated frozen suite'):
+        store.update_investigation(records[False]['feedback_id'], status='resolved',
+                                   retries=[records[True]['feedback_id']])
+
+
+def test_resolution_requires_retry_record_in_same_store(tmp_path):
+    store = FeedbackStore(tmp_path / 'feedback')
+    campaign(tmp_path / 'failure', result={'verified': False})
+    campaign(tmp_path / 'retry', result={'verified': True})
+    store.import_campaign(tmp_path / 'failure')
+    elsewhere = FeedbackStore(tmp_path / 'another-store')
+    elsewhere.import_campaign(tmp_path / 'retry')
+    failure = store.records()[0]['feedback_id']
+    retry = elsewhere.records()[0]['feedback_id']
+    with pytest.raises(ValueError, match='successful original-task retry'):
+        store.update_investigation(failure, status='resolved', retries=[retry])
+
+
+def test_restored_campaign_preserves_old_feedback_id_and_investigation(tmp_path):
+    import shutil
+    root = tmp_path / 'original'
+    campaign(root, result={'verified': False})
+    store = FeedbackStore(root / 'feedback')
+    store.import_campaign(root)
+    record = store.records()[0]
+    # Simulate a pre-migration ID generated from the absolute source path.
+    old_id = sha(canonical({key: record['outcome'][key]
+                           for key in ('source_root', 'attempt_id', 'completed')}))
+    (store.root / (record['feedback_id'] + '.json')).unlink()
+    record['feedback_id'] = old_id
+    record['investigation'].update(status='deferred', reason='needs isolated probe', retries=['retry-link'])
+    write(store.root / (old_id + '.json'), record)
+    restored = tmp_path / 'restored'
+    shutil.copytree(root, restored)
+    imported = FeedbackStore(restored / 'feedback')
+    report = imported.import_campaign(restored)
+    assert report['imported'] == 0
+    assert report['existing'] == 1
+    assert report['warnings'] == []
+    assert imported.records() == [record]
+    # An independent execution of the same authored task is not a duplicate.
+    campaign(tmp_path / 'independent', result={'verified': False})
+    assert imported.import_campaign(tmp_path / 'independent')['imported'] == 1
+
+
+def test_stable_reimport_does_not_scan_feedback_records(tmp_path, monkeypatch):
+    root = tmp_path / 'campaign'
+    campaign(root, result={'verified': False})
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(root)['imported'] == 1
+    def unexpected_scan():
+        raise AssertionError('stable existing identity must use direct lookup')
+    monkeypatch.setattr(store, 'records', unexpected_scan)
+    assert store.import_campaign(root)['existing'] == 1
+
+
+@pytest.mark.parametrize('mismatch', ['stale-flag', 'missing-native-case'])
+def test_retry_resolution_authenticates_retained_native_verdict(tmp_path, mismatch):
+    from optimizer.jobs import JobStore
+    campaign(tmp_path / 'failure', result={'verified': False})
+    root = tmp_path / 'retry'
+    row = campaign(root, result={'verified': mismatch != 'stale-flag'})
+    result = row['result']
+    result['verified'] = True
+    if mismatch == 'missing-native-case':
+        result['result']['cases'] = []
+        jobs = JobStore(root / 'execution' / 'jobs')
+        body = {key: value for key, value in result.items() if key != 'result_artifact'}
+        result['result_artifact'] = jobs.put_artifact(result['job_id'], 'result.json', canonical(body))
+        jobs.add_event(result['job_id'], 'phase2-attempt-result', result)
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(tmp_path / 'failure')
+    store.import_campaign(root)
+    records = {r['outcome']['verified']: r for r in store.records()}
+    with pytest.raises(ValueError, match='successful original-task retry'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
                                    retries=[records[True]['feedback_id']])

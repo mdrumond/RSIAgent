@@ -193,8 +193,8 @@ class OptimizerPhase2Coordinator:
             task, key = pending["task"], pending["attempt_id"]
             relative = self._directory(task)
             executor = self.factory(self.root / relative, task, self.seed)
-            executor.prepare()
             try:
+                executor.prepare()
                 result = executor.attempt(key, memory_snapshot=self._memory(state),
                                           feedback=state["attempts"][-2:])
             except Exception:

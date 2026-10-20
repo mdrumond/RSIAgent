@@ -98,6 +98,33 @@ def test_infrastructure_keeps_pending_without_semantic_charge(tmp_path):
     assert calls[0][0] == json.loads(pending)["attempt_id"]
 
 
+def test_prepare_stop_imports_feedback_before_propagating(tmp_path):
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.control import WorkerStopped
+    from optimizer.jobs import JobStore
+    prepared = []
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.store = JobStore(directory / 'jobs')
+            self.job = self.store.create('def f(x): return x', 'f', {}, {}, idempotency_key='prepare')
+        def prepare(self):
+            prepared.append(True)
+            if len(prepared) > 1:
+                self.store.transition(self.job['job_id'], 'stopped')
+                raise WorkerStopped('reference preparation stopped')
+            return {}
+        def attempt(self, *args, **kwargs):
+            raise AssertionError('stopped preparation must not attempt')
+    coordinator = OptimizerPhase2Coordinator(tmp_path, 'objective', seed(), lambda _: '', Executor,
+        selector=lambda **kwargs: proposal())
+    with pytest.raises(WorkerStopped, match='reference preparation'):
+        coordinator.run_attempt()
+    records = FeedbackStore(tmp_path / 'feedback').records()
+    assert len(records) == 1
+    assert records[0]['outcome']['completed'] is False
+    assert records[0]['outcome']['job_status']['status'] == 'stopped'
+
+
 def test_resume_after_state_commit_before_pending_cleanup(tmp_path):
     build, calls, _, _ = setup(tmp_path)
     assert build().run_attempt()["status"] == "RUNNING"
