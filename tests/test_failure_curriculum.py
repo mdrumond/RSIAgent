@@ -537,3 +537,61 @@ def test_concurrent_successful_and_failed_retries_preserve_union_and_resolution(
     assert actual['investigation']['status'] == 'resolved'
     expected = {r['feedback_id'] for r in stale if r['feedback_id'] != original['feedback_id']}
     assert set(actual['investigation']['retries']) == expected
+
+
+def test_all_infrastructure_feedback_beyond_first_page_can_defer_without_projects(tmp_path):
+    store = FeedbackStore(tmp_path/'feedback')
+    for index in range(10):
+        root = tmp_path/f'failed-{index}'
+        classification = 'provider' if index % 2 else 'infrastructure'
+        campaign(root, result=dict(verified=False, classification=classification,
+                                  summary=classification+' transport unavailable'))
+        store.import_campaign(root)
+    selection = select_feedback(store.root, 'a3')
+    root = tmp_path/'phase1'
+    root.mkdir()
+    feedback = FailureCurriculum(root, store.root, selection)
+    calls, manifest = [], []
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            payload = json.loads(messages[-1]['content'].rsplit('\n', 1)[-1])
+            manifest.extend(next(row['selected'] for row in payload['phase2_feedback']
+                                 if row['role'] == 'selection-index'))
+            assert len(manifest) == 10
+        else:
+            assert 'every selected failure' in messages[-1]['content']
+        # A first incomplete response receives ordinary correction; all hidden
+        # IDs are already visible, so no kernel wave is needed to turn the page.
+        selected = manifest[:8] if len(calls) == 1 else manifest
+        return 'DECISION: STALLED\n' + json.dumps(dict(reason='transport needs recovery',
+            failure_investigations=[dict(feedback_id=row['feedback_id'], status='deferred',
+                classification=row['classification'], reason=row['reason']) for row in selected]))
+    agent = CurriculumAgent(complete)
+    agent.failure_feedback = feedback
+    runner = AdaptivePhase1Coordinator(root, 'investigate', b'{}', agent,
+        lambda _: pytest.fail('transport deferral must not invent a kernel experiment'),
+        max_parallel=2, project_target=4)
+    runner.failure_feedback = feedback
+    assert runner.resume()['status'] == 'STALLED' and len(calls) == 2
+    assert all(row['investigation']['status'] == 'deferred' for row in store.records())
+
+
+def test_hidden_mixed_failure_task_is_hash_readable_without_advancing_wave(tmp_path):
+    store = FeedbackStore(tmp_path/'feedback')
+    for index in range(10):
+        root = tmp_path/f'failed-{index}'
+        campaign(root, task=dict(task_id=f'failure-{index}', rationale='isolate',
+            submission={'source': f'reference-{index}'}), result=dict(verified=False,
+            classification='infrastructure' if index < 9 else 'compile-error'))
+        store.import_campaign(root)
+    selection = select_feedback(store.root, 'a3')
+    feedback = FailureCurriculum(tmp_path, store.root, selection)
+    context = feedback.context({'wave_index':1})
+    visible = {row['feedback_id'] for row in context if row['role'] == 'selected'}
+    manifest = context[-1]['selected']
+    hidden = next(row for row in manifest if row['feedback_id'] not in visible)
+    task = json.loads(feedback.read(hidden['task_sha256'])['text'])
+    original = next(row for row in selection['selected'] if row['feedback_id'] == hidden['feedback_id'])
+    assert task == original['outcome']['task']
+    assert len(manifest) == 10 and len(visible) == 8

@@ -17,6 +17,9 @@ exhaustion never proves impossibility. Explain evidence-based deferrals; do not
 invent projects to repair infrastructure. Read retained source/host diagnostics
 with {"read_artifact":{"sha256":"exact hash","offset":0,"limit":8192}};
 at most six reads per selection. Raw profiling stays remote; use compact digests.
+The selection-index lists EVERY selected failure, including observations outside
+the current detailed page. Use its classifications/summaries to defer infrastructure
+or provider failures without inventing kernel work; its hashes are also readable.
 Propose small experiments isolating one hypothesis, a working control, and an
 explicit observable result. Sibling projects share pre-wave memory; they do NOT
 depend on each other. Existing verified projects may serve as controls.
@@ -92,7 +95,17 @@ class FailureCurriculum:
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
         chosen = [r for r in rows if r['role'] == 'selected'][start:start+8] + [r for r in rows if r['role'] == 'controls'][:2]
-        return tuple(_preview(row) for row in chosen)
+        manifest = []
+        latest = {row['feedback_id']: row for row in self.lineage}
+        for row in self.selection['selected']:
+            out = row['outcome']
+            investigation = latest.get(row['feedback_id'], row['investigation'])
+            manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
+                status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
+                reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
+                task_sha256=sha(canonical(out['task'])),
+                evidence={role: ref['sha256'] for role, ref in out['evidence'].items()}))
+        return (*(_preview(row) for row in chosen), {'role': 'selection-index', 'selected': manifest})
 
     def read(self, sha256, offset=0, limit=8192):
         digest = sha256
