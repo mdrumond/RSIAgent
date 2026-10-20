@@ -92,13 +92,15 @@ def test_agent_applies_target_policy_and_repairs_invalid_dtype():
     assert "dtype unavailable" in calls[1][-1]["content"]
 
 
-def test_legacy_agent_does_not_admit_native_capability():
+def test_legacy_agent_derives_simt_labels_for_new_proposals():
     response = "DECISION: WAVE\n" + json.dumps({
         "wave_id": "wave-001", "pre_wave_memory_sha256": "a" * 64,
         "pre_wave_coverage": [],
         "projects": [{"spec": spec_mapping(), "requires": []}],
     })
-    with pytest.raises(ValueError, match="explicit target policy"):
-        CurriculumAgent(lambda messages: response).select(
-            CurriculumContext("Learn kernels", 1, "a" * 64, (), ()),
-        )
+    decision, _ = CurriculumAgent(lambda messages: response).select(
+        CurriculumContext("Learn kernels", 1, "a" * 64, (), ()),
+    )
+    labels = {item.value for item in decision.wave.projects[0].spec.capabilities}
+    assert "simt-reduction" in labels
+    assert "vector-reduction" not in labels

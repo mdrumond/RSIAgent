@@ -24,7 +24,7 @@ from benchmarks.a5kernels.phase1_curriculum import (
     ProjectSpec,
     WaveSpec,
 )
-from benchmarks.a5kernels.phase1_project import ProjectOp
+from benchmarks.a5kernels.phase1_project import ProjectGraph, ProjectOp
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -338,9 +338,9 @@ def _grammar() -> dict[str, object]:
         "block_count_bounds": [1, 32],
         "shape": "1-3 dimensions, each integer in [1, 4096]; graph inputs must match shape except matmul shape [m,k,n] with inputs [m,k] and [k,n]; each graph tensor may contain at most 65536 elements",
         "timing_lengths": "0-8 unique ascending integers in [1, 4096]; timing-sweep requires at least two lengths and one-dimensional inputs",
-        "composition": "capabilities must agree with graph operations; failure-repair requires a non-none failure_mode; profiling requires profile_metric; padded-tail requires non-aligned output extent and physical tensors no larger than 65536 elements",
+        "composition": "operation capabilities are derived automatically from graph operations; failure-repair requires a non-none failure_mode; profiling requires profile_metric; padded-tail requires non-aligned output extent and physical tensors no larger than 65536 elements",
         "capability_operation_rules": {
-            "rule": "Each listed capability must be present if and only if the graph contains at least one of its listed operations; inspect every node, not just the output. These are RSI metadata rules, not Catlass API restrictions.",
+            "rule": "Operation capability labels are derived automatically, present if and only if the graph contains at least one of their listed operations; supplied operation labels are replaced. Other capability labels remain authored. Inspect every node, not just the output. These are RSI metadata rules, not Catlass API restrictions.",
             "simd-vector": ["add", "multiply", "relu"],
             "simt-reduction": ["reduce-sum"],
             "simt-mask": ["mask-positive"],
@@ -350,6 +350,16 @@ def _grammar() -> dict[str, object]:
         "graph": {
             "fields_exactly": ["inputs", "nodes", "output"],
             "input_fields_exactly": ["name", "shape"],
+            "types": {
+                "inputs": "array of objects with name string and shape integer array",
+                "nodes": "array of objects with name string, op string, operands string array, axis integer or null",
+                "output": "string naming a computed node; never an object or array",
+            },
+            "example": {
+                "inputs": [{"name": "x", "shape": [16]}],
+                "nodes": [{"name": "y", "op": "copy", "operands": ["x"], "axis": None}],
+                "output": "y",
+            },
             "node_fields_exactly": ["name", "op", "operands", "axis"],
             "operations": [item.value for item in ProjectOp],
             "axis": "null for every non-reduction operation; reduce-sum requires an integer zero-based axis within operand rank",
@@ -507,6 +517,54 @@ class CurriculumAgent:
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise AssertionError("unreachable selection attempt")
 
+    def _normalize_generated_wave(self, value: Mapping[str, object]) -> dict[str, object]:
+        """Derive redundant operation labels only at new-proposal admission.
+
+        Retained WaveSpec/ProjectSpec parsing stays strict. Work on fresh mappings
+        so the provider transcript and caller-owned proposals remain untouched.
+        """
+        projects = value.get("projects")
+        if not isinstance(projects, list):
+            return dict(value)  # Let the wire-schema validator diagnose it.
+        operation_labels = {
+            Capability.SIMD_VECTOR, Capability.SIMT_REDUCTION, Capability.SIMT_MASK,
+            Capability.VECTOR_REDUCTION, Capability.VECTOR_MASK, Capability.CUBE_TILING,
+        }
+        rules = {
+            Capability.SIMD_VECTOR: {ProjectOp.ADD, ProjectOp.MULTIPLY, ProjectOp.RELU},
+            Capability.SIMT_REDUCTION: {ProjectOp.REDUCE_SUM},
+            Capability.SIMT_MASK: {ProjectOp.MASK_POSITIVE},
+            Capability.CUBE_TILING: {ProjectOp.MATMUL},
+        }
+        if self.target_policy is not None:
+            rules = {
+                Capability(label): {ProjectOp(op) for op in operations}
+                for label, operations in self.target_policy.operation_capabilities().items()
+            }
+        normalized = []
+        for project in projects:
+            if not isinstance(project, Mapping) or not isinstance(project.get("spec"), Mapping):
+                normalized.append(project)
+                continue
+            spec = project["spec"]
+            labels = spec.get("capabilities")
+            if not isinstance(labels, list):
+                normalized.append(project)
+                continue
+            try:
+                capabilities = [Capability(label) for label in labels]
+            except (ValueError, TypeError) as exc:
+                raise ValueError("unregistered capability") from exc
+            if len(set(capabilities)) != len(capabilities):
+                raise ValueError("capabilities must be unique")
+            graph = ProjectGraph.from_mapping(spec.get("graph"))
+            operations = {node.op for node in graph.nodes}
+            derived = [label for label, supported in rules.items() if operations & supported]
+            normalized.append({**project, "spec": {**spec, "capabilities": [
+                label.value for label in capabilities if label not in operation_labels
+            ] + [label.value for label in derived]}})
+        return {**value, "projects": normalized}
+
     def _parse_and_validate(
         self, text: str, context: CurriculumContext,
     ) -> CurriculumDecision:
@@ -533,7 +591,7 @@ class CurriculumAgent:
             if status == "STALLED" and not context.prior_outcomes:
                 raise ValueError("stall requires an observed prior attempt")
             return terminal
-        wave = WaveSpec.from_mapping(value)
+        wave = WaveSpec.from_mapping(self._normalize_generated_wave(value))
         for project in wave.projects:
             if self.target_policy is not None:
                 self.target_policy.admit(project.spec)
