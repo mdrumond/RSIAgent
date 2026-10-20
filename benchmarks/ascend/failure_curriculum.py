@@ -76,7 +76,6 @@ class FailureCurriculum:
 
     def context(self, state):
         self.state = state
-        self.sync(state)
         rows = []
         for role in ('selected', 'controls'):
             for row in self.selection[role]:
@@ -147,7 +146,9 @@ class FailureCurriculum:
             raise ValueError('terminal feedback curriculum must recommend retry or explain deferral for every selected failure')
         return tuple(rows)
 
-    def record(self, rows):
+    def record(self, rows, state=None):
+        if state is not None:
+            self.state = state
         for row in rows:
             if row not in self.lineage:
                 self.lineage.append(row)
@@ -216,7 +217,7 @@ def retry_spec(selection, target):
     return dict(feedback_id=row['feedback_id'], task=out['task'],
         suite_sha256=frozen['suite_sha256'], policy=manifest['policy'],
         frozen_submission=manifest.get('submission'),
-        max_cases=out['runtime'].get('max_cases', 24))
+        max_cases=out['runtime'].get('max_cases') or 24)
 
 
 def link_retry(job):
