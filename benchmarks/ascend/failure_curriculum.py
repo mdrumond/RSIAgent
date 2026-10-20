@@ -143,17 +143,21 @@ class FailureCurriculum:
                 raise ValueError('retry recommendation requires committed host probe/control evidence')
         if projects - covered:
             raise ValueError('feedback wave contains projects without investigation lineage')
-        if wave is None and (self.ids - {row['feedback_id'] for row in [*self.lineage, *rows]
-                if row['status'] in {'ready-to-retry', 'deferred'}}):
+        latest = {row['feedback_id']: row for row in [*self.lineage, *rows]}
+        if wave is None and any(latest.get(key, {}).get('status') not in
+                {'ready-to-retry', 'deferred'} for key in self.ids):
             raise ValueError('terminal feedback curriculum must recommend retry or explain deferral for every selected failure')
         return tuple(rows)
 
     def record(self, rows, state=None):
         if state is not None:
             self.state = state
-        for row in rows:
-            if row not in self.lineage:
-                self.lineage.append(row)
+        if rows and self.lineage[-len(rows):] != list(rows):
+            for row in rows:
+                latest = next((old for old in reversed(self.lineage)
+                               if old['feedback_id'] == row['feedback_id']), None)
+                if row != latest:
+                    self.lineage.append(row)
         atomic(self.path, canonical(self.lineage))
         if hasattr(self, 'state'):
             self.sync(self.state)

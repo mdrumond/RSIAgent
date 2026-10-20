@@ -493,6 +493,8 @@ class AdaptivePhase1Coordinator:
             "memory_bytes_base64": memories,
             "session": pending["session"],
             "completed_waves": [*state["completed_waves"], wave.wave_id],
+            **({'failure_investigations': pending['failure_investigations']}
+               if pending.get('failure_investigations') else {}),
             **({"failed_outcomes": failures} if failures else {}),
         }
 

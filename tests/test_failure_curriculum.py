@@ -436,3 +436,39 @@ def test_cli_approval_recovers_feedback_after_committed_state(tmp_path, terminal
     assert bool(original['investigation']['evidence']) is not terminal
     assert len(selections) == 1 and len(executions) == (0 if terminal else 2)
     assert cli.run_approved_curriculum(job, proposed['proposal_id'], builder=builder) == recovered
+
+
+@pytest.mark.parametrize('duplicate_response', [False, True])
+def test_terminal_requires_latest_status_for_each_failure(tmp_path, duplicate_response):
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    store, selection, feedback = setup(tmp_path)
+    context = CurriculumContext('investigate', 1, 'a'*64, (), ())
+    wave = WaveSpec.from_mapping(dict(wave_id='wave-001', pre_wave_memory_sha256='a'*64,
+        pre_wave_coverage=[], projects=[dict(spec=_project('probe', 'padded-tail'), requires=[]),
+            dict(spec=_project('control', 'gm-ub-movement'), requires=[])]))
+    deferred = investigation(selection)
+    deferred.update(status='deferred', reason='temporarily unavailable')
+    investigating = investigation(selection)
+    # A later investigation supersedes a historical deferral, including when a
+    # response repeats the same ID. The terminal check must agree with sync().
+    feedback.context({})
+    if duplicate_response:
+        rows = feedback.admit([deferred, investigating], wave, context)
+        feedback.record(rows)
+        count = len(feedback.lineage)
+        feedback.record(rows)
+        assert len(feedback.lineage) == count
+    else:
+        feedback.record(feedback.admit([deferred], None, context))
+        feedback.record(feedback.admit([investigating], wave, context))
+    with pytest.raises(ValueError, match='terminal feedback curriculum'):
+        feedback.admit([], None, context)
+    # An explicit new deferral identical to an older one must supersede the
+    # investigation, but replaying that committed decision remains idempotent.
+    rows = feedback.admit([deferred], None, context)
+    feedback.record(rows)
+    count = len(feedback.lineage)
+    feedback.record(rows)
+    assert len(feedback.lineage) == count
+    original = next(r for r in store.records() if r['feedback_id'] in feedback.ids)
+    assert original['investigation']['status'] == 'deferred'
