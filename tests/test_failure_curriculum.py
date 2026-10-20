@@ -88,7 +88,10 @@ def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
             assert selected == task
             from optimizer.jobs import JobStore
             self.jobs = JobStore(directory/'jobs')
-            self.job = self.jobs.create('def forward(x): return x', 'forward', {}, {})
+            spec = selected['submission']
+            self.job = self.jobs.create(spec['source'], spec['entrypoint'],
+                {'signatures': spec['signatures']}, memory,
+                init_args=spec.get('init_args'), init_kwargs=spec.get('init_kwargs'))
             self.baseline = self.jobs.put_artifact(self.job['job_id'], 'baseline.json', canonical(original_baseline))
         def prepare(self):
             return {'suite_sha256': 'fixture-original-suite'}
