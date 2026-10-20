@@ -14,7 +14,14 @@ async function control(action, subject, body) {
 }
 document.querySelectorAll('button[data-action]').forEach(button => button.addEventListener('click', () => {
   const action = button.dataset.action, subject = button.dataset.subject;
-  control(action, subject, action === 'start' ? {preset_id: button.dataset.presetId} : {campaign_id: button.dataset.campaignId});
+  control(action, subject, action === 'start' ? {preset_id: button.dataset.presetId} : action === 'import-feedback' ? {} : {campaign_id: button.dataset.campaignId});
+}));
+document.querySelectorAll('[data-feedback-action]').forEach(button => button.addEventListener('click', event => {
+  event.preventDefault();
+  const form = button.closest('form'), preset = form.elements.preset_id.value;
+  control(button.dataset.feedbackAction, preset, {preset_id: preset,
+    feedback_ids: [...form.querySelectorAll('input[name="feedback_id"]:checked')].map(item => item.value),
+    project_target: Number(form.elements.project_target.value)});
 }));
 document.querySelectorAll('[data-proposal-action]').forEach(button => button.addEventListener('click', event => {
   event.preventDefault();

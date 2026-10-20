@@ -1221,7 +1221,7 @@ def test_start_is_async_allowlisted_and_idempotent(tmp_path):
     argv, kwargs = calls[0]
     assert argv[:3] == [pytest.importorskip("sys").executable, "/repo/run_ascend_campaign.py", "start"]
     assert "--target" in argv and argv[argv.index("--target") + 1] == "a3"
-    assert "--approval-mode" in argv and "--phase1-root" in argv and "--review" in argv
+    assert "--approval-mode" not in argv and "--phase1-root" in argv and "--review" in argv
     assert kwargs["shell"] is False
     conflict = client.post("/api/control/start", json={**body, "confirmation": "wrong"}, headers=headers)
     assert conflict.status_code == 409

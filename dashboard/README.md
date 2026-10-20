@@ -77,6 +77,26 @@ dedicated `Memory` profiler capture.
 
 ## Optional campaign controls
 
+### Failure-directed learning
+
+Set top-level `feedback_root` to the shared Phase 2 feedback directory. The
+**Failure feedback** tab displays immutable original outcomes separately from
+investigation status, classifications, linked projects and retries. A verified
+but slow kernel remains a correctness success with a performance shortfall.
+Evidence previews authenticate the retained digest on the host and return only
+an 8 KiB prefix; they never fetch remote raw profiler trees.
+
+With controls enabled, **Import configured Phase 2 results** runs the historical
+importer against every Phase 2 campaign in this dashboard configuration. Select
+failures, a compatible fresh A3 destination preset, and an explicit project
+budget to start a Phase 1 investigation awaiting curriculum approval. Retry
+requires exactly one original target and a fresh Phase 2 preset with its updated
+reviewed Phase 1 memory. These explicit starts use the existing asynchronous
+operation queue; no campaigns start merely by viewing or importing feedback.
+Resolved results and deferred/infrastructure observations remain visible but
+are not selectable for kernel investigation. Every round/retry needs unused
+preset root/control directories, just like ordinary campaign starts.
+
 Set `controls.enabled` to `true` only for a loopback listener. The CLI enforces
 this boundary and accepts loopback IP literals or the exact `localhost` name;
 use an SSH tunnel for remote access. Each preset is a complete server-side A3

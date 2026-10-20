@@ -50,7 +50,8 @@ def _information(spec):
 class ControlManager:
     """Validate commands, persist their lifecycle and execute one at a time."""
 
-    ACTIONS = {"start", "extend", "sample", "approve", "reject", "run-approved"}
+    ACTIONS = {"start", "extend", "sample", "approve", "reject", "run-approved",
+               "import-feedback", "investigate", "retry-feedback"}
     EXTENSION_WAIT_SECONDS = 300
     EXTENSION_POLL_SECONDS = .25
 
@@ -59,6 +60,8 @@ class ControlManager:
         self.runner = runner
         config = _read(self.config_path, {}) or {}
         self.settings = config.get("controls", {})
+        from .feedback import FeedbackView
+        self.feedback = FeedbackView(config.get("feedback_root"))
         self.enabled = self.settings.get("enabled") is True
         self.campaigns = {str(row.get("id", f"phase{row.get('phase')}")): row
                           for row in config.get("campaigns", [])}
@@ -133,6 +136,8 @@ class ControlManager:
             raise PermissionError("dashboard controls are disabled")
         if action not in self.ACTIONS:
             raise ControlError("command is not allowlisted")
+        if action in {"import-feedback", "investigate", "retry-feedback"}:
+            return self._validate_feedback(action, payload)
         identifier = payload.get("preset_id") if action == "start" else payload.get("campaign_id")
         if not isinstance(identifier, str):
             raise ControlError("campaign identifier is required")
@@ -220,21 +225,69 @@ class ControlManager:
                 raise ControlError("Phase 2 requires exactly one selected project")
         return identifier
 
+    def _validate_feedback(self, action, payload):
+        if self.feedback.root is None:
+            raise ControlError("configure feedback_root first")
+        subject = 'phase2' if action == 'import-feedback' else payload.get('preset_id')
+        if payload.get('confirmation') != f'{action}:{subject}':
+            raise ControlError("confirmation does not match the requested action")
+        if action == 'import-feedback':
+            return 'feedback-import'
+        preset = self.presets.get(subject, {})
+        phase = 1 if action == 'investigate' else 2
+        if preset.get('target') != 'a3' or preset.get('phase') != phase:
+            raise ControlError(f"select an A3 Phase {phase} destination preset")
+        identifiers = payload.get('feedback_ids')
+        if (not isinstance(identifiers, list) or not identifiers
+                or any(not isinstance(key, str) for key in identifiers)
+                or len(set(identifiers)) != len(identifiers)):
+            raise ControlError('select unique failure IDs')
+        if action == 'retry-feedback' and len(identifiers) != 1:
+            raise ControlError('retry requires exactly one original target')
+        for identifier in identifiers:
+            row = self.feedback.get(identifier)
+            if row is None:
+                raise ControlError('unknown failure ID')
+            outcome, state = row['outcome'], row['investigation']
+            if (outcome['target'] != preset['target']
+                    or outcome['language'] != preset.get('language', 'ascend-c')):
+                raise ControlError('failure target/language differs from destination preset')
+            if (state['status'] in {'resolved', 'deferred'}
+                    or outcome['category'] in {'verified-success', 'verified-timing-unknown', 'interrupted'}):
+                raise ControlError('select an unresolved, non-infrastructure failure')
+            if action == 'retry-feedback' and not outcome.get('task'):
+                raise ControlError('retry requires the retained original task')
+        if action == 'investigate':
+            if type(payload.get('project_target')) is not int or payload['project_target'] < 1:
+                raise ControlError('an explicit positive project budget is required')
+        return subject
+
     def _argv(self, action, payload):
         runner = self.settings.get("runner")
         if not isinstance(runner, str) or not runner:
             raise ControlError("control runner is not configured")
-        if action == "start":
+        if action == 'import-feedback':
+            return [sys.executable, runner, 'feedback-phase2', '--feedback-root',
+                    str(self.feedback.root), '--dashboard-config', str(self.config_path)]
+        if action in {"start", "investigate", "retry-feedback"}:
             preset = self.presets[payload["preset_id"]]
             argv = [sys.executable, runner, "start", "--control", str(preset["control"]),
                     "--root", str(preset["root"]), "--target", "a3", "--phase",
                     str(preset["phase"]), "--objective", str(preset["objective"]),
                     "--initial-memory", str(preset["initial_memory"]), "--config",
-                    str(preset["config"]), "--project-target", str(preset["project_target"]),
-                    "--approval-mode"]
+                    str(preset["config"]), "--project-target",
+                    str(payload['project_target'] if action == 'investigate' else
+                        1 if action == 'retry-feedback' else preset["project_target"])]
+            if preset['phase'] == 1:
+                argv += ['--approval-mode']
             if preset["phase"] == 2:
                 argv += ["--phase1-root", str(preset["phase1_root"]),
                          "--review", str(preset["review"])]
+            if action in {'investigate', 'retry-feedback'}:
+                argv += ['--feedback-root', str(self.feedback.root)]
+                flag = '--failure-id' if action == 'investigate' else '--retry-feedback-id'
+                for identifier in payload['feedback_ids']:
+                    argv += [flag, identifier]
             return argv
         campaign = self.campaigns[payload["campaign_id"]]
         if action == "extend":
