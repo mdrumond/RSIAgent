@@ -39,6 +39,11 @@ Changed source outcomes produce a warning instead of overwriting history.
 `read_evidence(digest, offset=0, limit=8192)` authenticates a linked local artifact
 and returns a bounded text page with byte `next_offset` (or null at EOF). It never
 fetches remote reports or embeds entire profiler trees.
+Campaign packages retain the default `feedback/` tree and Phase 1's
+`phase2-feedback.json` and `failure-investigations.json`, including investigation
+state and retry links. Original absolute evidence locations remain provenance;
+packaging does not make missing remote artifacts locally available. Unknown
+target or language identity cannot establish retry-based resolution.
 
 This command does not start investigations or restart either phase. Curriculum
 integration and explicit bounded retry controls are separate follow-up changes.
