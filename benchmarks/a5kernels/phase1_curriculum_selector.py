@@ -553,7 +553,7 @@ class CurriculumAgent:
                 item.verified for item in context.prior_outcomes
             ):
                 raise ValueError("saturation requires host-verified prior evidence")
-            if status == "STALLED" and not context.prior_outcomes:
+            if status == "STALLED" and not context.prior_outcomes and not context.phase2_feedback:
                 raise ValueError("stall requires an observed prior attempt")
             if self.failure_feedback is not None:
                 metadata = self.failure_feedback.admit(investigations, None, context)
