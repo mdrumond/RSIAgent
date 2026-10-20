@@ -153,6 +153,14 @@ def build_controller(job):
                     if key != "schema" and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
+        if job.get('feedback_root') and job['phase'] == 1:
+            from .failure_curriculum import FailureCurriculum
+            data = (Path(job['root']) / 'phase2-feedback.json').read_bytes()
+            if hashlib.sha256(data).hexdigest() != job['feedback_selection_sha256']:
+                raise ValueError('frozen Phase 2 feedback changed')
+            feedback = FailureCurriculum(job['root'], job['feedback_root'], json.loads(data))
+            coordinator.failure_feedback = feedback
+            coordinator.curriculum.failure_feedback = feedback
         if job.get("optimizer_goal"):
             coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
         elif job.get("target_goal") is not None or job.get("autonomous_goal"):
@@ -229,13 +237,20 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
     query = knowledge_query(config, Path(job["root"]) / "curriculum")
     seed = campaign_seed(job["root"], freeze_reviewed_phase1(snapshot),
                          settings.get("optimizer_prior_campaigns", []))
+    retry = job.get('retry_spec')
+    if retry and config.get('max_cases', 24) != retry['max_cases']:
+        raise ValueError('retry max_cases differs from original frozen suite')
+    def executor(directory, task, memory):
+        return OptimizerTaskExecutor(directory, task, memory, config,
+            expected_baseline=retry if retry and task == retry['task'] else None)
     return OptimizerPhase2Coordinator(job["root"], job["objective"], seed,
         composed.curriculum._complete,
-        lambda directory, task, memory: OptimizerTaskExecutor(directory, task, memory, config),
+        executor,
         query_knowledge=(lambda text: {"results": query(text)}) if query else None,
         max_target_attempts=job["target_attempt_budget"],
         max_practice_attempts=job["practice_attempt_budget"],
-        feedback_root=settings.get("phase2_feedback_root"))
+        feedback_root=job.get('feedback_root', settings.get("phase2_feedback_root")),
+        fixed_task=retry['task'] if retry else None)
 
 
 def _approval_path(job):
@@ -674,6 +689,9 @@ def campaign_worker(job, *, builder=build_controller):
                     adoption["project_target"] = job["project_target"]
                     _write(adoption_path, adoption)
             result = coordinator.report() if job.get("approval_mode") else coordinator.resume()
+            if job.get('retry_feedback_id'):
+                from .failure_curriculum import link_retry
+                link_retry(job)
             worker_status = _worker_status(result) if job.get("approval_mode") else "complete"
             _write(control / "worker.json", {"status": worker_status, "finished": time.time(),
                                              "result": result})
@@ -789,6 +807,9 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--phase1-root", type=Path)
             sub.add_argument("--review", type=Path)
             sub.add_argument("--approval-mode", action="store_true")
+            sub.add_argument('--feedback-root', type=Path)
+            sub.add_argument('--failure-id', action='append', default=[])
+            sub.add_argument('--retry-feedback-id')
         if command == "adopt":
             sub.add_argument("--root", type=Path, required=True)
             sub.add_argument("--objective", required=True)
@@ -845,6 +866,14 @@ def main(argv=None, *, screen=start_screen):
             parser.error("new phase 2 starts exactly one goal; use --project-target 1")
         if args.target_attempt_budget < 1 or args.practice_attempt_budget < 1:
             parser.error("target and practice attempt budgets must be positive")
+        if (args.failure_id or args.retry_feedback_id) and not args.feedback_root:
+            parser.error('feedback selection requires --feedback-root')
+        if (args.phase == 1 and args.retry_feedback_id) or (args.phase == 2 and args.failure_id):
+            parser.error('failure IDs are Phase 1; retry-feedback-id is Phase 2')
+        if args.phase == 2 and args.feedback_root and not args.retry_feedback_id:
+            parser.error('Phase 2 feedback requires --retry-feedback-id')
+        if args.retry_feedback_id and args.target_goal:
+            parser.error('feedback retry already pins its original target')
         root = args.root.resolve()
         if root == control or root in control.parents or control in root.parents:
             parser.error("campaign and control directories must be separate")
@@ -870,6 +899,15 @@ def main(argv=None, *, screen=start_screen):
         source_path = Path(settings["source_manifest"])
         source = SourceManifest.load(source_path)
         revision = _harness_revision()
+        selection = retry = None
+        if args.feedback_root:
+            from .failure_curriculum import select_feedback, retry_spec
+            try:
+                selection = select_feedback(args.feedback_root, args.target, args.failure_id,
+                                            retry_id=args.retry_feedback_id)
+                retry = retry_spec(selection, args.target) if args.retry_feedback_id else None
+            except (ValueError, KeyError, OSError) as error:
+                parser.error(str(error))
         control.mkdir(parents=True, exist_ok=False)
         root.mkdir(parents=True, exist_ok=True)
         (root / "initial-memory.bin").write_bytes(args.initial_memory.read_bytes())
@@ -889,6 +927,13 @@ def main(argv=None, *, screen=start_screen):
                 public["optimizer_goal"] = True
         if args.approval_mode:
             public["approval_mode"] = True
+        if selection is not None:
+            _write(root / 'phase2-feedback.json', selection)
+            public.update(feedback_root=str(args.feedback_root.resolve()),
+                failure_ids=[r['feedback_id'] for r in selection['selected']],
+                feedback_selection_sha256=hashlib.sha256((root / 'phase2-feedback.json').read_bytes()).hexdigest())
+            if retry:
+                public.update(retry_feedback_id=args.retry_feedback_id, retry_spec=retry)
         _write(root / "campaign-run.json", public)
         job = {**public, "root": str(root), "control": str(control), "config": str(config),
                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
