@@ -155,6 +155,7 @@ class AdaptivePhase1Coordinator:
         if max_projects is not None and (type(max_projects) is not int or max_projects < 1):
             raise ValueError("max_projects must be a positive integer or None")
         self.max_projects = max_projects
+        self.failure_feedback = None
 
     @staticmethod
     def root_state_target(root):
@@ -166,6 +167,8 @@ class AdaptivePhase1Coordinator:
 
     def _run(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
+        if self.failure_feedback is not None:
+            self.failure_feedback.record(state.get('failure_investigations', []), state)
         pending = self._load_pending(state)
         if pending is not None and (
             len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects)
@@ -212,7 +215,11 @@ class AdaptivePhase1Coordinator:
                             "reason": decision.reason,
                         },
                     }
+                    if decision.failure_investigations:
+                        state['failure_investigations'] = list(decision.failure_investigations)
                     self._atomic_json(self.root / "state.json", state)
+                    if self.failure_feedback is not None:
+                        self.failure_feedback.record(decision.failure_investigations, state)
                     return self._report(state)
                 assert isinstance(decision, WaveDecision)
                 if self.max_projects is not None and (
@@ -226,8 +233,12 @@ class AdaptivePhase1Coordinator:
                     "wave": decision.wave.as_dict(),
                     "session": self._session_dict(session),
                 }
+                if decision.failure_investigations:
+                    pending['failure_investigations'] = list(decision.failure_investigations)
                 self._atomic_json(self.root / "pending.json", pending)
             wave = WaveSpec.from_mapping(pending["wave"])
+            if self.failure_feedback is not None:
+                self.failure_feedback.record(pending.get('failure_investigations', []), state)
             if self.max_projects is not None and completed + len(wave.projects) > self.max_projects:
                 raise ValueError("retained wave exceeds configured project limit")
             coordinator = LiveWaveCoordinator(
@@ -246,6 +257,8 @@ class AdaptivePhase1Coordinator:
             state = self._publish(state, wave, pending, deltas)
             self._atomic_json(self.root / "state.json", state)
             (self.root / "pending.json").unlink(missing_ok=True)
+            if self.failure_feedback is not None:
+                self.failure_feedback.sync(state)
             executed_waves += 1
             if wave_limit is not None and executed_waves >= wave_limit:
                 return self._report(state)
@@ -271,10 +284,14 @@ class AdaptivePhase1Coordinator:
             return {"terminal": {"status": decision.status, "reason": decision.reason},
                     "base_wave_index": state["wave_index"],
                     "base_memory_sha256": hashlib.sha256(snapshot).hexdigest(),
-                    "session": self._session_dict(session)}
+                    "session": self._session_dict(session),
+                    **({'failure_investigations': list(decision.failure_investigations)}
+                       if decision.failure_investigations else {})}
         return {"schema": PENDING_SCHEMA, "base_wave_index": state["wave_index"],
                 "base_memory_sha256": hashlib.sha256(snapshot).hexdigest(),
-                "wave": decision.wave.as_dict(), "session": self._session_dict(session)}
+                "wave": decision.wave.as_dict(), "session": self._session_dict(session),
+                **({'failure_investigations': list(decision.failure_investigations)}
+                   if decision.failure_investigations else {})}
 
     def validate_proposal(self, proposal):
         state = self._load_state()
@@ -305,6 +322,13 @@ class AdaptivePhase1Coordinator:
         approved = {**proposal, "wave": {**wave, "projects": [
             row for row in wave["projects"] if row["spec"]["project_id"] in selected
         ]}}
+        if self.failure_feedback is not None:
+            rows = [row for row in proposal.get('failure_investigations', [])
+                if row['status'] != 'investigating' or row['project_id'] in selected]
+            state = self._load_state()
+            self.failure_feedback.admit(rows, WaveSpec.from_mapping(approved['wave']),
+                                       self._context(state, self._memory_snapshot(state)))
+            approved['failure_investigations'] = rows
         WaveSpec.from_mapping(approved["wave"])
         retained = self._proposal_pending(proposal)
         if retained is not None:
@@ -344,6 +368,12 @@ class AdaptivePhase1Coordinator:
     def run_approved_wave(self):
         return self._run(wave_limit=1, approved_only=True)
 
+    def reconcile_feedback(self):
+        """Replay feedback publication from committed state without executing work."""
+        if self.failure_feedback is not None:
+            state = self._load_state()
+            self.failure_feedback.record(state.get('failure_investigations', []), state)
+
     def run_approved_proposal(self, proposal):
         """Commit one approved wave or a bound terminal curriculum decision."""
         if "terminal" not in proposal:
@@ -352,10 +382,16 @@ class AdaptivePhase1Coordinator:
         if state["terminal"] is not None:
             if state["terminal"] != proposal["terminal"]:
                 raise ValueError("campaign has a different terminal decision")
+            if self.failure_feedback is not None:
+                self.failure_feedback.record(proposal.get('failure_investigations', []), state)
             return self._report(state)
         state = {**state, "session": proposal["session"],
                  "terminal": proposal["terminal"]}
+        if proposal.get('failure_investigations'):
+            state['failure_investigations'] = proposal['failure_investigations']
         self._atomic_json(self.root / "state.json", state)
+        if self.failure_feedback is not None:
+            self.failure_feedback.record(proposal.get('failure_investigations', []), state)
         return self._report(state)
 
     def resume(self) -> dict[str, object]:
@@ -457,6 +493,8 @@ class AdaptivePhase1Coordinator:
             "memory_bytes_base64": memories,
             "session": pending["session"],
             "completed_waves": [*state["completed_waves"], wave.wave_id],
+            **({'failure_investigations': pending['failure_investigations']}
+               if pending.get('failure_investigations') else {}),
             **({"failed_outcomes": failures} if failures else {}),
         }
 
@@ -502,6 +540,7 @@ class AdaptivePhase1Coordinator:
             ),
             remaining,
             self._curriculum_feedback(state),
+            self.failure_feedback.context(state) if self.failure_feedback else (),
         )
 
     @staticmethod

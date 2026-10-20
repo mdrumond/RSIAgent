@@ -12,7 +12,7 @@ from optimizer.memory import verify_snapshot
 class OptimizerPhase2Coordinator:
     def __init__(self, root, objective, snapshot, complete, execution_factory, *,
                  query_knowledge=None, max_target_attempts=3, max_practice_attempts=2,
-                 selector=None, feedback_root=None):
+                 selector=None, feedback_root=None, fixed_task=None):
         if any(type(n) is not int or n < 1
                for n in (max_target_attempts, max_practice_attempts)):
             raise ValueError("target and practice budgets must be positive")
@@ -26,6 +26,7 @@ class OptimizerPhase2Coordinator:
         self.feedback = FeedbackStore(feedback_root or self.root / 'feedback')
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
+        self.fixed_task = fixed_task
         self.target_budget, self.practice_budget = max_target_attempts, max_practice_attempts
         seed_path = self.root / "seed-memory.json"
         if seed_path.exists():
@@ -35,6 +36,8 @@ class OptimizerPhase2Coordinator:
             atomic(seed_path, canonical(snapshot))
         self.identity = dict(snapshot_id=snapshot["snapshot_id"], objective=objective,
                              target_budget=max_target_attempts, practice_budget=max_practice_attempts)
+        if fixed_task is not None:
+            self.identity['fixed_task_sha256'] = sha(canonical(fixed_task))
 
     def _write(self, name, value):
         path = self.root / name
@@ -65,7 +68,7 @@ class OptimizerPhase2Coordinator:
         while True:
             self._write("goal-selection.json", dict(stage="selection", proposal_count=0))
             try:
-                task = self.selector(complete=self.complete, snapshot=self.seed,
+                task = self.fixed_task or self.selector(complete=self.complete, snapshot=self.seed,
                     objective=self.objective, root=directory, kind="goal",
                     query_knowledge=self.knowledge)
             except (ValueError, TypeError, KeyError) as error:
@@ -76,6 +79,8 @@ class OptimizerPhase2Coordinator:
                 # Torch reference is the oracle. No native teacher is constructed.
                 self._qualify(task, 'qualification')
             except (ValueError, TypeError, KeyError) as error:
+                if self.fixed_task is not None:
+                    raise
                 from .phase2_optimizer_tasks import reject_optimizer_task
                 reject_optimizer_task(directory, str(error))
                 continue
