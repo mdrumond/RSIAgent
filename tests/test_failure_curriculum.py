@@ -586,11 +586,13 @@ def test_hidden_mixed_failure_task_is_hash_readable_without_advancing_wave(tmp_p
             classification='infrastructure' if index < 9 else 'compile-error'))
         store.import_campaign(root)
     selection = select_feedback(store.root, 'a3')
+    selection['selected'].sort(key=lambda row: row['outcome']['result']['classification'] == 'compile-error')
     feedback = FailureCurriculum(tmp_path, store.root, selection)
     context = feedback.context({'wave_index':1})
     visible = {row['feedback_id'] for row in context if row['role'] == 'selected'}
     manifest = context[-1]['selected']
-    hidden = next(row for row in manifest if row['feedback_id'] not in visible)
+    hidden = next(row for row in manifest if row['classification'] == 'compile-error')
+    assert hidden['feedback_id'] not in visible
     task = json.loads(feedback.read(hidden['task_sha256'])['text'])
     original = next(row for row in selection['selected'] if row['feedback_id'] == hidden['feedback_id'])
     assert task == original['outcome']['task']
