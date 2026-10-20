@@ -44,6 +44,16 @@ class OptimizerPhase2Coordinator:
     def _read(self, name):
         return json.loads((self.root / name).read_bytes())
 
+    def _qualify(self, task, kind):
+        self._write('qualification.json', dict(phase='optimizer-phase2', active=True, attempts=[], pending=dict(
+            attempt_id=kind + '-' + sha(canonical(task))[:12], kind=kind, task=task)))
+        try:
+            self.factory(self.root / self._directory(task), task, self.seed).prepare()
+        except Exception:
+            self.feedback.import_campaign(self.root)
+            raise
+        (self.root / 'qualification.json').unlink()
+
     def _bootstrap(self):
         path = self.root / "state.json"
         if path.exists():
@@ -62,15 +72,10 @@ class OptimizerPhase2Coordinator:
                 self._write("goal-selection.json", dict(stage="failed", diagnostic=str(error)))
                 raise
             self._write("goal-selection.json", dict(stage="qualification", candidate=task))
-            self._write('qualification.json', dict(phase='optimizer-phase2', attempts=[], pending=dict(
-                attempt_id='qualification-' + sha(canonical(task))[:12], kind='qualification', task=task)))
             try:
                 # Torch reference is the oracle. No native teacher is constructed.
-                self.factory(self.root / self._directory(task), task, self.seed).prepare()
-            except Exception as error:
-                self.feedback.import_campaign(self.root)
-                if not isinstance(error, (ValueError, TypeError, KeyError)):
-                    raise
+                self._qualify(task, 'qualification')
+            except (ValueError, TypeError, KeyError) as error:
                 from .phase2_optimizer_tasks import reject_optimizer_task
                 reject_optimizer_task(directory, str(error))
                 continue
@@ -165,7 +170,7 @@ class OptimizerPhase2Coordinator:
                     try:
                         if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
                             raise ValueError("practice must have a fresh task ID")
-                        self.factory(self.root / self._directory(task), task, self.seed).prepare()
+                        self._qualify(task, 'practice-qualification')
                     except (ValueError, TypeError, KeyError) as error:
                         from .phase2_optimizer_tasks import reject_optimizer_task
                         reject_optimizer_task(directory, str(error))

@@ -31,6 +31,9 @@ they do not increment completed attempts. Full profiler trees stay remote; only
 existing compact result objects and artifact/hash references enter feedback.
 Initial reference qualification failures are importable from `qualification.json`
 even when no campaign state or semantic attempt has been committed yet.
+Practice reference qualification uses the same explicit active marker alongside
+an existing campaign state. Successful qualification removes the marker; terminal
+preparation failures are retained without charging an unstarted semantic attempt.
 Target identity comes from campaign metadata or explicit `ascend-a3`/`ascend-a5`
 seed identities, never from a transport host label. Missing identity stays unknown.
 

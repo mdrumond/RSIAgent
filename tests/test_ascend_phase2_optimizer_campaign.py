@@ -150,6 +150,45 @@ def test_initial_qualification_stop_is_retained_and_historically_importable(tmp_
     assert historical.records()[0]['outcome'] == record['outcome']
 
 
+@pytest.mark.parametrize('status', ['stopped', 'failed'])
+def test_practice_qualification_failure_is_retained_before_pending(tmp_path, status):
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.control import WorkerStopped
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'campaign'
+    class Executor:
+        def __init__(self, directory, task, memory):
+            self.task = task
+            self.jobs = JobStore(directory / 'jobs')
+            self.job = self.jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key=task['task_id'])
+        def prepare(self):
+            if self.task['task_id'] == 'practice-copy':
+                self.jobs.transition(self.job['job_id'], status)
+                error = WorkerStopped if status == 'stopped' else ObservationUnavailable
+                raise error('practice reference interrupted')
+        def attempt(self, key, **kwargs):
+            return dict(verified=False, job_id=self.job['job_id'])
+    def selector(**kwargs):
+        task = proposal()
+        if kwargs['kind'] == 'practice':
+            task['task_id'] = 'practice-copy'
+        return task
+    coordinator = OptimizerPhase2Coordinator(root, 'objective', seed(),
+        lambda _: json.dumps(dict(action='practice', reason='isolate failure')), Executor, selector=selector)
+    with pytest.raises((WorkerStopped, ObservationUnavailable), match='practice reference'):
+        coordinator.resume()
+    assert not (root / 'pending.json').exists()
+    state = json.loads((root / 'state.json').read_bytes())
+    assert len(state['attempts']) == 1 and state['target_attempts'] == 1
+    record = next(row for row in FeedbackStore(root / 'feedback').records()
+                  if row['outcome']['kind'] == 'practice-qualification')
+    assert record['outcome']['completed'] is False
+    assert record['outcome']['job_status']['status'] == status
+    historical = FeedbackStore(tmp_path / 'historical')
+    historical.import_campaign(root)
+    assert any(row['outcome'] == record['outcome'] for row in historical.records())
+
+
 def test_resume_after_state_commit_before_pending_cleanup(tmp_path):
     build, calls, _, _ = setup(tmp_path)
     assert build().run_attempt()["status"] == "RUNNING"
