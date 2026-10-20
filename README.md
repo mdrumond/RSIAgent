@@ -424,9 +424,12 @@ Missing evidence is shown as unavailable, not reconstructed.
 Controls are **off by default**. For optional controls, keep the listener on
 loopback, set `controls.enabled`, configure the launcher `runner`, and define
 complete server-side launch `presets` with unused root/control directories.
-Each controlled campaign/preset must explicitly select `target: "a3"`; A5 is
-viewable but not controlled here. Phase 2 presets also require reviewed
-`phase1_root` and `review` paths. Use an SSH tunnel for remote access.
+With controls enabled, **every campaign and preset in that configuration must
+explicitly select `target: "a3"`**; mixed A3/A5 configurations are not supported.
+To view A5 alongside an A3 control dashboard, run a separate controls-disabled
+instance with its own configuration, cache directory, and port (for example,
+`--port 8081`). Phase 2 presets also require reviewed `phase1_root` and `review`
+paths. Use an SSH tunnel for remote access.
 
 Controls can sample/approve curriculum, launch approved projects, continue
 eligible campaigns, import feedback, start investigations, and request retries.
