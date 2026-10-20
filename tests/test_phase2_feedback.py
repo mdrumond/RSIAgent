@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -104,6 +105,7 @@ def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
     assert any('missing candidate evidence' in message for message in report['warnings'])
     assert store.records()[0]['outcome']['target'] == 'unknown'
     assert store.records()[0]['outcome']['evidence']['candidate']['sha256'] == 'b' * 64
+    assert not (source / 'jobs').exists()  # Backfill never mutates the source tree.
     write(tmp_path / 'legacy' / 'state.json', dict(phase='a5-phase2'))
     assert 'legacy' in store.import_campaign(tmp_path / 'legacy')['warnings'][0]
 
@@ -130,3 +132,68 @@ def test_coordinator_automatically_retains_failures(tmp_path):
     records = FeedbackStore(tmp_path / 'feedback').records()
     assert len(records) == 2
     assert {r['outcome']['verified'] for r in records} == {False, True}
+
+
+def test_correctness_retry_needs_no_timing_but_performance_retry_meets_goal(tmp_path):
+    store = FeedbackStore(tmp_path / 'feedback')
+    task = dict(task_id='relu', performance_goal={'speedup': 2})
+    for name, result in [('incorrect', {'verified': False}),
+                         ('slow', {'verified': True, 'speedup': 1.5}),
+                         ('unknown', {'verified': True}),
+                         ('fast', {'verified': True, 'speedup': 2})]:
+        campaign(tmp_path / name, task=task, result=result)
+        store.import_campaign(tmp_path / name)
+    records = {Path(r['outcome']['source_root']).name: r for r in store.records()}
+    store.update_investigation(records['incorrect']['feedback_id'], status='resolved',
+                               retries=[records['unknown']['feedback_id']])
+    with pytest.raises(ValueError, match='successful'):
+        store.update_investigation(records['slow']['feedback_id'], status='resolved',
+                                   retries=[records['unknown']['feedback_id']])
+    store.update_investigation(records['slow']['feedback_id'], status='resolved',
+                               retries=[records['fast']['feedback_id']])
+
+
+def test_runtime_and_candidate_provenance_from_retained_job(tmp_path):
+    from optimizer.jobs import JobStore
+    source = tmp_path / 'source'
+    jobs = JobStore(source / 'tasks' / 'retained' / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='test')
+    jobs.add_event(job['job_id'], 'phase2-task', dict(runtime=dict(target='bz-a3-1', arch='actual')))
+    write(source / 'campaign-run.json', dict(target='a3'))
+    ref = jobs.put_artifact(job['job_id'], 'candidate.cpp', b'actual candidate source')
+    row = campaign(source, result=dict(verified=False, job_id=job['job_id'], candidate=ref))
+    row['execution_directory'] = 'tasks/retained'
+    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(source)['warnings'] == []
+    outcome = store.records()[0]['outcome']
+    assert outcome['runtime']['arch'] == 'actual'
+    assert outcome['target'] == 'a3'
+    assert outcome['evidence']['candidate']['sha256'] == sha(b'actual candidate source')
+    page = store.read_evidence(ref['sha256'], limit=7)
+    assert page['text'] == 'actual '
+    assert page['next_offset'] == 7
+    assert store.read_evidence(ref['sha256'], offset=7)['text'] == 'candidate source'
+    jobs.artifact_path(job['job_id'], ref['sha256']).write_bytes(b'corrupt')
+    with pytest.raises(ValueError, match='digest mismatch'):
+        store.read_evidence(ref['sha256'])
+
+
+def test_changed_source_is_reported_without_overwriting_observation(tmp_path):
+    root = tmp_path / 'source'
+    campaign(root, result={'verified': False})
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(root)
+    campaign(root, result={'verified': True})
+    assert 'source outcome changed' in store.import_campaign(root)['warnings'][0]
+    assert store.records()[0]['outcome']['verified'] is False
+
+
+def test_compiler_diagnostics_classify_native_incorrect_report(tmp_path):
+    root = tmp_path / 'source'
+    campaign(root, result=dict(verified=False, result=dict(status='incorrect', cases=[
+        dict(error='CalledProcessError: bisheng exited 1', compiler_diagnostics='invalid syntax')
+    ])))
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(root)
+    assert store.records()[0]['outcome']['category'] == 'compile-failure'

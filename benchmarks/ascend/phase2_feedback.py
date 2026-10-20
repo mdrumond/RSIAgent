@@ -28,7 +28,10 @@ def _category(task, result):
                     and math.isfinite(speedup) and speedup > 0)
         return ('verified-slow' if speedup < threshold else 'verified-success') if measured else 'verified-timing-unknown'
     status = str((result.get('result') or {}).get('status', result.get('classification', '')))
-    if 'compile' in status:
+    cases = (result.get('result') or {}).get('cases', [])
+    compile_error = any(case.get('error') and not case.get('compilation') and
+                        ('compiler_diagnostics' in case or 'compiler' in case['error']) for case in cases)
+    if 'compile' in status or compile_error:
         return 'compile-failure'
     if 'budget' in status:
         return 'budget-exhausted'
@@ -47,6 +50,30 @@ class FeedbackStore:
 
     def records(self):
         return [_read(path) for path in sorted(self.root.glob('*.json'))]
+
+    def read_evidence(self, digest, offset=0, limit=8192):
+        """Authenticate a locally retained linked artifact, then return one text page."""
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
+            raise ValueError('evidence page requires nonnegative offset and limit 1..8192')
+        refs = [ref for record in self.records() for ref in record['outcome']['evidence'].values()
+                if ref['sha256'] == digest]
+        for ref in refs:
+            try:
+                if not Path(ref['job_root']).is_dir():
+                    continue
+                path = JobStore(ref['job_root']).artifact_path(ref['job_id'], digest)
+                with path.open('rb') as stream:
+                    if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
+                        raise ValueError('artifact digest mismatch')
+                    size = path.stat().st_size
+                    stream.seek(offset)
+                    return dict(sha256=digest, offset=offset, size=size,
+                                text=stream.read(limit).decode('utf-8', errors='replace'),
+                                has_more=offset + limit < size,
+                                next_offset=offset + limit if offset + limit < size else None)
+            except FileNotFoundError:
+                continue
+        raise FileNotFoundError('linked evidence is not retained locally')
 
     def update_investigation(self, feedback_id, **fields):
         if set(fields) - {'status', 'classification', 'reason', 'projects', 'retries', 'evidence'}:
@@ -81,12 +108,15 @@ class FeedbackStore:
             atomic(path, canonical(record))
             return record
 
-    def _put(self, outcome):
+    def _put(self, outcome, warnings):
         identity = {k: outcome[k] for k in ('source_root', 'attempt_id', 'completed')}
         key = sha(canonical(identity))
         path = self.root / (key + '.json')
         with exclusive(self.root / '.lock', wait=True):
             if path.exists():
+                if _read(path)['outcome'] != outcome:
+                    warnings.append(f'{outcome["source_root"]}:{outcome["attempt_id"]}: '
+                                    'source outcome changed; immutable imported observation preserved')
                 return False
             record = dict(feedback_id=key, outcome=outcome,
                 investigation=dict(status='resolved' if outcome['category'] in
@@ -101,7 +131,7 @@ class FeedbackStore:
         if not root.is_dir():
             report['warnings'].append('source root is missing')
             return report
-        paths = [root / 'state.json'] if (root / 'state.json').exists() else sorted(root.rglob('state.json'))
+        paths = sorted(root.rglob('state.json'))
         supported = 0
         for path in paths:
             try:
@@ -115,7 +145,8 @@ class FeedbackStore:
             campaign = path.parent
             metadata = _read(campaign / 'campaign-identity.json', {})
             seed = _read(campaign / 'seed-memory.json', {})
-            metadata = {**seed.get('source_identity', {}), **metadata}
+            metadata = {**seed.get('source_identity', {}), **metadata,
+                        **_read(campaign / 'campaign-run.json', {})}
             rows = {row['attempt_id']: row for row in state.get('attempts', [])}
             for retained in sorted((campaign / 'attempts').glob('*.json')):
                 row = _read(retained)
@@ -124,7 +155,7 @@ class FeedbackStore:
                 result = row['result']
                 outcome = self._outcome(campaign, row, metadata, report)
                 outcome.update(category=_category(row['task'], result), completed=True)
-                report['imported' if self._put(outcome) else 'existing'] += 1
+                report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
             pending = _read(campaign / 'pending.json')
             if pending and pending['attempt_id'] not in rows:
                 relative = 'tasks/' + pending['task']['task_id'] + '-' + sha(canonical(pending['task']))[:12]
@@ -141,7 +172,7 @@ class FeedbackStore:
                     outcome = self._outcome(campaign, row, metadata, report)
                     outcome.update(completed=False, category='budget-exhausted' if job['status'] == 'budget-exhausted'
                                    else 'interrupted', job_status=job)
-                    report['imported' if self._put(outcome) else 'existing'] += 1
+                    report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
         if not supported:
             report['warnings'].append('no supported optimizer Phase 2 state found; legacy layouts are not imported')
         return report
@@ -164,15 +195,19 @@ class FeedbackStore:
                 continue
             evidence[role] = dict(ref, job_root=str(directory / 'jobs'), job_id=job_id)
             try:
+                if not (directory / 'jobs').is_dir():
+                    raise FileNotFoundError('retained job directory is missing')
                 artifact = JobStore(directory / 'jobs').artifact_path(job_id, ref['sha256'])
                 with artifact.open('rb') as stream:
                     if hashlib.file_digest(stream, 'sha256').hexdigest() != ref['sha256']:
                         raise ValueError('artifact digest mismatch')
             except (ValueError, OSError, KeyError, TypeError) as error:
                 report['warnings'].append(f'{campaign}:{row["attempt_id"]}: missing {role} evidence: {error}')
+        target = metadata.get('target')
+        if target not in {'a3', 'a5'}:
+            target = {'ascend-a3': 'a3', 'ascend-a5': 'a5'}.get(metadata.get('benchmark'), 'unknown')
         return dict(source_root=str(campaign), attempt_id=row['attempt_id'],
-            kind=row.get('kind', 'target'), target=runtime.get('target', metadata.get('target', 'unknown')),
-            language=runtime.get('language', metadata.get('language',
-                'ascend-c' if runtime.get('target') == 'a3' else 'unknown')),
+            kind=row.get('kind', 'target'), target=target,
+            language=metadata.get('language', runtime.get('language', 'unknown')),
             runtime=runtime, task=row['task'], verified=result.get('verified') is True,
             result=result, evidence=evidence, interpretation='Observation, not verified reusable knowledge')
