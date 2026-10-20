@@ -394,7 +394,9 @@ def test_campaign_identity_is_persisted_and_unchanged_reconstruction_works(tmp_p
 
     second = _build(tmp_path, _cell())
 
+    from coding.pi import ENGINE_IDENTITY
     assert identity == {
+        **ENGINE_IDENTITY,
         "schema": "a5-phase1-production-identity-v1",
         "cell": first.cell.as_dict(),
     }

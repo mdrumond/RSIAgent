@@ -532,3 +532,6 @@ def test_cli_stops_after_three_infrastructure_retries(tmp_path):
         )
     assert len(calls) == 4
     assert sleeps == [120, 120, 120]
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

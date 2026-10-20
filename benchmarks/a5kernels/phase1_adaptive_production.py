@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from coding.pi.actor import PiActorDriver
+from coding.pi import ENGINE_IDENTITY
+
 import hashlib
 import os
 from pathlib import Path
@@ -41,7 +44,6 @@ from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend, Projec
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.phase1_provider import (
-    DirectActorDriver,
     DirectCompletionProvider,
     DirectModelProfile,
     Transport,
@@ -107,7 +109,7 @@ class AdaptivePhase1Production:
 
     cell: A5Phase1Cell
     profile: DirectModelProfile
-    actor: DirectActorDriver
+    actor: PiActorDriver
     backend: CatlassProjectBackend
     query_knowledge: ActionDependency
     request_profile: ActionDependency
@@ -291,6 +293,7 @@ def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=No
     root = Path(root)
     path = root / "campaign-identity.json"
     identity = {
+        **ENGINE_IDENTITY,
         "schema": _CAMPAIGN_IDENTITY_SCHEMA,
         "cell": cell.as_dict(),
     }
@@ -373,7 +376,7 @@ def build_adaptive_phase1(
         transport=provider_transport,
     )
     profile = direct_profile(admitted.model)
-    actor = DirectActorDriver(provider)
+    actor = PiActorDriver(provider)
     backend = CatlassProjectBackend(
         command,
         session_wrapper=str(paths.session_wrapper),

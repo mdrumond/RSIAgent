@@ -56,8 +56,10 @@ def knowledge_identity(seed="a"):
 
 
 def trial_protocol_sha256(openai_turns=24, *, mismatch_feedback=True):
+    from coding.pi import ENGINE_IDENTITY
     value = {
-        "schema": "a3-trial-protocol-v5",
+        **ENGINE_IDENTITY,
+        "schema": "a3-trial-protocol-v6",
         "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3, "backoff_seconds": 120,

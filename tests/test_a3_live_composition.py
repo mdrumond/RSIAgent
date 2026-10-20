@@ -152,8 +152,10 @@ def trial_protocol_sha256(
     openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
     prepare_runtime_infrastructure=True,
 ):
+    from coding.pi import ENGINE_IDENTITY
     value = {
-        "schema": "a3-trial-protocol-v5",
+        **ENGINE_IDENTITY,
+        "schema": "a3-trial-protocol-v6",
         "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3, "backoff_seconds": 120,
@@ -962,9 +964,9 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
 
     def resilient_actor_factory(cell, proposal):
         if cell == first:
-            return model_actor_factory(
-                {"DEEPSEEK_API_KEY": "fixture-secret"}, invalid_transport,
-            )(cell, proposal)
+            from benchmarks.a3_model_profiles import complete_a3
+            return lambda profile, context: complete_a3("test", context, model=cell.backend_model,
+                environ={"DEEPSEEK_API_KEY": "fixture-secret"}, transport=invalid_transport)
         return actor_factory(cell, proposal)
 
     deps = LiveDependencies(
@@ -1240,18 +1242,22 @@ def test_completion_provenance_and_no_secret_in_terminal_output(tmp_path):
     assert record["evidence_sha256"] == canonical_digest(composition.cell_digests[record["cell_id"]])
 
 
-def test_deepseek_actor_uses_native_pinned_route_without_exposing_secret():
+def test_deepseek_actor_uses_pi_without_exposing_secret():
     seen = {}
-    def transport(**kwargs):
-        seen.update(kwargs)
-        return A3TransportResult('{"action":"compile"}', 3)
-    factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, transport)
-    cell = next(cell for cell in __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells() if cell.backend_model is BackendModel.DEEPSEEK_FLASH)
+    class Session:
+        completion_tokens = 0
+        def __init__(self, **kwargs): seen.update(kwargs)
+        def next_action(self, context, allowed, **kwargs):
+            assert allowed == ["compile"]
+            self.completion_tokens += 3
+            return "compile", {}
+        def close(self): pass
+    factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, session_factory=Session)
+    cell = next(cell for cell in foundation_cells() if cell.backend_model is BackendModel.DEEPSEEK_FLASH)
     completion = factory(cell, DEFAULT_PROPOSALS[0])(
-        load_a3_model_profile(cell.backend_model), "{}"
-    )
-    assert seen["base_url"] == DEEPSEEK_BASE_URL
-    assert seen["api_key"] == "private-value"
+        load_a3_model_profile(cell.backend_model), '{"allowed_actions":{"compile":[]}}')
+    assert seen["model"] == BackendModel.DEEPSEEK_FLASH
+    assert completion.provenance["coding_engine"] == "pi"
     assert "private-value" not in json.dumps(completion.as_dict())
 
 

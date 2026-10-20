@@ -294,9 +294,10 @@ def build_production_trial(paths: ProductionPaths):
     )
     from benchmarks.a5kernels.profiling import ProfilingTreatmentController
     from benchmarks.a5kernels.profiling_bz import BZProfileBackend
-    from benchmarks.a5kernels.trial import CoreAttemptDriver, TrialOrchestrator
-    from config.settings import Config
-    from core.trace import ArtifactSink
+    from benchmarks.a5kernels.trial import TrialOrchestrator
+    from coding.pi.actor import PiActorDriver
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 
     command = CatlassValidationExecutor(
         upload_wrapper=str(paths.upload_wrapper),
@@ -348,10 +349,11 @@ def build_production_trial(paths: ProductionPaths):
         kdb=True,
         profiling_guidance=True,
     )
-    actor = CoreAttemptDriver(
-        object(), Config(agent_decided_stop=True),
-        lambda context: ArtifactSink(str(context)),
-    )
+    import os
+    def actor(instruction, *, profile, **kwargs):
+        driver = PiActorDriver(DirectCompletionProvider(os.environ))
+        selected = next(identity for identity in MODEL_IDENTITIES if identity.backend_model.value == profile.model)
+        return driver(instruction, profile=direct_profile(selected), **kwargs)
     orchestrator = TrialOrchestrator(
         paths.results_root,
         capabilities,

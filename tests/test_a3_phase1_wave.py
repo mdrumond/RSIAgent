@@ -39,8 +39,10 @@ def terminal_outcome(digest="a" * 64):
 
 
 def trial_protocol_sha256(openai_turns=24, *, candidate_contract=True):
+    from coding.pi import ENGINE_IDENTITY
     return canonical_digest({
-        "schema": "a3-trial-protocol-v5" if candidate_contract else "a3-trial-protocol-v4",
+        "schema": "a3-trial-protocol-v6" if candidate_contract else "a3-trial-protocol-v4",
+        **(ENGINE_IDENTITY if candidate_contract else {}),
         **(
             {"candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict()}
             if candidate_contract else {}

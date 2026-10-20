@@ -2,6 +2,9 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from coding.pi.actor import PiActorDriver
+from coding.pi import ENGINE_IDENTITY
+
 import re
 from queue import Queue
 from threading import Lock
@@ -157,7 +160,7 @@ def build_native_adaptive_phase1(
     from benchmarks.a5kernels.phase1_curriculum import Capability
     from benchmarks.a5kernels.knowledge import KnowledgeDB
     from benchmarks.a5kernels.phase1_adaptive_production import _knowledge_action
-    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
     from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
     from benchmarks.a5kernels.trial import _SYSTEM_PROMPT
     from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
@@ -182,6 +185,7 @@ def build_native_adaptive_phase1(
         raise ValueError("native profiling mode and admitted guidance must agree")
     policy = a3_curriculum_policy(dtypes=config.dtypes)
     identity = {
+        **ENGINE_IDENTITY,
         "schema": "ascend-native-adaptive-identity-v1", "target": config.target,
         "arch": config.arch, "execution_profile": config.execution_profile,
         "language": "ascend-c", "guide_sha256": config.guide_sha256,
@@ -233,7 +237,7 @@ def build_native_adaptive_phase1(
     provider = DirectCompletionProvider(environment, **(
         {"transport": provider_transport} if provider_transport is not None else {}
     ))
-    actor = DirectActorDriver(provider, system_prompt=_SYSTEM_PROMPT.replace("one A5 kernel", "one A3 Ascend C kernel"))
+    actor = PiActorDriver(provider, system_prompt=_SYSTEM_PROMPT.replace("one A5 kernel", "one A3 Ascend C kernel"))
     executor = None
     if not project_workers:
         backend = NativeProjectBackend(native_transport, root / "native-evidence",

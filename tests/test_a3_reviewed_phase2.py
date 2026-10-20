@@ -147,3 +147,6 @@ def test_cli_native_builder_reuses_shared_runtime_config(tmp_path, monkeypatch):
     path.write_text(json.dumps(config))
     with pytest.raises(ValueError, match="environment differs"):
         phase2_cli.native_runner(args)
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

@@ -160,6 +160,7 @@ class TrialBudgets:
 
 
 def trial_protocol_sha256() -> str:
+    from coding.pi import ENGINE_IDENTITY
     model_budgets = {}
     for model in BackendModel:
         budgets = TrialBudgets.for_model(model)
@@ -168,7 +169,8 @@ def trial_protocol_sha256() -> str:
             "max_tokens": budgets.max_tokens,
         }
     return canonical_digest({
-        "schema": "a3-trial-protocol-v5",
+        **ENGINE_IDENTITY,
+        "schema": "a3-trial-protocol-v6",
         "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3,
@@ -265,6 +267,18 @@ class A3TrialLoop:
         self.timing_dimensions = timing_dimensions
 
     def run(self) -> TrialResult:
+        try:
+            bind = getattr(self.actor, "bind_host", None)
+            if bind is not None:
+                bind(lambda kind, payload: self.evidence.append(EvidenceKind.ARTIFACT,
+                     self._identity({"pi_event": kind, "data": payload})), self.budgets)
+            return self._run()
+        finally:
+            close = getattr(self.actor, "close", None)
+            if close is not None:
+                close()
+
+    def _run(self) -> TrialResult:
         source = None
         compilation = None
         verified = None

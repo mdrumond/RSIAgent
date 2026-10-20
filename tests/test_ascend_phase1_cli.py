@@ -163,3 +163,6 @@ def test_native_runtime_config_fails_early_for_missing_version_identity(tmp_path
     path.write_text("{}")
     with pytest.raises(ValueError, match="missing fields"):
         load_native_config(path)
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

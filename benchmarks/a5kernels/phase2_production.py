@@ -50,7 +50,7 @@ from benchmarks.a5kernels.phase2_memory import (
     admit_phase1_snapshot,
     phase2_cells,
 )
-from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider
+from benchmarks.a5kernels.phase2_source_provider import PiPhase2SourceProvider
 from benchmarks.a5kernels.sft_dataset import SourceManifest, TraceRecorder
 from benchmarks.a5kernels.production import _probe_knowledge_query, _transformers_cache
 
@@ -458,7 +458,7 @@ def build_phase2_production(
             "session_handle": receipt.session_handle,
         }
 
-    source = Phase2SourceProvider(
+    source = PiPhase2SourceProvider(
         provider,
         evidence_root=config.phase2_root.resolve() / "cells",
         guide_text=phase2_guide_text,

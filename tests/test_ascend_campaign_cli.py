@@ -1187,3 +1187,6 @@ def test_binding_print_capability_and_native_runtime_observations(tmp_path):
         ("manifest_sha256", "c" * 64))))
     assert a5["device"] == "5" and a5["product"] == "Ascend950"
     assert a5["compiler"] == "a" * 40 and a5["catlass_revision"] == "b" * 40
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

@@ -247,6 +247,11 @@ class Phase2SourceProvider:
         self.max_compile_probes = max_compile_probes
         self.max_completion_bytes = max_completion_bytes
 
+    coding_identity = {}
+
+    def _new_coding_session(self, profile, consumed):
+        return None  # Historical isolated provider harness; production overrides this.
+
     def __call__(self, request: Phase2AttemptRequest) -> str:
         if not isinstance(request, Phase2AttemptRequest):
             raise TypeError("request must be a Phase2AttemptRequest")
@@ -277,9 +282,49 @@ class Phase2SourceProvider:
         if progress is not None and len(progress[1]) >= len(transcript):
             messages, transcript, queries, tokens, ordinary_turns, probes = progress
         knowledge = self._knowledge(root, request)
+        consumed = len(transcript)
+        if self.coding_identity and (root / "pi-events.jsonl").exists():
+            consumed = sum(json.loads(line)["kind"] == "pi-provider-request"
+                           for line in (root / "pi-events.jsonl").read_text().splitlines())
+        coding = self._new_coding_session(profile, consumed)
+        current_source = None
+        for message in reversed(messages):
+            if message.get("role") == "assistant":
+                previous = _parse_action(message["content"])
+                if previous is not None and previous[0] in ("compile_probe", "candidate_source"):
+                    current_source = previous[1]
+                    break
         try:
             while ordinary_turns < self.max_turns:
-                completion = self.provider.complete(profile, messages)
+                if coding is None:
+                    completion = self.provider.complete(profile, messages)
+                else:
+                    from coding.pi.session import ActionError
+                    from benchmarks.a5kernels.phase1_provider import DirectCompletion
+                    allowed = ["candidate_source"]
+                    if knowledge is not None and len(queries) < self.max_queries:
+                        allowed.append("knowledge_query")
+                    if self.compile_probe is not None and probes < self.max_compile_probes:
+                        allowed.append("compile_probe")
+                    before = coding.completion_tokens
+                    try:
+                        name, args = coding.next_action({"task": json.loads(prompt),
+                            "latest_host_observation": messages[-1]["content"] if len(messages) > 2 else None,
+                            "contract": messages[0]["content"],
+                            "current_source": current_source,
+                            "recent_host_observations": [m["content"] for m in messages[2:]
+                                                         if m["role"] == "user"][-6:],
+                            "remaining_turns": self.max_turns-ordinary_turns,
+                            "remaining_compile_probes": self.max_compile_probes-probes}, allowed,
+                            record=lambda kind, data: self._retain_pi_record(root, kind, data),
+                            source=current_source,
+                            write_action=lambda source: (
+                                "compile_probe" if "compile_probe" in allowed else "candidate_source",
+                                {"source": source}))
+                        text = json.dumps({name: args})
+                    except ActionError:
+                        text = "{}"
+                    completion = DirectCompletion(text, max(1, coding.completion_tokens-before))
                 tokens += completion.completion_tokens
                 payload = completion.text.encode("utf-8")
                 summary: dict[str, object] = {
@@ -294,6 +339,8 @@ class Phase2SourceProvider:
                 else:
                     action = _parse_action(completion.text)
                     summary["action"] = action[0] if action else "invalid"
+                    if action is not None and action[0] in ("compile_probe", "candidate_source"):
+                        current_source = action[1]
                 messages.append({"role": "assistant", "content": completion.text})
 
                 if action is not None and action[0] == "candidate_source":
@@ -408,6 +455,8 @@ class Phase2SourceProvider:
                     tokens, ordinary_turns, probes,
                 )
         finally:
+            if coding is not None:
+                coding.close()
             close = getattr(knowledge, "close", None)
             if callable(close):
                 close()
@@ -554,6 +603,7 @@ class Phase2SourceProvider:
             prompt_value["repair_context"] = request.repair_context
         prompt_bytes, prompt_sha256 = _canonical_context(prompt_value, "provider prompt")
         binding = {
+            **self.coding_identity,
             "cell_id": request.cell.cell_id,
             "protocol_sha256": request.protocol_sha256,
             "request_id": request.request_id,
@@ -872,4 +922,26 @@ class Phase2SourceProvider:
         return tuple(dict(item) for item in messages)
 
 
-__all__ = ["PROVIDER_SCHEMA", "Phase2SourceProvider"]
+class PiPhase2SourceProvider(Phase2SourceProvider):
+    """Production coding path; no direct-provider fallback."""
+    from coding.pi.session import ENGINE_IDENTITY as coding_identity
+
+    def __init__(self, *args, **kwargs):
+        from coding.pi import runtime_preflight
+        runtime_preflight()
+        super().__init__(*args, **kwargs)
+
+    def _new_coding_session(self, profile, consumed):
+        from coding.pi.session import PiCodingSession
+        from coding.pi.adapters import SOURCE_SCHEMAS
+        return PiCodingSession(model=profile.identity.backend_model.value, schemas=SOURCE_SCHEMAS,
+            environ=self.provider.coding_environment(), max_calls=max(0, self.max_turns-consumed))
+
+    @staticmethod
+    def _retain_pi_record(root, kind, data):
+        root.mkdir(parents=True, exist_ok=True)
+        with (root / "pi-events.jsonl").open("a") as stream:
+            stream.write(json.dumps({"kind": kind, "data": data}) + "\n")
+
+
+__all__ = ["PROVIDER_SCHEMA", "Phase2SourceProvider", "PiPhase2SourceProvider"]

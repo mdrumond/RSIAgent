@@ -81,7 +81,8 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path)
     )[1])
     assert actor_context["profiling_guidance"] == text
     retained = list((tmp_path / "actor-proof" / "artifacts" / "objects").rglob("*"))
-    assert any(path.is_file() and path.read_bytes() == production_request_bytes(actor_request) for path in retained)
+    assert any(path.is_file() and path.read_bytes() == production_request_bytes({"request": actor_request})
+               for path in retained)
     with pytest.raises(ValueError, match="does not match"):
         build_adaptive_phase1(
             cell=cell, paths=_paths(tmp_path / "bad"), objective="Learn.",
@@ -140,3 +141,6 @@ def test_over_budget_wave_is_corrected_before_any_execution(tmp_path):
                                      execute, max_parallel=1, max_projects=1).run()
     assert report["status"] == "PROJECT_LIMIT_REACHED"
     assert executed == ["one"]
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

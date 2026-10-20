@@ -216,6 +216,10 @@ class DirectCompletionProvider:
                 raise ValueError("context budgets must use registered model identities")
             self.context_budgets.update(context_budgets)
 
+    def coding_environment(self):
+        """Host-only credential copy for the Pi gateway; never passed to Pi."""
+        return dict(self._credentials)
+
     def context_budget(self, profile):
         return self.context_budgets[profile.identity.backend_model.value]
 
@@ -368,7 +372,7 @@ class _ProviderEvidenceRecorder:
 
 
 @dataclass(frozen=True)
-class _DirectActorContinuation:
+class _ActorContinuation:
     profile: DirectModelProfile
     messages: tuple[Mapping[str, str], ...]
     recorder: _ProviderEvidenceRecorder
@@ -509,7 +513,7 @@ class DirectActorDriver:
                     return ActorOutcome(
                         outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
-                        continuation=_DirectActorContinuation(
+                        continuation=_ActorContinuation(
                             profile, tuple(dict(item) for item in messages), recorder, working, turn
                         ),
                     )
@@ -531,7 +535,7 @@ class DirectActorDriver:
         """Resume the exact terminal Actor history after all host work completes."""
 
         continuation = outcome.continuation
-        if (not isinstance(continuation, _DirectActorContinuation)
+        if (not isinstance(continuation, _ActorContinuation)
                 or outcome.distillation is not None):
             raise ValueError("Actor outcome is not awaiting terminal distillation")
         admitted = dict(outcome.admitted_artifacts)
