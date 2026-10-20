@@ -1,8 +1,8 @@
 {
-  "name": "rsi-pi-coding-microbenchmark",
+  "name": "rsi-pi-coding-runtime",
   "private": true,
   "version": "0.1.0",
-  "description": "Pinned optional Pi runtime for the RSI coding microbenchmark",
+  "description": "Pinned Pi runtime for Ascend coding agents",
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.3.0"
   },
