@@ -107,6 +107,7 @@ def test_prepare_stop_imports_feedback_before_propagating(tmp_path):
         def __init__(self, directory, task, memory):
             self.store = JobStore(directory / 'jobs')
             self.job = self.store.create('def f(x): return x', 'f', {}, {}, idempotency_key='prepare')
+            self.job_id = self.job['job_id']
         def prepare(self):
             prepared.append(True)
             if len(prepared) > 1:

@@ -37,6 +37,9 @@ preparation failures are retained without charging an unstarted semantic attempt
 Interrupted attempts recover already-published baseline and candidate references
 from the latest optimizer-state event. This preserves the frozen acceptance suite
 for a later retry without inventing a completed native verdict.
+Semantic interruptions require a matching attempt/preparation request and newer
+terminal evidence; merely selecting a new pending retry cannot inherit an older
+attempt's stop. Missing historical boundaries are reported, not guessed.
 Target identity comes from campaign metadata or explicit `ascend-a3`/`ascend-a5`
 seed identities, never from a transport host label. Missing identity stays unknown.
 
@@ -67,6 +70,8 @@ Retry-based resolution also uses the existing native-attempt evidence checks:
 durable result event, matching result artifact, candidate digest, verified native
 verdict and complete frozen-case coverage. A stale imported verified flag alone
 cannot resolve a failure.
+The retained optimizer submission must match the claimed task's reference source,
+entrypoint, signature set and constructor arguments as well.
 
 This command does not start investigations or restart either phase. Curriculum
 integration and explicit bounded retry controls are separate follow-up changes.

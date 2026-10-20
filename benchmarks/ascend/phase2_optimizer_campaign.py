@@ -199,6 +199,8 @@ class OptimizerPhase2Coordinator:
             relative = self._directory(task)
             executor = self.factory(self.root / relative, task, self.seed)
             try:
+                if getattr(executor, 'job_id', None) is not None:
+                    executor.store.add_event(executor.job_id, 'phase2-prepare-request', dict(attempt_id=key))
                 executor.prepare()
                 result = executor.attempt(key, memory_snapshot=self._memory(state),
                                           feedback=state["attempts"][-2:])
