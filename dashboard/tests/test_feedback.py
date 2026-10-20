@@ -122,13 +122,14 @@ def test_deferred_and_resolved_visible_but_not_selected(feedback, status):
 
 
 @pytest.mark.parametrize('classification', ['infrastructure', 'provider'])
-def test_classified_infrastructure_not_offered_for_kernel_investigation(feedback, classification):
+def test_classified_infrastructure_selectable_for_retry_not_kernel_investigation(feedback, classification):
     client, app, config, row, calls = feedback
     row['outcome'].update(category='incorrect', verified=False)
     row['investigation'].update(classification=classification, reason='not a kernel defect')
     write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
     page = client.get('/feedback').get_data(as_text=True)
-    assert 'not a kernel defect' in page and 'name="feedback_id"' not in page
+    assert 'not a kernel defect' in page and 'name="feedback_id"' in page
+    assert 'Select for retry only' in page
     assert submit(client, 'investigate', dict(preset_id='phase1',
         feedback_ids=[row['feedback_id']], project_target=2)).status_code == 409
     assert not calls
@@ -207,9 +208,10 @@ def test_missing_feedback_root_not_created(feedback):
     assert not absent.exists()
 
 
-@pytest.mark.parametrize('action,phase', [('investigate', 1), ('retry-feedback', 2),
-                                         ('import-feedback', None)])
-def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback, action, phase):
+@pytest.mark.parametrize('action,phase,classification', [
+    ('investigate', 1, None), ('retry-feedback', 2, None), ('import-feedback', None, None),
+    ('retry-feedback', 2, 'infrastructure'), ('retry-feedback', 2, 'provider')])
+def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback, action, phase, classification):
     from benchmarks.ascend import campaign_cli
     from optimizer.jobs import JobStore
     client, app, config, row, calls = feedback
@@ -227,6 +229,7 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
         preset.update(config=str(settings), initial_memory=str(seed))
     # Retry pins exactly this locally retained original suite; it does not generate one.
     row['outcome']['task']['submission'] = {'source': 'original reference'}
+    row['investigation']['classification'] = classification
     frozen = json.dumps(dict(suite_sha256='d' * 64, manifest=dict(
         policy={'rtol': 1e-5}, submission={'signatures': [{'shape': [8]}]}))).encode()
     jobs = JobStore(root / 'jobs')
