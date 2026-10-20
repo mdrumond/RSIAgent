@@ -19,7 +19,7 @@ def campaign(root, *, result=None, task=None, attempt='attempt-001', baseline=Tr
     if baseline and not row['result'].get('job_id'):
         from optimizer.jobs import JobStore
         jobs = JobStore(root / 'execution' / 'jobs')
-        job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key='fixture')
+        job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key=str(root))
         value = baseline if isinstance(baseline, dict) else dict(suite_sha256='1' * 64,
             manifest=dict(policy=dict(name='host-policy', rtol=.01)))
         ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(value))
@@ -286,3 +286,43 @@ def test_resolution_rejects_missing_original_baseline_but_keeps_observation(tmp_
     with pytest.raises(ValueError, match='authenticated frozen suite'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
                                    retries=[records[True]['feedback_id']])
+
+
+def test_resolution_requires_retry_record_in_same_store(tmp_path):
+    store = FeedbackStore(tmp_path / 'feedback')
+    campaign(tmp_path / 'failure', result={'verified': False})
+    campaign(tmp_path / 'retry', result={'verified': True})
+    store.import_campaign(tmp_path / 'failure')
+    elsewhere = FeedbackStore(tmp_path / 'another-store')
+    elsewhere.import_campaign(tmp_path / 'retry')
+    failure = store.records()[0]['feedback_id']
+    retry = elsewhere.records()[0]['feedback_id']
+    with pytest.raises(ValueError, match='successful original-task retry'):
+        store.update_investigation(failure, status='resolved', retries=[retry])
+
+
+def test_restored_campaign_preserves_old_feedback_id_and_investigation(tmp_path):
+    import shutil
+    root = tmp_path / 'original'
+    campaign(root, result={'verified': False})
+    store = FeedbackStore(root / 'feedback')
+    store.import_campaign(root)
+    record = store.records()[0]
+    # Simulate a pre-migration ID generated from the absolute source path.
+    old_id = sha(canonical({key: record['outcome'][key]
+                           for key in ('source_root', 'attempt_id', 'completed')}))
+    (store.root / (record['feedback_id'] + '.json')).unlink()
+    record['feedback_id'] = old_id
+    record['investigation'].update(status='deferred', reason='needs isolated probe', retries=['retry-link'])
+    write(store.root / (old_id + '.json'), record)
+    restored = tmp_path / 'restored'
+    shutil.copytree(root, restored)
+    imported = FeedbackStore(restored / 'feedback')
+    report = imported.import_campaign(restored)
+    assert report['imported'] == 0
+    assert report['existing'] == 1
+    assert report['warnings'] == []
+    assert imported.records() == [record]
+    # An independent execution of the same authored task is not a duplicate.
+    campaign(tmp_path / 'independent', result={'verified': False})
+    assert imported.import_campaign(tmp_path / 'independent')['imported'] == 1
