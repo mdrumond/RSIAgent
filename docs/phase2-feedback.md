@@ -40,6 +40,9 @@ for a later retry without inventing a completed native verdict.
 Semantic interruptions require a matching attempt/preparation request and newer
 terminal evidence; merely selecting a new pending retry cannot inherit an older
 attempt's stop. Missing historical boundaries are reported, not guessed.
+If durable evaluated history or a pending evaluation checkpoint awaits the normal
+executor's result publication, import is explicitly deferred. Recovery publishes
+the completed observation rather than creating an extra incomplete failure.
 Target identity comes from campaign metadata or explicit `ascend-a3`/`ascend-a5`
 seed identities, never from a transport host label. Missing identity stays unknown.
 

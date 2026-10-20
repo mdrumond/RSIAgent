@@ -272,6 +272,16 @@ class FeedbackStore:
                             continue  # A new pending selection does not own a previous attempt's stop.
                     prepared = next((event['payload'] for event in reversed(events)
                                      if event['kind'] == 'optimizer-state'), {})
+                    evaluated = [item for item in prepared.get('history', [])
+                                 if 'result' in item and 'candidate_sha256' in item]
+                    consumed = sum(event['payload'].get('result') is not None for event in events
+                                   if event['kind'] == 'phase2-attempt-result')
+                    candidate = prepared.get('pending', {})
+                    if (len(evaluated) > consumed or
+                            (candidate.get('evaluation') and not candidate.get('history_recorded'))):
+                        report['warnings'].append(f'{campaign}:{pending["attempt_id"]}: '
+                            'durable evaluated evidence awaits normal attempt-result recovery; import deferred')
+                        continue
                     row = {**pending, 'execution_directory': relative,
                            'result': dict(job_id=job['job_id'], verified=False,
                                classification=job['status'], handles=job.get('handles', []),

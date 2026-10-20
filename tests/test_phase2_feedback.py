@@ -509,3 +509,51 @@ def test_resolution_rejects_misattached_frozen_task_submission(tmp_path, field, 
     with pytest.raises(ValueError, match='successful original-task retry'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
                                    retries=[records[True]['feedback_id']])
+
+
+@pytest.mark.parametrize('window', ['result-event', 'pending-evaluation'])
+def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, monkeypatch, window):
+    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from optimizer.loop import OptimizationLoop
+    from test_phase2_optimizer_execution import Agent, Backend, snapshot, candidate
+    from test_ascend_phase2_optimizer_tasks import proposal
+    root = tmp_path / 'campaign'
+    task = proposal()
+    relative = 'tasks/' + task['task_id'] + '-' + sha(canonical(task))[:12]
+    agent = Agent([dict(action='cases', signatures=[], summary='representative'), candidate('good')])
+    backend = Backend()
+    config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path / 'validation.sh'), max_cases=1)
+    execution = OptimizerTaskExecutor(root / relative, task, snapshot(), config, agent=agent, backend=backend)
+    execution.prepare()
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(root / 'pending.json', dict(attempt_id='attempt-001', kind='target', task=task))
+    if window == 'result-event':
+        original = execution.store.add_event
+        def crash(kind_key, kind, payload):
+            if kind == 'phase2-attempt-result':
+                raise RuntimeError('checkpoint crash')
+            return original(kind_key, kind, payload)
+        monkeypatch.setattr(execution.store, 'add_event', crash)
+    else:
+        original = OptimizationLoop._save
+        def crash(loop):
+            original(loop)
+            pending = loop.state.get('pending', {})
+            if pending.get('evaluation') and not pending.get('history_recorded'):
+                raise RuntimeError('checkpoint crash')
+        monkeypatch.setattr(OptimizationLoop, '_save', crash)
+    with pytest.raises(RuntimeError, match='checkpoint crash'):
+        execution.attempt('attempt-001')
+    calls = (len(agent.contexts), len(backend.evaluations))
+    store = FeedbackStore(tmp_path / 'feedback')
+    report = store.import_campaign(root)
+    assert report['imported'] == 0
+    assert any('import deferred' in warning for warning in report['warnings'])
+    if window == 'result-event':
+        monkeypatch.setattr(execution.store, 'add_event', original)
+    else:
+        monkeypatch.setattr(OptimizationLoop, '_save', original)
+    assert execution.attempt('attempt-001')['verified'] is True
+    assert (len(agent.contexts), len(backend.evaluations)) == calls
+    assert store.import_campaign(root)['imported'] == 1
+    assert len(store.records()) == 1 and store.records()[0]['outcome']['completed'] is True
