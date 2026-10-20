@@ -166,6 +166,44 @@ def test_completed_attempt_event_precedes_interruption_synthesis(tmp_path, verif
     assert store.import_campaign(source)['existing'] == 1
 
 
+@pytest.mark.parametrize('retry_policy', ['matching', 'different-suite', 'different-policy'])
+def test_prepared_interruption_retains_frozen_baseline_for_retry_resolution(tmp_path, retry_policy):
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'interrupted'
+    row = campaign(root, baseline=False)
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(root / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
+    relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
+    jobs = JobStore(root / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='interrupted')
+    baseline = dict(suite_sha256='1' * 64, cases=[dict(case='case-0')],
+                    manifest=dict(policy=dict(name='host-policy', rtol=.01)))
+    baseline_ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(baseline))
+    candidate_ref = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('unfinished candidate'))
+    jobs.add_event(job['job_id'], 'optimizer-state', dict(baseline=baseline_ref, candidate=candidate_ref))
+    jobs.transition(job['job_id'], 'stopped')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(root)
+    original = store.records()[0]
+    assert original['outcome']['completed'] is False
+    assert original['outcome']['verified'] is False
+    assert original['outcome']['evidence']['baseline']['sha256'] == baseline_ref['sha256']
+    assert original['outcome']['evidence']['candidate']['sha256'] == candidate_ref['sha256']
+    if retry_policy == 'different-suite':
+        baseline['suite_sha256'] = '2' * 64
+    if retry_policy == 'different-policy':
+        baseline['manifest']['policy']['rtol'] = .5
+    campaign(tmp_path / 'retry', task=row['task'], result={'verified': True}, baseline=baseline)
+    store.import_campaign(tmp_path / 'retry')
+    retry = next(record for record in store.records() if record['outcome']['verified'])
+    if retry_policy == 'matching':
+        assert store.update_investigation(original['feedback_id'], status='resolved',
+            retries=[retry['feedback_id']])['investigation']['status'] == 'resolved'
+    else:
+        with pytest.raises(ValueError, match='successful original-task retry'):
+            store.update_investigation(original['feedback_id'], status='resolved', retries=[retry['feedback_id']])
+
+
 def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
     source = tmp_path / 'source'
     row = campaign(source, result=dict(verified=False, job_id='a' * 32,

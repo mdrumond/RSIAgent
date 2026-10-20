@@ -34,6 +34,9 @@ even when no campaign state or semantic attempt has been committed yet.
 Practice reference qualification uses the same explicit active marker alongside
 an existing campaign state. Successful qualification removes the marker; terminal
 preparation failures are retained without charging an unstarted semantic attempt.
+Interrupted attempts recover already-published baseline and candidate references
+from the latest optimizer-state event. This preserves the frozen acceptance suite
+for a later retry without inventing a completed native verdict.
 Target identity comes from campaign metadata or explicit `ascend-a3`/`ascend-a5`
 seed identities, never from a transport host label. Missing identity stays unknown.
 

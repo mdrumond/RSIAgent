@@ -244,7 +244,8 @@ class FeedbackStore:
                     try:
                         store = JobStore(jobs)
                         job = store.get(manifest.parent.name)
-                        completed = next((event['payload'] for event in reversed(store.events(job['job_id']))
+                        events = store.events(job['job_id'])
+                        completed = next((event['payload'] for event in reversed(events)
                             if event['kind'] == 'phase2-attempt-result'
                             and event['payload'].get('attempt_id') == pending['attempt_id']), None)
                     except (ValueError, OSError) as error:
@@ -258,9 +259,12 @@ class FeedbackStore:
                         continue
                     if job.get('status') not in {'failed', 'stopped', 'budget-exhausted'}:
                         continue
+                    prepared = next((event['payload'] for event in reversed(events)
+                                     if event['kind'] == 'optimizer-state'), {})
                     row = {**pending, 'execution_directory': relative,
                            'result': dict(job_id=job['job_id'], verified=False,
-                               classification=job['status'], handles=job.get('handles', []))}
+                               classification=job['status'], handles=job.get('handles', []),
+                               **{role: prepared[role] for role in ('baseline', 'candidate') if role in prepared})}
                     outcome = self._outcome(campaign, row, metadata, report)
                     outcome.update(completed=False, category='budget-exhausted' if job['status'] == 'budget-exhausted'
                                    else 'interrupted', job_status=job)
