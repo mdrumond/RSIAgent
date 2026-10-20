@@ -22,9 +22,20 @@ def campaign(root, *, result=None, task=None, attempt='attempt-001', baseline=Tr
         job = jobs.create('def forward(x): return x', 'forward', {}, {}, idempotency_key=str(root))
         value = baseline if isinstance(baseline, dict) else dict(suite_sha256='1' * 64,
             manifest=dict(policy=dict(name='host-policy', rtol=.01)))
+        value.setdefault('cases', [dict(case='case-0')])
         ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(value))
         row.update(execution_directory='execution')
         row['result'].update(job_id=job['job_id'], baseline=ref)
+        if row['result'].get('verified'):
+            source = 'actual candidate source'
+            candidate = jobs.put_artifact(job['job_id'], 'candidate.json', canonical(source))
+            row['result'].update(candidate=candidate, source_sha256=sha(source.encode()),
+                result=dict(status='verified', candidate_sha256=sha(source.encode()),
+                    suite_sha256=value['suite_sha256'], cases=[dict(case='case-0')]))
+        row['result'].update(attempt_id=attempt, task_id=task['task_id'])
+        result_ref = jobs.put_artifact(job['job_id'], 'result.json', canonical(row['result']))
+        row['result']['result_artifact'] = result_ref
+        jobs.add_event(job['job_id'], 'phase2-attempt-result', row['result'])
     write(root / 'state.json', dict(phase='optimizer-phase2', target=task, attempts=[row]))
     write(root / 'seed-memory.json', dict(source_identity=dict(target='a3', language='ascend-c')))
     return row
@@ -361,3 +372,27 @@ def test_stable_reimport_does_not_scan_feedback_records(tmp_path, monkeypatch):
         raise AssertionError('stable existing identity must use direct lookup')
     monkeypatch.setattr(store, 'records', unexpected_scan)
     assert store.import_campaign(root)['existing'] == 1
+
+
+@pytest.mark.parametrize('mismatch', ['stale-flag', 'missing-native-case'])
+def test_retry_resolution_authenticates_retained_native_verdict(tmp_path, mismatch):
+    from optimizer.jobs import JobStore
+    campaign(tmp_path / 'failure', result={'verified': False})
+    root = tmp_path / 'retry'
+    row = campaign(root, result={'verified': mismatch != 'stale-flag'})
+    result = row['result']
+    result['verified'] = True
+    if mismatch == 'missing-native-case':
+        result['result']['cases'] = []
+        jobs = JobStore(root / 'execution' / 'jobs')
+        body = {key: value for key, value in result.items() if key != 'result_artifact'}
+        result['result_artifact'] = jobs.put_artifact(result['job_id'], 'result.json', canonical(body))
+        jobs.add_event(result['job_id'], 'phase2-attempt-result', result)
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(tmp_path / 'failure')
+    store.import_campaign(root)
+    records = {r['outcome']['verified']: r for r in store.records()}
+    with pytest.raises(ValueError, match='successful original-task retry'):
+        store.update_investigation(records[False]['feedback_id'], status='resolved',
+                                   retries=[records[True]['feedback_id']])

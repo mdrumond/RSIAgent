@@ -50,6 +50,19 @@ def _baseline_identity(outcome):
     return None
 
 
+def _verified_retry(outcome):
+    from .optimizer_phase2_artifacts import verify_attempt_result
+    try:
+        ref = outcome['evidence']['result_artifact']
+        if not Path(ref['job_root']).is_dir():
+            return False
+        verify_attempt_result(JobStore(ref['job_root']), outcome['result'],
+                              attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'])
+        return outcome['result'].get('verified') is True
+    except (KeyError, OSError, ValueError, TypeError):
+        return False
+
+
 def _category(task, result):
     if result.get('verified') is True:
         speedup = result.get('speedup')
@@ -137,6 +150,7 @@ class FeedbackStore:
                 known = {row['feedback_id']: row for row in self.records()}
                 retries = [known.get(key, {}) for key in value['retries']]
                 if not any(r.get('outcome', {}).get('verified') is True
+                           and _verified_retry(r['outcome'])
                            and r['outcome']['task'] == record['outcome']['task']
                            and r['outcome']['target'] == record['outcome']['target']
                            and r['outcome']['language'] == record['outcome']['language']

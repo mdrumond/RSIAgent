@@ -52,6 +52,10 @@ Resolution also authenticates both retained baseline artifacts and requires the
 same frozen expanded-suite hash and comparison policy. Missing or corrupt baseline
 evidence leaves the observation unresolved; it does not discard the observation.
 Retry IDs must refer to observations already retained in the same feedback store.
+Retry-based resolution also uses the existing native-attempt evidence checks:
+durable result event, matching result artifact, candidate digest, verified native
+verdict and complete frozen-case coverage. A stale imported verified flag alone
+cannot resolve a failure.
 
 This command does not start investigations or restart either phase. Curriculum
 integration and explicit bounded retry controls are separate follow-up changes.
