@@ -19,7 +19,7 @@ paths. Discover the target/runtime/workspace and device through current registry
 preflight; confirm the configured remote workspace already exists before launch.
 The architecture is the discovered compiler architecture, not a device nickname.
 Optional `env_file` loads provider credentials only in the detached worker.
-`model_profile` defaults to the existing A3 OpenAI profile. Optional `knowledge`
+`model_profile` defaults to the registered DeepSeek Flash profile. Install the pinned Pi runtime before starting a production worker; see [Pi coding setup](PI_CODING_RUNTIME.md). Optional `knowledge`
 contains `knowledge_manifest`, `knowledge_database`, and `embedding_cache` paths;
 the existing read-only manifest-checked KnowledgeAgent gates every query.
 For the current expanded multi-collection native campaign, use `knowledge` with
@@ -51,8 +51,7 @@ timeline reports and shared libraries are excluded. Downloaded artifacts are
 digest-checked and stored in the job artifact store. Every remote runtime call is
 bounded by the job's remaining wall-time budget. Runtime/device/workspace/guide
 identity is pinned across resume.
-Provider requests execute in a child process with streamed retained prompt/result
-records. Stop and the remaining wall-time budget terminate a stalled request.
+Provider requests execute through Pi in a persistent supervised child with streamed retained request intentions and results. Stop and the remaining wall-time budget terminate the entire owned process group.
 Successful exact-handle cancellation is persisted; resume evaluates in a fresh
 remote directory so partial compilation or baseline files cannot be reused.
 Pending diagnostic operations survive unavailable observation without permitting

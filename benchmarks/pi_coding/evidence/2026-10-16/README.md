@@ -15,4 +15,4 @@ This historical prompt included third-party excerpts and private source location
 
 The prior allocation bounds were $0.138656 for RSI and $0.031498 for Pi. This phase added $0.195938 and $0.097184 respectively, yielding $0.463276 total. These are conservative bounds including previous attempts, provider preflights and retained unknown reservations, not invoices. Generation tokens exclude preflights and previous attempts. Cached tokens are subsets of input totals. The preflight usage field describes this phase only.
 
-One pair supports a follow-up evaluation, not an average quality/cost claim or a causal claim about knowledge. The RSI baseline did not succeed, so its tokens-to-success are null. See the [benchmark guide](../../../../docs/PI_CODING_EVALUATION.md) for setup, reproduction, replay and limitations.
+One pair supports a follow-up evaluation, not an average quality/cost claim or a causal claim about knowledge. The RSI baseline did not succeed, so its tokens-to-success are null. See the [benchmark guide](../../../../docs/PI_CODING_EVALUATION.md) for historical limitations and the separate production smoke workflow.

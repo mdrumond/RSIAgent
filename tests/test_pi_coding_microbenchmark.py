@@ -67,5 +67,3 @@ def test_published_evidence_totals_and_source_digest():
     assert all(c['passed'] and c['max_abs_error'] == 0 for c in pi['validations'][-1]['cases'])
     assert hashlib.sha256((root / 'pi-kernel.cpp').read_bytes()).hexdigest() == pi['final_source_sha256']
     assert pi['tiling_review'] == 'passed'
-
-
