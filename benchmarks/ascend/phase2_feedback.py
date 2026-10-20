@@ -214,14 +214,16 @@ class FeedbackStore:
         if not root.is_dir():
             report['warnings'].append('source root is missing')
             return report
-        paths = sorted(root.rglob('state.json')) + [path for path in sorted(root.rglob('qualification.json'))
-                                                   if not (path.parent / 'state.json').exists()]
+        paths = sorted(root.rglob('state.json')) + sorted(root.rglob('qualification.json'))
         supported = 0
         for path in paths:
             try:
                 state = _read(path)
             except (ValueError, OSError) as error:
                 report['warnings'].append(f'{path}: unreadable state: {error}')
+                continue
+            qualification = path.name == 'qualification.json'
+            if qualification and (path.parent / 'state.json').exists() and not state.get('active'):
                 continue
             if state.get('phase') != 'optimizer-phase2':
                 continue
@@ -232,7 +234,7 @@ class FeedbackStore:
             metadata = {**seed.get('source_identity', {}), **metadata,
                         **_read(campaign / 'campaign-run.json', {})}
             rows = {row['attempt_id']: row for row in state.get('attempts', [])}
-            for retained in sorted((campaign / 'attempts').glob('*.json')):
+            for retained in ([] if qualification else sorted((campaign / 'attempts').glob('*.json'))):
                 row = _read(retained)
                 rows.setdefault(row['attempt_id'], row)
             for row in rows.values():
@@ -240,7 +242,7 @@ class FeedbackStore:
                 outcome = self._outcome(campaign, row, metadata, report)
                 outcome.update(category=_category(row['task'], result), completed=True)
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
-            pending = _read(campaign / 'pending.json', state.get('pending'))
+            pending = state.get('pending') if qualification else _read(campaign / 'pending.json')
             if pending and pending['attempt_id'] not in rows:
                 relative = 'tasks/' + pending['task']['task_id'] + '-' + sha(canonical(pending['task']))[:12]
                 jobs = campaign / relative / 'jobs'
