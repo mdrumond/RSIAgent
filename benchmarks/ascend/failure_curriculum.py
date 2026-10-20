@@ -195,16 +195,16 @@ class FailureCurriculum:
             status = latest['status']
             if status == 'ready-to-retry' and not self._supported(latest, state):
                 raise ValueError('retry recommendation requires committed host probe/control evidence')
-            current = next(r for r in self.store.records() if r['feedback_id'] == key)
-            if current['investigation']['status'] == 'resolved':
-                continue
-            other = [r for r in current['investigation']['projects'] if
-                     not isinstance(r, dict) or r.get('campaign_root') != str(self.root)]
-            other_evidence = [e for e in current['investigation']['evidence'] if e not in evidence]
-            self.store.update_investigation(key, status=status,
-                classification=latest['classification'], reason=latest['reason'],
-                projects=[*other, *(dict(row, campaign_root=str(self.root)) for row in rows)],
-                evidence=[*other_evidence, *evidence])
+            def merge(current):
+                if current['status'] == 'resolved':
+                    return None
+                other = [r for r in current['projects'] if
+                         not isinstance(r, dict) or r.get('campaign_root') != str(self.root)]
+                other_evidence = [e for e in current['evidence'] if e not in evidence]
+                return dict(status=status, classification=latest['classification'], reason=latest['reason'],
+                    projects=[*other, *(dict(row, campaign_root=str(self.root)) for row in rows)],
+                    evidence=[*other_evidence, *evidence])
+            self.store.update_investigation(key, merge=merge)
 
 
 def retry_spec(selection, target):

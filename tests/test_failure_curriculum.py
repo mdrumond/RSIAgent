@@ -472,3 +472,32 @@ def test_terminal_requires_latest_status_for_each_failure(tmp_path, duplicate_re
     assert len(feedback.lineage) == count
     original = next(r for r in store.records() if r['feedback_id'] in feedback.ids)
     assert original['investigation']['status'] == 'deferred'
+
+
+def test_concurrent_campaigns_merge_feedback_without_lost_lineage(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    store, selection, first = setup(tmp_path)
+    second_root = tmp_path/'phase1-other'
+    second_root.mkdir()
+    second = FailureCurriculum(second_root, store.root, selection)
+    stale = store.records()
+    # Both workers can have observed this same old dashboard/context snapshot.
+    # Publication must instead read/merge inside the shared store lock.
+    for feedback in (first, second):
+        monkeypatch.setattr(feedback.store, 'records', lambda: stale)
+        feedback.lineage = [investigation(selection)]
+    barrier = Barrier(2)
+    def publish(feedback):
+        evidence = sha(str(feedback.root).encode())
+        state = dict(prior_outcomes=[{'project_id':'probe'}], memory_bytes_base64=[
+            base64.b64encode(canonical(dict(source_revision=evidence, host_facts=[
+                {'evidence_sha256': evidence}]))).decode()])
+        barrier.wait(timeout=5)
+        feedback.sync(state)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(publish, (first, second)))
+    original = next(r for r in store.records() if r['feedback_id'] in first.ids)
+    assert {row['campaign_root'] for row in original['investigation']['projects']} == {
+        str(first.root), str(second.root)}
+    assert len(original['investigation']['evidence']) == 2

@@ -94,7 +94,8 @@ class FeedbackStore:
                 continue
         raise FileNotFoundError('linked evidence is not retained locally')
 
-    def update_investigation(self, feedback_id, **fields):
+    def update_investigation(self, feedback_id, *, merge=None, **fields):
+        """Optionally merge against current state under the same publication lock."""
         if set(fields) - {'status', 'classification', 'reason', 'projects', 'retries', 'evidence'}:
             raise ValueError('unknown investigation field')
         with exclusive(self.root / '.lock', wait=True):
@@ -102,6 +103,13 @@ class FeedbackStore:
             record = _read(path)
             if record is None:
                 raise KeyError(feedback_id)
+            if merge is not None:
+                merged = merge(record['investigation'])
+                if merged is None:
+                    return record
+                fields = {**fields, **merged}
+                if set(fields) - {'status', 'classification', 'reason', 'projects', 'retries', 'evidence'}:
+                    raise ValueError('unknown investigation field')
             value = {**record['investigation'], **fields}
             if value['status'] not in STATUSES:
                 raise ValueError('invalid investigation status')
