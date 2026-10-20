@@ -64,11 +64,19 @@ The new smoke calls the existing production A3 optimizer. It introduces no remot
 
 Remove `--check-only` to execute after checking the existing worker configuration. Local preflight does not attest remote readiness. Reuse the same root, window, and ledger for a resumed run. The original ledger limit is preserved; the incremental window cannot be silently increased. Limits are 20 provider requests, four evaluated candidates, 20 minutes, and at most $2 additional conservative spend. Inspect the generated source for tiling even after a numerical pass. Raw job records and the smoke summary remain local.
 
-The new production live smoke was **not run**: no existing A3 optimizer worker configuration was available, and the owner confirmed it is unavailable for now. No new model credits were spent. Historical numerical results are not presented as validation of this production migration.
+Limited live validation used a private transport hook and an existing cached CANN 8.5.1/Python 3.11/Torch NPU 2.9 container. The production optimizer compiled a fixed Ascend C add-one kernel and numerically verified one case with 65 float32 elements. Optional profiling was stopped, and command/container cleanup was confirmed. This validates a small infrastructure path; it does not validate Pi generation or the default checked transport.
+
+The full Pi matmul-add generation smoke was **not run**. A3 access is no longer available, remote work has stopped, and no new model calls or credits were used. Historical numerical results are not presented as validation of this production migration.
 
 ## Review and validation
 
 Runtime code lives in `coding/pi/`; the sole extension is `integrations/pi/host-actions.ts`. Production adapters never import runtime code from the microbenchmark package. The prototype's remote adapter and connection example were removed from the introduced branch history. Existing main-branch execution adapters remain in use.
+
+Suggested review order:
+
+1. Review the runtime gateway and typed-action boundary: full-request size enforcement, credential isolation, original argument validation, and host ownership of side effects.
+2. Review optimizer supervision and checkpoints: persistent sessions, cancellation of descendants, retained execution reconciliation, and engine/transport identity checks on resume.
+3. Review campaign adapters and migration instructions: production coding routes through Pi, explicit model selections remain authoritative, and incompatible direct-coding attempts require a fresh attempt.
 
 The historical evidence and portable knowledge are described in [PI_CODING_EVALUATION.md](PI_CODING_EVALUATION.md). The one historical pair supports investigating Pi, not a general superiority or cost claim.
 
