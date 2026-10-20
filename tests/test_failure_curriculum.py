@@ -37,7 +37,7 @@ def test_selection_controls_and_compatibility(tmp_path):
     assert len(selection['selected']) == len(selection['controls']) == 1
     assert selection['controls'][0]['outcome']['verified']
     with pytest.raises(ValueError, match='incompatible'):
-        select_feedback(store.root, 'a5')
+        select_feedback(store.root, 'a5', [selection['selected'][0]['feedback_id']])
     with pytest.raises(ValueError, match='unknown'):
         select_feedback(store.root, 'a3', ['missing'])
     context = feedback.context({})
@@ -78,6 +78,28 @@ def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
     assert original['investigation']['evidence']
     assert original['investigation']['projects'][0]['control_project_id'] == 'control'
     assert runner.resume() == result
+    # The full feedback loop returns to the original task, not a renamed probe.
+    from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
+    from test_ascend_phase2_optimizer_tasks import seed
+    task = original['outcome']['task']
+    class Retry:
+        def __init__(self, directory, selected, memory):
+            assert selected == task
+        def prepare(self):
+            return {'suite_sha256': 'fixture-original-suite'}
+        def attempt(self, key, **kwargs):
+            return dict(verified=True, summary='scripted host fixture', speedup=2)
+    retry_root = tmp_path / 'new-retry'
+    reviewed = seed()
+    reviewed['source_identity'] = dict(target='a3', language='ascend-c')
+    reviewed['snapshot_id'] = sha(canonical({k:v for k,v in reviewed.items() if k != 'snapshot_id'}))
+    retry = OptimizerPhase2Coordinator(retry_root, 'original retry', reviewed,
+        lambda _: '{"action":"ready","reason":"host fixture passed"}', Retry,
+        fixed_task=task, feedback_root=store.root)
+    assert retry.resume()['status'] == 'READY'
+    link_retry(dict(root=str(retry_root), feedback_root=str(store.root),
+                    retry_feedback_id=original['feedback_id']))
+    assert next(r for r in store.records() if r['feedback_id'] == original['feedback_id'])['investigation']['status'] == 'resolved'
 
 
 def test_successful_new_probes_do_not_automatically_resolve_or_ready(tmp_path):
@@ -189,3 +211,68 @@ def test_retry_freezes_original_expanded_cases_and_rejects_changed_suite(tmp_pat
     execution.expected_baseline = dict(expected, suite_sha256='other')
     with pytest.raises(ValueError, match='suite'):
         execution.prepare()
+
+
+def test_retry_reads_actual_retained_baseline_and_refuses_missing_original(tmp_path):
+    from test_phase2_optimizer_execution import executor
+    execution, _, backend = executor(tmp_path, [])
+    original = backend.prepare
+    frozen = dict(execution.task['submission'])
+    backend.prepare = lambda spec, directory: {**original(spec, directory),
+        'manifest': {'policy': {'name': 'fixture-policy'}, 'submission': frozen}}
+    execution.prepare()
+    baseline = execution._state()['baseline']
+    selection = {'selected': [dict(feedback_id='original', outcome=dict(task=execution.task,
+        runtime={'max_cases':1}, evidence={'baseline': dict(baseline,
+            job_root=str(execution.store.root), job_id=execution.job_id)}))]}
+    pinned = retry_spec(selection, 'a3')
+    assert pinned['frozen_submission'] == frozen and pinned['max_cases'] == 1
+    assert pinned['suite_sha256'] == 'suite'
+    with pytest.raises(ValueError, match='A3'):
+        retry_spec(selection, 'a5')
+    selection['selected'][0]['outcome']['evidence'] = {}
+    with pytest.raises(ValueError, match='missing'):
+        retry_spec(selection, 'a3')
+
+
+def test_cli_pins_feedback_and_rejects_incompatible_before_launch(tmp_path):
+    from benchmarks.ascend import campaign_cli as cli
+    from test_ascend_campaign_cli import start
+    store, selection, _ = setup(tmp_path)
+    base = tmp_path / 'base'
+    base.mkdir()
+    old = start(base)
+    key = selection['selected'][0]['feedback_id']
+    args = ['start', '--control', str(tmp_path/'control'), '--root', str(tmp_path/'new'),
+        '--phase', '1', '--target', 'a3', '--objective', 'investigate', '--project-target', '2',
+        '--config', old['config'], '--initial-memory', str(base/'seed'),
+        '--feedback-root', str(store.root), '--failure-id', key]
+    sessions = []
+    cli.main(args, screen=lambda job, role: sessions.append(role) or role)
+    job = cli._read(tmp_path/'control/job.json')
+    frozen = (tmp_path/'new/phase2-feedback.json').read_bytes()
+    assert job['feedback_selection_sha256'] == sha(frozen)
+    assert job['failure_ids'] == [key] and sessions == ['collector', 'campaign']
+    args[args.index('a3')] = 'a5'
+    args[args.index(str(tmp_path/'control'))] = str(tmp_path/'bad-control')
+    args[args.index(str(tmp_path/'new'))] = str(tmp_path/'bad-root')
+    with pytest.raises(SystemExit):
+        cli.main(args, screen=lambda *args: pytest.fail('must reject before launch'))
+    assert not (tmp_path/'bad-control').exists() and not (tmp_path/'bad-root').exists()
+
+
+def test_default_selection_filters_shared_store_without_relabeling_other_targets(tmp_path):
+    store, original, _ = setup(tmp_path)
+    for target, language in [('a5', 'catlass-dsl'), ('unknown', 'unknown')]:
+        root = tmp_path / target
+        campaign(root)
+        write(root/'seed-memory.json', dict(source_identity=dict(target=target, language=language)))
+        store.import_campaign(root)
+    before = store.records()
+    selected = select_feedback(store.root, 'a3')
+    assert selected['selected'] == original['selected']
+    for row in before:
+        if row['outcome']['target'] != 'a3':
+            with pytest.raises(ValueError, match='incompatible'):
+                select_feedback(store.root, 'a3', [row['feedback_id']])
+    assert store.records() == before
