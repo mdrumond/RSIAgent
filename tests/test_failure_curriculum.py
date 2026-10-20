@@ -353,3 +353,29 @@ def test_retry_normalizes_omitted_max_cases_in_retained_runtime(tmp_path):
     selection = select_feedback(store.root, 'a3')
     assert selection['selected'][0]['outcome']['runtime']['max_cases'] is None
     assert retry_spec(selection, 'a3')['max_cases'] == 24
+
+
+@pytest.mark.parametrize('invalid', [None, 'failure', 1, []])
+def test_nonobject_investigation_is_corrected_without_aborting_campaign(tmp_path, invalid):
+    store, selection, feedback = setup(tmp_path)
+    calls = []
+    initial_prompt = []
+    def complete(messages):
+        calls.append(messages)
+        if not initial_prompt:
+            initial_prompt.append(messages[-1]['content'])
+        payload = json.loads(_wave(initial_prompt[0], [_project('probe', 'padded-tail'),
+            _project('control', 'gm-ub-movement')]).split('\n', 1)[1])
+        payload['failure_investigations'] = [invalid] if len(calls) == 1 else [investigation(selection)]
+        if len(calls) == 2:
+            assert 'entries must be objects' in messages[-1]['content']
+        return 'DECISION: WAVE\n' + json.dumps(payload)
+    agent = CurriculumAgent(complete)
+    agent.failure_feedback = feedback
+    runner = AdaptivePhase1Coordinator(feedback.root, 'investigate', b'{}', agent,
+        lambda request: _result(request.spec, True, 'host fixture passed'), max_parallel=2, project_target=2)
+    runner.failure_feedback = feedback
+    assert runner.resume()['published_projects'] == ['probe', 'control']
+    assert len(calls) == 2
+    original = next(r for r in store.records() if r['feedback_id'] in feedback.ids)
+    assert original['investigation']['status'] == 'investigating'

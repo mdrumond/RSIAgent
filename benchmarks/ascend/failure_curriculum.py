@@ -116,6 +116,8 @@ class FailureCurriculum:
         prior = {p.project_id for p in context.prior_outcomes if p.verified}
         covered = set()
         for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError('failure_investigations entries must be objects')
             if row.get('feedback_id') not in self.ids or row.get('status') not in {
                     'investigating', 'ready-to-retry', 'deferred'}:
                 raise ValueError('unknown feedback or investigation status')
