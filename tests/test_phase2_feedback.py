@@ -326,3 +326,14 @@ def test_restored_campaign_preserves_old_feedback_id_and_investigation(tmp_path)
     # An independent execution of the same authored task is not a duplicate.
     campaign(tmp_path / 'independent', result={'verified': False})
     assert imported.import_campaign(tmp_path / 'independent')['imported'] == 1
+
+
+def test_stable_reimport_does_not_scan_feedback_records(tmp_path, monkeypatch):
+    root = tmp_path / 'campaign'
+    campaign(root, result={'verified': False})
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(root)['imported'] == 1
+    def unexpected_scan():
+        raise AssertionError('stable existing identity must use direct lookup')
+    monkeypatch.setattr(store, 'records', unexpected_scan)
+    assert store.import_campaign(root)['existing'] == 1

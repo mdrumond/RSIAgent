@@ -158,10 +158,11 @@ class FeedbackStore:
         path = self.root / (key + '.json')
         with exclusive(self.root / '.lock', wait=True):
             # Keep IDs and investigation work from older path-keyed feedback files.
-            existing = next((row for row in self.records()
-                             if _observation_identity(row['outcome']) == identity), None)
-            if existing is not None:
-                path = self.root / (existing['feedback_id'] + '.json')
+            if not path.exists():
+                existing = next((row for row in self.records()
+                                 if _observation_identity(row['outcome']) == identity), None)
+                if existing is not None:
+                    path = self.root / (existing['feedback_id'] + '.json')
             if path.exists():
                 if _logical_outcome(_read(path)['outcome']) != _logical_outcome(outcome):
                     warnings.append(f'{outcome["source_root"]}:{outcome["attempt_id"]}: '
