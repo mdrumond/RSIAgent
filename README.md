@@ -23,7 +23,7 @@
 <!-- Rank snapshot verified September 16, 2026 (UTC): https://huggingface.co/papers/date/2026-09-15 -->
 
 <p align="center">
-  <a href="#news">News</a> · <a href="#demos">Demos</a> · <a href="#method">Method</a> · <a href="#results">Results</a> · <a href="#installation">Quickstart</a> · <a href="#documentation">Documentation</a> · <a href="#citation">Citation</a>
+  <a href="#news">News</a> · <a href="#demos">Demos</a> · <a href="#method">Method</a> · <a href="#results">Results</a> · <a href="#installation">Quickstart</a> · <a href="#ascend">Ascend campaigns</a> · <a href="#dashboard">Dashboard</a> · <a href="#documentation">Documentation</a> · <a href="#citation">Citation</a>
 </p>
 
 https://github.com/user-attachments/assets/11cb3919-1073-4ba3-8bcd-37a15ec53c33
@@ -156,9 +156,14 @@ outside the learning process.
 ```text
 run_osworld.py        OSWorld batch entrypoint
 run_ale.py            ALE preparation, execution, and reporting
+run_ascend_campaign.py Explicit Ascend phase launcher and artifact collection
 benchmarks/
   osworld/           OSWorld stages, VM adapter, and evaluation
   ale/               ALE host, worker, and VM adapters
+  ascend/            Shared A3/A5 campaigns, feedback, and training annexes
+  a5kernels/         Catlass DSL and adaptive kernel-learning integration
+dashboard/           Campaign viewer and optional A3 launch controls
+optimizer/           Executable kernel submissions and native A3 workers
 core/                Shared Actor and Verifier runtime
 explore/             Curriculum, learning, memory, and recovery
 env/                 Shared guest transport and isolation
@@ -170,7 +175,7 @@ tests/               Regression tests
 docs/                Guides, architecture, and attribution
 ```
 
-The two root entrypoints are the starting point for benchmark runs. Internal
+The root entrypoints are the starting point for runs. Internal
 OSWorld stages are Python modules under `benchmarks/osworld/`; see the
 [source map](docs/ARCHITECTURE.md#source-map) for their responsibilities.
 
@@ -178,7 +183,7 @@ OSWorld stages are Python modules under `benchmarks/osworld/`; see the
 
 ## ⚙️ Installation
 
-Use Python 3.12, [uv](https://docs.astral.sh/uv/getting-started/installation/),
+For OSWorld and ALE, use Python 3.12, [uv](https://docs.astral.sh/uv/getting-started/installation/),
 and a Linux host with Docker and access to `/dev/kvm`. Start with the repository
 and your own model API credential:
 
@@ -258,6 +263,183 @@ ALE requires a successful smoke for each requested OS on the current source and
 runner image. Use a new `--output` directory when repeating a smoke. See
 [ALE operations](docs/ALE.md) for storage options and the upstream guide.
 
+<a id="ascend"></a>
+
+## Ascend kernel-learning campaigns
+
+`run_ascend_campaign.py` launches one explicitly requested phase. Agents run
+locally; compilation, host verification, timing, and profiling use configured
+remote device adapters. A3 uses Ascend C; A5 retains its Catlass DSL entrypoints.
+Starting Phase 1 does **not** automatically start Phase 2.
+
+Install the host dependencies (`python -m pip install -r requirements.txt`) and
+GNU Screen on the launcher host. Configure the user-wide `remote-access` skill
+and the checked validation adapter, a programming guide, provider credentials,
+and, when selected, KDB/profiling guidance. Check the configured target and run
+a bounded smoke before committing to a campaign. No desktop VM is needed for
+Ascend. See [target/runtime setup](docs/ascend-target-launcher.md) for required
+native fields, treatment bindings, and explicit A3 device pools.
+
+All `/path/to/...` values below are placeholders. Keep settings, credentials,
+and machine-specific configuration in ignored local files outside campaign
+roots; do not commit them. There are separate configuration layers:
+
+- **Launcher settings** (`--config` below): model, observed source manifest,
+  and target CLI arguments. Phase 2 also needs `optimizer_worker_config` for
+  fresh A3 optimizer-backed goals.
+- **Native runtime settings** (`--config` inside `phase1_arguments`): checked
+  profile/runtime, actual target/architecture, device, guide, environment
+  identity, and optional KDB/profiling configuration.
+- **Optimizer worker settings**: the compatible native A3 worker configuration;
+  see [worker setup](docs/optimizer-worker.md). Its treatment must agree with
+  the reviewed Phase 1 composition.
+
+Example ignored launcher settings (not a complete native runtime file):
+
+```json
+{
+  "model": "openai/gpt-5.6-sol",
+  "source_manifest": "/path/to/observed-sources.json",
+  "optimizer_worker_config": "/path/to/optimizer-worker.json",
+  "phase1_arguments": [
+    "--config", "/path/to/native-runtime.json",
+    "--env-file", "/path/to/provider.env",
+    "--model", "openai/gpt-5.6-sol",
+    "--knowledge", "without-kdb",
+    "--profiling", "new"
+  ]
+}
+```
+
+The source manifest records available repositories, exact revisions, and
+licenses; it does not download repositories or weights. See
+[source-manifest format](docs/a5-sft-dataset.md). Credentials belong in the
+ignored environment file, not JSON or campaign output. Use a fresh root/control
+pair for each new campaign; identity-bearing settings are pinned at start.
+
+### Start, observe, and continue
+
+```bash
+python run_ascend_campaign.py start --target a3 --phase 1 \
+  --root /path/to/phase1 --control /path/to/phase1-control \
+  --config /path/to/launcher-settings.json --initial-memory /path/to/seed.bin \
+  --objective 'Learn reliable kernels and measured performance' --project-target 64
+python run_ascend_campaign.py status --control /path/to/phase1-control --watch
+python run_ascend_campaign.py resume --control /path/to/phase1-control
+python run_ascend_campaign.py continue --control /path/to/phase1-control --project-target 96
+```
+
+Compute and collection have separate retained Screen sessions and logs in the
+control directory. `status --watch` polls every five minutes. Inspect errors and
+retained remote handles before resuming; never run two controllers on one root.
+`resume` retries unfinished work without increasing the target. `continue`
+explicitly raises it; add `--reopen-terminal` to reopen a curriculum terminal.
+Phase 1 siblings share pre-wave memory and consolidate at the wave barrier;
+an A3 device pool enables parallel projects, not automatic idle-device discovery.
+
+Before Phase 2, review the actual Phase 1 memory and evidence for usefulness,
+diversity, and observed profiler guidance. The
+[review contract](docs/ascend-target-launcher.md#reviewed-native-phase-2-handoff)
+defines the required review JSON; do not fabricate acceptance or curate memory
+to pass it. Start with the original Phase 1 initial memory:
+
+```bash
+python run_ascend_campaign.py start --target a3 --phase 2 \
+  --root /path/to/phase2 --control /path/to/phase2-control \
+  --config /path/to/launcher-settings.json --initial-memory /path/to/seed.bin \
+  --phase1-root /path/to/phase1 --review /path/to/phase1-review.json \
+  --objective 'Investigate a new kernel goal using reviewed lessons' --project-target 1
+```
+
+Fresh A3 Phase 2 selects one executable optimizer goal, freezes its reference
+suite, then alternates target attempts and focused practice. Only host results
+establish correctness. See [optimizer-backed Phase 2](docs/phase2-optimizer-campaign.md)
+for budgets and successive goals; A5 and retained legacy runs keep their own
+entrypoints. This A3 example does not establish A5 optimizer support.
+
+Collection runs independently on poor links. To restart it or package evidence:
+
+```bash
+python run_ascend_campaign.py collect --control /path/to/phase1-control --watch
+python run_ascend_campaign.py package --control /path/to/phase1-control \
+  --output /path/to/phase1-evidence.tar.gz
+```
+
+Strict packaging requires a committed boundary and all referenced artifacts.
+`--allow-pending` creates an explicitly incomplete checkpoint instead. Archives
+bundle memory and retained evidence, not credentials or local runtime settings.
+See [campaign lifecycle and collection](docs/ascend-campaigns.md).
+
+### Learn from Phase 2 failures
+
+The launcher supports importing observations, investigating them, and explicitly
+retrying the original target. Nothing starts merely by importing results:
+
+```bash
+python run_ascend_campaign.py feedback-phase2 --feedback-root /path/to/feedback \
+  --source-root /path/to/phase2
+python run_ascend_campaign.py start --target a3 --phase 1 \
+  --root /path/to/investigation --control /path/to/investigation-control \
+  --config /path/to/launcher-settings.json --initial-memory /path/to/seed.bin \
+  --feedback-root /path/to/feedback --failure-id FEEDBACK_ID \
+  --objective 'Isolate the failure with smaller probes and working controls' --project-target 8
+python run_ascend_campaign.py start --target a3 --phase 2 \
+  --root /path/to/retry --control /path/to/retry-control \
+  --config /path/to/launcher-settings.json --initial-memory /path/to/seed.bin \
+  --phase1-root /path/to/investigation --review /path/to/investigation-review.json \
+  --feedback-root /path/to/feedback --retry-feedback-id FEEDBACK_ID \
+  --objective 'Retry the original target with reviewed investigation memory' --project-target 1
+```
+
+Read `FEEDBACK_ID` from the imported records or dashboard. Review the investigation
+before issuing the retry command. Investigation success does not resolve the
+original failure: only a successful original-task retry does. Retries require
+fresh directories and newly reviewed memory, preserve the original expanded
+frozen tests/comparison policy, and currently support A3 executable optimizer
+tasks. Slow kernels must meet their original performance goal. Full profiler
+trees stay remote; feedback contains bounded summaries and evidence references.
+See [feedback observations](docs/phase2-feedback.md) and
+[failure-directed curriculum](docs/failure-directed-curriculum.md).
+
+<a id="dashboard"></a>
+
+## Campaign dashboard
+
+Create an ignored local JSON using [the example](dashboard/config.example.json),
+then install and start the viewer:
+
+```bash
+python -m pip install -r dashboard/requirements.txt
+python -m dashboard serve --config /path/to/dashboard.json --cache-dir /path/to/dashboard-cache
+```
+
+Open **http://127.0.0.1:8080**. In `campaigns`, list locally accessible campaign
+`root` paths, phase/target, and launcher `control` directories. Set top-level
+`feedback_root` to the shared feedback store; configure campaign settings with
+`phase2_feedback_root` to publish future Phase 2 observations there rather than
+the default `CAMPAIGN/feedback`. The viewer shows progress, retained traces,
+source, host verification, timing/profiling evidence, and failure/retry lineage.
+Missing evidence is shown as unavailable, not reconstructed.
+
+Controls are **off by default**. For optional controls, keep the listener on
+loopback, set `controls.enabled`, configure the launcher `runner`, and define
+complete server-side launch `presets` with unused root/control directories.
+With controls enabled, **every campaign and preset in that configuration must
+explicitly select `target: "a3"`**; mixed A3/A5 configurations are not supported.
+To view A5 alongside an A3 control dashboard, run a separate controls-disabled
+instance with its own configuration, cache directory, and port (for example,
+`--port 8081`). Phase 2 presets also require reviewed `phase1_root` and `review`
+paths. Use an SSH tunnel for remote access.
+
+Controls can sample/approve curriculum, launch approved projects, continue
+eligible campaigns, import feedback, start investigations, and request retries.
+Viewing/importing feedback never launches agents; every investigation/retry
+needs a fresh preset. Infrastructure/provider observations are retryable but
+not kernel-investigation tasks. The **Kernel Optimizer** tab is separate: its
+own `optimizer` configuration enables individual submission jobs, not campaign
+controls. See [dashboard setup and controls](dashboard/README.md) for configuration,
+approval/recovery behavior, and optimizer setup.
+
 <a id="run-batches"></a>
 
 ## 🚀 Run batches
@@ -328,6 +510,9 @@ experiments with the pinned configuration.
 - [Architecture](docs/ARCHITECTURE.md)
 - [OSWorld operations and recovery](docs/OPERATIONS.md)
 - [ALE setup, batches, and reports](docs/ALE.md)
+- [Ascend campaign launcher](docs/ascend-campaigns.md) · [Target/runtime setup](docs/ascend-target-launcher.md)
+- [Phase 2 optimizer workflow](docs/phase2-optimizer-campaign.md) · [Failure-directed learning](docs/failure-directed-curriculum.md)
+- [Campaign dashboard and controls](dashboard/README.md)
 - [Release provenance and validation](docs/RELEASE.md)
 - [Paper and reporting scope](docs/PAPER.md)
 - [Contributing](docs/CONTRIBUTING.md) · [Third-party attribution](docs/THIRD_PARTY.md)
