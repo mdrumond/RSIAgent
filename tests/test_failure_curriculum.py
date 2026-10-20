@@ -93,8 +93,16 @@ def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
         def prepare(self):
             return {'suite_sha256': 'fixture-original-suite'}
         def attempt(self, key, **kwargs):
-            return dict(verified=True, summary='scripted host fixture', speedup=2,
-                        job_id=self.job['job_id'], baseline=self.baseline)
+            source = 'scripted native candidate source'
+            result = dict(verified=True, summary='scripted host fixture', speedup=2,
+                attempt_id=key, task_id=task['task_id'], job_id=self.job['job_id'],
+                baseline=self.baseline, source_sha256=sha(source.encode()),
+                candidate=self.jobs.put_artifact(self.job['job_id'], 'candidate.json', canonical(source)),
+                result=dict(status='verified', candidate_sha256=sha(source.encode()),
+                    suite_sha256=original_baseline['suite_sha256'], cases=original_baseline['cases']))
+            result['result_artifact'] = self.jobs.put_artifact(self.job['job_id'], 'result.json', canonical(result))
+            self.jobs.add_event(self.job['job_id'], 'phase2-attempt-result', result)
+            return result
     retry_root = tmp_path / 'new-retry'
     reviewed = seed()
     reviewed['source_identity'] = dict(target='a3', language='ascend-c')
