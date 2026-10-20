@@ -276,3 +276,17 @@ def test_default_selection_filters_shared_store_without_relabeling_other_targets
             with pytest.raises(ValueError, match='incompatible'):
                 select_feedback(store.root, 'a3', [row['feedback_id']])
     assert store.records() == before
+
+
+def test_initial_infrastructure_feedback_can_defer_without_kernel_projects(tmp_path):
+    store, selection, feedback = setup(tmp_path)
+    deferred = dict(feedback_id=selection['selected'][0]['feedback_id'], status='deferred',
+        classification='infrastructure', reason='retained remote failure; no kernel execution')
+    agent = CurriculumAgent(lambda _: 'DECISION: STALLED\n' + json.dumps(dict(
+        reason='infrastructure must recover first', failure_investigations=[deferred])))
+    agent.failure_feedback = feedback
+    context = CurriculumContext('investigate', 1, 'a'*64, (), (),
+                                phase2_feedback=feedback.context({}))
+    decision, _ = agent.select(context)
+    assert decision.status == 'STALLED'
+    assert next(r for r in store.records() if r['feedback_id'] == deferred['feedback_id'])['investigation']['status'] == 'deferred'
