@@ -90,19 +90,45 @@ def test_resolution_requires_successful_original_task_retry(tmp_path):
 
 
 def test_pending_job_import_is_not_completed_attempt(tmp_path):
+    from optimizer.jobs import JobStore
     source = tmp_path / 'source'
     row = campaign(source)
     write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
     write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
     relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
-    write(source / relative / 'jobs' / ('a' * 32) / 'manifest.json',
-          dict(job_id='a' * 32, status='stopped', handles=[{'handle': 'remote:exact'}]))
+    jobs = JobStore(source / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
+    jobs.retain_handle(job['job_id'], 'remote:exact', operation='evaluate')
+    jobs.transition(job['job_id'], 'stopped')
     store = FeedbackStore(tmp_path / 'feedback')
     store.import_campaign(source)
     outcome = store.records()[0]['outcome']
     assert outcome['completed'] is False
     assert outcome['category'] == 'interrupted'
-    assert outcome['result']['handles'] == [{'handle': 'remote:exact'}]
+    assert outcome['result']['handles'] == [{'handle': 'remote:exact', 'operation': 'evaluate'}]
+
+
+@pytest.mark.parametrize('status', ['failed', 'stopped', 'budget-exhausted'])
+def test_pending_import_replays_terminal_event_over_stale_manifest(tmp_path, status):
+    from optimizer.jobs import JobStore
+    source = tmp_path / 'source'
+    row = campaign(source)
+    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
+    relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
+    jobs = JobStore(source / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
+    jobs.transition(job['job_id'], 'running')
+    path = jobs.root / job['job_id'] / 'manifest.json'
+    stale = path.read_bytes()
+    jobs.transition(job['job_id'], status)
+    path.write_bytes(stale)  # Event committed, process crashed before cache replacement.
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(source)['imported'] == 1
+    outcome = store.records()[0]['outcome']
+    assert outcome['completed'] is False
+    assert outcome['job_status']['status'] == status
+    assert outcome['category'] == ('budget-exhausted' if status == 'budget-exhausted' else 'interrupted')
 
 
 def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):

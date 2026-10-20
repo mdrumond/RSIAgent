@@ -189,7 +189,11 @@ class FeedbackStore:
                 manifests = sorted(jobs.glob('*/manifest.json'))
                 # A pending selection is not evidence of an interrupted execution.
                 for manifest in manifests:
-                    job = _read(manifest)
+                    try:
+                        job = JobStore(jobs).get(manifest.parent.name)
+                    except (ValueError, OSError) as error:
+                        report['warnings'].append(f'{manifest}: retained job unreadable: {error}')
+                        continue
                     if job.get('status') not in {'failed', 'stopped', 'budget-exhausted'}:
                         continue
                     row = {**pending, 'execution_directory': relative,
