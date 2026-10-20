@@ -626,6 +626,9 @@ def run_approved_curriculum(job, proposal_id, *, builder=build_controller):
                       else current["wave_index"] == base_wave
                       and current["status"] == terminal["status"])
         if reconciled:
+            reconcile_feedback = getattr(coordinator, 'reconcile_feedback', None)
+            if reconcile_feedback is not None:
+                reconcile_feedback()
             record = {**record, "status": "complete", "result": current,
                       "finished": time.time(), "recovered": True}
             _write(_approval_path(job), record)

@@ -368,6 +368,12 @@ class AdaptivePhase1Coordinator:
     def run_approved_wave(self):
         return self._run(wave_limit=1, approved_only=True)
 
+    def reconcile_feedback(self):
+        """Replay feedback publication from committed state without executing work."""
+        if self.failure_feedback is not None:
+            state = self._load_state()
+            self.failure_feedback.record(state.get('failure_investigations', []), state)
+
     def run_approved_proposal(self, proposal):
         """Commit one approved wave or a bound terminal curriculum decision."""
         if "terminal" not in proposal:

@@ -379,3 +379,60 @@ def test_nonobject_investigation_is_corrected_without_aborting_campaign(tmp_path
     assert len(calls) == 2
     original = next(r for r in store.records() if r['feedback_id'] in feedback.ids)
     assert original['investigation']['status'] == 'investigating'
+
+
+@pytest.mark.parametrize('terminal', [False, True])
+def test_cli_approval_recovers_feedback_after_committed_state(tmp_path, terminal):
+    from benchmarks.ascend import campaign_cli as cli
+    store, selection, initial = setup(tmp_path)
+    control = tmp_path/'control'
+    control.mkdir()
+    job = dict(control=str(control), root=str(initial.root), approval_mode=True, phase=1)
+    selections, executions, crashed = [], [], []
+    def complete(messages):
+        selections.append(1)
+        row = investigation(selection)
+        if terminal:
+            row.update(status='deferred', classification='infrastructure', reason='remote unavailable')
+            return 'DECISION: STALLED\n' + json.dumps(dict(reason='host infrastructure blocked',
+                failure_investigations=[row]))
+        payload = json.loads(_wave(messages[-1]['content'], [_project('probe', 'padded-tail'),
+            _project('control', 'gm-ub-movement')]).split('\n', 1)[1])
+        return 'DECISION: WAVE\n' + json.dumps(dict(payload, failure_investigations=[row]))
+    def builder(_job):
+        feedback = FailureCurriculum(initial.root, store.root, selection)
+        original_record, original_sync = feedback.record, feedback.sync
+        def interrupt_record(rows, state=None):
+            if terminal and state and state.get('terminal') and not crashed:
+                crashed.append(1)
+                raise SystemExit('after terminal state publication')
+            return original_record(rows, state)
+        def interrupt_sync(state):
+            if not terminal and state.get('wave_index') == 2 and not crashed:
+                crashed.append(1)
+                raise SystemExit('after wave state publication')
+            return original_sync(state)
+        feedback.record, feedback.sync = interrupt_record, interrupt_sync
+        agent = CurriculumAgent(complete)
+        agent.failure_feedback = feedback
+        runner = AdaptivePhase1Coordinator(initial.root, 'investigate', b'{}', agent,
+            lambda request: executions.append(request.spec.project_id) or _result(
+                request.spec, True, 'host fixture passed'), max_parallel=2, project_target=2)
+        runner.failure_feedback = feedback
+        return runner
+    proposed = cli.sample_curriculum(job, builder=builder)
+    cli.approve_curriculum(job, [] if terminal else ['probe', 'control'], proposed['proposal_id'], builder=builder)
+    with pytest.raises(SystemExit):
+        cli.run_approved_curriculum(job, proposed['proposal_id'], builder=builder)
+    assert cli._read(control/'curriculum-approval.json')['status'] == 'running'
+    original = next(r for r in store.records() if r['feedback_id'] in initial.ids)
+    assert original['investigation']['evidence'] == []
+    recovered = cli.run_approved_curriculum(job, proposed['proposal_id'], builder=builder)
+    assert recovered['status'] == 'complete' and recovered['recovered']
+    original = next(r for r in store.records() if r['feedback_id'] in initial.ids)
+    assert original['investigation']['status'] == ('deferred' if terminal else 'investigating')
+    assert original['investigation']['reason'] == ('remote unavailable' if terminal else 'isolate data movement')
+    assert original['investigation']['projects']
+    assert bool(original['investigation']['evidence']) is not terminal
+    assert len(selections) == 1 and len(executions) == (0 if terminal else 2)
+    assert cli.run_approved_curriculum(job, proposed['proposal_id'], builder=builder) == recovered
