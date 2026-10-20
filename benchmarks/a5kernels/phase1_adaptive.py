@@ -155,6 +155,7 @@ class AdaptivePhase1Coordinator:
         if max_projects is not None and (type(max_projects) is not int or max_projects < 1):
             raise ValueError("max_projects must be a positive integer or None")
         self.max_projects = max_projects
+        self.failure_feedback = None
 
     @staticmethod
     def root_state_target(root):
@@ -246,6 +247,8 @@ class AdaptivePhase1Coordinator:
             state = self._publish(state, wave, pending, deltas)
             self._atomic_json(self.root / "state.json", state)
             (self.root / "pending.json").unlink(missing_ok=True)
+            if self.failure_feedback is not None:
+                self.failure_feedback.sync(state)
             executed_waves += 1
             if wave_limit is not None and executed_waves >= wave_limit:
                 return self._report(state)
@@ -502,6 +505,7 @@ class AdaptivePhase1Coordinator:
             ),
             remaining,
             self._curriculum_feedback(state),
+            self.failure_feedback.context(state) if self.failure_feedback else (),
         )
 
     @staticmethod

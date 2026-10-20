@@ -194,6 +194,7 @@ class CurriculumContext:
     prior_outcomes: tuple[PriorOutcome, ...]
     remaining_projects: int = 64
     curriculum_memory: tuple[Mapping[str, object], ...] = ()
+    phase2_feedback: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -232,12 +233,14 @@ class CurriculumSession:
 @dataclass(frozen=True)
 class WaveDecision:
     wave: WaveSpec
+    failure_investigations: tuple[Mapping[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
 class TerminalDecision:
     status: str
     reason: str
+    failure_investigations: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if self.status not in {"SATURATED", "STALLED"}:
@@ -382,6 +385,10 @@ def curriculum_prompt(
             _grammar() if target_policy is None else target_policy.grammar(_grammar())
         ),
     }
+    if context.phase2_feedback:
+        from benchmarks.ascend.failure_curriculum import GUIDANCE
+        payload['phase2_feedback'] = list(context.phase2_feedback)
+        payload['failure_investigation_guidance'] = GUIDANCE
     if unavailable_capabilities:
         payload["unavailable_capabilities"] = [
             item.value for item in unavailable_capabilities
@@ -430,6 +437,7 @@ class CurriculumAgent:
         if not callable(complete):
             raise TypeError("complete must be callable")
         self._complete = complete
+        self.failure_feedback = None
         self.target_policy = target_policy
         self.profiling_guidance = profiling_guidance
         self.require_fresh_project_ids = require_fresh_project_ids
@@ -474,7 +482,8 @@ class CurriculumAgent:
                 f"Project budget: select no more than {remaining_projects} projects in this wave.\n"
                 + history[-1]["content"]
             )
-        for attempt in range(1, 4):
+        reads = 0
+        for attempt in range(1, 10):
             # Provider failures are not proposal-validation failures. Let the
             # caller's existing infrastructure handling observe them unchanged.
             # The current host context contains all authoritative prior outcomes.
@@ -486,11 +495,22 @@ class CurriculumAgent:
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
             try:
+                if self.failure_feedback is not None and completion.lstrip().startswith('{'):
+                    request = json.loads(completion)
+                    if not isinstance(request, dict) or set(request) != {'read_artifact'} or reads >= 6:
+                        raise ValueError('feedback permits at most six artifact reads')
+                    reads += 1
+                    try:
+                        page = self.failure_feedback.read(**request['read_artifact'])
+                    except (OSError, ValueError, TypeError) as error:
+                        page = {'error': str(error)}
+                    history.append({'role': 'user', 'content': json.dumps(page, sort_keys=True)})
+                    continue
                 decision = self._parse_and_validate(completion, context)
                 if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
                     raise ValueError("wave exceeds remaining project budget; select a smaller wave")
             except ValueError as exc:
-                if attempt == 3:
+                if attempt - reads >= 3:
                     raise ValueError(
                         f"curriculum selection failed validation after 3 attempts: {exc}"
                     ) from exc
@@ -504,6 +524,8 @@ class CurriculumAgent:
                     ),
                 })
                 continue
+            if self.failure_feedback is not None:
+                self.failure_feedback.record(decision.failure_investigations)
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise AssertionError("unreachable selection attempt")
 
@@ -520,6 +542,7 @@ class CurriculumAgent:
             raise ValueError("curriculum decision payload must be one JSON object") from exc
         if not isinstance(value, Mapping):
             raise ValueError("curriculum decision payload must be one JSON object")
+        investigations = value.pop('failure_investigations', []) if self.failure_feedback is not None else []
         if status != "WAVE":
             if set(value) != {"reason"}:
                 raise ValueError("terminal decision fields must be exactly reason")
@@ -532,6 +555,9 @@ class CurriculumAgent:
                 raise ValueError("saturation requires host-verified prior evidence")
             if status == "STALLED" and not context.prior_outcomes:
                 raise ValueError("stall requires an observed prior attempt")
+            if self.failure_feedback is not None:
+                metadata = self.failure_feedback.admit(investigations, None, context)
+                terminal = TerminalDecision(terminal.status, terminal.reason, metadata)
             return terminal
         wave = WaveSpec.from_mapping(value)
         for project in wave.projects:
@@ -593,7 +619,8 @@ class CurriculumAgent:
         }
         if self._held_out.intersection(executable_signatures):
             raise ValueError("wave matches a held-out contract or shape")
-        return WaveDecision(wave)
+        metadata = self.failure_feedback.admit(investigations, wave, context) if self.failure_feedback else ()
+        return WaveDecision(wave, metadata)
 
 
 __all__ = [

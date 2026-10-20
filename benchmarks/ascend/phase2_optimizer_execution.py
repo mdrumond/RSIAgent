@@ -22,9 +22,11 @@ from optimizer.worker import RemoteBackend, knowledge_query
 
 
 class OptimizerTaskExecutor:
-    def __init__(self, directory, task, memory_snapshot, config, *, agent=None, backend=None):
+    def __init__(self, directory, task, memory_snapshot, config, *, agent=None, backend=None,
+                 expected_baseline=None):
         self.directory = Path(directory)
         self.task, self.config = task, config
+        self.expected_baseline = expected_baseline
         verify_snapshot(memory_snapshot)
         spec = validate_submission(task['submission'])
         self.store = JobStore(self.directory / 'jobs')
@@ -90,11 +92,21 @@ class OptimizerTaskExecutor:
         with exclusive(self.job_directory / 'worker.lock'), exclusive(self._device_lock(), wait=True,
                 stopped=lambda: self.store.get(self.job_id)['stop_requested']):
             if 'baseline' not in self._state():
-                self._loop().run(prepare_only=True)
+                loop = self._loop()
+                if self.expected_baseline and 'spec' not in loop.state:
+                    spec = validate_submission(self.expected_baseline['frozen_submission'])
+                    loop.state['spec'] = loop._artifact('frozen-reference-submission', spec)
+                    loop._save()
+                loop.run(prepare_only=True)
             state = self._state()
             if 'baseline' not in state:
                 raise WorkerStopped('reference preparation stopped before a frozen baseline')
-            return self._read(state['baseline'])
+            baseline = self._read(state['baseline'])
+            expected = self.expected_baseline
+            if expected and (baseline['suite_sha256'] != expected['suite_sha256'] or
+                    baseline.get('manifest', {}).get('policy') != expected['policy']):
+                raise ValueError('retry frozen suite or comparison policy differs from original')
+            return baseline
 
     def attempt(self, attempt_id, *, memory_snapshot=None, feedback=None):
         """Return one evaluated candidate, or an explicit no-candidate failure.
