@@ -37,6 +37,9 @@ preparation failures are retained without charging an unstarted semantic attempt
 Interrupted attempts recover already-published baseline and candidate references
 from the latest optimizer-state event. This preserves the frozen acceptance suite
 for a later retry without inventing a completed native verdict.
+Candidate references additionally require an artifact publication belonging to the
+interrupted attempt's request boundary. A persistent previous candidate is omitted
+with a warning rather than attached to a new retry that never wrote a candidate.
 Semantic interruptions require a matching attempt/preparation request and newer
 terminal evidence; merely selecting a new pending retry cannot inherit an older
 attempt's stop. Missing historical boundaries are reported, not guessed.

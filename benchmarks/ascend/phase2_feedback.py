@@ -260,6 +260,7 @@ class FeedbackStore:
                         continue
                     if job.get('status') not in {'failed', 'stopped', 'budget-exhausted'}:
                         continue
+                    boundary = None
                     if pending.get('kind') not in {'qualification', 'practice-qualification'}:
                         boundary = next((event['sequence'] for event in reversed(events)
                             if event['kind'] in {'phase2-attempt-request', 'phase2-prepare-request'}
@@ -282,10 +283,22 @@ class FeedbackStore:
                         report['warnings'].append(f'{campaign}:{pending["attempt_id"]}: '
                             'durable evaluated evidence awaits normal attempt-result recovery; import deferred')
                         continue
+                    references = {role: prepared[role] for role in ('baseline',) if role in prepared}
+                    source = prepared.get('candidate')
+                    if source:
+                        source_boundary = next((event['sequence'] for event in events
+                            if event['kind'] == 'phase2-attempt-request'
+                            and event['payload'].get('attempt_id') == pending['attempt_id']), boundary)
+                        if source_boundary is not None and any(event['kind'] == 'artifact'
+                                and event['sequence'] > source_boundary and event['payload'] == source for event in events):
+                            references['candidate'] = source
+                        else:
+                            report['warnings'].append(f'{campaign}:{pending["attempt_id"]}: '
+                                'candidate ownership is not established for this attempt; reference omitted')
                     row = {**pending, 'execution_directory': relative,
                            'result': dict(job_id=job['job_id'], verified=False,
                                classification=job['status'], handles=job.get('handles', []),
-                               **{role: prepared[role] for role in ('baseline', 'candidate') if role in prepared})}
+                               **references)}
                     outcome = self._outcome(campaign, row, metadata, report)
                     outcome.update(completed=False, category='budget-exhausted' if job['status'] == 'budget-exhausted'
                                    else 'interrupted', job_status=job)

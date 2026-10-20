@@ -188,9 +188,9 @@ def test_prepared_interruption_retains_frozen_baseline_for_retry_resolution(tmp_
     baseline = dict(suite_sha256='1' * 64, cases=[dict(case='case-0')],
                     manifest=dict(policy=dict(name='host-policy', rtol=.01)))
     baseline_ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(baseline))
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
     candidate_ref = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('unfinished candidate'))
     jobs.add_event(job['job_id'], 'optimizer-state', dict(baseline=baseline_ref, candidate=candidate_ref))
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
     jobs.transition(job['job_id'], 'stopped')
     store = FeedbackStore(tmp_path / 'feedback')
     store.import_campaign(root)
@@ -557,3 +557,35 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
     assert (len(agent.contexts), len(backend.evaluations)) == calls
     assert store.import_campaign(root)['imported'] == 1
     assert len(store.records()) == 1 and store.records()[0]['outcome']['completed'] is True
+
+
+@pytest.mark.parametrize('new_candidate', [False, True])
+def test_interrupted_retry_does_not_inherit_previous_candidate(tmp_path, new_candidate):
+    from optimizer.jobs import JobStore
+    root = tmp_path / 'campaign'
+    old = campaign(root, baseline=False)
+    relative = 'tasks/relu-' + sha(canonical(old['task']))[:12]
+    jobs = JobStore(root / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='retry')
+    previous = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('previous completed candidate'))
+    baseline = jobs.put_artifact(job['job_id'], 'baseline.json', canonical({'suite_sha256': '1' * 64}))
+    old.update(execution_directory=relative)
+    old['result'].update(job_id=job['job_id'], attempt_id='attempt-001', candidate=previous)
+    jobs.add_event(job['job_id'], 'phase2-attempt-result', old['result'])
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[old]))
+    write(root / 'pending.json', dict(attempt_id='attempt-002', kind='target', task=old['task']))
+    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id='attempt-002'))
+    source = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('new interrupted candidate')) if new_candidate else previous
+    # A newer state checkpoint alone does not establish ownership of a persistent old candidate.
+    jobs.add_event(job['job_id'], 'optimizer-state', dict(baseline=baseline, candidate=source))
+    jobs.add_event(job['job_id'], 'phase2-prepare-request', dict(attempt_id='attempt-002'))
+    jobs.transition(job['job_id'], 'stopped')
+    store = FeedbackStore(tmp_path / 'feedback')
+    report = store.import_campaign(root)
+    interrupted = next(row['outcome'] for row in store.records() if not row['outcome']['completed'])
+    assert interrupted['evidence']['baseline']['sha256'] == baseline['sha256']
+    if new_candidate:
+        assert interrupted['evidence']['candidate']['sha256'] == source['sha256']
+    else:
+        assert 'candidate' not in interrupted['evidence']
+        assert any('candidate ownership' in warning for warning in report['warnings'])
