@@ -131,6 +131,30 @@ def test_pending_import_replays_terminal_event_over_stale_manifest(tmp_path, sta
     assert outcome['category'] == ('budget-exhausted' if status == 'budget-exhausted' else 'interrupted')
 
 
+@pytest.mark.parametrize('verified', [False, True])
+def test_completed_attempt_event_precedes_interruption_synthesis(tmp_path, verified):
+    from optimizer.jobs import JobStore
+    source = tmp_path / 'source'
+    row = campaign(source)
+    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
+    relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
+    jobs = JobStore(source / relative / 'jobs')
+    job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
+    jobs.transition(job['job_id'], 'running')
+    jobs.transition(job['job_id'], 'budget-exhausted')
+    result = dict(attempt_id=row['attempt_id'], job_id=job['job_id'], verified=verified,
+                  speedup=1.1, source_sha256='actual-candidate')
+    jobs.add_event(job['job_id'], 'phase2-attempt-result', result)
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(source)['imported'] == 1
+    outcome = store.records()[0]['outcome']
+    assert outcome['completed'] is True
+    assert outcome['verified'] is verified
+    assert outcome['category'] == ('verified-success' if verified else 'incorrect')
+    assert store.import_campaign(source)['existing'] == 1
+
+
 def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
     source = tmp_path / 'source'
     row = campaign(source, result=dict(verified=False, job_id='a' * 32,

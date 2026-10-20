@@ -214,9 +214,19 @@ class FeedbackStore:
                 # A pending selection is not evidence of an interrupted execution.
                 for manifest in manifests:
                     try:
-                        job = JobStore(jobs).get(manifest.parent.name)
+                        store = JobStore(jobs)
+                        job = store.get(manifest.parent.name)
+                        completed = next((event['payload'] for event in reversed(store.events(job['job_id']))
+                            if event['kind'] == 'phase2-attempt-result'
+                            and event['payload'].get('attempt_id') == pending['attempt_id']), None)
                     except (ValueError, OSError) as error:
                         report['warnings'].append(f'{manifest}: retained job unreadable: {error}')
+                        continue
+                    if completed is not None:
+                        row = {**pending, 'execution_directory': relative, 'result': completed}
+                        outcome = self._outcome(campaign, row, metadata, report)
+                        outcome.update(completed=True, category=_category(pending['task'], completed))
+                        report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
                         continue
                     if job.get('status') not in {'failed', 'stopped', 'budget-exhausted'}:
                         continue
