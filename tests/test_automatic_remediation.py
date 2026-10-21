@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from benchmarks.ascend.automatic_remediation import AutomaticRemediation
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
@@ -99,3 +101,63 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
     with automatic.project_active(request):
         now[0] += 60
     assert budget.elapsed_seconds == 0
+
+
+@pytest.mark.parametrize("standalone", [False, True])
+def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone):
+    from types import SimpleNamespace
+    from tests.test_a3_reviewed_phase2 import native_source
+    from tests.test_phase2_optimizer_execution import Agent, Backend, candidate, snapshot
+    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from benchmarks.ascend.automatic_remediation import optimizer_retry_adapter
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from optimizer.jobs import atomic, canonical
+    source, _, _ = native_source(tmp_path/'learning')
+    state = json.loads((source/'state.json').read_bytes())
+    state['prior_outcomes'][0]['summary'] = 'host verified'
+    atomic(source/'state.json', canonical(state))
+    task = dict(task_id='original', submission=dict(source='def forward(a): return a',
+        entrypoint='forward', signatures=[dict(args=[dict(shape=[8], dtype='float32')])]))
+    class FrozenBackend(Backend):
+        def __init__(self, latency):
+            super().__init__()
+            self.latency = latency
+        def prepare(self, spec, directory):
+            value = super().prepare(spec, directory)
+            value.update(suite_sha256='a'*64, manifest=dict(policy=dict(rtol=.001), submission=spec))
+            value['cases'][0]['timing']['torch']['latency_us'] = self.latency
+            return value
+        def evaluate(self, source, directory, **kwargs):
+            return dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
+    config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path/'validation.sh'), max_cases=1)
+    original_dir = tmp_path/'external'
+    first = OptimizerTaskExecutor(original_dir, task, snapshot(), config,
+        agent=Agent([dict(action='cases', signatures=[], summary='freeze'), candidate('bad')]), backend=FrozenBackend(10))
+    first.prepare()
+    failed = first.attempt('failed')
+    atomic(original_dir/'state.json', canonical(dict(phase='optimizer-phase2', attempts=[
+        dict(attempt_id='failed', task=task, result=failed, execution_directory='')])) )
+    atomic(original_dir/'campaign-identity.json', canonical(dict(target='a3', language='ascend-c')))
+    store = FeedbackStore(tmp_path/'feedback')
+    store.import_campaign(original_dir)
+    row = store.records()[0]
+    if standalone:
+        submission = first.store.submission(first.job_id)
+        original = {k: v for k, v in submission.items() if k not in {
+            'memory_snapshot', 'max_attempts', 'max_seconds', 'name'}}
+        row['outcome'].update(source_type='optimizer', original_spec=original,
+            task=dict(task_id='original', submission=original))
+        atomic(store.root / (row['feedback_id'] + '.json'), canonical(row))
+    received = []
+    def factory(directory, task, memory, bound, **kwargs):
+        received.append(memory)
+        return OptimizerTaskExecutor(directory, task, memory, bound,
+            agent=Agent([candidate('good')]), backend=FrozenBackend(12), **kwargs)
+    monkeypatch.setattr('benchmarks.ascend.phase2_optimizer_execution.OptimizerTaskExecutor', factory)
+    runner = SimpleNamespace(root=source, initial_memory=b'')
+    retry = optimizer_retry_adapter(runner, store, config)
+    retry(row, tmp_path/'retried', 30)
+    retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
+    assert store.link_original_retry(row['feedback_id'], retried['feedback_id'])['lifecycle'] == 'fixed'
+    assert received[0]['phase'] == 'committed-phase1'
+    assert len(received[0]['memory_entries']) == 1
