@@ -154,11 +154,11 @@ class OptimizerTaskExecutor:
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'} and 'pending' not in self._state():
                     evaluated = [item for item in self._state().get('history', []) if 'result' in item and 'candidate_sha256' in item]
                     if len(evaluated) <= sum(item.get('result') is not None for item in results):
-                        self.store.resume(self.job_id, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                        self.store.resume(self.job_id, additional_attempts=1, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
             else:
                 row = self.store.get(self.job_id)
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'}:
-                    self.store.resume(self.job_id, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                    self.store.resume(self.job_id, additional_attempts=1, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
                 for record, value in ((request['memory_snapshot'], memory_snapshot),
                                       (request['feedback'], feedback)):
                     if record is not None:

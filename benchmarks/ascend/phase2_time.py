@@ -73,6 +73,7 @@ class Phase2TimeBudget:
             raise RuntimeError('practice selection requires an active campaign operation')
         self.practice_started = self.clock()
         self.active_practice = True
+        self.state['inflight_seconds'] = min(self.remaining, self.practice_remaining)
         self.state['inflight_practice'] = True
         self.save()
         try:
@@ -82,6 +83,7 @@ class Phase2TimeBudget:
             self.practice_started = None
             self.active_practice = False
             self.state['inflight_practice'] = False
+            self.state['inflight_seconds'] = self.remaining
             self.save()
 
     @contextmanager

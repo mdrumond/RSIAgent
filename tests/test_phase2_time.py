@@ -50,3 +50,19 @@ def test_observing_live_allocation_does_not_consume_it(tmp_path):
             with observed.active():
                 pass
     assert Phase2TimeBudget(tmp_path, 20, 5).remaining == 17
+
+
+def test_practice_crash_reserves_only_admitted_practice_window(tmp_path):
+    budget = Phase2TimeBudget(tmp_path, 20, 5, clock=lambda: 0)
+    with budget.active():
+        with budget.practice_work():
+            retained = json.loads(budget.path.read_bytes())
+            assert retained['inflight_seconds'] == 5
+            retained.pop('owner_pid')
+            crash = tmp_path / 'crash'
+            crash.mkdir()
+            (crash / 'time-budget.json').write_text(json.dumps(retained))
+            recovered = Phase2TimeBudget(crash, 20, 5, clock=lambda: 0)
+            assert recovered.remaining == 15
+            assert recovered.practice_remaining == 0
+        assert budget.state['inflight_seconds'] == 20
