@@ -61,6 +61,7 @@ def test_expired_failure_budget_does_not_extend_campaign(tmp_path):
     automatic.refresh(runner._load_state())
     key = next(iter(automatic.budgets))
     path = runner.root / 'failure-budgets' / (key + '.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(dict(max_seconds=1800, elapsed_seconds=1800)))
     assert not automatic.refresh(runner._load_state())
     assert automatic.store.records()[0]['lifecycle'] == 'failed'
