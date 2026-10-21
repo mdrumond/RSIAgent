@@ -9,7 +9,7 @@ from optimizer.jobs import JobStore, atomic, canonical, sha
 from .phase2_feedback import FeedbackStore
 
 
-GUIDANCE = '''Investigate the supplied Phase 2 observations, which are failures or
+GUIDANCE = '''Investigate the supplied Phase 1, Phase 2 and optimizer observations, which are failures or
 working controls, NOT verified reusable knowledge. Distinguish learnable kernel,
 numerical, compilation and performance issues from infrastructure/provider errors,
 invalid specifications and suspected unsupported/impossible requirements. A budget
@@ -27,7 +27,8 @@ Add optional top-level failure_investigations to the ordinary DECISION JSON,
 outside the strict WaveSpec: [{"feedback_id":"...","status":"investigating",
 "classification":"learnable","reason":"...","project_id":"probe-id",
 "control_project_id":"control-id","hypothesis":"...","observation":"..."}].
-Every project in a feedback-directed wave must be a probe or control in this list.
+Prioritize remediation; fill remaining wave slots with new projects. Only remedial
+projects require probe/control lineage in this list.
 Classifications: learnable, infrastructure, provider, invalid-specification,
 suspected-unsupported, suspected-impossible. Status: investigating, deferred,
 ready-to-retry. Deferred needs reason; budget exhaustion alone is not a reason
@@ -53,11 +54,11 @@ def select_feedback(root, target, ids=(), *, retry_id=None):
     if retry_id:
         selected = [retry_id]
     if not selected:
-        raise ValueError('no unresolved Phase 2 feedback selected')
+        raise ValueError('no unresolved failure feedback selected')
     result = []
     for key in dict.fromkeys(selected):
         if key not in by_id:
-            raise ValueError('unknown Phase 2 feedback ID: ' + key)
+            raise ValueError('unknown failure feedback ID: ' + key)
         row = by_id[key]
         outcome = row['outcome']
         if not compatible(outcome):
@@ -76,6 +77,17 @@ class FailureCurriculum:
         self.path = self.root / 'failure-investigations.json'
         self.lineage = json.loads(self.path.read_bytes()) if self.path.exists() else []
         self.ids = {r['feedback_id'] for r in selection['selected']}
+
+    def refresh(self, target):
+        """Reload unresolved observations before selecting the next mixed wave."""
+        try:
+            self.selection = select_feedback(self.store.root, target)
+        except ValueError as error:
+            if str(error) != 'no unresolved failure feedback selected':
+                raise
+            self.selection = dict(selected=[], controls=[])
+        self.ids = {row['feedback_id'] for row in self.selection['selected']}
+        return self.selection
 
     def context(self, state):
         self.state = state
@@ -127,7 +139,6 @@ class FailureCurriculum:
             raise ValueError('failure_investigations must be a list')
         projects = {p.spec.project_id for p in wave.projects} if wave else set()
         prior = {p.project_id for p in context.prior_outcomes if p.verified}
-        covered = set()
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError('failure_investigations entries must be objects')
@@ -147,15 +158,12 @@ class FailureCurriculum:
             if row['status'] == 'investigating':
                 if probe not in projects or not row.get('hypothesis') or not row.get('observation'):
                     raise ValueError('investigation requires a small probe, hypothesis and observation')
-                covered.update({probe, control} & projects)
             elif not any(old['feedback_id'] == row['feedback_id'] and
                     old.get('project_id') == probe and old.get('control_project_id') == control
                     for old in self.lineage):
                 raise ValueError('retry recommendation requires a previously linked probe/control')
             elif not self._supported(row, self.state):
                 raise ValueError('retry recommendation requires committed host probe/control evidence')
-        if projects - covered:
-            raise ValueError('feedback wave contains projects without investigation lineage')
         latest = {row['feedback_id']: row for row in [*self.lineage, *rows]}
         if wave is None and any(latest.get(key, {}).get('status') not in
                 {'ready-to-retry', 'deferred'} for key in self.ids):

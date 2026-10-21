@@ -1,4 +1,4 @@
-"""Phase 2 observations, not verified knowledge; imports never execute workloads."""
+"""Failure observations, not verified knowledge; imports never execute workloads."""
 from __future__ import annotations
 
 import json
@@ -46,7 +46,7 @@ def _same_observation(old, new):
 
 def _logical_outcome(outcome):
     # Moving retained files changes locations, not the historical observation.
-    return {**{key: value for key, value in outcome.items() if key not in {'source_root', 'evidence', 'job_incarnation'}},
+    return {**{key: value for key, value in outcome.items() if key not in {'source_root', 'evidence', 'job_incarnation', 'source_type', 'original_spec'}},
             'evidence': {role: {key: value for key, value in ref.items() if key != 'job_root'}
                          for role, ref in outcome['evidence'].items()}}
 
@@ -116,7 +116,15 @@ class FeedbackStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def records(self):
-        return [_read(path) for path in sorted(self.root.glob('*.json'))]
+        return [self._present(_read(path)) for path in sorted(self.root.glob('*.json'))]
+
+    @staticmethod
+    def _present(record):
+        control = record['outcome']['category'] in {'verified-success', 'verified-timing-unknown'}
+        record['lifecycle'] = None if control else {
+            'resolved': 'fixed', 'ready-to-retry': 'remediated'
+        }.get(record['investigation']['status'], 'failed')
+        return record
 
     def read_evidence(self, digest, offset=0, limit=8192):
         """Authenticate a locally retained linked artifact, then return one text page."""
@@ -126,9 +134,12 @@ class FeedbackStore:
                 if ref['sha256'] == digest]
         for ref in refs:
             try:
-                if not Path(ref['job_root']).is_dir():
-                    continue
-                path = JobStore(ref['job_root']).artifact_path(ref['job_id'], digest)
+                if ref.get('retained_path'):
+                    path = Path(ref['retained_path'])
+                else:
+                    if not Path(ref['job_root']).is_dir():
+                        continue
+                    path = JobStore(ref['job_root']).artifact_path(ref['job_id'], digest)
                 with path.open('rb') as stream:
                     if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
                         raise ValueError('artifact digest mismatch')
@@ -169,7 +180,12 @@ class FeedbackStore:
             if (value['status'] == 'resolved' and not control
                     and not value.get('retries')):
                 raise ValueError('resolution requires a linked successful original-task retry')
-            if value['status'] == 'resolved' and not control:
+            if value['status'] == 'resolved' and not control and record['outcome'].get('source_type') in {'phase1', 'optimizer'}:
+                known = {row['feedback_id']: row for row in self.records()}
+                if not any(self._original_retry(record['outcome'], known.get(key, {}).get('outcome', {}))
+                           for key in value['retries']):
+                    raise ValueError('resolution requires authenticated successful original-project retry')
+            elif value['status'] == 'resolved' and not control:
                 if (record['outcome']['target'] not in {'a3', 'a5'}
                         or record['outcome']['language'] not in {'ascend-c', 'catlass-dsl'}):
                     raise ValueError('resolution requires known target and language identity')
@@ -190,7 +206,7 @@ class FeedbackStore:
                     raise ValueError('resolution requires a verified successful original-task retry')
             record['investigation'] = value
             atomic(path, canonical(record))
-            return record
+            return self._present(record)
 
     def _put(self, outcome, warnings):
         identity = _observation_identity(outcome)
@@ -219,6 +235,154 @@ class FeedbackStore:
                     classification=None, reason=None, projects=[], retries=[], evidence=[]))
             atomic(path, canonical(record))
         return True
+
+    @staticmethod
+    def _identity(root, target, language):
+        metadata = _read(root / 'campaign-identity.json', {})
+        target = target or metadata.get('target', 'unknown')
+        target = {'native-a3': 'a3', 'native-a5': 'a5'}.get(target, target)
+        return target, language or metadata.get('language', 'unknown')
+
+    def import_phase1(self, root, *, target=None, language=None):
+        """Import only outcomes committed by the adaptive wave publisher."""
+        root = Path(root).resolve()
+        report = dict(source_root=str(root), imported=0, existing=0, warnings=[])
+        state = _read_import(root / 'state.json', report['warnings'], {})
+        if state.get('schema') != 'a5-phase1-adaptive-state-v2':
+            report['warnings'].append('no supported committed Phase 1 state found')
+            return report
+        target, language = self._identity(root, target, language)
+        for row in state.get('failed_outcomes', []) + state.get('prior_outcomes', []):
+            try:
+                spec = row['spec']
+                pid = row['project_id']
+                # The state commits a project once; proposal/pending waves are excluded.
+                branches = [root / 'waves' / wave / 'branches' / pid
+                            for wave in state.get('completed_waves', [])]
+                branch = next((path for path in branches if (path / 'outcome.json').is_file()), None)
+                evidence = {}
+                if branch:
+                    plan = branch.parent.parent / 'plan.json'
+                    if plan.is_file():
+                        evidence['plan'] = dict(retained_path=str(plan), sha256=sha(plan.read_bytes()))
+                    for name in ('outcome.json', 'execution-evidence.bin', 'memory-delta.bin'):
+                        path = branch / name
+                        if path.is_file():
+                            evidence[name] = dict(retained_path=str(path), sha256=sha(path.read_bytes()))
+                verified = row.get('verified') is True
+                outcome = dict(source_type='phase1', source_root=str(root), attempt_id=pid,
+                    completed=True, kind='project', target=target, language=language,
+                    original_spec=spec, task=dict(task_id=pid, project_spec=spec), runtime={},
+                    category='verified-success' if verified else row.get('evidence', {}).get('classification', 'incorrect'),
+                    verified=verified, result=dict(verified=verified, summary=row.get('summary'),
+                        classification=row.get('evidence', {}).get('classification')),
+                    evidence=evidence, interpretation='Observation, not verified reusable knowledge')
+                report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+            except (KeyError, TypeError, OSError, ValueError) as error:
+                report['warnings'].append(f'{root}: unreadable committed project: {error}')
+        return report
+
+    def import_optimizer(self, root, *, target=None, language=None):
+        """Import terminal standalone jobs, retaining frozen optimizer artifacts."""
+        root = Path(root).resolve()
+        report = dict(source_root=str(root), imported=0, existing=0, warnings=[])
+        if not root.is_dir():
+            report['warnings'].append('source root is missing')
+            return report
+        store = JobStore(root)
+        target, language = self._identity(root, target, language)
+        for manifest in sorted(root.glob('*/manifest.json')):
+            try:
+                job = store.get(manifest.parent.name)
+                if job['status'] not in {'failed', 'stopped', 'budget-exhausted', 'completed'}:
+                    continue
+                events = store.events(job['job_id'])
+                # Phase 2 owns these observations and their established identities.
+                if any(event['kind'].startswith('phase2-') for event in events):
+                    continue
+                state = next((event['payload'] for event in reversed(events)
+                              if event['kind'] == 'optimizer-state'), {})
+                best = state.get('best', {})
+                result = dict(job_id=job['job_id'], verified=bool(best),
+                    classification=job['status'], speedup=best.get('speedup'),
+                    result=best.get('content', {}))
+                evidence = {}
+                for role, ref in dict(baseline=state.get('baseline'), candidate=best.get('source'),
+                                      evaluation=best.get('result')).items():
+                    if ref:
+                        store.read_artifact(job['job_id'], ref['sha256'])
+                        evidence[role] = dict(ref, job_root=str(root), job_id=job['job_id'])
+                spec = store.submission(job['job_id'])
+                # Memory and budgets vary across retries; acceptance inputs do not.
+                original = {key: value for key, value in spec.items()
+                            if key not in {'memory_snapshot', 'max_attempts', 'max_seconds'}}
+                task = dict(task_id=job['name'] or job['job_id'], submission=original)
+                outcome = dict(source_type='optimizer', source_root=str(root),
+                    attempt_id=job['job_id'], completed=True, kind='optimizer',
+                    target=target, language=language, original_spec=original,
+                    task=task, runtime={}, job_incarnation=events[0]['sha256'],
+                    verified=bool(best), result=result, evidence=evidence,
+                    category=_category(task, result),
+                    interpretation='Observation, not verified reusable knowledge')
+                report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+            except (KeyError, TypeError, ValueError, OSError) as error:
+                report['warnings'].append(f'{manifest}: unreadable optimizer job: {error}')
+        return report
+
+    @staticmethod
+    def _original_retry(original, retry):
+        if (not retry.get('verified') or original.get('source_type') != retry.get('source_type')
+                or original.get('original_spec') != retry.get('original_spec')
+                or original['target'] not in {'a3', 'a5'}
+                or original['target'] != retry.get('target')
+                or original['language'] != retry.get('language')
+                or original['language'] not in {'ascend-c', 'catlass-dsl'}):
+            return False
+        try:
+            if original['source_type'] == 'optimizer':
+                from optimizer.loop import score
+                def artifact(outcome, role):
+                    ref = outcome['evidence'][role]
+                    return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
+                baseline = artifact(original, 'baseline')
+                if baseline != artifact(retry, 'baseline'):
+                    return False
+                measured = score(baseline, artifact(retry, 'evaluation'))
+                return measured is not None and measured >= 1.0
+            plan_ref = retry['evidence']['plan']
+            plan_data = Path(plan_ref['retained_path']).read_bytes()
+            if sha(plan_data) != plan_ref['sha256']:
+                return False
+            plan = json.loads(plan_data)
+            if not any(project['spec'] == retry['original_spec'] for project in plan['wave']['projects']):
+                return False
+            ref = retry['evidence']['outcome.json']
+            data = Path(ref['retained_path']).read_bytes()
+            if sha(data) != ref['sha256']:
+                return False
+            outcome = json.loads(data)
+            evidence = retry['evidence']['execution-evidence.bin']
+            payload = Path(evidence['retained_path']).read_bytes()
+            return (outcome.get('verified') is True
+                    and outcome.get('wave_fingerprint') == plan['wave_fingerprint']
+                    and outcome.get('project_id') == retry['original_spec']['project_id']
+                    and sha(payload) == evidence['sha256']
+                    and outcome.get('evidence_sha256') == evidence['sha256'])
+        except (KeyError, ValueError, OSError, TypeError):
+            return False
+
+    def link_original_retry(self, feedback_id, retry_id):
+        """Record an attempt; only authenticated original acceptance marks it fixed."""
+        known = {row['feedback_id']: row for row in self.records()}
+        original, retry = known[feedback_id], known[retry_id]
+        if feedback_id == retry_id:
+            raise ValueError('retry must have a distinct execution identity')
+        def merge(current):
+            updates = dict(retries=list(dict.fromkeys([*current['retries'], retry_id])))
+            updates['status'] = ('resolved' if self._original_retry(original['outcome'], retry['outcome'])
+                                 else 'open')
+            return updates
+        return self.update_investigation(feedback_id, merge=merge)
 
     def import_campaign(self, root):
         root = Path(root).resolve()
@@ -375,7 +539,7 @@ class FeedbackStore:
         if target not in {'a3', 'a5'}:
             target = {'ascend-a3': 'a3', 'ascend-a5': 'a5'}.get(metadata.get('benchmark'), 'unknown')
         return dict(source_root=str(campaign), attempt_id=row['attempt_id'],
-            kind=row.get('kind', 'target'), target=target,
+            kind=row.get('kind', 'target'), source_type='phase2', original_spec=row['task'], target=target,
             language=metadata.get('language', runtime.get('language', 'unknown')),
             runtime=runtime, job_incarnation=incarnation, task=row['task'], verified=result.get('verified') is True,
             result=result, evidence=evidence, interpretation='Observation, not verified reusable knowledge')
