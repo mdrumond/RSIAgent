@@ -1431,3 +1431,25 @@ def test_background_failure_is_sanitized_and_visible(tmp_path):
     assert operation["status"] == "failed"
     assert "provider unavailable" in operation["error"]
     assert "SECRET_TOKEN" not in operation["error"]
+
+
+def test_usefulness_page_and_evidence_routes(campaign, tmp_path):
+    directory = tmp_path / 'phase1/memory-usefulness' / ('a' * 64)
+    write(directory / '0000.json', dict(kind='started', lesson={'claim': 'Tail insight'},
+        source_id='vector-add', lesson_id='b' * 64, arm_seconds=300))
+    write(directory / '0001.json', dict(kind='assessment', outcome='both-succeeded',
+        arms={'control': {'verified': True}, 'treatment': {'verified': True}}))
+    write(directory / 'control/evidence.json', {'verified': True})
+    app = create_app(campaign, tmp_path / 'cache.sqlite3', refresh_seconds=0)
+    try:
+        client = app.test_client()
+        body = client.get('/memory').get_data(as_text=True)
+        assert 'Tail insight' in body and 'both-succeeded' in body
+        assert 'does not establish that memory is useless' in body
+        assert client.get('/api/phase/1/usefulness').get_json()[0]['outcome'] == 'both-succeeded'
+        endpoint = '/api/phase/1/usefulness/' + 'a' * 64
+        assert client.get(endpoint + '/control').get_json()['text'] == '{"verified": true}'
+        assert client.get(endpoint + '/other').status_code == 404
+        assert client.get(endpoint + '/treatment').status_code == 404
+    finally:
+        app.extensions['dashboard_controls'].close()

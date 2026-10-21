@@ -524,7 +524,7 @@ def _optimizer_projects(root, state):
     return projects
 
 
-def _campaign(entry):
+def _load_campaign(entry):
     root = Path(entry["root"])
     if not root.is_dir():
         raise FileNotFoundError(f"campaign root unavailable: {root}")
@@ -610,6 +610,11 @@ def _campaign(entry):
             "stats": {"attempted": len(projects),
                       "verified": sum(project["verified"] for project in projects),
                       "published": published}, "projects": projects, "planned": planned}
+
+
+def _campaign(entry):
+    from .usefulness import enrich
+    return enrich(_load_campaign(entry))
 
 
 class DashboardStore:

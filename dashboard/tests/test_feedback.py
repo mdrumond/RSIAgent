@@ -68,7 +68,7 @@ def test_feedback_readonly_separates_correctness_performance_and_investigation(f
     body = client.get('/feedback').get_data(as_text=True)
     assert 'verified-slow' in body and 'shortfall' in body and 'Host correctness:' in body
     assert 'original attempt attempt-001' in body and 'Investigation:</b> open' in body
-    assert client.get('/api/feedback').get_json() == [row]
+    assert client.get('/api/feedback').get_json() == [{**row, 'lifecycle': 'failed'}]
     assert not calls
     settings = json.loads(config.read_text())
     settings['controls']['enabled'] = False
@@ -77,7 +77,7 @@ def test_feedback_readonly_separates_correctness_performance_and_investigation(f
     try:
         view = readonly.test_client()
         assert 'data-feedback-action' not in view.get('/feedback').get_data(as_text=True)
-        assert view.get('/api/feedback').get_json() == [row]
+        assert view.get('/api/feedback').get_json() == [{**row, 'lifecycle': 'failed'}]
         assert view.post('/api/control/investigate', json={}).status_code == 403
     finally:
         readonly.extensions['dashboard_controls'].close()
@@ -107,7 +107,7 @@ def test_retry_is_one_original_goal_with_reviewed_memory_and_no_approval_flag(fe
     assert argv[argv.index('--phase1-root') + 1] == '/reviewed-phase1'
     assert argv[argv.index('--review') + 1] == '/review.json'
     assert argv[-2:] == ['--retry-feedback-id', row['feedback_id']]
-    assert client.get('/api/feedback').get_json() == [row]  # start does not rewrite history
+    assert client.get('/api/feedback').get_json() == [{**row, 'lifecycle': 'failed'}]  # start does not rewrite history
 
 
 @pytest.mark.parametrize('status', ['resolved', 'deferred'])

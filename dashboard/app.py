@@ -29,6 +29,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     register_optimizer(app, config_path, csrf_token, optimizer_launcher)
     from .feedback import register_feedback
     register_feedback(app, controls, csrf_token)
+    from .usefulness import register_usefulness
+    register_usefulness(app, controls)
     last = [0.0]
 
     def view():
