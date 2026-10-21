@@ -281,7 +281,7 @@ class AdaptivePhase1Coordinator:
                 with remediate.active() if remediate else nullcontext():
                     decision, session = self._select(
                         self._context(state, snapshot), self._session(state),
-                        remaining_projects=max(1, self.max_parallel if obligations else
+                        remaining_projects=max(1, remediate.wave_slots(state) if obligations else
                                                self.project_target - len(state["prior_outcomes"])),
                     )
                 if self._time_exhausted(state):
@@ -690,7 +690,7 @@ class AdaptivePhase1Coordinator:
         remaining = max(0, self.project_target - len(state["prior_outcomes"]))
         context_state = self._seed_context_state(state)
         if self.automatic_remediation and self.automatic_remediation.feedback.ids:
-            remaining = max(remaining, self.max_parallel)
+            remaining = max(remaining, self.automatic_remediation.wave_slots(state))
         return CurriculumContext(
             self.objective,
             state["wave_index"],
