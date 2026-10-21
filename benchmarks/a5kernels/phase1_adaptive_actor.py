@@ -425,6 +425,18 @@ class _ProjectActions:
         )
 
 
+class _ObservedActions:
+    """Keep live host state and deadlines visible through trace instrumentation."""
+    def __init__(self, actions, observe):
+        self.actions, self.observe = actions, observe
+
+    def __getattr__(self, name):
+        return getattr(self.actions, name)
+
+    def __call__(self, action):
+        return self.observe(action)
+
+
 class AdaptiveActorProjectExecutor:
     """Drive bounded candidate repair, then emit only distilled verified memory."""
 
@@ -548,7 +560,7 @@ class AdaptiveActorProjectExecutor:
 
             actor = actor.with_trace(observe)
 
-            def execute_action(action):
+            def observe_action(action):
                 outcome = actions(action)
                 if action.kind == "write" and actions.source is not None:
                     recorder.candidate(actions.source, candidate_id=actions.source_sha256)
@@ -572,6 +584,7 @@ class AdaptiveActorProjectExecutor:
                         details={"classification": result.evidence.classification.value},
                     )
                 return outcome
+            execute_action = _ObservedActions(actions, observe_action)
         try:
             outcome = actor(
                 opening, profile=self.profile, workspace=root / "actor",

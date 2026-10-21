@@ -186,7 +186,16 @@ def test_adaptive_trace_retains_repair_but_excludes_distillation(tmp_path):
     from benchmarks.a5kernels.sft_dataset import _read_trace, _example
     executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
     request = _request(tmp_path, executor)
-    actor = TracedScriptedActor([
+    class DeadlineCheckingActor(TracedScriptedActor):
+        def __call__(self, instruction, **kwargs):
+            import time
+            actions = kwargs['action_executor']
+            assert 0 < actions.deadline-time.monotonic() <= 5
+            assert actions.query_knowledge is not None
+            return super().__call__(instruction, **kwargs)
+    from dataclasses import replace
+    request = replace(request, remaining_seconds=5)
+    actor = DeadlineCheckingActor([
         '{"write":{"slot":"kernel","content":"broken source"}}',
         '{"run":{}}',
         '{"write":{"slot":"kernel","content":"fixed source"}}',

@@ -52,9 +52,11 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path)
                 if c.profiling is ProfilingGuidance.NEW and c.model.provider == "OpenAI"
                 and c.knowledge.value == "without-kdb")
     calls = []
+    now = [0.0]
 
     def transport(**kwargs):
         calls.append(kwargs["request"])
+        now[0] += 1
         return DirectCompletion('DECISION: WAVE\n{}', 1)
 
     campaign = build_adaptive_phase1(
@@ -70,7 +72,8 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path)
     spec = _project("context-copy", "gm-ub-movement")
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
     prepared = campaign.project_actor.executor.prepare(ProjectSpec.from_mapping(spec))
-    campaign.actor.max_turns = 1
+    campaign.actor.max_seconds = 1
+    campaign.actor.clock = lambda: now[0]
     with pytest.raises(RuntimeError, match="without host-verified"):
         campaign.project_actor(AdaptiveProjectRequest(
             prepared.spec, 1, b"", tmp_path / "actor-proof", prepared.inputs, prepared.expected,
