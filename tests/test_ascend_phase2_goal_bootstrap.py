@@ -17,7 +17,7 @@ from test_ascend_phase2_curriculum import snapshot, project
 from test_ascend_phase2_targets import RUNTIME
 
 
-def setup(tmp_path, responses, *, failure=None, query=None):
+def setup(tmp_path, responses, *, failure=None, query=None, clock=None, max_seconds=7200):
     calls, messages = [], []
     class Backend(FakeBackend):
         def run(self, request, compilation):
@@ -54,7 +54,8 @@ def setup(tmp_path, responses, *, failure=None, query=None):
     coordinator.root = root
     def run():
         return bootstrap_goal(coordinator, root=root, private_root=tmp_path / "control" / "bootstrap",
-                              objective="Optimize a new task", available_tools=getattr(run, "available_tools", ()))
+                              objective="Optimize a new task", available_tools=getattr(run, "available_tools", ()),
+                              max_seconds=max_seconds, clock=clock)
     run.coordinator = coordinator
     return run, root, calls, messages, actor, backend
 
@@ -96,14 +97,19 @@ def test_renamed_phase1_and_invalid_proposal_are_corrected(tmp_path):
 
 
 def test_exhaustion_never_starts_learner(tmp_path):
-    run, root, calls, messages, _, _ = setup(tmp_path, ["bad"] * 3)
-    with pytest.raises(ValueError, match="bootstrap failed"):
+    now = [0.0]
+    def bad(_):
+        now[0] += 1
+        return 'bad'
+    run, root, calls, messages, _, _ = setup(tmp_path, [bad] * 5,
+        clock=lambda: now[0], max_seconds=5)
+    with pytest.raises(TimeoutError, match="elapsed-time"):
         run()
-    assert not calls and len(messages) == 3
+    assert not calls and len(messages) == 5
     assert json.loads((root / "goal-selection.json").read_bytes())["stage"] == "failed"
-    with pytest.raises(ValueError, match="bootstrap failed"):
+    with pytest.raises(TimeoutError, match="elapsed-time"):
         run()
-    assert len(messages) == 3
+    assert len(messages) == 5
 
 
 def test_reference_failure_feeds_next_proposal_but_infrastructure_preserves_budget(tmp_path):
@@ -151,7 +157,7 @@ def test_64_large_memories_and_tool_reads_fit_provider_budget_without_losing_see
         return SimpleNamespace(observation={"results": [{"citation": {"path": "kernel.cpp"},
             "text": "huge reference code " * 2000}] * 3})
     run, _, calls, messages, _, _ = setup(tmp_path,
-        [json.dumps({"query": "vector code"})] * 3 + [page] * 3 + [proposal(100)], query=query)
+        [json.dumps({"query": "vector code"})] * 7 + [page] * 8 + [proposal(100)], query=query)
     memories = []
     for index in range(64):
         memory = deepcopy(snapshot().memory_entries()[0])
@@ -160,7 +166,7 @@ def test_64_large_memories_and_tool_reads_fit_provider_budget_without_losing_see
         memories.append(memory)
     run.coordinator.snapshot.memory_entries = lambda: memories
     run()
-    assert len(messages) == 7
+    assert len(messages) == 16
     assert max(len(json.dumps(request).encode()) for request in messages) < 192 * 1024
     envelope = json.loads(calls[0].pre_wave_memory)
     assert json.loads(base64.b64decode(envelope["initial_memory_base64"]))["phase1_memory"] == memories
@@ -234,3 +240,32 @@ def test_actual_reference_actor_can_submit_profile_timing_goal_without_measureme
     assert target.spec.as_dict() == value
     assert backend.compile_requests[-1].spec == target.spec
     assert backend.compile_requests[0].spec.timing_lengths == ()
+
+
+def test_autonomous_goal_and_reference_share_campaign_time_allocation(tmp_path):
+    from benchmarks.ascend.phase2_time import Phase2TimeBudget
+    now = [0.0]
+    def select(_):
+        now[0] += 2
+        return proposal()
+    def reference(_):
+        now[0] += 3
+    run, root, calls, _, _, backend = setup(tmp_path, [select], failure=reference)
+    original_run = backend.run
+    def native_run(request, compilation):
+        now[0] += 1
+        return original_run(request, compilation)
+    backend.run = native_run
+    budget = Phase2TimeBudget(root, 10, 2, clock=lambda: now[0])
+    with budget.active():
+        bootstrap_goal(run.coordinator, root=root, private_root=tmp_path / 'control/bootstrap',
+            objective='goal', available_tools=(), remaining_seconds=lambda: budget.remaining)
+    assert calls[0].remaining_seconds == 8
+    # The learner opens the same campaign ledger after goal qualification.
+    assert Phase2TimeBudget(root, 10, 2, clock=lambda: now[0]).remaining == 4
+
+
+def test_autonomous_goal_can_correct_more_than_three_proposals(tmp_path):
+    run, _, calls, messages, _, _ = setup(tmp_path, ['bad'] * 5 + [proposal()])
+    run()
+    assert len(messages) == 6 and len(calls) == 1

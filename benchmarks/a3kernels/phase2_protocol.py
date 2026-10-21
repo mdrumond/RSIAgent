@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 import re
+import time
+
+from benchmarks.ascend.phase2_time import Phase2TimeBudget
 from typing import Any
 
 from benchmarks.a3_experiments import (
@@ -32,8 +35,7 @@ from core.self_evolving_loop import (
 )
 
 
-MAX_PRACTICE_PROJECTS = 8
-MAX_TARGET_ATTEMPTS = 9
+DEFAULT_MAX_SECONDS = 7200
 _SHA = re.compile(r"[0-9a-f]{64}")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
@@ -246,7 +248,7 @@ class A3Phase2Adapter:
         self,
         identity: A3Phase2Identity,
         hooks: A3Phase2Hooks,
-        evidence_path: str | Path,
+        evidence_path: str | Path, *, max_seconds=DEFAULT_MAX_SECONDS, clock=time.monotonic,
     ) -> None:
         if not isinstance(identity, A3Phase2Identity):
             raise TypeError("identity must be A3Phase2Identity")
@@ -255,6 +257,10 @@ class A3Phase2Adapter:
         self.identity = identity
         self.hooks = hooks
         self.evidence = EvidenceLedger(evidence_path)
+        time_root = Path(evidence_path).with_suffix(".time")
+        if self.evidence.entries and not (time_root / "time-budget.json").exists():
+            raise ValueError("legacy Phase 2 evidence requires an explicit time-budget migration")
+        self.time = Phase2TimeBudget(time_root, max_seconds, clock=clock)
 
     def _require_identity(self, value: Any, label: str) -> None:
         if getattr(value, "identity", None) != self.identity:
@@ -273,7 +279,11 @@ class A3Phase2Adapter:
             },
         )
 
-    def run(
+    def run(self, *args, **kwargs):
+        with self.time.active():
+            return self._run(*args, **kwargs)
+
+    def _run(
         self, target_direction: str, memory: Any, *,
         start: SelfEvolvingStart | None = None,
         completed_practice_projects: tuple[str, ...] = (),
@@ -298,20 +308,19 @@ class A3Phase2Adapter:
             "PHASE2_STARTED",
             {
                 "stop_policy": "curriculum_review",
-                "max_practice_projects": MAX_PRACTICE_PROJECTS,
-                "max_target_attempts": MAX_TARGET_ATTEMPTS,
+                "max_seconds": self.time.maximum,
             },
             EvidenceKind.PLAN,
         )
 
         def environment(_direction: str, attempt: int) -> OwnedAgent:
-            if attempt > MAX_TARGET_ATTEMPTS:
+            if self.time.remaining <= 0:
                 self._event(
                     "PHASE2_BUDGET_STOPPED",
                     {"target_attempts": attempt - 1, "practice_projects": practice_count},
                     EvidenceKind.RESULT,
                 )
-                raise A3Phase2BudgetStop("nine target attempts exhausted")
+                raise A3Phase2BudgetStop("Phase 2 elapsed-time budget exhausted")
             item = self.hooks.fresh_target_environment(self.identity, attempt)
             self._require_identity(item, "target environment")
             if not isinstance(item, OwnedAgent) or item.instance_id in seen_targets:
@@ -434,14 +443,8 @@ class A3Phase2Adapter:
                 )
             assert decision.project is not None
             project_id = decision.project.project_id
-            if practice_count >= MAX_PRACTICE_PROJECTS:
-                self._event(
-                    "PHASE2_BUDGET_STOPPED",
-                    {"target_attempts": len(seen_targets),
-                     "practice_projects": practice_count},
-                    EvidenceKind.RESULT,
-                )
-                raise A3Phase2BudgetStop("eight practice projects exhausted")
+            if self.time.remaining <= 0:
+                raise A3Phase2BudgetStop("Phase 2 elapsed-time budget exhausted")
             if project_id in seen_projects:
                 raise A3Phase2ProtocolError("focused practice project must be fresh")
             practiced = self.hooks.run_practice(
@@ -460,12 +463,7 @@ class A3Phase2Adapter:
                  "fresh_target_required": True},
                 EvidenceKind.RESULT,
             )
-            status = (
-                EvolutionStatus.STALLED
-                if practice_count == MAX_PRACTICE_PROJECTS
-                else EvolutionStatus.READY_FOR_RETRY
-            )
-            return EvolutionResult(status, practiced.memory, 1, decision.reason)
+            return EvolutionResult(EvolutionStatus.READY_FOR_RETRY, practiced.memory, 1, decision.reason)
 
         core_hooks = SelfEvolvingLoopHooks(
             fresh_target_environment=environment,
@@ -511,8 +509,6 @@ class A3Phase2Adapter:
             raise
 
         termination = result.termination
-        if practice_count == MAX_PRACTICE_PROJECTS:
-            termination = "practice_budget_final_target"
         if (
             current_verification is None
             or current_learning is None
@@ -550,6 +546,5 @@ __all__ = [
     "A3Phase2Adapter", "A3Phase2BudgetStop", "A3Phase2Hooks",
     "A3Phase2Identity", "A3Phase2InfrastructureError", "A3Phase2ProtocolError",
     "A3Phase2Result", "CurriculumDecision", "CurriculumStatus",
-    "GroundedLearning", "GroundedTarget", "MAX_PRACTICE_PROJECTS",
-    "MAX_TARGET_ATTEMPTS", "OwnedAgent", "PracticeResult",
+    "GroundedLearning", "GroundedTarget", "DEFAULT_MAX_SECONDS", "OwnedAgent", "PracticeResult",
 ]

@@ -5,6 +5,7 @@ from functools import wraps
 import fcntl
 import hashlib
 import io
+import math
 import json
 import os
 from pathlib import Path
@@ -150,7 +151,7 @@ def build_controller(job):
             if identity_path.exists():
                 current = _read(identity_path)
                 for key, value in snapshot.destination.source_identity.items():
-                    if key != "schema" and current.get(key) != value:
+                    if key not in {"schema", "runtime_budget"} and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
         if job.get('feedback_root') and job['phase'] == 1:
@@ -170,9 +171,14 @@ def build_controller(job):
             from .phase2_target_loop import TargetDrivenPhase2Coordinator
             if job.get("autonomous_goal"):
                 from .phase2_goal_bootstrap import bootstrap_goal
-                goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
-                    private_root=Path(job["control"]) / "bootstrap", objective=job["objective"],
-                    available_tools=_target_available_tools(coordinator.execute_project))
+                from .phase2_time import Phase2TimeBudget
+                budget = Phase2TimeBudget(job["root"], job["phase2_max_seconds"],
+                                          job["practice_max_seconds"])
+                with budget.active():
+                    goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
+                        private_root=Path(job["control"]) / "bootstrap", objective=job["objective"],
+                        available_tools=_target_available_tools(coordinator.execute_project),
+                        remaining_seconds=lambda: budget.remaining)
                 runtime = goal.runtime
             else:
                 goal = TargetContract.from_mapping(job["target_goal"])
@@ -185,8 +191,8 @@ def build_controller(job):
                 coordinator.execute_project,
                 target=goal, artifacts=artifacts, runtime=runtime,
                 target_policy=coordinator.curriculum.target_policy,
-                max_target_attempts=job["target_attempt_budget"],
-                max_practice_attempts=job["practice_attempt_budget"],
+                max_seconds=job["phase2_max_seconds"],
+                max_practice_seconds=job["practice_max_seconds"],
                 available_tools=_target_available_tools(coordinator.execute_project),
                 trace_hook=coordinator.trace_hook,
             )
@@ -247,8 +253,8 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
         composed.curriculum._complete,
         executor,
         query_knowledge=(lambda text: {"results": query(text)}) if query else None,
-        max_target_attempts=job["target_attempt_budget"],
-        max_practice_attempts=job["practice_attempt_budget"],
+        max_seconds=job["phase2_max_seconds"],
+        max_practice_seconds=job["practice_max_seconds"],
         feedback_root=job.get('feedback_root', settings.get("phase2_feedback_root")),
         fixed_task=retry['task'] if retry else None)
 
@@ -805,8 +811,8 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--project-target", type=int, required=True)
             sub.add_argument("--target-goal", type=Path,
                              help="host-qualified TargetContract JSON; omission lets curriculum author and qualify a new goal")
-            sub.add_argument("--target-attempt-budget", type=int, default=3)
-            sub.add_argument("--practice-attempt-budget", type=int, default=2)
+            sub.add_argument("--phase2-max-seconds", type=float, default=7200)
+            sub.add_argument("--practice-max-seconds", type=float, default=1800)
             sub.add_argument("--phase1-root", type=Path)
             sub.add_argument("--review", type=Path)
             sub.add_argument("--approval-mode", action="store_true")
@@ -867,8 +873,8 @@ def main(argv=None, *, screen=start_screen):
             parser.error("target-driven phase 2 does not support --approval-mode")
         if args.phase == 2 and args.project_target != 1:
             parser.error("new phase 2 starts exactly one goal; use --project-target 1")
-        if args.target_attempt_budget < 1 or args.practice_attempt_budget < 1:
-            parser.error("target and practice attempt budgets must be positive")
+        if any(not math.isfinite(value) or value <= 0 for value in (args.phase2_max_seconds, args.practice_max_seconds)):
+            parser.error("Phase 2 and practice budgets must be finite positive seconds")
         if (args.failure_id or args.retry_feedback_id) and not args.feedback_root:
             parser.error('feedback selection requires --feedback-root')
         if (args.phase == 1 and args.retry_feedback_id) or (args.phase == 2 and args.failure_id):
@@ -885,7 +891,7 @@ def main(argv=None, *, screen=start_screen):
         config = args.config.resolve()
         settings = _read(config)
         arguments = settings["phase1_arguments"]
-        reserved = {"--root", "--objective", "--initial-memory", "--target", "--project-target", "--max-projects"}
+        reserved = {"--root", "--objective", "--initial-memory", "--target", "--project-target", "--max-projects", "--max-seconds"}
         if not isinstance(arguments, list) or any(not isinstance(a, str) for a in arguments):
             parser.error("phase1_arguments must be a string list")
         if any(a.split("=", 1)[0] in reserved for a in arguments):
@@ -921,11 +927,11 @@ def main(argv=None, *, screen=start_screen):
                   "model": settings["model"], "source_manifest_sha256": source.sha256,
                   "harness_revision": revision, "created": time.time(), "round_id": control.name}
         if goal is not None:
-            public.update(target_goal=goal.as_dict(), target_attempt_budget=args.target_attempt_budget,
-                          practice_attempt_budget=args.practice_attempt_budget)
+            public.update(target_goal=goal.as_dict(), phase2_max_seconds=args.phase2_max_seconds,
+                          practice_max_seconds=args.practice_max_seconds)
         elif args.phase == 2:
-            public.update(autonomous_goal=True, target_attempt_budget=args.target_attempt_budget,
-                          practice_attempt_budget=args.practice_attempt_budget)
+            public.update(autonomous_goal=True, phase2_max_seconds=args.phase2_max_seconds,
+                          practice_max_seconds=args.practice_max_seconds)
             if args.target == "a3":
                 public["optimizer_goal"] = True
         if args.approval_mode:

@@ -4,6 +4,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import time
+
+from .phase2_time import Phase2TimeBudget
 
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator, PENDING_SCHEMA
@@ -18,31 +21,30 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
     """Reuse project execution and learning, with a separate immutable goal.
 
     Exceptions leave the exact pending branch and its retained execution handles
-    intact. Only returned host verdicts consume semantic attempt budgets.
+    intact. Every operation consumes elapsed time, including failed operations.
     """
 
     def __init__(self, root, objective, reviewed_snapshot, curriculum, execute_project, *,
-                 target, artifacts, runtime, target_policy=None, max_target_attempts=3,
-                 max_practice_attempts=2, available_tools=(), trace_hook=None):
-        for count in (max_target_attempts, max_practice_attempts):
-            if type(count) is not int or count < 1:
-                raise ValueError("target and practice attempt budgets must be positive integers")
+                 target, artifacts, runtime, target_policy=None, max_seconds=7200,
+                 max_practice_seconds=1800, clock=time.monotonic, available_tools=(), trace_hook=None):
         target.verify(artifacts, runtime, target_policy)
         self.target, self.artifacts, self.runtime = target, artifacts, dict(runtime)
         self.target_policy = target_policy
-        self.max_target_attempts, self.max_practice_attempts = max_target_attempts, max_practice_attempts
+        self.time = Phase2TimeBudget(root, max_seconds, max_practice_seconds, clock=clock)
         self.available_tools = tuple(available_tools)
         super().__init__(root, objective, reviewed_snapshot, CurriculumAgent(lambda _: None),
                          execute_project, project_target=1, trace_hook=trace_hook)
         self.curriculum = curriculum
+
+    def _remaining_seconds(self):
+        return min(self.time.remaining, self.time.practice_remaining) if self.time.active_practice else self.time.remaining
 
     def _load_state(self):
         self.snapshot.verify()
         self.target.verify(self.artifacts, self.runtime, self.target_policy)
         state = AdaptivePhase1Coordinator._load_state(self)
         identity = {"target": self.target.as_dict(), "snapshot_id": self.snapshot.snapshot_id,
-                    "max_target_attempts": self.max_target_attempts,
-                    "max_practice_attempts": self.max_practice_attempts,
+                    **self.time.identity,
                     "available_tools": list(self.available_tools)}
         if "phase" in state:
             if state["phase"] != "target-driven-phase2" or state.get("goal_identity") != identity:
@@ -69,8 +71,8 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         return TargetCurriculumContext(self.target, targets[-1],
             tuple([*self._curriculum_feedback(state),
                    *[row for row in state["attempts"][-2:] if row["kind"] == "practice"]]),
-            self.max_target_attempts - state["target_attempts"],
-            self.max_practice_attempts - state["practice_since_target"], self.available_tools,
+            self.time.remaining,
+            self.time.practice_remaining, self.available_tools,
             used_project_ids=tuple(sorted({row["project_id"]
                 for row in [*self.seed_outcomes, *state["attempts"]]})))
 
@@ -80,8 +82,8 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
             kind, project, decision = "target", self.target.spec, None
             session = self._session(state)
         else:
-            # Two practice attempts (including failures) force the target retry.
-            if state["practice_since_target"] >= self.max_practice_attempts:
+            # Elapsed practice time forces a fixed-target retest.
+            if self.time.practice_remaining <= 0:
                 kind, project, decision = "target", self.target.spec, None
                 session = self._session(state)
             else:
@@ -104,8 +106,8 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
                     seen = {row["project_id"] for row in [*self.seed_outcomes, *state["attempts"]]}
                     if project.project_id in seen or project.as_dict() == self.target.spec.as_dict():
                         raise ValueError("practice requires a fresh project ID")
-        if kind == "target" and state["target_attempts"] >= self.max_target_attempts:
-            state["terminal"] = {"status": "BUDGET_EXHAUSTED", "reason": "Target retry budget exhausted; readiness was not demonstrated."}
+        if self.time.remaining <= 0:
+            state["terminal"] = {"status": "BUDGET_EXHAUSTED", "reason": "Phase 2 elapsed-time budget exhausted; readiness was not demonstrated."}
             self._atomic_json(self.root / "state.json", state)
             return None
         wave = WaveSpec(f"attempt-{state['wave_index']:03d}", hashlib.sha256(snapshot).hexdigest(),
@@ -147,7 +149,12 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
             raise ValueError("target-driven Phase 2 uses fixed-target execution; approval-mode is unsupported")
         state, completed = self._load_state(), 0
         while state["terminal"] is None:
-            pending = self._load_pending(state) or self._select_pending(state)
+            if self.time.remaining <= 0:
+                state["terminal"] = {"status": "BUDGET_EXHAUSTED", "reason": "Phase 2 elapsed-time budget exhausted"}
+                self._atomic_json(self.root / "state.json", state)
+                break
+            with self.time.active():
+                pending = self._load_pending(state) or self._select_pending(state)
             if pending is None:
                 break
             wave = WaveSpec.from_mapping(pending["wave"])
@@ -156,7 +163,8 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
                 raise ValueError("pending target differs from the fixed goal")
             runner = LiveWaveCoordinator(self.root / "waves" / wave.wave_id, wave,
                 self._memory_snapshot(state), self._execute, 1, allow_semantic_failures=True)
-            consolidation = runner.resume()
+            with self.time.active(practice=pending["kind"] == "practice"):
+                consolidation = runner.resume()
             committed = bool(consolidation.commits)
             delta = self._read_delta(wave.wave_id, project.project_id) if committed else None
             state = self._publish(state, wave, pending, (delta,))
@@ -168,12 +176,10 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
             if pending["kind"] == "target":
                 state["target_attempts"] += 1
                 state["practice_since_target"] = 0
+                self.time.reset_practice()
             else:
                 state["practice_since_target"] += 1
             state["next_kind"] = "review"
-            if (pending["kind"] == "target" and not committed
-                    and state["target_attempts"] >= self.max_target_attempts):
-                state["terminal"] = {"status": "BUDGET_EXHAUSTED", "reason": "Last target attempt failed host verification."}
             self._atomic_json(self.root / "state.json", state)
             (self.root / "pending.json").unlink(missing_ok=True)
             if self.trace_hook is not None:

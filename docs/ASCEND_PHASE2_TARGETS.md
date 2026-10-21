@@ -108,7 +108,7 @@ python run_ascend_campaign.py start \
   --phase1-root /absolute/path/to/reviewed-phase1 \
   --review /absolute/path/to/phase1-review.json \
   --target-goal /absolute/path/to/copy-goal.json --project-target 1 \
-  --target-attempt-budget 3 --practice-attempt-budget 2
+  --phase2-max-seconds 7200 --practice-max-seconds 1800
 python run_ascend_campaign.py status --control /absolute/path/to/private-control
 python run_ascend_campaign.py resume --control /absolute/path/to/private-control
 ```
@@ -127,3 +127,13 @@ retained handles for explicit resume; they do not consume a semantic attempt.
 Target-driven budgets and identities cannot be changed in place. Wave approval
 mode is currently unsupported for target-driven campaigns and is rejected before
 creation.
+
+Phase 2 admits work using elapsed-time budgets. Target and practice counts are
+telemetry, not limits. The total window includes curriculum selection,
+qualification and host attempts; the practice window resets after a fixed-target
+attempt. Time spent in failed operations is retained across resume. A process
+interruption with unknown duration conservatively consumes its admitted remaining
+window. Start a new campaign when changing a budget or migrating an older
+count-budget campaign. No timestamp from a previous process is reused as a
+monotonic clock. Native operations retain their bounded execution timeouts;
+campaign admission stops new work when the window expires.
