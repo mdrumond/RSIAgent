@@ -144,6 +144,10 @@ def build_controller(job):
             phase=f"phase{job['phase']}", round_id=job["round_id"],
             model=job["model"], source_manifest_sha256=job["source_manifest_sha256"],
         )
+        # Campaign settings opt into record-only verification without changing CLI defaults.
+        if settings.get("verify_memory_usefulness"):
+            options["usefulness_enabled"] = True
+            options["usefulness_pair_seconds"] = settings.get("usefulness_pair_seconds", 600)
         built = (build_native_adaptive_phase1 if job["target"] == "a3"
                  else build_adaptive_phase1)(**options)
         if job["phase"] == 2 and job["target"] == "a3":
@@ -263,7 +267,8 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
         max_seconds=job["phase2_max_seconds"],
         max_practice_seconds=job["practice_max_seconds"],
         feedback_root=job.get('feedback_root', settings.get("phase2_feedback_root")),
-        fixed_task=retry['task'] if retry else None)
+        fixed_task=retry['task'] if retry else None,
+        usefulness_verifier=getattr(composed, 'usefulness_verifier', None))
 
 
 def _approval_path(job):

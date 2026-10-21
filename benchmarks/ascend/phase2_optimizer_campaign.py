@@ -16,7 +16,7 @@ from optimizer.memory import verify_snapshot
 class OptimizerPhase2Coordinator:
     def __init__(self, root, objective, snapshot, complete, execution_factory, *,
                  query_knowledge=None, max_seconds=7200, max_practice_seconds=1800, clock=time.monotonic,
-                 selector=None, feedback_root=None, fixed_task=None):
+                 selector=None, feedback_root=None, fixed_task=None, usefulness_verifier=None):
         if selector is None:
             from .phase2_optimizer_tasks import select_optimizer_task
             selector = select_optimizer_task
@@ -27,6 +27,7 @@ class OptimizerPhase2Coordinator:
         self.feedback = FeedbackStore(feedback_root or self.root / 'feedback')
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
+        self.usefulness_verifier = usefulness_verifier
         self.fixed_task = fixed_task
         self.time = Phase2TimeBudget(self.root, max_seconds, max_practice_seconds, clock=clock)
         seed_path = self.root / "seed-memory.json"
@@ -244,7 +245,8 @@ class OptimizerPhase2Coordinator:
                     executor.store.add_event(executor.job_id, 'phase2-prepare-request', dict(attempt_id=key))
                 with self.time.active(practice=pending["kind"] == "practice"):
                     executor.prepare()
-                    result = executor.attempt(key, memory_snapshot=self._memory(state),
+                    prior_memory = self._memory(state)
+                    result = executor.attempt(key, memory_snapshot=prior_memory,
                                               feedback=state["attempts"][-2:])
             except Exception:
                 self.feedback.import_campaign(self.root)
@@ -269,6 +271,9 @@ class OptimizerPhase2Coordinator:
             state["next_kind"] = "review"
             self._write("state.json", state)
             self.feedback.import_campaign(self.root)
+            if row["verified"] and self.usefulness_verifier is not None:
+                self.usefulness_verifier.assess_lesson(state["memory_entries"][-1],
+                    canonical(prior_memory), key, host_facts=[row])
             (self.root / "pending.json").unlink()
             completed += 1
             if limit is not None and completed >= limit:
