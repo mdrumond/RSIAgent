@@ -624,3 +624,91 @@ def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tm
     assert calls == before_calls
     assert {path: (path.read_bytes(), path.stat().st_mtime_ns)
             for path in tmp_path.rglob("*") if path.is_file()} == files
+
+
+class _BudgetClock:
+    def __init__(self):
+        self.now = 0.0
+    def __call__(self):
+        return self.now
+
+
+def test_exception_time_is_retained_and_resume_receives_only_remaining_time(tmp_path):
+    clock, observed = _BudgetClock(), []
+    def select(messages):
+        clock.now += 1
+        return _wave(messages[-1]["content"], [_project("retry", "gm-ub-movement")])
+    def execute(request):
+        observed.append(request.remaining_seconds)
+        clock.now += 2
+        if len(observed) == 1:
+            raise RuntimeError("transport interrupted")
+        return _result(request.spec, True, "verified")
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
+            execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
+    with pytest.raises(RuntimeError, match="failed before verification"):
+        make().run()
+    assert json.loads((tmp_path / "state.json").read_text())["elapsed_seconds"] == 3
+    clock.now += 100  # Downtime is not active runtime.
+    report = make().resume()
+    assert observed == [9, 7]
+    assert report["elapsed_seconds"] == 5
+    assert report["status"] == "TARGET_REACHED"
+
+
+def test_legacy_state_remains_reportable_but_cannot_reset_unknown_spend(tmp_path):
+    coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED,
+        CurriculumAgent(lambda _: pytest.fail("selection")), lambda _: pytest.fail("execution"),
+        max_parallel=1)
+    coordinator._load_state()
+    path = tmp_path / "state.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("elapsed_seconds")
+    legacy.pop("max_seconds")
+    path.write_text(json.dumps(legacy))
+    original = path.read_bytes()
+    assert AdaptivePhase1Coordinator.read_retained_report(tmp_path, "Learn", SEED)["elapsed_seconds"] is None
+    with pytest.raises(ValueError, match="no elapsed-time accounting"):
+        coordinator.resume()
+    assert path.read_bytes() == original
+
+
+def test_approved_selection_and_execution_share_elapsed_allocation(tmp_path):
+    clock, observed = _BudgetClock(), []
+    def select(messages):
+        clock.now += 2
+        return _wave(messages[-1]["content"], [_project("approved", "gm-ub-movement")])
+    def execute(request):
+        observed.append(request.remaining_seconds)
+        clock.now += 3
+        return _result(request.spec, True, "verified")
+    coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
+        execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
+    proposal = coordinator.propose_wave()
+    assert proposal["elapsed_seconds"] == 2
+    coordinator.approve_wave(proposal, ["approved"])
+    report = coordinator.run_approved_wave()
+    assert observed == [8]
+    assert report["elapsed_seconds"] == 5
+
+
+def test_unobserved_interruption_keeps_remaining_allocation_reserved(tmp_path):
+    clock, calls = _BudgetClock(), []
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, "Learn", SEED,
+            CurriculumAgent(lambda _: calls.append("select")), lambda _: calls.append("execute"),
+            max_parallel=1, max_seconds=10, clock=clock)
+    coordinator = make()
+    state = coordinator._load_state()
+    # Durable marker left by a worker killed before its finally checkpoint.
+    state.update(elapsed_seconds=2, allocation_active=True)
+    coordinator._atomic_json(tmp_path / "state.json", state)
+    report = make().resume()
+    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
+    assert report["remaining_seconds"] == 0
+    assert calls == []
+    retained = json.loads((tmp_path / "state.json").read_text())
+    assert retained["allocation_interrupted"] is True
+    assert retained["allocation_active"] is False
+    assert retained["elapsed_seconds"] == 10

@@ -11,9 +11,15 @@ context-budget, transport and infrastructure exceptions leave pending work
 `RECOVERY_REQUIRED` rather than being mislabeled as kernel failures.
 `TARGET_REACHED` means the verified project count was
 reached, not that every requested topic was learned. Inspect `coverage_gaps`.
-An explicit `--max-projects` smoke cap instead bounds **all completed attempts**
-(verified plus semantic failures). Reaching it returns `PROJECT_LIMIT_REACHED`,
-not saturation. Infrastructure failures remain pending, not completed attempts.
+`--max-seconds` sets the campaign's elapsed-time allocation (default 7,200
+seconds). Selection and execution share that allocation; resume preserves consumed
+time. A process killed before its final checkpoint keeps the remaining allocation
+reserved; resume never refunds unknown interrupted work. Projects receive the remaining seconds when they start. Counts are telemetry:
+legacy `--max-projects` is accepted as metadata and no longer stops work. Expiry
+returns `TIME_BUDGET_EXHAUSTED`; interrupted pending work retains its recovery state.
+Active legacy campaigns without elapsed-time accounting require a new campaign root;
+read-only historical reports remain available. Change the time allocation only in a
+new campaign. `--project-target` continues to define the requested verified workload.
 
 `report` includes the full `curriculum_memory`: concise lesson claims, explicit
 `no_new_knowledge` outcomes, and completed failures. Each curriculum request

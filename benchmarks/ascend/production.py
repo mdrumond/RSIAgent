@@ -32,7 +32,7 @@ def native_target_runtime(config, transport):
 
 def compose_adaptive_controller(
     *, root, objective, initial_memory, executor, actor, profile, provider,
-    immutable_context, max_parallel=1, project_target=None, max_projects=None,
+    immutable_context, max_parallel=1, project_target=None, max_projects=None, max_seconds=7200,
     target_policy=None, profiling_guidance=None, query_knowledge=None,
     request_profile=None, request_timing=None, request_diagnostic=None,
     diagnostic_instructions=None,
@@ -61,7 +61,7 @@ def compose_adaptive_controller(
     if reviewed_snapshot is None:
         coordinator = AdaptivePhase1Coordinator(
             root, objective, initial_memory, curriculum, project_actor,
-            max_parallel=max_parallel, project_target=project_target, max_projects=max_projects,
+            max_parallel=max_parallel, project_target=project_target, max_projects=max_projects, max_seconds=max_seconds,
         )
     else:
         from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
@@ -143,7 +143,7 @@ class NativeProjectPool:
 def build_native_adaptive_phase1(
     *, config, native_transport, profile, guide_bytes, objective, initial_memory,
     environment, provider_transport=None, embeddings=None, project_target=None,
-    max_projects=None, request_profile=None, request_timing=None,
+    max_projects=None, max_seconds=7200, request_profile=None, request_timing=None,
     profiling_guidance=None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
     project_workers=(),
@@ -194,6 +194,8 @@ def build_native_adaptive_phase1(
         "kdb_collection": config.collection,
         "environment_identity": config.environment_identity or {},
     }
+    if reviewed_snapshot is None:
+        identity["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": max_seconds}
     if reviewed_snapshot is not None:
         reviewed_snapshot.verify()
         identity.update(schema="ascend-native-adaptive-phase2-identity-v1",
@@ -270,7 +272,7 @@ def build_native_adaptive_phase1(
         trace_recorder_factory=trace_recorder_factory,
         query_knowledge=query, request_profile=request_profile, request_timing=request_timing,
         diagnostic_instructions=diagnostics,
-        project_target=project_target, max_projects=max_projects,
+        project_target=project_target, max_projects=max_projects, max_seconds=max_seconds,
         reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
         unavailable_capabilities=tuple(capability for capability, action in (
             (Capability.PROFILING, request_profile), (Capability.TIMING_SWEEP, request_timing),

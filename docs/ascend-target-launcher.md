@@ -14,7 +14,7 @@ python -m benchmarks.ascend.phase1_cli --target a3 run \
   --config <ignored-native-runtime.json> --root <new-campaign-directory> \
   --objective '<learning objective>' --initial-memory <memory-file> \
   --model openai/gpt-5.6-sol --knowledge without-kdb \
-  --profiling without-profiling-guidance --project-target 1 --max-projects 1
+  --profiling without-profiling-guidance --project-target 1 --max-seconds 300
 ```
 
 Use `resume` with identical identity-bearing inputs. `report` needs only root,
