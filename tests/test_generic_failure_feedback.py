@@ -21,7 +21,7 @@ def phase1(root, verified=False, spec=None):
           wave_fingerprint='frozen-wave', project_id=spec['project_id']))
     write(branch.parent.parent / 'plan.json', dict(wave_fingerprint='frozen-wave',
           wave=dict(projects=[dict(spec=spec)])))
-    write(root / 'campaign-identity.json', dict(target='native-a3', language='ascend-c'))
+    write(root / 'campaign-identity.json', dict(schema='ascend-native-adaptive-identity-v1', target='Ascend910B4', language='ascend-c'))
     row = dict(project_id=spec['project_id'], spec=spec, verified=verified,
                evidence=dict(classification='host-mismatch'))
     write(root / 'state.json', dict(schema='a5-phase1-adaptive-state-v2',
@@ -76,16 +76,20 @@ def test_phase1_import_ignores_pending_proposals(tmp_path):
 
 def test_standalone_optimizer_import_is_terminal_and_deduplicated(tmp_path):
     jobs = JobStore(tmp_path/'jobs')
-    job = jobs.create('source', 'forward', {}, {})
+    job = jobs.create('source', 'forward', {}, dict(source_identity=dict(
+        schema='ascend-native-adaptive-identity-v1', target='Ascend910B4', language='ascend-c')))
     store = FeedbackStore(tmp_path/'feedback')
     assert store.import_optimizer(jobs.root)['imported'] == 0
     jobs.transition(job['job_id'], 'running')
     jobs.add_event(job['job_id'], 'optimizer-state', dict(history=[]))
     jobs.transition(job['job_id'], 'failed')
-    report = store.import_optimizer(jobs.root, target='a3', language='ascend-c')
+    report = store.import_optimizer(jobs.root)
     assert report['imported'] == 1
     record = store.records()[0]
     assert record['outcome']['source_type'] == 'optimizer'
+    assert record['outcome']['target'] == 'a3'
+    assert record['outcome']['language'] == 'ascend-c'
+    assert 'name' not in record['outcome']['original_spec']
     assert record['lifecycle'] == 'failed'
     assert record['outcome']['original_spec']['source'] == 'source'
     assert store.import_optimizer(jobs.root, target='a3', language='ascend-c')['existing'] == 1

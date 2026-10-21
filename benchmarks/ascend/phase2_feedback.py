@@ -237,8 +237,11 @@ class FeedbackStore:
         return True
 
     @staticmethod
-    def _identity(root, target, language):
-        metadata = _read(root / 'campaign-identity.json', {})
+    def _identity(root, target, language, metadata=None):
+        metadata = metadata or _read(root / 'campaign-identity.json', {})
+        if (not target and metadata.get('schema') == 'ascend-native-adaptive-identity-v1'
+                and metadata.get('language') == 'ascend-c'):
+            target = 'a3'
         target = target or metadata.get('target', 'unknown')
         target = {'native-a3': 'a3', 'native-a5': 'a5'}.get(target, target)
         return target, language or metadata.get('language', 'unknown')
@@ -313,13 +316,17 @@ class FeedbackStore:
                         store.read_artifact(job['job_id'], ref['sha256'])
                         evidence[role] = dict(ref, job_root=str(root), job_id=job['job_id'])
                 spec = store.submission(job['job_id'])
+                observed_target, observed_language = self._identity(root,
+                    None if target == 'unknown' else target,
+                    None if language == 'unknown' else language,
+                    spec.get('memory_snapshot', {}).get('source_identity'))
                 # Memory and budgets vary across retries; acceptance inputs do not.
                 original = {key: value for key, value in spec.items()
-                            if key not in {'memory_snapshot', 'max_attempts', 'max_seconds'}}
+                            if key not in {'memory_snapshot', 'max_attempts', 'max_seconds', 'name'}}
                 task = dict(task_id=job['name'] or job['job_id'], submission=original)
                 outcome = dict(source_type='optimizer', source_root=str(root),
                     attempt_id=job['job_id'], completed=True, kind='optimizer',
-                    target=target, language=language, original_spec=original,
+                    target=observed_target, language=observed_language, original_spec=original,
                     task=task, runtime={}, job_incarnation=events[0]['sha256'],
                     verified=bool(best), result=result, evidence=evidence,
                     category=_category(task, result),
