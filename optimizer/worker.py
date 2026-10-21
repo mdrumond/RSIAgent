@@ -8,13 +8,21 @@ from pathlib import Path
 import shlex
 import tarfile
 import time
+import sys
 
 from .jobs import JobStore, atomic, canonical, sha
 from .transport import CheckedTransport, ObservationUnavailable, WorkerStopped, exclusive
 
 
-def load_config(path):
-    config = json.loads(Path(path).read_text())
+def load_config(path, worker_config_path=None):
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode
+    config = apply_worker_config(json.loads(Path(path).read_text()), worker_config_path)
+    if execution_mode(config) == 'local':
+        if not Path(config.get('guide', '')).is_absolute():
+            raise ValueError('local worker requires an absolute guide path')
+        return config
+    if 'transport_target' in config:
+        config['target'] = config['transport_target']
     required = {'profile', 'target', 'runtime', 'physical_device', 'arch', 'cpl_remote',
                 'validation_wrapper', 'remote_workspace', 'guide'}
     if not required <= config.keys() or config['profile'] not in {'bz-a3-1', 'bz-a3-2'}:
@@ -153,6 +161,50 @@ class RemoteBackend:
         return self._operation('profile', directory, source=source, block_count=block_count)
 
 
+class LocalBackend(RemoteBackend):
+    """Run the same authoritative kernel protocol in this activated environment."""
+    def __init__(self, store, job_id, config):
+        from benchmarks.ascend.execution import LocalProcessRunner
+        super().__init__(store, job_id, config, transport=object())
+        self.remote = Path(config['workspace']) / ('optimizer-' + job_id)
+        self.transport = LocalProcessRunner(config, deadline=self.deadline,
+            stopped=self._stopped, retain=self._retain)
+
+    def _operation(self, operation, directory, **payload):
+        directory = Path(directory)
+        result_path = directory / 'result.json'
+        if result_path.exists():
+            return json.loads(result_path.read_text())
+        marker = directory / 'transport.json'
+        if marker.exists() and json.loads(marker.read_text())['state'] == 'cancelled':
+            return self._operation(operation, directory / 'retry', **payload)
+        relative = directory.relative_to(self.store.root / self.job_id / 'execution')
+        work = self.remote / 'execution' / relative
+        work.mkdir(parents=True, exist_ok=True)
+        baseline = self.store.root / self.job_id / 'execution' / 'baseline'
+        while (baseline / 'transport.json').exists() and json.loads((baseline / 'transport.json').read_text())['state'] == 'cancelled':
+            baseline /= 'retry'
+        reference = (json.loads((baseline / 'result.json').read_text()).get('remote_reference')
+                     if (baseline / 'result.json').exists() else None)
+        request = {'operation': operation, 'directory': str(work),
+                   'baseline': str(work / 'frozen') if operation == 'prepare' else reference,
+                   'arch': self.config['arch'], 'max_cases': self.config.get('max_cases', 24), **payload}
+        request_path = work / 'request.json'
+        atomic(request_path, canonical(request))
+        result = self.transport.run([sys.executable, '-m', 'optimizer.remote_worker', str(request_path)],
+                                    directory, cwd=work)
+        if not (work / 'result.json').exists():
+            raise RuntimeError('local kernel operation failed: ' + result.stderr[-4000:])
+        receipt = json.loads((work / 'result.json').read_text())
+        for row in json.loads((work / 'files.json').read_text()):
+            data = (work / row['path']).read_bytes()
+            if sha(data) != row['sha256'] or len(data) != row['size']:
+                raise ValueError('local artifact digest differs')
+            self.store.put_artifact(self.job_id, str(relative / row['path']), data)
+        atomic(result_path, canonical(receipt))
+        return receipt
+
+
 def knowledge_query(config, directory):
     if not config.get('knowledge'):
         return None
@@ -189,6 +241,11 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
     from .loop import OptimizationLoop
     from .provider import BoundedAgent
     from benchmarks.a3_experiments import BackendModel
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode, preflight_local
+    config = apply_worker_config(config)
+    is_local = execution_mode(config) == 'local'
+    if is_local and transport_factory is not None:
+        raise ValueError('local execution cannot also inject a remote transport')
     if transport_factory is not None and not config.get('lock_directory'):
         raise ValueError('injected transport requires an explicit lock_directory')
     if transport_factory is not None:
@@ -209,6 +266,8 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
         identity['guide_sha256'] = sha(guide.encode())
         identity['max_cases'] = config.get('max_cases', 24)
         identity['knowledge'] = config.get('knowledge')
+        if is_local:
+            identity.update(preflight_local(config))
         # Separate custom execution routes from the default on resume. The
         # caller pins a versioned identity; callable names are not stable IDs.
         if transport_factory is not None:
@@ -221,7 +280,8 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
             store.add_event(job_id, 'worker-configuration', identity)
         agent = agent or OptimizerAgent(guide=guide,
                                         model=BackendModel(config.get('model_profile', BackendModel.DEEPSEEK_FLASH.value)))
-        backend = RemoteBackend(store, job_id, config, transport_factory=transport_factory)
+        backend = (LocalBackend(store, job_id, config) if is_local else
+                   RemoteBackend(store, job_id, config, transport_factory=transport_factory))
         agent = BoundedAgent(agent, deadline=backend.deadline,
                              stopped=lambda: store.get(job_id)['stop_requested'])
         store.add_event(job_id, 'worker-started', {'pid': os.getpid(), 'profile': config['profile'], 'device': config['physical_device']})
@@ -254,7 +314,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', required=True, type=Path)
     parser.add_argument('--job-id', required=True)
-    parser.add_argument('--config', required=True, type=Path)
+    parser.add_argument('--config', '--worker-config', dest='config', required=True, type=Path)
     args = parser.parse_args(argv)
     try:
         print(json.dumps(run_worker(args.root, args.job_id, load_config(args.config))))

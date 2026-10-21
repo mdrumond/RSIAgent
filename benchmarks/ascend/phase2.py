@@ -31,7 +31,7 @@ def source_cell_id(identity):
 def _native_identity(identity):
     if (identity.get("schema") != "ascend-native-adaptive-identity-v1"
             or identity.get("language") != "ascend-c"
-            or identity.get("execution_profile") not in {"bz-a3-1", "bz-a3-2"}
+            or identity.get("execution_profile") not in {"bz-a3-1", "bz-a3-2", "local"}
             or not identity.get("target") or not identity.get("arch")):
         raise ValueError("handoff requires an explicitly native A3 source identity")
 

@@ -73,6 +73,8 @@ class AdaptiveProductionPaths:
         default_factory=lambda: Path.home() / ".agents/skills/ascend-profiling",
     )
 
+    worker_config: dict | None = None
+
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", Path(self.root))
         object.__setattr__(self, "tla_root", Path(self.tla_root))
@@ -88,18 +90,26 @@ class AdaptiveProductionPaths:
 
     @property
     def validation_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("validation_wrapper"):
+            return Path(self.worker_config["validation_wrapper"])
         return self.tla_root / "execution-profiles/catlass-validation.sh"
 
     @property
     def upload_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("upload_wrapper"):
+            return Path(self.worker_config["upload_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/upload.sh"
 
     @property
     def session_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("session_wrapper"):
+            return Path(self.worker_config["session_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/session.sh"
 
     @property
     def collection_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("collection_wrapper"):
+            return Path(self.worker_config["collection_wrapper"])
         return self.profiling_skill_root / "scripts/collect_profile.sh"
 
 
@@ -229,6 +239,10 @@ def _measurement_action(measurements, *, profiling: bool) -> ActionDependency:
 
 
 def _checked_command(paths: AdaptiveProductionPaths) -> BZCommandExecutor:
+    from benchmarks.ascend.execution import execution_mode
+    if paths.worker_config and execution_mode(paths.worker_config) == "local":
+        from benchmarks.ascend.local_catlass import LocalCatlassExecutor
+        return LocalCatlassExecutor(paths.worker_config)
     wrappers = (paths.validation_wrapper, paths.upload_wrapper, paths.session_wrapper)
     if any(not path.is_file() or not os.access(path, os.X_OK) for path in wrappers):
         raise ValueError("checked BZ-A5 wrappers are unavailable")
@@ -380,27 +394,46 @@ def build_adaptive_phase1(
     )
     profile = direct_profile(admitted.model)
     actor = PiActorDriver(provider)
-    backend = CatlassProjectBackend(
-        command,
-        session_wrapper=str(paths.session_wrapper),
-        evidence_root=paths.root / "project-bundles",
-        device=paths.device,
-    )
+    from benchmarks.ascend.execution import execution_mode
+    local = paths.worker_config is not None and execution_mode(paths.worker_config) == "local"
+    if local:
+        from benchmarks.ascend.execution import local_identity
+        from benchmarks.ascend.local_catlass import LocalCatlassProjectBackend
+        backend = LocalCatlassProjectBackend(paths.worker_config, evidence_root=paths.root / "project-bundles")
+        binding_path = paths.root / "execution-identity.json"
+        binding = canonical_bytes(local_identity(paths.worker_config))
+        if not binding_path.exists() and (paths.root / "state.json").exists():
+            raise ValueError("cannot resume remote campaign with local execution")
+        if binding_path.exists() and binding_path.read_bytes() != binding:
+            raise ValueError("local campaign execution identity changed")
+        binding_path.write_bytes(binding)
+    else:
+        binding_path = paths.root / "execution-identity.json"
+        if binding_path.exists():
+            raise ValueError("cannot resume local campaign with remote execution")
+        backend = CatlassProjectBackend(
+            command,
+            session_wrapper=str(paths.session_wrapper),
+            evidence_root=paths.root / "project-bundles",
+            device=paths.device,
+        )
     executor = ProjectExecutor(
         backend, EvidenceLedger(paths.root / "project-evidence.jsonl"),
         runtime_identity=lambda: catlass_target_runtime(paths, command),
     )
     from benchmarks.a5kernels.phase1_project_measurements import ProjectMeasurementBackend
-    measurements = ProjectMeasurementBackend(
-        backend,
-        BZProfileBackend(
+    if local:
+        from benchmarks.ascend.local_catlass import LocalProfileBackend
+        profile_backend = LocalProfileBackend(paths.worker_config, evidence_directory=paths.root / "measurement-evidence")
+    else:
+        profile_backend = BZProfileBackend(
             validation_wrapper=str(paths.validation_wrapper),
             session_wrapper=str(paths.session_wrapper),
             collection_wrapper=str(paths.collection_wrapper),
             catlass_source=paths.catlass_source,
             evidence_directory=str(paths.root / "measurement-evidence"),
-        ),
-    )
+        )
+    measurements = ProjectMeasurementBackend(backend, profile_backend)
     request_profile = _measurement_action(measurements, profiling=True)
     request_timing = _measurement_action(measurements, profiling=False)
     from benchmarks.a5kernels.phase1_project_diagnostics import diagnostic_action

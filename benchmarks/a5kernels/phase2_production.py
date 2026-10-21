@@ -79,6 +79,7 @@ class Phase2ProductionConfig:
     adaptive_review: Path | None = None
     initial_memory: Path | None = None
     profiling_guidance_text: str | None = None
+    worker_config: dict | None = None
 
     def __post_init__(self) -> None:
         if self.adaptive_review is not None:
@@ -106,14 +107,20 @@ class Phase2ProductionConfig:
 
     @property
     def validation_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("validation_wrapper"):
+            return Path(self.worker_config["validation_wrapper"])
         return self.tla_root / "execution-profiles/catlass-validation.sh"
 
     @property
     def session_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("session_wrapper"):
+            return Path(self.worker_config["session_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/session.sh"
 
     @property
     def upload_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("upload_wrapper"):
+            return Path(self.worker_config["upload_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/upload.sh"
 
 
@@ -145,7 +152,7 @@ def _publish_exact(path: Path, value: bytes) -> None:
 def _qualification_identity(config: Phase2ProductionConfig, cell, provenance):
     case = ATTENTION_CASES[0]
     execution = build_execution(case)
-    return execution, {
+    identity = {
         "schema": QUALIFICATION_SCHEMA,
         "cell_id": cell.cell_id,
         "catlass_source": config.catlass_source,
@@ -162,6 +169,11 @@ def _qualification_identity(config: Phase2ProductionConfig, cell, provenance):
         }),
     }
 
+    if config.worker_config and config.worker_config.get("execution") == "local":
+        from benchmarks.ascend.execution import local_identity
+        identity["execution_identity"] = local_identity(config.worker_config)
+    return execution, identity
+
 
 def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
     if not isinstance(value, dict):
@@ -170,6 +182,8 @@ def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
     digest = retained.pop("record_sha256", None)
     output = retained.get("output")
     expected_identity = dict(identity)
+    local = expected_identity.get("execution_identity", {}).get("execution") == "local"
+    handle_prefix = "local:" if local else "bz-a5:"
     if (
         "runtime_catlass_revision" not in retained
         and expected_identity["runtime_catlass_revision"]
@@ -185,7 +199,7 @@ def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
         or retained.get("status") != "transport-qualified"
         or retained.get("exit_code") != 0
         or not isinstance(retained.get("session_handle"), str)
-        or not retained["session_handle"].startswith("bz-a5:")
+        or not retained["session_handle"].startswith(handle_prefix)
         or not isinstance(output, list)
         or len(output) != len(execution.v)
         or retained.get("output_sha256") != canonical_digest(output)
@@ -383,6 +397,14 @@ def build_phase2_production(
             database.close()
         knowledge_factory = _knowledge_factory(config, embeddings)
 
+    from benchmarks.ascend.execution import execution_mode
+    local = config.worker_config is not None and execution_mode(config.worker_config) == "local"
+    if local:
+        from benchmarks.ascend.local_catlass import LocalCatlassExecutor, LocalCatlassAttentionBackend
+        if executor is None:
+            executor = LocalCatlassExecutor(config.worker_config)
+        if backend is None:
+            backend = LocalCatlassAttentionBackend(config.worker_config)
     if executor is None:
         for wrapper in (
             config.validation_wrapper, config.session_wrapper, config.upload_wrapper,
@@ -405,7 +427,7 @@ def build_phase2_production(
             "retained Phase 2 qualification runtime provenance changed"
         )
     provenance = live_provenance
-    if config.adaptive_review is not None and not dict(provenance).get("cann_version", "").startswith("9.3"):
+    if not local and config.adaptive_review is not None and not dict(provenance).get("cann_version", "").startswith("9.3"):
         raise ValueError("adaptive Phase 2 requires the checked CANN 9.3 weekly runtime")
     expected_runtime_revision = (
         config.runtime_catlass_revision or cell.catlass_revision
@@ -511,10 +533,11 @@ def build_phase2_production(
             candidate,
             request_id=request_id,
             attempt_id=attempt_id,
-            execution_profile="bz-a5",
+            execution_profile="local" if local else "bz-a5",
             workdir=workdir,
         ),
         retain_sft_trace,
+        execution_profile="local" if local else None,
     )
 
 

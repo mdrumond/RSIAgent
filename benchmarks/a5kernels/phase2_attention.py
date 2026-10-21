@@ -128,8 +128,8 @@ class AttentionTargetVerifier:
                             ("execution_profile", execution_profile)):
             if type(value) is not str or not value:
                 raise ValueError(f"{name} must be a non-empty string")
-        if execution_profile != "bz-a5":
-            raise ValueError("attention target requires bz-a5 execution")
+        if execution_profile not in {"bz-a5", "local"}:
+            raise ValueError("attention target requires bz-a5 or local execution")
 
         candidate_sha = hashlib.sha256(candidate_source.encode("utf-8")).hexdigest()
         results = verify_cases(self._backend, candidate_source, workdir)

@@ -86,3 +86,8 @@ The historical evidence and portable knowledge are described in [PI_CODING_EVALU
 ```
 
 Real Pi tests use fake DeepSeek/OpenAI providers and exercise persistent sessions, strict typed actions, exact edits, context paging, full-request byte limits, truncation, accounting, parallel isolation, and RPC failure cleanup. Supervisor tests exercise persistent state and cancellation of descendants. Existing host-loop regression tests continue to cover frozen cases, treatment gates, verification, distillation, and uncertain-operation recovery. Composition tests inject scripted typed sessions; they do not call paid providers.
+
+Kernel execution location is selected separately from the Pi coding process.
+Set `"execution": "local"` in the shared worker configuration to run kernel
+compilation, numerical checks, timing, and profiling on the current host without
+remote-access. See [local kernel execution](local-kernel-execution.md).

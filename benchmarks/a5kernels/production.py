@@ -38,6 +38,7 @@ class ProductionPaths:
     collection: str | tuple[str, ...] | list[str]
     results_root: Path
     device: int
+    worker_config: dict | None = None
 
     def __post_init__(self) -> None:
         if not self.catlass_source.startswith("/"):
@@ -51,22 +52,32 @@ class ProductionPaths:
 
     @property
     def validation_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("validation_wrapper"):
+            return Path(self.worker_config["validation_wrapper"])
         return self.tla_root / "execution-profiles/catlass-validation.sh"
 
     @property
     def session_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("session_wrapper"):
+            return Path(self.worker_config["session_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/session.sh"
 
     @property
     def upload_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("upload_wrapper"):
+            return Path(self.worker_config["upload_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/upload.sh"
 
     @property
     def provenance_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("provenance_wrapper"):
+            return Path(self.worker_config["provenance_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/catlass-provenance.sh"
 
     @property
     def collection_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("collection_wrapper"):
+            return Path(self.worker_config["collection_wrapper"])
         return self.profiling_skill_root / "scripts/collect_profile.sh"
 
 
@@ -97,6 +108,8 @@ def preflight(
         "results_parent": paths.results_root.parent.is_dir(),
         "results_absent": not paths.results_root.exists(),
     }
+    from benchmarks.ascend.execution import execution_mode, preflight_local
+    local = paths.worker_config is not None and execution_mode(paths.worker_config) == "local"
     for name, wrapper in {
         "catlass_validation_wrapper": paths.validation_wrapper,
         "bz_session_wrapper": paths.session_wrapper,
@@ -104,7 +117,7 @@ def preflight(
         "catlass_provenance_wrapper": paths.provenance_wrapper,
         "profile_collection_wrapper": paths.collection_wrapper,
     }.items():
-        checks[name] = wrapper.is_file() and os.access(wrapper, os.X_OK)
+        checks[name] = local or (wrapper.is_file() and os.access(wrapper, os.X_OK))
     checks["bge_cache"] = paths.bge_cache.is_dir()
     checks["kdb"] = paths.kdb.is_file()
 
@@ -118,7 +131,10 @@ def preflight(
         )
     ):
         try:
-            (runtime_probe or _probe_catlass_runtime)(paths)
+            if local:
+                preflight_local(paths.worker_config, catlass=True)
+            else:
+                (runtime_probe or _probe_catlass_runtime)(paths)
             checks["catlass_runtime"] = True
         except Exception:
             # Preflight output is deliberately bounded and never includes remote
@@ -289,25 +305,43 @@ def build_production_trial(paths: ProductionPaths):
     from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 
-    command = CatlassValidationExecutor(
-        upload_wrapper=str(paths.upload_wrapper),
-        validation_wrapper=str(paths.validation_wrapper),
-        catlass_source=paths.catlass_source,
-        catlass_revision=paths.catlass_revision,
-    )
-    candidate = CatlassCandidateBackend(
-        BZSessionAdapter(command, session_wrapper=str(paths.session_wrapper)),
-        device=paths.device,
-    )
+    from benchmarks.ascend.execution import execution_mode
+    local = paths.worker_config is not None and execution_mode(paths.worker_config) == "local"
+    if local:
+        from benchmarks.ascend.execution import bind_local_identity
+        bind_local_identity(paths.results_root, paths.worker_config)
+        from benchmarks.ascend.local_catlass import LocalCatlassExecutor
+        command = LocalCatlassExecutor(paths.worker_config)
+    else:
+        if (paths.results_root / "local-execution-identity.json").exists():
+            raise ValueError("cannot resume local pilot state with remote execution")
+        command = CatlassValidationExecutor(
+            upload_wrapper=str(paths.upload_wrapper),
+            validation_wrapper=str(paths.validation_wrapper),
+            catlass_source=paths.catlass_source,
+            catlass_revision=paths.catlass_revision,
+        )
+    from benchmarks.ascend.execution import execution_mode
+    local = paths.worker_config is not None and execution_mode(paths.worker_config) == "local"
+    if local:
+        from benchmarks.ascend.local_catlass import LocalSessionAdapter
+        execution_backend = LocalSessionAdapter(paths.worker_config)
+    else:
+        execution_backend = BZSessionAdapter(command, session_wrapper=str(paths.session_wrapper))
+    candidate = CatlassCandidateBackend(execution_backend, device=paths.device)
     embeddings = PinnedBGEEmbeddings(cache_dir=_transformers_cache(paths.bge_cache))
     database = KnowledgeDB.open_read_only(paths.kdb, embeddings)
 
-    profile_backend = BZProfileBackend(
-        validation_wrapper=str(paths.validation_wrapper),
-        collection_wrapper=str(paths.collection_wrapper),
-        catlass_source=paths.catlass_source,
-        evidence_directory=str(paths.results_root / "profile-evidence"),
-    )
+    if local:
+        from benchmarks.ascend.local_catlass import LocalProfileBackend
+        profile_backend = LocalProfileBackend(paths.worker_config, evidence_directory=paths.results_root / "profile-evidence")
+    else:
+        profile_backend = BZProfileBackend(
+            validation_wrapper=str(paths.validation_wrapper),
+            collection_wrapper=str(paths.collection_wrapper),
+            catlass_source=paths.catlass_source,
+            evidence_directory=str(paths.results_root / "profile-evidence"),
+        )
 
     def knowledge_factory(memory, cell):
         if cell.knowledge is not KnowledgeMode.WITH_KDB:

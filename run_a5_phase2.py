@@ -55,6 +55,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--phase2-guide", type=Path)
         command.add_argument("--phase2-cpl-skills-revision")
         command.add_argument("--tla-root", type=Path)
+        command.add_argument("--worker-config", type=Path)
         command.add_argument("--catlass-source")
         command.add_argument("--runtime-catlass-revision")
         command.add_argument("--bge-cache", type=Path)
@@ -75,6 +76,10 @@ def _parser() -> argparse.ArgumentParser:
 def _production_factory(
     args: argparse.Namespace,
 ) -> tuple[A5Phase1Snapshot, Phase2Dependencies]:
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode
+    worker = apply_worker_config({}, getattr(args, "worker_config", None)) if getattr(args, "worker_config", None) else None
+    from benchmarks.ascend.worker_bindings import apply_a5_worker_arguments
+    apply_a5_worker_arguments(args, worker, source="catlass_source", revision="runtime_catlass_revision")
     required = {
         "phase1_root": args.phase1_root,
         "guide": args.guide,
@@ -96,6 +101,7 @@ def _production_factory(
         )
     gate = load_gate_report(args.gate) if args.gate else None
     return build_phase2_production(Phase2ProductionConfig(
+        worker_config=worker,
         phase1_root=args.phase1_root,
         gate=gate,
         guide_path=args.guide,

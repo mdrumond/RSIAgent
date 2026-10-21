@@ -27,7 +27,7 @@ def native_target_runtime(config, transport):
     if (not compiler or not environment.get("cann_version")
             or not hasattr(transport, "_device") or not hasattr(transport, "profile")):
         return None
-    return {"target": "a3", "runtime": "py311-torch", "device": str(transport._device),
+    return {"target": "a3", "runtime": ("local" if transport.profile == "local" else "py311-torch"), "device": str(transport._device),
             "toolchain": environment["cann_version"], "compiler": compiler,
             "product": config.target, "architecture": config.arch,
             "execution_profile": transport.profile}
@@ -93,8 +93,8 @@ class NativeProductionConfig:
     compiler_version: str | None = None
 
     def __post_init__(self):
-        if self.execution_profile not in {"bz-a3-1", "bz-a3-2"}:
-            raise ValueError("native production requires a BZ-A3 profile")
+        if self.execution_profile not in {"bz-a3-1", "bz-a3-2", "local"}:
+            raise ValueError("native production requires a BZ-A3 or local profile")
         if not self.target or not self.arch:
             raise ValueError("native production requires discovered target and architecture")
         if re.fullmatch(r"[0-9a-f]{64}", self.guide_sha256) is None:

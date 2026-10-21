@@ -143,7 +143,7 @@ class Phase2Composition:
         self, *, config, dependencies: LiveDependencies,
         execution_profile: str,
     ) -> None:
-        if execution_profile not in {"bz-a3-1", "bz-a3-2"}:
+        if execution_profile not in {"bz-a3-1", "bz-a3-2", "local"}:
             raise ValueError("Phase 2 requires a BZ-A3 execution profile")
         if dependencies.execution_profile != execution_profile:
             raise ValueError("live dependencies changed the execution profile")

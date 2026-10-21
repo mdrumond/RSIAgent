@@ -263,7 +263,9 @@ class A3TrialLoop:
                 bind(lambda kind, payload: self.evidence.append(EvidenceKind.ARTIFACT,
                      self._identity({"pi_event": kind, "data": payload})),
                      replace(self.budgets, max_seconds=max(0.001, self.deadline-self.clock())))
-            return self._run()
+            from benchmarks.ascend.execution import process_deadline
+            with process_deadline(time.monotonic() + max(0, self.deadline-self.clock())):
+                return self._run()
         finally:
             budget.close()
             close = getattr(self.actor, "close", None)

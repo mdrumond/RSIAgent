@@ -33,11 +33,12 @@ def _parser() -> argparse.ArgumentParser:
         command = sub.add_parser(name)
         command.add_argument("--state-root", type=Path, required=True)
         command.add_argument("--phase1-root", action="append", type=Path, default=[])
-        command.add_argument("--validation-wrapper", type=Path, required=True)
-        command.add_argument("--cpl-remote", required=True)
-        command.add_argument("--profile", choices=("bz-a3-1", "bz-a3-2"), required=True)
-        command.add_argument("--remote-workspace", required=True)
-        command.add_argument("--physical-device", type=int, required=True)
+        command.add_argument("--validation-wrapper", type=Path)
+        command.add_argument("--worker-config", type=Path)
+        command.add_argument("--cpl-remote")
+        command.add_argument("--profile", choices=("bz-a3-1", "bz-a3-2"))
+        command.add_argument("--remote-workspace")
+        command.add_argument("--physical-device", type=int)
         command.add_argument("--embedding-cache", type=Path, default=Path("/unconfigured"))
         command.add_argument("--corpus-artifacts", type=Path, default=Path("/unconfigured"))
         command.add_argument("--knowledge-database", type=Path, default=Path("/unconfigured"))
@@ -201,15 +202,18 @@ def _run(args, cells) -> tuple[dict[str, object], ...]:
     config = Phase1Config(
         args.state_root, args.validation_wrapper, args.embedding_cache,
         args.corpus_artifacts, args.knowledge_database, args.knowledge_manifest,
+        **({'worker_config': args.worker_settings} if getattr(args, 'worker_settings', None) is not None else {}),
     )
     sources = {destination.cell_id: source for source, destination in phase2_cell_pairs()}
     config.preflight(os.environ, cells=tuple(sources[cell.cell_id] for cell in cells))
-    _bz_preflight(config.validation_wrapper, args.profile, args.cpl_remote)
-    live = bz_live_dependencies(
-        config, cpl_remote=args.cpl_remote, profile=args.profile,
-        remote_workspace=args.remote_workspace,
-        physical_device=args.physical_device, environ=os.environ,
-    )
+    if getattr(args, 'worker_settings', None) is not None and args.worker_settings.get('execution') == 'local':
+        from run_a3_phase1 import _runtime_preflight, _live_dependencies
+        _runtime_preflight(args, config)
+        live = _live_dependencies(args, config)
+    else:
+        _bz_preflight(config.validation_wrapper, args.profile, args.cpl_remote)
+        live = bz_live_dependencies(config, cpl_remote=args.cpl_remote, profile=args.profile,
+            remote_workspace=args.remote_workspace, physical_device=args.physical_device, environ=os.environ)
     composition = Phase2Composition(
         config=config, dependencies=live, execution_profile=args.profile,
     )
@@ -262,6 +266,8 @@ def _report(root: Path) -> dict[str, object]:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    from run_a3_phase1 import _worker_settings, _runtime_preflight
+    _worker_settings(args)
     status = 0
     if args.command == "dry-run":
         value = {"schema": "a3-phase2-dry-run-v1",
@@ -272,10 +278,9 @@ def main(argv=None) -> int:
         config = Phase1Config(
             args.state_root, args.validation_wrapper, args.embedding_cache,
             args.corpus_artifacts, args.knowledge_database, args.knowledge_manifest,
+            worker_config=getattr(args, "worker_settings", None),
         )
-        value = {**config.preflight(os.environ), "remote_preflight": _bz_preflight(
-            config.validation_wrapper, args.profile, args.cpl_remote,
-        )}
+        value = {**config.preflight(os.environ), "remote_preflight": _runtime_preflight(args, config)}
     else:
         if args.command == "qualify":
             records = _run(args, qualification_cells())

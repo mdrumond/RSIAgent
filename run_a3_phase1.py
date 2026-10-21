@@ -51,7 +51,8 @@ def _parser() -> argparse.ArgumentParser:
     ):
         command = sub.add_parser(name)
         command.add_argument("--state-root", type=Path, required=True)
-        command.add_argument("--validation-wrapper", type=Path, required=True)
+        command.add_argument("--validation-wrapper", type=Path)
+        command.add_argument("--worker-config", type=Path)
         command.add_argument("--embedding-cache", type=Path, default=Path("/unconfigured"))
         command.add_argument("--corpus-artifacts", type=Path, default=Path("/unconfigured"))
         command.add_argument("--knowledge-database", type=Path, default=Path("/unconfigured"))
@@ -60,12 +61,12 @@ def _parser() -> argparse.ArgumentParser:
             "preflight", "run", "resume", "smoke-preflight", "smoke", "smoke-resume",
         ):
             command.add_argument(
-                "--profile", choices=("bz-a3-1", "bz-a3-2"), required=True,
+                "--profile", choices=("bz-a3-1", "bz-a3-2"),
             )
-            command.add_argument("--cpl-remote", required=True)
+            command.add_argument("--cpl-remote")
         if name in ("run", "resume", "smoke", "smoke-resume"):
-            command.add_argument("--remote-workspace", required=True)
-            command.add_argument("--physical-device", type=int, required=True)
+            command.add_argument("--remote-workspace")
+            command.add_argument("--physical-device", type=int)
             command.add_argument(
                 "--cell-id", action="append", default=[],
                 help="run only this foundation cell; repeat to select more",
@@ -91,6 +92,7 @@ def _config(args) -> Phase1Config:
     return Phase1Config(
         args.state_root, args.validation_wrapper, args.embedding_cache,
         args.corpus_artifacts, args.knowledge_database, args.knowledge_manifest,
+        worker_config=getattr(args, "worker_settings", None),
     )
 
 
@@ -138,8 +140,46 @@ def _bz_preflight(
     return {"profile": profile, "state": "completed"}
 
 
+def _worker_settings(args):
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode
+    path = getattr(args, "worker_config", None)
+    settings = apply_worker_config({}, path) if path else None
+    args.worker_settings = settings
+    if settings is not None and execution_mode(settings) == 'remote':
+        for name in ('profile', 'cpl_remote', 'remote_workspace', 'physical_device', 'validation_wrapper'):
+            if name in settings and hasattr(args, name):
+                setattr(args, name, Path(settings[name]) if name == 'validation_wrapper' else settings[name])
+    if settings is not None and execution_mode(settings) == "local":
+        args.profile = "local"
+        args.physical_device = settings["physical_device"]
+        args.validation_wrapper = Path("/unconfigured-local-wrapper")
+    elif hasattr(args, "validation_wrapper"):
+        if args.validation_wrapper is None or args.profile is None or args.cpl_remote is None:
+            raise ValueError("remote execution requires validation wrapper, profile and cpl-remote")
+        if hasattr(args, "remote_workspace") and (args.remote_workspace is None or args.physical_device is None):
+            raise ValueError("remote execution requires workspace and physical device")
+
+
+def _runtime_preflight(args, config):
+    if getattr(args, "worker_settings", None) and args.worker_settings.get("execution") == "local":
+        from benchmarks.ascend.execution import preflight_local
+        return preflight_local(args.worker_settings)
+    return _bz_preflight(config.validation_wrapper, args.profile, args.cpl_remote)
+
+
+def _live_dependencies(args, config):
+    if getattr(args, "worker_settings", None) and args.worker_settings.get("execution") == "local":
+        from benchmarks.ascend.local_native import local_legacy_dependencies
+        return local_legacy_dependencies(config, args.worker_settings, os.environ)
+    if (Path(config.state_root) / "local-execution-identity.json").exists():
+        raise ValueError("cannot resume local fixed A3 state with remote execution")
+    return bz_live_dependencies(config, cpl_remote=args.cpl_remote, profile=args.profile,
+        remote_workspace=args.remote_workspace, physical_device=args.physical_device, environ=os.environ)
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    _worker_settings(args)
     if args.command == "dry-run":
         value = full_dry_run()
     elif args.command == "prepare":
@@ -170,9 +210,7 @@ def main(argv=None) -> int:
         )
         value = {
             **local,
-            "remote_preflight": _bz_preflight(
-                cfg.validation_wrapper, args.profile, args.cpl_remote,
-            ),
+            "remote_preflight": _runtime_preflight(args, cfg),
         }
     else:
         cells = select_foundation_cells(
@@ -189,12 +227,8 @@ def main(argv=None) -> int:
             )
             if smoke else cfg.preflight(os.environ, cells=cells)
         )
-        _bz_preflight(cfg.validation_wrapper, args.profile, args.cpl_remote)
-        dependencies = bz_live_dependencies(
-            cfg, cpl_remote=args.cpl_remote, profile=args.profile,
-            remote_workspace=args.remote_workspace,
-            physical_device=args.physical_device, environ=os.environ,
-        )
+        _runtime_preflight(args, cfg)
+        dependencies = _live_dependencies(args, cfg)
         if smoke:
             assert proposals is not None
             wave = SmokeWave(

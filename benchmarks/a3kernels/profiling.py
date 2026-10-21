@@ -15,7 +15,7 @@ from benchmarks.a3kernels.phase1_evidence import canonical_digest
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _REPLAY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _TIMING = re.compile(r"^A3TIMING_US=(.+)$")
-_EXECUTION_PROFILES = frozenset(("gz-a3", "bz-a3-1", "bz-a3-2"))
+_EXECUTION_PROFILES = frozenset(("gz-a3", "bz-a3-1", "bz-a3-2", "local"))
 
 
 def _digest(value: object, label: str) -> None:

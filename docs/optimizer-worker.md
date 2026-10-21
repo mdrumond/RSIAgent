@@ -12,7 +12,7 @@ loads and web restarts must not launch replacements. A per-job nonblocking flock
 rejects duplicate workers. A shared device flock queues different jobs until the
 configured device is free. Stop also interrupts queued device admission.
 
-The ignored JSON config requires `profile` and matching `target` (checked A3
+For remote execution (the default), the ignored JSON config requires `profile` and matching `target` (checked A3
 profile), `runtime` (registered Torch runtime), numeric `physical_device`, `arch`,
 and absolute `cpl_remote`, `validation_wrapper`, `remote_workspace`, and `guide`
 paths. Discover the target/runtime/workspace and device through current registry
@@ -81,8 +81,11 @@ remote completion; a submission acknowledgement is insufficient.
 
 Injected configurations require an explicit `lock_directory` and a versioned
 `transport_identity`, pinned across resume alongside the runtime and device.
-They need no checked-wrapper paths. The normal CLI still validates and uses the
-existing checked transport. No transport is loaded dynamically from config.
+They need no checked-wrapper paths. The normal CLI selects the built-in local
+backend for `"execution": "local"`; otherwise it validates and uses the checked
+remote transport. See [local kernel execution](local-kernel-execution.md) for the
+shared worker configuration used by the optimizer and A3/A5 launchers. No
+transport is loaded dynamically from config.
 Machine-specific launchers and credentials belong in ignored local storage.
 The fixed Pi smoke is also callable through
 `benchmarks.pi_coding.smoke.run_smoke(config=..., transport_factory=..., ...)`;

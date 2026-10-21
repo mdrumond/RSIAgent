@@ -8,6 +8,7 @@ from coding.pi.budget import allocation_lock
 from optimizer.agent import OptimizerAgent
 from optimizer.jobs import JobStore, canonical, sha
 from optimizer.worker import load_config, run_worker
+from benchmarks.ascend.execution import execution_mode, preflight_local
 from .report import usage_totals
 from .tasks import MATMUL_SHAPES
 
@@ -49,7 +50,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     runtime_preflight()
     config = load_config(args.worker_config)
-    for key in ("cpl_remote", "validation_wrapper", "guide"):
+    for key in (("guide",) if execution_mode(config) == 'local' else ("cpl_remote", "validation_wrapper", "guide")):
         if not Path(config[key]).is_file():
             parser.error(f"configured {key} is unavailable")
     report = run_smoke(config=config, budget_ledger=args.budget_ledger,
@@ -79,6 +80,9 @@ def run_smoke(*, config, budget_ledger=None, root, window, budget_usd=2,
         raise ValueError("this smoke requires the registered deepseek-flash profile")
     config = {**config, "max_cases": 3, "model_profile": "deepseek-flash"}
     if check_only:
+        if execution_mode(config) == 'local':
+            return {"status": "local-preflight-passed", "execution": "local",
+                    "identity": preflight_local(config), "max_seconds": max_seconds}
         return {"status": "local-preflight-passed", "remote_validated": False,
                 "max_seconds": max_seconds}
     guide = Path(config["guide"]).read_text() + "\n" + TASK
