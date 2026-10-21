@@ -49,6 +49,17 @@ def test_selection_controls_and_compatibility(tmp_path):
         feedback.read('a'*64)
 
 
+def test_mixed_wave_accepts_new_projects_without_remedial_lineage(tmp_path):
+    from types import SimpleNamespace
+    _, selection, feedback = setup(tmp_path)
+    wave = SimpleNamespace(projects=[SimpleNamespace(spec=SimpleNamespace(project_id=pid))
+        for pid in ('probe', 'control', 'new-project')])
+    context = SimpleNamespace(prior_outcomes=[])
+    rows = [investigation(selection)]
+    assert feedback.admit(rows, wave, context) == tuple(rows)
+    assert feedback.admit([], wave, context) == ()
+
+
 def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
     store, selection, feedback = setup(tmp_path)
     calls = []
