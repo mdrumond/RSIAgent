@@ -284,6 +284,9 @@ class Phase2SourceProvider:
         from benchmarks.ascend.time_budget import AttemptTimeBudget
         budget = AttemptTimeBudget(root / "time-budget.json", self.max_seconds, clock=self.clock)
         self.deadline = budget.deadline
+        remaining_seconds = getattr(request, "remaining_seconds", None)
+        if remaining_seconds is not None:
+            self.deadline = min(self.deadline, self.clock()+remaining_seconds)
         coding = None
         current_source = None
         for message in reversed(messages):
@@ -324,6 +327,8 @@ class Phase2SourceProvider:
                         text = "{}"
                     completion = DirectCompletion(text, max(1, coding.completion_tokens-before))
                 tokens += completion.completion_tokens
+                if self.clock() >= self.deadline:
+                    break
                 payload = completion.text.encode("utf-8")
                 summary: dict[str, object] = {
                     "turn": len(transcript) + 1,

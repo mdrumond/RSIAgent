@@ -614,7 +614,7 @@ class LiveComposition:
                             else (
                                 "token-budget-exhausted"
                                 if "token budget exhausted" in trial.failures
-                                else "turn-budget-exhausted"
+                                else "time-budget-exhausted"
                             )
                         )
                     ),

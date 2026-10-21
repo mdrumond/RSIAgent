@@ -365,7 +365,7 @@ class TrialActionExecutor:
             return ActionOutcome(
                 json.dumps({"error": "time budget exhausted"}),
                 True,
-                "safety_ceiling",
+                "time-budget-exhausted",
                 budget_exempt=compile_exempt,
             )
         handler = getattr(self, "_" + action.kind.replace("-", "_"))

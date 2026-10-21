@@ -631,7 +631,7 @@ def test_compile_stops_at_time_deadline_before_backend_work(tmp_path):
     executor(parse_trial_action('{"write":{"slot":"kernel","content":"agent source"}}'))
     executor.deadline = 0
     exhausted = executor(parse_trial_action('{"compile":{}}'))
-    assert exhausted.terminal and exhausted.status == "safety_ceiling"
+    assert exhausted.terminal and exhausted.status == "time-budget-exhausted"
     assert json.loads(exhausted.observation) == {"error": "time budget exhausted"}
     assert not backend.compiles
 

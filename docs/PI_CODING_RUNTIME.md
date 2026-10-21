@@ -43,26 +43,25 @@ Large guides, source, memory, and observations become hash-addressed admitted re
 
 DeepSeek snapshots target 16 KiB, leaving space inside the existing 24 KiB target / 32 KiB high / 48 KiB hard production context envelope for the system prompt, tool schemas, framing, and one page exchange. The gateway measures the complete serialized outgoing request and refuses anything above 48 KiB before upstream HTTP, independently of Pi's context hooks. OpenAI retains the larger registered hard envelope. Mandatory snapshots that do not fit fail locally; no model call is used to summarize them.
 
-Pre-HTTP request intentions and provider results are retained separately. Page reads, invalid calls, and truncated generations consume the provider-request allowance. Unknown usage remains unknown. Cached input and reasoning tokens are subsets of provider totals and are not added twice. Optional dollar budgets reserve conservatively before HTTP and retain unknown reservations. Rates in the smoke ledger are conservative accounting assumptions, not invoices.
+Runtime budgets use elapsed seconds. Compile probes, host actions, context pages, provider requests, evaluated candidates, cumulative tokens, and estimated spend are telemetry and do not stop execution. Pi and the optimizer supervisor enforce the enclosing deadline and cancellation. Per-request context and output-size limits still apply. Legacy count and dollar arguments remain accepted for configuration compatibility but do not enforce caps. Resume preserves elapsed allocations; incompatible engine or budget identities require a fresh attempt.
 
-Noncoding terminal distillation still uses the existing provider, admitted-evidence parser, and bounded correction loop. It receives terminal host state and admitted artifacts; oversized original instructions are represented by a digest and bounded preview.
+Noncoding terminal distillation still uses the existing provider, admitted-evidence parser, and time-bounded correction loop. It receives terminal host state and admitted artifacts; oversized original instructions are represented by a digest and bounded preview.
 
-## Capped matmul-add smoke
+## Time-bounded matmul-add smoke
 
-The new smoke calls the existing production A3 optimizer. It introduces no remote execution adapter. It requires an already configured worker, guide, provider environment, and original allocation ledger. The three fixed `(M,N,K)` cases are `(64,64,64)`, `(129,193,257)`, and `(257,321,193)`. The task requests 64×64 output tiles, K chunks of 32, FP16 A/B, FP32 accumulation/C/output, and edge/reduction-tail handling. It uses the production `optimizer_kernel` ABI and frozen verification policy; the historical prototype used a different wrapper.
+The new smoke calls the existing production A3 optimizer. It introduces no remote execution adapter. It requires an already configured worker, guide, provider environment, and a time allocation. The three fixed `(M,N,K)` cases are `(64,64,64)`, `(129,193,257)`, and `(257,321,193)`. The task requests 64×64 output tiles, K chunks of 32, FP16 A/B, FP32 accumulation/C/output, and edge/reduction-tail handling. It uses the production `optimizer_kernel` ABI and frozen verification policy; the historical prototype used a different wrapper.
 
 ```bash
 .venv/bin/python -m benchmarks.pi_coding.smoke \
   --worker-config /absolute/ignored/worker.json \
-  --budget-ledger /absolute/ignored/original-pi-budget.json \
   --root .codex/local/pi-production-smoke \
   --window pi-production-smoke-v1 \
-  --budget-usd 2 \
+  --max-seconds 1200 \
   --knowledge-file benchmarks/pi_coding/knowledge/ascendc.md \
   --check-only
 ```
 
-Remove `--check-only` to execute after checking the existing worker configuration. Local preflight does not attest remote readiness. Reuse the same root, window, and ledger for a resumed run. The original ledger limit is preserved; the incremental window cannot be silently increased. Limits are 20 provider requests, four evaluated candidates, 20 minutes, and at most $2 additional conservative spend. Inspect the generated source for tiling even after a numerical pass. Raw job records and the smoke summary remain local.
+Remove `--check-only` to execute after checking the worker configuration. Local preflight does not attest remote readiness. Reuse the same root and window for resume; elapsed time remains charged. The default allocation is 1,200 seconds. Inspect generated source for tiling even after a numerical pass. Raw job records and the smoke summary remain local.
 
 Limited live validation used a private transport hook and an existing cached CANN 8.5.1/Python 3.11/Torch NPU 2.9 container. The production optimizer compiled a fixed Ascend C add-one kernel and numerically verified one case with 65 float32 elements. Optional profiling was stopped, and command/container cleanup was confirmed. This validates a small infrastructure path; it does not validate Pi generation or the default checked transport.
 

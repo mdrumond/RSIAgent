@@ -87,3 +87,6 @@ Machine-specific launchers and credentials belong in ignored local storage.
 The fixed Pi smoke is also callable through
 `benchmarks.pi_coding.smoke.run_smoke(config=..., transport_factory=..., ...)`;
 its CLI, budget caps, and numerical verification policy remain the same.
+
+
+Runtime allocations are measured in elapsed seconds. Attempt, compile, action, provider-request, cumulative-token, and dollar counts do not terminate jobs. Resume requires only `--additional-seconds`; the dashboard exposes time allocations and attempt telemetry. Legacy count arguments and stored count limits remain readable for compatibility but are ignored as stopping conditions. Provider response/context limits and frozen correctness cases remain enforced.

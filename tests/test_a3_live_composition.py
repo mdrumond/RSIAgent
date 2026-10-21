@@ -953,7 +953,24 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
     assert dependency_calls == []
 
 
-def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path):
+def elapsed_trial_clock(monkeypatch, *, seconds=10):
+    """Model calls consume simulated time; live composition keeps its real host loop."""
+    import benchmarks.a3kernels.live_composition as composition_module
+    from benchmarks.a3kernels.trial import A3TrialLoop, TrialBudgets
+    class TimedTrial(A3TrialLoop):
+        def __init__(self, **kwargs):
+            now = [0.0]
+            actor = kwargs['actor']
+            def timed_actor(*args):
+                now[0] += 1
+                return actor(*args)
+            super().__init__(**{**kwargs, 'actor': timed_actor,
+                'clock': lambda: now[0], 'budgets': TrialBudgets(max_seconds=seconds)})
+    monkeypatch.setattr(composition_module, 'A3TrialLoop', TimedTrial)
+
+
+def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path, monkeypatch):
+    elapsed_trial_clock(monkeypatch)
     cfg = config(tmp_path)
     first, later = foundation_cells()[4:6]
     invalid_calls = []
@@ -993,16 +1010,16 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     )
 
     assert [record["status"] for record in records] == ["failed", "passed"]
-    assert records[0]["terminal_reason"] == "turn-budget-exhausted"
+    assert records[0]["terminal_reason"] == "time-budget-exhausted"
     assert records[0]["completed_projects"] == 0
     assert records[0]["failed_project_id"] == SMOKE_PROPOSALS[0].project_id
     assert "invalid-content" not in first_paths.terminal.read_text()
-    assert len(invalid_calls) == 24
+    assert len(invalid_calls) == 10
     failures = tuple(
         entry for entry in EvidenceLedger(first_paths.evidence).entries
         if "provider_response_failure" in entry.payload
     )
-    assert len(failures) == 24
+    assert len(failures) == 10
     assert all(
         entry.payload["provider_response_failure"]["code"]
         == "invalid-content-or-usage"
@@ -1010,13 +1027,14 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     )
     assert wave.paths(later).terminal.is_file()
     assert wave.resume() == records
-    assert len(invalid_calls) == 24
+    assert len(invalid_calls) == 10
     assert retained == (
         first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
     )
 
 
-def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
+def test_terminal_reports_time_exhaustion_independent_of_token_usage(tmp_path, monkeypatch):
+    elapsed_trial_clock(monkeypatch)
     cfg = config(tmp_path)
     cell = foundation_cells()[0]
 
@@ -1042,11 +1060,12 @@ def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
     ).run()[0]
 
     assert record["status"] == "failed"
-    assert record["terminal_reason"] == "token-budget-exhausted"
+    assert record["terminal_reason"] == "time-budget-exhausted"
     assert record["completed_projects"] == 0
 
 
-def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
+def test_late_host_mismatch_can_be_repaired_before_deadline(tmp_path, monkeypatch):
+    elapsed_trial_clock(monkeypatch, seconds=40)
     cfg = config(tmp_path)
     cell = next(
         item for item in foundation_cells()
@@ -1059,7 +1078,9 @@ def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
         [{"action": "compile"}] * 23
         + [{"action": "write_source", "source": SOURCE},
            {"action": "compile"}, {"action": "run"},
-           {"action": "write_source", "source": SOURCE + "\n"}]
+           {"action": "write_source", "source": SOURCE + "\n"},
+           {"action": "compile"}, {"action": "run"},
+           {"action": "submit", "interpretation": "repaired", "supports": []}]
     )
 
     def late_actor_factory(_cell, _proposal):
@@ -1073,7 +1094,11 @@ def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
         return actor
 
     class HostMismatch(FakeCandidate):
+        mismatched = False
         def run(self, source, _workdir, **options):
+            if self.mismatched:
+                return super().run(source, _workdir, **options)
+            self.mismatched = True
             plan = self.base.plan(source, **options)
             output = (0.0,) * plan.padded_length
             return VerifiedResult.from_receipt(
@@ -1099,12 +1124,10 @@ def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
     )
 
     record = wave.run()[0]
-    assert record["status"] == "failed"
-    assert record["terminal_reason"] == "attempt-rewrite-required"
-    assert len(calls) == 26
-    assert wave.report()["records"][0]["terminal_reason"] == (
-        "attempt-rewrite-required"
-    )
+    assert record["status"] == "passed"
+    assert record["terminal_reason"] == "completed"
+    assert len(calls) == 30
+    assert wave.report()["records"][0]["terminal_reason"] == "completed"
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):

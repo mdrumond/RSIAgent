@@ -484,6 +484,8 @@ class AdaptiveActorProjectExecutor:
             raise TypeError("request must be AdaptiveProjectRequest")
         started = time.monotonic()
         remaining = getattr(request, "remaining_seconds", None)
+        if remaining is not None and remaining <= 0:
+            raise RuntimeError("project time budget exhausted")
         max_seconds = min(self.max_seconds, remaining) if remaining is not None else self.max_seconds
         prepared = self.executor.prepare(request.spec)
         if (
@@ -503,6 +505,7 @@ class AdaptiveActorProjectExecutor:
             request_timing=self.request_timing,
             request_diagnostic=self.request_diagnostic,
         )
+        actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
         actions.read_artifacts = MemoryArtifactReader(request, artifacts)
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "

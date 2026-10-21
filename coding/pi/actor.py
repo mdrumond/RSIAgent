@@ -123,7 +123,7 @@ class PiActorDriver(DirectActorDriver):
                         return ActorOutcome(outcome.status, turn, tokens,
                             admitted_artifacts=dict(outcome.admitted_artifacts),
                             continuation=_ActorContinuation(profile, tuple(retained), recorder,
-                                                            working, turn))
+                                                            working, turn, deadline))
                 recorder.observation(latest, turn=turn)
                 history.append(latest)
                 self._trace("message", {"role": "user", "content": latest})

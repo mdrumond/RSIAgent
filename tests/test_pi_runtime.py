@@ -313,6 +313,7 @@ def test_actor_compile_and_host_turns_are_bounded_by_time_only(monkeypatch, tmp_
     outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))), workspace=tmp_path,
                      context=None, turn_parser=parse_trial_action, action_executor=execute)
     assert outcome.status == 'passed' and seen == ['compile', 'compile', 'submit']
+    assert outcome.continuation.deadline > time.monotonic()
 
 
 def test_actor_expires_without_executing_another_action(monkeypatch, tmp_path):
