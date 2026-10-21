@@ -784,3 +784,13 @@ def test_bound_trial_requires_a_host_verified_submit(tmp_path):
             profiling_guidance=False,
             ledger=EvidenceLedger(tmp_path / "evidence.jsonl"),
         )
+
+
+def test_single_model_provider_does_not_require_unrelated_credentials():
+    selected = MODEL_IDENTITIES[0]
+    provider = DirectCompletionProvider({selected.credential_env: 'fixture-only'},
+        models=(selected.backend_model,), transport=lambda **_: DirectCompletion('ok', 1))
+    assert provider.coding_environment() == {selected.credential_env: 'fixture-only'}
+    assert provider.complete(direct_profile(selected), [{'role':'user', 'content':'test'}]).text == 'ok'
+    with pytest.raises(ValueError, match='not configured'):
+        provider.complete(direct_profile(MODEL_IDENTITIES[1]), [{'role':'user', 'content':'test'}])

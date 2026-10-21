@@ -191,9 +191,14 @@ class DirectCompletionProvider:
         sleeper: Callable[[float], None] = time.sleep,
         retry_max_seconds: float = 480,
         clock=None,
+        models: Sequence[A5BackendModel] | None = None,
     ) -> None:
+        selected = tuple(_DIRECT_VALUES) if models is None else tuple(models)
+        if not selected or any(model not in _DIRECT_VALUES for model in selected):
+            raise ValueError("provider models must use registered identities")
         credentials = {}
-        for values in _DIRECT_VALUES.values():
+        for model in selected:
+            values = _DIRECT_VALUES[model]
             name = values["identity"]["credential_env"]
             value = environment.get(name, "")
             if not isinstance(value, str) or not value.strip():
@@ -237,6 +242,8 @@ class DirectCompletionProvider:
     ) -> DirectCompletion:
         if profile != direct_profile(profile.identity):
             raise ValueError("provider profile is not canonical")
+        if profile.identity.credential_env not in self._credentials:
+            raise ValueError("provider credential is not configured for this model")
         if request_bytes(profile.request(messages)) > self.context_budget(profile).hard:
             raise ContextBudgetError("direct provider request exceeds context hard byte budget")
         request = profile.request(messages)
