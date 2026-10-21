@@ -268,8 +268,8 @@ runner image. Use a new `--output` directory when repeating a smoke. See
 ## Ascend kernel-learning campaigns
 
 `run_ascend_campaign.py` launches one explicitly requested phase. Agents run
-locally; compilation, host verification, timing, and profiling use configured
-remote device adapters. A3 uses Ascend C; A5 retains its Catlass DSL entrypoints.
+locally; compilation, host verification, timing, and profiling use the selected
+local or remote runtime. A3 uses Ascend C; A5 retains its Catlass DSL entrypoints.
 Starting Phase 1 does **not** automatically start Phase 2.
 
 Install the host dependencies (`python -m pip install -r requirements.txt`) and
@@ -279,6 +279,97 @@ and, when selected, KDB/profiling guidance. Check the configured target and run
 a bounded smoke before committing to a campaign. No desktop VM is needed for
 Ascend. See [target/runtime setup](docs/ascend-target-launcher.md) for required
 native fields, treatment bindings, and explicit A3 device pools.
+
+### Small Pi smoke with a local Ascend runtime
+
+Run these commands **on the Ascend host**, after activating its Python/CANN
+runtime and putting Node 22+ on `PATH`. Pi and kernel execution then run on that
+host. Local mode does not need remote-access configuration or remote wrappers.
+
+```bash
+git clone https://github.com/mdrumond/RSIAgent.git RSIAgent
+cd RSIAgent
+# To test the local-execution PR instead of main:
+git fetch origin refs/pull/170/head
+git checkout --detach FETCH_HEAD
+python -m pip install -r requirements.txt
+npm ci --prefix integrations/pi
+```
+
+If the Ascend host cannot reach GitHub, create a Git bundle on a connected host
+and upload it through your configured transport instead:
+
+```bash
+# In the PR checkout on the connected host:
+git bundle create /private/pr170.bundle codex/pi-local-execution
+cpl-remote upload YOUR_A3_TARGET /private/pr170.bundle /remote/private/pr170.bundle
+# On the Ascend host, instead of the network clone:
+git clone --branch codex/pi-local-execution /remote/private/pr170.bundle RSIAgent
+cd RSIAgent
+git rev-parse HEAD
+```
+
+Then install the Python/Pi dependencies as above. Verify that `git rev-parse HEAD`
+matches the PR head you intend to validate.
+
+Keep `DEEPSEEK_API_KEY` in your environment or a private environment file outside
+the checkout. Create a private worker configuration, replacing the paths,
+physical device, and compiler architecture with values for your active runtime:
+
+```json
+{
+  "execution": "local",
+  "workspace": "/absolute/private/pi-smoke/kernel-work",
+  "physical_device": 0,
+  "arch": "YOUR_COMPILER_ARCHITECTURE",
+  "guide": "/absolute/RSIAgent/benchmarks/pi_coding/knowledge/ascendc.md",
+  "env_file": "/absolute/private/provider.env",
+  "model_profile": "deepseek-flash",
+  "max_cases": 1,
+  "max_seconds": 300
+}
+```
+
+This small smoke asks real Pi to generate an add-one kernel for one frozen
+64-element FP32 case. It uses the production optimizer, compiler, numerical
+oracle, and measurement path, with a five-minute elapsed-time allocation:
+
+```bash
+export RSI_SMOKE_CONFIG=/absolute/private/worker-local.json
+export RSI_SMOKE_ROOT=/absolute/private/pi-smoke/jobs
+python - <<'PYSMOKE'
+import json, os
+from pathlib import Path
+from optimizer.jobs import JobStore, canonical, sha
+from optimizer.worker import load_config, run_worker
+
+store = JobStore(Path(os.environ["RSI_SMOKE_ROOT"]))
+body = {"files": {}, "memory_entries": []}
+memory = {**body, "snapshot_id": sha(canonical(body))}
+job = store.create(
+    "def forward(x): return x + 1", "forward",
+    {"signatures": [{"args": [{"shape": [64], "dtype": "float32"}]}]},
+    memory, name="Pi local add-one smoke", max_seconds=300)
+result = run_worker(store.root, job["job_id"],
+                    load_config(os.environ["RSI_SMOKE_CONFIG"]))
+states = [event["payload"] for event in store.events(job["job_id"])
+          if event["kind"] == "optimizer-state"]
+verified = bool(states and states[-1].get("best"))
+print(json.dumps({"job_id": job["job_id"], "status": result["status"],
+                  "host_verified": verified}))
+raise SystemExit(0 if verified else 2)
+PYSMOKE
+```
+
+Success requires `host_verified: true`; model prose and compilation alone do
+not establish success. Inspect the retained job events, generated source,
+operation receipts, and profiler evidence under the private run directories.
+Use a fresh root for a new smoke; existing jobs retain their original allocation.
+For the larger fixed tiled matmul-add smoke and other launchers, see
+[local kernel execution](docs/local-kernel-execution.md) and
+[Pi setup](docs/PI_CODING_RUNTIME.md).
+
+### Campaign configuration
 
 All `/path/to/...` values below are placeholders. Keep settings, credentials,
 and machine-specific configuration in ignored local files outside campaign
