@@ -208,3 +208,39 @@ def test_target_complete_phase1_memory_is_reviewable(tmp_path):
     state["project_target"] = 2
     with pytest.raises(ValueError, match="must be complete"):
         _memory(state, SEED)
+
+
+def test_automatic_phase2_rejected_selection_retains_transcript(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+
+    calls, responses = [], []
+
+    def complete(messages):
+        calls.append(messages)
+        proposal = json.loads(_wave(messages[1]["content"], [project(1)]).split("\n", 1)[1])
+        proposal["projects"][0]["requires"] = ["cube-tiling"]
+        raw = "DECISION: WAVE\n" + json.dumps(proposal)
+        responses.append(raw)
+        return raw
+
+    def execute(_):
+        pytest.fail("invalid selection must never dispatch a project")
+
+    coordinator = AdaptivePhase2Coordinator(
+        tmp_path, "Learn", snapshot(), CurriculumAgent(complete), execute, project_target=2)
+    with pytest.raises(ValueError, match="rejected selection artifact:") as failure:
+        coordinator.run()
+    assert len(calls) == 3
+    digest = str(failure.value).rsplit(": ", 1)[1]
+    artifact = ContentAddressedArtifacts(tmp_path / "artifacts").read_json(digest)
+    assert [row["content"] for row in artifact["messages"]
+            if row["role"] == "assistant"] == responses
+    feedback = [row["content"] for row in artifact["messages"] if row["role"] == "user"][1:]
+    assert len(feedback) == 3
+    assert all("project phase2-1: unsupported requires ['cube-tiling']" in row
+               and "allowed pre-wave coverage prerequisites: ['gm-ub-movement']" in row
+               for row in feedback)
+    assert not (tmp_path / "pending.json").exists()
+    state = json.loads((tmp_path / "state.json").read_bytes())
+    assert state["prior_outcomes"] == []
+    assert state["completed_waves"] == []

@@ -370,7 +370,7 @@ def _grammar() -> dict[str, object]:
             "bounds": "1-3 inputs, 1-12 topological nodes, 1-3 dimensions",
         },
         "wave_project_fields_exactly": ["spec", "requires"],
-        "requires": "list of Capability values already in pre_wave_coverage, never project IDs; [] for the initial wave",
+        "requires": "prerequisites already available BEFORE this wave: only values in pre_wave_coverage, never project IDs or sibling outputs. [] is valid in ANY wave. These are not operations being studied: a project studying unfamiliar cube-tiling may use requires: [] even when cube-tiling is absent from pre_wave_coverage",
         "wave_fields_exactly": [
             "wave_id", "pre_wave_memory_sha256", "pre_wave_coverage", "projects",
         ],
@@ -409,6 +409,10 @@ def curriculum_prompt(
         "A failed attempt is not kernel knowledge or a permanent operation ban: "
         "a smaller, changed experiment with a fresh ID may still be useful. "
         "no_new_knowledge means verified execution yielded no reusable lesson. "
+        "pre_wave_coverage is the exact allowed prerequisite set, derived from "
+        "host-verified project categories, including authenticated copied seed memory; "
+        "it does not establish mastery or restrict which new operations to study. "
+        "Each requires list must be a subset of this set before the wave starts. "
         "Coverage dimensions are advisory: new exact shapes within a covered shape "
         "class and new combinations of covered dimensions are allowed. Avoid exact "
         "repeats of verified prior or sibling project information; changing only "
@@ -429,6 +433,14 @@ def curriculum_prompt(
         )
     guidance = ASCEND_EXPERIMENT_GUIDANCE if target_policy is None else target_policy.guidance
     return instructions + guidance + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+class CurriculumSelectionError(ValueError):
+    """A rejected selection, including its exact model responses and feedback."""
+
+    def __init__(self, message, messages):
+        super().__init__(message)
+        self.messages = tuple(dict(row) for row in messages)
 
 
 class CurriculumAgent:
@@ -520,10 +532,6 @@ class CurriculumAgent:
                 if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
                     raise ValueError("wave exceeds remaining project budget; select a smaller wave")
             except ValueError as exc:
-                if attempt - reads >= 3:
-                    raise ValueError(
-                        f"curriculum selection failed validation after 3 attempts: {exc}"
-                    ) from exc
                 history.append({
                     "role": "user",
                     "content": (
@@ -533,6 +541,11 @@ class CurriculumAgent:
                         "are unchanged; no project has been admitted."
                     ),
                 })
+                if attempt - reads >= 3:
+                    raise CurriculumSelectionError(
+                        f"curriculum selection failed validation after 3 attempts: {exc}",
+                        history[selection_start:],
+                    ) from exc
                 continue
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise AssertionError("unreachable selection attempt")
