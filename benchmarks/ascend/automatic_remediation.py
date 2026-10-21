@@ -1,4 +1,5 @@
 """Opt-in failure obligations, separate from the campaign's project target."""
+import base64
 from contextlib import ExitStack, contextmanager
 import math
 import threading
@@ -103,6 +104,10 @@ class AutomaticRemediation:
                                                if not self.budgets[row['feedback_id']].expired]
         self.feedback.ids = {row['feedback_id'] for row in self.feedback.selection['selected']}
         self.save()
+        for key, failure in self.state['failures'].items():
+            for retry in failure['retries']:
+                directory = self.runner.root / 'original-retries' / key / Path(retry['root']).name
+                self._assess_retry(directory)
         return bool(self.feedback.ids)
 
     @contextmanager
@@ -169,6 +174,31 @@ class AutomaticRemediation:
                         reason='Original acceptance still fails after retry; investigate retained retry evidence.'))
                     self.feedback.record([], state)
             self.save()
+            self._assess_retry(directory)
+
+    def _assess_retry(self, directory):
+        verifier = getattr(self.runner, 'usefulness_verifier', None)
+        marker = directory / 'usefulness-assessment.json'
+        if (verifier is None or not verifier.enabled or not (directory / 'retry-memory.bin').exists()
+                or marker.exists() and json.loads(marker.read_bytes()).get('complete')):
+            return
+        try:
+            from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+            state = json.loads((directory / 'state.json').read_bytes())
+            prior = (directory / 'retry-memory.bin').read_bytes()
+            for wave in state['completed_waves']:
+                for outcome in (directory / 'waves' / wave / 'branches').glob('*/outcome.json'):
+                    if not json.loads(outcome.read_bytes())['verified']:
+                        continue
+                    delta = json.loads((outcome.parent / 'memory-delta.bin').read_bytes())
+                    memory = Phase1ProjectMemory.from_mapping(json.loads(base64.b64decode(delta['memory_base64'])))
+                    source_id = outcome.parent.relative_to(self.runner.root).as_posix()
+                    verifier.assess_memory(memory, prior, source_id)
+            atomic(marker, canonical(dict(complete=True)))
+        except Exception as error:
+            # Acceptance and linked lifecycle have already committed. Assessment
+            # is optional evidence and cannot undo or delay that transition.
+            atomic(marker, canonical(dict(complete=False, error_type=type(error).__name__, error=str(error))))
 
     def _phase1_retry(self, row, directory, state):
         from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveProject, WaveSpec

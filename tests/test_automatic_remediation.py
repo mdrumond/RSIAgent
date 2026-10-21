@@ -8,7 +8,8 @@ from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from test_a5_phase1_adaptive import _project, _wave, _result
 
 
-def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path):
+@pytest.mark.parametrize("assessment_error", [False, True])
+def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error):
     calls, executions = [], []
     runner = None
     automatic = None
@@ -36,6 +37,16 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
     runner = AdaptivePhase1Coordinator(tmp_path / 'run', 'Repair failures.', b'{}',
         CurriculumAgent(complete), execute, max_parallel=1, project_target=1)
     automatic = AutomaticRemediation(runner, target='a3')
+    from types import SimpleNamespace
+    assessments = []
+    def assess(memory, prior, source_id):
+        linked = next(row for row in automatic.store.records() if
+            row['outcome']['attempt_id'] == 'original' and row['outcome']['source_root'] == str(runner.root.resolve()))
+        assert linked['lifecycle'] == 'fixed'
+        assessments.append((memory, prior, source_id))
+        if assessment_error:
+            raise RuntimeError('optional assessment unavailable')
+    runner.usefulness_verifier = SimpleNamespace(enabled=True, assess_memory=assess)
     result = runner.run()
     original = next(r for r in automatic.store.records() if
                     r['outcome']['source_root'] == str(runner.root.resolve()) and
@@ -45,10 +56,18 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
     retries = [r for r in executions if 'original-retries' in str(r.branch_root)]
     assert retries[0].spec == executions[0].spec
     assert retries[0].pre_wave_memory != executions[0].pre_wave_memory
+    assert assessments and assessments[0][1] == retries[0].pre_wave_memory
+    assert assessments[0][0].project_spec == executions[0].spec
+    assert assessments[0][2].startswith('original-retries/' + original['feedback_id'] + '/retry-1/')
+    assert not assessments[0][2].startswith('/')
+    marker = next((runner.root/'original-retries').glob('*/retry-1/usefulness-assessment.json'))
+    assert json.loads(marker.read_bytes())['complete'] is not assessment_error
     assert result['project_target'] == 1
     before = len(executions)
     runner.resume()
     assert len(executions) == before
+    if not assessment_error:
+        assert len(assessments) == 1
 
 
 def test_expired_failure_budget_does_not_extend_campaign(tmp_path):
