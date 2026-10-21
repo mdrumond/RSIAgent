@@ -188,3 +188,62 @@ def discover_sources(configured_roots, *, snapshot_roots=()):
         except (OSError, ValueError, KeyError, TypeError) as error:
             result.append(dict(root=str(root), available=False, reason=str(error)))
     return result
+
+
+def freeze_committed_phase1(root, initial_memory):
+    """Export committed host-authenticated learning without claiming human review."""
+    from benchmarks.ascend.phase2 import _native_identity
+    from benchmarks.ascend.training_annex import _verify_adaptive_state, _verify_wave, _project_memory
+    root = Path(root).absolute()
+    state_bytes = _read(root, 'state.json')
+    state = json.loads(state_bytes)
+    identity = json.loads(_read(root, 'campaign-identity.json'))
+    _native_identity(identity)
+    if state.get('schema') != 'a5-phase1-adaptive-state-v2' or state.get('phase'):
+        raise ValueError('committed Phase 1 source required')
+    if state['initial_memory_sha256'] != sha(initial_memory):
+        raise ValueError('committed Phase 1 initial memory differs')
+    # Use the production state reader and host publication verifier, including
+    # failed branches; a human review verdict is deliberately not manufactured.
+    import tempfile
+    with tempfile.NamedTemporaryFile() as seed:
+        seed.write(initial_memory)
+        seed.flush()
+        _verify_adaptive_state(root, state, external_initial_memory=seed.name)
+    from benchmarks.a5kernels.phase2_adaptive_memory import _published_evidence
+    _published_evidence(root, state, initial_memory)
+    files = {'state.json': state_bytes, 'campaign-identity.json': canonical(identity),
+             'initial-memory.bin': initial_memory}
+    for wave_id in state['completed_waves']:
+        wave = root / 'waves' / wave_id
+        _verify_wave(wave)
+        for name in ('plan.json', 'published.json', 'consolidated-memory.json'):
+            relative = f'waves/{wave_id}/{name}'
+            files[relative] = _read(root, relative)
+        plan = json.loads(files[f'waves/{wave_id}/plan.json'])
+        for project in plan['wave']['projects']:
+            branch = wave / 'branches' / project['spec']['project_id']
+            for name in ('outcome.json', 'memory-delta.bin', 'execution-evidence.bin'):
+                relative = (branch / name).relative_to(root).as_posix()
+                files[relative] = _read(root, relative)
+            if not json.loads((branch / 'outcome.json').read_bytes())['verified']:
+                continue
+            _, memory = _project_memory(branch)
+            for digest in {memory.source_revision, *memory.admitted_artifact_sha256,
+                           *(fact.evidence_sha256 for fact in memory.host_facts)}:
+                path = branch / (memory.artifact_store or 'artifacts') / 'objects' / digest[:2] / digest[2:]
+                relative = path.relative_to(root).as_posix()
+                data = _read(root, relative)
+                if sha(data) != digest:
+                    raise ValueError('committed Phase 1 CAS mismatch')
+                files[relative] = data
+    if _read(root, 'state.json') != state_bytes:
+        raise ValueError('Phase 1 changed during committed snapshot')
+    body = dict(schema='optimizer-memory-snapshot-v1', phase='committed-phase1',
+        source_identity=identity, terminal=state.get('terminal'),
+        phase1_snapshot_id=sha(state_bytes),
+        memory_entries=[json.loads(base64.b64decode(raw, validate=True))
+                        for raw in state['memory_bytes_base64']],
+        files={name: dict(sha256=sha(data), base64=base64.b64encode(data).decode())
+               for name, data in sorted(files.items())})
+    return {**body, 'snapshot_id': sha(canonical(body))}

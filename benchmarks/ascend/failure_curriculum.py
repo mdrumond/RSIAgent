@@ -96,7 +96,8 @@ class FailureCurriculum:
             for row in self.selection[role]:
                 out = row['outcome']
                 rows.append(dict(feedback_id=row['feedback_id'], role=role,
-                    category=out['category'], task={k: v for k, v in out['task'].items() if k != 'submission'},
+                    category=out['category'], lifecycle=row.get('lifecycle'),
+                    retries=row['investigation']['retries'], task={k: v for k, v in out['task'].items() if k != 'submission'},
                     task_sha256=sha(canonical(out['task'])),
                     submission_preview=json.dumps(out['task'].get('submission'), sort_keys=True)[:2048],
                     investigations=[r for r in self.lineage if r['feedback_id'] == row['feedback_id']][-3:],
