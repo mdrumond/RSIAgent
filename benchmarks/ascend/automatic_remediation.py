@@ -1,5 +1,8 @@
 """Opt-in failure obligations, separate from the campaign's project target."""
 from contextlib import ExitStack, contextmanager
+import math
+import threading
+import time
 import json
 from copy import copy
 from pathlib import Path
@@ -7,6 +10,48 @@ from pathlib import Path
 from optimizer.jobs import atomic, canonical, sha
 from .failure_curriculum import FailureCurriculum
 from .phase2_feedback import FeedbackStore
+
+
+class FailureTimeBudget:
+    """Start the shared upstream attempt clock only for attributable work."""
+    def __init__(self, path, seconds, *, clock=time.monotonic):
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+            raise ValueError('failure seconds must be positive and finite')
+        self.path, self.seconds, self.clock = path, seconds, clock
+        self.timer, self.depth, self.lock = None, 0, threading.RLock()
+        if path.exists() and json.loads(path.read_bytes())['max_seconds'] != seconds:
+            raise ValueError('failure time allowance changed')
+
+    @property
+    def elapsed_seconds(self):
+        with self.lock:
+            if self.timer:
+                return self.timer.elapsed + max(0, self.clock() - self.timer.started)
+            return json.loads(self.path.read_bytes())['elapsed_seconds'] if self.path.exists() else 0
+
+    @property
+    def remaining_seconds(self):
+        return max(0, self.seconds - self.elapsed_seconds)
+
+    @property
+    def expired(self):
+        return self.remaining_seconds <= 0
+
+    @contextmanager
+    def active(self):
+        from .time_budget import AttemptTimeBudget
+        with self.lock:
+            if self.timer is None:
+                self.timer = AttemptTimeBudget(self.path, self.seconds, clock=self.clock)
+            self.depth += 1
+        try:
+            yield
+        finally:
+            with self.lock:
+                self.depth -= 1
+                if self.depth == 0:
+                    self.timer.close()
+                    self.timer = None
 
 
 class AutomaticRemediation:
@@ -42,12 +87,10 @@ class AutomaticRemediation:
             if Path(row['outcome']['source_root']).resolve().is_relative_to(retry_parent)}
         self.feedback.selection['selected'] = [row for row in self.feedback.selection['selected']
                                               if row['feedback_id'] not in excluded]
-        from core.active_budget import ActiveTimeBudget
         self.budgets = {}
-        parent = getattr(self.runner, 'budget', None)
         for row in self.feedback.selection['selected']:
             key = row['feedback_id']
-            budget = ActiveTimeBudget(self.runner.root / 'failure-budgets' / (key + '.json'), self.seconds, parent=parent)
+            budget = FailureTimeBudget(self.runner.root / 'failure-budgets' / (key + '.json'), self.seconds, clock=self.runner.clock)
             self.budgets[key] = budget
             self.state['failures'].setdefault(key, dict(retries=[], pending=None))
             self.state['failures'][key].update(active_seconds=budget.elapsed_seconds,
@@ -65,11 +108,11 @@ class AutomaticRemediation:
                 stack.enter_context(self.budgets[key].active())
             yield
 
-    def project_active(self, request):
+    def project_keys(self, request):
         branch = request.branch_root.resolve()
         retry_parent = (self.runner.root / 'original-retries').resolve()
         if branch.is_relative_to(retry_parent):
-            return self.active({branch.relative_to(retry_parent).parts[0]})
+            return {branch.relative_to(retry_parent).parts[0]}
         rows = list(self.feedback.lineage)
         pending = self.runner.root / 'pending.json'
         if pending.exists():
@@ -77,7 +120,14 @@ class AutomaticRemediation:
         keys = {row['feedback_id'] for row in rows
                 if request.assignment.project_id in {row.get('project_id'), row.get('control_project_id')}
                 and row['feedback_id'] in self.feedback.ids}
-        return self.active(keys)
+        return keys
+
+    def project_active(self, request):
+        return self.active(self.project_keys(request))
+
+    def project_remaining(self, request):
+        return min([self.runner._remaining_seconds(),
+                    *(self.budgets[key].remaining_seconds for key in self.project_keys(request))])
 
     def retry_ready(self, state):
         for row in self.feedback.selection['selected']:
@@ -93,7 +143,7 @@ class AutomaticRemediation:
                 if row['outcome']['source_type'] == 'phase1':
                     self._phase1_retry(row, directory, state)
                 elif self.retry_external:
-                    self.retry_external(row, directory, self.budgets[key].remaining_seconds)
+                    self.retry_external(row, directory, min(self.budgets[key].remaining_seconds, self.runner._remaining_seconds()))
                 else:
                     raise ValueError('external feedback requires a configured optimizer retry adapter')
             attempts = [r for r in self.store.records()

@@ -540,7 +540,8 @@ class AdaptivePhase1Coordinator:
             request.branch_root,
             request.inputs,
             request.oracle,
-            remaining_seconds=self._remaining_seconds(),
+            remaining_seconds=(self.automatic_remediation.project_remaining(request)
+                               if self.automatic_remediation else self._remaining_seconds()),
         ))
         if not isinstance(result, AdaptiveProjectResult):
             raise TypeError("project adapter must return AdaptiveProjectResult")

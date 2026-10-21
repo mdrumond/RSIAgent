@@ -61,7 +61,7 @@ def test_expired_failure_budget_does_not_extend_campaign(tmp_path):
     automatic.refresh(runner._load_state())
     key = next(iter(automatic.budgets))
     path = runner.root / 'failure-budgets' / (key + '.json')
-    path.write_text(json.dumps(dict(schema='active-time-v1', seconds=1800, elapsed_seconds=1800)))
+    path.write_text(json.dumps(dict(max_seconds=1800, elapsed_seconds=1800)))
     assert not automatic.refresh(runner._load_state())
     assert automatic.store.records()[0]['lifecycle'] == 'failed'
 
@@ -161,3 +161,30 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     assert store.link_original_retry(row['feedback_id'], retried['feedback_id'])['lifecycle'] == 'fixed'
     assert received[0]['phase'] == 'committed-phase1'
     assert len(received[0]['memory_entries']) == 1
+
+
+def test_original_retry_propagates_only_remaining_failure_seconds(tmp_path):
+    from types import SimpleNamespace
+    from test_generic_failure_feedback import phase1
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    source = tmp_path/'source'
+    phase1(source, spec=_project('original', 'gm-ub-movement'))
+    received = []
+    def execute(request):
+        received.append(request.remaining_seconds)
+        return _result(request.spec, True, 'pass')
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}',
+        CurriculumAgent(lambda _: ''), execute, max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', sources=[dict(type='phase1', root=str(source))])
+    automatic.refresh(runner._load_state())
+    key = next(iter(automatic.budgets))
+    path = runner.root/'failure-budgets'/(key+'.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(dict(max_seconds=1800, elapsed_seconds=1780)))
+    automatic.refresh(runner._load_state())
+    spec = ProjectSpec.from_mapping(_project('original', 'gm-ub-movement'))
+    request = SimpleNamespace(branch_root=runner.root/'original-retries'/key/'retry-1/waves/original/branches/original',
+        assignment=SimpleNamespace(project_id='original', spec=spec, authored_ordinal=1),
+        pre_wave_memory=b'{}', inputs=(), oracle=None)
+    runner._execute(request)
+    assert 0 < received[0] <= 20
