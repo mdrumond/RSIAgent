@@ -365,6 +365,11 @@ Success requires `host_verified: true`; model prose and compilation alone do
 not establish success. Inspect the retained job events, generated source,
 operation receipts, and profiler evidence under the private run directories.
 Use a fresh root for a new smoke; existing jobs retain their original allocation.
+A run may end with `status: "budget-exhausted"` after using its time allocation
+and still have `host_verified: true`; inspect these fields separately. A live
+A3 run of this 64-element smoke used real Pi 1.3.0 and the configured provider,
+compiled and numerically verified the generated kernel in local mode, and ended
+at its 300-second allocation with `host_verified: true`.
 For the larger fixed tiled matmul-add smoke and other launchers, see
 [local kernel execution](docs/local-kernel-execution.md) and
 [Pi setup](docs/PI_CODING_RUNTIME.md).
