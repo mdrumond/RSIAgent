@@ -159,7 +159,7 @@ class AdaptivePhase2Coordinator(AdaptivePhase1Coordinator):
             if pending is None:
                 if approved_only:
                     raise ValueError("no approved wave is pending")
-                decision, session = self.curriculum.select(
+                decision, session = self._select(
                     self._context(state, snapshot), self._session(state),
                     remaining_projects=1)
                 if isinstance(decision, TerminalDecision):

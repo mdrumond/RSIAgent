@@ -20,6 +20,7 @@ from benchmarks.a5kernels.phase1_curriculum_selector import (
     CurriculumAgent,
     CurriculumContext,
     CurriculumSession,
+    CurriculumSelectionError,
     PriorOutcome,
     ProjectInformation,
     TerminalDecision,
@@ -261,7 +262,7 @@ class AdaptivePhase1Coordinator:
             if pending is None:
                 if approved_only:
                     raise ValueError("no approved wave is pending")
-                decision, session = self.curriculum.select(
+                decision, session = self._select(
                     self._context(state, snapshot), self._session(state),
                     remaining_projects=self.project_target - len(state["prior_outcomes"]),
                 )
@@ -336,7 +337,7 @@ class AdaptivePhase1Coordinator:
                     "base_wave_index": state["wave_index"],
                     "base_memory_sha256": hashlib.sha256(self._memory_snapshot(state)).hexdigest()}
         snapshot = self._memory_snapshot(state)
-        decision, session = self.curriculum.select(
+        decision, session = self._select(
             self._context(state, snapshot), self._session(state),
             remaining_projects=self.project_target - len(state["prior_outcomes"]),
         )
@@ -581,13 +582,59 @@ class AdaptivePhase1Coordinator:
             "summary": _validated_summary(value["summary"]),
         }
 
+    def _select(self, *args, **kwargs):
+        try:
+            return self.curriculum.select(*args, **kwargs)
+        except CurriculumSelectionError as error:
+            from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+
+            digest = ContentAddressedArtifacts(self.root / "artifacts").put_json({
+                "schema": "phase1-curriculum-rejection-v1",
+                "error": str(error), "messages": list(error.messages),
+            })
+            raise ValueError(f"{error}; rejected selection artifact: {digest}") from error
+
+    def _seed_context_state(self, state):
+        """Authenticate portable copied memory; never publish it as new attempts."""
+        if state.get("phase") == "adaptive-phase2":
+            return state  # Phase 2 owns its authenticated seed outcomes already.
+        try:
+            seed = json.loads(self.initial_memory)
+        except (ValueError, UnicodeDecodeError):
+            return state
+        if not isinstance(seed, dict) or seed.get("schema") != "ascend-phase2-curriculum-seed-v1":
+            return state
+        from benchmarks.ascend.phase2_curriculum import reviewed_seed
+
+        authenticated, _ = reviewed_seed(self.root, seed["snapshot_id"])
+        if json.loads(authenticated) != seed:
+            raise ValueError("reviewed seed differs from initial memory")
+        memories = [Phase1ProjectMemory.from_mapping(row) for row in seed["phase1_memory"]]
+        if any(memory.project_spec is None for memory in memories):
+            raise ValueError("copied seed requires generic project memory")
+        outcomes = [{"project_id": memory.project_spec.project_id,
+                     "spec": memory.project_spec.as_dict(), "verified": True,
+                     "summary": "Reviewed seed project; consult pinned memory."}
+                    for memory in memories]
+        coverage = list(state["coverage"])
+        for memory in memories:
+            for capability in memory.project_spec.capabilities:
+                if capability.value not in coverage:
+                    coverage.append(capability.value)
+        return {**state, "coverage": coverage,
+                "prior_outcomes": [*outcomes, *state["prior_outcomes"]],
+                "memory_bytes_base64": [
+                    *(base64.b64encode(canonical_bytes(row)).decode("ascii")
+                      for row in seed["phase1_memory"]), *state["memory_bytes_base64"]]}
+
     def _context(self, state, snapshot):
         remaining = max(0, self.project_target - len(state["prior_outcomes"]))
+        context_state = self._seed_context_state(state)
         return CurriculumContext(
             self.objective,
             state["wave_index"],
             hashlib.sha256(snapshot).hexdigest(),
-            tuple(self._capability(value) for value in state["coverage"]),
+            tuple(self._capability(value) for value in context_state["coverage"]),
             tuple(
                 PriorOutcome(
                     value["project_id"],
@@ -595,10 +642,10 @@ class AdaptivePhase1Coordinator:
                     value["verified"],
                     value["summary"][:240].rstrip(),
                 )
-                for value in self._effective_outcomes(state)
+                for value in self._effective_outcomes(context_state)
             ),
             remaining,
-            self._curriculum_feedback(state),
+            self._curriculum_feedback(context_state),
             self.failure_feedback.context(state) if self.failure_feedback else (),
             remaining_seconds=self._remaining_seconds(),
         )
