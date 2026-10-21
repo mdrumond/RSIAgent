@@ -95,6 +95,7 @@ class AdaptiveProjectRequest:
     oracle: ReferenceOutput
     memory_root: Path | None = None
     remaining_seconds: float | None = None
+    publish_learning: bool = True
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,7 @@ class AdaptivePhase1Coordinator:
 
     def _run(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
+        self._assess_committed_memory(state)
         pending = self._load_pending(state)
         if pending is not None and len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects) > self.project_target:
             raise ValueError("retained wave exceeds configured project target")
@@ -319,6 +321,7 @@ class AdaptivePhase1Coordinator:
             (self.root / "pending.json").unlink(missing_ok=True)
             if self.failure_feedback is not None:
                 self.failure_feedback.sync(state)
+            self._assess_committed_memory(state)
             executed_waves += 1
             if wave_limit is not None and executed_waves >= wave_limit:
                 return self._report(state)
@@ -565,6 +568,27 @@ class AdaptivePhase1Coordinator:
                if pending.get('failure_investigations') else {}),
             **({"failed_outcomes": failures} if failures else {}),
         }
+
+    def _assess_committed_memory(self, state):
+        verifier = getattr(self, "usefulness_verifier", None)
+        if verifier is None or not verifier.enabled:
+            return
+        previous = []
+        for wave_id in state["completed_waves"]:
+            plan = self._read_json(self.root / "waves" / wave_id / "plan.json")
+            wave = WaveSpec.from_mapping(plan["wave"])
+            prior = self._memory_snapshot({**state, "memory_bytes_base64": previous})
+            for project in wave.projects:
+                path = self.root / "waves" / wave_id / "branches" / project.spec.project_id / "memory-delta.bin"
+                if not path.exists():
+                    continue
+                if not self._read_json(path.parent / "outcome.json")["verified"]:
+                    continue
+                delta = self._read_json(path)
+                raw = base64.b64decode(delta["memory_base64"])
+                memory = Phase1ProjectMemory.from_mapping(json.loads(raw))
+                verifier.assess_memory(memory, prior, f"{wave_id}/{project.spec.project_id}")
+                previous.append(delta["memory_base64"])
 
     def _read_delta(self, wave_id: str, project_id: str) -> dict[str, object]:
         path = self.root / "waves" / wave_id / "branches" / project_id / "memory-delta.bin"
