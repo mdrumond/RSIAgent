@@ -172,13 +172,16 @@ def memory_presentation(raw, artifacts):
     except (ValueError, UnicodeDecodeError):
         result["preview"] = raw[:2048].decode("utf-8", errors="replace")
         return result
+    if isinstance(value, dict) and "usefulness_lesson" in value:
+        result["usefulness_lesson"] = value["usefulness_lesson"]
+    if isinstance(value, dict) and isinstance(value.get("memory_entries"), list):
+        result["memory_entries"] = [dict(sha256=artifacts.put_bytes(canonical_bytes(entry)),
+            lesson=_preview(entry)) for entry in value["memory_entries"]]
     if not isinstance(value, dict) or "project_memory_base64" not in value:
         result["preview"] = _preview(value)
         if len(canonical_bytes(result)) > 8192:
             result.pop("preview")
         return result
-    if "usefulness_lesson" in value:
-        result["usefulness_lesson"] = value["usefulness_lesson"]
     if "phase2_feedback" in value:
         result["phase2_feedback"] = _preview(value["phase2_feedback"])
     initial = base64.b64decode(value["initial_memory_base64"], validate=True)

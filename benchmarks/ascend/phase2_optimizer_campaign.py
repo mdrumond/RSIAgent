@@ -221,11 +221,25 @@ class OptimizerPhase2Coordinator:
     def _directory(task):
         return "tasks/" + task["task_id"] + "-" + sha(canonical(task))[:12]
 
+    def _assess_committed(self, state):
+        if self.usefulness_verifier is None:
+            return
+        for lesson in state["memory_entries"]:
+            index = next(i for i, row in enumerate(state["attempts"])
+                         if row["attempt_id"] == lesson["attempt_id"])
+            prior = dict(state, attempts=state["attempts"][:index], memory_entries=[entry
+                for entry in state["memory_entries"] if entry["attempt_id"] in {
+                    row["attempt_id"] for row in state["attempts"][:index]}])
+            self.usefulness_verifier.assess_lesson(lesson, canonical(self._memory(prior)),
+                lesson["attempt_id"], host_facts=[state["attempts"][index]])
+
     def _run(self, limit=None):
         with self.time.active():
             state = self._bootstrap()
         completed = 0
         self.feedback.import_campaign(self.root)
+        # Replay committed lessons after interrupted publication; experiment identities deduplicate.
+        self._assess_committed(state)
         while not state["terminal"]:
             if self.time.remaining <= 0:
                 state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Phase 2 elapsed-time budget exhausted")
@@ -271,9 +285,7 @@ class OptimizerPhase2Coordinator:
             state["next_kind"] = "review"
             self._write("state.json", state)
             self.feedback.import_campaign(self.root)
-            if row["verified"] and self.usefulness_verifier is not None:
-                self.usefulness_verifier.assess_lesson(state["memory_entries"][-1],
-                    canonical(prior_memory), key, host_facts=[row])
+            self._assess_committed(state)
             (self.root / "pending.json").unlink()
             completed += 1
             if limit is not None and completed >= limit:

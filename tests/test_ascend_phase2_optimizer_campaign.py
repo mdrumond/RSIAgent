@@ -433,3 +433,17 @@ def test_verified_optimizer_lesson_assessed_with_frozen_prior_memory(tmp_path):
     assert json.loads(args[1]) == calls[0][2]['memory_snapshot']
     assert args[0] not in json.loads(args[1])['memory_entries']
     assert kwargs['host_facts'][0]['verified'] is True
+
+
+def test_committed_memory_assessment_replayed_after_interrupted_hook(tmp_path):
+    from types import SimpleNamespace
+    build, calls, _, _ = setup(tmp_path)
+    assert build().resume()['status'] == 'READY'
+    assessments = []
+    resumed = build()
+    resumed.usefulness_verifier = SimpleNamespace(assess_lesson=lambda *args, **kwargs:
+        assessments.append(args))
+    assert resumed.resume()['status'] == 'READY'
+    assert len(calls) == 1
+    assert len(assessments) == 1
+    assert assessments[0][2] == calls[0][0]

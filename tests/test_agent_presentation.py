@@ -208,3 +208,17 @@ def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_pat
     assert not current._path(evidence).exists()
     with pytest.raises(FileNotFoundError):
         reader.read_bytes("f" * 64)
+
+
+@pytest.mark.parametrize('adaptive', [False, True])
+def test_usefulness_treatment_keeps_lesson_and_prior_memories_visible(tmp_path, adaptive):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    prior = {'memory_entries': [{'statement': 'prior optimizer insight'}]}
+    if adaptive:
+        prior = dict(initial_memory_base64=base64.b64encode(b'{}').decode(),
+                     project_memory_base64=[])
+    prior['usefulness_lesson'] = {'statement': 'new isolated insight'}
+    view = memory_presentation(json.dumps(prior).encode(), ContentAddressedArtifacts(tmp_path))
+    assert view['usefulness_lesson']['statement'] == 'new isolated insight'
+    if not adaptive:
+        assert view['memory_entries'][0]['lesson']['statement'] == 'prior optimizer insight'
