@@ -212,6 +212,9 @@ def test_adaptive_archive_keeps_memory_only_objects_without_mutating_evidence(ad
     assert package_campaign(adaptive_campaign, destination)["complete"]
     with tarfile.open(destination) as archive:
         for path, payload in before.items():
+            if path.name == "allocation.lock":
+                assert "campaign/allocation.lock" not in archive.getnames()
+                continue
             assert archive.extractfile("campaign/" + path.relative_to(adaptive_campaign).as_posix()).read() == payload
     assert all(path.read_bytes() == payload for path, payload in before.items())
 
