@@ -754,3 +754,23 @@ def test_live_report_is_read_only_and_duplicate_admission_is_rejected(tmp_path):
         thread.join(5)
     assert not thread.is_alive() and errors == []
     assert owner.report()['status'] == 'TARGET_REACHED'
+
+
+@pytest.mark.parametrize('manual', [False, True])
+@pytest.mark.parametrize('terminal', [False, True])
+def test_late_curriculum_result_cannot_admit_wave_or_claim_terminal(tmp_path, manual, terminal):
+    clock = _BudgetClock()
+    def select(messages):
+        clock.now += 11
+        return _wave(messages[-1]['content'], [_project('late', 'gm-ub-movement')])
+    coordinator = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select),
+        lambda _: pytest.fail('expired project executed'), max_parallel=1, max_seconds=10, clock=clock)
+    if terminal:
+        from benchmarks.a5kernels.phase1_curriculum_selector import TerminalDecision
+        def select_terminal(*args, **kwargs):
+            clock.now += 11
+            return TerminalDecision('STALLED', 'finished'), args[1]
+        coordinator._select = select_terminal
+    report = coordinator.propose_wave() if manual else coordinator.run()
+    assert (report['terminal']['status'] if manual else report['status']) == 'TIME_BUDGET_EXHAUSTED'
+    assert not (tmp_path / 'pending.json').exists()
