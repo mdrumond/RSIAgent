@@ -64,7 +64,9 @@ def test_guidance_reaches_actual_curriculum_provider_and_actor_context(tmp_path)
         provider_transport=transport, command_executor=FakeCommandExecutor(),
     )
     assert json.loads(campaign.project_actor.immutable_context)["profiling_guidance"] == text
-    with pytest.raises(ValueError, match="3 attempts"):
+    ticks = iter(range(0, 1000000, 2000))
+    campaign.coordinator.curriculum.clock = lambda: next(ticks)
+    with pytest.raises(ValueError, match="time budget exhausted"):
         campaign.run()
     assert text in calls[0]["messages"][1]["content"]
     spec = _project("context-copy", "gm-ub-movement")

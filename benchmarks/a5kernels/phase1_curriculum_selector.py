@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
+import time
 import re
 from typing import Callable, Mapping, Sequence
 
@@ -195,6 +197,7 @@ class CurriculumContext:
     remaining_projects: int = 64
     curriculum_memory: tuple[Mapping[str, object], ...] = ()
     phase2_feedback: tuple[Mapping[str, object], ...] = ()
+    remaining_seconds: float = 3600
 
     def __post_init__(self) -> None:
         if (
@@ -205,6 +208,8 @@ class CurriculumContext:
             raise ValueError("objective must be a non-empty trimmed string")
         if type(self.wave_index) is not int or self.wave_index < 1:
             raise ValueError("wave_index must be a positive integer")
+        if type(self.remaining_seconds) not in (int, float) or not math.isfinite(self.remaining_seconds) or self.remaining_seconds < 0:
+            raise ValueError("remaining_seconds must be finite nonnegative seconds")
         _digest(self.pre_wave_memory_sha256, "pre-wave memory identity")
         if type(self.remaining_projects) is not int or self.remaining_projects < 0:
             raise ValueError("remaining_projects must be nonnegative")
@@ -385,6 +390,7 @@ def curriculum_prompt(
     payload = {
         "objective": context.objective,
         "remaining_projects": context.remaining_projects,
+        "remaining_seconds": context.remaining_seconds,
         "max_wave_projects": min(8, context.remaining_projects),
         "next_wave_id": f"wave-{context.wave_index:03d}",
         "pre_wave_memory_sha256": context.pre_wave_memory_sha256,
@@ -443,10 +449,12 @@ class CurriculumAgent:
         target_policy: "CurriculumPolicy | None" = None,
         profiling_guidance: str | None = None,
         require_fresh_project_ids: bool = False,
+        clock=None,
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
         self._complete = complete
+        self.clock = clock or time.monotonic
         self.failure_feedback = None
         self.target_policy = target_policy
         self.profiling_guidance = profiling_guidance
@@ -492,8 +500,11 @@ class CurriculumAgent:
                 f"Project budget: select no more than {remaining_projects} projects in this wave.\n"
                 + history[-1]["content"]
             )
-        reads = 0
-        for attempt in range(1, 10):
+        deadline = self.clock() + context.remaining_seconds
+        attempt = 0
+        diagnostic = "no proposal admitted"
+        while self.clock() < deadline:
+            attempt += 1
             # Provider failures are not proposal-validation failures. Let the
             # caller's existing infrastructure handling observe them unchanged.
             # The current host context contains all authoritative prior outcomes.
@@ -507,9 +518,8 @@ class CurriculumAgent:
             try:
                 if self.failure_feedback is not None and completion.lstrip().startswith('{'):
                     request = json.loads(completion)
-                    if not isinstance(request, dict) or set(request) != {'read_artifact'} or reads >= 6:
-                        raise ValueError('feedback permits at most six artifact reads')
-                    reads += 1
+                    if not isinstance(request, dict) or set(request) != {'read_artifact'}:
+                        raise ValueError('expected one read_artifact request')
                     try:
                         page = self.failure_feedback.read(**request['read_artifact'])
                     except (OSError, ValueError, TypeError) as error:
@@ -520,10 +530,7 @@ class CurriculumAgent:
                 if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
                     raise ValueError("wave exceeds remaining project budget; select a smaller wave")
             except ValueError as exc:
-                if attempt - reads >= 3:
-                    raise ValueError(
-                        f"curriculum selection failed validation after 3 attempts: {exc}"
-                    ) from exc
+                diagnostic = str(exc)
                 history.append({
                     "role": "user",
                     "content": (
@@ -535,7 +542,7 @@ class CurriculumAgent:
                 })
                 continue
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
-        raise AssertionError("unreachable selection attempt")
+        raise ValueError(f"curriculum selection time budget exhausted: {diagnostic}")
 
     def _normalize_generated_wave(self, value: Mapping[str, object]) -> dict[str, object]:
         """Derive redundant operation labels only at new-proposal admission.

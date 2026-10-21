@@ -201,9 +201,9 @@ def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     root = tmp_path / "exhaustion"
     coordinator = AdaptivePhase1Coordinator(
         root, "Learn bounded skills.", SEED,
-        CurriculumAgent(complete), execute, max_parallel=1,
+        CurriculumAgent(complete, clock=_selection_clock()), execute, max_parallel=1,
     )
-    with pytest.raises(ValueError, match="3 attempts"):
+    with pytest.raises(ValueError, match="time budget exhausted"):
         coordinator.run()
     before = json.loads((root / "state.json").read_text())
     assert coordinator.report()["published_projects"] == ["published"]
@@ -211,7 +211,7 @@ def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     stop_after_first = True
     resumed = AdaptivePhase1Coordinator(
         root, "Learn bounded skills.", SEED,
-        CurriculumAgent(complete), execute, max_parallel=1,
+        CurriculumAgent(complete, clock=_selection_clock()), execute, max_parallel=1,
     ).resume()
     assert resumed["status"] == "SATURATED"
     assert resumed["published_projects"] == ["published"]
@@ -240,9 +240,9 @@ def test_resume_rejects_reordered_focus_without_rewriting_retained_evidence(tmp_
 
     def campaign(provider):
         return AdaptivePhase1Coordinator(tmp_path, "Learn focus", SEED,
-            CurriculumAgent(provider), execute, max_parallel=1)
+            CurriculumAgent(provider, clock=_selection_clock()), execute, max_parallel=1)
 
-    with pytest.raises(ValueError, match="3 attempts"):
+    with pytest.raises(ValueError, match="time budget exhausted"):
         campaign(complete).run()
     before_state = json.loads((tmp_path / "state.json").read_bytes())
     retained_files = {path: path.read_bytes() for path in (tmp_path / "waves").rglob("*")
@@ -712,3 +712,45 @@ def test_unobserved_interruption_keeps_remaining_allocation_reserved(tmp_path):
     assert retained["allocation_interrupted"] is True
     assert retained["allocation_active"] is False
     assert retained["elapsed_seconds"] == 10
+
+
+def _selection_clock():
+    ticks = iter(range(0, 1000000, 2000))
+    return lambda: next(ticks)
+
+
+def test_live_report_is_read_only_and_duplicate_admission_is_rejected(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    clock = _BudgetClock()
+    def select(messages):
+        entered.set()
+        assert release.wait(5)
+        return _wave(messages[-1]['content'], [_project('owned', 'gm-ub-movement')])
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select),
+            lambda request: _result(request.spec, True, 'verified'), max_parallel=1,
+            project_target=1, max_seconds=10, clock=clock)
+    owner = make()
+    errors = []
+    def run():
+        try:
+            owner.resume()
+        except Exception as error:
+            errors.append(error)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        path = tmp_path / 'state.json'
+        before = path.read_bytes()
+        observer = make()
+        assert observer.report()['elapsed_seconds'] == 0
+        assert path.read_bytes() == before
+        with pytest.raises(RuntimeError, match='already active'):
+            observer.resume()
+        assert path.read_bytes() == before
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and errors == []
+    assert owner.report()['status'] == 'TARGET_REACHED'

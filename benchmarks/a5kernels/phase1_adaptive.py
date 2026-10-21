@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from copy import copy
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import math
@@ -185,7 +186,22 @@ class AdaptivePhase1Coordinator:
         return self._with_allocation(lambda: self._run_allocated(wave_limit=wave_limit, approved_only=approved_only))
 
     def _with_allocation(self, operation):
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / "allocation.lock").open("a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError("campaign allocation is already active") from None
+            return self._run_allocation(operation)
+
+    def _run_allocation(self, operation):
         state = self._load_state()
+        if state.get("allocation_active"):
+            # Exclusive ownership proves the previous interval has no owner.
+            state["elapsed_seconds"] = max(self.max_seconds, state["elapsed_seconds"])
+            state["allocation_active"] = False
+            state["allocation_interrupted"] = True
+            self._atomic_json(self.root / "state.json", state)
         started = self.clock()
         self._deadline = started + max(0, self.max_seconds - state["elapsed_seconds"])
         # An unobserved interruption reserves the whole remaining allocation.
@@ -584,6 +600,7 @@ class AdaptivePhase1Coordinator:
             remaining,
             self._curriculum_feedback(state),
             self.failure_feedback.context(state) if self.failure_feedback else (),
+            remaining_seconds=self._remaining_seconds(),
         )
 
     @staticmethod
@@ -626,13 +643,6 @@ class AdaptivePhase1Coordinator:
             raise ValueError("legacy campaign has no elapsed-time accounting; start a new campaign")
         if state.get("max_seconds") != self.max_seconds:
             raise ValueError("adaptive state time allocation does not match")
-        if state.get("allocation_active") and getattr(self, "_deadline", None) is None:
-            # No reliable final observation exists after process disappearance.
-            # Keep pending work, but never silently refund its reserved time.
-            state["elapsed_seconds"] = max(self.max_seconds, state["elapsed_seconds"])
-            state["allocation_active"] = False
-            state["allocation_interrupted"] = True
-            self._atomic_json(path, state)
         return state
 
     def _validate_state(self, state) -> None:

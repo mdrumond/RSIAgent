@@ -194,7 +194,7 @@ def test_selection_validation_exhaustion_is_bounded_and_diagnostic():
         calls.append(messages)
         return wave([project(capabilities=["unknown"])])
 
-    with pytest.raises(ValueError, match="3 attempts.*unregistered capability"):
+    with pytest.raises(ValueError, match="time budget exhausted.*unregistered capability"):
         CurriculumAgent(complete).select(context())
     assert len(calls) == 3
     assert [len(messages) for messages in calls] == [2, 4, 6]
@@ -662,3 +662,52 @@ def test_learning_focus_cannot_bypass_held_out_executable_signature():
             proposal = project(learning_focus=focus)
             with pytest.raises(ValueError, match="held-out contract"):
                 CurriculumAgent(lambda _: wave([proposal]), held_out_information_sha256=[signature]).select(context())
+
+
+@pytest.fixture(autouse=True)
+def bounded_fake_selection_clock(monkeypatch):
+    """Negative fake completions consume time instead of relying on retry counts."""
+    original = CurriculumAgent.__init__
+    def initialize(self, *args, **kwargs):
+        ticks = iter(range(0, 1000000, 1000))
+        kwargs.setdefault("clock", lambda: next(ticks))
+        original(self, *args, **kwargs)
+    monkeypatch.setattr(CurriculumAgent, "__init__", initialize)
+
+
+def test_time_allocation_allows_more_than_old_proposal_and_read_limits():
+    now = [0.0]
+    calls = []
+    def complete(messages):
+        calls.append(messages)
+        now[0] += 1
+        if len(calls) <= 5:
+            return 'invalid proposal'
+        if len(calls) <= 15:
+            return json.dumps({'read_artifact': {'sha256': 'b' * 64}})
+        return wave([project()])
+    class Feedback:
+        def read(self, **kwargs):
+            return {'page': 'host evidence'}
+        def admit(self, *args):
+            return ()
+    agent = CurriculumAgent(complete, clock=lambda: now[0])
+    agent.failure_feedback = Feedback()
+    from dataclasses import replace
+    decision, session = agent.select(replace(context(), remaining_seconds=20))
+    assert isinstance(decision, WaveDecision)
+    assert len(calls) == session.turns == 16
+
+
+def test_selector_stops_at_elapsed_allocation_without_admitting_work():
+    now = [0.0]
+    calls = []
+    def complete(messages):
+        calls.append(messages)
+        now[0] += 1
+        return 'invalid proposal'
+    from dataclasses import replace
+    agent = CurriculumAgent(complete, clock=lambda: now[0])
+    with pytest.raises(ValueError, match='time budget exhausted'):
+        agent.select(replace(context(), remaining_seconds=5))
+    assert len(calls) == 5
