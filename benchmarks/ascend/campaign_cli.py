@@ -734,9 +734,14 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
             transport["execution"] = "local"
         elif native.config is not None:
             transport["cpl_remote"] = settings["cpl_remote"]
-    elif job.get("worker_config"):
+    else:
         from benchmarks.ascend.execution import apply_worker_config, execution_mode
-        if execution_mode(apply_worker_config({}, job["worker_config"])) == "local":
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument('--worker-config', type=Path)
+        arguments = _read(job['config']).get('phase1_arguments', []) if job.get('config') else []
+        native, _ = parser.parse_known_args(arguments)
+        path = job.get('worker_config') or native.worker_config
+        if path and execution_mode(apply_worker_config({}, path)) == "local":
             transport["execution"] = "local"
     worker = factory(job["root"], control / "reports", control / "collector.json", **transport)
     while True:

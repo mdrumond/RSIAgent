@@ -58,7 +58,7 @@ def apply_worker_config(config, worker_config_path=None):
         if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
             raise ValueError('max_seconds must be finite positive seconds')
         settings['workspace'] = str(workspace.resolve())
-        settings.setdefault('remote_workspace', settings['workspace'])
+        settings['remote_workspace'] = settings['workspace']
         settings.setdefault('profile', 'local')
         settings['execution_profile'] = 'local'
         settings.setdefault('target', 'local')
@@ -198,6 +198,8 @@ class LocalProcessRunner:
                 raise ValueError('local operation must resume with its original command')
             if state['state'] == 'dispatching':
                 raise ObservationUnavailable('local dispatch interrupted before process identity was retained')
+            if state['state'] == 'cancelled':
+                return self.run(argv, directory / 'retry', cwd=cwd or directory, env=env, stdin=stdin)
         else:
             if self.stopped() or time.monotonic() >= deadline:
                 raise WorkerStopped('local operation stopped before dispatch')
@@ -244,7 +246,10 @@ class LocalProcessRunner:
             raise WorkerStopped('local operation was cancelled')
         if process is not None:
             process.wait(timeout=2)
-        return subprocess.CompletedProcess(argv, state['returncode'], stdout, stderr)
+        result = subprocess.CompletedProcess(argv, state['returncode'], stdout, stderr)
+        result.local_handle = state['handle']
+        result.operation_directory = directory
+        return result
 
 
 def _supervise(directory):

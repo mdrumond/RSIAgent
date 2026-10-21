@@ -166,6 +166,7 @@ class LocalBackend(RemoteBackend):
     def __init__(self, store, job_id, config):
         from benchmarks.ascend.execution import LocalProcessRunner
         super().__init__(store, job_id, config, transport=object())
+        self.remote = Path(config['workspace']) / ('optimizer-' + job_id)
         self.transport = LocalProcessRunner(config, deadline=self.deadline,
             stopped=self._stopped, retain=self._retain)
 

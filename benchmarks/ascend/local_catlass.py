@@ -96,7 +96,7 @@ class LocalSessionAdapter(BZSessionAdapter):
         environment = {**dict(plan.environment.bindings), **dict.fromkeys(plan.environment.unset)}
         result = self._executor.execute([*argv, *self._executor.arguments], root / 'operation', environment=environment)
         return ExecutionReceipt(result.returncode, _parse_output(result.stdout) if result.returncode == 0 else (),
-            result.stdout, result.stderr, json.loads((root / 'operation/transport.json').read_text())['handle'])
+            result.stdout, result.stderr, getattr(result, 'local_handle', None) or json.loads((root / 'operation/transport.json').read_text())['handle'])
 
 
 class LocalCatlassProjectBackend(CatlassProjectBackend):
@@ -121,7 +121,7 @@ class LocalCatlassProjectBackend(CatlassProjectBackend):
             raise ProjectInfrastructureError('local project driver returned an invalid record')
         receipt = json.loads((operation / 'transport.json').read_text())
         evidence = self._retain_evidence({'schema': 'a5-phase1-project-observation-v1',
-            'identity': identity, 'mode': mode, 'record': record, 'handle': receipt['handle'],
+            'identity': identity, 'mode': mode, 'record': record, 'handle': getattr(result, 'local_handle', receipt['handle']),
             'execution_identity': local_identity(self.config),
             'stdout': result.stdout, 'stderr': result.stderr, 'exit_code': result.returncode})
         return record, evidence
@@ -148,7 +148,7 @@ class LocalCatlassAttentionBackend(CatlassAttentionBackend):
             raise AttentionInfrastructureError('local compile receipt is unavailable')
         output = attention_output(result.stdout, execution.case.output_elements) if result.returncode == 0 and not compile_only else ()
         return AttentionReceipt(result.returncode, output, result.stdout, result.stderr,
-            json.loads((root / 'operation/transport.json').read_text())['handle'],
+            getattr(result, 'local_handle', None) or json.loads((root / 'operation/transport.json').read_text())['handle'],
             (('case_id', execution.case.case_id), ('execution', 'local')))
 
 

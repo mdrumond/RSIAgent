@@ -101,8 +101,8 @@ class OptimizerTaskExecutor:
             knowledge=knowledge_query(config, self.job_directory), max_cases=config.get('max_cases', 24))
 
     def _device_lock(self):
-        base = Path(self.config.get('lock_directory',
-            Path(self.config['validation_wrapper']).parent / '.optimizer-locks'))
+        directory = self.config.get('lock_directory')
+        base = Path(directory) if directory else Path(self.config['validation_wrapper']).parent / '.optimizer-locks'
         return base / f'{self.config["target"]}-{self.config["physical_device"]}.lock'
 
     def prepare(self):
