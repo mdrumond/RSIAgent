@@ -149,6 +149,8 @@ class OptimizerTaskExecutor:
                 if active != request:
                     raise ValueError('resume the pending attempt with its original memory and feedback')
                 row = self.store.get(self.job_id)
+                if row['status'] == 'failed' and 'pending' in self._state():
+                    row = self.store.recover(self.job_id)
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'} and 'pending' not in self._state():
                     evaluated = [item for item in self._state().get('history', []) if 'result' in item and 'candidate_sha256' in item]
                     if len(evaluated) <= sum(item.get('result') is not None for item in results):

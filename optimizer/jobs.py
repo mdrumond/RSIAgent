@@ -198,6 +198,16 @@ class JobStore:
                 row.update(status='stopped', stage='stopped')
         return self._update(job_id, 'stop-requested', change)
 
+    def recover(self, job_id):
+        """Requeue failed checkpoint recovery without granting more runtime."""
+        def change(row):
+            if row['status'] != 'failed' or row['stop_requested']:
+                raise ValueError('only failed jobs without a stop request can recover')
+            status = ('queued' if row['elapsed_seconds'] < row['max_seconds']
+                      else 'budget-exhausted')
+            row.update(status=status, stage=status)
+        return self._update(job_id, 'recovered', change)
+
     def resume(self, job_id, *, additional_seconds, additional_attempts=0):
         self._budget(additional_attempts, additional_seconds)
         def change(row):
