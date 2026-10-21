@@ -35,7 +35,8 @@ def test_production_curriculum_pair_isolated_frozen_and_idempotent(tmp_path):
     assert requests[0].spec == requests[1].spec
     assert requests[0].inputs == requests[1].inputs and requests[0].oracle == requests[1].oracle
     assert requests[0].branch_root != requests[1].branch_root
-    assert all(r.remaining_seconds == 300 and not r.publish_learning for r in requests)
+    assert all(0 < r.remaining_seconds <= 300 and not r.publish_learning for r in requests)
+    assert requests[0].remaining_seconds == requests[1].remaining_seconds
     baseline, treatment = map(lambda r: json.loads(r.pre_wave_memory), requests)
     assert treatment.pop('usefulness_lesson')['claim'] == memory.lessons[0].claim
     assert baseline == treatment
@@ -86,3 +87,63 @@ def test_experiment_actor_skips_distillation_and_returns_no_lessons(tmp_path):
     assert result.evidence.verified
     assert actor.distill_calls == []
     assert result.memory.no_new_knowledge and result.memory.lessons == ()
+
+
+@pytest.mark.parametrize('exhaust_stage', ['inspect', 'curriculum', 'control'])
+def test_parent_deadline_blocks_further_calls_and_caps_arms(tmp_path, exhaust_stage):
+    now = [0.0]
+    stages, requests = [], []
+    def verify(stage, evidence):
+        stages.append(stage)
+        if stage == exhaust_stage:
+            now[0] = 10
+        return stage
+    def author(messages):
+        if exhaust_stage == 'curriculum':
+            now[0] = 10
+        return _wave(messages[-1]['content'], [_project('deadline-copy', 'gm-ub-movement')])
+    def execute(request):
+        requests.append(request)
+        assert request.remaining_seconds <= 5
+        if exhaust_stage == 'control':
+            now[0] = 10
+        return _result(request.spec, True, 'host pass')
+    verifier = UsefulnessVerifier(tmp_path, CurriculumAgent(author), execute, verify,
+        enabled=True, remaining_seconds=lambda: max(0, 10-now[0]), clock=lambda: now[0])
+    memory = _memory(ProjectSpec.from_mapping(_project('source', 'gm-ub-movement')))
+    result = verifier.assess_memory(memory, b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'parent')
+    assert result[0]['outcome'] == 'inconclusive'
+    assert 'interpret' not in stages
+    assert len(requests) == (1 if exhaust_stage == 'control' else 0)
+
+
+def test_expired_parent_makes_no_model_or_actor_calls(tmp_path):
+    def unexpected(*args):
+        pytest.fail('expired parent must not dispatch')
+    verifier = UsefulnessVerifier(tmp_path, None, unexpected, unexpected,
+        enabled=True, remaining_seconds=lambda: 0)
+    assert verifier.assess_lesson({'claim': 'new'}, b'{}', 'source')['outcome'] == 'inconclusive'
+
+
+def test_factory_requests_follow_current_rebound_parent_allowance(tmp_path):
+    from benchmarks.ascend.memory_usefulness import build_usefulness_verifier
+    requests = []
+    class Provider:
+        def complete(self, profile, messages, *, max_seconds=None):
+            requests.append(max_seconds)
+            return SimpleNamespace(text='response')
+    verifier = build_usefulness_verifier(root=tmp_path, provider=Provider(), profile=object(),
+        curriculum=CurriculumAgent(lambda _: pytest.fail('use bounded provider binding')),
+        project_actor=None, enabled=True, remaining_seconds=lambda: 2)
+    verifier.verify('inspect', {})
+    verifier.curriculum._complete([])
+    verifier.remaining_seconds = lambda: 5
+    verifier.verify('interpret', {})
+    verifier.curriculum._complete([])
+    assert requests == [2, 2, 5, 5]
+    verifier.remaining_seconds = lambda: 0
+    with pytest.raises(TimeoutError):
+        verifier.verify('inspect', {})
+    with pytest.raises(TimeoutError):
+        verifier.curriculum._complete([])
+    assert len(requests) == 4
