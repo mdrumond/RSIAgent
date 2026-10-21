@@ -87,7 +87,7 @@ class UsefulnessVerifier:
             arms = {}
             def remaining():
                 available = max(0, deadline - self.clock())
-                return min(available, self.remaining_seconds()) if self.remaining_seconds else available
+                return max(0, self.remaining_seconds()) if self.remaining_seconds else available
             def require_time():
                 available = remaining()
                 if available <= 0:
@@ -102,7 +102,8 @@ class UsefulnessVerifier:
                         f'has {self.pair_seconds / 2} seconds. Keep the project small enough for that allowance. '
                         'Freeze normal host acceptance criteria. Lesson: ' + json.dumps(lesson)),
                     wave_index=1, pre_wave_memory_sha256=hashlib.sha256(prior_memory).hexdigest(),
-                    pre_wave_coverage=(), prior_outcomes=(), remaining_projects=1)
+                    pre_wave_coverage=(), prior_outcomes=(), remaining_projects=1,
+                    remaining_seconds=require_time())
                 require_time()
                 curriculum = copy(self.curriculum)
                 if callable(getattr(curriculum, '_complete', None)):
