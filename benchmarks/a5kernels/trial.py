@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field as dataclass_field, replace
 import difflib
 import hashlib
 import json
+import time
 import math
 from pathlib import Path
 import re
@@ -318,24 +319,15 @@ class TrialActionExecutor:
                  knowledge: KnowledgeAgent, profiling: ProfileEvaluation,
                  profiling_guidance: bool,
                  max_actions: int = 40, max_source_bytes: int = 128_000,
+                 max_seconds: float = 3600,
                  unmetered_compile_probes: int | None = None,
                  artifacts: ContentAddressedArtifacts | None = None):
-        if type(max_actions) is not int or max_actions < 1:
-            raise ValueError("max_actions must be a positive integer")
-        if (
-            unmetered_compile_probes is not None
-            and (
-                type(unmetered_compile_probes) is not int
-                or unmetered_compile_probes < 1
-            )
-        ):
-            raise ValueError(
-                "unmetered_compile_probes must be a positive integer or None"
-            )
         self.workspace, self.language, self.workload = workspace, language, workload
         self.backend, self.ledger = backend, ledger
         self.knowledge, self.profiling = knowledge, profiling
         self.profiling_guidance = profiling_guidance
+        from benchmarks.ascend.time_budget import deadline_after
+        self.deadline = deadline_after(max_seconds)
         self.max_actions, self.max_source_bytes = max_actions, max_source_bytes
         self.unmetered_compile_probes = unmetered_compile_probes
         self.artifacts = artifacts
@@ -355,35 +347,23 @@ class TrialActionExecutor:
         if not isinstance(action, TrialAction):
             raise TypeError("A5 trials accept only TrialAction values")
         self.total_actions += 1
-        compile_exempt = (
-            action.kind == "compile" and self.unmetered_compile_probes is not None
-        )
+        compile_exempt = action.kind == "compile"
         if compile_exempt:
             self.compile_probes += 1
         else:
             self.actions += 1
-        exhausted = (
-            self.compile_probes > self.unmetered_compile_probes
-            if compile_exempt else self.actions > self.max_actions
-        )
+        exhausted = time.monotonic() >= self.deadline
         action_evidence = {
             "ordinal": self.total_actions,
             "action": action.kind,
             "payload_sha256": hashlib.sha256(
                 json.dumps(action.payload, sort_keys=True).encode()).hexdigest(),
-            "budget": {
-                "ordinary_used": self.actions,
-                "ordinary_limit": self.max_actions,
-                "compile_probes_used": self.compile_probes,
-                "compile_probe_limit": self.unmetered_compile_probes,
-                "ordinary_budget_exempt": compile_exempt,
-            },
+            "budget": {"remaining_seconds": max(0, self.deadline-time.monotonic())},
         }
         if exhausted:
             self.ledger.append(EvidenceKind.ACTION, action_evidence)
-            budget = "compile probe" if compile_exempt else "action"
             return ActionOutcome(
-                json.dumps({"error": f"{budget} budget exhausted"}),
+                json.dumps({"error": "time budget exhausted"}),
                 True,
                 "safety_ceiling",
                 budget_exempt=compile_exempt,
@@ -693,6 +673,7 @@ class TrialOrchestrator:
         profiling_guidance: bool,
         ledger: EvidenceLedger,
         unmetered_compile_probes: int | None = None,
+        max_seconds: float = 3600,
     ) -> TrialResult:
         """Run one host-bound project without the legacy pilot matrix scheduler.
 
@@ -709,19 +690,11 @@ class TrialOrchestrator:
         for path in (workspace, memory, context):
             path.mkdir()
         request = dict(request_payload)
-        request["trial_budget"] = {
-            "ordinary_action_limit": 40,
-            "unmetered_compile_probes": unmetered_compile_probes,
-        }
-        actor_instruction = instruction
-        if unmetered_compile_probes is not None:
-            actor_instruction += (
-                "\n\nCompile-probe allowance: compile actions do not consume your "
-                "ordinary action budget in this trial. You have exactly "
-                f"{unmetered_compile_probes} compile probe(s); failed or rejected "
-                "compiles consume a probe. Compilation does not launch the kernel "
-                "or establish correctness. Use run and submit for host verification."
-            )
+        request["trial_budget"] = {"max_seconds": max_seconds, "policy": "elapsed-time-v1"}
+        actor_instruction = instruction + (
+            "\n\nCompile and repair within the remaining time. Compilation does not launch "
+            "the kernel or establish correctness. Use run and submit for host verification."
+        )
         artifacts = ContentAddressedArtifacts(trial_root / "artifacts")
         instruction_ref = artifacts.put_bytes(actor_instruction.encode("utf-8"))
         system_ref = artifacts.put_bytes(_SYSTEM_PROMPT.encode("utf-8"))
@@ -744,6 +717,7 @@ class TrialOrchestrator:
             profiling=profiling,
             profiling_guidance=profiling_guidance,
             unmetered_compile_probes=unmetered_compile_probes,
+            max_seconds=max_seconds,
             artifacts=artifacts,
         )
         outcome = actor(

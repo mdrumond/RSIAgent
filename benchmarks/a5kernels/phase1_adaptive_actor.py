@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import time
 from pathlib import Path
 import re
 from typing import Callable, Mapping, Protocol
@@ -172,6 +173,7 @@ class _ProjectActions:
         artifacts: ContentAddressedArtifacts,
         *,
         max_actions: int,
+        max_seconds: float,
         max_source_bytes: int,
         query_knowledge: ActionDependency,
         request_profile: ActionDependency,
@@ -184,6 +186,8 @@ class _ProjectActions:
         self.artifacts = artifacts
         self.read_artifacts = artifacts
         self.max_actions = max_actions
+        from benchmarks.ascend.time_budget import deadline_after
+        self.deadline = deadline_after(max_seconds)
         self.max_source_bytes = max_source_bytes
         self.query_knowledge = query_knowledge
         self.request_profile = request_profile
@@ -205,12 +209,8 @@ class _ProjectActions:
         if not isinstance(action, TrialAction):
             raise TypeError("adaptive projects accept only TrialAction values")
         self.actions.append(action.kind)
-        if action.kind != "compile":
-            self.metered_actions += 1
-            if self.metered_actions > self.max_actions:
-                return self._observation(
-                    {"error": "action budget exhausted"}, True, "budget"
-                )
+        if time.monotonic() >= self.deadline:
+            return self._observation({"error": "time budget exhausted"}, True, "budget")
         if action.kind == "propose":
             return self._observation({"event": "proposal-recorded"})
         if action.kind == "read-artifact":
@@ -431,6 +431,7 @@ class AdaptiveActorProjectExecutor:
     def __init__(
         self, executor: ProjectExecutor, actor: AdaptiveActorDriver, profile: object,
         *, max_actions: int = 40, max_source_bytes: int = 128_000,
+        max_seconds: float = 3600,
         query_knowledge: ActionDependency | None = None,
         request_profile: ActionDependency | None = None,
         request_timing: ActionDependency | None = None,
@@ -442,8 +443,6 @@ class AdaptiveActorProjectExecutor:
     ) -> None:
         if not callable(actor):
             raise TypeError("actor must be callable")
-        if type(max_actions) is not int or not 1 <= max_actions <= 40:
-            raise ValueError("max_actions must be in [1, 40]")
         if type(max_source_bytes) is not int or max_source_bytes < 1:
             raise ValueError("max_source_bytes must be positive")
         if not isinstance(immutable_context, bytes):
@@ -456,6 +455,7 @@ class AdaptiveActorProjectExecutor:
         self.actor = actor
         self.profile = profile
         self.max_actions = max_actions
+        self.max_seconds = max_seconds
         self.max_source_bytes = max_source_bytes
         self.query_knowledge = (
             disabled_knowledge_action if query_knowledge is None else query_knowledge
@@ -482,6 +482,9 @@ class AdaptiveActorProjectExecutor:
     def __call__(self, request: AdaptiveProjectRequest) -> AdaptiveProjectResult:
         if not isinstance(request, AdaptiveProjectRequest):
             raise TypeError("request must be AdaptiveProjectRequest")
+        started = time.monotonic()
+        remaining = getattr(request, "remaining_seconds", None)
+        max_seconds = min(self.max_seconds, remaining) if remaining is not None else self.max_seconds
         prepared = self.executor.prepare(request.spec)
         if (
             prepared.spec != request.spec
@@ -494,7 +497,7 @@ class AdaptiveActorProjectExecutor:
         memory_sha256 = artifacts.put_bytes(request.pre_wave_memory)
         actions = _ProjectActions(
             self.executor, request, prepared, artifacts,
-            max_actions=self.max_actions, max_source_bytes=self.max_source_bytes,
+            max_actions=self.max_actions, max_seconds=max(0.001, max_seconds-(time.monotonic()-started)), max_source_bytes=self.max_source_bytes,
             query_knowledge=self.query_knowledge,
             request_profile=self.request_profile,
             request_timing=self.request_timing,

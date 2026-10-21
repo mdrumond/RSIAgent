@@ -7,6 +7,7 @@ from benchmarks.a5kernels.phase1_provider import (
 )
 from benchmarks.a5kernels.trial import ActorOutcome
 from benchmarks.ascend.agent_context import WorkingContext
+from .rpc import PiDeadlineError
 from .adapters import A5_SCHEMAS
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_preflight
 
@@ -14,13 +15,18 @@ from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_pref
 class PiActorDriver(DirectActorDriver):
     session_factory = PiCodingSession
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, max_seconds=3600, **kwargs):
         runtime_preflight()
-        super().__init__(*args, **kwargs)
+        kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
+        super().__init__(*args, max_seconds=max_seconds, **kwargs)
+
+    def with_trace(self, trace_event):
+        return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
+                          trace_event=trace_event, system_prompt=self.system_prompt)
 
     def _new_session(self, profile):
         return self.session_factory(model=profile.identity.backend_model.value, schemas=A5_SCHEMAS,
-            environ=self.provider.coding_environment(), max_calls=self.max_turns)
+            environ=self.provider.coding_environment(), deadline=self.clock() + self.max_seconds)
 
     def __call__(self, instruction, *, profile, workspace, context, turn_parser, action_executor):
         # The legacy pilot uses a closed OpenRouter profile. It must be migrated
@@ -32,7 +38,9 @@ class PiActorDriver(DirectActorDriver):
         for message in messages:
             self._trace("message", message)
         tokens = 0
-        ordinary = 0
+        turn = 0
+        deadline = min(self.clock() + self.max_seconds,
+                       getattr(action_executor, "deadline", float("inf")))
         latest = None
         history = []
         source = None
@@ -52,9 +60,12 @@ class PiActorDriver(DirectActorDriver):
         if getattr(getattr(action_executor, "request_diagnostic", None), "__name__", "") == "disabled_diagnostic_action":
             allowed -= {"request-debug", "request-sanitizer"}
         with self._new_session(profile) as session:
-            for turn in range(1, self.max_turns + 1):
-                if ordinary >= self.max_turns:
-                    break
+            session.deadline = min(getattr(session, "deadline", float("inf")), deadline)
+            gateway = getattr(session, "gateway", None)
+            if gateway is not None:
+                gateway.deadline = min(gateway.deadline, deadline)
+            while self.clock() < deadline:
+                turn += 1
                 before = session.completion_tokens
                 def record(kind, payload):
                     self._trace("tool", {"name": kind, "turn": turn, **payload})
@@ -66,11 +77,14 @@ class PiActorDriver(DirectActorDriver):
                         "instruction": instruction, "contract": self.system_prompt,
                         "latest_host_observation": latest, "source": source,
                         "recent_host_observations": history[-6:],
-                        "ordinary_turns_remaining": self.max_turns-ordinary,
+                        "remaining_seconds": max(0, deadline-self.clock()),
                         "coding": ENGINE_IDENTITY,
                     }, allowed, record=record, source=source,
                        write_action=lambda s: ("write", {"slot": "kernel", "content": s}))
                     text = json.dumps({name: args})
+                except PiDeadlineError:
+                    tokens += session.completion_tokens-before
+                    break
                 except ActionError:
                     text = "{}"
                 tokens += session.completion_tokens-before
@@ -78,13 +92,11 @@ class PiActorDriver(DirectActorDriver):
                 self._trace("message", {"role": "assistant", "content": text})
                 action = turn_parser(text)
                 if action is None:
-                    ordinary += 1
                     latest = json.dumps({"host": {"event": "invalid-action"}})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation
                     working.append({"role": "user", "content": latest})
-                    ordinary += not outcome.budget_exempt
                     if action.kind == "write":
                         actual = getattr(action_executor, "source", None)
                         if isinstance(actual, str):
@@ -115,4 +127,4 @@ class PiActorDriver(DirectActorDriver):
                 recorder.observation(latest, turn=turn)
                 history.append(latest)
                 self._trace("message", {"role": "user", "content": latest})
-        return ActorOutcome("turn-budget-exhausted", turn, tokens)
+        return ActorOutcome("time-budget-exhausted", turn, tokens)

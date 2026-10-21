@@ -70,12 +70,12 @@ def test_bad_evidence_read_returns_feedback_before_candidate(tmp_path, action):
     class RepairAgent(Agent):
         def complete(self, stage, context, record):
             if context.get('history'):
-                assert context['history'][-1]['content']['status'] == 'tool-error'
+                assert json.loads(context['history'][-1]['content_preview'])['status'] == 'tool-error'
             return super().complete(stage, context, record)
 
     agent = RepairAgent([{'action': 'cases', 'signatures': [], 'summary': ''},
                          action, candidate('fast')])
-    result = OptimizationLoop(store, key, agent, backend).run()
+    result = OptimizationLoop(store, key, agent, backend).run(single_evaluation=True)
     assert result['attempts'] == 1
     assert backend.evaluations == ['fast']
     state = OptimizationLoop(store, key, Agent([]), backend).state
@@ -98,7 +98,7 @@ def test_bad_read_replay_is_cleared_only_with_persisted_feedback(tmp_path, monke
         loop.run()
     resumed = OptimizationLoop(store, key, Agent([candidate('fast')]), backend)
     assert resumed._read(resumed.state['model_action']) == bad
-    resumed.run()
+    resumed.run(single_evaluation=True)
     state = OptimizationLoop(store, key, Agent([]), backend).state
     assert state['history'][0]['content']['status'] == 'tool-error'
     assert 'model_action' not in state
@@ -150,12 +150,30 @@ def test_missing_recorded_artifact_is_not_model_feedback(tmp_path):
     assert store.get(key)['status'] == 'failed'
 
 
-def test_failure_repair_slower_faster_and_budget(tmp_path):
-    store, key = fixture(tmp_path)
-    backend = Backend()
-    agent = Agent([{'action': 'cases', 'signatures': [], 'summary': 'tails'},
+def test_failure_repair_slower_faster_and_time_budget(tmp_path):
+    store, key = fixture(tmp_path, attempts=1, seconds=13)
+    class Clock:
+        now = 0
+        def __call__(self): return self.now
+    clock = Clock()
+    class TimedBackend(Backend):
+        def prepare(self, *args, **kwargs):
+            clock.now += 1
+            return super().prepare(*args, **kwargs)
+        def evaluate(self, *args, **kwargs):
+            clock.now += 2
+            return super().evaluate(*args, **kwargs)
+        def profile(self, *args, **kwargs):
+            clock.now += 1
+            return super().profile(*args, **kwargs)
+    class TimedAgent(Agent):
+        def complete(self, *args, **kwargs):
+            clock.now += 1
+            return super().complete(*args, **kwargs)
+    backend = TimedBackend()
+    agent = TimedAgent([{'action': 'cases', 'signatures': [], 'summary': 'tails'},
                    candidate('bad'), candidate('slow'), candidate('fast')])
-    result = OptimizationLoop(store, key, agent, backend).run()
+    result = OptimizationLoop(store, key, agent, backend, clock=clock).run()
     assert result['status'] == 'budget-exhausted'
     state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
     assert state['best']['speedup'] == 2
@@ -170,7 +188,9 @@ def test_stop_resume_preserves_suite_and_candidates(tmp_path):
     store, key = fixture(tmp_path, attempts=1)
     backend = Backend()
     OptimizationLoop(store, key, Agent([{'action': 'cases', 'signatures': [], 'summary': ''},
-                                       candidate('slow')]), backend).run()
+                                       candidate('slow')]), backend).run(single_evaluation=True)
+    store.stop(key)
+    assert OptimizationLoop(store, key, Agent([]), backend).run()['status'] == 'stopped'
     store.resume(key, additional_attempts=2, additional_seconds=60)
     result = OptimizationLoop(store, key, Agent([candidate('slow'),
                          {'action': 'finish', 'summary': 'done'}]), backend).run()
@@ -197,7 +217,9 @@ def test_corrupt_memory_and_changed_model_rejected(tmp_path):
     store, key = fixture(tmp_path, attempts=1)
     backend = Backend()
     OptimizationLoop(store, key, Agent([{'action': 'cases', 'signatures': [], 'summary': ''},
-                                       candidate('slow')]), backend).run()
+                                       candidate('slow')]), backend).run(single_evaluation=True)
+    store.stop(key)
+    assert OptimizationLoop(store, key, Agent([]), backend).run()['status'] == 'stopped'
     store.resume(key, additional_attempts=1, additional_seconds=10)
     agent = Agent([])
     agent.identity = {'model': 'changed'}
@@ -317,6 +339,7 @@ def test_final_reserved_attempt_reconnects_without_added_budget(tmp_path):
         def evaluate(self, *args, **kwargs):
             if not self.evaluations:
                 self.evaluations.append('lost')
+                store.account_time(key, store.get(key)['max_seconds'])
                 raise ObservationUnavailable('same retained handle')
             return super().evaluate(*args, **kwargs)
     backend = LostBackend()
@@ -344,7 +367,7 @@ def test_replay_persisted_cases_and_candidate_actions_without_model_calls(tmp_pa
         loop.state['action_result'] = loop._artifact(stage, action)
         loop._save()  # crash after _action returned evidence, before caller checkpoint
         actions = [candidate('fast')] if stage == 'cases' else []
-        OptimizationLoop(store, key, Agent(actions), backend).run()
+        OptimizationLoop(store, key, Agent(actions), backend).run(single_evaluation=True)
         assert store.get(key)['attempts'] == 1
         assert backend.evaluations == ['fast']
 
@@ -357,6 +380,7 @@ def test_final_reserved_profile_reconnect_does_not_repeat_evaluation(tmp_path):
         def profile(self, *args, **kwargs):
             if not self.profiles:
                 self.profiles.append('lost')
+                store.account_time(key, store.get(key)['max_seconds'])
                 raise ObservationUnavailable('retained profile handle')
             return {'status': 'available'}
     backend = LostProfile()
@@ -366,7 +390,10 @@ def test_final_reserved_profile_reconnect_does_not_repeat_evaluation(tmp_path):
     OptimizationLoop(store, key, Agent([]), backend).run()
     state = [e['payload'] for e in store.events(key) if e['kind'] == 'optimizer-state'][-1]
     assert len(state['history']) == len(backend.evaluations) == 1
-    assert 'profiling' in state['best']
+    assert state['best']['speedup'] == 2
+    assert 'profiling' not in state['best']
+    assert backend.profiles == ['lost']
+    assert any(event['kind'] == 'profiling-unavailable' for event in store.events(key))
     assert store.get(key)['attempts'] == store.get(key)['max_attempts'] == 1
 
 
@@ -423,3 +450,27 @@ def test_case_cap_validation_preserves_all_representatives(tmp_path):
                        {**body, 'snapshot_id': sha(canonical(body))})['job_id']
     with pytest.raises(ValueError, match='representatives exceed'):
         OptimizationLoop(store, key, Agent([]), Backend(), max_cases=1).run()
+
+
+def test_model_actions_have_no_count_ceiling_and_receive_remaining_time(tmp_path):
+    store, key = fixture(tmp_path, attempts=1)
+    class TimeAwareAgent(Agent):
+        identity = {'model': 'fake-fixed', 'coding_engine': 'pi'}
+        def complete(self, stage, context, record):
+            assert 0 < context['remaining_seconds'] <= 7200
+            assert 'remaining_provider_requests' not in context
+            return super().complete(stage, context, record)
+    actions = [{'action': 'cases', 'signatures': [], 'summary': ''}] + [
+        {'action': 'read-memory', 'index': 99}] * 2 + [
+        candidate('bad'), candidate('slow'), candidate('fast'),
+        {'action': 'finish', 'summary': 'done'}]
+    backend = Backend()
+    loop = OptimizationLoop(store, key, TimeAwareAgent(actions), backend)
+    loop.state['turn'] = 199  # Retained telemetry must not become a stopping limit.
+    loop._save()
+    result = loop.run()
+    assert result['status'] == 'completed' and result['attempts'] == 3
+    assert backend.evaluations == ['bad', 'slow', 'fast']
+    state = next(event['payload'] for event in reversed(store.events(key))
+                 if event['kind'] == 'optimizer-state')
+    assert state['turn'] > 200 and state['best']['speedup'] == 2

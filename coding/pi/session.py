@@ -15,7 +15,7 @@ import uuid
 
 from .context import ContextRecords, encoded
 from .gateway import Gateway, PROVIDERS
-from .rpc import PiError, PiRPC
+from .rpc import PiError, PiRPC, PiDeadlineError
 from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +56,7 @@ def runtime_preflight():
 
 
 class RequestAccounting:
-    """Production host limits bound requests/tokens; optional Budget bounds dollars."""
+    """Provider usage accounting without count or spend limits."""
     def reserve(self, *_args, **_kwargs):
         return uuid.uuid4().hex
 
@@ -78,9 +78,9 @@ class PiCodingSession:
         key = environment.get(PROVIDERS[provider]["key"])
         if not key:
             raise RuntimeUnavailable("configured provider credential is missing")
-        self.deadline = deadline or time.monotonic() + 3600
+        self.deadline = deadline if deadline is not None else time.monotonic() + 3600
         self._provider_secret = key
-        self.gateway = Gateway(provider, key, budget or RequestAccounting(), "production-pi",
+        self.gateway = Gateway(provider, key, RequestAccounting(), "production-pi",
                                max_calls=max_calls, deadline=self.deadline,
                                max_output_tokens=8192 if provider == "deepseek" else 32768,
                                hard_bytes=49152 if provider == "deepseek" else 196608)
@@ -204,11 +204,8 @@ class PiCodingSession:
         self.record = record or (lambda *_: None)
         if self._provider_secret.encode() in encoded(context):
             raise ValueError("provider credential must not enter coding context")
-        remaining = (limits or {}).get("provider_requests")
-        if remaining is not None:
-            if type(remaining) is not int or remaining < 0:
-                raise ValueError("invalid remaining provider request limit")
-            self.gateway.max_calls = min(self.gateway.max_calls, self.gateway.calls + remaining)
+        if time.monotonic() >= self.deadline:
+            raise PiDeadlineError("Pi attempt deadline exceeded")
         if not set(allowed_actions) <= self.schemas.keys():
             raise ValueError("unknown host action schema")
         self.source, self.write_action = source, write_action
@@ -218,8 +215,8 @@ class PiCodingSession:
         self.pending, self.mutations = None, 0
         self.context = ContextRecords()
         self.snapshot = self.context.snapshot({
-            "host": context, "limits": limits or {},
-            "remaining_provider_requests": self.gateway.max_calls - self.gateway.calls,
+            "host": context,
+            "remaining_seconds": max(0, self.deadline - time.monotonic()),
             "source_sha256": hashlib.sha256(source.encode()).hexdigest() if source is not None else None,
         }, target=16384 if self.gateway.provider == "deepseek" else 65536)
         try:
@@ -256,6 +253,9 @@ class PiCodingSession:
                 raise ActionError("invalid original Pi tool arguments") from None
             if self.mutations != 1 or self.pending is None:
                 raise ActionError("Pi must select exactly one valid host action")
+            if time.monotonic() >= self.deadline:
+                self.pending = None
+                raise PiDeadlineError("Pi attempt deadline exceeded")
             name, args = self.pending
             # Persist intent before returning it to the host that owns side effects.
             self.record("pi-action", {"id": uuid.uuid4().hex, "name": name, "arguments": args,

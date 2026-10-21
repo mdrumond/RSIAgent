@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 from typing import Callable, Mapping
 
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
@@ -210,6 +211,8 @@ class Phase2SourceProvider:
         compile_probe: CompileProbe | None = None,
         max_compile_probes: int = 0,
         max_completion_bytes: int = 256 * 1024,
+        max_seconds: float = 3600,
+        clock=None,
     ) -> None:
         if not isinstance(provider, DirectCompletionProvider):
             raise TypeError("provider must be a DirectCompletionProvider")
@@ -219,18 +222,6 @@ class Phase2SourceProvider:
             raise ValueError("programming guide exceeds the provider context bound")
         if knowledge_factory is not None and not callable(knowledge_factory):
             raise TypeError("knowledge_factory must be callable")
-        if type(max_turns) is not int or not 1 <= max_turns <= 40:
-            raise ValueError("max_turns must be in [1, 40]")
-        if type(max_queries) is not int or not 0 <= max_queries <= max_turns:
-            raise ValueError("max_queries must be in [0, max_turns]")
-        if not isinstance(max_compile_probes, int) or isinstance(
-            max_compile_probes, bool
-        ) or not 0 <= max_compile_probes <= 20:
-            raise ValueError("max_compile_probes must be in [0, 20]")
-        if (compile_probe is None) != (max_compile_probes == 0):
-            raise ValueError(
-                "compile_probe and a positive max_compile_probes must be enabled together"
-            )
         if (
             type(max_completion_bytes) is not int
             or not 1024 <= max_completion_bytes <= 1024 * 1024
@@ -241,6 +232,10 @@ class Phase2SourceProvider:
         self.guide_text = guide_text
         self.knowledge_factory = knowledge_factory
         self.profiling_guidance = profiling_guidance
+        from benchmarks.ascend.time_budget import deadline_after
+        self.clock = clock or time.monotonic
+        deadline_after(max_seconds, clock=self.clock)
+        self.max_seconds = max_seconds
         self.max_turns = max_turns
         self.max_queries = max_queries
         self.compile_probe = compile_probe
@@ -286,7 +281,10 @@ class Phase2SourceProvider:
         if self.coding_identity and (root / "pi-events.jsonl").exists():
             consumed = sum(json.loads(line)["kind"] == "pi-provider-request"
                            for line in (root / "pi-events.jsonl").read_text().splitlines())
-        coding = self._new_coding_session(profile, consumed)
+        from benchmarks.ascend.time_budget import AttemptTimeBudget
+        budget = AttemptTimeBudget(root / "time-budget.json", self.max_seconds, clock=self.clock)
+        self.deadline = budget.deadline
+        coding = None
         current_source = None
         for message in reversed(messages):
             if message.get("role") == "assistant":
@@ -295,16 +293,17 @@ class Phase2SourceProvider:
                     current_source = previous[1]
                     break
         try:
-            while ordinary_turns < self.max_turns:
+            coding = self._new_coding_session(profile, consumed)
+            while self.clock() < self.deadline:
                 if coding is None:
                     completion = self.provider.complete(profile, messages)
                 else:
                     from coding.pi.session import ActionError
                     from benchmarks.a5kernels.phase1_provider import DirectCompletion
                     allowed = ["candidate_source"]
-                    if knowledge is not None and len(queries) < self.max_queries:
+                    if knowledge is not None:
                         allowed.append("knowledge_query")
-                    if self.compile_probe is not None and probes < self.max_compile_probes:
+                    if self.compile_probe is not None:
                         allowed.append("compile_probe")
                     before = coding.completion_tokens
                     try:
@@ -314,8 +313,7 @@ class Phase2SourceProvider:
                             "current_source": current_source,
                             "recent_host_observations": [m["content"] for m in messages[2:]
                                                          if m["role"] == "user"][-6:],
-                            "remaining_turns": self.max_turns-ordinary_turns,
-                            "remaining_compile_probes": self.max_compile_probes-probes}, allowed,
+                            "remaining_seconds": max(0, self.deadline-self.clock())}, allowed,
                             record=lambda kind, data: self._retain_pi_record(root, kind, data),
                             source=current_source,
                             write_action=lambda source: (
@@ -370,26 +368,6 @@ class Phase2SourceProvider:
                     elif self.compile_probe is None:
                         action = None
                         summary["action"] = "compile-probe-disabled"
-                    elif probes >= self.max_compile_probes:
-                        ordinary_turns += 1
-                        observation = {"compile_probe": {
-                            "status": "probe-budget-exhausted",
-                            "compilation_only": True,
-                            "correctness_established": False,
-                        }}
-                        observation_text = json.dumps(
-                            observation, sort_keys=True, separators=(",", ":")
-                        )
-                        summary["observation_sha256"] = _sha256(
-                            observation_text.encode()
-                        )
-                        transcript.append(summary)
-                        messages.append({"role": "user", "content": observation_text})
-                        self._retain_progress(
-                            root, binding, messages, transcript, queries,
-                            tokens, ordinary_turns, probes,
-                        )
-                        continue
                     else:
                         probes += 1
                         self._retain_probe_request(
@@ -405,18 +383,10 @@ class Phase2SourceProvider:
                         continue
 
                 if action is not None and action[0] == "knowledge_query":
-                    # Compile probes are the only accepted action exempt from
-                    # the ordinary provider-turn allowance.
                     ordinary_turns += 1
                     query = action[1]
                     assert isinstance(query, KnowledgeQuery)
-                    if len(queries) >= self.max_queries:
-                        observation = {"knowledge_query": {
-                            "available": knowledge is not None,
-                            "error": "query-budget-exhausted",
-                            "results": [],
-                        }}
-                    elif knowledge is None:
+                    if knowledge is None:
                         observation = {
                             "knowledge_query": {"available": False, "results": []}
                         }
@@ -455,12 +425,13 @@ class Phase2SourceProvider:
                     tokens, ordinary_turns, probes,
                 )
         finally:
+            budget.close()
             if coding is not None:
                 coding.close()
             close = getattr(knowledge, "close", None)
             if callable(close):
                 close()
-        raise RuntimeError("Phase 2 source provider turn budget exhausted")
+        raise RuntimeError("Phase 2 source provider time budget exhausted")
 
     def _validate_request(self, request: Phase2AttemptRequest) -> None:
         self._validate_profiling(request)
@@ -594,8 +565,7 @@ class Phase2SourceProvider:
         if self.compile_probe is not None:
             prompt_value["compile_probes"] = {
                 "enabled": True,
-                "allowance": self.max_compile_probes,
-                "counts_against_ordinary_turns": False,
+                "budget_policy": "elapsed-time-v1",
                 "compilation_only": True,
                 "correctness_established": False,
             }
@@ -618,8 +588,8 @@ class Phase2SourceProvider:
             "profiling_guidance_sha256": guidance_sha256,
             "target_contract_sha256": target_contract_sha256,
         }
-        if self.compile_probe is not None:
-            binding["max_compile_probes"] = self.max_compile_probes
+        binding["budget_policy"] = "elapsed-time-v1"
+        binding["max_seconds"] = self.max_seconds
         return prompt_bytes.decode("utf-8"), binding
 
     def _attempt_root(self, request: Phase2AttemptRequest) -> Path:
@@ -935,7 +905,7 @@ class PiPhase2SourceProvider(Phase2SourceProvider):
         from coding.pi.session import PiCodingSession
         from coding.pi.adapters import SOURCE_SCHEMAS
         return PiCodingSession(model=profile.identity.backend_model.value, schemas=SOURCE_SCHEMAS,
-            environ=self.provider.coding_environment(), max_calls=max(0, self.max_turns-consumed))
+            environ=self.provider.coding_environment(), deadline=self.deadline)
 
     @staticmethod
     def _retain_pi_record(root, kind, data):

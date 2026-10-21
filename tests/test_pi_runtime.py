@@ -35,7 +35,8 @@ def session(**kwargs):
     except RuntimeError:
         pytest.skip('npm ci --prefix integrations/pi required')
     return PiCodingSession(model='deepseek-flash', schemas={'write': obj({'source': STRING})},
-                           environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, deadline=time.monotonic()+30, **kwargs)
+                           environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'},
+                           deadline=kwargs.pop('deadline', time.monotonic()+30), **kwargs)
 
 
 def test_real_pi_persistent_action_and_exact_edit(monkeypatch):
@@ -86,11 +87,11 @@ def test_context_paging_multibyte():
 def test_invalid_or_wrong_stage_tools_have_no_host_effect(monkeypatch, tool, args):
     from coding.pi.rpc import PiError
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: stream(tool, args))
-    with session(max_calls=1) as pi:
+    with session(max_calls=1, deadline=time.monotonic()+4) as pi:
         with pytest.raises(PiError):
             pi.next_action({'task': 'TEST'}, ['write'])
         assert pi.pending is None
-        assert pi.gateway.calls == 1
+        assert pi.gateway.calls >= 1
 
 
 def test_truncation_has_no_effect_and_same_process_can_repair(monkeypatch):
@@ -169,7 +170,7 @@ def test_multiple_mutations_reject_whole_batch(monkeypatch):
         response.iter_lines = lines
         return response
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
-    with session(max_calls=1) as pi:
+    with session(max_calls=1, deadline=time.monotonic()+4) as pi:
         with pytest.raises(PiError): pi.next_action({'task':'TEST'}, ['write'])
         assert pi.pending is None
 
@@ -209,20 +210,47 @@ def test_openai_responses_uses_registered_profile_and_counts_subsets(monkeypatch
         assert usage['cached_input_tokens'] == 20 and usage['reasoning_tokens'] == 30
 
 
-def test_incremental_window_preserves_original_allocation_and_unknown_charge(tmp_path):
-    from coding.pi.budget import Budget, BudgetExceeded
-    path = tmp_path/'budget.json'
-    old = Budget(path, 5)
-    old.reserve({}, output_tokens=100, rates=(1,1), label='original')
-    window = Budget(path, 5, window='production-smoke', window_limit=.01)
-    window.reserve({}, output_tokens=100, rates=(1,1), label='new')
-    window.reserve({}, output_tokens=100, rates=(1,1), label='new')
-    with pytest.raises(BudgetExceeded, match='incremental'):
-        window.reserve({}, output_tokens=100, rates=(1,1), label='new')
-    assert window.snapshot()['limit_usd'] == 5
-    assert len(window.snapshot()['requests']) == 3
-    with pytest.raises(ValueError, match='different limit'):
-        Budget(path,5,window='production-smoke',window_limit=1).reserve({},output_tokens=1,rates=(1,1),label='new')
+def test_usage_ledger_does_not_stop_at_legacy_dollar_limits(tmp_path):
+    from coding.pi.budget import Budget
+    ledger = Budget(tmp_path/'usage.json', .00001, window='run', window_limit=.000001)
+    first = ledger.reserve({}, output_tokens=100, rates=(1, 1), label='first')
+    ledger.reserve({}, output_tokens=100, rates=(1, 1), label='second')
+    ledger.settle(first, {'prompt_tokens': 100000, 'completion_tokens': 100000}, (1, 1))
+    assert len(ledger.snapshot()['requests']) == 2
+    assert ledger.snapshot()['requests'][0]['charged_bound_usd'] == .2
+
+
+def test_requests_and_cumulative_tokens_do_not_stop_before_deadline(monkeypatch):
+    monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: stream('write', {'source': 'kernel'}))
+    class LegacyBudget:
+        def reserve(self, *args, **kwargs): pytest.fail('legacy dollar budget used')
+    with session(max_calls=0, budget=LegacyBudget()) as pi:
+        pi.gateway.completion_limit = 0  # Legacy attributes cannot cap a run.
+        for _ in range(3):
+            assert pi.next_action({'task': 'TEST'}, ['write'], limits={'provider_requests': 0}) == ('write', {'source': 'kernel'})
+        assert pi.gateway.calls == 3 and pi.completion_tokens == 30
+
+
+def test_expired_deadline_stops_before_starting_pi(monkeypatch):
+    from coding.pi.rpc import PiDeadlineError
+    monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('upstream HTTP'))
+    with session() as pi:
+        pi.deadline = time.monotonic() - 1
+        with pytest.raises(PiDeadlineError):
+            pi.next_action({'task': 'TEST'}, ['write'])
+        assert pi.rpc is None and pi.gateway.calls == 0
+
+
+def test_action_completed_after_deadline_is_not_released(monkeypatch):
+    from coding.pi.rpc import PiDeadlineError
+    def provider(*args, **kwargs):
+        pi.deadline = time.monotonic() - 1
+        return stream('write', {'source': 'late kernel'})
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        with pytest.raises(PiDeadlineError):
+            pi.next_action({'task': 'TEST'}, ['write'])
+        assert pi.pending is None
 
 
 def test_parallel_pi_sessions_keep_contexts_and_processes_isolated(monkeypatch):
@@ -233,7 +261,7 @@ def test_parallel_pi_sessions_keep_contexts_and_processes_isolated(monkeypatch):
         return stream('write', {'source': snapshot['context']['host']['task']})
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     def run(task):
-        with session(max_calls=1) as pi:
+        with session(max_calls=1, deadline=time.monotonic()+4) as pi:
             result = pi.next_action({'task':task}, ['write'])
             return result, pi.rpc.process.pid
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -262,3 +290,69 @@ def test_missing_runtime_fails_before_credentials_or_provider(monkeypatch):
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('provider called'))
     with pytest.raises(RuntimeUnavailable, match='Node'):
         PiCodingSession(model='deepseek-flash', schemas={})
+
+
+def test_actor_compile_and_host_turns_are_bounded_by_time_only(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    actions = iter([('compile', {}), ('compile', {}), ('submit', {})])
+    class FakeSession:
+        completion_tokens = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, *args, **kwargs): return next(actions)
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
+    driver = actor_module.PiActorDriver(DirectCompletionProvider({'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_turns=1, max_seconds=10)
+    seen = []
+    def execute(action):
+        seen.append(action.kind)
+        return ActionOutcome('{}', action.kind == 'submit', 'passed', budget_exempt=action.kind == 'compile')
+    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))), workspace=tmp_path,
+                     context=None, turn_parser=parse_trial_action, action_executor=execute)
+    assert outcome.status == 'passed' and seen == ['compile', 'compile', 'submit']
+
+
+def test_actor_expires_without_executing_another_action(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    class FakeSession:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, *args, **kwargs): pytest.fail('deadline expired')
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
+    times = iter([0, 2])
+    driver = actor_module.PiActorDriver(DirectCompletionProvider({'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}),
+                                        max_seconds=1, clock=lambda: next(times))
+    outcome = driver('task', profile=None, workspace=tmp_path, context=None,
+                     turn_parser=None, action_executor=None)
+    assert outcome.status == 'time-budget-exhausted' and outcome.iterations == 0
+
+
+def test_actor_inherits_executor_deadline_and_preserves_clock_on_clone(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    clock = lambda: 10
+    session = SimpleNamespace(deadline=4000, gateway=SimpleNamespace(deadline=4000))
+    class Session:
+        completion_tokens = 0
+        deadline = 4000
+        gateway = session.gateway
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, *args, **kwargs): pytest.fail('enclosing attempt expired')
+    active = Session()
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: active)
+    driver = actor_module.PiActorDriver(DirectCompletionProvider(
+        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=3600, clock=clock)
+    cloned = driver.with_trace(lambda *args: None)
+    assert cloned.clock is clock
+    outcome = cloned('task', profile=None, workspace=tmp_path, context=None,
+        turn_parser=None, action_executor=SimpleNamespace(deadline=9))
+    assert outcome.status == 'time-budget-exhausted'
+    assert active.deadline == active.gateway.deadline == 9

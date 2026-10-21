@@ -78,7 +78,7 @@ class JobStore:
             staging = self.root / ('.creating-' + uuid.uuid4().hex)
             staging.mkdir()
             atomic(staging / 'submission.json', data)
-            manifest = dict(schema='optimizer-job-v1', job_id=job_id, name=name,
+            manifest = dict(schema='optimizer-job-v1', budget_policy='elapsed-time-v1', job_id=job_id, name=name,
                             submission_sha256=sha(data), created_at=time.time(),
                             status='queued', stage='queued', attempts=0, elapsed_seconds=0,
                             max_attempts=max_attempts, max_seconds=max_seconds,
@@ -95,8 +95,8 @@ class JobStore:
 
     @staticmethod
     def _budget(attempts, seconds):
-        if type(attempts) is not int or attempts < 1 or type(seconds) is not int or seconds < 1:
-            raise ValueError('budgets must be positive integers')
+        if type(seconds) is not int or seconds < 1:
+            raise ValueError('time budget must be a positive integer')
 
     def get(self, job_id):
         directory = self._directory(job_id)
@@ -179,7 +179,7 @@ class JobStore:
 
     @staticmethod
     def _exhaust(row):
-        if row['attempts'] >= row['max_attempts'] or row['elapsed_seconds'] >= row['max_seconds']:
+        if row['elapsed_seconds'] >= row['max_seconds']:
             row['status'] = 'budget-exhausted'
 
     def account_time(self, job_id, seconds):
@@ -198,7 +198,7 @@ class JobStore:
                 row.update(status='stopped', stage='stopped')
         return self._update(job_id, 'stop-requested', change)
 
-    def resume(self, job_id, *, additional_attempts, additional_seconds):
+    def resume(self, job_id, *, additional_seconds, additional_attempts=0):
         self._budget(additional_attempts, additional_seconds)
         def change(row):
             if row['status'] not in {'stopped', 'budget-exhausted', 'failed'}:

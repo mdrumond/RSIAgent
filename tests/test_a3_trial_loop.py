@@ -175,11 +175,19 @@ class FakeProfiler:
         return result
 
 
+class FakeClock:
+    def __init__(self): self.now = 0.0
+    def __call__(self): return self.now
+    def advance(self, seconds): self.now += seconds
+
+
 def _run(
     tmp_path, actions, *, cell=None, knowledge=None, profiler=None,
     candidate=None, budgets=None, completion_tokens=1,
     execution_profile="gz-a3", evidence=None, model_default_budgets=False,
+    clock=None, actor_seconds=1, backend_seconds=.25,
 ):
+    clock = clock or FakeClock()
     selected = cell or _cell()
     profile = load_a3_model_profile(selected.backend_model)
     resolver = Resolver()
@@ -188,6 +196,7 @@ def _run(
     def actor(actual_profile, context):
         assert actual_profile == profile
         prompts.append(context)
+        clock.advance(actor_seconds)
         action = queue.pop(0)
         if isinstance(action, BaseException):
             raise action
@@ -209,6 +218,14 @@ def _run(
         selected_candidate.resolver = resolver
     if hasattr(selected_profiler, "resolver"):
         selected_profiler.resolver = resolver
+    def timed(operation):
+        def invoke(*args, **kwargs):
+            clock.advance(backend_seconds)
+            return operation(*args, **kwargs)
+        return invoke
+    for name in ('compile', 'run'):
+        setattr(selected_candidate, name, timed(getattr(selected_candidate, name)))
+    selected_profiler.profile = timed(selected_profiler.profile)
     budget_options = (
         {} if model_default_budgets
         else {"budgets": budgets or TrialBudgets(10, 2000)}
@@ -219,7 +236,7 @@ def _run(
         profiler=selected_profiler,
         evidence=evidence or EvidenceLedger(tmp_path / "evidence.jsonl"),
         memory=journal, workdir=tmp_path / "work",
-        execution_profile=execution_profile,
+        execution_profile=execution_profile, clock=clock,
         **budget_options,
     )
     return loop.run(), prompts, journal
@@ -380,7 +397,7 @@ def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(
         tmp_path,
         [json.dumps({"action": "write_source", "source": SOURCE}),
          '{"action":"compile"}', '{"action":"compile"}'],
-        candidate=CompileFailure(), budgets=TrialBudgets(3, 2000),
+        candidate=CompileFailure(), budgets=TrialBudgets(max_seconds=3),
     )
     context = json.loads(prompts[2])
     observation = context["observations"][-1]["candidate_failure"]
@@ -1012,9 +1029,9 @@ def test_submit_gates_source_identity_verification_and_required_profile(tmp_path
         json.dumps({"action": "write_source", "source": SOURCE}),
         '{"action":"compile"}', '{"action":"run"}',
         early_submit, early_submit, early_submit, early_submit, early_submit,
-    ], cell=cell, budgets=TrialBudgets(4, 2000))
+    ], cell=cell, budgets=TrialBudgets(max_seconds=8))
     assert result.status == "budget-exhausted"
-    assert result.completion_turns == 4
+    assert result.completion_turns == 0
     assert "profile" in result.failures[-1]
     assert journal.read() == ()
 
@@ -1076,436 +1093,93 @@ def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_pat
     assert len(journal.read()) == 1
 
 
-def test_iteration_and_token_budgets_are_terminal_and_isolated(tmp_path):
-    result, _, journal = _run(
-        tmp_path, ['{"action":"compile"}'] * 3, budgets=TrialBudgets(2, 30)
+def test_elapsed_time_budget_is_terminal_and_isolated(tmp_path):
+    result, prompts, journal = _run(
+        tmp_path, ['{"action":"compile"}'] * 5,
+        budgets=TrialBudgets(max_seconds=2),
     )
-    assert result.status == "budget-exhausted" and result.turns <= 2
+    assert result.status == "budget-exhausted" and len(prompts) == 2
     assert journal.read() == ()
-    token_result, _, token_journal = _run(
-        tmp_path / "tokens", ['{"action": "compile"}'],
-        budgets=TrialBudgets(3, 1), completion_tokens=2,
-    )
-    assert token_result.status == "budget-exhausted" and token_result.turns == 1
-    assert token_result.failures == ("token budget exhausted",)
-    assert token_journal.read() == ()
-
-
-def _late_candidate_actions(final_actions):
-    return ['{"action":"compile"}'] * 23 + [
+    independent, _, other_journal = _run(tmp_path / "other", [
         json.dumps({"action": "write_source", "source": SOURCE}),
-        *final_actions,
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
+    ], budgets=TrialBudgets(max_seconds=10))
+    assert independent.status == "passed" and len(other_journal.read()) == 1
+
+
+@pytest.mark.parametrize("guidance", list(ProfilingGuidance))
+def test_legacy_turn_and_token_counts_do_not_prevent_verified_submission(tmp_path, guidance):
+    actions = ['not json'] * 30 + [
+        json.dumps({"action": "write_source", "source": SOURCE}),
+        '{"action":"compile"}', '{"action":"run"}',
     ]
+    if guidance is ProfilingGuidance.WITH_GUIDANCE:
+        actions.append('{"action":"profile","metric":"PipeUtilization"}')
+    actions.append(json.dumps({"action": "submit", "interpretation": "done", "supports": []}))
+    result, prompts, _ = _run(tmp_path, actions, cell=_cell(profiling=guidance),
+        budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=100), completion_tokens=1000)
+    assert result.status == "passed" and result.tokens > 30000
+    assert result.completion_turns == 0
+    assert all('attempt_completion' not in json.loads(prompt) for prompt in prompts)
+    entries = EvidenceLedger(tmp_path / 'evidence.jsonl').entries
+    assert not any('attempt_completion_boundary' in entry.payload for entry in entries)
+    write = next(entry for entry in entries
+                 if entry.kind == 'action' and entry.payload['action'] == 'write_source')
+    assert write.payload['source_sha256'] == hashlib.sha256(SOURCE.encode()).hexdigest()
 
 
-@pytest.mark.parametrize(
-    "guidance, final_actions, expected_turns",
-    [
-        (
-            ProfilingGuidance.WITHOUT_GUIDANCE,
-            [
-                '{"action":"compile"}', '{"action":"run"}',
-                json.dumps({
-                    "action": "submit", "interpretation": "completed",
-                    "supports": [],
-                }),
-            ],
-            27,
-        ),
-        (
-            ProfilingGuidance.WITH_GUIDANCE,
-            [
-                '{"action":"compile"}', '{"action":"run"}',
-                '{"action":"profile","metric":"PipeUtilization"}',
-                json.dumps({
-                    "action": "submit", "interpretation": "completed",
-                    "supports": [],
-                }),
-            ],
-            28,
-        ),
-    ],
-)
-def test_fixed_candidate_finishes_in_treatment_bound_completion_calls(
-    tmp_path, guidance, final_actions, expected_turns,
-):
-    cell = _cell(profiling=guidance)
-    result, prompts, _ = _run(
-        tmp_path,
-        _late_candidate_actions(final_actions),
-        cell=cell,
-        budgets=TrialBudgets(24, 2000),
-    )
-
-    assert result.status == "passed"
-    assert result.turns == expected_turns
-    assert result.completion_turns == expected_turns - 24
-    assert all(
-        "attempt_completion" not in json.loads(prompt)
-        for prompt in prompts[:24]
-    )
-    completion_context = json.loads(prompts[24])
-    assert completion_context["attempt_completion"] == {
-        "active": True,
-        "call_limit": 4 if guidance is ProfilingGuidance.WITH_GUIDANCE else 3,
-        "calls_remaining": expected_turns - 24,
-        "source_frozen": True,
-    }
-    assert set(completion_context["allowed_actions"]) == {"compile"}
-
-
-@pytest.mark.parametrize(
-    "nominal_tail, completion_actions, expected_completion_turns",
-    [
-        (
-            [json.dumps({"action": "write_source", "source": SOURCE})],
-            ['{"action":"compile"}', '{"action":"run"}',
-             json.dumps({"action": "submit", "interpretation": "done", "supports": []})],
-            3,
-        ),
-        (
-            [json.dumps({"action": "write_source", "source": SOURCE}),
-             '{"action":"compile"}'],
-            ['{"action":"run"}',
-             json.dumps({"action": "submit", "interpretation": "done", "supports": []})],
-            2,
-        ),
-        (
-            [json.dumps({"action": "write_source", "source": SOURCE}),
-             '{"action":"compile"}', '{"action":"run"}'],
-            [json.dumps({"action": "submit", "interpretation": "done", "supports": []})],
-            1,
-        ),
-    ],
-)
-def test_completion_resumes_each_fixed_candidate_state(
-    tmp_path, nominal_tail, completion_actions, expected_completion_turns,
-):
-    padding = ['{"action":"compile"}'] * (24 - len(nominal_tail))
-    result, _, _ = _run(
-        tmp_path, padding + nominal_tail + completion_actions,
-        budgets=TrialBudgets(24, 2000),
-    )
-    assert result.status == "passed"
-    assert result.completion_turns == expected_completion_turns
-
-
-@pytest.mark.parametrize("operation", ["compile", "run"])
-def test_completion_resumes_retained_retry_attempt(operation, tmp_path):
-    class RetryOnce(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.compile_attempts = []
-            self.run_attempts = []
-
-        def compile(self, source, workdir, **kw):
-            self.compile_attempts.append(kw["attempt_id"])
-            if operation == "compile" and len(self.compile_attempts) == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1),
-                    kw.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="compile", error_type="RuntimeError",
-                    detail="observe retained compile",
-                )
-            return super().compile(source, workdir, **kw)
-
-        def run(self, source, workdir, **kw):
-            self.run_attempts.append(kw["attempt_id"])
-            if operation == "run" and len(self.run_attempts) == 1:
-                plan = self._plan(
-                    source, kw["request_id"], kw["attempt_id"], kw["length"],
-                    kw["project_id"], kw.get("padded_length"),
-                    kw.get("block_count", 1),
-                    kw.get("execution_profile", "gz-a3"),
-                )
-                return FailedEvidence.create(
-                    plan, stage="execute", error_type="RuntimeError",
-                    detail="observe retained run",
-                )
-            return super().run(source, workdir, **kw)
-
-    if operation == "compile":
-        nominal_tail = [
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            '{"action":"compile"}',
-        ]
-        completion = [
-            '{"action":"compile"}', '{"action":"run"}',
-            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
-        ]
-    else:
-        nominal_tail = [
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            '{"action":"compile"}', '{"action":"run"}',
-        ]
-        completion = [
-            '{"action":"run"}',
-            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
-        ]
-    candidate = RetryOnce()
-    result, prompts, _ = _run(
-        tmp_path,
-        ['{"action":"compile"}'] * (24 - len(nominal_tail))
-        + nominal_tail + completion,
-        candidate=candidate, budgets=TrialBudgets(24, 2000),
-    )
-
-    assert result.status == "passed"
-    context = json.loads(prompts[24])
-    assert context["action_contract"]["trial_state"] == f"{operation}-retry"
-    attempts = (
-        candidate.compile_attempts if operation == "compile"
-        else candidate.run_attempts
-    )
-    assert attempts[0] == attempts[1]
-
-
-def test_completion_freezes_source_and_disallows_knowledge_queries(tmp_path):
-    replacement = SOURCE.replace(" {}", " { return; }")
-    cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
+@pytest.mark.parametrize('backend_seconds, expected_calls', [(1, 2), (4, 1)])
+def test_slow_backend_work_spends_elapsed_allocation(tmp_path, backend_seconds, expected_calls):
+    actions = [json.dumps({"action": "write_source", "source": SOURCE}),
+               '{"action":"compile"}', '{"action":"run"}',
+               json.dumps({"action": "submit", "interpretation": "done", "supports": []})]
     candidate = FakeCandidate()
-    result, prompts, _ = _run(
-        tmp_path,
-        _late_candidate_actions([
-            json.dumps({"action": "query", "query": "queues", "limit": 1}),
-            json.dumps({"action": "write_source", "source": replacement}),
-            '{"action":"compile"}',
-        ]),
-        cell=cell, knowledge=FakeKnowledge(True), candidate=candidate,
-        budgets=TrialBudgets(24, 2000),
-    )
-
-    assert result.status == "budget-exhausted"
-    assert result.turns == 27 and result.completion_turns == 3
-    assert result.failures[-2:] == (
-        "query is not valid in compile-required",
-        "write_source is not valid in compile-required",
-    )
-    assert candidate.source == SOURCE
-    assert set(json.loads(prompts[24])["allowed_actions"]) == {"compile"}
+    result, prompts, journal = _run(tmp_path, actions, candidate=candidate,
+        budgets=TrialBudgets(max_seconds=5), backend_seconds=backend_seconds)
+    assert result.status == 'budget-exhausted' and journal.read() == ()
+    assert len(prompts) == expected_calls + 1
+    assert result.completion_turns == 0
 
 
-def test_malformed_and_provider_failures_consume_completion_calls(tmp_path):
-    result, prompts, _ = _run(
-        tmp_path,
-        _late_candidate_actions([
-            "not json",
-            A3ProviderResponseError("invalid-content-or-usage"),
-            '{"action":"compile"}',
-        ]),
-        budgets=TrialBudgets(24, 2000),
-    )
-
-    assert result.status == "budget-exhausted"
-    assert result.turns == 27 and result.completion_turns == 3
-    assert result.failures[-2:] == (
-        "action must be one JSON object",
-        "provider response failure: invalid-content-or-usage",
-    )
-    assert len(prompts) == 27
-
-
-def test_deterministic_completion_failure_terminates_without_requesting_rewrite(
-    tmp_path,
-):
-    class DeterministicCompileFailure(FakeCandidate):
-        def compile(self, source, _workdir, **kw):
-            plan = self._plan(
-                source, kw["request_id"], kw["attempt_id"], kw["length"],
-                kw["project_id"], kw.get("padded_length"),
-                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-            )
-            return FailedEvidence.create(
-                plan, stage="compile", error_type="CompileError",
-                detail="source rewrite required",
-            )
-
-    result, prompts, _ = _run(
-        tmp_path,
-        _late_candidate_actions([
-            '{"action":"compile"}',
-            json.dumps({"action": "write_source", "source": SOURCE + "\n"}),
-        ]),
-        candidate=DeterministicCompileFailure(),
-        budgets=TrialBudgets(24, 2000),
-    )
-    assert result.status == "attempt-rewrite-required"
-    assert result.turns == 25 and result.completion_turns == 1
-    assert len(prompts) == 25
-    assert result.failures[-1] == "compile failed: source rewrite required"
-
-
-def test_nominal_candidate_validation_exception_requires_changed_source(
-    tmp_path,
-):
-    replacement = SOURCE.replace(" {}", " { return; }")
-
-    class RejectFirstSource(FakeCandidate):
-        def __init__(self):
-            super().__init__()
-            self.sources = []
-
-        def compile(self, source, workdir, **kw):
-            self.sources.append(source)
-            if len(self.sources) == 1:
-                raise ValueError(
-                    "candidate must contain the exact exported vector_add "
-                    "signature once"
-                )
-            return super().compile(source, workdir, **kw)
-
-    candidate = RejectFirstSource()
-    result, prompts, _ = _run(
-        tmp_path,
-        [
-            json.dumps({"action": "write_source", "source": SOURCE}),
-            '{"action":"compile"}',
-            json.dumps({"action": "write_source", "source": replacement}),
-            '{"action":"compile"}', '{"action":"run"}',
-            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
-        ],
-        candidate=candidate,
-    )
-
-    assert result.status == "passed"
-    assert candidate.sources == [SOURCE, replacement]
-    after_rejection = json.loads(prompts[2])
-    assert after_rejection["action_contract"]["trial_state"] == (
-        "rewrite-required"
-    )
-    assert after_rejection["observations"][-1] == (
-        "failure: candidate must contain the exact exported vector_add "
-        "signature once"
-    )
-
-
-@pytest.mark.parametrize("operation", ["compile", "run"])
-def test_completion_candidate_validation_exception_is_immediately_terminal(
-    tmp_path, operation,
-):
-    class ValidationFailure(FakeCandidate):
-        def compile(self, source, workdir, **kw):
-            if operation == "compile":
-                raise ValueError(
-                    "candidate must contain the exact exported vector_add "
-                    "signature once"
-                )
-            return super().compile(source, workdir, **kw)
-
-        def run(self, source, workdir, **kw):
-            raise ValueError("runtime fixture rejected candidate source")
-
-    nominal_tail = [
+def test_provider_and_invalid_actions_can_recover_while_time_remains(tmp_path):
+    actions = [A3ProviderResponseError('invalid-content-or-usage'), 'not json'] * 5 + [
         json.dumps({"action": "write_source", "source": SOURCE}),
-    ]
-    completion = ['{"action":"compile"}']
-    if operation == "run":
-        nominal_tail.append('{"action":"compile"}')
-        completion = ['{"action":"run"}']
-    completion.append(
-        json.dumps({"action": "write_source", "source": SOURCE + "\n"})
-    )
-    result, prompts, _ = _run(
-        tmp_path,
-        ['{"action":"compile"}'] * (24 - len(nominal_tail))
-        + nominal_tail + completion,
-        candidate=ValidationFailure(), budgets=TrialBudgets(24, 2000),
-    )
-
-    assert result.status == "attempt-rewrite-required"
-    assert result.turns == 25 and result.completion_turns == 1
-    assert len(prompts) == 25
-    assert "candidate" in result.failures[-1]
-    retained = EvidenceLedger(tmp_path / "evidence.jsonl").entries[-1]
-    assert retained.kind == "failure"
-    assert retained.payload["turn"] == 25
-    assert retained.payload["detail"] == result.failures[-1]
+        '{"action":"compile"}', '{"action":"run"}',
+        json.dumps({"action": "submit", "interpretation": "done", "supports": []})]
+    result, _, journal = _run(tmp_path, actions,
+        budgets=TrialBudgets(max_turns=1, max_tokens=1, max_seconds=30))
+    assert result.status == 'passed' and len(journal.read()) == 1
+    assert len(result.failures) == 10
+    assert result.completion_turns == 0
 
 
-def test_completion_host_mismatch_is_distinct_and_stops_before_source_rewrite(
-    tmp_path,
-):
-    class HostMismatch(FakeCandidate):
-        def run(self, source, _workdir, **kw):
-            plan = self._plan(
-                source, kw["request_id"], kw["attempt_id"], kw["length"],
-                kw["project_id"], kw.get("padded_length"),
-                kw.get("block_count", 1), kw.get("execution_profile", "gz-a3"),
-            )
-            return VerifiedResult.from_receipt(
-                plan, ExecutionReceipt(0, (0.0,) * plan.padded_length),
-                max_abs_error=3.0,
-            )
-
-    result, prompts, _ = _run(
-        tmp_path,
-        _late_candidate_actions([
-            '{"action":"compile"}', '{"action":"run"}',
-            json.dumps({"action": "write_source", "source": SOURCE + "\n"}),
-        ]),
-        candidate=HostMismatch(), budgets=TrialBudgets(24, 2000),
-    )
-
-    assert result.status == "attempt-rewrite-required"
-    assert result.turns == 26 and result.completion_turns == 2
-    assert len(prompts) == 26
-    assert result.verified is None
-    assert result.failures[-1].startswith("host verification failed:")
-    failures = EvidenceLedger(tmp_path / "evidence.jsonl").entries
-    retained = [
-        entry.payload["failed_verification"] for entry in failures
-        if "failed_verification" in entry.payload
-    ]
-    assert len(retained) == 1
-    assert retained[0]["max_abs_error"] == 3.0
-
-
-def test_token_ceiling_is_absolute_during_attempt_completion(tmp_path):
-    result, prompts, _ = _run(
-        tmp_path,
-        _late_candidate_actions(['{"action":"compile"}']),
-        budgets=TrialBudgets(24, 24),
-    )
-    assert result.status == "budget-exhausted"
-    assert result.turns == 25 and result.completion_turns == 1
-    assert result.tokens == 25
-    assert result.failures[-1] == "token budget exhausted"
-    assert len(prompts) == 25
-
-
-def test_completion_boundary_and_source_action_are_authenticated(tmp_path):
-    result, _, _ = _run(
-        tmp_path,
-        _late_candidate_actions([
-            '{"action":"compile"}', '{"action":"run"}',
-            json.dumps({"action": "submit", "interpretation": "done", "supports": []}),
-        ]),
-        budgets=TrialBudgets(24, 2000),
-    )
-    assert result.status == "passed"
-    entries = EvidenceLedger(tmp_path / "evidence.jsonl").entries
-    write = next(
-        entry for entry in entries
-        if entry.kind == "action" and entry.payload["action"] == "write_source"
-    )
-    assert write.payload["source_sha256"] == hashlib.sha256(
-        SOURCE.encode("utf-8")
-    ).hexdigest()
-    boundary = next(
-        entry.payload["attempt_completion_boundary"] for entry in entries
-        if "attempt_completion_boundary" in entry.payload
-    )
-    assert boundary == {
-        "allowed_actions": ("compile",),
-        "call_limit": 3,
-        "nominal_max_turns": 24,
-        "source_sha256": write.payload["source_sha256"],
-        "trial_state": "compile-required",
-    }
+@pytest.mark.parametrize('operation', ['compile', 'run'])
+def test_validation_failure_allows_changed_source_repair_within_time(tmp_path, operation):
+    replacement = SOURCE.replace(' {}', ' { return; }')
+    class RejectOnce(FakeCandidate):
+        rejected = False
+        def invoke(self, name, source, workdir, **kwargs):
+            if name == operation and not self.rejected:
+                self.rejected = True
+                raise ValueError('candidate source rejected by fixture')
+            return getattr(super(), name)(source, workdir, **kwargs)
+        def compile(self, source, workdir, **kwargs):
+            return self.invoke('compile', source, workdir, **kwargs)
+        def run(self, source, workdir, **kwargs):
+            return self.invoke('run', source, workdir, **kwargs)
+    actions = [json.dumps({'action': 'write_source', 'source': SOURCE}), '{"action":"compile"}']
+    if operation == 'run':
+        actions.append('{"action":"run"}')
+    actions += [json.dumps({'action': 'write_source', 'source': replacement}),
+                '{"action":"compile"}', '{"action":"run"}',
+                json.dumps({'action': 'submit', 'interpretation': 'repaired', 'supports': []})]
+    result, prompts, _ = _run(tmp_path, actions, candidate=RejectOnce(),
+        budgets=TrialBudgets(max_turns=1, max_seconds=20))
+    assert result.status == 'passed'
+    after_failure = json.loads(prompts[3 if operation == 'run' else 2])
+    assert after_failure['action_contract']['trial_state'] == 'rewrite-required'
+    assert result.failures == ('candidate source rejected by fixture',)
 
 
 def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_path):
@@ -1535,7 +1209,7 @@ def test_provider_response_failure_is_authenticated_and_consumes_one_turn(tmp_pa
     }
 
 
-def test_provider_failure_usage_is_debited_before_budget_continuation(tmp_path):
+def test_provider_failure_usage_is_recorded_until_time_expires(tmp_path):
     calls = []
 
     def malformed(_context):
@@ -1546,23 +1220,23 @@ def test_provider_failure_usage_is_debited_before_budget_continuation(tmp_path):
 
     result, _, journal = _run(
         tmp_path, [malformed, malformed, malformed],
-        budgets=TrialBudgets(3, 10),
+        budgets=TrialBudgets(3, 10, max_seconds=3),
     )
 
     assert result.status == "budget-exhausted"
-    assert result.turns == 2 and result.tokens == 14
+    assert result.turns == 3 and result.tokens == 21
     assert result.failures == (
         "provider response failure: invalid-content-or-usage",
         "provider response failure: invalid-content-or-usage",
-        "token budget exhausted",
+        "provider response failure: invalid-content-or-usage",
     )
-    assert calls == ["provider", "provider"]
+    assert calls == ["provider", "provider", "provider"]
     assert journal.read() == ()
     failures = EvidenceLedger(tmp_path / "evidence.jsonl").entries
     assert [
         entry.payload["provider_response_failure"]["completion_tokens"]
         for entry in failures
-    ] == [7, 7]
+    ] == [7, 7, 7]
 
 
 def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(
@@ -1589,18 +1263,23 @@ def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(
     path = tmp_path / "evidence.jsonl"
     with pytest.raises(InjectedCrash, match="after retained"):
         _run(
-            tmp_path, [malformed], budgets=TrialBudgets(2, 100),
+            tmp_path, [malformed], budgets=TrialBudgets(2, 100, max_seconds=2),
             evidence=CrashAfterFirstProviderFailure(path),
         )
 
     result, prompts, journal = _run(
-        tmp_path, [malformed], budgets=TrialBudgets(2, 100),
+        tmp_path, [malformed], budgets=TrialBudgets(2, 100, max_seconds=2),
     )
 
     assert result.status == "budget-exhausted"
     assert result.turns == 2 and result.tokens == 6
     assert calls == ["provider", "provider"]
     assert len(prompts) == 1 and journal.read() == ()
+    elapsed = json.loads((tmp_path / 'work/time-budget.json').read_text())
+    assert elapsed['elapsed_seconds'] == 2 and elapsed['active_since'] is None
+    repeated, repeated_prompts, _ = _run(tmp_path, [], budgets=TrialBudgets(max_seconds=2))
+    assert repeated == result and repeated_prompts == []
+    assert calls == ['provider', 'provider']
     recovered = json.loads(prompts[0])["observations"]
     assert recovered == [{
         "provider_response_failure": {
@@ -1622,7 +1301,7 @@ def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(
 
     reference, _, _ = _run(
         tmp_path / "reference", [reference_malformed, reference_malformed],
-        budgets=TrialBudgets(2, 100),
+        budgets=TrialBudgets(2, 100, max_seconds=2),
     )
     assert reference_calls == ["provider", "provider"]
     assert result == reference
@@ -1634,7 +1313,7 @@ def test_resume_recovers_consumed_provider_failure_turn_without_duplicate_call(
 def test_provider_failure_recovery_does_not_hide_mixed_partial_state(tmp_path):
     _run(
         tmp_path, [A3ProviderResponseError("invalid-content-or-usage")],
-        budgets=TrialBudgets(1, 100),
+        budgets=TrialBudgets(1, 100, max_seconds=1),
     )
     cell = _cell()
     EvidenceLedger(tmp_path / "evidence.jsonl").append(EvidenceKind.ACTION, {
@@ -1646,7 +1325,7 @@ def test_provider_failure_recovery_does_not_hide_mixed_partial_state(tmp_path):
     })
 
     with pytest.raises(ValueError, match="only leading retained failures"):
-        _run(tmp_path, [])
+        _run(tmp_path, [], budgets=TrialBudgets(max_seconds=1))
 
 
 @pytest.mark.parametrize("error", [ValueError("actor bug"), RuntimeError("actor bug")])
@@ -1757,7 +1436,7 @@ def test_deepseek_default_recovers_after_twelve_turns_without_relaxing_gates(tmp
 
     short, _, _ = _run(
         tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
-        budgets=TrialBudgets(12, 65536),
+        budgets=TrialBudgets(12, 65536, max_seconds=14),
     )
     recovered, _, _ = _run(
         tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),
@@ -1810,7 +1489,7 @@ def test_openai_default_recovers_after_twelve_turns_without_relaxing_gates(tmp_p
 
     short, _, _ = _run(
         tmp_path / "short", actions, cell=cell, candidate=FourMismatches(),
-        budgets=TrialBudgets(12, 32768),
+        budgets=TrialBudgets(12, 32768, max_seconds=14),
     )
     recovered, _, _ = _run(
         tmp_path / "default", actions, cell=cell, candidate=FourMismatches(),
@@ -1838,14 +1517,17 @@ def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
         evidence_resolver=Resolver(),
         trial_protocol_sha256=trial_protocol_sha256(),
     )
+    clock = FakeClock()
+    def invalid_actor(*_):
+        clock.advance(1)
+        return A3Completion(
+            '{"action":"compile"}', 1, {"profile_sha256": "0" * 64})
     loop = A3TrialLoop(
         cell=cell, proposal=DEFAULT_PROPOSALS[0], profile=profile,
-        actor=lambda *_: A3Completion(
-            '{"action":"compile"}', 1, {"profile_sha256": "0" * 64}
-        ),
+        actor=invalid_actor, clock=clock,
         candidate=FakeCandidate(), knowledge=FakeKnowledge(False), profiler=FakeProfiler(),
         evidence=EvidenceLedger(tmp_path / "evidence.jsonl"), memory=journal,
-        workdir=tmp_path / "work", budgets=TrialBudgets(1, 100),
+        workdir=tmp_path / "work", budgets=TrialBudgets(1, 100, max_seconds=1),
     )
     result = loop.run()
     assert result.status == "budget-exhausted"

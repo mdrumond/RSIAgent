@@ -1,9 +1,8 @@
-"""Durable, conservative spend reservations shared by both coding backends."""
+"""Durable usage estimates; execution limits are enforced only by deadlines."""
 
 from contextlib import contextmanager
 import fcntl
 import json
-import math
 import os
 from pathlib import Path
 import uuid
@@ -15,13 +14,7 @@ class BudgetExceeded(RuntimeError):
 
 class Budget:
     def __init__(self, path: Path, limit: float = 3.0, *, window=None, window_limit=None):
-        if not math.isfinite(limit) or not 0 < limit <= 10:
-            raise ValueError("experiment budget must be in (0, 10] USD")
         self.path, self.limit = Path(path), limit
-        if window is not None and (not isinstance(window, str) or not window or
-                type(window_limit) not in (int, float) or not math.isfinite(window_limit) or
-                not 0 < window_limit <= limit):
-            raise ValueError("invalid incremental budget window")
         self.window, self.window_limit = window, window_limit
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -37,8 +30,6 @@ class Budget:
             state = json.loads(self.path.read_text()) if self.path.exists() else {
                 "limit_usd": self.limit, "requests": [],
             }
-            if state["limit_usd"] != self.limit:
-                raise ValueError("existing budget has a different limit")
             yield state
             temporary = self.path.with_suffix(".tmp")
             with temporary.open("w") as stream:
@@ -52,16 +43,6 @@ class Budget:
         input_bound = len(json.dumps(request, ensure_ascii=False).encode()) + 4096
         amount = (input_bound * rates[0] + output_tokens * rates[1]) / 1_000_000
         with self._state() as state:
-            if sum(r["charged_bound_usd"] for r in state["requests"]) + amount > self.limit:
-                raise BudgetExceeded("request would exceed the shared smoke budget")
-            if self.window is not None:
-                windows = state.setdefault("windows", {})
-                if windows.setdefault(self.window, self.window_limit) != self.window_limit:
-                    raise ValueError("existing incremental window has a different limit")
-                charged = sum(r["charged_bound_usd"] for r in state["requests"]
-                              if r.get("window") == self.window)
-                if charged + amount > self.window_limit:
-                    raise BudgetExceeded("request would exceed the incremental smoke budget")
             rid = uuid.uuid4().hex
             state["requests"].append({
                 "id": rid, "label": label, "reserved_usd": amount,
@@ -79,10 +60,6 @@ class Budget:
             row = next(r for r in state["requests"] if r["id"] == rid)
             row.update(usage={"prompt_tokens": input_tokens, "completion_tokens": output_tokens},
                        charged_bound_usd=amount)
-            if amount > row["reserved_usd"]:
-                # Fail closed on subsequent calls if the assumed bound was wrong.
-                row["charged_bound_usd"] = max(amount, self.limit)
-                row["bound_violation"] = True
 
 
 @contextmanager

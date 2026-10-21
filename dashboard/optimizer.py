@@ -66,12 +66,12 @@ class OptimizerDashboard:
         if intent.get('state') != 'resume-prepared':
             if self.worker_active(job_id):
                 raise ValueError('cannot resume while the worker is active')
-            self.store._budget(data.get('additional_attempts'), data.get('additional_seconds'))
+            self.store._budget(data.get('additional_attempts', 0), data.get('additional_seconds'))
             if job['status'] not in {'stopped', 'budget-exhausted', 'failed'}:
                 raise ValueError('job must be stopped before resume')
             intent.update(state='resume-prepared',
                 before=[job['max_attempts'], job['max_seconds']],
-                expected=[job['max_attempts'] + data['additional_attempts'],
+                expected=[job['max_attempts'] + data.get('additional_attempts', 0),
                           job['max_seconds'] + data['additional_seconds']])
             atomic(receipt, canonical(intent))
         budget = [job['max_attempts'], job['max_seconds']]
@@ -79,7 +79,7 @@ class OptimizerDashboard:
             if self.worker_active(job_id):
                 raise ValueError('cannot resume while the worker is active')
             job = self.store.resume(job_id,
-                additional_attempts=data['additional_attempts'],
+                additional_attempts=data.get('additional_attempts', 0),
                 additional_seconds=data['additional_seconds'])
         elif budget != intent['expected']:
             raise ValueError('resume intent conflicts with the current job budget')

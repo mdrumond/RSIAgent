@@ -89,6 +89,7 @@ def test_reserved_final_attempt_controls_follow_worker_lock(setup):
     key = store.create('def f(x): return x', 'f', {}, {}, max_attempts=1)['job_id']
     store.transition(key, 'running')
     store.record_attempt(key, candidate_sha256='a', result='evaluating')
+    store.account_time(key, store.get(key)['max_seconds'])
     url = f'/api/optimizer/jobs/{key}'
     client = app.test_client()
     assert client.get(url).json['worker_active'] is False

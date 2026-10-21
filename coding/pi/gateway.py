@@ -1,4 +1,4 @@
-"""Loopback-only provider gateway: keys stay outside Pi; budgets cannot be bypassed.
+"""Loopback-only provider gateway: keys stay outside Pi; attempt deadlines remain authoritative.
 
 Only the configured model and endpoint are forwarded. Reservations happen before
 HTTP. The host can retain request evidence; credentials never enter that evidence.
@@ -11,8 +11,6 @@ import threading
 import time
 
 import requests
-
-from .budget import BudgetExceeded
 
 
 PROVIDERS = {
@@ -62,11 +60,10 @@ class Gateway:
         self.on_record = on_record or (lambda *_: None)
         self.finished = threading.Event()
         self.finished.set()
-        self.completion_limit = None
         self.stop_reason = None
         self.api_key, self.budget, self.label = api_key, budget, label
         self.token = secrets.token_urlsafe(32)
-        self.max_calls, self.deadline = max_calls, deadline or time.monotonic() + 600
+        self.max_calls, self.deadline = max_calls, deadline if deadline is not None else time.monotonic() + 600
         self.calls, self.records = 0, []
         self.lock = threading.Lock()
 
@@ -82,12 +79,6 @@ class Gateway:
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages are required")
         output_limit = self.spec["max_tokens"]
-        if self.completion_limit is not None:
-            used = sum((row.get("usage") or {}).get("completion_tokens", self.spec["max_tokens"])
-                       for row in self.records)
-            output_limit = min(output_limit, self.completion_limit-used)
-            if output_limit <= 0:
-                raise BudgetExceeded("completion token limit reached")
         if responses:
             if self.provider != "openai":
                 raise ValueError("Responses API is configured only for OpenAI")
@@ -131,15 +122,15 @@ class Gateway:
                     responses = self.path == "/v1/responses"
                     request = owner.prepare(payload, responses=responses)
                     with owner.lock:
-                        if owner.calls >= owner.max_calls or started >= owner.deadline:
-                            owner.stop_reason = "request_limit" if owner.calls >= owner.max_calls else "deadline"
-                            raise BudgetExceeded("call or time limit reached")
+                        if time.monotonic() >= owner.deadline:
+                            owner.stop_reason = "deadline"
+                            raise TimeoutError("attempt deadline reached")
                         rid = owner.budget.reserve(request, output_tokens=owner.spec["max_tokens"],
                                                    rates=owner.spec["rates"], label=owner.label)
                         owner.calls += 1
-                except BudgetExceeded as exc:
-                    owner.stop_reason = owner.stop_reason or "budget_exhausted"
-                    return self.error(402, str(exc))
+                except TimeoutError as exc:
+                    owner.stop_reason = owner.stop_reason or "deadline"
+                    return self.error(408, str(exc))
                 except (ValueError, TypeError, AttributeError):
                     return self.error(400, "invalid smoke request")
                 row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}

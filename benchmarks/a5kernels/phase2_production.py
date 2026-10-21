@@ -103,12 +103,6 @@ class Phase2ProductionConfig:
             raise ValueError(
                 "Phase 2 guide path and CPL skills revision must be supplied together"
             )
-        if (
-            isinstance(self.compile_probes, bool)
-            or not isinstance(self.compile_probes, int)
-            or not 0 <= self.compile_probes <= 20
-        ):
-            raise ValueError("compile_probes must be in [0, 20]")
 
     @property
     def validation_wrapper(self) -> Path:
@@ -464,7 +458,7 @@ def build_phase2_production(
         guide_text=phase2_guide_text,
         knowledge_factory=knowledge_factory,
         profiling_guidance=guidance,
-        compile_probe=compile_probe if config.compile_probes else None,
+        compile_probe=compile_probe,
         max_compile_probes=config.compile_probes,
     )
     verifier = AttentionTargetVerifier(backend)

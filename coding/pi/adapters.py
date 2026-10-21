@@ -1,5 +1,6 @@
 """Mechanical adapters from typed Pi tools to existing host action contracts."""
 import json
+import time
 
 from .schema import STRING, INTEGER, obj
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError
@@ -43,8 +44,8 @@ class A3Actor:
 
     def bind_host(self, record, budgets):
         self.record = record
-        self.session.gateway.max_calls = budgets.max_turns + 4
-        self.session.gateway.completion_limit = budgets.max_tokens
+        self.session.deadline = time.monotonic() + budgets.max_seconds
+        self.session.gateway.deadline = self.session.deadline
 
     def __call__(self, profile, context):
         from benchmarks.a3_model_profiles import A3Completion

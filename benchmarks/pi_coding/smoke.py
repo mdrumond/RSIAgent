@@ -1,10 +1,10 @@
-"""Opt-in tiled matmul-add smoke using the existing production optimizer."""
+"""Time-bounded tiled matmul-add smoke using the production optimizer."""
 import argparse
 import json
 from pathlib import Path
 
 from coding.pi import runtime_preflight
-from coding.pi.budget import Budget, allocation_lock
+from coding.pi.budget import allocation_lock
 from optimizer.agent import OptimizerAgent
 from optimizer.jobs import JobStore, canonical, sha
 from optimizer.worker import load_config, run_worker
@@ -38,16 +38,15 @@ def signatures():
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker-config", type=Path, required=True)
-    parser.add_argument("--budget-ledger", type=Path, required=True,
-                        help="Existing allocation ledger; it is never reset")
+    parser.add_argument("--budget-ledger", type=Path,
+                        help="Legacy accounting path; no spend limit is enforced")
     parser.add_argument("--root", type=Path, required=True, help="Ignored local run directory")
     parser.add_argument("--window", required=True, help="Stable incremental allocation name; reuse on resume")
-    parser.add_argument("--budget-usd", type=float, default=2)
+    parser.add_argument("--budget-usd", type=float, default=2, help=argparse.SUPPRESS)
+    parser.add_argument("--max-seconds", type=int, default=1200)
     parser.add_argument("--knowledge-file", type=Path)
     parser.add_argument("--check-only", action="store_true")
     args = parser.parse_args(argv)
-    if not 0 < args.budget_usd <= 2:
-        parser.error("incremental budget must be in (0, 2] USD")
     runtime_preflight()
     config = load_config(args.worker_config)
     for key in ("cpl_remote", "validation_wrapper", "guide"):
@@ -55,22 +54,22 @@ def main(argv=None):
             parser.error(f"configured {key} is unavailable")
     report = run_smoke(config=config, budget_ledger=args.budget_ledger,
                        root=args.root, window=args.window, budget_usd=args.budget_usd,
-                       knowledge_file=args.knowledge_file, check_only=args.check_only)
+                       knowledge_file=args.knowledge_file, check_only=args.check_only, max_seconds=args.max_seconds)
     print(json.dumps(report))
     return 0 if args.check_only or report["host_verified"] else 2
 
 
-def run_smoke(*, config, budget_ledger, root, window, budget_usd=2,
-              knowledge_file=None, check_only=False, transport_factory=None):
+def run_smoke(*, config, budget_ledger=None, root, window, budget_usd=2,
+              knowledge_file=None, check_only=False, transport_factory=None, max_seconds=1200):
     """Run the fixed smoke with caller-validated runtime/transport configuration.
 
     Custom transports are trusted host code, injected only through this Python
     API. The CLI retains the checked production route and its config validator.
     """
-    if not 0 < budget_usd <= 2:
-        raise ValueError("incremental budget must be in (0, 2] USD")
+    if type(max_seconds) is not int or max_seconds <= 0:
+        raise ValueError("max_seconds must be a positive integer")
     runtime_preflight()
-    budget_ledger, root = Path(budget_ledger), Path(root)
+    root = Path(root)
     knowledge_file = Path(knowledge_file) if knowledge_file else None
     if transport_factory is not None:
         if not config.get("lock_directory") or not config.get("transport_identity"):
@@ -79,24 +78,20 @@ def run_smoke(*, config, budget_ledger, root, window, budget_usd=2,
     if config.get("model_profile", "deepseek-flash") != "deepseek-flash":
         raise ValueError("this smoke requires the registered deepseek-flash profile")
     config = {**config, "max_cases": 3, "model_profile": "deepseek-flash"}
-    existing = json.loads(budget_ledger.read_text())
-    budget = Budget(budget_ledger, existing["limit_usd"],
-                    window=window, window_limit=budget_usd)
     if check_only:
         return {"status": "local-preflight-passed", "remote_validated": False,
-                          "max_requests": 20, "max_candidates": 4, "max_seconds": 1200,
-                          "incremental_bound_usd": budget_usd}
+                "max_seconds": max_seconds}
     guide = Path(config["guide"]).read_text() + "\n" + TASK
     if knowledge_file:
         guide += "\nStarting knowledge:\n" + knowledge_file.read_text()
     body = {"files": {}, "memory_entries": []}
     memory = {**body, "snapshot_id": sha(canonical(body))}
-    with allocation_lock(budget_ledger.parent):
+    with allocation_lock(root):
         store = JobStore(root)
         row = store.create(REFERENCE, "forward", signatures(), memory,
                            name="Pi tiled matmul-add smoke", idempotency_key=window,
-                           max_attempts=4, max_seconds=1200)
-        agent = OptimizerAgent(guide=guide, max_provider_calls=20, budget=budget)
+                           max_seconds=max_seconds)
+        agent = OptimizerAgent(guide=guide)
         failure = None
         try:
             result = run_worker(root, row["job_id"], config, agent=agent,

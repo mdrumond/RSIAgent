@@ -33,16 +33,13 @@ class OptimizerAgent:
         if session_factory is PiCodingSession:
             runtime_preflight()
         self.session_factory = session_factory
-        if type(max_provider_calls) is not int or not 1 <= max_provider_calls <= 200:
-            raise ValueError("max_provider_calls must be in [1, 200]")
-        self.max_provider_calls, self.budget = max_provider_calls, budget
         self.session = None
         self.last_source = None
         self.last_block_count = 1
         self.own_process_group = True
         self.deadline = None
         self.identity = {**load_a3_model_profile(model).as_dict(), **ENGINE_IDENTITY,
-                         "provider_request_limit": max_provider_calls,
+                         "budget_policy": "wall-time-v1",
                          "guide_sha256": hashlib.sha256(guide.encode()).hexdigest()}
 
     def close(self):
@@ -67,14 +64,13 @@ class OptimizerAgent:
             raise ValueError('unknown optimizer model stage')
         if self.session is None:
             self.session = self.session_factory(model=self.model, schemas=OPTIMIZER_SCHEMAS,
-                max_calls=self.max_provider_calls, budget=self.budget,
                 deadline=self.deadline, own_process_group=self.own_process_group)
         allowed = ["cases"] if stage == "cases" else [name for name in OPTIMIZER_SCHEMAS if name != "cases"]
         if context.get("knowledge_available") is False:
             allowed = [name for name in allowed if name != "query-knowledge"]
         name, args = self.session.next_action({**context, "guide": self.guide,
             "stage": stage, "contract": SYSTEM, "current_stage_instruction": directive}, allowed,
-            limits={"provider_requests": context.get("remaining_provider_requests", 200)}, record=record,
+            record=record,
             source=self.last_source if stage == "optimize" else None,
             write_action=(lambda s: ("compile", {"source": s, "block_count": self.last_block_count,
                                                   "summary": "Targeted source correction"})) if stage == "optimize" else None)

@@ -189,6 +189,8 @@ class DirectCompletionProvider:
         invalid_prompt_retries: int = 3,
         invalid_prompt_backoff_seconds: float = 120,
         sleeper: Callable[[float], None] = time.sleep,
+        retry_max_seconds: float = 480,
+        clock=None,
     ) -> None:
         credentials = {}
         for values in _DIRECT_VALUES.values():
@@ -207,6 +209,10 @@ class DirectCompletionProvider:
             raise ValueError("invalid_prompt_backoff_seconds must be nonnegative")
         self.invalid_prompt_retries = invalid_prompt_retries
         self.invalid_prompt_backoff_seconds = invalid_prompt_backoff_seconds
+        from benchmarks.ascend.time_budget import deadline_after
+        deadline_after(retry_max_seconds)
+        self.retry_max_seconds = retry_max_seconds
+        self.clock = clock or time.monotonic
         self._sleep = sleeper
         self.context_budgets = dict(DEFAULT_CONTEXT_BUDGETS)
         if context_budgets is not None:
@@ -235,14 +241,17 @@ class DirectCompletionProvider:
             raise ContextBudgetError("direct provider request exceeds context hard byte budget")
         request = profile.request(messages)
         request_sha256 = canonical_digest(request)
-        for attempt in range(1, self.invalid_prompt_retries + 2):
+        deadline = self.clock() + self.retry_max_seconds
+        attempt = 0
+        while True:
+            attempt += 1
             if attempt_observer is not None:
                 attempt_observer("request", {"attempt": attempt, "request": deepcopy(request),
                                              "request_sha256": request_sha256})
             try:
                 return self._complete_once(profile, request)
             except ProviderRejectionError as exc:
-                retry = attempt <= self.invalid_prompt_retries
+                retry = self.clock() + self.invalid_prompt_backoff_seconds < deadline
                 delay = self.invalid_prompt_backoff_seconds if retry else 0
                 rejection = {"attempt": attempt, **exc.evidence(),
                              "request_sha256": request_sha256,
@@ -378,18 +387,21 @@ class _ActorContinuation:
     recorder: _ProviderEvidenceRecorder
     working_context: WorkingContext
     total_turns: int
+    deadline: float | None = None
 
 
 class DirectActorDriver:
     """Run the existing restricted A5 action protocol over one direct profile."""
 
     def __init__(
-        self, provider: DirectCompletionProvider, *, max_turns: int = 40,
+        self, provider: DirectCompletionProvider, *, max_turns: int = 40, max_seconds: float = 3600, clock=None,
         trace_event: Callable[[str, Mapping[str, object]], None] | None = None,
         system_prompt: str = _SYSTEM_PROMPT,
     ):
-        if type(max_turns) is not int or not 1 <= max_turns <= 40:
-            raise ValueError("max_turns must be in [1, 40]")
+        from benchmarks.ascend.time_budget import deadline_after
+        deadline_after(max_seconds)
+        self.max_seconds = max_seconds
+        self.clock = clock or time.monotonic
         self.provider = provider
         self.max_turns = max_turns
         if trace_event is not None and not callable(trace_event):
@@ -403,7 +415,7 @@ class DirectActorDriver:
 
     def with_trace(self, trace_event):
         """Bind a project-local observer without mutating this shared driver."""
-        return type(self)(self.provider, max_turns=self.max_turns,
+        return type(self)(self.provider, max_turns=self.max_turns, max_seconds=self.max_seconds, clock=self.clock,
                           trace_event=trace_event, system_prompt=self.system_prompt)
 
     def _prepare_context(self, working, profile, recorder, *, turn):
@@ -462,7 +474,8 @@ class DirectActorDriver:
         tokens = 0
         turn = 0
         ordinary_turns = 0
-        while ordinary_turns < self.max_turns:
+        deadline = self.clock() + self.max_seconds
+        while self.clock() < deadline:
             turn += 1
             messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
             tokens += summary_tokens
@@ -514,7 +527,7 @@ class DirectActorDriver:
                         outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
                         continuation=_ActorContinuation(
-                            profile, tuple(dict(item) for item in messages), recorder, working, turn
+                            profile, tuple(dict(item) for item in messages), recorder, working, turn, deadline
                         ),
                     )
             messages.append({"role": "user", "content": observation})
@@ -522,8 +535,8 @@ class DirectActorDriver:
             self._trace("message", messages[-1])
             if action is None:
                 ordinary_turns += 1
-        self._trace("terminal", {"status": "turn-budget-exhausted"})
-        return ActorOutcome("turn-budget-exhausted", turn, tokens)
+        self._trace("terminal", {"status": "time-budget-exhausted"})
+        return ActorOutcome("time-budget-exhausted", turn, tokens)
 
     def distill(
         self,
@@ -570,7 +583,10 @@ class DirectActorDriver:
         # they are instructions, not history that a work log may fold away.
         working.pinned.append(dict(messages[-1]))
         tokens = outcome.tokens or 0
-        for correction in range(_MAX_DISTILLATION_ATTEMPTS):
+        deadline = continuation.deadline or self.clock() + self.max_seconds
+        correction = -1
+        while self.clock() < deadline:
+            correction += 1
             turn = continuation.total_turns + correction + 1
             messages, summary_tokens = self._prepare_context(
                 working, continuation.profile, continuation.recorder, turn=turn,
@@ -598,7 +614,7 @@ class DirectActorDriver:
             try:
                 distillation = parse_agent_distillation(completion.text, admitted)
             except ValueError as exc:
-                if correction + 1 == _MAX_DISTILLATION_ATTEMPTS:
+                if self.clock() >= deadline:
                     raise
                 messages.extend((
                     {"role": "assistant", "content": completion.text},
@@ -615,7 +631,8 @@ class DirectActorDriver:
                 outcome.status, outcome.iterations, tokens, outcome.wall_time_s,
                 completion.text, distillation, admitted, None,
             )
-        raise AssertionError("bounded distillation loop did not terminate")
+        self._trace("terminal", {"status": "distillation-time-budget-exhausted"})
+        return replace(outcome, tokens=tokens)
 
 
 __all__ = [

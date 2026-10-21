@@ -18,16 +18,16 @@ def test_callable_preflight_is_offline_and_preserves_allocation(tmp_path, monkey
                              budget_ledger=ledger, root=tmp_path / 'jobs',
                              window='test', check_only=True, transport_factory=forbidden)
     assert result['remote_validated'] is False
-    assert result['max_requests'] == 20
+    assert result['max_seconds'] == 1200
     assert ledger.read_bytes() == original
     assert not (tmp_path / 'jobs').exists()
 
 
-@pytest.mark.parametrize('budget', [0, -1, 2.01, float('nan'), float('inf')])
-def test_callable_rejects_budget_before_runtime_or_provider(budget):
-    with pytest.raises(ValueError, match='incremental budget'):
+@pytest.mark.parametrize('seconds', [0, -1, float('nan'), float('inf')])
+def test_callable_rejects_invalid_time_before_runtime_or_provider(seconds):
+    with pytest.raises(ValueError, match='max_seconds'):
         smoke.run_smoke(config={}, budget_ledger='unused', root='unused',
-                        window='test', budget_usd=budget)
+                        window='test', max_seconds=seconds)
 
 
 def test_callable_preserves_failed_run_report_and_forwards_transport(tmp_path, monkeypatch):

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -140,15 +141,11 @@ def parse_action(text: str) -> Action:
 class TrialBudgets:
     max_turns: int = 24
     max_tokens: int = 32768
+    max_seconds: float = 3600
 
     def __post_init__(self) -> None:
-        if (
-            type(self.max_turns) is not int
-            or not 1 <= self.max_turns <= 100
-            or type(self.max_tokens) is not int
-            or not 1 <= self.max_tokens <= 1_000_000
-        ):
-            raise ValueError("trial budgets are outside registered bounds")
+        from benchmarks.ascend.time_budget import deadline_after
+        deadline_after(self.max_seconds)
 
     @classmethod
     def for_model(cls, model: BackendModel) -> "TrialBudgets":
@@ -165,12 +162,11 @@ def trial_protocol_sha256() -> str:
     for model in BackendModel:
         budgets = TrialBudgets.for_model(model)
         model_budgets[model.value] = {
-            "max_turns": budgets.max_turns,
-            "max_tokens": budgets.max_tokens,
+            "max_seconds": budgets.max_seconds,
         }
     return canonical_digest({
         **ENGINE_IDENTITY,
-        "schema": "a3-trial-protocol-v6",
+        "schema": "a3-trial-protocol-v7",
         "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3,
@@ -187,18 +183,7 @@ def trial_protocol_sha256() -> str:
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
         "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
-        "attempt_completion": {
-            "schema": _ATTEMPT_COMPLETION_SCHEMA,
-            "source_frozen": True,
-            "allowed_operations": ["compile", "run", "profile", "submit"],
-            "call_limits": {
-                treatment.value: limit
-                for treatment, limit in _COMPLETION_CALL_LIMITS.items()
-            },
-            "token_ceiling": "absolute",
-            "rewrite_required": "terminate",
-            "rewrite_terminal_status": "attempt-rewrite-required",
-        },
+        "budget_policy": "elapsed-time-v1",
         "model_budgets": model_budgets,
     })
 
@@ -237,6 +222,7 @@ class A3TrialLoop:
         timing_dimensions: StudyDimensions | None = None,
         execution_profile: str = "gz-a3",
         infrastructure_attempt_ordinal: int = 0,
+        clock=None,
     ) -> None:
         if not isinstance(cell, A3ExperimentCell):
             raise TypeError("trial requires an A3ExperimentCell")
@@ -253,6 +239,7 @@ class A3TrialLoop:
         self.actor, self.candidate, self.knowledge, self.profiler = actor, candidate, knowledge, profiler
         self.evidence, self.memory, self.workdir = evidence, memory, Path(workdir)
         self.budgets = budgets if budgets is not None else TrialBudgets.for_model(cell.backend_model)
+        self.clock = clock or time.monotonic
         if execution_profile not in A3_EXECUTION_PROFILES:
             raise ValueError("trial execution_profile must be a registered A3 profile")
         self.execution_profile = execution_profile
@@ -267,13 +254,18 @@ class A3TrialLoop:
         self.timing_dimensions = timing_dimensions
 
     def run(self) -> TrialResult:
+        from benchmarks.ascend.time_budget import AttemptTimeBudget
+        budget = AttemptTimeBudget(self.workdir / "time-budget.json", self.budgets.max_seconds, clock=self.clock)
+        self.deadline = budget.deadline
         try:
             bind = getattr(self.actor, "bind_host", None)
             if bind is not None:
                 bind(lambda kind, payload: self.evidence.append(EvidenceKind.ARTIFACT,
-                     self._identity({"pi_event": kind, "data": payload})), self.budgets)
+                     self._identity({"pi_event": kind, "data": payload})),
+                     replace(self.budgets, max_seconds=max(0.001, self.deadline-self.clock())))
             return self._run()
         finally:
+            budget.close()
             close = getattr(self.actor, "close", None)
             if close is not None:
                 close()
@@ -293,36 +285,12 @@ class A3TrialLoop:
         rewrite_source: str | None = None
         queries = 0
         completion_turns = 0
-        completion_started = False
         completion_limit = _COMPLETION_CALL_LIMITS[self.cell.profiling]
         last_turn = consumed_turns
-        if tokens > self.budgets.max_tokens:
-            failures.append("token budget exhausted")
-            return TrialResult(
-                "budget-exhausted", consumed_turns, tokens, verified,
-                profile_result, queries, tuple(failures),
-                completion_turns=completion_turns,
-            )
-        for turn in range(
-            consumed_turns + 1,
-            self.budgets.max_turns + completion_limit + 1,
-        ):
-            in_completion = turn > self.budgets.max_turns
-            if in_completion:
-                state = self._trial_state(
-                    source, compilation, verified, profile_result,
-                    rewrite_source, compile_attempt_id, run_attempt_id,
-                )
-                if not completion_started:
-                    if state not in _COMPLETION_STATES:
-                        break
-                    completion_started = True
-                    self._record_completion_boundary(
-                        source=source, state=state, call_limit=completion_limit,
-                    )
-                elif state not in _COMPLETION_STATES:
-                    break
-                completion_turns += 1
+        turn = consumed_turns
+        while self.clock() < self.deadline:
+            turn += 1
+            in_completion = False
             last_turn = turn
             try:
                 completion = self.actor(
@@ -343,24 +311,10 @@ class A3TrialLoop:
                 self._retain_provider_response_failure(
                     turn, exc, failures, observations
                 )
-                if tokens > self.budgets.max_tokens:
-                    failures.append("token budget exhausted")
-                    return TrialResult(
-                        "budget-exhausted", turn, tokens, verified,
-                        profile_result, queries, tuple(failures),
-                        completion_turns=completion_turns,
-                    )
                 continue
             if not isinstance(completion, A3Completion):
                 raise TypeError("actor must return A3Completion")
             tokens += completion.completion_tokens
-            if tokens > self.budgets.max_tokens:
-                failures.append("token budget exhausted")
-                return TrialResult(
-                    "budget-exhausted", turn, tokens, verified,
-                    profile_result, queries, tuple(failures),
-                    completion_turns=completion_turns,
-                )
             try:
                 if completion.provenance.get("profile_sha256") != self.profile.fingerprint:
                     raise ValueError("completion provenance does not match the cell model")
@@ -1033,6 +987,7 @@ class A3TrialLoop:
                 "lineage_id": self.memory.lineage_id,
                 "memory": json.loads(self.memory.project_context()),
                 "observations": observations,
+                "remaining_seconds": max(0, self.deadline-self.clock()),
                 "policy": {
                     "logical_length": self._length(),
                     "padded_length": self._padded_length(),
