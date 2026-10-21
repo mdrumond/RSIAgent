@@ -126,7 +126,7 @@ def test_normalization_does_not_hide_invalid_proposals(change, diagnostic):
 def test_dependencies_are_not_derived_from_project_operations():
     raw = json.loads(wave([project()]).split("\n", 1)[1])
     raw["projects"][0]["requires"] = ["simd-vector"]
-    with pytest.raises(ValueError, match="dependencies must exist"):
+    with pytest.raises(ValueError, match="unsupported requires"):
         CurriculumAgent(lambda _: "DECISION: WAVE\n" + json.dumps(raw)).select(context())
 
 
