@@ -128,8 +128,14 @@ print(json.dumps(dict(cann_version=cann or 'unreported',compiler_version=version
  profiler_version=profiler or 'unavailable',torch_version=torch.__version__,
  product=torch.npu.get_device_name(0))))
 '''
-    result = subprocess.run([sys.executable, '-c', probe], env=local_environment(settings),
-                            capture_output=True, text=True, timeout=30)
+    timeout = min(settings.get('preflight_timeout_seconds', 120), settings.get('max_seconds', 600))
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('preflight_timeout_seconds must be finite positive seconds')
+    try:
+        result = subprocess.run([sys.executable, '-c', probe], env=local_environment(settings),
+                                capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f'local runtime preflight exceeded {timeout:g} seconds; check the activated runtime and selected device') from error
     if result.returncode:
         raise RuntimeError('local kernel runtime preflight failed: ' + result.stderr[-4000:])
     identity = {**local_identity(settings), **json.loads(result.stdout.splitlines()[-1])}

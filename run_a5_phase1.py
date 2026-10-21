@@ -92,13 +92,12 @@ def _paths(
     from benchmarks.ascend.execution import apply_worker_config, execution_mode
     worker = apply_worker_config({}, getattr(args, "worker_config", None)) if getattr(args, "worker_config", None) else None
     local = worker is not None and execution_mode(worker) == "local"
-    if local:
-        args.tla_root = args.tla_root or Path.cwd()
-        args.profiling_skill_root = args.profiling_skill_root or Path.cwd()
-        args.device = worker["physical_device"]
-        args.catlass_source = worker["catlass_source"]
+    from benchmarks.ascend.worker_bindings import apply_a5_worker_arguments
+    apply_a5_worker_arguments(args, worker, source="catlass_source", revision="catlass_revision")
     if args.profiling_skill_root is None or args.tla_root is None or args.device is None or args.catlass_source is None:
         raise ValueError("remote execution requires explicit toolchain paths and device")
+    if worker and worker.get("catlass_revision", revision) != revision:
+        raise ValueError("worker Catlass revision differs from the admitted Phase 1 revision")
     return ProductionPaths(
         worker_config=worker,
         tla_root=args.tla_root,

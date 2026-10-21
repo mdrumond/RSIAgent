@@ -66,7 +66,7 @@ class LocalCatlassExecutor:
         environment['PYTHONPYCACHEPREFIX'] = None
         if direct:
             # Profilers and the application must see the same physical ordinal.
-            environment['ASCEND_RT_VISIBLE_DEVICES'] = ''
+            environment['ASCEND_RT_VISIBLE_DEVICES'] = None
             environment['A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE'] = '1'
         else:
             environment['A5KERNEL_PROFILE_DIRECT_PHYSICAL_DEVICE'] = '0'

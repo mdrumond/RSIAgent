@@ -78,11 +78,8 @@ def _production_factory(
 ) -> tuple[A5Phase1Snapshot, Phase2Dependencies]:
     from benchmarks.ascend.execution import apply_worker_config, execution_mode
     worker = apply_worker_config({}, getattr(args, "worker_config", None)) if getattr(args, "worker_config", None) else None
-    if worker is not None and execution_mode(worker) == "local":
-        args.catlass_source = worker["catlass_source"]
-        args.runtime_catlass_revision = worker["catlass_revision"]
-        args.device = worker["physical_device"]
-        args.tla_root = args.tla_root or Path.cwd()
+    from benchmarks.ascend.worker_bindings import apply_a5_worker_arguments
+    apply_a5_worker_arguments(args, worker, source="catlass_source", revision="runtime_catlass_revision")
     required = {
         "phase1_root": args.phase1_root,
         "guide": args.guide,

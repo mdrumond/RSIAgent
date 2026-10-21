@@ -73,11 +73,8 @@ def main(
         return
     from benchmarks.ascend.execution import apply_worker_config, execution_mode
     worker = apply_worker_config({}, args.worker_config) if args.worker_config else None
-    if worker is not None and execution_mode(worker) == "local":
-        args.catlass_source = worker["catlass_source"]
-        args.catlass_revision = worker["catlass_revision"]
-        args.device = worker["physical_device"]
-        args.tla_root = args.tla_root or Path.cwd()
+    from benchmarks.ascend.worker_bindings import apply_a5_worker_arguments
+    apply_a5_worker_arguments(args, worker, source="catlass_source", revision="catlass_revision")
     required = {
         "--guide": args.guide,
         "--cpl-skills-revision": args.cpl_skills_revision,

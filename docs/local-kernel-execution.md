@@ -25,6 +25,8 @@ requested profiler runs execute in local child processes. Local mode does not
 invoke cpl-remote, the remote registry, SSH, upload/download, or profile wrappers.
 It needs real Ascend hardware and the corresponding installed toolchain; this
 is not a CPU emulation mode. Preflight errors stop before model requests.
+Device initialization has a 120-second timeout, bounded by `max_seconds`;
+`preflight_timeout_seconds` can adjust it for a cold runtime.
 
 For A5 Catlass workflows, also set `catlass_source` to the absolute local source
 checkout and `catlass_revision` to its exact commit. The source, native build,

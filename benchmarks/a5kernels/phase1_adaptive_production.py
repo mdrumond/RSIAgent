@@ -90,18 +90,26 @@ class AdaptiveProductionPaths:
 
     @property
     def validation_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("validation_wrapper"):
+            return Path(self.worker_config["validation_wrapper"])
         return self.tla_root / "execution-profiles/catlass-validation.sh"
 
     @property
     def upload_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("upload_wrapper"):
+            return Path(self.worker_config["upload_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/upload.sh"
 
     @property
     def session_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("session_wrapper"):
+            return Path(self.worker_config["session_wrapper"])
         return self.tla_root / "execution-profiles/bz-a5/session.sh"
 
     @property
     def collection_wrapper(self) -> Path:
+        if self.worker_config and self.worker_config.get("collection_wrapper"):
+            return Path(self.worker_config["collection_wrapper"])
         return self.profiling_skill_root / "scripts/collect_profile.sh"
 
 

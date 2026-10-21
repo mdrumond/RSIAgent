@@ -162,3 +162,16 @@ def test_phase2_optimizer_selects_local_backend_without_wrapper_config(tmp_path,
     assert task._loop().backend is sentinel
     assert calls == ['preflight']
     assert task._device_lock().name.endswith('-0.lock')
+
+
+def test_local_preflight_uses_bounded_cold_runtime_timeout(tmp_path, monkeypatch):
+    import benchmarks.ascend.execution as execution
+    import subprocess
+    settings = dict(execution='local', workspace=str(tmp_path), physical_device=0,
+                    arch='test', max_seconds=45)
+    def timeout_probe(*args, **kwargs):
+        assert kwargs['timeout'] == 45
+        raise subprocess.TimeoutExpired(args[0], kwargs['timeout'])
+    monkeypatch.setattr(execution.subprocess, 'run', timeout_probe)
+    with pytest.raises(RuntimeError, match='exceeded 45 seconds'):
+        execution.preflight_local(settings)

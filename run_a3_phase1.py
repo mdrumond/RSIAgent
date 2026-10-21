@@ -145,6 +145,10 @@ def _worker_settings(args):
     path = getattr(args, "worker_config", None)
     settings = apply_worker_config({}, path) if path else None
     args.worker_settings = settings
+    if settings is not None and execution_mode(settings) == 'remote':
+        for name in ('profile', 'cpl_remote', 'remote_workspace', 'physical_device', 'validation_wrapper'):
+            if name in settings and hasattr(args, name):
+                setattr(args, name, Path(settings[name]) if name == 'validation_wrapper' else settings[name])
     if settings is not None and execution_mode(settings) == "local":
         args.profile = "local"
         args.physical_device = settings["physical_device"]
