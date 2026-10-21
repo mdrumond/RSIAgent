@@ -381,3 +381,15 @@ def test_archive_next_kind_matches_completed_history_including_pending_work(tmp_
         _verify_adaptive_state(c.root, state)
     c._atomic_json(c.root / "state.json", state)
     assert {"kind": "invalid-adaptive-memory-chain"} in inventory_campaign(c.root)["issues"]
+
+
+def test_target_driven_memory_assessed_in_parent_time_scope(tmp_path):
+    from types import SimpleNamespace
+    coordinator, _, _ = build(tmp_path, [])
+    calls = []
+    def assess(memory, prior, source):
+        assert coordinator.time.started is not None
+        calls.append(source)
+    coordinator.usefulness_verifier = SimpleNamespace(enabled=True, assess_memory=assess)
+    coordinator.run_attempt()
+    assert calls == ['attempt-001/' + coordinator.target.spec.project_id]

@@ -447,3 +447,17 @@ def test_committed_memory_assessment_replayed_after_interrupted_hook(tmp_path):
     assert len(calls) == 1
     assert len(assessments) == 1
     assert assessments[0][2] == calls[0][0]
+
+
+def test_usefulness_work_consumes_parent_optimizer_allocation(tmp_path):
+    from types import SimpleNamespace
+    build, _, _, _ = setup(tmp_path)
+    coordinator = build()
+    now = [0.0]
+    coordinator.time.clock = lambda: now[0]
+    def assess(*args, **kwargs):
+        assert coordinator.time.started is not None
+        now[0] += 4
+    coordinator.usefulness_verifier = SimpleNamespace(assess_lesson=assess)
+    coordinator.run_attempt()
+    assert coordinator.time.state['elapsed_seconds'] == 4
