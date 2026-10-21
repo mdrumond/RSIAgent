@@ -70,6 +70,10 @@ class AutomaticRemediation:
         coordinator.curriculum.failure_feedback = self.feedback
         coordinator.automatic_remediation = self
 
+    def wave_slots(self, state):
+        outcomes = self.runner._seed_context_state(state)["prior_outcomes"]
+        return max(self.runner.max_parallel, 1 if any(row["verified"] for row in outcomes) else 2)
+
     def save(self):
         atomic(self.path, canonical(self.state))
 

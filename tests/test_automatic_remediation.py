@@ -34,7 +34,7 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
         passed = request.spec.project_id != 'original' or len(executions) > 1
         return _result(request.spec, passed, 'host outcome')
     runner = AdaptivePhase1Coordinator(tmp_path / 'run', 'Repair failures.', b'{}',
-        CurriculumAgent(complete), execute, max_parallel=2, project_target=1)
+        CurriculumAgent(complete), execute, max_parallel=1, project_target=1)
     automatic = AutomaticRemediation(runner, target='a3')
     result = runner.run()
     original = next(r for r in automatic.store.records() if
