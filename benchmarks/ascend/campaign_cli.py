@@ -166,6 +166,16 @@ def build_controller(job):
             feedback = FailureCurriculum(job['root'], job['feedback_root'], json.loads(data))
             coordinator.failure_feedback = feedback
             coordinator.curriculum.failure_feedback = feedback
+        if job['phase'] == 1 and settings.get('automatic_remediation', False):
+            from .automatic_remediation import AutomaticRemediation, optimizer_retry_adapter
+            from optimizer.worker import load_config
+            automatic = AutomaticRemediation(coordinator, target=job['target'],
+                store=settings.get('feedback_root', job.get('feedback_root')),
+                sources=settings.get('feedback_sources', []),
+                seconds=settings.get('failure_active_seconds', 1800))
+            if settings.get('optimizer_worker_config'):
+                automatic.retry_external = optimizer_retry_adapter(coordinator, automatic.store,
+                    load_config(settings['optimizer_worker_config']))
         if job.get("optimizer_goal"):
             coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
         elif job.get("target_goal") is not None or job.get("autonomous_goal"):
@@ -822,8 +832,9 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    feedback = commands.add_parser('feedback-phase2', help='import retained Phase 2 observations without running agents')
+    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'], help='import retained Phase 2 observations without running agents')
     feedback.add_argument('--feedback-root', type=Path, required=True)
+    feedback.add_argument('--source-type', choices=('phase1', 'phase2', 'optimizer'), default='phase2')
     sources = feedback.add_mutually_exclusive_group(required=True)
     sources.add_argument('--source-root', type=Path, action='append')
     sources.add_argument('--dashboard-config', type=Path)
@@ -875,14 +886,16 @@ def main(argv=None, *, screen=start_screen):
         if command == "approve":
             sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
-    if args.command == 'feedback-phase2':
+    if args.command in {'feedback', 'feedback-phase2'}:
         from .phase2_feedback import FeedbackStore
         roots = args.source_root
         if args.dashboard_config:
             roots = [row['root'] for row in _read(args.dashboard_config).get('campaigns', [])
-                     if row.get('phase') in (2, '2')]
+                     if str(row.get('phase')) == ('1' if args.source_type == 'phase1' else '2')]
         store = FeedbackStore(args.feedback_root)
-        print(json.dumps({'reports': [store.import_campaign(root) for root in roots]}))
+        importer = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
+                    'optimizer': store.import_optimizer}[args.source_type]
+        print(json.dumps({'reports': [importer(root) for root in roots]}))
         return
     control = args.control.resolve()
     if args.command == "adopt":
