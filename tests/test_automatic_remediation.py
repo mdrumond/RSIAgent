@@ -40,6 +40,10 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
     from types import SimpleNamespace
     assessments = []
     def assess(memory, prior, source_id):
+        # The integrated coordinator also assesses ordinary remedial lessons;
+        # this regression checks the post-link original-retry assessment only.
+        if not source_id.startswith('original-retries/'):
+            return
         linked = next(row for row in automatic.store.records() if
             row['outcome']['attempt_id'] == 'original' and row['outcome']['source_root'] == str(runner.root.resolve()))
         assert linked['lifecycle'] == 'fixed'
