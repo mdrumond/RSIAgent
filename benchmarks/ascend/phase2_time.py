@@ -22,6 +22,7 @@ class Phase2TimeBudget:
         self.practice = seconds(practice) if practice is not None else None
         self.clock, self.started = clock, None
         self.active_practice = False
+        self.practice_started = None
         self.identity = dict(max_seconds=maximum, max_practice_seconds=practice)
         self.state = dict(identity=self.identity, elapsed_seconds=0, practice_seconds=0)
         if self.path.exists():
@@ -57,12 +58,31 @@ class Phase2TimeBudget:
 
     @property
     def practice_remaining(self):
-        running = max(0, self.clock() - self.started) if self.started is not None and self.active_practice else 0
+        anchor = self.practice_started if self.practice_started is not None else self.started
+        running = max(0, self.clock() - anchor) if anchor is not None and self.active_practice else 0
         return max(0, self.practice - self.state['practice_seconds'] - running)
 
     def reset_practice(self):
         self.state['practice_seconds'] = 0
         self.save()
+
+    @contextmanager
+    def practice_work(self):
+        """Charge practice selection and qualification inside a total-time scope."""
+        if self.started is None or self.active_practice:
+            raise RuntimeError('practice selection requires an active campaign operation')
+        self.practice_started = self.clock()
+        self.active_practice = True
+        self.state['inflight_practice'] = True
+        self.save()
+        try:
+            yield
+        finally:
+            self.state['practice_seconds'] += max(0, self.clock() - self.practice_started)
+            self.practice_started = None
+            self.active_practice = False
+            self.state['inflight_practice'] = False
+            self.save()
 
     @contextmanager
     def active(self, *, practice=False):

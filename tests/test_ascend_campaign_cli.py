@@ -1114,12 +1114,15 @@ def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_pa
     source = dict(target="native", arch="arch", execution_profile="bz-a3-1", guide_sha256="a" * 64,
                   cpl_skills_revision="b" * 40, environment_identity={}, model=model.as_dict(),
                   profiling_mode="without-profiling-guidance")
+    source["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": 900}
     reviewed = snapshot()
     reviewed.destination = SimpleNamespace(source_identity=source)
     monkeypatch.setattr(cli, "_snapshot", lambda *args: reviewed)
     native = SimpleNamespace(**{k: v for k, v in source.items() if k != "model"}, collection=None)
     monkeypatch.setattr(phase1_cli, "main", lambda argv, **kw: kw["native_builder"](
         config=native, profile=SimpleNamespace(identity=model)))
+    write(root / "campaign-identity.json", {key: value for key, value in source.items()
+                                             if key != "runtime_budget"})
     def execute(request):
         return None
     execute.executor = SimpleNamespace(runtime_identity=RUNTIME)
