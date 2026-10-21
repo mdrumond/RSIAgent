@@ -56,6 +56,7 @@ def test_target_first_failure_practice_learning_and_unchanged_retry(tmp_path):
         [wire("PRACTICE", practice(c)), wire("RETRY_TARGET"), wire("READY")][len(contexts)-1]))
     assert c.run()["status"] == "READY"
     assert [r.spec.project_id for r in requests] == [c.target.spec.project_id, "practice-tail", c.target.spec.project_id]
+    assert [r.remaining_seconds for r in requests] == [100, 2, 98]
     assert contexts[0]["latest_target_attempt"]["verified"] is False
     assert len(json.loads(requests[-1].pre_wave_memory)["project_memory_base64"]) == 1
     assert c.resume()["target_attempts"] == 2
