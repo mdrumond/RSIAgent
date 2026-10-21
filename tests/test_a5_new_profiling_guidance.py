@@ -96,51 +96,41 @@ def production_request_bytes(value):
     return canonical_bytes(value)
 
 
-def test_project_cap_stops_before_next_selection_and_survives_resume(tmp_path):
-    calls = []
-
+def test_time_allocation_stops_before_next_selection_and_survives_resume(tmp_path):
+    calls, now = [], [0.0]
     def complete(messages):
         calls.append(messages)
         return _wave(messages[-1]["content"], [_project("only", "gm-ub-movement")])
-
-    coordinator = AdaptivePhase1Coordinator(
-        tmp_path, "Learn.", b"", CurriculumAgent(complete),
-        lambda request: _result(request.spec, True, "verified"),
-        max_parallel=1, max_projects=1,
-    )
+    def execute(request):
+        assert request.remaining_seconds == 5
+        now[0] += 5
+        return _result(request.spec, True, "verified")
+    coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn.", b"", CurriculumAgent(complete),
+        execute, max_parallel=1, max_seconds=5, clock=lambda: now[0])
     report = coordinator.run()
-    assert report["status"] == "PROJECT_LIMIT_REACHED"
+    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
+    assert report["elapsed_seconds"] == 5 and report["remaining_seconds"] == 0
     assert report["published_projects"] == ["only"]
     assert len(calls) == 1
     before = (tmp_path / "state.json").read_bytes()
     assert coordinator.resume() == report
     assert (tmp_path / "state.json").read_bytes() == before
-    with pytest.raises(ValueError, match="project limit"):
+    with pytest.raises(ValueError, match="time allocation"):
         AdaptivePhase1Coordinator(tmp_path, "Learn.", b"", CurriculumAgent(complete),
-                                  lambda _: None, max_parallel=1, max_projects=2).resume()
+                                  lambda _: None, max_parallel=1, max_seconds=6).resume()
 
 
-def test_over_budget_wave_is_corrected_before_any_execution(tmp_path):
-    calls = []
-
+def test_slow_selection_cannot_admit_execution_after_deadline(tmp_path):
+    now, executed = [0.0], []
     def complete(messages):
-        calls.append(messages)
-        original = messages[1]["content"]
-        if len(calls) == 1:
-            return _wave(original, [_project("one", "gm-ub-movement"), _project("two", "simd-vector")])
-        assert "remaining project budget" in messages[-1]["content"]
-        return _wave(original, [_project("one", "gm-ub-movement")])
-
-    executed = []
-
-    def execute(request):
-        executed.append(request.spec.project_id)
-        return _result(request.spec, True, "verified")
-
+        now[0] += 6
+        return _wave(messages[-1]["content"], [_project("one", "gm-ub-movement")])
     report = AdaptivePhase1Coordinator(tmp_path, "Learn.", b"", CurriculumAgent(complete),
-                                     execute, max_parallel=1, max_projects=1).run()
-    assert report["status"] == "PROJECT_LIMIT_REACHED"
-    assert executed == ["one"]
+        lambda request: executed.append(request), max_parallel=1,
+        max_seconds=5, clock=lambda: now[0]).run()
+    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
+    assert report["elapsed_seconds"] == 6
+    assert executed == []
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")

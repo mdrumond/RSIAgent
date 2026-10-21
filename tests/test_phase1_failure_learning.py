@@ -272,24 +272,25 @@ def test_64_project_feedback_is_durable_but_wire_detail_is_bounded(tmp_path):
 
 
 @pytest.mark.parametrize("typed_failure", [False, True])
-def test_one_project_smoke_cap_stops_after_semantic_failure_and_survives_resume(tmp_path, typed_failure):
-    calls, selections = [], []
+def test_time_allocation_stops_after_semantic_failure_and_survives_resume(tmp_path, typed_failure):
+    calls, selections, now = [], [], [0.0]
     def select(messages):
         selections.append(messages)
         return _wave(messages[-1]["content"], [project(f"failure-{len(selections)}", 32)])
     def execute(request):
         calls.append(request.spec.project_id)
+        now[0] += 5
         if typed_failure:
             raise SemanticProjectFailure("Actor budget exhausted", {"iterations": 40})
         return _result(request.spec, False, "host mismatch")
     def make():
         return AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
-            execute, max_parallel=1, project_target=64, max_projects=1)
+            execute, max_parallel=1, project_target=64, max_seconds=5, clock=lambda: now[0])
     report = make().run()
-    assert report["status"] == "PROJECT_LIMIT_REACHED"
+    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
     assert report["completed_attempts"] == report["failed_projects"] == 1
     assert report["successful_projects"] == 0
-    assert "saturation was not evaluated" in report["reason"]
+    assert report["elapsed_seconds"] == 5
     before = (tmp_path / "state.json").read_bytes()
     assert make().resume() == report
     assert calls == ["failure-1"]
@@ -297,8 +298,8 @@ def test_one_project_smoke_cap_stops_after_semantic_failure_and_survives_resume(
     assert (tmp_path / "state.json").read_bytes() == before
 
 
-def test_smoke_cap_counts_verified_and_failed_projects_and_bounds_next_selection(tmp_path):
-    contexts, calls = [], []
+def test_time_allocation_counts_failures_without_capping_workload(tmp_path):
+    contexts, calls, now = [], [], [0.0]
     def select(messages):
         prompt = messages[-1]["content"]
         context = json.loads(prompt.rsplit("\n", 1)[-1])
@@ -307,16 +308,17 @@ def test_smoke_cap_counts_verified_and_failed_projects_and_bounds_next_selection
                      if len(contexts) == 1 else [project("next-verified", 16)])
     def execute(request):
         calls.append(request.spec.project_id)
+        now[0] += 1
         if request.spec.project_id == "failure":
             raise SemanticProjectFailure("Actor research budget exhausted", {})
         return verified(request)
     controller = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
-        execute, max_parallel=2, project_target=64, max_projects=3)
+        execute, max_parallel=2, project_target=64, max_seconds=3, max_projects=1, clock=lambda: now[0])
     report = controller.run()
-    assert report["status"] == "PROJECT_LIMIT_REACHED"
+    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
     assert report["completed_attempts"] == 3
     assert report["successful_projects"] == 2
     assert report["failed_projects"] == 1
-    assert contexts[0]["remaining_projects"] == 3
-    assert contexts[1]["remaining_projects"] == contexts[1]["max_wave_projects"] == 1
+    assert contexts[0]["remaining_projects"] == 64
+    assert contexts[1]["remaining_projects"] == 63
     assert len(calls) == 3

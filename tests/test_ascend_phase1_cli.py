@@ -85,7 +85,7 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
     main(["--target", "a3", "run", "--root", str(root), "--objective", "Learn native copy profiling",
           "--initial-memory", str(memory), "--config", str(config_path), "--model", "openai/gpt-5.6-sol",
           "--knowledge", "without-kdb", "--profiling", "without-profiling-guidance",
-          "--project-target", "1", "--max-projects", "1"],
+          "--project-target", "1", "--max-seconds", "300"],
          transport_factory=Transport, provider_transport=provider, measurement_factory=Measurements,
          environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
     assert "profile" in events
@@ -99,7 +99,9 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
                     if path.read_bytes().startswith(b'{')]
         assert {hashlib.sha256(value.encode()).hexdigest() for value in (source, source + " // variant")} <= {
             row.get("candidate_sha256") for row in payloads}
-    assert json.loads((root / "campaign-identity.json").read_text())["language"] == "ascend-c"
+    identity = json.loads((root / "campaign-identity.json").read_text())
+    assert identity["language"] == "ascend-c"
+    assert identity["runtime_budget"] == {"policy": "elapsed-time-v1", "max_seconds": 300}
     assert "discovered-a3" in (root / "campaign-identity.json").read_text()
     assert "CATLASS" not in capsys.readouterr().out
 

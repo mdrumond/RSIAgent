@@ -7,6 +7,8 @@ from copy import copy
 from dataclasses import dataclass
 import hashlib
 import json
+import math
+import time
 import os
 from pathlib import Path
 from typing import Callable, Mapping
@@ -90,6 +92,7 @@ class AdaptiveProjectRequest:
     inputs: tuple[HostTensor, ...]
     oracle: ReferenceOutput
     memory_root: Path | None = None
+    remaining_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,8 @@ class AdaptivePhase1Coordinator:
         max_parallel: int,
         project_target: int | None = None,
         max_projects: int | None = None,
+        max_seconds: float = 7200,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("objective must be non-empty")
@@ -154,7 +159,10 @@ class AdaptivePhase1Coordinator:
         self.max_parallel = max_parallel
         if max_projects is not None and (type(max_projects) is not int or max_projects < 1):
             raise ValueError("max_projects must be a positive integer or None")
-        self.max_projects = max_projects
+        self.max_projects = max_projects  # Legacy metadata; never an execution limit.
+        if isinstance(max_seconds, bool) or not math.isfinite(max_seconds) or max_seconds <= 0:
+            raise ValueError("max_seconds must be positive and finite")
+        self.max_seconds, self.clock = max_seconds, clock
         self.failure_feedback = None
 
     @staticmethod
@@ -166,6 +174,51 @@ class AdaptivePhase1Coordinator:
         return self._run()
 
     def _run(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
+        state = self._load_state()
+        pending = self._load_pending(state)
+        if pending is not None and len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects) > self.project_target:
+            raise ValueError("retained wave exceeds configured project target")
+        if state.get("project_target", self.project_target) != self.project_target:
+            raise ValueError("use continue_campaign to change the retained project target")
+        if state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target:
+            return self._report(state)
+        return self._with_allocation(lambda: self._run_allocated(wave_limit=wave_limit, approved_only=approved_only))
+
+    def _with_allocation(self, operation):
+        state = self._load_state()
+        started = self.clock()
+        self._deadline = started + max(0, self.max_seconds - state["elapsed_seconds"])
+        # An unobserved interruption reserves the whole remaining allocation.
+        state["allocation_active"] = True
+        self._atomic_json(self.root / "state.json", state)
+        try:
+            result = operation()
+        finally:
+            # Reload after publication; exceptions retain the exact pending wave.
+            current = self._read_json(self.root / "state.json")
+            current["elapsed_seconds"] += max(0, self.clock() - started)
+            current["allocation_active"] = False
+            self._atomic_json(self.root / "state.json", current)
+            self._deadline = None
+        result["elapsed_seconds"] = current["elapsed_seconds"]
+        result["remaining_seconds"] = max(0, self.max_seconds-current["elapsed_seconds"])
+        return result
+
+    def _remaining_seconds(self):
+        deadline = getattr(self, "_deadline", None)
+        if deadline is None:
+            return self.max_seconds
+        return max(0, deadline - self.clock())
+
+    def _time_exhausted(self, state):
+        if self._remaining_seconds() > 0:
+            return False
+        state["terminal"] = {"status": "TIME_BUDGET_EXHAUSTED",
+                             "reason": "Campaign elapsed-time allocation exhausted."}
+        self._atomic_json(self.root / "state.json", state)
+        return True
+
+    def _run_allocated(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
         if self.failure_feedback is not None:
             self.failure_feedback.record(state.get('failure_investigations', []), state)
@@ -185,26 +238,16 @@ class AdaptivePhase1Coordinator:
                 return self._report(state)
             if len(state["prior_outcomes"]) >= self.project_target:
                 return self._report(state)
+            if self._time_exhausted(state):
+                return self._report(state)
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
-            completed = self._completed_attempts(state)
             if pending is None:
                 if approved_only:
                     raise ValueError("no approved wave is pending")
-                if self.max_projects is not None and completed >= self.max_projects:
-                    state = {**state, "terminal": {
-                        "status": "PROJECT_LIMIT_REACHED",
-                        "reason": f"Completed attempt limit {self.max_projects} reached; saturation was not evaluated.",
-                    }}
-                    self._atomic_json(self.root / "state.json", state)
-                    return self._report(state)
                 decision, session = self.curriculum.select(
                     self._context(state, snapshot), self._session(state),
-                    remaining_projects=min(
-                        self.project_target - len(state["prior_outcomes"]),
-                        self.max_projects - completed if self.max_projects is not None
-                        else self.project_target,
-                    ),
+                    remaining_projects=self.project_target - len(state["prior_outcomes"]),
                 )
                 if isinstance(decision, TerminalDecision):
                     state = {
@@ -222,10 +265,8 @@ class AdaptivePhase1Coordinator:
                         self.failure_feedback.record(decision.failure_investigations, state)
                     return self._report(state)
                 assert isinstance(decision, WaveDecision)
-                if self.max_projects is not None and (
-                    completed + len(decision.wave.projects) > self.max_projects
-                ):
-                    raise ValueError("selected wave exceeds remaining project limit; select a smaller wave")
+                if self._time_exhausted(state):
+                    return self._report(state)
                 pending = {
                     "schema": PENDING_SCHEMA,
                     "base_wave_index": state["wave_index"],
@@ -239,8 +280,8 @@ class AdaptivePhase1Coordinator:
             wave = WaveSpec.from_mapping(pending["wave"])
             if self.failure_feedback is not None:
                 self.failure_feedback.record(pending.get('failure_investigations', []), state)
-            if self.max_projects is not None and completed + len(wave.projects) > self.max_projects:
-                raise ValueError("retained wave exceeds configured project limit")
+            if self._time_exhausted(state):
+                return self._report(state)
             coordinator = LiveWaveCoordinator(
                 self.root / "waves" / wave.wave_id,
                 wave,
@@ -264,21 +305,24 @@ class AdaptivePhase1Coordinator:
                 return self._report(state)
 
     def propose_wave(self):
+        """Charge curriculum selection to the campaign allocation."""
+        return self._with_allocation(self._propose_wave)
+
+    def _propose_wave(self):
         """Select a wave without admitting it for execution."""
         state = self._load_state()
         if self._load_pending(state) is not None:
             raise ValueError("a pending wave already exists")
         if state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target:
             raise ValueError("campaign cannot accept another proposal")
+        if self._time_exhausted(state):
+            return {"terminal": state["terminal"], "session": state["session"],
+                    "base_wave_index": state["wave_index"],
+                    "base_memory_sha256": hashlib.sha256(self._memory_snapshot(state)).hexdigest()}
         snapshot = self._memory_snapshot(state)
-        completed = self._completed_attempts(state)
         decision, session = self.curriculum.select(
             self._context(state, snapshot), self._session(state),
-            remaining_projects=min(
-                self.project_target - len(state["prior_outcomes"]),
-                self.max_projects - completed if self.max_projects is not None
-                else self.project_target,
-            ),
+            remaining_projects=self.project_target - len(state["prior_outcomes"]),
         )
         if isinstance(decision, TerminalDecision):
             return {"terminal": {"status": decision.status, "reason": decision.reason},
@@ -451,6 +495,7 @@ class AdaptivePhase1Coordinator:
             request.branch_root,
             request.inputs,
             request.oracle,
+            remaining_seconds=self._remaining_seconds(),
         ))
         if not isinstance(result, AdaptiveProjectResult):
             raise TypeError("project adapter must return AdaptiveProjectResult")
@@ -522,8 +567,6 @@ class AdaptivePhase1Coordinator:
 
     def _context(self, state, snapshot):
         remaining = max(0, self.project_target - len(state["prior_outcomes"]))
-        if self.max_projects is not None:
-            remaining = min(remaining, max(0, self.max_projects - self._completed_attempts(state)))
         return CurriculumContext(
             self.objective,
             state["wave_index"],
@@ -570,6 +613,8 @@ class AdaptivePhase1Coordinator:
                 "session": self._session_dict(CurriculumSession()),
                 "completed_waves": [],
                 "terminal": None,
+                "max_seconds": self.max_seconds,
+                "elapsed_seconds": 0.0,
             }
             if self.max_projects is not None:
                 state["max_projects"] = self.max_projects
@@ -577,6 +622,17 @@ class AdaptivePhase1Coordinator:
             return state
         state = self._read_json(path)
         self._validate_state(state)
+        if "elapsed_seconds" not in state:
+            raise ValueError("legacy campaign has no elapsed-time accounting; start a new campaign")
+        if state.get("max_seconds") != self.max_seconds:
+            raise ValueError("adaptive state time allocation does not match")
+        if state.get("allocation_active") and getattr(self, "_deadline", None) is None:
+            # No reliable final observation exists after process disappearance.
+            # Keep pending work, but never silently refund its reserved time.
+            state["elapsed_seconds"] = max(self.max_seconds, state["elapsed_seconds"])
+            state["allocation_active"] = False
+            state["allocation_interrupted"] = True
+            self._atomic_json(path, state)
         return state
 
     def _validate_state(self, state) -> None:
@@ -584,8 +640,9 @@ class AdaptivePhase1Coordinator:
             raise ValueError("adaptive state does not match objective")
         if state.get("initial_memory_sha256") != hashlib.sha256(self.initial_memory).hexdigest():
             raise ValueError("adaptive state initial memory does not match")
-        if hasattr(self, "max_projects") and state.get("max_projects") != self.max_projects:
-            raise ValueError("adaptive state project limit does not match")
+        elapsed = state.get("elapsed_seconds", 0)
+        if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)) or not math.isfinite(elapsed) or elapsed < 0:
+            raise ValueError("adaptive state elapsed time is invalid")
 
     def _load_pending(self, state):
         path = self.root / "pending.json"
@@ -630,6 +687,9 @@ class AdaptivePhase1Coordinator:
                 else terminal["status"]
             ),
             "reason": None if terminal is None else terminal["reason"],
+            "max_seconds": state.get("max_seconds"),
+            "elapsed_seconds": state.get("elapsed_seconds"),
+            "remaining_seconds": max(0, state["max_seconds"]-state["elapsed_seconds"]) if "elapsed_seconds" in state else None,
             "wave_index": state["wave_index"],
             "project_target": self.project_target,
             "successful_projects": len(state["prior_outcomes"]),
