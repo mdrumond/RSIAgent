@@ -38,10 +38,10 @@ def terminal_outcome(digest="a" * 64):
     }
 
 
-def trial_protocol_sha256(openai_turns=24, *, candidate_contract=True):
+def trial_protocol_sha256(openai_seconds=3600, *, candidate_contract=True):
     from coding.pi import ENGINE_IDENTITY
     return canonical_digest({
-        "schema": "a3-trial-protocol-v6" if candidate_contract else "a3-trial-protocol-v4",
+        "schema": "a3-trial-protocol-v7" if candidate_contract else "a3-trial-protocol-v4",
         **(ENGINE_IDENTITY if candidate_contract else {}),
         **(
             {"candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict()}
@@ -61,24 +61,13 @@ def trial_protocol_sha256(openai_turns=24, *, candidate_contract=True):
         "verification_feedback_schema": "a3-verification-mismatch-v1",
         "candidate_validation_exception": "rewrite-required",
         "recovery_starter_ambiguous_outcome": "infrastructure-unverified",
-        "attempt_completion": {
-            "schema": "a3-attempt-completion-v1",
-            "source_frozen": True,
-            "allowed_operations": ["compile", "run", "profile", "submit"],
-            "call_limits": {
-                ProfilingGuidance.WITHOUT_GUIDANCE.value: 3,
-                ProfilingGuidance.WITH_GUIDANCE.value: 4,
-            },
-            "token_ceiling": "absolute",
-            "rewrite_required": "terminate",
-            "rewrite_terminal_status": "attempt-rewrite-required",
-        },
+        "budget_policy": "elapsed-time-v1",
         "model_budgets": {
             BackendModel.GPT_5_6_SOL.value: {
-                "max_turns": openai_turns, "max_tokens": 32768,
+                "max_seconds": openai_seconds,
             },
             BackendModel.DEEPSEEK_FLASH.value: {
-                "max_turns": 24, "max_tokens": 65536,
+                "max_seconds": 3600,
             },
         },
     })
@@ -323,7 +312,7 @@ def test_resume_rejects_terminal_from_stale_research_identity(tmp_path, field):
         wave.resume()
 
 
-def test_full_resume_rejects_retained_twelve_turn_trial_protocol(tmp_path):
+def test_full_resume_rejects_changed_trial_time_allocation(tmp_path):
     cfg = config(tmp_path)
     wave = Phase1Wave(cfg, lambda *_: terminal_outcome())
     wave.run()
