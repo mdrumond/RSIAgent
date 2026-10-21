@@ -34,7 +34,7 @@ class OptimizerTaskExecutor:
             memory_snapshot, name=task['task_id'], init_args=spec.get('init_args'),
             init_kwargs=spec.get('init_kwargs'),
             idempotency_key='phase2-task:' + str(self.directory.resolve()),
-            max_attempts=1, max_seconds=config.get('phase2_attempt_seconds', 7200))
+            max_seconds=config.get('phase2_attempt_seconds', 7200))
         self.job_id = job['job_id']
         self.job_directory = self.store.root / self.job_id
         identity = {'task': task, 'runtime': {key: config.get(key) for key in (
@@ -48,6 +48,12 @@ class OptimizerTaskExecutor:
         if previous is None:
             self.store.add_event(self.job_id, 'phase2-task', identity)
         self._agent, self._backend = agent, backend
+        self.deadline = None
+
+    def set_remaining_seconds(self, remaining_seconds):
+        if remaining_seconds <= 0:
+            raise WorkerStopped('Phase 2 elapsed-time budget exhausted')
+        self.deadline = time.monotonic() + remaining_seconds
 
     def _event(self, kind):
         return next((event['payload'] for event in reversed(self.store.events(self.job_id))
@@ -68,6 +74,11 @@ class OptimizerTaskExecutor:
     def _loop(self):
         config = self.config
         backend = self._backend or RemoteBackend(self.store, self.job_id, config)
+        if self.deadline is not None:
+            backend.deadline = min(getattr(backend, "deadline", self.deadline), self.deadline)
+            transport = getattr(backend, "transport", None)
+            if transport is not None:
+                transport.deadline = min(getattr(transport, "deadline", self.deadline), self.deadline)
         agent = self._agent
         if agent is None:
             if config.get('env_file'):
@@ -141,13 +152,11 @@ class OptimizerTaskExecutor:
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'} and 'pending' not in self._state():
                     evaluated = [item for item in self._state().get('history', []) if 'result' in item and 'candidate_sha256' in item]
                     if len(evaluated) <= sum(item.get('result') is not None for item in results):
-                        self.store.resume(self.job_id, additional_attempts=1,
-                            additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                        self.store.resume(self.job_id, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
             else:
                 row = self.store.get(self.job_id)
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'}:
-                    self.store.resume(self.job_id, additional_attempts=1,
-                        additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                    self.store.resume(self.job_id, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
                 for record, value in ((request['memory_snapshot'], memory_snapshot),
                                       (request['feedback'], feedback)):
                     if record is not None:

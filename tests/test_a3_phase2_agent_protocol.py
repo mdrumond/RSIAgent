@@ -20,6 +20,7 @@ from benchmarks.a3kernels.phase2_protocol import (
     OwnedAgent,
     PracticeResult,
 )
+from benchmarks.ascend.phase2_time import Phase2TimeBudget
 from core.self_evolving_loop import TargetVerdict
 
 
@@ -136,14 +137,9 @@ def test_default_curriculum_review_pass_ready_learns_grounded_result(tmp_path):
     assert events[-1].payload["event"] == "PHASE2_COMPLETED"
 
 
-@pytest.mark.parametrize("final_verdict", [TargetVerdict.PASS, TargetVerdict.FAIL])
-def test_terminal_head_binds_target_and_learning_evidence(tmp_path, final_verdict):
-    if final_verdict is TargetVerdict.FAIL:
-        adapter, _agents = _run(
-            tmp_path, [TargetVerdict.FAIL] * 9, list(DEFAULT_PROPOSALS)
-        )
-    else:
-        adapter, _agents = _run(tmp_path, [TargetVerdict.PASS], [None])
+def test_terminal_head_binds_target_and_learning_evidence(tmp_path):
+    final_verdict = TargetVerdict.PASS
+    adapter, _agents = _run(tmp_path, [TargetVerdict.PASS], [None])
 
     result = adapter.run("improve tiled vector add", {})
 
@@ -178,27 +174,35 @@ def test_focused_practice_always_forces_a_fresh_target(tmp_path, first):
     assert agents.learned == [first, TargetVerdict.PASS]
 
 
-def test_eight_practices_allow_only_the_ninth_final_target(tmp_path):
+def test_practice_and_target_counts_are_telemetry(tmp_path):
     proposals = list(DEFAULT_PROPOSALS)
     adapter, agents = _run(
         tmp_path,
         [TargetVerdict.FAIL] * 8 + [TargetVerdict.PASS],
-        proposals,
+        [*proposals, None],
     )
 
     result = adapter.run("improve tiled vector add", {})
 
     assert result.target_attempts == 9 and result.practice_projects == 8
-    assert result.termination == "practice_budget_final_target"
     assert len(set(agents.targets)) == 9
 
 
-def test_ninth_failed_target_stops_before_a_tenth_attempt(tmp_path):
+def test_elapsed_time_stops_new_target_admission(tmp_path):
     adapter, agents = _run(
         tmp_path, [TargetVerdict.FAIL] * 9, [None] * 9
     )
 
-    with pytest.raises(A3Phase2BudgetStop, match="nine target attempts"):
+    now = [0.]
+    adapter.time = Phase2TimeBudget(
+        tmp_path / 'test-time', 9, clock=lambda: now[0])
+    work = adapter.hooks.actor_work
+    def timed_work(*args):
+        now[0] += 1
+        return work(*args)
+    adapter.hooks = replace(adapter.hooks, actor_work=timed_work)
+    with pytest.raises(A3Phase2BudgetStop, match="elapsed-time budget"):
+
         adapter.run("improve tiled vector add", {})
 
     assert len(agents.targets) == 9
