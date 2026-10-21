@@ -266,6 +266,8 @@ class AdaptivePhase1Coordinator:
                     self._context(state, snapshot), self._session(state),
                     remaining_projects=self.project_target - len(state["prior_outcomes"]),
                 )
+                if self._time_exhausted(state):
+                    return self._report(state)
                 if isinstance(decision, TerminalDecision):
                     state = {
                         **state,
@@ -341,6 +343,10 @@ class AdaptivePhase1Coordinator:
             self._context(state, snapshot), self._session(state),
             remaining_projects=self.project_target - len(state["prior_outcomes"]),
         )
+        if self._time_exhausted(state):
+            return {"terminal": state["terminal"], "session": self._session_dict(session),
+                    "base_wave_index": state["wave_index"],
+                    "base_memory_sha256": hashlib.sha256(snapshot).hexdigest()}
         if isinstance(decision, TerminalDecision):
             return {"terminal": {"status": decision.status, "reason": decision.reason},
                     "base_wave_index": state["wave_index"],
