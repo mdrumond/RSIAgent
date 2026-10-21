@@ -165,12 +165,21 @@ def build_usefulness_verifier(*, root, provider, profile, curriculum, project_ac
     from copy import copy
     curriculum = copy(curriculum)
     curriculum.failure_feedback = None
+    def allowance():
+        available = verifier.remaining_seconds() if verifier.remaining_seconds else pair_seconds
+        if available <= 0:
+            raise TimeoutError('Memory usefulness parent allowance exhausted')
+        return available
+    def complete(messages):
+        return provider.complete(profile, messages, max_seconds=allowance()).text
+    curriculum._complete = complete
     def verify(stage, evidence):
-        return provider.complete(profile, (
+        return complete((
             {'role': 'system', 'content': 'You are the memory usefulness verifier. Inspect retained '
              'host evidence and explain applicability and uncertainty. Host verification is authoritative. '
              'Record usefulness only; never reject memory or claim both arms succeeding proves uselessness.'},
             {'role': 'user', 'content': json.dumps({'stage': stage, **evidence}, sort_keys=True)},
-        )).text
-    return UsefulnessVerifier(Path(root) / 'memory-usefulness', curriculum,
+        ))
+    verifier = UsefulnessVerifier(Path(root) / 'memory-usefulness', curriculum,
         project_actor, verify, enabled=enabled, pair_seconds=pair_seconds, memory_root=Path(root), remaining_seconds=remaining_seconds)
+    return verifier

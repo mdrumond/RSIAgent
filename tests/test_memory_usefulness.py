@@ -123,3 +123,27 @@ def test_expired_parent_makes_no_model_or_actor_calls(tmp_path):
     verifier = UsefulnessVerifier(tmp_path, None, unexpected, unexpected,
         enabled=True, remaining_seconds=lambda: 0)
     assert verifier.assess_lesson({'claim': 'new'}, b'{}', 'source')['outcome'] == 'inconclusive'
+
+
+def test_factory_requests_follow_current_rebound_parent_allowance(tmp_path):
+    from benchmarks.ascend.memory_usefulness import build_usefulness_verifier
+    requests = []
+    class Provider:
+        def complete(self, profile, messages, *, max_seconds=None):
+            requests.append(max_seconds)
+            return SimpleNamespace(text='response')
+    verifier = build_usefulness_verifier(root=tmp_path, provider=Provider(), profile=object(),
+        curriculum=CurriculumAgent(lambda _: pytest.fail('use bounded provider binding')),
+        project_actor=None, enabled=True, remaining_seconds=lambda: 2)
+    verifier.verify('inspect', {})
+    verifier.curriculum._complete([])
+    verifier.remaining_seconds = lambda: 5
+    verifier.verify('interpret', {})
+    verifier.curriculum._complete([])
+    assert requests == [2, 2, 5, 5]
+    verifier.remaining_seconds = lambda: 0
+    with pytest.raises(TimeoutError):
+        verifier.verify('inspect', {})
+    with pytest.raises(TimeoutError):
+        verifier.curriculum._complete([])
+    assert len(requests) == 4
