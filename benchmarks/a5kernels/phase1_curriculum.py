@@ -346,7 +346,12 @@ class WaveSpec:
         available = set(self.pre_wave_coverage)
         for project in self.projects:
             if not set(project.requires) <= available:
-                raise ValueError("project dependencies must exist in pre-wave coverage")
+                raise ValueError(
+                    f"project {project.spec.project_id}: unsupported requires "
+                    f"{sorted(item.value for item in set(project.requires) - available)}; "
+                    f"allowed pre-wave coverage prerequisites: {sorted(item.value for item in available)}. "
+                    "requires lists prior prerequisites, not study operations; [] is valid."
+                )
 
     @property
     def semantic_width(self) -> int:
