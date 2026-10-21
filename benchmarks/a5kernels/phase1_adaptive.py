@@ -178,13 +178,18 @@ class AdaptivePhase1Coordinator:
 
     def _run(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
-        self._assess_committed_memory(state)
         pending = self._load_pending(state)
         if pending is not None and len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects) > self.project_target:
             raise ValueError("retained wave exceeds configured project target")
         if state.get("project_target", self.project_target) != self.project_target:
             raise ValueError("use continue_campaign to change the retained project target")
         if state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target:
+            verifier = getattr(self, 'usefulness_verifier', None)
+            if verifier is not None and verifier.enabled:
+                def reconcile():
+                    self._assess_committed_memory(state)
+                    return self._report(state)
+                return self._with_allocation(reconcile)
             return self._report(state)
         return self._with_allocation(lambda: self._run_allocated(wave_limit=wave_limit, approved_only=approved_only))
 
@@ -239,6 +244,7 @@ class AdaptivePhase1Coordinator:
 
     def _run_allocated(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
+        self._assess_committed_memory(state)
         if self.failure_feedback is not None:
             self.failure_feedback.record(state.get('failure_investigations', []), state)
         pending = self._load_pending(state)

@@ -4,6 +4,8 @@ Host verdicts determine outcomes. AI interpretation cannot admit a candidate,
 change retrieval, or promote learning from either experiment arm.
 """
 from dataclasses import asdict
+from copy import copy
+import time
 import fcntl
 import hashlib
 import json
@@ -30,13 +32,14 @@ def paired_outcome(control, treatment):
 
 class UsefulnessVerifier:
     def __init__(self, root, curriculum, execute_project, verify, *, enabled=False,
-                 pair_seconds=600, memory_root=None):
+                 pair_seconds=600, memory_root=None, remaining_seconds=None, clock=time.monotonic):
         if pair_seconds <= 0:
             raise ValueError('pair allowance must be positive')
         self.root, self.curriculum = Path(root), curriculum
         self.execute_project, self.verify = execute_project, verify
         self.enabled, self.pair_seconds = enabled, pair_seconds
         self.memory_root = memory_root
+        self.remaining_seconds, self.clock = remaining_seconds, clock
 
     def _append(self, directory, kind, **body):
         events = list(directory.glob('[0-9]*.json'))
@@ -80,7 +83,18 @@ class UsefulnessVerifier:
                          lesson_id=lesson_id, source_id=source_id, lesson=lesson,
                          prior_memory_sha256=hashlib.sha256(prior_memory).hexdigest(),
                          pair_seconds=self.pair_seconds, arm_seconds=self.pair_seconds / 2)
+            deadline = self.clock() + self.pair_seconds
+            arms = {}
+            def remaining():
+                available = max(0, deadline - self.clock())
+                return min(available, self.remaining_seconds()) if self.remaining_seconds else available
+            def require_time():
+                available = remaining()
+                if available <= 0:
+                    raise TimeoutError('Memory usefulness active-time allowance exhausted')
+                return available
             try:
+                require_time()
                 inspection = self.verify('inspect', {'lesson': lesson, 'host_facts': host_facts})
                 context = CurriculumContext(
                     objective=('Create exactly ONE SMALL project that should benefit from this lesson. '
@@ -89,7 +103,15 @@ class UsefulnessVerifier:
                         'Freeze normal host acceptance criteria. Lesson: ' + json.dumps(lesson)),
                     wave_index=1, pre_wave_memory_sha256=hashlib.sha256(prior_memory).hexdigest(),
                     pre_wave_coverage=(), prior_outcomes=(), remaining_projects=1)
-                decision, _ = self.curriculum.select(context, remaining_projects=1)
+                require_time()
+                curriculum = copy(self.curriculum)
+                if callable(getattr(curriculum, '_complete', None)):
+                    complete = curriculum._complete
+                    def guarded_complete(messages):
+                        require_time()
+                        return complete(messages)
+                    curriculum._complete = guarded_complete
+                decision, _ = curriculum.select(context, remaining_projects=1)
                 if not isinstance(decision, WaveDecision) or len(decision.wave.projects) != 1:
                     raise ValueError('usefulness curriculum must generate exactly one project')
                 spec = decision.wave.projects[0].spec
@@ -97,8 +119,9 @@ class UsefulnessVerifier:
                              project_sha256=digest(spec.as_dict()), inspection=inspection)
                 inputs = materialize_inputs(spec)
                 oracle = evaluate_reference(spec, inputs)
-                arms = {}
+                arm_allowance = min(self.pair_seconds / 2, require_time() / 2)
                 for name in ('control', 'treatment'):
+                    admitted_seconds = min(arm_allowance, require_time())
                     raw = prior_memory
                     if name == 'treatment':
                         envelope = json.loads(prior_memory)
@@ -108,9 +131,9 @@ class UsefulnessVerifier:
                     branch.mkdir(exist_ok=False)
                     (branch / 'memory.bin').write_bytes(raw)
                     self._append(directory, 'arm-started', arm=name,
-                                 memory_sha256=hashlib.sha256(raw).hexdigest())
+                                 memory_sha256=hashlib.sha256(raw).hexdigest(), admitted_seconds=admitted_seconds)
                     request = AdaptiveProjectRequest(spec, 1, raw, branch, inputs, oracle,
-                        memory_root=self.memory_root, remaining_seconds=self.pair_seconds / 2,
+                        memory_root=self.memory_root, remaining_seconds=admitted_seconds,
                         publish_learning=False)
                     try:
                         result = self.execute_project(request)
@@ -123,6 +146,7 @@ class UsefulnessVerifier:
                         arms[name] = {'verified': False, 'detail': error.summary, 'evidence': error.evidence}
                     self._append(directory, 'arm-completed', arm=name, **arms[name])
                 outcome = paired_outcome(arms['control'], arms['treatment'])
+                require_time()
                 interpretation = self.verify('interpret', {'lesson': lesson, 'arms': arms,
                     'outcome': outcome, 'warning': 'Both succeeding does not establish uselessness.'})
                 return self._append(directory, 'assessment', experiment_id=experiment_id,
@@ -130,12 +154,12 @@ class UsefulnessVerifier:
             except Exception as error:
                 # Assessment is best effort and never gates original publication.
                 return self._append(directory, 'assessment', experiment_id=experiment_id,
-                    lesson_id=lesson_id, outcome='inconclusive', reason=str(error),
+                    lesson_id=lesson_id, outcome='inconclusive', reason=str(error), arms=arms,
                     error_type=type(error).__name__)
 
 
 def build_usefulness_verifier(*, root, provider, profile, curriculum, project_actor,
-                             enabled=False, pair_seconds=600):
+                             enabled=False, pair_seconds=600, remaining_seconds=None):
     """Bind production curriculum, provider and host-verified actor execution."""
     from copy import copy
     curriculum = copy(curriculum)
@@ -148,4 +172,4 @@ def build_usefulness_verifier(*, root, provider, profile, curriculum, project_ac
             {'role': 'user', 'content': json.dumps({'stage': stage, **evidence}, sort_keys=True)},
         )).text
     return UsefulnessVerifier(Path(root) / 'memory-usefulness', curriculum,
-        project_actor, verify, enabled=enabled, pair_seconds=pair_seconds, memory_root=Path(root))
+        project_actor, verify, enabled=enabled, pair_seconds=pair_seconds, memory_root=Path(root), remaining_seconds=remaining_seconds)

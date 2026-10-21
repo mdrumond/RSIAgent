@@ -45,7 +45,15 @@ def experiments(root):
 def enrich(campaign):
     root = Path(campaign['root'])
     campaign['usefulness'] = experiments(root)
-    campaign['time_budget'] = read(root / 'active-time.json')
+    state = read(root / 'state.json', {})
+    clock = read(root / 'time-budget.json', {})
+    if clock:
+        campaign['time_budget'] = dict(seconds=clock.get('identity', {}).get('max_seconds'),
+            elapsed_seconds=clock.get('elapsed_seconds', 0), practice_seconds=clock.get('practice_seconds'))
+    elif 'max_seconds' in state and 'elapsed_seconds' in state:
+        campaign['time_budget'] = dict(seconds=state['max_seconds'], elapsed_seconds=state['elapsed_seconds'])
+    else:
+        campaign['time_budget'] = read(root / 'active-time.json')
     campaign['remediation'] = read(root / 'remediation.json', {})
     kinds = {}
     for row in read(root / 'failure-investigations.json', []):

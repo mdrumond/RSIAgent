@@ -188,6 +188,7 @@ def build_controller(job):
                 goal = TargetContract.from_mapping(job["target_goal"])
                 artifacts = ContentAddressedArtifacts(Path(job["target_artifact_store"]))
                 runtime = _composed_target_runtime(coordinator.execute_project, settings["target_runtime"])
+            usefulness_verifier = getattr(coordinator, "usefulness_verifier", None)
             coordinator = TargetDrivenPhase2Coordinator(
                 job["root"], job["objective"], snapshot,
                 TargetCurriculumAgent(coordinator.curriculum._complete,
@@ -200,6 +201,9 @@ def build_controller(job):
                 available_tools=_target_available_tools(coordinator.execute_project),
                 trace_hook=coordinator.trace_hook,
             )
+            if usefulness_verifier is not None:
+                coordinator.usefulness_verifier = usefulness_verifier
+                usefulness_verifier.remaining_seconds = coordinator._remaining_seconds
         captured.append(coordinator)
         # The old CLI calls run() after composing. Capture without executing it.
         return type("Deferred", (), {"run": lambda self: {"deferred": True}})()

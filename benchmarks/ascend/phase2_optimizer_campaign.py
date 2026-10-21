@@ -30,6 +30,8 @@ class OptimizerPhase2Coordinator:
         self.usefulness_verifier = usefulness_verifier
         self.fixed_task = fixed_task
         self.time = Phase2TimeBudget(self.root, max_seconds, max_practice_seconds, clock=clock)
+        if self.usefulness_verifier is not None:
+            self.usefulness_verifier.remaining_seconds = lambda: self.time.remaining
         seed_path = self.root / "seed-memory.json"
         if seed_path.exists():
             if json.loads(seed_path.read_bytes()) != snapshot:
@@ -222,6 +224,12 @@ class OptimizerPhase2Coordinator:
         return "tasks/" + task["task_id"] + "-" + sha(canonical(task))[:12]
 
     def _assess_committed(self, state):
+        if self.usefulness_verifier is None:
+            return
+        with self.time.active():
+            self._assess_committed_active(state)
+
+    def _assess_committed_active(self, state):
         if self.usefulness_verifier is None:
             return
         for lesson in state["memory_entries"]:

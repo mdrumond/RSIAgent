@@ -515,7 +515,8 @@ def _optimizer_projects(root, state):
             "verified": row.get("verified") is True,
             "classification": result.get("classification", "unknown"),
             "spec": task, "performance": [], "optimizer_results": measured,
-            "memory": {"actions": [], "facts": [], "lessons": result.get("lessons", []),
+            "memory": {"actions": [], "facts": [], "lessons": [*result.get("lessons", []), *[entry for entry in state.get("memory_entries", [])
+                           if entry.get("attempt_id") == row["attempt_id"]]],
                        "interpretations": []},
             "revisions": revisions, "source": revisions[-1]["source"] if revisions else "",
             "transitions": [{"from": a["sha256"], "to": b["sha256"], "diff": "".join(

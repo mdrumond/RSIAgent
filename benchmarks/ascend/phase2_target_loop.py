@@ -148,6 +148,8 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         if approved_only:
             raise ValueError("target-driven Phase 2 uses fixed-target execution; approval-mode is unsupported")
         state, completed = self._load_state(), 0
+        with self.time.active():
+            self._assess_committed_memory(state)
         while state["terminal"] is None:
             if self.time.remaining <= 0:
                 state["terminal"] = {"status": "BUDGET_EXHAUSTED", "reason": "Phase 2 elapsed-time budget exhausted"}
@@ -181,6 +183,8 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
                 state["practice_since_target"] += 1
             state["next_kind"] = "review"
             self._atomic_json(self.root / "state.json", state)
+            with self.time.active():
+                self._assess_committed_memory(state)
             (self.root / "pending.json").unlink(missing_ok=True)
             if self.trace_hook is not None:
                 self.trace_hook({"event_id": f"{self.snapshot.snapshot_id}:{wave.wave_id}",

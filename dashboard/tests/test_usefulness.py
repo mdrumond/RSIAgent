@@ -36,3 +36,11 @@ def test_lesson_pair_lineage_and_portable_journal(tmp_path):
     retained = dict(_retained(tmp_path))
     assert str((directory / '0000.json').relative_to(tmp_path)) in retained
     assert str((directory / 'control/evidence.json').relative_to(tmp_path)) in retained
+
+
+def test_projects_show_current_phase_clocks(tmp_path):
+    write(tmp_path / 'state.json', dict(max_seconds=100, elapsed_seconds=25))
+    assert enrich(dict(root=str(tmp_path), projects=[]))['time_budget'] == dict(seconds=100, elapsed_seconds=25)
+    write(tmp_path / 'time-budget.json', dict(identity=dict(max_seconds=80), elapsed_seconds=30, practice_seconds=12))
+    budget = enrich(dict(root=str(tmp_path), projects=[]))['time_budget']
+    assert budget == dict(seconds=80, elapsed_seconds=30, practice_seconds=12)

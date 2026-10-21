@@ -78,7 +78,7 @@ def compose_adaptive_controller(
     coordinator.usefulness_verifier = build_usefulness_verifier(
         root=root, provider=provider, profile=profile, curriculum=curriculum,
         project_actor=project_actor, enabled=usefulness_enabled,
-        pair_seconds=usefulness_pair_seconds)
+        pair_seconds=usefulness_pair_seconds, remaining_seconds=coordinator._remaining_seconds)
     return project_actor, coordinator
 
 
