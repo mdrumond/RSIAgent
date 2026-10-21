@@ -3,19 +3,20 @@ from __future__ import annotations
 
 import base64
 import json
+import time
+
+from .phase2_time import Phase2TimeBudget
 from pathlib import Path
 
 from optimizer.jobs import JobStore, atomic, canonical, sha
+from optimizer.control import WorkerStopped
 from optimizer.memory import verify_snapshot
 
 
 class OptimizerPhase2Coordinator:
     def __init__(self, root, objective, snapshot, complete, execution_factory, *,
-                 query_knowledge=None, max_target_attempts=3, max_practice_attempts=2,
+                 query_knowledge=None, max_seconds=7200, max_practice_seconds=1800, clock=time.monotonic,
                  selector=None, feedback_root=None, fixed_task=None):
-        if any(type(n) is not int or n < 1
-               for n in (max_target_attempts, max_practice_attempts)):
-            raise ValueError("target and practice budgets must be positive")
         if selector is None:
             from .phase2_optimizer_tasks import select_optimizer_task
             selector = select_optimizer_task
@@ -27,7 +28,7 @@ class OptimizerPhase2Coordinator:
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
         self.fixed_task = fixed_task
-        self.target_budget, self.practice_budget = max_target_attempts, max_practice_attempts
+        self.time = Phase2TimeBudget(self.root, max_seconds, max_practice_seconds, clock=clock)
         seed_path = self.root / "seed-memory.json"
         if seed_path.exists():
             if json.loads(seed_path.read_bytes()) != snapshot:
@@ -35,7 +36,7 @@ class OptimizerPhase2Coordinator:
         else:
             atomic(seed_path, canonical(snapshot))
         self.identity = dict(snapshot_id=snapshot["snapshot_id"], objective=objective,
-                             target_budget=max_target_attempts, practice_budget=max_practice_attempts)
+                             max_seconds=max_seconds, max_practice_seconds=max_practice_seconds)
         if fixed_task is not None:
             self.identity['fixed_task_sha256'] = sha(canonical(fixed_task))
 
@@ -47,11 +48,21 @@ class OptimizerPhase2Coordinator:
     def _read(self, name):
         return json.loads((self.root / name).read_bytes())
 
+    def _bound_executor(self, executor, *, practice=False):
+        bind = getattr(executor, 'set_remaining_seconds', None)
+        if bind is not None:
+            remaining = self.time.remaining
+            if practice:
+                remaining = min(remaining, self.time.practice_remaining)
+            bind(remaining)
+
     def _qualify(self, task, kind):
         self._write('qualification.json', dict(phase='optimizer-phase2', active=True, attempts=[], pending=dict(
             attempt_id=kind + '-' + sha(canonical(task))[:12], kind=kind, task=task)))
         try:
-            self.factory(self.root / self._directory(task), task, self.seed).prepare()
+            executor = self.factory(self.root / self._directory(task), task, self.seed)
+            self._bound_executor(executor, practice=kind.startswith("practice"))
+            executor.prepare()
         except Exception:
             self.feedback.import_campaign(self.root)
             raise
@@ -65,12 +76,12 @@ class OptimizerPhase2Coordinator:
                 raise ValueError("retained optimizer Phase 2 identity changed")
             return state
         directory = self.root / "curriculum" / "goal"
-        while True:
+        while self.time.remaining > 0:
             self._write("goal-selection.json", dict(stage="selection", proposal_count=0))
             try:
                 task = self.fixed_task or self.selector(complete=self.complete, snapshot=self.seed,
                     objective=self.objective, root=directory, kind="goal",
-                    query_knowledge=self.knowledge)
+                    query_knowledge=self.knowledge, remaining_seconds=lambda: self.time.remaining)
             except (ValueError, TypeError, KeyError) as error:
                 self._write("goal-selection.json", dict(stage="failed", diagnostic=str(error)))
                 raise
@@ -85,6 +96,8 @@ class OptimizerPhase2Coordinator:
                 reject_optimizer_task(directory, str(error))
                 continue
             break
+        else:
+            raise TimeoutError("Phase 2 time budget exhausted during qualification")
         self._write("goal-selection.json", dict(stage="qualified", candidate=task,
                     qualified_target_id=sha(canonical(task))))
         state = dict(schema="ascend-optimizer-phase2-v1", phase="optimizer-phase2",
@@ -119,8 +132,8 @@ class OptimizerPhase2Coordinator:
             return self._read(name)
         recent = [self._feedback(row) for row in state["attempts"][-3:]]
         context = dict(objective=self.objective, target=state["target"], recent_attempts=recent,
-                       targets_remaining=self.target_budget-state["target_attempts"],
-                       practices_remaining=self.practice_budget-state["practice_since_target"])
+                       remaining_seconds=self.time.remaining,
+                       practice_seconds_remaining=self.time.practice_remaining)
         messages = [{"role": "system", "content": (
             'You are the Phase 2 Curriculum Agent. Return JSON {"action":'
             '"ready"|"stalled"|"retry-target"|"practice","reason":"..."}. '
@@ -162,27 +175,42 @@ class OptimizerPhase2Coordinator:
                 state["terminal"] = dict(status="STALLED", reason=decision["reason"])
                 return None
             if (decision["action"] == "practice"
-                    and state["practice_since_target"] < self.practice_budget
-                    and state["target_attempts"] < self.target_budget):
-                kind = "practice"
-                directory = self.root / "curriculum" / f"practice-{len(state['attempts']):03d}"
-                while True:
-                    task = self.selector(complete=self.complete, snapshot=self._memory(state),
-                        objective=self.objective, root=directory, kind="practice",
-                        context=dict(target=state["target"], feedback=self._feedback(latest),
-                        reason=decision["reason"], used_task_ids=[state["target"]["task_id"],
-                            *[row["task_id"] for row in state["attempts"]]]), query_knowledge=self.knowledge)
-                    try:
-                        if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
-                            raise ValueError("practice must have a fresh task ID")
-                        self._qualify(task, 'practice-qualification')
-                    except (ValueError, TypeError, KeyError) as error:
-                        from .phase2_optimizer_tasks import reject_optimizer_task
-                        reject_optimizer_task(directory, str(error))
-                        continue
-                    break
-        if kind == "target" and state["target_attempts"] >= self.target_budget:
-            state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Target attempt budget exhausted")
+                    and self.time.practice_remaining > 0
+                    and self.time.remaining > 0):
+                with self.time.practice_work():
+                    kind = "practice"
+                    directory = self.root / "curriculum" / f"practice-{len(state['attempts']):03d}"
+                    while self.time.remaining > 0 and self.time.practice_remaining > 0:
+                        try:
+                            task = self.selector(complete=self.complete, snapshot=self._memory(state),
+                                objective=self.objective, root=directory, kind="practice",
+                                context=dict(target=state["target"], feedback=self._feedback(latest),
+                                reason=decision["reason"], used_task_ids=[state["target"]["task_id"],
+                                    *[row["task_id"] for row in state["attempts"]]]), query_knowledge=self.knowledge,
+                                    remaining_seconds=lambda: min(self.time.remaining, self.time.practice_remaining))
+                        except TimeoutError:
+                            kind, task = "target", state["target"]
+                            break
+                        try:
+                            if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
+                                raise ValueError("practice must have a fresh task ID")
+                            self._qualify(task, 'practice-qualification')
+                        except (TimeoutError, WorkerStopped):
+                            if self.time.practice_remaining > 0 and self.time.remaining > 0:
+                                raise
+                            kind, task = "target", state["target"]
+                            break
+                        except (ValueError, TypeError, KeyError) as error:
+                            from .phase2_optimizer_tasks import reject_optimizer_task
+                            reject_optimizer_task(directory, str(error))
+                            continue
+                        if self.time.practice_remaining <= 0:
+                            kind, task = "target", state["target"]
+                        break
+                    else:
+                        kind, task = "target", state["target"]
+        if self.time.remaining <= 0:
+            state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Phase 2 elapsed-time budget exhausted")
             return None
         value = dict(attempt_id=f"attempt-{len(state['attempts'])+1:03d}", kind=kind, task=task)
         self._write("pending.json", value)
@@ -193,22 +221,31 @@ class OptimizerPhase2Coordinator:
         return "tasks/" + task["task_id"] + "-" + sha(canonical(task))[:12]
 
     def _run(self, limit=None):
-        state, completed = self._bootstrap(), 0
+        with self.time.active():
+            state = self._bootstrap()
+        completed = 0
         self.feedback.import_campaign(self.root)
         while not state["terminal"]:
-            pending = self._select(state)
+            if self.time.remaining <= 0:
+                state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Phase 2 elapsed-time budget exhausted")
+                self._write("state.json", state)
+                break
+            with self.time.active():
+                pending = self._select(state)
             self._write("state.json", state)
             if pending is None:
                 break
             task, key = pending["task"], pending["attempt_id"]
             relative = self._directory(task)
             executor = self.factory(self.root / relative, task, self.seed)
+            self._bound_executor(executor, practice=pending["kind"] == "practice")
             try:
                 if getattr(executor, 'job_id', None) is not None:
                     executor.store.add_event(executor.job_id, 'phase2-prepare-request', dict(attempt_id=key))
-                executor.prepare()
-                result = executor.attempt(key, memory_snapshot=self._memory(state),
-                                          feedback=state["attempts"][-2:])
+                with self.time.active(practice=pending["kind"] == "practice"):
+                    executor.prepare()
+                    result = executor.attempt(key, memory_snapshot=self._memory(state),
+                                              feedback=state["attempts"][-2:])
             except Exception:
                 self.feedback.import_campaign(self.root)
                 raise
@@ -220,6 +257,7 @@ class OptimizerPhase2Coordinator:
             if pending["kind"] == "target":
                 state["target_attempts"] += 1
                 state["practice_since_target"] = 0
+                self.time.reset_practice()
             else:
                 state["practice_since_target"] += 1
             if row["verified"]:

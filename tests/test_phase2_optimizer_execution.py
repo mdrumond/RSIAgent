@@ -290,3 +290,53 @@ def test_optional_profile_honors_stop_and_uncertain_observation(tmp_path, failur
         execution.attempt('target-001')
     assert 'evaluation' in execution._state()['pending']
     assert execution._event('phase2-attempt-result') is None
+
+
+def test_failed_evaluation_checkpoint_recovers_same_attempt_without_new_allocation(tmp_path, monkeypatch):
+    from optimizer.loop import OptimizationLoop
+    execution, agent, backend = executor(tmp_path, [candidate('good')])
+    original = OptimizationLoop._save
+    def crash(loop):
+        original(loop)
+        pending = loop.state.get('pending', {})
+        if pending.get('evaluation') and not pending.get('history_recorded'):
+            raise RuntimeError('evaluation checkpoint crash')
+    monkeypatch.setattr(OptimizationLoop, '_save', crash)
+    with pytest.raises(RuntimeError, match='evaluation checkpoint crash'):
+        execution.attempt('target-001')
+    before = execution.store.get(execution.job_id)
+    assert before['status'] == 'failed'
+    assert 'evaluation' in execution._state()['pending']
+    calls = (len(agent.contexts), len(backend.evaluations), backend.prepares)
+    monkeypatch.setattr(OptimizationLoop, '_save', original)
+    result = execution.attempt('target-001')
+    assert result['verified']
+    assert execution.attempt('target-001') == result
+    assert (len(agent.contexts), len(backend.evaluations), backend.prepares) == calls
+    recovered = next(event['payload']['manifest'] for event in execution.store.events(execution.job_id)
+                     if event['kind'] == 'recovered')
+    for key in ('max_seconds', 'elapsed_seconds', 'max_attempts', 'attempts', 'latest_attempt'):
+        assert recovered[key] == before[key]
+    after = execution.store.get(execution.job_id)
+    assert after['max_seconds'] == before['max_seconds']
+    assert after['attempts'] == before['attempts'] == 1
+    assert not any(event['kind'] == 'resumed' for event in execution.store.events(execution.job_id))
+
+
+def test_failed_job_recovery_preserves_elapsed_exhaustion(tmp_path):
+    execution, _, _ = executor(tmp_path, [])
+    execution.store.account_time(execution.job_id, 7200)
+    execution.store.transition(execution.job_id, 'failed')
+    before = execution.store.get(execution.job_id)
+    recovered = execution.store.recover(execution.job_id)
+    assert recovered == {**before, 'status': 'budget-exhausted', 'stage': 'budget-exhausted'}
+
+
+def test_failed_job_recovery_honors_explicit_stop(tmp_path):
+    execution, _, _ = executor(tmp_path, [])
+    execution.store.transition(execution.job_id, 'failed')
+    execution.store.stop(execution.job_id)
+    before = execution.store.get(execution.job_id)
+    with pytest.raises(ValueError, match='without a stop request'):
+        execution.store.recover(execution.job_id)
+    assert execution.store.get(execution.job_id) == before

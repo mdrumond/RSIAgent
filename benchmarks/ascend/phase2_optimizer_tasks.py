@@ -41,7 +41,7 @@ replace the fixed final target. For kind=goal, choose a genuinely new compositio
 not merely a renamed Phase 1 task. Never name held-out benchmarks.
 You may return {"query":"specific kernel code search"} or
 {"read_artifact":{"sha256":"hash","offset":0,"limit":8192}} before proposing.
-At most six tool reads, including three KDB queries, per proposal. Query KDB before
+Use the remaining time for tool reads and corrections. Query KDB before
 proposing when enabled. Memory is a bounded index; full evidence is hash-readable.
 Return JSON only. No private chain of thought.'''
 
@@ -63,23 +63,40 @@ def reject_optimizer_task(root, diagnostic):
 
 
 def select_optimizer_task(*, complete, snapshot, objective, root, kind='goal',
-                          context=None, query_knowledge=None, max_proposals=3):
+                          context=None, query_knowledge=None, max_proposals=None,
+                          remaining_seconds=None, max_seconds=7200, clock=None):
+    """Select within elapsed time; max_proposals is deprecated and ignored."""
+    if remaining_seconds is None:
+        from .phase2_time import Phase2TimeBudget
+        import time
+        budget = Phase2TimeBudget(Path(root) / "selection-time", max_seconds, clock=clock or time.monotonic)
+        with budget.active():
+            return select_optimizer_task(complete=complete, snapshot=snapshot, objective=objective,
+                root=root, kind=kind, context=context, query_knowledge=query_knowledge,
+                remaining_seconds=lambda: budget.remaining)
+    return _select_optimizer_task(complete=complete, snapshot=snapshot, objective=objective,
+        root=root, kind=kind, context=context, query_knowledge=query_knowledge,
+        remaining_seconds=remaining_seconds)
+
+
+def _select_optimizer_task(*, complete, snapshot, objective, root, kind,
+                           context, query_knowledge, remaining_seconds):
     """Return task_id/submission/rationale/citations; retain provider/tool turns.
 
     ``complete(messages)`` returns JSON text. ``query_knowledge(query)`` returns
     the existing gated observation with results[].citation. Provider/transport
-    exceptions escape and preserve pending work; invalid proposals consume the
-    bounded proposal budget. Use reject_optimizer_task after worker rejection.
+    exceptions escape and preserve pending work; invalid proposals consume elapsed
+    time. Use reject_optimizer_task after worker rejection.
     """
     verify_snapshot(snapshot)
-    if kind not in {'goal', 'practice'} or not 1 <= max_proposals <= 3:
-        raise ValueError('kind must be goal/practice; proposal budget must be 1..3')
+    if kind not in {'goal', 'practice'}:
+        raise ValueError('kind must be goal/practice')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / 'selection.json'
     identity = dict(snapshot_id=snapshot['snapshot_id'], objective=objective,
                     kind=kind, context=context or {}, kdb=query_knowledge is not None,
-                    max_proposals=max_proposals)
+                    budget_policy="elapsed-time-v1")
     # Compare the persisted wire identity, not Python-only tuple/key forms.
     identity = json.loads(canonical(identity))
     state = (json.loads(path.read_bytes()) if path.exists() else dict(
@@ -96,7 +113,7 @@ def select_optimizer_task(*, complete, snapshot, objective, root, kind='goal',
     memory = memory_presentation(canonical(dict(initial_memory_base64=
         base64.b64encode(seed).decode(), project_memory_base64=[])), store)
     _save(path, state)
-    while state['stage'] != 'selected' and state['proposal_count'] < max_proposals:
+    while state['stage'] != 'selected' and remaining_seconds() > 0:
         if state['messages'] is None:
             state.update(messages=[dict(role='system', content=SYSTEM), dict(role='user',
                 content=json.dumps(dict(objective=objective, kind=kind, context=context or {},
@@ -108,14 +125,14 @@ def select_optimizer_task(*, complete, snapshot, objective, root, kind='goal',
             state['pending'] = complete(state['messages'])
             _save(path, state)
         response = state['pending']
+        if remaining_seconds() <= 0:
+            break
         try:
             value = json.loads(response)
             if isinstance(value, dict) and set(value) in ({'query'}, {'read_artifact'}):
-                if state['reads'] >= 6:
-                    raise ValueError('six tool reads exhausted; return a submission')
                 if 'query' in value:
-                    if query_knowledge is None or state['queries'] >= 3:
-                        raise ValueError('KDB unavailable or three queries exhausted')
+                    if query_knowledge is None:
+                        raise ValueError('KDB unavailable')
                     if not isinstance(value['query'], str) or not value['query'].strip():
                         raise ValueError('knowledge query must be nonempty text')
                     # Transport exceptions intentionally escape without consuming a proposal.
@@ -169,5 +186,5 @@ def select_optimizer_task(*, complete, snapshot, objective, root, kind='goal',
     if state['stage'] != 'selected':
         state['stage'] = 'failed'
         _save(path, state)
-        raise ValueError('optimizer curriculum proposals exhausted: ' + str(state['diagnostic']))
+        raise TimeoutError('optimizer curriculum elapsed-time budget exhausted: ' + str(state['diagnostic']))
     return state['selected']

@@ -29,7 +29,22 @@ def executable_identity(spec):
         nodes=nodes, output=names[spec.graph.output]))
 
 
-def bootstrap_goal(coordinator, *, root, private_root, objective, available_tools):
+def bootstrap_goal(coordinator, *, root, private_root, objective, available_tools,
+                   remaining_seconds=None, max_seconds=7200, clock=None):
+    if remaining_seconds is None:
+        from .phase2_time import Phase2TimeBudget
+        import time
+        budget = Phase2TimeBudget(Path(private_root) / "bootstrap-time", max_seconds,
+                                  clock=clock or time.monotonic)
+        with budget.active():
+            return bootstrap_goal(coordinator, root=root, private_root=private_root,
+                objective=objective, available_tools=available_tools,
+                remaining_seconds=lambda: budget.remaining)
+    return _bootstrap_goal(coordinator, root=root, private_root=private_root,
+        objective=objective, available_tools=available_tools, remaining_seconds=remaining_seconds)
+
+
+def _bootstrap_goal(coordinator, *, root, private_root, objective, available_tools, remaining_seconds):
     """Return only an authenticated contract/store; never publish reference lessons.
 
     Provider and transport exceptions escape without closing the current proposal.
@@ -113,12 +128,12 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
         '{"query":"specific kernel code search"} or '
         '{"read_artifact":{"sha256":"hash","offset":0,"limit":8192}} or '
         '{"project":{ProjectSpec},"rationale":"why this is useful and new"}. '
-        "At most six tool reads including three code searches per proposal. "
+        "Use the remaining time for tool reads and corrections. "
         "Memory index is presentation only; original memories and observations are hash-addressed. "
         "When KDB is available, search it before proposing the goal.")}
     memory = memory_presentation(seed, store)
     historical_reader = None
-    while state["proposal_count"] < 3 or state["stage"] == "qualification":
+    while remaining_seconds() > 0:
         if state["stage"] == "selection":
             messages = [system, {"role": "user", "content": json.dumps(dict(
                 objective=objective, runtime=dict(runtime), available_tools=available_tools,
@@ -129,7 +144,9 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
             # Persist each completed model turn/query before another provider request.
             turns = state.setdefault("selection_turns", [])
             query_count = 0
-            for query_index in range(7):
+            query_index = -1
+            while remaining_seconds() > 0:
+                query_index += 1
                 if query_index < len(turns):
                     response = turns[query_index]
                 else:
@@ -137,9 +154,11 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                     turns.append(response)
                     save()
                 messages.append({"role": "assistant", "content": response})
+                if remaining_seconds() <= 0:
+                    break
                 try:
                     value = json.loads(response)
-                    if isinstance(value, dict) and set(value) == {"read_artifact"} and query_index < 6:
+                    if isinstance(value, dict) and set(value) == {"read_artifact"}:
                         try:
                             result = artifact_page_presentation(value["read_artifact"], store)
                         except FileNotFoundError:
@@ -153,7 +172,7 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                                 raise ValueError("requested memory artifact was not retained") from error
                         messages.append({"role": "user", "content": json.dumps(result)})
                         continue
-                    if isinstance(value, dict) and set(value) == {"query"} and query_index < 6 and query_count < 3:
+                    if isinstance(value, dict) and set(value) == {"query"}:
                         query_count += 1
                         if not isinstance(value["query"], str) or not value["query"].strip():
                             raise ValueError("knowledge query must be nonempty text")
@@ -168,7 +187,7 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                         messages.append({"role": "user", "content": json.dumps(compact_observation(result, store))})
                         continue
                     if not isinstance(value, dict) or set(value) != {"project", "rationale"}:
-                        raise ValueError("expected project and rationale after at most three searches")
+                        raise ValueError("expected project and rationale")
                     if knowledge_enabled and query_count == 0:
                         raise ValueError("KDB-enabled goal selection must query kernel code first")
                     spec = ProjectSpec.from_mapping(value["project"])
@@ -201,6 +220,8 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                 break
         if state["stage"] != "qualification":
             continue
+        if remaining_seconds() <= 0:
+            break
         spec = ProjectSpec.from_mapping(state["candidate"]["spec"])
         branch = private_root / f"reference-{state['proposal_count']}"
         branch.mkdir(parents=True, exist_ok=True)
@@ -218,12 +239,15 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                     failure_mode=FailureMode.NONE, timing_lengths=(), profile_metric=None, learning_focus=())
                 inputs = materialize_inputs(reference_spec)
                 result = reference_actor(AdaptiveProjectRequest(reference_spec, 0, seed, branch,
-                    inputs, evaluate_reference(reference_spec, inputs), memory_root=coordinator.root))
+                    inputs, evaluate_reference(reference_spec, inputs), memory_root=coordinator.root,
+                    remaining_seconds=remaining_seconds()))
                 if not result.evidence.verified:
                     raise ValueError("private reference Actor did not pass host verification: " + result.summary)
                 source_sha = json.loads(result.evidence_payload)["source_sha256"]
                 source = ContentAddressedArtifacts(branch / "artifacts").read_bytes(source_sha).decode()
                 _write(source_path, {"source_sha256": store.put_bytes(source.encode())})
+            if remaining_seconds() <= 0:
+                break
             target = qualify_target(spec, source, runtime, reference_actor.executor, store, policy=policy)
         except (SemanticProjectFailure, ValueError) as error:
             state["history"].append(dict(candidate=state["candidate"], diagnostic=str(error)))
@@ -234,6 +258,6 @@ def bootstrap_goal(coordinator, *, root, private_root, objective, available_tool
                      diagnostic=None)
         save()
         return target, store
-    state.update(stage="failed", diagnostic=state["diagnostic"] or "Three goal proposals exhausted")
+    state.update(stage="failed", diagnostic="Phase 2 elapsed-time budget exhausted")
     save()
-    raise ValueError("Autonomous Phase2 bootstrap failed: " + state["diagnostic"])
+    raise TimeoutError("Autonomous Phase2 bootstrap failed: " + state["diagnostic"])

@@ -71,12 +71,19 @@ def test_gated_kdb_and_hash_read_are_retained_across_provider_failure(tmp_path):
     assert json.loads((tmp_path / 'selection.json').read_bytes())['proposal_count'] == 1
 
 
-def test_requires_kdb_and_exhausts_three_proposals(tmp_path):
-    with pytest.raises(ValueError, match='must query'):
-        select(tmp_path, lambda _: json.dumps(proposal()), query_knowledge=lambda _: {})
+def test_requires_kdb_until_elapsed_allocation_expires(tmp_path):
+    now = [0.0]
+    def complete(_):
+        now[0] += 1
+        return json.dumps(proposal())
+    with pytest.raises(TimeoutError, match='elapsed-time'):
+        select(tmp_path, complete, query_knowledge=lambda _: {}, max_seconds=5, clock=lambda: now[0])
     state = json.loads((tmp_path / 'selection.json').read_bytes())
-    assert state['proposal_count'] == 3
+    assert state['proposal_count'] == 4
     assert state['stage'] == 'failed'
+    with pytest.raises(TimeoutError):
+        select(tmp_path, lambda _: pytest.fail('spent allocation was reset'),
+               query_knowledge=lambda _: {}, max_seconds=5, clock=lambda: now[0])
 
 
 def test_host_rejection_is_actionable_and_counts_same_budget(tmp_path):
@@ -156,3 +163,17 @@ def test_phase1_export_rejects_changed_manifest(tmp_path):
     manifest.write_text('{}')
     with pytest.raises(ValueError, match='manifest changed'):
         freeze_reviewed_phase1(admitted)
+
+
+def test_corrections_and_tool_reads_have_no_count_limit(tmp_path):
+    responses = iter(['bad'] * 4 + [json.dumps({'query': 'kernel'})] * 7
+                     + [json.dumps({'read_artifact': {'sha256': sha(b'original kernel code')}})] * 8
+                     + [json.dumps(proposal())])
+    now = [0.0]
+    def complete(_):
+        now[0] += 1
+        return next(responses)
+    result = select(tmp_path, complete, query_knowledge=lambda _: {'results': []},
+                    max_seconds=30, clock=lambda: now[0])
+    assert result['task_id'] == proposal()['task_id']
+    assert now[0] == 20

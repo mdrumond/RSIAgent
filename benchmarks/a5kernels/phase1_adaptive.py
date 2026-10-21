@@ -91,6 +91,7 @@ class AdaptiveProjectRequest:
     inputs: tuple[HostTensor, ...]
     oracle: ReferenceOutput
     memory_root: Path | None = None
+    remaining_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -452,6 +453,7 @@ class AdaptivePhase1Coordinator:
             request.branch_root,
             request.inputs,
             request.oracle,
+            remaining_seconds=self._remaining_seconds() if hasattr(self, "_remaining_seconds") else None,
         ))
         if not isinstance(result, AdaptiveProjectResult):
             raise TypeError("project adapter must return AdaptiveProjectResult")

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from typing import Mapping
 
 from benchmarks.a5kernels.phase1_curriculum import Capability, ProjectSpec
@@ -30,8 +31,8 @@ class TargetCurriculumContext:
     target: TargetContract
     latest_attempt: Mapping[str, object]
     lessons: tuple[Mapping[str, object], ...]
-    remaining_target_attempts: int
-    remaining_practice_attempts: int
+    remaining_seconds: float
+    practice_seconds_remaining: float
     available_tools: tuple[str, ...] = ()
     used_project_ids: tuple[str, ...] = ()
 
@@ -40,9 +41,9 @@ class TargetCurriculumContext:
             raise TypeError("target must be TargetContract")
         if type(self.latest_attempt.get("verified")) is not bool:
             raise ValueError("latest target attempt requires host verified verdict")
-        if any(type(n) is not int or n < 0 for n in (
-            self.remaining_target_attempts, self.remaining_practice_attempts)):
-            raise ValueError("remaining attempt budgets must be nonnegative integers")
+        if any(type(n) not in (int, float) or not math.isfinite(n) or n < 0 for n in (
+            self.remaining_seconds, self.practice_seconds_remaining)):
+            raise ValueError("remaining time budgets must be finite nonnegative seconds")
 
 
 @dataclass(frozen=True)
@@ -120,8 +121,8 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
         'DECISION: STALLED\n{"reason":"..."}\n'
         + json.dumps({"target": context.target.prompt_dict(),
             "latest_target_attempt": dict(context.latest_attempt), "lessons": list(context.lessons),
-            "remaining_target_attempts": context.remaining_target_attempts,
-            "remaining_practice_attempts": context.remaining_practice_attempts,
+            "remaining_seconds": context.remaining_seconds,
+            "practice_seconds_remaining": context.practice_seconds_remaining,
             "available_tools": list(context.available_tools),
             "used_project_ids": list(context.used_project_ids), "project_grammar": grammar}, sort_keys=True))
 
@@ -177,10 +178,10 @@ class TargetCurriculumAgent:
                 raise ValueError(f"{key} must be nonempty text")
         if action == "ready" and context.latest_attempt["verified"] is not True:
             raise ValueError("readiness requires a host-verified target")
-        if action in {"practice", "retry-target"} and context.remaining_target_attempts == 0:
+        if action in {"practice", "retry-target"} and context.remaining_seconds == 0:
             raise ValueError("no target retry budget remains")
         if action == "practice":
-            if context.remaining_practice_attempts == 0:
+            if context.practice_seconds_remaining == 0:
                 raise ValueError("no practice budget remains")
             project = ProjectSpec.from_mapping(value["project"])
             if project.project_id == context.target.spec.project_id:

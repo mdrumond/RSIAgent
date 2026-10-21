@@ -6,6 +6,9 @@ from dataclasses import asdict, dataclass
 import hashlib
 import json
 import os
+import time
+
+from benchmarks.ascend.phase2_time import Phase2TimeBudget
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -24,7 +27,7 @@ PROTOCOL_SCHEMA = "a5-catlass-phase2-live-protocol-v3"
 ATTEMPT_SCHEMA = "a5-catlass-phase2-attempt-v1"
 MEMORY_SCHEMA = "a5-catlass-phase2-memory-v1"
 TERMINAL_SCHEMA = "a5-catlass-phase2-terminal-v1"
-MAX_ATTEMPTS = 3
+DEFAULT_MAX_SECONDS = 7200
 _MAX_FAILURE_DETAIL = 160
 _MAX_HOST_DIAGNOSTIC = 512
 MAX_REPAIR_SOURCE_BYTES = 256 * 1024
@@ -48,6 +51,7 @@ class Phase2AttemptRequest:
     phase1_memory: tuple[Mapping[str, object], ...]
     phase2_memory: tuple[Mapping[str, object], ...]
     repair_context: Mapping[str, object] | None = None
+    remaining_seconds: float | None = None
 
 
 SourceProvider = Callable[[Phase2AttemptRequest], str]
@@ -115,7 +119,7 @@ class Phase2LiveRunner:
 
     def __init__(
         self, *, phase2_root: str | Path, snapshot: A5Phase1Snapshot,
-        dependencies: Phase2Dependencies,
+        dependencies: Phase2Dependencies, max_seconds=DEFAULT_MAX_SECONDS, clock=time.monotonic,
     ) -> None:
         if not isinstance(snapshot, self.snapshot_type):
             raise TypeError("snapshot must be an A5Phase1Snapshot")
@@ -127,6 +131,7 @@ class Phase2LiveRunner:
         self.snapshot = snapshot
         self.dependencies = dependencies
         self.root = self.phase2_root / "cells" / dependencies.cell.cell_id
+        self.time = Phase2TimeBudget(self.root, max_seconds, clock=clock)
         if snapshot.root.resolve() != self.root / "snapshot":
             raise ValueError("snapshot path does not match the Phase 2 cell root")
 
@@ -152,9 +157,11 @@ class Phase2LiveRunner:
         if self.terminal_path.exists():
             return self._read_terminal(protocol, memories)
 
-        for ordinal in range(len(memories) + 1, MAX_ATTEMPTS + 1):
+        while self.time.remaining > 0:
+            ordinal = len(memories) + 1
             self.snapshot.verify()
-            evidence = self._attempt(protocol, ordinal, memories)
+            with self.time.active():
+                evidence = self._attempt(protocol, ordinal, memories)
             memories = self._commit_memory(protocol, ordinal, evidence, memories)
             if evidence.passed:
                 return self._publish_terminal(protocol, memories, "passed")
@@ -168,7 +175,11 @@ class Phase2LiveRunner:
             return None
         protocol = _read_object(self.protocol_path, "Phase 2 protocol")
         digest = protocol.pop("protocol_sha256", None)
-        if protocol != self._protocol_body() or digest != canonical_digest(protocol):
+        expected = self._protocol_body()
+        if "maximum_semantic_attempts" in protocol:
+            expected.pop("max_seconds")
+            expected["maximum_semantic_attempts"] = 3  # Read-only historical protocol.
+        if protocol != expected or digest != canonical_digest(protocol):
             raise ValueError("Phase 2 protocol identity changed")
         protocol["protocol_sha256"] = digest
         memories = self._read_memory(protocol)
@@ -187,7 +198,7 @@ class Phase2LiveRunner:
             "schema": self.protocol_schema,
             "identity": identity,
             "execution_profile": self.execution_profile,
-            "maximum_semantic_attempts": MAX_ATTEMPTS,
+            "max_seconds": self.time.maximum,
             "semantic_retry": {
                 "preceding_attempt_only": True,
                 "candidate_source_max_bytes": MAX_REPAIR_SOURCE_BYTES,
@@ -244,6 +255,7 @@ class Phase2LiveRunner:
             self.snapshot.memory_entries(),
             tuple(self._memory_context(item) for item in memories),
             self._repair_context(memories),
+            remaining_seconds=self.time.remaining,
         )
         if source_path.exists():
             source = source_path.read_text(encoding="utf-8")
@@ -441,11 +453,11 @@ class Phase2LiveRunner:
         self, protocol: Mapping[str, object],
         memories: tuple[Mapping[str, object], ...], status: str,
     ) -> Mapping[str, object]:
-        last = memories[-1]
+        last = memories[-1] if memories else {}
         if status == "passed" and last["passed"] is not True:
             raise ValueError("only host PASS evidence can admit Phase 2")
         if status == "failed" and (
-            len(memories) != MAX_ATTEMPTS or last["passed"] is not False
+            self.time.remaining > 0 or last.get("passed", False) is not False
         ):
             raise ValueError("failed terminal requires exhausted host evidence")
         body = {
@@ -454,8 +466,8 @@ class Phase2LiveRunner:
             "cell_id": self.dependencies.cell.cell_id,
             "protocol_sha256": protocol["protocol_sha256"],
             "completed_attempts": len(memories),
-            "memory_head_sha256": last["entry_sha256"],
-            "evidence_head_sha256": last["evidence_sha256"],
+            "memory_head_sha256": last.get("entry_sha256", GENESIS_HASH),
+            "evidence_head_sha256": last.get("evidence_sha256", GENESIS_HASH),
         }
         terminal = {**body, "record_sha256": canonical_digest(body)}
         _publish_exact(self.terminal_path, canonical_bytes(terminal) + b"\n")
@@ -471,17 +483,17 @@ class Phase2LiveRunner:
         valid_completion = (
             status == "passed" and bool(memories) and memories[-1]["passed"] is True
         ) or (
-            status == "failed" and len(memories) == MAX_ATTEMPTS
-            and memories[-1]["passed"] is False
+            status == "failed"
+            and (self.time.remaining <= 0 or (protocol.get("maximum_semantic_attempts") == len(memories) == 3))
+            and (not memories or memories[-1]["passed"] is False)
         )
         if (
             value.get("schema") != self.terminal_schema
             or value.get("cell_id") != self.dependencies.cell.cell_id
             or value.get("protocol_sha256") != protocol["protocol_sha256"]
             or value.get("completed_attempts") != len(memories)
-            or not memories
-            or value.get("memory_head_sha256") != memories[-1]["entry_sha256"]
-            or value.get("evidence_head_sha256") != memories[-1]["evidence_sha256"]
+            or value.get("memory_head_sha256") != (memories[-1]["entry_sha256"] if memories else GENESIS_HASH)
+            or value.get("evidence_head_sha256") != (memories[-1]["evidence_sha256"] if memories else GENESIS_HASH)
             or digest != canonical_digest(value)
             or not valid_completion
         ):
@@ -490,6 +502,6 @@ class Phase2LiveRunner:
 
 
 __all__ = [
-    "MAX_ATTEMPTS", "MAX_REPAIR_SOURCE_BYTES", "REPAIR_INSTRUCTION",
+    "DEFAULT_MAX_SECONDS", "MAX_REPAIR_SOURCE_BYTES", "REPAIR_INSTRUCTION",
     "Phase2AttemptRequest", "Phase2Dependencies", "Phase2LiveRunner",
 ]

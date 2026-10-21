@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import replace
 
 from dataclasses import asdict
 import hashlib
@@ -16,7 +17,7 @@ from benchmarks.a5kernels.phase2_attention import (
     attention_reference,
 )
 from benchmarks.a5kernels.phase2_live import (
-    MAX_ATTEMPTS,
+    DEFAULT_MAX_SECONDS,
     Phase2Dependencies,
     Phase2LiveRunner,
 )
@@ -234,17 +235,21 @@ def test_retry_candidate_source_is_bounded_and_digest_bound(tmp_path):
 def test_exhausted_semantic_attempts_emit_failed_terminal(tmp_path):
     _composition, _source, _destination, snapshot = _snapshot(tmp_path)
     calls = []
+    now = [0.]
+    dependencies = _deps(snapshot, _Backend((False,) * 3), calls)
+    def source(request):
+        now[0] += 1
+        return dependencies.source(request)
     runner = Phase2LiveRunner(
-        phase2_root=tmp_path / "phase2",
-        snapshot=snapshot,
-        dependencies=_deps(snapshot, _Backend((False,) * MAX_ATTEMPTS), calls),
+        phase2_root=tmp_path / "phase2", snapshot=snapshot,
+        dependencies=replace(dependencies, source=source), max_seconds=3, clock=lambda: now[0],
     )
 
     terminal = runner.run()
 
     assert terminal["status"] == "failed"
-    assert terminal["completed_attempts"] == MAX_ATTEMPTS
-    assert len(calls) == MAX_ATTEMPTS
+    assert terminal["completed_attempts"] == 3
+    assert len(calls) == 3
 
 
 def test_infrastructure_is_incomplete_and_resumes_same_persisted_source(tmp_path):
@@ -369,3 +374,13 @@ def test_rejects_cell_identity_and_output_path_mismatch(tmp_path):
     changed["cell_id"] = "a5-phase2-cell-" + "0" * 16
     with pytest.raises((TypeError, ValueError)):
         Phase2Dependencies(changed, dependencies.source, dependencies.verify)
+
+
+def test_time_window_allows_more_than_three_semantic_attempts(tmp_path):
+    _composition, _source, _destination, snapshot = _snapshot(tmp_path)
+    calls = []
+    terminal = Phase2LiveRunner(phase2_root=tmp_path / 'phase2', snapshot=snapshot,
+        dependencies=_deps(snapshot, _Backend((False, False, False, True)), calls)).run()
+    assert terminal['status'] == 'passed'
+    assert terminal['completed_attempts'] == len(calls) == 4
+    assert calls[-1].remaining_seconds > 0
