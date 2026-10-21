@@ -70,3 +70,19 @@ def test_committed_phase1_lessons_assessed_on_resume_without_duplicates(tmp_path
     coordinator.resume()
     # The engine deduplicates repeat reconciliation calls by stable experiment ID.
     assert len(calls) == 2
+
+
+def test_experiment_actor_skips_distillation_and_returns_no_lessons(tmp_path):
+    from dataclasses import replace
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from test_a5_phase1_adaptive_actor import SourceBackend, ScriptedActor, _request
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / 'evidence.jsonl'))
+    actor = ScriptedActor(('{"write":{"slot":"kernel","content":"fixed source"}}',
+                           '{"run":{}}', '{"submit":{}}'))
+    result = AdaptiveActorProjectExecutor(executor, actor, object())(
+        replace(_request(tmp_path, executor), publish_learning=False))
+    assert result.evidence.verified
+    assert actor.distill_calls == []
+    assert result.memory.no_new_knowledge and result.memory.lessons == ()
