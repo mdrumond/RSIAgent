@@ -47,10 +47,10 @@ _ROOT_FILES = {"state.json", "pending.json", "campaign-identity.json",
                "project-evidence.jsonl", "initial-memory.bin", "memory.jsonl",
                "terminal.json", "protocol.json", "review.json", "snapshot.json",
                "phase1-memory.jsonl", "phase1-terminal.json", "seed-memory.json",
-               "phase2-feedback.json", "failure-investigations.json", "qualification.json"}
+               "phase2-feedback.json", "failure-investigations.json", "qualification.json", "remediation.json"}
 _TREES = {"waves", "native-evidence", "measurements", "cells", "attempts",
           "provider", "provider-evidence", "source-evidence", "artifacts", "traces",
-          "sft-traces", "snapshot", "project-bundles", "measurement-evidence", "tasks", "curriculum", "feedback", "memory-usefulness"}
+          "sft-traces", "snapshot", "project-bundles", "measurement-evidence", "tasks", "curriculum", "feedback", "memory-usefulness", "failure-budgets", "original-retries"}
 
 
 def _retained(root):
