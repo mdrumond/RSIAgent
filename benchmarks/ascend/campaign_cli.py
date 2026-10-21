@@ -151,7 +151,7 @@ def build_controller(job):
             if identity_path.exists():
                 current = _read(identity_path)
                 for key, value in snapshot.destination.source_identity.items():
-                    if key != "schema" and current.get(key) != value:
+                    if key not in {"schema", "runtime_budget"} and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
         if job.get('feedback_root') and job['phase'] == 1:
@@ -171,9 +171,14 @@ def build_controller(job):
             from .phase2_target_loop import TargetDrivenPhase2Coordinator
             if job.get("autonomous_goal"):
                 from .phase2_goal_bootstrap import bootstrap_goal
-                goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
-                    private_root=Path(job["control"]) / "bootstrap", objective=job["objective"],
-                    available_tools=_target_available_tools(coordinator.execute_project))
+                from .phase2_time import Phase2TimeBudget
+                budget = Phase2TimeBudget(job["root"], job["phase2_max_seconds"],
+                                          job["practice_max_seconds"])
+                with budget.active():
+                    goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
+                        private_root=Path(job["control"]) / "bootstrap", objective=job["objective"],
+                        available_tools=_target_available_tools(coordinator.execute_project),
+                        remaining_seconds=lambda: budget.remaining)
                 runtime = goal.runtime
             else:
                 goal = TargetContract.from_mapping(job["target_goal"])

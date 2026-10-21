@@ -349,3 +349,71 @@ def test_export_authenticates_job_once_not_once_per_profile_artifact(tmp_path, m
     monkeypatch.setattr(JobStore, "get", counted)
     verify_campaign(tmp_path, require_ready=True)
     assert len(calls) <= 3
+
+
+def test_practice_qualification_failures_spend_practice_time_and_force_target(tmp_path):
+    now, selected, attempted, bounds = [0.0], [], [], []
+    responses = iter(['practice', 'ready'])
+    class Executor:
+        def __init__(self, path, task, memory):
+            self.task = task
+        def set_remaining_seconds(self, remaining):
+            bounds.append((self.task['task_id'], remaining))
+        def prepare(self):
+            if self.task['task_id'] == 'practice-task':
+                now[0] += 2
+                raise ValueError('host reference rejected')
+        def attempt(self, key, **kwargs):
+            attempted.append(self.task['task_id'])
+            now[0] += 1
+            return {'verified': len(attempted) > 1, 'summary': 'host verification'}
+    def selector(**kwargs):
+        selected.append(kwargs['kind'])
+        if kwargs['kind'] == 'goal':
+            return proposal()
+        # Use the actual selector so host rejection preserves proposal history.
+        from benchmarks.ascend.phase2_optimizer_tasks import select_optimizer_task
+        def complete(_):
+            now[0] += .5
+            value = proposal()
+            value['task_id'] = 'practice-task'
+            return json.dumps(value)
+        return select_optimizer_task(**{**kwargs, 'complete': complete})
+    coordinator = OptimizerPhase2Coordinator(tmp_path, 'goal', seed(),
+        lambda _: json.dumps({'action': next(responses), 'reason': 'host evidence'}),
+        Executor, selector=selector, max_seconds=30, max_practice_seconds=5,
+        clock=lambda: now[0])
+    assert coordinator.resume()['status'] == 'READY'
+    assert selected == ['goal', 'practice', 'practice']
+    assert attempted == [proposal()['task_id'], proposal()['task_id']]
+    assert [remaining for name, remaining in bounds if name == 'practice-task'] == [4.5, 2.0]
+    assert json.loads((tmp_path / 'time-budget.json').read_bytes())['elapsed_seconds'] == 7
+
+
+def test_practice_selection_expiry_forces_target_without_practice_attempt(tmp_path):
+    now, attempts = [0.0], []
+    responses = iter(['practice', 'ready'])
+    class Executor:
+        def __init__(self, path, task, memory):
+            self.task = task
+        def prepare(self):
+            return {}
+        def attempt(self, key, **kwargs):
+            attempts.append(self.task['task_id'])
+            now[0] += 1
+            return {'verified': len(attempts) > 1, 'summary': 'host verification'}
+    def selector(**kwargs):
+        if kwargs['kind'] == 'goal':
+            return proposal()
+        from benchmarks.ascend.phase2_optimizer_tasks import select_optimizer_task
+        def invalid(_):
+            now[0] += 1
+            return 'bad'
+        return select_optimizer_task(**{**kwargs, 'complete': invalid})
+    coordinator = OptimizerPhase2Coordinator(tmp_path, 'goal', seed(),
+        lambda _: json.dumps({'action': next(responses), 'reason': 'host evidence'}),
+        Executor, selector=selector, max_seconds=30, max_practice_seconds=5,
+        clock=lambda: now[0])
+    assert coordinator.resume()['status'] == 'READY'
+    assert attempts == [proposal()['task_id'], proposal()['task_id']]
+    assert json.loads((tmp_path / 'time-budget.json').read_bytes())['elapsed_seconds'] == 7

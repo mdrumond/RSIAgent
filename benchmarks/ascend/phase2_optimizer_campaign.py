@@ -9,6 +9,7 @@ from .phase2_time import Phase2TimeBudget
 from pathlib import Path
 
 from optimizer.jobs import JobStore, atomic, canonical, sha
+from optimizer.control import WorkerStopped
 from optimizer.memory import verify_snapshot
 
 
@@ -80,7 +81,7 @@ class OptimizerPhase2Coordinator:
             try:
                 task = self.fixed_task or self.selector(complete=self.complete, snapshot=self.seed,
                     objective=self.objective, root=directory, kind="goal",
-                    query_knowledge=self.knowledge)
+                    query_knowledge=self.knowledge, remaining_seconds=lambda: self.time.remaining)
             except (ValueError, TypeError, KeyError) as error:
                 self._write("goal-selection.json", dict(stage="failed", diagnostic=str(error)))
                 raise
@@ -176,25 +177,38 @@ class OptimizerPhase2Coordinator:
             if (decision["action"] == "practice"
                     and self.time.practice_remaining > 0
                     and self.time.remaining > 0):
-                kind = "practice"
-                directory = self.root / "curriculum" / f"practice-{len(state['attempts']):03d}"
-                while self.time.remaining > 0 and self.time.practice_remaining > 0:
-                    task = self.selector(complete=self.complete, snapshot=self._memory(state),
-                        objective=self.objective, root=directory, kind="practice",
-                        context=dict(target=state["target"], feedback=self._feedback(latest),
-                        reason=decision["reason"], used_task_ids=[state["target"]["task_id"],
-                            *[row["task_id"] for row in state["attempts"]]]), query_knowledge=self.knowledge)
-                    try:
-                        if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
-                            raise ValueError("practice must have a fresh task ID")
-                        self._qualify(task, 'practice-qualification')
-                    except (ValueError, TypeError, KeyError) as error:
-                        from .phase2_optimizer_tasks import reject_optimizer_task
-                        reject_optimizer_task(directory, str(error))
-                        continue
-                    break
-                else:
-                    kind, task = "target", state["target"]
+                with self.time.practice_work():
+                    kind = "practice"
+                    directory = self.root / "curriculum" / f"practice-{len(state['attempts']):03d}"
+                    while self.time.remaining > 0 and self.time.practice_remaining > 0:
+                        try:
+                            task = self.selector(complete=self.complete, snapshot=self._memory(state),
+                                objective=self.objective, root=directory, kind="practice",
+                                context=dict(target=state["target"], feedback=self._feedback(latest),
+                                reason=decision["reason"], used_task_ids=[state["target"]["task_id"],
+                                    *[row["task_id"] for row in state["attempts"]]]), query_knowledge=self.knowledge,
+                                    remaining_seconds=lambda: min(self.time.remaining, self.time.practice_remaining))
+                        except TimeoutError:
+                            kind, task = "target", state["target"]
+                            break
+                        try:
+                            if task["task_id"] in {state["target"]["task_id"], *[r["task_id"] for r in state["attempts"]]}:
+                                raise ValueError("practice must have a fresh task ID")
+                            self._qualify(task, 'practice-qualification')
+                        except (TimeoutError, WorkerStopped):
+                            if self.time.practice_remaining > 0 and self.time.remaining > 0:
+                                raise
+                            kind, task = "target", state["target"]
+                            break
+                        except (ValueError, TypeError, KeyError) as error:
+                            from .phase2_optimizer_tasks import reject_optimizer_task
+                            reject_optimizer_task(directory, str(error))
+                            continue
+                        if self.time.practice_remaining <= 0:
+                            kind, task = "target", state["target"]
+                        break
+                    else:
+                        kind, task = "target", state["target"]
         if self.time.remaining <= 0:
             state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Phase 2 elapsed-time budget exhausted")
             return None

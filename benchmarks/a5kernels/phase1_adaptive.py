@@ -90,6 +90,7 @@ class AdaptiveProjectRequest:
     inputs: tuple[HostTensor, ...]
     oracle: ReferenceOutput
     memory_root: Path | None = None
+    remaining_seconds: float | None = None
 
 
 @dataclass(frozen=True)
