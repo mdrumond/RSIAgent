@@ -256,6 +256,7 @@ def admit_phase2_lineage(
         phase2_root=phase2_root,
         snapshot=snapshot,
         dependencies=Phase2Dependencies(cell, forbidden, forbidden),
+        max_seconds=_read_object(cell_root / "protocol.json", "Phase 2 protocol").get("max_seconds", 7200),
     )
     source_paths = (
         runner.protocol_path, runner.memory_path, runner.terminal_path,

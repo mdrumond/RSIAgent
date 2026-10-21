@@ -7,7 +7,8 @@ from optimizer.control import ObservationUnavailable
 from test_ascend_phase2_optimizer_tasks import seed, proposal
 
 
-def setup(tmp_path, *, verdicts=(True,), decisions=("ready",), budget=3):
+def setup(tmp_path, *, verdicts=(True,), decisions=("ready",), budget=10):
+    now = [0.0]
     calls, prepared, tasks, responses = [], [], [], iter(decisions)
     outcomes = iter(verdicts)
     cache = {}
@@ -29,6 +30,7 @@ def setup(tmp_path, *, verdicts=(True,), decisions=("ready",), budget=3):
 
         def attempt(self, key, **kwargs):
             if (self.path, key) not in cache:
+                now[0] += 10
                 value = next(outcomes)
                 if isinstance(value, Exception):
                     raise value
@@ -41,7 +43,7 @@ def setup(tmp_path, *, verdicts=(True,), decisions=("ready",), budget=3):
 
     def build():
         return OptimizerPhase2Coordinator(tmp_path, "new composition", seed(), complete,
-            Executor, selector=selector, max_target_attempts=budget)
+            Executor, selector=selector, max_seconds=budget*10, max_practice_seconds=20, clock=lambda: now[0])
 
     return build, calls, prepared, tasks
 
@@ -205,7 +207,7 @@ def test_resume_after_state_commit_before_pending_cleanup(tmp_path):
 def test_seed_and_budget_changes_rejected(tmp_path):
     build, _, _, _ = setup(tmp_path)
     build().run_attempt()
-    with pytest.raises(ValueError, match="identity changed"):
+    with pytest.raises(ValueError, match="identity changed|budgets changed"):
         OptimizerPhase2Coordinator(tmp_path, "changed objective", seed(), lambda _: "", lambda *a: None).resume()
 
 
@@ -269,7 +271,7 @@ def test_cli_composition_pins_worker_config_and_reviewed_treatment(tmp_path, mon
     path.write_bytes(canonical(config))
     job = dict(root=str(tmp_path / "campaign"), objective="new", model="openai/gpt-5.6-sol",
                optimizer_worker_config_sha256=sha(path.read_bytes()),
-               target_attempt_budget=3, practice_attempt_budget=2)
+               phase2_max_seconds=7200, practice_max_seconds=1800)
     native = SimpleNamespace(execution_profile="bz-a3-1", arch="dav-2201",
                              guide_sha256=sha(guide.read_bytes()), collection=None)
     composed = SimpleNamespace(curriculum=SimpleNamespace(_complete=lambda _: ""),
@@ -277,7 +279,7 @@ def test_cli_composition_pins_worker_config_and_reviewed_treatment(tmp_path, mon
     monkeypatch.setattr(memory, "freeze_reviewed_phase1", lambda _: seed())
     controller = campaign_cli._optimizer_controller(job, {"optimizer_worker_config": str(path)}, None, composed, native)
     assert isinstance(controller, OptimizerPhase2Coordinator)
-    assert controller.target_budget == 3
+    assert controller.time.maximum == 7200
     native.collection = ["selected-kdb"]
     with pytest.raises(ValueError, match="KDB treatment"):
         campaign_cli._optimizer_controller(job, {"optimizer_worker_config": str(path)}, None, composed, native)

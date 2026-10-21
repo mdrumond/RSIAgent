@@ -21,7 +21,7 @@ def test_optimizer_composition_binds_reviewed_kdb_manifest(tmp_path, monkeypatch
                   knowledge=dict(collection=collection, manifest=manifest))
     path = tmp_path / "worker.json"
     job = dict(root=str(tmp_path / "campaign"), objective="new", model="openai/gpt-5.6-sol",
-               target_attempt_budget=3, practice_attempt_budget=2)
+               phase2_max_seconds=7200, practice_max_seconds=1800)
     native = SimpleNamespace(execution_profile="bz-a3-1", arch="dav-2201",
                              guide_sha256=sha(guide.read_bytes()), collection=collection)
     composed = SimpleNamespace(curriculum=SimpleNamespace(_complete=lambda _: ""),

@@ -19,7 +19,7 @@ from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WavePr
 from benchmarks.a5kernels.phase2_adaptive_memory import (
     REVIEW_SCHEMA, admit_adaptive_snapshot, adaptive_destination,
 )
-from benchmarks.a5kernels.phase2_live import MAX_ATTEMPTS, Phase2AttemptRequest
+from benchmarks.a5kernels.phase2_live import DEFAULT_MAX_SECONDS, Phase2AttemptRequest
 from benchmarks.a5kernels.phase2_production import Phase2ProductionConfig, build_phase2_production
 from tests.test_a5_phase1_adaptive import _project
 from tests.test_a5_phase2_source_provider import GUIDE, GUIDE_ID, ENVIRONMENT
@@ -190,7 +190,7 @@ def test_new_guidance_reaches_phase2_and_current_qualification_is_required(tmp_p
     assert dependencies.source(request) == "candidate"
     assert "New profiler instructions" in json.dumps(calls)
     assert snapshot.memory_entries() == (memory,)
-    assert MAX_ATTEMPTS == 3
+    assert DEFAULT_MAX_SECONDS == 7200
     with pytest.raises(ValueError):
         build_phase2_production(replace(config, profiling_guidance_text="wrong"),
                                 environment=ENVIRONMENT, transport=transport,

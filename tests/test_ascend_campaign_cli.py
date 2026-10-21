@@ -1073,7 +1073,7 @@ def test_new_phase2_without_contract_persists_autonomous_bootstrap(tmp_path):
     job = cli._read(control / "job.json")
     assert job["autonomous_goal"] is True and "target_goal" not in job
     assert job["optimizer_goal"] is True
-    assert job["target_attempt_budget"] == 3 and job["practice_attempt_budget"] == 2
+    assert job["phase2_max_seconds"] == 7200 and job["practice_max_seconds"] == 1800
     assert cli._read(root / "campaign-run.json")["autonomous_goal"] is True
     with pytest.raises(SystemExit):
         cli.main(["continue", "--control", str(control), "--project-target", "2"])

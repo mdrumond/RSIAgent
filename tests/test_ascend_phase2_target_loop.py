@@ -12,6 +12,7 @@ from test_a5_phase1_adaptive import _result
 
 
 def build(tmp_path, decisions, execute=None, **kwargs):
+    now = [0.0]
     target, store, _ = qualified(tmp_path / "reference")
     contexts, requests = [], []
     responses = iter(decisions)
@@ -21,9 +22,13 @@ def build(tmp_path, decisions, execute=None, **kwargs):
         return next(responses)
 
     def run(request):
+        now[0] += 1
         requests.append(request)
         return execute(request, len(requests)) if execute else _result(request.spec, True, "host pass")
 
+    kwargs.setdefault("max_seconds", 100)
+    kwargs.setdefault("max_practice_seconds", 2)
+    kwargs.setdefault("clock", lambda: now[0])
     coordinator = TargetDrivenPhase2Coordinator(tmp_path / "campaign", "fixed copy", snapshot(),
         TargetCurriculumAgent(select), run, target=target, artifacts=store, runtime=RUNTIME, **kwargs)
     return coordinator, contexts, requests
@@ -78,7 +83,7 @@ def test_failed_practice_counts_and_forces_retry_after_two_attempts(tmp_path):
 
 
 def test_budget_and_stalled_are_not_success(tmp_path):
-    c, _, _ = build(tmp_path, [], max_target_attempts=1,
+    c, _, _ = build(tmp_path, [], max_seconds=1,
                     execute=lambda r, n: _result(r.spec, False, "mismatch"))
     assert c.run()["status"] == "BUDGET_EXHAUSTED"
     other, _, _ = build(tmp_path / "other", [wire("STALLED")])
@@ -107,10 +112,10 @@ def test_infrastructure_resume_reuses_exact_pending_branch_without_selection(tmp
 def test_resume_rejects_changed_target_budget_runtime_and_legacy_conversion(tmp_path):
     c, _, _ = build(tmp_path, [])
     c.run_attempt()
-    c.max_target_attempts += 1
+    c.time.identity["max_seconds"] += 1
     with pytest.raises(ValueError, match="budgets changed"):
         c.report()
-    c.max_target_attempts -= 1
+    c.time.identity["max_seconds"] -= 1
     c.runtime = {**RUNTIME, "compiler": "different"}
     with pytest.raises(ValueError, match="runtime changed"):
         c.report()
@@ -325,7 +330,7 @@ def test_archive_budget_counters_exclude_infrastructure_pending_attempts(tmp_pat
         c.run_attempt()
         _verify_adaptive_state(c.root, c._load_state())
     assert c.resume()["status"] == "READY"
-    assert len(requests) == 5
+    assert len(requests) == 6  # Interrupted practice time also consumes its window.
     _verify_adaptive_state(c.root, c._load_state())
 
 

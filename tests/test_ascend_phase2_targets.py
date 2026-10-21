@@ -117,9 +117,9 @@ def test_practice_requires_concrete_fields_budget_and_fixed_target(tmp_path):
     assert decision.project.project_id != target.spec.project_id
     assert decision.as_dict()["retry_plan"] == "apply verified tail bounds"
     with pytest.raises(ValueError, match="practice budget"):
-        agent.parse(practice_wire(), replace(context(target), remaining_practice_attempts=0))
+        agent.parse(practice_wire(), replace(context(target), practice_seconds_remaining=0))
     with pytest.raises(ValueError, match="retry budget"):
-        agent.parse(practice_wire(), replace(context(target), remaining_target_attempts=0))
+        agent.parse(practice_wire(), replace(context(target), remaining_seconds=0))
     value = json.loads(practice_wire().split("\n", 1)[1])
     value["project"] = target.spec.as_dict()
     with pytest.raises(ValueError, match="replace the target"):
