@@ -182,6 +182,8 @@ def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
     digest = retained.pop("record_sha256", None)
     output = retained.get("output")
     expected_identity = dict(identity)
+    local = expected_identity.get("execution_identity", {}).get("execution") == "local"
+    handle_prefix = "local:" if local else "bz-a5:"
     if (
         "runtime_catlass_revision" not in retained
         and expected_identity["runtime_catlass_revision"]
@@ -197,7 +199,7 @@ def _validate_qualification(value, identity, execution) -> Mapping[str, object]:
         or retained.get("status") != "transport-qualified"
         or retained.get("exit_code") != 0
         or not isinstance(retained.get("session_handle"), str)
-        or not retained["session_handle"].startswith("bz-a5:")
+        or not retained["session_handle"].startswith(handle_prefix)
         or not isinstance(output, list)
         or len(output) != len(execution.v)
         or retained.get("output_sha256") != canonical_digest(output)

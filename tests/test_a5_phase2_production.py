@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -61,14 +62,15 @@ class FakeExecutor:
 
 
 class CopyVBackend:
-    def __init__(self):
+    def __init__(self, handle_prefix="bz-a5"):
+        self.handle_prefix = handle_prefix
         self.calls = []
         self.compile_calls = []
 
     def execute(self, source, execution, workdir):
         self.calls.append((source, execution, workdir))
         return AttentionReceipt(
-            0, execution.v, session_handle="bz-a5:qualification",
+            0, execution.v, session_handle=f"{self.handle_prefix}:qualification",
             metadata=(("result_exit_code", "0"),),
         )
 
@@ -535,3 +537,91 @@ def test_cli_stops_after_three_infrastructure_retries(tmp_path):
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")
+
+
+def _qualification_for_mode(tmp_path, mode):
+    worker = (dict(execution="local", workspace=str(tmp_path / "workspace"),
+                   physical_device=3, arch="test-arch") if mode == "local" else None)
+    _, cell, config = _config(tmp_path, worker_config=worker)
+    executor = FakeExecutor(cell.catlass_revision)
+    executor.runtime_provenance = tuple(
+        (key, "local" if mode == "local" else value)
+        if key == "execution_profile" else (key, value)
+        for key, value in executor.runtime_provenance
+    )
+    return config, executor
+
+
+@pytest.mark.parametrize("mode,prefix,accepted", [
+    ("local", "local", True), ("remote", "bz-a5", True),
+    ("local", "bz-a5", False), ("remote", "local", False),
+])
+def test_qualification_handle_matches_execution_mode(tmp_path, mode, prefix, accepted):
+    config, executor = _qualification_for_mode(tmp_path, mode)
+    backend = CopyVBackend(prefix)
+    options = dict(environment=ENVIRONMENT, transport=_transport,
+                   executor=executor, backend=backend)
+    path = config.phase2_root / "cells" / config.cell_id / "qualification.json"
+    if not accepted:
+        with pytest.raises(ValueError, match="invalid Phase 2 transport qualification"):
+            build_phase2_production(config, **options)
+        assert not path.exists()
+        return
+
+    snapshot, dependencies = build_phase2_production(config, **options)
+    assert dependencies.execution_profile == ("local" if mode == "local" else None)
+    assert json.loads(path.read_text())["session_handle"] == f"{prefix}:qualification"
+    resumed, _ = build_phase2_production(config, **options)
+    assert resumed == snapshot
+    assert len(backend.calls) == 1
+
+
+@pytest.mark.parametrize("mode,prefix,wrong_prefix", [
+    ("local", "local", "bz-a5"), ("remote", "bz-a5", "local"),
+])
+def test_retained_qualification_rejects_other_mode_handle(tmp_path, mode, prefix, wrong_prefix):
+    config, executor = _qualification_for_mode(tmp_path, mode)
+    backend = CopyVBackend(prefix)
+    options = dict(environment=ENVIRONMENT, transport=_transport,
+                   executor=executor, backend=backend)
+    build_phase2_production(config, **options)
+    path = config.phase2_root / "cells" / config.cell_id / "qualification.json"
+    value = json.loads(path.read_text())
+    value["session_handle"] = f"{wrong_prefix}:qualification"
+    value.pop("record_sha256")
+    value["record_sha256"] = canonical_digest(value)
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="invalid Phase 2 transport qualification"):
+        build_phase2_production(config, **options)
+    assert len(backend.calls) == 1
+
+
+def test_local_qualification_rejects_changed_execution_identity(tmp_path):
+    config, executor = _qualification_for_mode(tmp_path, "local")
+    backend = CopyVBackend("local")
+    options = dict(environment=ENVIRONMENT, transport=_transport,
+                   executor=executor, backend=backend)
+    build_phase2_production(config, **options)
+    changed = replace(config, worker_config={**config.worker_config,
+                      "workspace": str(tmp_path / "different-workspace")})
+    with pytest.raises(ValueError, match="invalid Phase 2 transport qualification"):
+        build_phase2_production(changed, **options)
+    assert len(backend.calls) == 1
+
+
+def test_local_qualification_still_checks_numerical_output(tmp_path):
+    config, executor = _qualification_for_mode(tmp_path, "local")
+    backend = CopyVBackend("local")
+    options = dict(environment=ENVIRONMENT, transport=_transport,
+                   executor=executor, backend=backend)
+    build_phase2_production(config, **options)
+    path = config.phase2_root / "cells" / config.cell_id / "qualification.json"
+    value = json.loads(path.read_text())
+    value["output"][0] += 1
+    value["output_sha256"] = canonical_digest(value["output"])
+    value.pop("record_sha256")
+    value["record_sha256"] = canonical_digest(value)
+    path.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="transport fixture did not reproduce input V"):
+        build_phase2_production(config, **options)
+    assert len(backend.calls) == 1
