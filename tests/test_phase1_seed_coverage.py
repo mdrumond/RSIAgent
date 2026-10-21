@@ -88,8 +88,10 @@ def test_legacy_initial_memory_does_not_authenticate(tmp_path, monkeypatch):
 def test_rejected_dependencies_are_corrected_and_audited_on_exhaustion(tmp_path):
     calls = []
     raw = []
+    now = [0.0]
     def complete(messages):
         calls.append(messages)
+        now[0] += 1
         response = json.loads(_wave(messages[1]['content'],
             [_project('new-add', 'simd-vector')]).split('\n', 1)[1])
         response['projects'][0]['requires'] = ['cube-tiling']
@@ -97,6 +99,8 @@ def test_rejected_dependencies_are_corrected_and_audited_on_exhaustion(tmp_path)
         raw.append(value)
         return value
     runner = coordinator(tmp_path, b'legacy', complete)
+    runner.clock = runner.curriculum.clock = lambda: now[0]
+    runner.max_seconds = 3
     with pytest.raises(ValueError, match='rejected selection artifact:') as error:
         runner.propose_wave()
     assert len(calls) == 3

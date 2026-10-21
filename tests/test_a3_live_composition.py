@@ -152,8 +152,10 @@ def trial_protocol_sha256(
     openai_turns=24, *, mismatch_feedback=True, attempt_completion=True,
     prepare_runtime_infrastructure=True,
 ):
+    from coding.pi import ENGINE_IDENTITY
     value = {
-        "schema": "a3-trial-protocol-v5",
+        **ENGINE_IDENTITY,
+        "schema": "a3-trial-protocol-v6",
         "candidate_source_contract": CANDIDATE_SOURCE_CONTRACT.as_dict(),
         "infrastructure_retry": {
             "max_retries": 3, "backoff_seconds": 120,
@@ -951,7 +953,24 @@ def test_composition_rejects_old_trial_protocol_memory_before_dependencies(
     assert dependency_calls == []
 
 
-def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path):
+def elapsed_trial_clock(monkeypatch, *, seconds=10):
+    """Model calls consume simulated time; live composition keeps its real host loop."""
+    import benchmarks.a3kernels.live_composition as composition_module
+    from benchmarks.a3kernels.trial import A3TrialLoop, TrialBudgets
+    class TimedTrial(A3TrialLoop):
+        def __init__(self, **kwargs):
+            now = [0.0]
+            actor = kwargs['actor']
+            def timed_actor(*args):
+                now[0] += 1
+                return actor(*args)
+            super().__init__(**{**kwargs, 'actor': timed_actor,
+                'clock': lambda: now[0], 'budgets': TrialBudgets(max_seconds=seconds)})
+    monkeypatch.setattr(composition_module, 'A3TrialLoop', TimedTrial)
+
+
+def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_path, monkeypatch):
+    elapsed_trial_clock(monkeypatch)
     cfg = config(tmp_path)
     first, later = foundation_cells()[4:6]
     invalid_calls = []
@@ -962,9 +981,9 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
 
     def resilient_actor_factory(cell, proposal):
         if cell == first:
-            return model_actor_factory(
-                {"DEEPSEEK_API_KEY": "fixture-secret"}, invalid_transport,
-            )(cell, proposal)
+            from benchmarks.a3_model_profiles import complete_a3
+            return lambda profile, context: complete_a3("test", context, model=cell.backend_model,
+                environ={"DEEPSEEK_API_KEY": "fixture-secret"}, transport=invalid_transport)
         return actor_factory(cell, proposal)
 
     deps = LiveDependencies(
@@ -991,16 +1010,16 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     )
 
     assert [record["status"] for record in records] == ["failed", "passed"]
-    assert records[0]["terminal_reason"] == "turn-budget-exhausted"
+    assert records[0]["terminal_reason"] == "time-budget-exhausted"
     assert records[0]["completed_projects"] == 0
     assert records[0]["failed_project_id"] == SMOKE_PROPOSALS[0].project_id
     assert "invalid-content" not in first_paths.terminal.read_text()
-    assert len(invalid_calls) == 24
+    assert len(invalid_calls) == 10
     failures = tuple(
         entry for entry in EvidenceLedger(first_paths.evidence).entries
         if "provider_response_failure" in entry.payload
     )
-    assert len(failures) == 24
+    assert len(failures) == 10
     assert all(
         entry.payload["provider_response_failure"]["code"]
         == "invalid-content-or-usage"
@@ -1008,13 +1027,14 @@ def test_malformed_provider_result_publishes_terminal_and_later_cell_runs(tmp_pa
     )
     assert wave.paths(later).terminal.is_file()
     assert wave.resume() == records
-    assert len(invalid_calls) == 24
+    assert len(invalid_calls) == 10
     assert retained == (
         first_paths.terminal.read_bytes(), first_paths.evidence.read_bytes()
     )
 
 
-def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
+def test_terminal_reports_time_exhaustion_independent_of_token_usage(tmp_path, monkeypatch):
+    elapsed_trial_clock(monkeypatch)
     cfg = config(tmp_path)
     cell = foundation_cells()[0]
 
@@ -1040,11 +1060,12 @@ def test_terminal_distinguishes_token_budget_exhaustion(tmp_path):
     ).run()[0]
 
     assert record["status"] == "failed"
-    assert record["terminal_reason"] == "token-budget-exhausted"
+    assert record["terminal_reason"] == "time-budget-exhausted"
     assert record["completed_projects"] == 0
 
 
-def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
+def test_late_host_mismatch_can_be_repaired_before_deadline(tmp_path, monkeypatch):
+    elapsed_trial_clock(monkeypatch, seconds=40)
     cfg = config(tmp_path)
     cell = next(
         item for item in foundation_cells()
@@ -1057,7 +1078,9 @@ def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
         [{"action": "compile"}] * 23
         + [{"action": "write_source", "source": SOURCE},
            {"action": "compile"}, {"action": "run"},
-           {"action": "write_source", "source": SOURCE + "\n"}]
+           {"action": "write_source", "source": SOURCE + "\n"},
+           {"action": "compile"}, {"action": "run"},
+           {"action": "submit", "interpretation": "repaired", "supports": []}]
     )
 
     def late_actor_factory(_cell, _proposal):
@@ -1071,7 +1094,11 @@ def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
         return actor
 
     class HostMismatch(FakeCandidate):
+        mismatched = False
         def run(self, source, _workdir, **options):
+            if self.mismatched:
+                return super().run(source, _workdir, **options)
+            self.mismatched = True
             plan = self.base.plan(source, **options)
             output = (0.0,) * plan.padded_length
             return VerifiedResult.from_receipt(
@@ -1097,12 +1124,10 @@ def test_completion_rewrite_terminal_is_distinct_in_wave_and_report(tmp_path):
     )
 
     record = wave.run()[0]
-    assert record["status"] == "failed"
-    assert record["terminal_reason"] == "attempt-rewrite-required"
-    assert len(calls) == 26
-    assert wave.report()["records"][0]["terminal_reason"] == (
-        "attempt-rewrite-required"
-    )
+    assert record["status"] == "passed"
+    assert record["terminal_reason"] == "completed"
+    assert len(calls) == 30
+    assert wave.report()["records"][0]["terminal_reason"] == "completed"
 
 
 def test_composition_rejects_noncanonical_proposals_before_dependencies(tmp_path):
@@ -1240,18 +1265,22 @@ def test_completion_provenance_and_no_secret_in_terminal_output(tmp_path):
     assert record["evidence_sha256"] == canonical_digest(composition.cell_digests[record["cell_id"]])
 
 
-def test_deepseek_actor_uses_native_pinned_route_without_exposing_secret():
+def test_deepseek_actor_uses_pi_without_exposing_secret():
     seen = {}
-    def transport(**kwargs):
-        seen.update(kwargs)
-        return A3TransportResult('{"action":"compile"}', 3)
-    factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, transport)
-    cell = next(cell for cell in __import__("benchmarks.a3kernels.phase1_wave", fromlist=["foundation_cells"]).foundation_cells() if cell.backend_model is BackendModel.DEEPSEEK_FLASH)
+    class Session:
+        completion_tokens = 0
+        def __init__(self, **kwargs): seen.update(kwargs)
+        def next_action(self, context, allowed, **kwargs):
+            assert allowed == ["compile"]
+            self.completion_tokens += 3
+            return "compile", {}
+        def close(self): pass
+    factory = model_actor_factory({"DEEPSEEK_API_KEY": "private-value"}, session_factory=Session)
+    cell = next(cell for cell in foundation_cells() if cell.backend_model is BackendModel.DEEPSEEK_FLASH)
     completion = factory(cell, DEFAULT_PROPOSALS[0])(
-        load_a3_model_profile(cell.backend_model), "{}"
-    )
-    assert seen["base_url"] == DEEPSEEK_BASE_URL
-    assert seen["api_key"] == "private-value"
+        load_a3_model_profile(cell.backend_model), '{"allowed_actions":{"compile":[]}}')
+    assert seen["model"] == BackendModel.DEEPSEEK_FLASH
+    assert completion.provenance["coding_engine"] == "pi"
     assert "private-value" not in json.dumps(completion.as_dict())
 
 

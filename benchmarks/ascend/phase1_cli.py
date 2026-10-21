@@ -157,7 +157,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
     parser.add_argument("--knowledge", choices=("with-kdb", "without-kdb"))
     parser.add_argument("--profiling", choices=("new", "without-profiling-guidance"))
     parser.add_argument("--project-target", type=int)
-    parser.add_argument("--max-projects", type=int)
+    parser.add_argument("--max-projects", type=int, help="Deprecated metadata; does not limit execution")
+    parser.add_argument("--max-seconds", type=float, default=7200)
     args = parser.parse_args(rest)
     memory = args.initial_memory.read_bytes()
     if args.action == "report":
@@ -205,7 +206,7 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             config=native_config, native_transport=first.transport, profile=profile, guide_bytes=guide,
             objective=args.objective, initial_memory=memory,
             environment=environment_loader(env_file=args.env_file), provider_transport=provider_transport,
-            embeddings=embeddings, project_target=args.project_target, max_projects=args.max_projects,
+            embeddings=embeddings, project_target=args.project_target, max_projects=args.max_projects, max_seconds=args.max_seconds,
             request_timing=first.request_timing, request_profile=first.request_profile,
             **({"project_workers": tuple(workers)} if parallel else {}),
             profiling_guidance=guidance,

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from coding.pi.actor import PiActorDriver
+from coding.pi import ENGINE_IDENTITY
+
 import hashlib
 import os
 from pathlib import Path
@@ -41,7 +44,6 @@ from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend, Projec
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend
 from benchmarks.a5kernels.phase1_provider import (
-    DirectActorDriver,
     DirectCompletionProvider,
     DirectModelProfile,
     Transport,
@@ -107,7 +109,7 @@ class AdaptivePhase1Production:
 
     cell: A5Phase1Cell
     profile: DirectModelProfile
-    actor: DirectActorDriver
+    actor: PiActorDriver
     backend: CatlassProjectBackend
     query_knowledge: ActionDependency
     request_profile: ActionDependency
@@ -287,13 +289,16 @@ def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes, profiling_guidance_te
     })
 
 
-def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=None) -> None:
+def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=None, *, max_seconds=7200) -> None:
     root = Path(root)
     path = root / "campaign-identity.json"
     identity = {
+        **ENGINE_IDENTITY,
         "schema": _CAMPAIGN_IDENTITY_SCHEMA,
         "cell": cell.as_dict(),
     }
+    if reviewed_snapshot is None:
+        identity["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": max_seconds}
     if reviewed_snapshot is not None:
         reviewed_snapshot.verify()
         identity.update(schema="ascend-catlass-adaptive-phase2-identity-v1",
@@ -347,6 +352,7 @@ def build_adaptive_phase1(
     max_parallel: int = 1,
     project_target: int | None = None,
     max_projects: int | None = None,
+    max_seconds: float = 7200,
     profiling_guidance_text: str | None = None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
 ) -> AdaptivePhase1Production:
@@ -360,7 +366,7 @@ def build_adaptive_phase1(
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
     actor_context = _actor_context(admitted, guide_bytes, profiling_guidance_text)
-    _bind_campaign_identity(paths.root, admitted, reviewed_snapshot)
+    _bind_campaign_identity(paths.root, admitted, reviewed_snapshot, max_seconds=max_seconds)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
             raise ValueError("KDB-off treatment must not receive KDB dependencies")
@@ -373,7 +379,7 @@ def build_adaptive_phase1(
         transport=provider_transport,
     )
     profile = direct_profile(admitted.model)
-    actor = DirectActorDriver(provider)
+    actor = PiActorDriver(provider)
     backend = CatlassProjectBackend(
         command,
         session_wrapper=str(paths.session_wrapper),
@@ -412,6 +418,7 @@ def build_adaptive_phase1(
         max_parallel=max_parallel,
         project_target=project_target,
         max_projects=max_projects,
+        max_seconds=max_seconds,
         reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
     )
     return AdaptivePhase1Production(

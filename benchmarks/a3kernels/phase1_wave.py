@@ -391,7 +391,7 @@ class Phase1Wave:
         if (
             type(outcome["terminal_reason"]) is not str
             or outcome["terminal_reason"] not in {
-                "completed", "token-budget-exhausted", "turn-budget-exhausted",
+                "completed", "time-budget-exhausted", "token-budget-exhausted", "turn-budget-exhausted",
                 "attempt-rewrite-required", "infrastructure-unverified",
             }
             or type(outcome["completed_projects"]) is not int

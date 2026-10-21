@@ -201,9 +201,9 @@ def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     root = tmp_path / "exhaustion"
     coordinator = AdaptivePhase1Coordinator(
         root, "Learn bounded skills.", SEED,
-        CurriculumAgent(complete), execute, max_parallel=1,
+        CurriculumAgent(complete, clock=_selection_clock()), execute, max_parallel=1,
     )
-    with pytest.raises(ValueError, match="3 attempts"):
+    with pytest.raises(ValueError, match="time budget exhausted"):
         coordinator.run()
     before = json.loads((root / "state.json").read_text())
     assert coordinator.report()["published_projects"] == ["published"]
@@ -211,7 +211,7 @@ def test_exhausted_selection_preserves_published_state_for_resume(tmp_path):
     stop_after_first = True
     resumed = AdaptivePhase1Coordinator(
         root, "Learn bounded skills.", SEED,
-        CurriculumAgent(complete), execute, max_parallel=1,
+        CurriculumAgent(complete, clock=_selection_clock()), execute, max_parallel=1,
     ).resume()
     assert resumed["status"] == "SATURATED"
     assert resumed["published_projects"] == ["published"]
@@ -240,9 +240,9 @@ def test_resume_rejects_reordered_focus_without_rewriting_retained_evidence(tmp_
 
     def campaign(provider):
         return AdaptivePhase1Coordinator(tmp_path, "Learn focus", SEED,
-            CurriculumAgent(provider), execute, max_parallel=1)
+            CurriculumAgent(provider, clock=_selection_clock()), execute, max_parallel=1)
 
-    with pytest.raises(ValueError, match="3 attempts"):
+    with pytest.raises(ValueError, match="time budget exhausted"):
         campaign(complete).run()
     before_state = json.loads((tmp_path / "state.json").read_bytes())
     retained_files = {path: path.read_bytes() for path in (tmp_path / "waves").rglob("*")
@@ -624,3 +624,153 @@ def test_target_shrink_rejects_retained_wave_before_execution_or_file_rewrite(tm
     assert calls == before_calls
     assert {path: (path.read_bytes(), path.stat().st_mtime_ns)
             for path in tmp_path.rglob("*") if path.is_file()} == files
+
+
+class _BudgetClock:
+    def __init__(self):
+        self.now = 0.0
+    def __call__(self):
+        return self.now
+
+
+def test_exception_time_is_retained_and_resume_receives_only_remaining_time(tmp_path):
+    clock, observed = _BudgetClock(), []
+    def select(messages):
+        clock.now += 1
+        return _wave(messages[-1]["content"], [_project("retry", "gm-ub-movement")])
+    def execute(request):
+        observed.append(request.remaining_seconds)
+        clock.now += 2
+        if len(observed) == 1:
+            raise RuntimeError("transport interrupted")
+        return _result(request.spec, True, "verified")
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
+            execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
+    with pytest.raises(RuntimeError, match="failed before verification"):
+        make().run()
+    assert json.loads((tmp_path / "state.json").read_text())["elapsed_seconds"] == 3
+    clock.now += 100  # Downtime is not active runtime.
+    report = make().resume()
+    assert observed == [9, 7]
+    assert report["elapsed_seconds"] == 5
+    assert report["status"] == "TARGET_REACHED"
+
+
+def test_legacy_state_remains_reportable_but_cannot_reset_unknown_spend(tmp_path):
+    coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED,
+        CurriculumAgent(lambda _: pytest.fail("selection")), lambda _: pytest.fail("execution"),
+        max_parallel=1)
+    coordinator._load_state()
+    path = tmp_path / "state.json"
+    legacy = json.loads(path.read_text())
+    legacy.pop("elapsed_seconds")
+    legacy.pop("max_seconds")
+    path.write_text(json.dumps(legacy))
+    original = path.read_bytes()
+    assert AdaptivePhase1Coordinator.read_retained_report(tmp_path, "Learn", SEED)["elapsed_seconds"] is None
+    with pytest.raises(ValueError, match="no elapsed-time accounting"):
+        coordinator.resume()
+    assert path.read_bytes() == original
+
+
+def test_approved_selection_and_execution_share_elapsed_allocation(tmp_path):
+    clock, observed = _BudgetClock(), []
+    def select(messages):
+        clock.now += 2
+        return _wave(messages[-1]["content"], [_project("approved", "gm-ub-movement")])
+    def execute(request):
+        observed.append(request.remaining_seconds)
+        clock.now += 3
+        return _result(request.spec, True, "verified")
+    coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
+        execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
+    proposal = coordinator.propose_wave()
+    assert proposal["elapsed_seconds"] == 2
+    coordinator.approve_wave(proposal, ["approved"])
+    report = coordinator.run_approved_wave()
+    assert observed == [8]
+    assert report["elapsed_seconds"] == 5
+
+
+def test_unobserved_interruption_keeps_remaining_allocation_reserved(tmp_path):
+    clock, calls = _BudgetClock(), []
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, "Learn", SEED,
+            CurriculumAgent(lambda _: calls.append("select")), lambda _: calls.append("execute"),
+            max_parallel=1, max_seconds=10, clock=clock)
+    coordinator = make()
+    state = coordinator._load_state()
+    # Durable marker left by a worker killed before its finally checkpoint.
+    state.update(elapsed_seconds=2, allocation_active=True)
+    coordinator._atomic_json(tmp_path / "state.json", state)
+    report = make().resume()
+    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
+    assert report["remaining_seconds"] == 0
+    assert calls == []
+    retained = json.loads((tmp_path / "state.json").read_text())
+    assert retained["allocation_interrupted"] is True
+    assert retained["allocation_active"] is False
+    assert retained["elapsed_seconds"] == 10
+
+
+def _selection_clock():
+    ticks = iter(range(0, 1000000, 2000))
+    return lambda: next(ticks)
+
+
+def test_live_report_is_read_only_and_duplicate_admission_is_rejected(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    clock = _BudgetClock()
+    def select(messages):
+        entered.set()
+        assert release.wait(5)
+        return _wave(messages[-1]['content'], [_project('owned', 'gm-ub-movement')])
+    def make():
+        return AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select),
+            lambda request: _result(request.spec, True, 'verified'), max_parallel=1,
+            project_target=1, max_seconds=10, clock=clock)
+    owner = make()
+    errors = []
+    def run():
+        try:
+            owner.resume()
+        except Exception as error:
+            errors.append(error)
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        path = tmp_path / 'state.json'
+        before = path.read_bytes()
+        observer = make()
+        assert observer.report()['elapsed_seconds'] == 0
+        assert path.read_bytes() == before
+        with pytest.raises(RuntimeError, match='already active'):
+            observer.resume()
+        assert path.read_bytes() == before
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive() and errors == []
+    assert owner.report()['status'] == 'TARGET_REACHED'
+
+
+@pytest.mark.parametrize('manual', [False, True])
+@pytest.mark.parametrize('terminal', [False, True])
+def test_late_curriculum_result_cannot_admit_wave_or_claim_terminal(tmp_path, manual, terminal):
+    clock = _BudgetClock()
+    def select(messages):
+        clock.now += 11
+        return _wave(messages[-1]['content'], [_project('late', 'gm-ub-movement')])
+    coordinator = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select),
+        lambda _: pytest.fail('expired project executed'), max_parallel=1, max_seconds=10, clock=clock)
+    if terminal:
+        from benchmarks.a5kernels.phase1_curriculum_selector import TerminalDecision
+        def select_terminal(*args, **kwargs):
+            clock.now += 11
+            return TerminalDecision('STALLED', 'finished'), args[1]
+        coordinator._select = select_terminal
+    report = coordinator.propose_wave() if manual else coordinator.run()
+    assert (report['terminal']['status'] if manual else report['status']) == 'TIME_BUDGET_EXHAUSTED'
+    assert not (tmp_path / 'pending.json').exists()

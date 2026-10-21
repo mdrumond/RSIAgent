@@ -186,7 +186,16 @@ def test_adaptive_trace_retains_repair_but_excludes_distillation(tmp_path):
     from benchmarks.a5kernels.sft_dataset import _read_trace, _example
     executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
     request = _request(tmp_path, executor)
-    actor = TracedScriptedActor([
+    class DeadlineCheckingActor(TracedScriptedActor):
+        def __call__(self, instruction, **kwargs):
+            import time
+            actions = kwargs['action_executor']
+            assert 0 < actions.deadline-time.monotonic() <= 5
+            assert actions.query_knowledge is not None
+            return super().__call__(instruction, **kwargs)
+    from dataclasses import replace
+    request = replace(request, remaining_seconds=5)
+    actor = DeadlineCheckingActor([
         '{"write":{"slot":"kernel","content":"broken source"}}',
         '{"run":{}}',
         '{"write":{"slot":"kernel","content":"fixed source"}}',
@@ -305,7 +314,8 @@ def test_artifact_wire_view_and_provider_rejection_keep_exact_evidence(tmp_path)
             return DirectCompletion(json.dumps({"read-artifact": {"sha256": digest}}), 1)
         raise Rejected("credential must not appear")
     provider = DirectCompletionProvider({"OPENAI_API_KEY": "secret", "DEEPSEEK_API_KEY": "secret"},
-        transport=transport, sleeper=lambda _: None)
+        transport=transport, sleeper=lambda _: None,
+        clock=lambda: max(0, len(calls)-2)*120)
     executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / "evidence.jsonl"))
     request = _request(tmp_path, executor)
     driver = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(MODEL_IDENTITIES[0]),

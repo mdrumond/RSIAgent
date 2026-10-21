@@ -230,7 +230,7 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
     if (config["profile"] != native.execution_profile or config["arch"] != native.arch
             or runtime is None or str(config["physical_device"]) != str(runtime["device"])
             or hashlib.sha256(Path(config["guide"]).read_bytes()).hexdigest() != native.guide_sha256
-            or config.get("model_profile", "openai/gpt-5.6-sol") != job["model"]):
+            or config.get("model_profile", "deepseek-flash") != job["model"]):
         raise ValueError("optimizer runtime, device, guide or model differs from reviewed composition")
     selected = config.get("knowledge")
     if bool(selected) != bool(native.collection) or (selected and selected.get("collection") != native.collection):

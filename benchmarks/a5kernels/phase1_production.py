@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from coding.pi.actor import PiActorDriver
+from coding.pi import ENGINE_IDENTITY
+
 import hashlib
 import importlib.util
 import json
@@ -40,7 +43,6 @@ from benchmarks.a5kernels.phase1_memory import (
 )
 from benchmarks.a5kernels.phase1_performance import Phase1PerformanceExecution
 from benchmarks.a5kernels.phase1_provider import (
-    DirectActorDriver,
     DirectCompletionProvider,
     Transport,
     direct_profile,
@@ -140,7 +142,7 @@ class ProductionProjectExecutor:
         ledger: EvidenceLedger,
     ) -> Phase1ProjectMemory:
         trace_events: list[tuple[str, Mapping[str, object]]] = []
-        actor = DirectActorDriver(
+        actor = PiActorDriver(
             self.provider,
             trace_event=lambda kind, payload: trace_events.append((kind, payload)),
         )
@@ -161,6 +163,7 @@ class ProductionProjectExecutor:
         trial = TrialOrchestrator.run_bound(
             trial_root=attempt,
             request_payload={
+                **ENGINE_IDENTITY,
                 "schema": "a5-phase1-bound-project-v1",
                 "cell": request.cell.as_dict(),
                 "proposal": request.proposal.as_dict(),

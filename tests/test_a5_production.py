@@ -91,17 +91,17 @@ def test_preflight_is_fail_closed_and_does_not_expose_secret(tmp_path):
     probed = []
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": ""},
+        environment={"OPENAI_API_KEY": ""},
         embedding_probe=lambda backend: probed.append((backend.model, backend.revision)),
         runtime_probe=lambda _paths: None,
         query_probe=_query_schema,
     )
 
     assert report["ready"] is False
-    assert report["checks"]["openrouter_credential"] is False
+    assert report["checks"]["openai_credential"] is False
     assert report["checks"]["kdb_manifest"] is True
     assert probed == [(TinyEmbeddings.model, TinyEmbeddings.revision)]
-    assert "OPENROUTER_API_KEY" not in json.dumps(report)
+    assert "OPENAI_API_KEY" not in json.dumps(report)
 
 
 def test_dotenv_credential_syntax_matches_runtime_parser(tmp_path):
@@ -109,30 +109,30 @@ def test_dotenv_credential_syntax_matches_runtime_parser(tmp_path):
     env_file = tmp_path / ".env"
     base = {"RSIAGENT_ENV_FILE": str(env_file)}
 
-    env_file.write_text(" OPENROUTER_API_KEY=not-runtime-visible\n", encoding="utf-8")
+    env_file.write_text(" OPENAI_API_KEY=not-runtime-visible\n", encoding="utf-8")
     rejected = preflight(
         paths, environment=base, embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: None, query_probe=_query_schema,
     )
-    env_file.write_text("OPENROUTER_API_KEY=runtime-visible\n", encoding="utf-8")
+    env_file.write_text("OPENAI_API_KEY=runtime-visible\n", encoding="utf-8")
     accepted = preflight(
         paths, environment=base, embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: None, query_probe=_query_schema,
     )
 
-    assert rejected["checks"]["openrouter_credential"] is False
-    assert accepted["checks"]["openrouter_credential"] is True
+    assert rejected["checks"]["openai_credential"] is False
+    assert accepted["checks"]["openai_credential"] is True
 
 
-def test_truthy_whitespace_environment_key_does_not_fall_back_to_dotenv(tmp_path):
+def test_blank_environment_key_matches_shared_dotenv_loading(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
     env_file = tmp_path / ".env"
-    env_file.write_text("OPENROUTER_API_KEY=runtime-visible\n", encoding="utf-8")
+    env_file.write_text("OPENAI_API_KEY=runtime-visible\n", encoding="utf-8")
 
     report = preflight(
         paths,
         environment={
-            "OPENROUTER_API_KEY": "   ",
+            "OPENAI_API_KEY": "   ",
             "RSIAGENT_ENV_FILE": str(env_file),
         },
         embedding_probe=lambda _backend: None,
@@ -140,15 +140,15 @@ def test_truthy_whitespace_environment_key_does_not_fall_back_to_dotenv(tmp_path
         query_probe=_query_schema,
     )
 
-    assert report["checks"]["openrouter_credential"] is False
-    assert report["ready"] is False
+    assert report["checks"]["openai_credential"] is True
+    assert report["ready"] is True
 
 
 def test_preflight_checks_complete_local_inputs_without_model_or_bz_call(tmp_path):
     paths, _wrappers = _inputs(tmp_path)
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "present-but-never-reported"},
+        environment={"OPENAI_API_KEY": "present-but-never-reported"},
         embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: None,
         query_probe=_query_schema,
@@ -202,7 +202,7 @@ def test_preflight_rejects_legacy_shared_fts_without_migrating(
 
     report = preflight(
         replace(paths, kdb=legacy),
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         runtime_probe=lambda _paths: None,
     )
 
@@ -231,7 +231,7 @@ def test_preflight_rejects_query_hit_with_corrupted_chunk_bytes(
 
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         runtime_probe=lambda _paths: None,
     )
 
@@ -275,7 +275,7 @@ def test_preflight_validates_corrupted_chunk_beyond_first_query_hit(
 
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         runtime_probe=lambda _paths: None,
     )
 
@@ -300,7 +300,7 @@ def test_preflight_rejects_missing_selected_collection_fts_row(monkeypatch, tmp_
 
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         runtime_probe=lambda _paths: None,
     )
 
@@ -315,7 +315,7 @@ def test_hugging_face_home_routes_its_hub_cache_to_embeddings(tmp_path):
     observed = []
     preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         embedding_probe=lambda backend: observed.append(backend.cache_dir),
         runtime_probe=lambda _paths: None,
         query_probe=_query_schema,
@@ -328,7 +328,7 @@ def test_existing_results_directory_prevents_accidental_overwrite(tmp_path):
     paths.results_root.mkdir()
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: None,
         query_probe=_query_schema,
@@ -345,7 +345,7 @@ def test_remote_runtime_failure_is_bounded_and_fails_closed(tmp_path):
 
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         runtime_probe=unavailable,
         query_probe=_query_schema,
@@ -399,7 +399,7 @@ def test_runtime_probe_rejects_unavailable_configured_device(monkeypatch, tmp_pa
 
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         query_probe=_query_schema,
     )
@@ -414,7 +414,7 @@ def test_missing_provenance_wrapper_prevents_remote_probe(tmp_path):
     calls = []
     report = preflight(
         paths,
-        environment={"OPENROUTER_API_KEY": "configured"},
+        environment={"OPENAI_API_KEY": "configured"},
         embedding_probe=lambda _backend: None,
         runtime_probe=lambda _paths: calls.append(True),
         query_probe=_query_schema,

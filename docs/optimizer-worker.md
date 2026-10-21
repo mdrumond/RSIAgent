@@ -19,7 +19,7 @@ paths. Discover the target/runtime/workspace and device through current registry
 preflight; confirm the configured remote workspace already exists before launch.
 The architecture is the discovered compiler architecture, not a device nickname.
 Optional `env_file` loads provider credentials only in the detached worker.
-`model_profile` defaults to the existing A3 OpenAI profile. Optional `knowledge`
+`model_profile` defaults to the registered DeepSeek Flash profile. Install the pinned Pi runtime before starting a production worker; see [Pi coding setup](PI_CODING_RUNTIME.md). Optional `knowledge`
 contains `knowledge_manifest`, `knowledge_database`, and `embedding_cache` paths;
 the existing read-only manifest-checked KnowledgeAgent gates every query.
 For the current expanded multi-collection native campaign, use `knowledge` with
@@ -51,8 +51,7 @@ timeline reports and shared libraries are excluded. Downloaded artifacts are
 digest-checked and stored in the job artifact store. Every remote runtime call is
 bounded by the job's remaining wall-time budget. Runtime/device/workspace/guide
 identity is pinned across resume.
-Provider requests execute in a child process with streamed retained prompt/result
-records. Stop and the remaining wall-time budget terminate a stalled request.
+Provider requests execute through Pi in a persistent supervised child with streamed retained request intentions and results. Stop and the remaining wall-time budget terminate the entire owned process group.
 Successful exact-handle cancellation is persisted; resume evaluates in a fresh
 remote directory so partial compilation or baseline files cannot be reused.
 Pending diagnostic operations survive unavailable observation without permitting
@@ -70,3 +69,24 @@ whose identity is fixed and whose `complete(stage,context,record)` returns cases
 one Ascend C candidate, and finish. This still executes the actual production
 transport, freezing, compiler, CANNBot timing, profiling and hydration. Repeat
 without `agent=stub` for the configured real provider.
+
+For another trusted execution environment, a host launcher can call
+`run_worker(..., transport_factory=factory)` with its own validated configuration.
+The factory receives `(config, *, retain, stopped, deadline)` and returns a
+transport implementing `transfer(action, source, destination)`,
+`execute(directory, argv)`, and `cancel_pending(directory)`. It must preserve
+retained handles, dispatch sentinels, exact-operation cancellation, and resume
+without replaying an uncertain dispatch. Execution success requires confirmed
+remote completion; a submission acknowledgement is insufficient.
+
+Injected configurations require an explicit `lock_directory` and a versioned
+`transport_identity`, pinned across resume alongside the runtime and device.
+They need no checked-wrapper paths. The normal CLI still validates and uses the
+existing checked transport. No transport is loaded dynamically from config.
+Machine-specific launchers and credentials belong in ignored local storage.
+The fixed Pi smoke is also callable through
+`benchmarks.pi_coding.smoke.run_smoke(config=..., transport_factory=..., ...)`;
+its CLI, budget caps, and numerical verification policy remain the same.
+
+
+Runtime allocations are measured in elapsed seconds. Attempt, compile, action, provider-request, cumulative-token, and dollar counts do not terminate jobs. Resume requires only `--additional-seconds`; the dashboard exposes time allocations and attempt telemetry. Legacy count arguments and stored count limits remain readable for compatibility but are ignored as stopping conditions. Provider response/context limits and frozen correctness cases remain enforced.

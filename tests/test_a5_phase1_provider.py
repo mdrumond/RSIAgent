@@ -88,7 +88,7 @@ def test_invalid_prompt_exhaustion_is_noninfra_and_safe():
     def transport(**kwargs):
         calls.append(kwargs["request"])
         raise PromptRejected("openai-secret")
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append)
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=delays.append, clock=lambda: len(delays)*120)
     with pytest.raises(ProviderRejectionError) as caught:
         provider.complete(direct_profile(MODEL_IDENTITIES[0]), [{"role": "user", "content": "kernel"}],
                           attempt_observer=lambda event, payload: events.append((event, payload)))
@@ -108,7 +108,7 @@ def test_rejections_are_logged_safely_without_actor_observer(caplog, exhaust):
         if exhaust or len(calls) == 1:
             raise PromptRejected("openai-secret deepseek-secret raw body")
         return DirectCompletion("ordinary response", 1)
-    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=lambda _: None)
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, sleeper=lambda _: None, clock=lambda: max(0, len(calls)-1)*120)
     if exhaust:
         with pytest.raises(ProviderRejectionError):
             provider.complete(direct_profile(MODEL_IDENTITIES[0]), [])
@@ -525,11 +525,12 @@ def test_distillation_correction_is_bounded_and_does_not_rerun_actions(tmp_path)
     )
 
 
-def test_distillation_correction_stops_after_three_invalid_responses():
+def test_distillation_correction_stops_at_deadline():
+    calls = []
     provider = _scripted_provider([
         '{"submit":{}}', "bad-1", "bad-2", "bad-3",
-    ], [])
-    actor = DirectActorDriver(provider, max_turns=1)
+    ], calls)
+    actor = DirectActorDriver(provider, max_seconds=4, clock=lambda: len(calls))
     from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
     outcome = actor(
         "instruction", profile=direct_profile(MODEL_IDENTITIES[0]),
@@ -554,8 +555,9 @@ def test_distillation_correction_stops_after_three_invalid_responses():
 def test_direct_actor_rejects_invalid_or_unsupported_distillation(response, match, role):
     # The last case deliberately admits only compile evidence, which cannot
     # establish correctness even when its digest is genuine.
-    provider = _scripted_provider(['{"submit":{}}', response, response, response], [])
-    actor = DirectActorDriver(provider, max_turns=1)
+    calls = []
+    provider = _scripted_provider(['{"submit":{}}', response, response, response], calls)
+    actor = DirectActorDriver(provider, max_seconds=4, clock=lambda: len(calls))
     from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
 
     outcome = actor(
@@ -580,7 +582,7 @@ def test_direct_actor_counts_all_turns_but_exempts_compile_budget(tmp_path, term
         '{"submit":{}}',
         _distillation(),
     ], calls)
-    actor = DirectActorDriver(provider, max_turns=2)
+    actor = DirectActorDriver(provider, max_turns=2, max_seconds=5 if terminal else 4, clock=lambda: len(calls))
     workspace = tmp_path / "trial/workspace"
     workspace.mkdir(parents=True)
 
@@ -598,7 +600,7 @@ def test_direct_actor_counts_all_turns_but_exempts_compile_budget(tmp_path, term
         ),
     )
 
-    assert outcome.status == ("done" if terminal else "turn-budget-exhausted")
+    assert outcome.status == ("done" if terminal else "time-budget-exhausted")
     assert outcome.iterations == 4
     assert outcome.tokens == 8
     assert len(calls) == 4
@@ -664,8 +666,8 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     retained = [entry.payload for entry in ledger.entries
                 if entry.kind == EvidenceKind.ARTIFACT.value]
     by_role = {entry["role"]: entry["sha256"] for entry in retained}
-    assert artifacts.read_bytes(by_role["actor-instruction"]).decode() == (
-        f"execute registered {proposal.family.value}"
+    assert artifacts.read_bytes(by_role["actor-instruction"]).decode().startswith(
+        f"execute registered {proposal.family.value}\n"
     )
     assert artifacts.read_bytes(by_role["actor-system-prompt"]).decode() == _SYSTEM_PROMPT
     assert artifacts.read_json(by_role["final-profile"]) == result.final_profile
@@ -683,8 +685,8 @@ def test_every_registered_project_family_can_use_the_bound_trial_executor(
     assert request_entries[-1].payload["proposal"] == proposal.as_dict()
     assert request_entries[-1].payload["runtime"] == runtime.as_dict()
     assert request_entries[-1].payload["trial_budget"] == {
-        "ordinary_action_limit": 40,
-        "unmetered_compile_probes": None,
+        "max_seconds": 3600,
+        "policy": "elapsed-time-v1",
     }
 
 
@@ -734,7 +736,7 @@ def test_bound_trial_retains_and_explains_unmetered_compile_allowance(tmp_path):
     assert result.outcome.tokens == 6
     assert len(backend.compiles) == 1
     opening = calls[0]["request"]["messages"][1]["content"]
-    assert "exactly 1 compile probe(s)" in opening
+    assert "within the remaining time" in opening
     assert "does not launch the kernel or establish correctness" in opening
     artifacts = ContentAddressedArtifacts(result.artifacts)
     instruction = next(entry.payload for entry in ledger.entries
@@ -744,23 +746,24 @@ def test_bound_trial_retains_and_explains_unmetered_compile_allowance(tmp_path):
     actions = [entry.payload for entry in ledger.entries
                if entry.kind == EvidenceKind.ACTION.value]
     assert [entry["ordinal"] for entry in actions] == [1, 2, 3]
-    assert actions[1]["budget"]["ordinary_budget_exempt"]
+    assert actions[1]["budget"]["remaining_seconds"] > 0
     assert all("payload_artifact_sha256" in entry for entry in actions)
     request = next(
         entry for entry in ledger.entries
         if entry.kind == EvidenceKind.REQUEST.value
     )
     assert request.payload["trial_budget"] == {
-        "ordinary_action_limit": 40,
-        "unmetered_compile_probes": 1,
+        "max_seconds": 3600,
+        "policy": "elapsed-time-v1",
     }
 
 
 def test_bound_trial_requires_a_host_verified_submit(tmp_path):
+    calls = []
     provider = _scripted_provider([
         json.dumps({"write": {"slot": "kernel", "content": SOURCE}})
-    ], [])
-    actor = DirectActorDriver(provider, max_turns=1)
+    ], calls)
+    actor = DirectActorDriver(provider, max_seconds=1, clock=lambda: len(calls))
     knowledge = KnowledgeAgent(
         enabled=False,
         journal=ProgressiveMemoryJournal(tmp_path / "knowledge.jsonl"),
@@ -781,3 +784,13 @@ def test_bound_trial_requires_a_host_verified_submit(tmp_path):
             profiling_guidance=False,
             ledger=EvidenceLedger(tmp_path / "evidence.jsonl"),
         )
+
+
+def test_single_model_provider_does_not_require_unrelated_credentials():
+    selected = MODEL_IDENTITIES[0]
+    provider = DirectCompletionProvider({selected.credential_env: 'fixture-only'},
+        models=(selected.backend_model,), transport=lambda **_: DirectCompletion('ok', 1))
+    assert provider.coding_environment() == {selected.credential_env: 'fixture-only'}
+    assert provider.complete(direct_profile(selected), [{'role':'user', 'content':'test'}]).text == 'ok'
+    with pytest.raises(ValueError, match='not configured'):
+        provider.complete(direct_profile(MODEL_IDENTITIES[1]), [{'role':'user', 'content':'test'}])

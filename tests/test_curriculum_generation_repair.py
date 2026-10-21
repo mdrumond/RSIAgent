@@ -118,7 +118,7 @@ def test_normalization_does_not_hide_invalid_proposals(change, diagnostic):
         calls.append(messages)
         return wave([item])
 
-    with pytest.raises(ValueError, match=f"3 attempts.*{diagnostic}"):
+    with pytest.raises(ValueError, match=f"time budget exhausted.*{diagnostic}"):
         CurriculumAgent(complete).select(context())
     assert len(calls) == 3
 
@@ -137,3 +137,14 @@ def test_grammar_gives_valid_typed_graph_and_explains_derivation(policy):
     assert "string naming a computed node" in grammar["graph"]["types"]["output"]
     assert "derived automatically" in grammar["capability_operation_rules"]["rule"]
     assert "capabilities" in grammar["project_fields_exactly"]
+
+
+@pytest.fixture(autouse=True)
+def bounded_fake_selection_clock(monkeypatch):
+    """Negative fake completions consume time instead of relying on retry counts."""
+    original = CurriculumAgent.__init__
+    def initialize(self, *args, **kwargs):
+        ticks = iter(range(0, 1000000, 1000))
+        kwargs.setdefault("clock", lambda: next(ticks))
+        original(self, *args, **kwargs)
+    monkeypatch.setattr(CurriculumAgent, "__init__", initialize)

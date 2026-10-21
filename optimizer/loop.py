@@ -107,6 +107,15 @@ class OptimizationLoop:
                                    | {'signatures': signatures})
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
+        try:
+            return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
+                             memory_snapshot=memory_snapshot, context=context)
+        finally:
+            close = getattr(self.agent, "close", None)
+            if close is not None:
+                close()
+
+    def _run_owned(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         """Optionally stop at Phase 2's preparation or single-evaluation boundary.
 
         These boundaries reuse this job's durable state, reference and pending
@@ -250,7 +259,7 @@ class OptimizationLoop:
             # Attempt is reserved before submission: crashes never lose its charge.
             if self.store.get(self.key)['attempts'] < pending['attempt']:
                 self.store.record_attempt(self.key, candidate_sha256=pending['sha256'], result='evaluating')
-            # Final allowed attempt must still run after its reservation exhausts count.
+            # Reconcile an already retained attempt even after its time allocation expires.
             if 'evaluation' not in pending:
                 result = self._evaluate_reserved(pending)
                 pending['evaluation'] = self._artifact('evaluation', result)
@@ -320,11 +329,13 @@ class OptimizationLoop:
             # The caller removes this result in the same checkpoint that applies
             # it. A crash in between must not issue another billable request.
             return self._read(retained)
-        if self.state['turn'] >= 200:
-            raise ValueError('model action limit reached')
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        row = self.store.get(self.key)
+        context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
+        if self.agent.identity.get('coding_engine') == 'pi':
+            context['knowledge_available'] = self.knowledge is not None
         if self.single_evaluation or self.prepare_only:
             # Keep every lesson addressable, but don't replay hundreds of full
             # entries or accumulated compiler/profiler logs on every turn.

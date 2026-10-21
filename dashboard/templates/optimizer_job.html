@@ -4,11 +4,11 @@
 <div class="eyebrow">A3 / ASCEND C</div><h1>{{ job.name or 'Optimization job' }}</h1>
 <section id="optimizer-job" data-job-id="{{ job.job_id }}"><h2>Progress</h2>
 <p id="optimizer-progress" role="status">{{ job.status }} · {{ job.stage }}</p>
-<p id="optimizer-budget">{{ job.attempts }} / {{ job.max_attempts }} attempts; {{ job.elapsed_seconds }} / {{ job.max_seconds }} seconds</p>
+<p id="optimizer-budget">{{ job.attempts }} attempts; {{ job.elapsed_seconds }} / {{ job.max_seconds }} seconds</p>
 <pre id="optimizer-handles"></pre>
 <button id="optimizer-stop">Stop</button>
 <button id="optimizer-recover" hidden>Reconnect retained operation</button>
-<form id="optimizer-resume"><div class="optimizer-grid"><label>Additional attempts<input name="additional_attempts" type="number" min="1" value="25" required></label><label>Additional seconds<input name="additional_seconds" type="number" min="1" value="7200" required></label></div><button>Resume with additional budget</button></form>
+<form id="optimizer-resume"><div class="optimizer-grid"><label>Additional seconds<input name="additional_seconds" type="number" min="1" value="7200" required></label></div><button>Resume with additional budget</button></form>
 <p id="optimizer-message" role="status"></p></section>
 <section id="optimizer-results"><h2>Results</h2>
 <button id="optimizer-load-results">Load / refresh results</button>

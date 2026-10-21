@@ -118,12 +118,14 @@ def _request(cell, *, attempt=1):
 def _provider(tmp_path, replies, *, cell=None, knowledge_factory=None,
               guidance=None, max_turns=4, max_queries=None,
               max_completion_bytes=256 * 1024, compile_probe=None,
-              max_compile_probes=0):
+              max_compile_probes=0, max_seconds=3600):
     calls = []
+    now = [0.0]
     replies = iter(replies)
 
     def transport(**kwargs):
         calls.append(kwargs)
+        now[0] += 1
         reply = next(replies)
         if isinstance(reply, Exception):
             raise reply
@@ -140,6 +142,7 @@ def _provider(tmp_path, replies, *, cell=None, knowledge_factory=None,
         compile_probe=compile_probe,
         max_compile_probes=max_compile_probes,
         max_completion_bytes=max_completion_bytes,
+        max_seconds=max_seconds, clock=lambda: now[0],
     )
     return provider, calls
 
@@ -357,31 +360,31 @@ def test_guidance_text_and_digest_are_bound_into_prompt_and_manifest(tmp_path):
     '{"candidate_source":{"source":"x"},"knowledge_query":{"query":"y"}}',
     '{"candidate_source":{"source":""}}',
 ])
-def test_invalid_or_multiple_actions_exhaust_the_turn_budget(tmp_path, bad):
-    provider, _calls = _provider(tmp_path, [bad], max_turns=1)
-    with pytest.raises(RuntimeError, match="turn budget exhausted"):
+def test_invalid_or_multiple_actions_exhaust_the_time_budget(tmp_path, bad):
+    provider, _calls = _provider(tmp_path, [bad], max_turns=1, max_seconds=1)
+    with pytest.raises(RuntimeError, match="time budget exhausted"):
         provider(_request(_cell()))
     assert not list(tmp_path.rglob("provider.json"))
 
 
-def test_query_budget_is_bounded(tmp_path):
+def test_repeated_queries_are_bounded_by_time(tmp_path):
     cell = _cell(knowledge=KnowledgeMode.WITH_KDB)
     provider, _calls = _provider(
         tmp_path,
         ['{"knowledge_query":{"query":"one"}}', '{"knowledge_query":{"query":"two"}}'],
         knowledge_factory=lambda path, _cell: FakeKnowledge(ProgressiveMemoryJournal(path)),
         max_turns=2,
-        max_queries=1,
+        max_queries=1, max_seconds=2,
     )
-    with pytest.raises(RuntimeError, match="turn budget exhausted"):
+    with pytest.raises(RuntimeError, match="time budget exhausted"):
         provider(_request(cell))
 
 
 def test_compile_probe_is_opt_in_and_disabled_action_consumes_ordinary_turn(tmp_path):
     provider, calls = _provider(
-        tmp_path, ['{"compile_probe":{"source":"source"}}'], max_turns=1,
+        tmp_path, ['{"compile_probe":{"source":"source"}}'], max_turns=1, max_seconds=1,
     )
-    with pytest.raises(RuntimeError, match="turn budget exhausted"):
+    with pytest.raises(RuntimeError, match="time budget exhausted"):
         provider(_request(_cell()))
     assert "compile_probe" not in calls[0]["request"]["messages"][0]["content"]
     assert not list(tmp_path.rglob("compile-probes"))
@@ -414,7 +417,7 @@ def test_compile_probe_does_not_consume_ordinary_turn_and_retains_tokens(tmp_pat
     assert len(probes) == 1
 
 
-def test_compile_probe_is_exempt_but_knowledge_query_consumes_last_turn(tmp_path):
+def test_compile_probe_and_query_do_not_consume_candidate_capacity(tmp_path):
     def compile_probe(_source, _workdir):
         return {
             "status": "compiled", "case_id": "case", "exit_code": 0,
@@ -427,9 +430,8 @@ def test_compile_probe_is_exempt_but_knowledge_query_consumes_last_turn(tmp_path
     ], max_turns=1, max_queries=1, compile_probe=compile_probe,
        max_compile_probes=1)
 
-    with pytest.raises(RuntimeError, match="turn budget exhausted"):
-        provider(_request(_cell()))
-    assert len(calls) == 2
+    assert provider(_request(_cell())) == "must-not-run"
+    assert len(calls) == 3
 
 
 @pytest.mark.parametrize("with_probe", [False, True])
@@ -468,18 +470,18 @@ def test_completed_query_survives_provider_timeout(tmp_path, with_probe):
         '{"candidate_source":{"source":"done"}}',
     ], **options)
     assert resumed(request) == "done"
-    assert queried == ["completed"]
+    assert queried == ["completed", "over budget"]
     observation = json.loads(calls[0]["request"]["messages"][-1]["content"])
     assert observation["knowledge_query"] == {"available": True, "results": []}
     observation = json.loads(calls[1]["request"]["messages"][-1]["content"])
-    assert observation["knowledge_query"]["error"] == "query-budget-exhausted"
+    assert observation["knowledge_query"] == {"available": True, "results": []}
     manifest = json.loads(next(tmp_path.rglob("provider.json")).read_text())
     assert manifest["ordinary_turns"] == 3
     assert manifest["completion_tokens"] == 3 * (3 + int(with_probe))
-    assert len(manifest["knowledge_queries"]) == 1
+    assert len(manifest["knowledge_queries"]) == 2
 
 
-def test_compile_probe_limit_exhaustion_is_bounded(tmp_path):
+def test_compile_probes_continue_past_legacy_count_limit(tmp_path):
     def callback(_source, _workdir):
         return {
             "status": "compiled", "case_id": "case", "exit_code": 0,
@@ -492,7 +494,7 @@ def test_compile_probe_limit_exhaustion_is_bounded(tmp_path):
     ], max_turns=2, compile_probe=callback, max_compile_probes=1)
     assert provider(_request(_cell())) == "done"
     observation = json.loads(calls[2]["request"]["messages"][-1]["content"])
-    assert observation["compile_probe"]["status"] == "probe-budget-exhausted"
+    assert observation["compile_probe"]["status"] == "compiled"
 
 
 def test_compile_probe_rejects_unbounded_or_invalid_host_evidence(tmp_path):
@@ -599,10 +601,10 @@ def test_completion_and_candidate_bytes_are_bounded_and_agent_is_closed(tmp_path
 
     oversized = json.dumps({"candidate_source": {"source": "x" * 1100}})
     provider, _calls = _provider(
-        tmp_path, [oversized], knowledge_factory=factory, max_turns=1,
+        tmp_path, [oversized], knowledge_factory=factory, max_turns=1, max_seconds=1,
         max_completion_bytes=1024,
     )
-    with pytest.raises(RuntimeError, match="turn budget exhausted"):
+    with pytest.raises(RuntimeError, match="time budget exhausted"):
         provider(_request(cell))
     assert agents[0].closed is True
     assert not list(tmp_path.rglob("candidate.py"))

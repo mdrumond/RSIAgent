@@ -214,9 +214,11 @@ def test_automatic_phase2_rejected_selection_retains_transcript(tmp_path):
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 
     calls, responses = [], []
+    now = [0.0]
 
     def complete(messages):
         calls.append(messages)
+        now[0] += 1
         proposal = json.loads(_wave(messages[1]["content"], [project(1)]).split("\n", 1)[1])
         proposal["projects"][0]["requires"] = ["cube-tiling"]
         raw = "DECISION: WAVE\n" + json.dumps(proposal)
@@ -228,6 +230,8 @@ def test_automatic_phase2_rejected_selection_retains_transcript(tmp_path):
 
     coordinator = AdaptivePhase2Coordinator(
         tmp_path, "Learn", snapshot(), CurriculumAgent(complete), execute, project_target=2)
+    coordinator.clock = coordinator.curriculum.clock = lambda: now[0]
+    coordinator.max_seconds = 3
     with pytest.raises(ValueError, match="rejected selection artifact:") as failure:
         coordinator.run()
     assert len(calls) == 3

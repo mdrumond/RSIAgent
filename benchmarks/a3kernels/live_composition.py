@@ -12,7 +12,7 @@ import time
 from typing import Callable, Mapping, Protocol, Sequence
 
 from benchmarks.a3_experiments import A3ExperimentCell
-from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, complete_a3, load_a3_model_profile
+from benchmarks.a3_model_profiles import A3Completion, A3ModelProfile, load_a3_model_profile
 from benchmarks.a3kernels.candidate import A3CandidateBackend, CandidateCompilation
 from benchmarks.a3kernels.artifact_prepare import (
     DEFAULT_CORPUS_SPEC,
@@ -614,7 +614,7 @@ class LiveComposition:
                             else (
                                 "token-budget-exhausted"
                                 if "token budget exhausted" in trial.failures
-                                else "turn-budget-exhausted"
+                                else "time-budget-exhausted"
                             )
                         )
                     ),
@@ -639,17 +639,18 @@ class LiveComposition:
 
 
 def model_actor_factory(
-    environ: Mapping[str, str], transport=None,
+    environ: Mapping[str, str], transport=None, *, session_factory=None,
 ) -> Callable[[A3ExperimentCell, CurriculumProposal], Callable[[A3ModelProfile, str], A3Completion]]:
     """Build the real model actor without retaining or returning credentials."""
+    from coding.pi.adapters import A3Actor
+    from coding.pi import runtime_preflight
+    if transport is not None:
+        raise ValueError("inject a Pi session factory for offline coding tests")
+    if session_factory is None:
+        runtime_preflight()
     environment = dict(environ)
     def factory(cell: A3ExperimentCell, _proposal: CurriculumProposal):
-        def actor(_profile: A3ModelProfile, context: str) -> A3Completion:
-            return complete_a3(
-                _SYSTEM, context, model=cell.backend_model,
-                environ=environment, transport=transport,
-            )
-        return actor
+        return A3Actor(cell.backend_model, environment, **({"session_factory": session_factory} if session_factory is not None else {}))
     return factory
 
 

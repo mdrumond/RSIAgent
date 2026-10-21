@@ -331,3 +331,6 @@ def test_parallel_actors_serialize_shared_kdb_query(tmp_path, monkeypatch):
         assert all(call.result(timeout=2) == {"query": "copy"} for call in calls)
     assert peak == 1
 
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

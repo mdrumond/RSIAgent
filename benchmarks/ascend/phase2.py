@@ -16,7 +16,7 @@ from benchmarks.a5kernels.phase2_adaptive_memory import (
 )
 from benchmarks.a5kernels.phase2_live import Phase2Dependencies, Phase2LiveRunner
 from benchmarks.a5kernels.phase2_memory import _publish_exact
-from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider, _target_contract
+from benchmarks.a5kernels.phase2_source_provider import PiPhase2SourceProvider, _target_contract
 
 
 REVIEW_SCHEMA = "ascend-phase1-usefulness-review-v1"
@@ -149,12 +149,12 @@ def admit_native_snapshot(source_root, initial_memory, review_path, phase2_root)
     return snapshot
 
 
-class NativeSourceProvider(Phase2SourceProvider):
+class NativeSourceProvider(PiPhase2SourceProvider):
     adaptive_schema = CELL_SCHEMA
     provider_schema = "a3-native-phase2-source-provider-v1"
     source_filename = "candidate.cpp"
     task_prompt = "Produce Ascend C source for the host-owned attention suite."
-    system_prompt = Phase2SourceProvider.system_prompt.replace("Catlass DSL", "Ascend C").replace("complete Python source", "complete Ascend C device source")
+    system_prompt = PiPhase2SourceProvider.system_prompt.replace("Catlass DSL", "Ascend C").replace("complete Python source", "complete Ascend C device source")
 
     def _validate_profiling(self, request):
         expected = request.cell.source_identity.get("profiling_guidance")

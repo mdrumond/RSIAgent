@@ -22,13 +22,14 @@ def main(argv=None):
     create.add_argument('--snapshot-root', action='append', default=[])
     create.add_argument('--name', default='')
     create.add_argument('--idempotency-key')
+    create.add_argument('--max-seconds', type=int, default=7200)
     for command in ('inspect', 'events', 'stop', 'resume', 'list'):
         child = commands.add_parser(command)
         child.add_argument('--store', required=True)
         if command != 'list':
             child.add_argument('job_id')
         if command == 'resume':
-            child.add_argument('--additional-attempts', type=int, required=True)
+            child.add_argument('--additional-attempts', type=int, default=0, help=argparse.SUPPRESS)
             child.add_argument('--additional-seconds', type=int, required=True)
     args = parser.parse_args(argv)
     if args.command == 'discover':
@@ -39,7 +40,7 @@ def main(argv=None):
             result = store.create(Path(args.source).read_text(), args.entrypoint,
                 json.loads(Path(args.signature).read_bytes()),
                 freeze_source(args.memory_root, snapshot_roots=args.snapshot_root),
-                name=args.name, idempotency_key=args.idempotency_key)
+                name=args.name, idempotency_key=args.idempotency_key, max_seconds=args.max_seconds)
         elif args.command == 'resume':
             result = store.resume(args.job_id, additional_attempts=args.additional_attempts,
                                   additional_seconds=args.additional_seconds)

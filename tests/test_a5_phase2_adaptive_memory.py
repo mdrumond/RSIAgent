@@ -195,3 +195,6 @@ def test_new_guidance_reaches_phase2_and_current_qualification_is_required(tmp_p
         build_phase2_production(replace(config, profiling_guidance_text="wrong"),
                                 environment=ENVIRONMENT, transport=transport,
                                 executor=executor, backend=CopyVBackend())
+
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")

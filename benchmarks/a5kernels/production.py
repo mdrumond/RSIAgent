@@ -71,19 +71,9 @@ class ProductionPaths:
 
 
 def _credential_present(environment: Mapping[str, str], env_file: Path) -> bool:
-    environment_value = environment.get("OPENROUTER_API_KEY", "")
-    if environment_value:
-        # Match llm.client._api_key's precedence: a present, truthy environment
-        # value wins even when it is unusable whitespace.  Do not claim that a
-        # dotenv key will rescue a runtime which will never consult that file.
-        return bool(environment_value.strip())
-    try:
-        for line in env_file.read_text(encoding="utf-8").splitlines():
-            if line.startswith("OPENROUTER_API_KEY=") and line.split("=", 1)[1].strip():
-                return True
-    except FileNotFoundError:
-        pass
-    return False
+    from benchmarks.a5kernels.phase1_production import load_direct_environment
+    values = load_direct_environment(environment, env_file=env_file)
+    return bool(values.get("OPENAI_API_KEY", "").strip())
 
 
 def preflight(
@@ -101,7 +91,7 @@ def preflight(
 
     values = os.environ if environment is None else environment
     checks: dict[str, bool] = {
-        "openrouter_credential": _credential_present(
+        "openai_credential": _credential_present(
             values, resolve_env_file(values)
         ),
         "results_parent": paths.results_root.parent.is_dir(),
@@ -294,9 +284,10 @@ def build_production_trial(paths: ProductionPaths):
     )
     from benchmarks.a5kernels.profiling import ProfilingTreatmentController
     from benchmarks.a5kernels.profiling_bz import BZProfileBackend
-    from benchmarks.a5kernels.trial import CoreAttemptDriver, TrialOrchestrator
-    from config.settings import Config
-    from core.trace import ArtifactSink
+    from benchmarks.a5kernels.trial import TrialOrchestrator
+    from coding.pi.actor import PiActorDriver
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 
     command = CatlassValidationExecutor(
         upload_wrapper=str(paths.upload_wrapper),
@@ -348,10 +339,12 @@ def build_production_trial(paths: ProductionPaths):
         kdb=True,
         profiling_guidance=True,
     )
-    actor = CoreAttemptDriver(
-        object(), Config(agent_decided_stop=True),
-        lambda context: ArtifactSink(str(context)),
-    )
+    from benchmarks.a5kernels.phase1_production import load_direct_environment
+    def actor(instruction, *, profile, **kwargs):
+        selected = next(identity for identity in MODEL_IDENTITIES if identity.backend_model.value == profile.model)
+        driver = PiActorDriver(DirectCompletionProvider(load_direct_environment(),
+            models=(selected.backend_model,)))
+        return driver(instruction, profile=direct_profile(selected), **kwargs)
     orchestrator = TrialOrchestrator(
         paths.results_root,
         capabilities,

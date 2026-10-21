@@ -24,17 +24,23 @@ def test_submission_is_immutable_idempotent_and_artifacts_verified(tmp_path):
 
 def test_budget_stop_resume_and_retained_handles(tmp_path):
     store = JobStore(tmp_path)
-    job = create(store, max_attempts=1)
+    job = create(store, max_attempts=1, max_seconds=10)
     key = job['job_id']
     store.transition(key, 'running', stage='compile')
     store.retain_handle(key, 'bz-a3-1:one', operation='compile')
     assert store.get(key)['handles'][0]['handle'] == 'bz-a3-1:one'
     store.record_attempt(key, candidate_sha256='a' * 64, result='compile-failed')
+    assert store.get(key)['status'] == 'running'
+    store.record_attempt(key, candidate_sha256='b' * 64, result='passed')
+    assert store.get(key)['attempts'] == 2  # Legacy attempt metadata never stops work.
+    store.account_time(key, 10)
     assert store.get(key)['status'] == 'budget-exhausted'
     with pytest.raises(ValueError):
         store.record_attempt(key, candidate_sha256='b' * 64, result='passed')
-    store.resume(key, additional_attempts=1, additional_seconds=60)
+    store.resume(key, additional_seconds=60)
     assert store.get(key)['status'] == 'queued'
+    assert store.get(key)['max_seconds'] == 70
+    assert store.get(key)['attempts'] == 2
     store.stop(key)
     assert store.get(key)['stop_requested']
     assert len(store.events(key)) >= 5

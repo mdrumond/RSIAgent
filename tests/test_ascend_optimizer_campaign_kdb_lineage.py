@@ -15,7 +15,7 @@ from test_ascend_phase2_optimizer_tasks import seed
 def test_optimizer_composition_binds_reviewed_kdb_manifest(tmp_path, monkeypatch, collection, manifest):
     guide = tmp_path / "guide.md"
     guide.write_text("Ascend C")
-    config = dict(profile="bz-a3-1", target="bz-a3-1", runtime="py311-torch", physical_device=10,
+    config = dict(model_profile="openai/gpt-5.6-sol", profile="bz-a3-1", target="bz-a3-1", runtime="py311-torch", physical_device=10,
                   arch="dav-2201", cpl_remote="/configured/transport", validation_wrapper="/configured/adapter",
                   remote_workspace="/configured/workspace", guide=str(guide),
                   knowledge=dict(collection=collection, manifest=manifest))

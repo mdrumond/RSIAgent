@@ -50,7 +50,7 @@ from benchmarks.a5kernels.phase2_memory import (
     admit_phase1_snapshot,
     phase2_cells,
 )
-from benchmarks.a5kernels.phase2_source_provider import Phase2SourceProvider
+from benchmarks.a5kernels.phase2_source_provider import PiPhase2SourceProvider
 from benchmarks.a5kernels.sft_dataset import SourceManifest, TraceRecorder
 from benchmarks.a5kernels.production import _probe_knowledge_query, _transformers_cache
 
@@ -103,12 +103,6 @@ class Phase2ProductionConfig:
             raise ValueError(
                 "Phase 2 guide path and CPL skills revision must be supplied together"
             )
-        if (
-            isinstance(self.compile_probes, bool)
-            or not isinstance(self.compile_probes, int)
-            or not 0 <= self.compile_probes <= 20
-        ):
-            raise ValueError("compile_probes must be in [0, 20]")
 
     @property
     def validation_wrapper(self) -> Path:
@@ -458,13 +452,13 @@ def build_phase2_production(
             "session_handle": receipt.session_handle,
         }
 
-    source = Phase2SourceProvider(
+    source = PiPhase2SourceProvider(
         provider,
         evidence_root=config.phase2_root.resolve() / "cells",
         guide_text=phase2_guide_text,
         knowledge_factory=knowledge_factory,
         profiling_guidance=guidance,
-        compile_probe=compile_probe if config.compile_probes else None,
+        compile_probe=compile_probe,
         max_compile_probes=config.compile_probes,
     )
     verifier = AttentionTargetVerifier(backend)

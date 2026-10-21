@@ -46,7 +46,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--max-parallel", type=int, default=1)
     parser.add_argument("--project-target", type=int)
-    parser.add_argument("--max-projects", type=int)
+    parser.add_argument("--max-projects", type=int, help="Deprecated metadata; does not limit execution")
+    parser.add_argument("--max-seconds", type=float, default=7200)
     parser.add_argument("--profiling-guidance-skill", type=Path)
     parser.add_argument("--kdb", type=Path)
     parser.add_argument("--collection", action="append")
@@ -126,6 +127,7 @@ def main(
         embeddings=embeddings,
         max_parallel=args.max_parallel,
         project_target=args.project_target,
+        max_seconds=args.max_seconds,
         **({"max_projects": args.max_projects} if args.max_projects is not None else {}),
         **({"profiling_guidance_text": guidance_text} if guidance_text is not None else {}),
     )
