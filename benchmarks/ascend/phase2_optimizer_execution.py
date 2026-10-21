@@ -18,13 +18,15 @@ from optimizer.loop import OptimizationLoop
 from optimizer.memory import verify_snapshot
 from optimizer.provider import BoundedAgent
 from optimizer.transport import exclusive
-from optimizer.worker import RemoteBackend, knowledge_query
+from optimizer.worker import RemoteBackend, LocalBackend, knowledge_query
+from .execution import apply_worker_config, execution_mode, local_identity, preflight_local
 
 
 class OptimizerTaskExecutor:
     def __init__(self, directory, task, memory_snapshot, config, *, agent=None, backend=None,
                  expected_baseline=None):
         self.directory = Path(directory)
+        config = apply_worker_config(config)
         self.task, self.config = task, config
         self.expected_baseline = expected_baseline
         verify_snapshot(memory_snapshot)
@@ -40,6 +42,8 @@ class OptimizerTaskExecutor:
         identity = {'task': task, 'runtime': {key: config.get(key) for key in (
             'target', 'profile', 'runtime', 'arch', 'physical_device', 'remote_workspace',
             'cpl_remote', 'validation_wrapper', 'max_cases', 'knowledge', 'model_profile')}}
+        if execution_mode(config) == 'local':
+            identity['runtime'].update(local_identity(config))
         if config.get('guide'):
             identity['guide_sha256'] = sha(Path(config['guide']).read_bytes())
         previous = self._event('phase2-task')
@@ -73,7 +77,10 @@ class OptimizerTaskExecutor:
 
     def _loop(self):
         config = self.config
-        backend = self._backend or RemoteBackend(self.store, self.job_id, config)
+        if execution_mode(config) == 'local' and self._backend is None:
+            preflight_local(config)
+        backend = self._backend or (LocalBackend(self.store, self.job_id, config)
+            if execution_mode(config) == 'local' else RemoteBackend(self.store, self.job_id, config))
         if self.deadline is not None:
             backend.deadline = min(getattr(backend, "deadline", self.deadline), self.deadline)
             transport = getattr(backend, "transport", None)

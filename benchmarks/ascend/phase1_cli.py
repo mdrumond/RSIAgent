@@ -47,7 +47,7 @@ class NativeProjectMeasurements:
             compilation=compiled, candidate_backend=self.backend.transport,
             expected_output=request.expected.storage, atol=tolerance, rtol=tolerance,
             environment_identity=self.config["environment_identity"],
-            validation_wrapper=self.config["validation_wrapper"], cpl_remote=self.config["cpl_remote"],
+            validation_wrapper=self.config.get("validation_wrapper"), cpl_remote=self.config.get("cpl_remote"),
             profile=self.config["execution_profile"],
             remote_candidate_directory=str(self.backend.transport.remote_candidate_directory(plan)),
             evidence_directory=self.root / plan.execution_id / "measurements",
@@ -103,11 +103,20 @@ def _guidance(path):
             "actions, not shell commands. Preserve returned evidence identities.\n\n" + text)
 
 
-def load_native_config(path):
+def load_native_config(path, worker_config_path=None):
     """Load machine-local settings; persist content identities, never this mapping."""
-    config = json.loads(Path(path).read_text())
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode, preflight_local
+    config = apply_worker_config(json.loads(Path(path).read_text()), worker_config_path)
+    local = execution_mode(config) == "local"
+    if local:
+        identity = preflight_local(config)
+        config["execution_profile"] = "local"
+        config["environment_identity"] = identity
+        config["compiler_version"] = identity.get("compiler_version")
     required = ("guide", "target", "arch", "execution_profile", "cpl_skills_revision",
-                "cpl_remote", "validation_wrapper", "remote_workspace", "environment_identity")
+                "environment_identity")
+    if not local:
+        required += ("cpl_remote", "validation_wrapper", "remote_workspace")
     missing = [name for name in required if name not in config]
     if missing:
         raise ValueError("native runtime config missing fields: " + ", ".join(missing))
@@ -130,6 +139,10 @@ def native_devices(config):
 
 
 def native_transport(config, root, *, factory=BZA3RemoteCandidateBackend):
+    from benchmarks.ascend.execution import execution_mode
+    if execution_mode(config) == "local":
+        from benchmarks.ascend.local_native import LocalNativeCandidateBackend
+        return LocalNativeCandidateBackend(config)
     return factory(cpl_remote=config["cpl_remote"], validation_wrapper=config["validation_wrapper"],
         profile=config["execution_profile"], remote_workspace=config["remote_workspace"],
         physical_device=config["physical_device"], state_directory=Path(root) / "transport-state")
@@ -152,6 +165,7 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
     parser.add_argument("--objective", required=True)
     parser.add_argument("--initial-memory", required=True, type=Path)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--env-file", type=Path)
     parser.add_argument("--model", choices=[i.backend_model.value for i in MODEL_IDENTITIES])
     parser.add_argument("--knowledge", choices=("with-kdb", "without-kdb"))
@@ -169,7 +183,7 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
     else:
         if any(v is None for v in (args.config, args.model, args.knowledge, args.profiling)):
             parser.error("live native actions require --config, --model, --knowledge, --profiling")
-        config = load_native_config(args.config)
+        config = load_native_config(args.config, args.worker_config)
         guide = Path(config["guide"]).read_bytes()
         profile = direct_profile(next(i for i in MODEL_IDENTITIES if i.backend_model.value == args.model))
         embeddings, kdb, collection = None, None, None
@@ -195,8 +209,12 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             transport = native_transport(worker_config, worker_root, factory=transport_factory)
             backend = NativeProjectBackend(transport, worker_root / "native-measurement-evidence",
                 target=config["target"], arch=config["arch"], profile=config["execution_profile"])
+            selected_measurements = measurement_factory
+            if worker_config.get("execution") == "local":
+                from benchmarks.ascend.local_native import LocalNativeMeasurements
+                selected_measurements = LocalNativeMeasurements
             measurements = NativeProjectMeasurements(backend, worker_config, worker_root / "measurements",
-                                                      factory=measurement_factory)
+                                                      factory=selected_measurements)
             workers.append(NativeProjectWorker(worker_root, transport,
                 _measurement_action(measurements, profiling=True),
                 _measurement_action(measurements, profiling=False)))

@@ -14,7 +14,7 @@ def native_runner(args):
     from benchmarks.a5kernels.phase1_production import load_direct_environment
     from benchmarks.a5kernels.phase2_production import _knowledge_factory
 
-    config = load_native_config(args.config)
+    config = load_native_config(args.config, getattr(args, "worker_config", None))
     snapshot = admit_native_snapshot(args.phase1_root, args.initial_memory.read_bytes(), args.review, args.root)
     identity = snapshot.destination.source_identity
     for key in ("target", "arch", "execution_profile", "cpl_skills_revision"):
@@ -56,6 +56,7 @@ def main(argv=None, *, runner_factory=native_runner, sleeper=time.sleep):
     parser = argparse.ArgumentParser(description=__doc__, parents=[selector])
     parser.add_argument("command", choices=("admit", "run"))
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--phase1-root", type=Path, required=True)
     parser.add_argument("--initial-memory", type=Path, required=True)

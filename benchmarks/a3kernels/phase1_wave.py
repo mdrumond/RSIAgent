@@ -45,7 +45,7 @@ _KNOWLEDGE_IDENTITY_FIELDS = {
     "knowledge_manifest_sha256", "knowledge_collection_sha256",
     "knowledge_probe_sha256",
 }
-_BZ_A3_EXECUTION_PROFILES = frozenset({"bz-a3-1", "bz-a3-2"})
+_BZ_A3_EXECUTION_PROFILES = frozenset({"bz-a3-1", "bz-a3-2", "local"})
 
 
 def full_dry_run() -> dict[str, object]:
@@ -220,6 +220,7 @@ class Phase1Config:
     corpus_artifacts: Path
     knowledge_database: Path
     knowledge_manifest: Path
+    worker_config: dict | None = None
 
     def preflight(
         self,
@@ -230,7 +231,7 @@ class Phase1Config:
         driver = profile_driver_asset()
         selected = foundation_cells() if cells is None else tuple(cells)
         paths = {
-            "validation_wrapper": self.validation_wrapper.is_file()
+            "validation_wrapper": bool(self.worker_config and self.worker_config.get("execution") == "local") or self.validation_wrapper.is_file()
             and os.access(self.validation_wrapper, os.X_OK)
             and self.validation_wrapper.name == "catlass-validation.sh",
             "profile_driver": (

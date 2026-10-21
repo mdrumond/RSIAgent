@@ -68,6 +68,7 @@ class Phase2Dependencies:
     verify: TargetVerifier
     trace: TraceSink | None = None
     cell_type: type = A5Phase2Cell
+    execution_profile: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.cell, self.cell_type):
@@ -130,6 +131,10 @@ class Phase2LiveRunner:
         self.phase2_root = Path(phase2_root).resolve()
         self.snapshot = snapshot
         self.dependencies = dependencies
+        if dependencies.execution_profile is not None:
+            if dependencies.execution_profile not in {"bz-a5", "local"}:
+                raise ValueError("unrecognized Phase 2 execution profile")
+            self.execution_profile = dependencies.execution_profile
         self.root = self.phase2_root / "cells" / dependencies.cell.cell_id
         self.time = Phase2TimeBudget(self.root, max_seconds, clock=clock)
         if snapshot.root.resolve() != self.root / "snapshot":
@@ -271,9 +276,11 @@ class Phase2LiveRunner:
         else:
             # Infrastructure errors intentionally propagate before evidence or
             # memory is committed.  Resume therefore retries this same attempt.
-            evidence = self.dependencies.verify(
-                source, request.request_id, request.attempt_id, attempt_root / "host",
-            )
+            from benchmarks.ascend.execution import process_deadline
+            with process_deadline(time.monotonic() + self.time.remaining):
+                evidence = self.dependencies.verify(
+                    source, request.request_id, request.attempt_id, attempt_root / "host",
+                )
             if not isinstance(evidence, self.evidence_type):
                 raise TypeError("Phase 2 verifier must return AttentionTargetEvidence")
             self._validate_evidence(evidence, source, request)

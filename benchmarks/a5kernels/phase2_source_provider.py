@@ -700,7 +700,10 @@ class Phase2SourceProvider:
             ):
                 raise ValueError("retained compile probe changed identity")
             return {key: retained[key] for key in _PROBE_RESULT_KEYS}
-        result = dict(self.compile_probe(source, probe_root / "host"))
+        from benchmarks.ascend.execution import process_deadline
+        remaining = max(0, self.deadline-self.clock()) if hasattr(self, 'deadline') else self.max_seconds
+        with process_deadline(time.monotonic() + remaining):
+            result = dict(self.compile_probe(source, probe_root / "host"))
         if set(result) != _PROBE_RESULT_KEYS:
             raise ValueError("compile probe returned an invalid result contract")
         if (

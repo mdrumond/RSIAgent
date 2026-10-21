@@ -39,7 +39,7 @@ _LEARNING_SCHEMA = "a3-phase2-learning-v1"
 _LEARNING_KINDS = frozenset({
     "target-attempt", "target-verdict", "practice", "curriculum",
 })
-_AUTHORITATIVE_PROFILES = frozenset({"bz-a3-1", "bz-a3-2"})
+_AUTHORITATIVE_PROFILES = frozenset({"bz-a3-1", "bz-a3-2", "local"})
 
 
 def _sha256(value: bytes) -> str:

@@ -204,6 +204,13 @@ def build_controller(job):
     arguments = ["run", "--root", job["root"], "--objective", job["objective"],
                  "--initial-memory", initial_memory,
                  "--project-target", str(job["project_target"]), *settings["phase1_arguments"]]
+    if job.get("worker_config"):
+        data = Path(job["worker_config"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != job["worker_config_sha256"]:
+            raise ValueError("worker execution configuration changed on resume")
+        if "--worker-config" in arguments:
+            raise ValueError("choose campaign --worker-config or phase1_arguments worker config")
+        arguments += ["--worker-config", job["worker_config"]]
     with redirect_stdout(io.StringIO()):
         target_main(["--target", job["target"], *arguments], native_builder=capture,
                     native_parallel=job["phase"] == 1,
@@ -225,9 +232,9 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
     data = Path(path).read_bytes()
     if hashlib.sha256(data).hexdigest() != job["optimizer_worker_config_sha256"]:
         raise ValueError("optimizer worker configuration changed on resume")
-    config = load_config(path)
+    config = load_config(path, job.get("worker_config"))
     runtime = getattr(getattr(composed.execute_project, "executor", None), "runtime_identity", None)
-    if (config["profile"] != native.execution_profile or config["arch"] != native.arch
+    if (("local" if config.get("execution") == "local" else config["profile"]) != native.execution_profile or config["arch"] != native.arch
             or runtime is None or str(config["physical_device"]) != str(runtime["device"])
             or hashlib.sha256(Path(config["guide"]).read_bytes()).hexdigest() != native.guide_sha256
             or config.get("model_profile", "deepseek-flash") != job["model"]):
@@ -718,9 +725,19 @@ def collector_worker(job, *, once=False, factory=ArtifactCollector, sleeper=time
     if job["target"] == "a3":
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--config", type=Path)
+        parser.add_argument("--worker-config", type=Path)
         native, _ = parser.parse_known_args(_read(job["config"])["phase1_arguments"])
-        if native.config is not None:
-            transport["cpl_remote"] = _read(native.config)["cpl_remote"]
+        from benchmarks.ascend.execution import apply_worker_config, execution_mode
+        settings = apply_worker_config(_read(native.config) if native.config else {},
+                                      job.get("worker_config") or native.worker_config)
+        if execution_mode(settings) == "local":
+            transport["execution"] = "local"
+        elif native.config is not None:
+            transport["cpl_remote"] = settings["cpl_remote"]
+    elif job.get("worker_config"):
+        from benchmarks.ascend.execution import apply_worker_config, execution_mode
+        if execution_mode(apply_worker_config({}, job["worker_config"])) == "local":
+            transport["execution"] = "local"
     worker = factory(job["root"], control / "reports", control / "collector.json", **transport)
     while True:
         try:
@@ -808,6 +825,7 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--objective", required=True)
             sub.add_argument("--initial-memory", type=Path, required=True)
             sub.add_argument("--config", type=Path, required=True)
+            sub.add_argument("--worker-config", type=Path)
             sub.add_argument("--project-target", type=int, required=True)
             sub.add_argument("--target-goal", type=Path,
                              help="host-qualified TargetContract JSON; omission lets curriculum author and qualify a new goal")
@@ -948,6 +966,9 @@ def main(argv=None, *, screen=start_screen):
                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
                "phase1_root": str(args.phase1_root.resolve()) if args.phase1_root else None,
                "review": str(args.review.resolve()) if args.review else None}
+        if args.worker_config is not None:
+            job["worker_config"] = str(args.worker_config.resolve(strict=True))
+            job["worker_config_sha256"] = hashlib.sha256(args.worker_config.read_bytes()).hexdigest()
         if job.get("optimizer_goal") and settings.get("optimizer_worker_config"):
             job["optimizer_worker_config_sha256"] = hashlib.sha256(
                 Path(settings["optimizer_worker_config"]).read_bytes()).hexdigest()

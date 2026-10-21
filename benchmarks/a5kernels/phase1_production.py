@@ -446,18 +446,20 @@ def build_phase1_live_dependencies(
         raise ValueError("results root parent does not exist")
     if not paths.kdb.is_file() or not paths.bge_cache.is_dir():
         raise ValueError("pinned embeddings and KDB are required before dispatch")
+    from benchmarks.ascend.execution import execution_mode
+    local = paths.worker_config is not None and execution_mode(paths.worker_config) == "local"
     execution_wrappers = (
         paths.validation_wrapper,
         paths.session_wrapper,
         paths.upload_wrapper,
         paths.provenance_wrapper,
     )
-    if execution_backend is None and any(
+    if not local and execution_backend is None and any(
         not path.is_file() or not os.access(path, os.X_OK)
         for path in execution_wrappers
     ):
         raise ValueError("checked BZ-A5 execution wrappers are unavailable")
-    if profile_backend is None and (
+    if not local and profile_backend is None and (
         not paths.validation_wrapper.is_file()
         or not os.access(paths.validation_wrapper, os.X_OK)
         or not paths.collection_wrapper.is_file()
@@ -482,6 +484,21 @@ def build_phase1_live_dependencies(
     finally:
         database.close()
 
+    from benchmarks.ascend.execution import execution_mode
+    local = paths.worker_config is not None and execution_mode(paths.worker_config) == "local"
+    identity_path = paths.results_root / "local-execution-identity.json"
+    if local:
+        from benchmarks.ascend.execution import bind_local_identity
+        if not identity_path.exists() and any(paths.results_root.rglob("terminal.json")):
+            raise ValueError("cannot resume remote fixed A5 state with local execution")
+        bind_local_identity(paths.results_root, paths.worker_config)
+        from benchmarks.ascend.local_catlass import LocalSessionAdapter, LocalProfileBackend
+        if execution_backend is None:
+            execution_backend = LocalSessionAdapter(paths.worker_config)
+        if profile_backend is None:
+            profile_backend = LocalProfileBackend(paths.worker_config, evidence_directory=paths.results_root / "profile-evidence")
+    if not local and identity_path.exists():
+        raise ValueError("cannot resume local fixed A5 state with remote execution")
     if execution_backend is None:
         command = CatlassValidationExecutor(
             upload_wrapper=str(paths.upload_wrapper),

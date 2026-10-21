@@ -119,7 +119,7 @@ class Phase2LiveDependencies:
     ]
 
     def __post_init__(self) -> None:
-        if self.execution_profile not in {"bz-a3-1", "bz-a3-2"}:
+        if self.execution_profile not in {"bz-a3-1", "bz-a3-2", "local"}:
             raise ValueError("Phase 2 live execution requires a BZ-A3 profile")
         if not isinstance(self.cell, A3ExperimentCell):
             raise TypeError("Phase 2 live dependencies require an experiment cell")

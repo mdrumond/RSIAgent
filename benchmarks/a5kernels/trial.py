@@ -377,7 +377,9 @@ class TrialActionExecutor:
         if action_ref is not None:
             self._artifact("action-payload", action_ref, ordinal=self.total_actions)
             self.admitted_artifacts[action_ref] = "action"
-        outcome = handler(action.payload)
+        from benchmarks.ascend.execution import process_deadline
+        with process_deadline(self.deadline):
+            outcome = handler(action.payload)
         if self.artifacts is not None:
             observation_ref = self.artifacts.put_bytes(outcome.observation.encode("utf-8"))
             self._artifact("host-observation", observation_ref, ordinal=self.total_actions)

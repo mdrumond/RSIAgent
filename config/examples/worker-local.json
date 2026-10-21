@@ -1,0 +1,7 @@
+{
+  "execution": "local",
+  "workspace": "/absolute/path/to/local-kernel-workspace",
+  "physical_device": 0,
+  "arch": "REPLACE_WITH_DISCOVERED_COMPILER_ARCHITECTURE",
+  "guide": "/absolute/path/to/programming-guide.md"
+}

@@ -38,6 +38,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--guide", type=Path)
     parser.add_argument("--cpl-skills-revision")
     parser.add_argument("--tla-root", type=Path)
+    parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--catlass-source")
     parser.add_argument("--catlass-revision")
     parser.add_argument("--model", choices=[item.value for item in A5BackendModel])
@@ -70,6 +71,13 @@ def main(
         result = reporter(args.root, args.objective, initial_memory)
         print(json.dumps(result, sort_keys=True, separators=(",", ":")))
         return
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode
+    worker = apply_worker_config({}, args.worker_config) if args.worker_config else None
+    if worker is not None and execution_mode(worker) == "local":
+        args.catlass_source = worker["catlass_source"]
+        args.catlass_revision = worker["catlass_revision"]
+        args.device = worker["physical_device"]
+        args.tla_root = args.tla_root or Path.cwd()
     required = {
         "--guide": args.guide,
         "--cpl-skills-revision": args.cpl_skills_revision,
@@ -119,6 +127,7 @@ def main(
             args.kdb,
             (args.collection[0] if args.collection and len(args.collection) == 1
              else tuple(args.collection) if args.collection else None),
+            worker_config=worker,
         ),
         objective=args.objective,
         initial_memory=initial_memory,

@@ -206,6 +206,11 @@ class _ProjectActions:
         self.latest_run_at: int | None = None
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
+        from benchmarks.ascend.execution import process_deadline
+        with process_deadline(self.deadline):
+            return self._execute_action(action)
+
+    def _execute_action(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
             raise TypeError("adaptive projects accept only TrialAction values")
         self.actions.append(action.kind)

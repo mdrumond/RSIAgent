@@ -55,13 +55,14 @@ def _parser() -> argparse.ArgumentParser:
                 action="append",
                 help="run or resume exactly one registered runnable cell",
             )
-            command.add_argument("--tla-root", type=Path, required=True)
-            command.add_argument("--profiling-skill-root", type=Path, required=True)
-            command.add_argument("--catlass-source", required=True)
+            command.add_argument("--tla-root", type=Path)
+            command.add_argument("--worker-config", type=Path)
+            command.add_argument("--profiling-skill-root", type=Path)
+            command.add_argument("--catlass-source")
             command.add_argument("--bge-cache", type=Path, required=True)
             command.add_argument("--kdb", type=Path, required=True)
             command.add_argument("--collection", action="append", required=True)
-            command.add_argument("--device", type=int, required=True)
+            command.add_argument("--device", type=int)
             command.add_argument("--env-file", type=Path)
             command.add_argument(
                 "--compile-probes",
@@ -88,7 +89,18 @@ def _paths(
     *,
     results_root: Path | None = None,
 ) -> ProductionPaths:
+    from benchmarks.ascend.execution import apply_worker_config, execution_mode
+    worker = apply_worker_config({}, getattr(args, "worker_config", None)) if getattr(args, "worker_config", None) else None
+    local = worker is not None and execution_mode(worker) == "local"
+    if local:
+        args.tla_root = args.tla_root or Path.cwd()
+        args.profiling_skill_root = args.profiling_skill_root or Path.cwd()
+        args.device = worker["physical_device"]
+        args.catlass_source = worker["catlass_source"]
+    if args.profiling_skill_root is None or args.tla_root is None or args.device is None or args.catlass_source is None:
+        raise ValueError("remote execution requires explicit toolchain paths and device")
     return ProductionPaths(
+        worker_config=worker,
         tla_root=args.tla_root,
         profiling_skill_root=args.profiling_skill_root,
         catlass_source=args.catlass_source,

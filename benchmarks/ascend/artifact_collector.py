@@ -41,7 +41,10 @@ class ArtifactCollector:
     """
 
     def __init__(self, campaign_root, artifact_store, state_path, *,
-                 cpl_remote=None, free_floor_bytes=5 * 1024**3):
+                 cpl_remote=None, free_floor_bytes=5 * 1024**3, execution="remote"):
+        if execution not in {"local", "remote"}:
+            raise ValueError("invalid collector execution mode")
+        self.execution = execution
         self.root = Path(campaign_root).resolve()
         self.store = Path(artifact_store).resolve()
         self.path = Path(state_path).resolve()
@@ -153,6 +156,26 @@ class ArtifactCollector:
         self._save(state)
 
     def _transfer(self, state, entry, now):
+        if self.execution == "local":
+            try:
+                source = Path(entry["remote_path"])
+                if not source.is_absolute():
+                    raise ValueError("local report requires an absolute retained path")
+                digest = report_digest(source)
+                if entry.get("expected_sha256") and entry["expected_sha256"] != digest:
+                    raise ValueError("local report differs from retained digest")
+                if not entry.get("expected_sha256"):
+                    entry.update(expected_sha256=digest, digest_origin="collection-time")
+                staging = self.store / (".partial-" + entry["id"])
+                shutil.copytree(source, staging, dirs_exist_ok=True)
+                if report_digest(staging) != digest:
+                    raise ValueError("local report changed during collection")
+                staging.replace(self.store / entry["id"])
+                self._complete(entry)
+            except (OSError, ValueError) as error:
+                self._retry(entry, now, str(error))
+            self._save(state)
+            return
         if not entry.get("backend"):
             try:
                 probe = subprocess.run([self.command, "--json", "capabilities", entry["target"]],

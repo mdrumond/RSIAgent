@@ -672,9 +672,18 @@ class RemoteCandidateBundle:
         execution_profile = getattr(self.backend, "profile", "gz-a3")
         if requested_profile is not None and requested_profile != execution_profile:
             raise ValueError("candidate execution profile does not match its backend")
-        return self.planner.plan(
-            source, execution_profile=execution_profile, **selected
-        )
+        plan = self.planner.plan(source, execution_profile=execution_profile, **selected)
+        if execution_profile == "local":
+            from benchmarks.a3kernels.phase1_protocol import SourceFile
+            updated = []
+            for item in plan.files:
+                if item.relative_path == "build.json":
+                    build = json.loads(item.content)
+                    build["arch"] = self.backend.config["arch"]
+                    item = SourceFile(item.relative_path, json.dumps(build, sort_keys=True))
+                updated.append(item)
+            plan = replace(plan, files=tuple(updated))
+        return plan
 
     def compile(self, source, workdir, **options):
         plan = self._plan(source, options)
