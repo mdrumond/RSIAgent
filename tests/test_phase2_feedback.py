@@ -548,7 +548,12 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
     store = FeedbackStore(tmp_path / 'feedback')
     report = store.import_campaign(root)
     assert report['imported'] == 0
-    assert any('import deferred' in warning for warning in report['warnings'])
+    if execution.store.get(execution.job_id)['status'] == 'running':
+        # A result-event interruption leaves an active job; only terminal jobs
+        # need an explicit warning that evaluated evidence awaits reconciliation.
+        assert report['warnings'] == []
+    else:
+        assert any('import deferred' in warning for warning in report['warnings'])
     if window == 'result-event':
         monkeypatch.setattr(execution.store, 'add_event', original)
     else:
