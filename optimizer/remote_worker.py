@@ -19,6 +19,7 @@ def execute(request):
     directory = Path(request['directory'])
     directory.mkdir(parents=True, exist_ok=True)
     baseline = Path(request['baseline'])
+    cache_directory = baseline.parent / 'compiled-cache'
     operation = request['operation']
     if operation == 'prepare':
         prepared = prepare_reference(request['spec'], device='npu:0', max_cases=request.get('max_cases', 24))
@@ -32,10 +33,11 @@ def execute(request):
             result['cases'].append({'case': row['case']['id'], 'contract': describe_case(prepared, row), 'timing': {'torch': timing}})
     elif operation == 'compile':
         result = compile_candidate(baseline, request['source'], directory / 'compilation',
-                                   arch=request['arch'], block_count=request['block_count'])
+                                   arch=request['arch'], block_count=request['block_count'], cache_directory=cache_directory)
     elif operation == 'evaluate' or request.get('source') is not None:
         result = evaluate(baseline, request['source'], directory / 'evaluation', arch=request['arch'],
-                          block_count=request['block_count'], benchmark=operation == 'evaluate', profile=operation == 'profile')
+                          block_count=request['block_count'], benchmark=operation == 'evaluate', profile=operation == 'profile',
+                          cache_directory=cache_directory)
     else:
         prepared = load_reference(baseline, 'npu:0')
         result = {'suite_sha256': prepared.manifest['suite_sha256'], 'cases': []}

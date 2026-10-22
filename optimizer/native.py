@@ -10,7 +10,9 @@ import hashlib
 import json
 import math
 from pathlib import Path
-import uuid
+import os
+import shutil
+import subprocess
 
 from .cases import digest
 from .reference import (POLICY, PreparedReference, ReferenceError, _input_state,
@@ -159,35 +161,121 @@ def render_wrapper(candidate, contract, namespace, block_count):
         f'TORCH_LIBRARY_IMPL({namespace}, PrivateUse1, m) {{ m.impl("launch", {namespace}_host::launch); }}'])
 
 
-def _compile_case(source, contract, directory, *, arch, block_count):
+_LOADED = {}
+_CACHE_BYTES = 2 * 1024 ** 3
+
+
+def _compile_identity(torch, torch_npu, compiler, includes, libraries):
+    """Observed host toolchain identity, not a caller's product/version label."""
+    def stamp(path):
+        path = Path(path).resolve()
+        stat = path.stat()
+        return [str(path), stat.st_size, stat.st_mtime_ns]
+    files = [stamp(compiler)]
+    for directory in libraries:
+        for path in sorted(Path(directory).glob('*.so*')):
+            if path.is_file():
+                files.append(stamp(path))
+    for directory in includes:
+        for name in ('kernel_operator.h', 'torch/version.h', 'torch_npu/csrc/core/npu/NPUStream.h'):
+            path = Path(directory) / name
+            if path.is_file():
+                files.append(stamp(path))
+    return {'compiler': subprocess.check_output([compiler, '--version'], text=True),
+            'files': files, 'torch': torch.__version__, 'torch_npu': torch_npu.__version__,
+            'torch_abi': int(torch._C._GLIBCXX_USE_CXX11_ABI),
+            'runtime': {name: os.environ.get(name) for name in
+                        ('ASCEND_HOME_PATH', 'ASCEND_OPP_PATH', 'LD_LIBRARY_PATH', 'CANN_VERSION')},
+            'wrapper_implementation': _sha(Path(__file__).read_bytes())}
+
+
+def _cache_record(root, wrapper):
+    try:
+        record = json.loads((root / 'compiled.json').read_text())
+        if ((root / 'kernel.cpp').read_text() == wrapper
+                and record['wrapper_sha256'] == _sha(wrapper.encode())
+                and record['binary_sha256'] == _sha((root / 'kernel.so').read_bytes())):
+            return record
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _prune_cache(root, keep):
+    entries = sorted((p for p in root.iterdir() if p.is_dir()),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    total = 0
+    for path in entries:
+        size = sum(p.stat().st_size for p in path.rglob('*') if p.is_file())
+        total += size
+        if total > _CACHE_BYTES and path != keep:
+            shutil.rmtree(path)
+
+
+def _compile_case(source, contract, directory, *, arch, block_count, cache_directory=None):
     import torch
     import torch_npu
-    import shutil
-    import subprocess
+    import fcntl
     from benchmarks.a3kernels.ascendc_runtime.host_driver import _toolchain_paths
-    root = Path(directory)
-    root.mkdir(parents=True, exist_ok=False)
-    namespace = 'optimizer_' + uuid.uuid4().hex
-    (root / 'kernel.cpp').write_text(render_wrapper(source, contract, namespace, block_count))
-    spec = {'compiler': 'bisheng', 'arch': arch, 'source': 'kernel.cpp', 'output': 'kernel.so'}
-    (root / 'build.json').write_text(json.dumps(spec))
+    output = Path(directory)
+    output.mkdir(parents=True, exist_ok=True)
     compiler = shutil.which('bisheng')
     if not compiler:
         raise RuntimeError('bisheng compiler not found on PATH')
     includes, libraries = _toolchain_paths(torch, torch_npu)
-    library = root / 'kernel.so'
-    argv = [compiler, '-x', 'asc', f'--npu-arch={arch}', '-shared', '-fPIC', '-std=c++17',
-            f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}',
-            '-ltorch_npu', '-ltorch', '-lc10', str((root / 'kernel.cpp').resolve()),
-            '-o', str(library.resolve()), *(f'-I{x}' for x in includes), *(f'-L{x}' for x in libraries)]
-    (root / 'command.json').write_text(json.dumps(argv))
-    with (root / 'compile.log').open('w') as log:
-        subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, check=True)
-    if not library.is_file():
-        raise RuntimeError('compiler produced no library')
-    torch.ops.load_library(str(library.resolve()))
-    return getattr(torch.ops, namespace).launch, {'binary_sha256': _sha(library.read_bytes()),
-            'wrapper_sha256': _sha((root / 'kernel.cpp').read_bytes()), 'build': spec, 'namespace': namespace}
+    identity = {'source': source, 'contract': contract, 'arch': arch, 'block_count': block_count,
+                'environment': _compile_identity(torch, torch_npu, compiler, includes, libraries)}
+    key = _sha(json.dumps(identity, sort_keys=True, allow_nan=False).encode())
+    cache = Path(cache_directory) if cache_directory is not None else output.parent / 'compiled-cache'
+    cache.mkdir(parents=True, exist_ok=True)
+    namespace = 'optimizer_' + _sha((str(cache.resolve()) + ':' + key).encode())
+    wrapper = render_wrapper(source, contract, namespace, block_count)
+    root = cache / key
+    # One small job-owned lock covers publication and bounded eviction. No failed
+    # compilation can publish a hit; separate worker processes share this cache.
+    with (cache / '.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        record = _cache_record(root, wrapper)
+        hit = record is not None
+        if not hit:
+            if root.exists():
+                shutil.rmtree(root)
+            root.mkdir()
+            (root / 'kernel.cpp').write_text(wrapper)
+            observed = identity['environment']
+            spec = {'compiler': 'bisheng', 'arch': arch, 'source': 'kernel.cpp', 'output': 'kernel.so',
+                    'compiler_version': observed['compiler'], 'torch': observed['torch'],
+                    'torch_npu': observed['torch_npu'], 'torch_abi': observed['torch_abi']}
+            (root / 'build.json').write_text(json.dumps(spec))
+            library = root / 'kernel.so'
+            argv = [compiler, '-x', 'asc', f'--npu-arch={arch}', '-shared', '-fPIC', '-std=c++17',
+                    f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}',
+                    '-ltorch_npu', '-ltorch', '-lc10', str((root / 'kernel.cpp').resolve()),
+                    '-o', str(library.resolve()), *(f'-I{x}' for x in includes), *(f'-L{x}' for x in libraries)]
+            (root / 'command.json').write_text(json.dumps(argv))
+            try:
+                with (root / 'compile.log').open('w') as log:
+                    subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, check=True)
+                if not library.is_file():
+                    raise RuntimeError('compiler produced no library')
+                record = {'binary_sha256': _sha(library.read_bytes()), 'wrapper_sha256': _sha(wrapper.encode()),
+                          'build': spec, 'namespace': namespace, 'cache_key': key}
+                (root / 'compiled.json').write_text(json.dumps(record))
+            finally:
+                for name in ('kernel.cpp', 'build.json', 'command.json', 'compile.log'):
+                    if (root / name).is_file():
+                        shutil.copy2(root / name, output / name)
+        for name in ('kernel.cpp', 'build.json', 'command.json', 'compiled.json', 'compile.log'):
+            shutil.copy2(root / name, output / name)
+        library = root / 'kernel.so'
+        if namespace not in _LOADED:
+            torch.ops.load_library(str(library.resolve()))
+            _LOADED[namespace] = (record['binary_sha256'], getattr(torch.ops, namespace).launch)
+        elif _LOADED[namespace][0] != record['binary_sha256']:
+            raise RuntimeError('compiled binary changed after Torch registration; restart worker')
+        os.utime(root, None)
+        _prune_cache(cache, root)
+        return _LOADED[namespace][1], {**record, 'cache_hit': hit}
 
 
 def _rebuild(template, leaves):
@@ -206,7 +294,7 @@ def _benchmark(*args, **kwargs):
     return benchmark(*args, **kwargs)
 
 
-def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, block_count=1):
+def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, block_count=1, cache_directory=None):
     """Compile all frozen case wrappers, but never launch the candidate kernel."""
     prepared = load_reference(reference, device) if isinstance(reference, (str, Path)) else reference
     _validate_prepared(prepared)
@@ -221,7 +309,7 @@ def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, 
         result['cases'].append(record)
         try:
             _, record['compilation'] = _compile_case(candidate, describe_case(prepared, row),
-                case_root, arch=arch, block_count=block_count)
+                case_root, arch=arch, block_count=block_count, cache_directory=cache_directory)
         except Exception as exc:
             result['status'] = 'compile-error'
             record['error'] = f'{type(exc).__name__}: {exc}'
@@ -231,7 +319,7 @@ def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, 
 
 
 def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_count=1,
-             benchmark=False, profile=False):
+             benchmark=False, profile=False, cache_directory=None):
     """Evaluate exactly a prepared/frozen suite; timing starts after all cases pass.
 
     One process per candidate is required: device crashes cannot be recovered here.
@@ -256,7 +344,7 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
         record = {'case': row['case']['id'], 'contract': describe_case(prepared, row)}
         result['cases'].append(record)
         try:
-            run, provenance = _compile_case(candidate, record['contract'], root / f'case-{i}', arch=arch, block_count=block_count)
+            run, provenance = _compile_case(candidate, record['contract'], root / f'case-{i}', arch=arch, block_count=block_count, cache_directory=cache_directory)
             record['compilation'] = provenance
             def fresh(row=row, run=run):
                 args, kwargs = copy.deepcopy((row['args'], row['kwargs']))
