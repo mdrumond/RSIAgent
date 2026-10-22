@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 from pathlib import Path
 import sys
 import time
@@ -176,7 +177,7 @@ def main(
                 raise
             failures += 1
             sleeper(BACKOFF_SECONDS)
-    print(json.dumps(terminal, sort_keys=True, separators=(",", ":")))
+    print(json.dumps(describe_statuses(terminal), sort_keys=True, separators=(",", ":")))
     return 0
 
 

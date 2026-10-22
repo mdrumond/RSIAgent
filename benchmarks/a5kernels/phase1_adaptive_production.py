@@ -369,6 +369,7 @@ def build_adaptive_phase1(
     max_seconds: float = 7200,
     profiling_guidance_text: str | None = None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
+    usefulness_enabled=False, usefulness_pair_seconds=600,
 ) -> AdaptivePhase1Production:
     """Bind one registered treatment cell without fallback routes."""
 
@@ -453,6 +454,7 @@ def build_adaptive_phase1(
         max_projects=max_projects,
         max_seconds=max_seconds,
         reviewed_snapshot=reviewed_snapshot, trace_hook=trace_hook,
+        usefulness_enabled=usefulness_enabled, usefulness_pair_seconds=usefulness_pair_seconds,
     )
     return AdaptivePhase1Production(
         admitted,

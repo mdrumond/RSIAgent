@@ -417,3 +417,47 @@ def test_practice_selection_expiry_forces_target_without_practice_attempt(tmp_pa
     assert coordinator.resume()['status'] == 'READY'
     assert attempts == [proposal()['task_id'], proposal()['task_id']]
     assert json.loads((tmp_path / 'time-budget.json').read_bytes())['elapsed_seconds'] == 7
+
+
+def test_verified_optimizer_lesson_assessed_with_frozen_prior_memory(tmp_path):
+    from types import SimpleNamespace
+    build, calls, _, _ = setup(tmp_path)
+    assessments = []
+    coordinator = build()
+    coordinator.usefulness_verifier = SimpleNamespace(assess_lesson=lambda *args, **kwargs:
+        assessments.append((args, kwargs)))
+    coordinator.resume()
+    assert len(assessments) == 1
+    args, kwargs = assessments[0]
+    assert args[0]['category'] == 'host-verification'
+    assert json.loads(args[1]) == calls[0][2]['memory_snapshot']
+    assert args[0] not in json.loads(args[1])['memory_entries']
+    assert kwargs['host_facts'][0]['verified'] is True
+
+
+def test_committed_memory_assessment_replayed_after_interrupted_hook(tmp_path):
+    from types import SimpleNamespace
+    build, calls, _, _ = setup(tmp_path)
+    assert build().resume()['status'] == 'READY'
+    assessments = []
+    resumed = build()
+    resumed.usefulness_verifier = SimpleNamespace(assess_lesson=lambda *args, **kwargs:
+        assessments.append(args))
+    assert resumed.resume()['status'] == 'READY'
+    assert len(calls) == 1
+    assert len(assessments) == 1
+    assert assessments[0][2] == calls[0][0]
+
+
+def test_usefulness_work_consumes_parent_optimizer_allocation(tmp_path):
+    from types import SimpleNamespace
+    build, _, _, _ = setup(tmp_path)
+    coordinator = build()
+    now = [0.0]
+    coordinator.time.clock = lambda: now[0]
+    def assess(*args, **kwargs):
+        assert coordinator.time.started is not None
+        now[0] += 4
+    coordinator.usefulness_verifier = SimpleNamespace(assess_lesson=assess)
+    coordinator.run_attempt()
+    assert coordinator.time.state['elapsed_seconds'] == 4
