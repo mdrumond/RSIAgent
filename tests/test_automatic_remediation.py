@@ -258,7 +258,7 @@ def test_selection_uses_failure_allowance_and_discards_late_wave(tmp_path, late_
             return (_wave(prompt, [_project('must-not-run', 'gm-ub-movement')])
                     if late_decision == 'wave' else '{invalid')
         return 'DECISION: STALLED\n{"reason":"No eligible work remains."}'
-    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}', CurriculumAgent(complete),
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}', CurriculumAgent(complete, clock=lambda:now[0]),
         lambda request:executed.append(request), max_parallel=1, project_target=1,
         max_seconds=100, clock=lambda:now[0])
     automatic = AutomaticRemediation(runner, target='a3', seconds=5,
