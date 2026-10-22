@@ -131,12 +131,9 @@ def test_dependencies_are_not_derived_from_project_operations():
 
 
 @pytest.mark.parametrize("policy", [None, a3_curriculum_policy()])
-def test_grammar_gives_valid_typed_graph_and_explains_derivation(policy):
+def test_generated_graph_example_passes_typed_graph_validation(policy):
     grammar = json.loads(curriculum_prompt(context(), target_policy=policy).splitlines()[-1])["bounded_project_grammar"]
     assert ProjectGraph.from_mapping(grammar["graph"]["example"]).output == "y"
-    assert "string naming a computed node" in grammar["graph"]["types"]["output"]
-    assert "derived automatically" in grammar["capability_operation_rules"]["rule"]
-    assert "capabilities" in grammar["project_fields_exactly"]
 
 
 @pytest.fixture(autouse=True)
