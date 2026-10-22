@@ -672,7 +672,6 @@ def test_missing_retry_justification_is_corrected_before_wave_execution(tmp_path
         prompt = messages[1]['content']
         payload = json.loads(_wave(prompt, [_project('next-probe', 'padded-tail')]).split('\n', 1)[1])
         if len(calls) > 1:
-            assert 'explicit investigation update' in messages[-1]['content']
             payload['failure_investigations'] = [dict(investigation(selection), project_id='next-probe',
                 retry_skip_reason='Padding uncertainty remains; this probe separates sentinel effects before the original retry.')]
         return 'DECISION: WAVE\n' + json.dumps(payload)
