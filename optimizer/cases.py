@@ -163,3 +163,17 @@ def materialize_case(case, device="cpu"):
         return tensor.to(device)
 
     return [make(hint) for hint in case["args"]], {k: make(hint) for k, hint in case["kwargs"].items()}
+
+
+def normalize_job_submission(submission):
+    """Normalize the supported stored-job signature envelope/list/single forms."""
+    signature = submission['signature']
+    if isinstance(signature, dict) and 'signatures' in signature:
+        if set(signature) != {'signatures'}:
+            raise ValueError('signature envelope contains unexpected fields')
+        signatures = signature['signatures']
+    else:
+        signatures = signature if isinstance(signature, list) else [signature]
+    return validate_submission(dict(source=submission['source'], entrypoint=submission['entrypoint'],
+        init_args=submission.get('init_args', []), init_kwargs=submission.get('init_kwargs', {}),
+        signatures=signatures))

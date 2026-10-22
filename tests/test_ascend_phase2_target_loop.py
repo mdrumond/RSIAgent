@@ -260,11 +260,15 @@ def test_duplicate_practice_correction_is_bounded_without_consuming_attempts(tmp
     c.run_attempt()
     calls = []
     duplicate = replace(practice(c), project_id=c.seed_outcomes[0]["project_id"])
-    c.curriculum = TargetCurriculumAgent(lambda messages: (
-        calls.append(messages), wire("PRACTICE", duplicate))[1])
-    with pytest.raises(ValueError, match="after 3 attempts.*fresh project ID"):
+    selection_time = [0]
+    def invalid(messages):
+        calls.append(messages)
+        selection_time[0] += 20
+        return wire("PRACTICE", duplicate)
+    c.curriculum = TargetCurriculumAgent(invalid, clock=lambda: selection_time[0])
+    with pytest.raises(ValueError, match="elapsed-time budget exhausted.*fresh project ID"):
         c.resume()
-    assert len(calls) == 3
+    assert len(calls) > 3
     assert len(requests) == 1
     assert not (c.root / "pending.json").exists()
     assert c.report()["practice_attempts"] == 0
@@ -412,3 +416,39 @@ def test_assessment_replay_uses_exact_pre_attempt_memory_without_source_or_futur
     for prior, source in assessments:
         assert prior == expected[source]
     assert json.loads(assessments[0][0])['phase2_feedback'] == []
+
+
+def test_native_curriculum_reads_retained_failure_case_and_candidate_only(tmp_path):
+    from pathlib import Path
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    source = b'actual wrong candidate'
+    def execute(request, count):
+        objects = ContentAddressedArtifacts(request.branch_root/'artifacts')
+        source_hash = objects.put_bytes(source)
+        payloads = dict(inputs={'tensors':[{'storage':list(request.inputs[0].storage)}]},
+                        expected={'dtype':'float32','storage':list(request.oracle.storage)},
+                        observed={'output':[0.0]*len(request.oracle.storage)})
+        retain_phase1_failure(objects, request.spec, source_hash, 'host-mismatch',
+                              'Actual retained mismatch.', payloads, 'float32')
+        result = _result(request.spec, False, 'host mismatch')
+        return replace(result, evidence_payload=canonical_bytes(dict(classification='host-mismatch',
+            source_sha256=source_hash, artifacts={name:objects.put_json(value) for name,value in payloads.items()})))
+    coordinator, _, _ = build(tmp_path, [], execute=execute)
+    coordinator.run_attempt()
+    state = coordinator._load_state()
+    context = coordinator._context(state, coordinator._memory_snapshot(state))
+    case_ref = next(ref for ref in context.context_files if ref['filename'].startswith('native-failure-cases'))
+    cases = json.loads(context.artifact_reader(**case_ref['read_artifact'])['text'])
+    assert cases and cases[0]['classification']=='host-mismatch'
+    raw = cases[0]['artifacts']
+    assert context.artifact_reader(sha256=raw['source']['sha256'])['text']==source.decode()
+    expected = json.loads(context.artifact_reader(sha256=raw['expected']['sha256'])['text'])
+    assert expected['storage']
+    with pytest.raises(ValueError):
+        context.artifact_reader(sha256=coordinator.target.reference_sha256)
+    artifact = Path(raw['source']['retained_path'])
+    artifact.write_bytes(b'changed')
+    with pytest.raises(ValueError, match='digest mismatch'):
+        context.artifact_reader(sha256=raw['source']['sha256'])

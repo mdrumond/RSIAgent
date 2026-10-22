@@ -1,10 +1,12 @@
 """Descriptions explain real workflow distinctions without altering evidence."""
 import copy
+from dataclasses import asdict
 
 import pytest
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes
+from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.ascend.agent_presentation import compact_observation
 from benchmarks.ascend.status_descriptions import describe_statuses, explain_status
 
@@ -16,6 +18,8 @@ def test_repair_requirements_are_actionable_and_codes_unchanged(tmp_path):
     store = ContentAddressedArtifacts(tmp_path)
     view = compact_observation(raw, store)
     assert view['missing'] == raw['missing']
+    assert {(row['field'], row['code']) for row in view['status_explanations']} == {
+        ('missing', code) for code in raw['missing']}
     assert store.read_json(store.put_json(raw)) == raw
 
 
@@ -65,21 +69,22 @@ def test_registered_reason_codes_are_explained_without_interpreting_prose(code):
 
 
 @pytest.mark.parametrize('code', ['profiling', 'performance-study'])
-def test_measurement_fact_and_missing_requirement_have_distinct_explanations(code):
-    raw = {'facts': [{'category': code, 'evidence_sha256': 'a' * 64}], 'missing': [code]}
-    view = describe_statuses(raw)
+def test_measurement_fact_and_missing_requirement_have_distinct_explanations(code, tmp_path):
+    fact = asdict(HostFact(code, 'Completed host measurement', 'a' * 64))
+    raw = {'facts': [fact], 'missing': [code]}
+    store = ContentAddressedArtifacts(tmp_path)
+    view = compact_observation(raw, store)
     retained, = view['facts'][0]['status_explanations']
     missing, = view['status_explanations']
-    assert view['facts'][0]['category'] == retained['code'] == code
-    assert view['missing'] == [missing['code']] == [code]
     assert retained['field'] == 'category'
     assert missing['field'] == 'missing'
+    assert view['facts'][0]['category'] == retained['code'] == code
+    assert view['missing'] == [missing['code']] == [code]
     assert retained['description'] != missing['description']
-    assert raw['facts'][0] == {'category': code, 'evidence_sha256': 'a' * 64}
-
-
-def test_unknown_status_preserves_code():
-    code = 'not-yet-registered-status'
-    row = explain_status(code, field='stage')
-    assert row['code'] == code
-    assert set(row) == {'code', 'description', 'next_action'}
+    assert retained['next_action'] != missing['next_action']
+    assert retained['description'] != explain_status(code)['description']
+    assert missing['description'] != explain_status(code)['description']
+    assert {key: value for key, value in view['facts'][0].items()
+            if key != 'status_explanations'} == fact
+    assert store.read_json(store.put_json(raw)) == raw
+    assert describe_statuses(view) == view

@@ -4,7 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import math
-from typing import Mapping
+import time
+from typing import Callable, Mapping
 
 from benchmarks.a5kernels.phase1_curriculum import Capability, ProjectSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import (
@@ -35,6 +36,8 @@ class TargetCurriculumContext:
     practice_seconds_remaining: float
     available_tools: tuple[str, ...] = ()
     used_project_ids: tuple[str, ...] = ()
+    context_files: tuple[Mapping[str, object], ...] = ()
+    artifact_reader: Callable | None = None
 
     def __post_init__(self):
         if not isinstance(self.target, TargetContract):
@@ -112,6 +115,11 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
         "used_project_ids or the fixed target ID. Use only available tools; missing tools are unavailable, "
         "never zero. Separate debug/print/sanitizer runs from device timing. Sync "
         "practice must test correctness and compare performance only for correct variants.\n"
+        'Optional detailed context_files support {"read_artifact":{"sha256":"advertised hash",'
+        '"offset":0,"limit":8192}} before a decision. Original retries are fresh repair '
+        'attempts using current memory, exempt from new-project novelty. Apply a known '
+        'cause and repair next unless a concrete execution blocker remains; missing '
+        'coverage of unrelated operators/layouts is not a reason for more practice.\n'
         "Wire forms:\nDECISION: PRACTICE\n"
         '{"reason":"...","project":{ProjectSpec},"weakness":"observed target failure or bottleneck",'
         '"control":"one controlled change","evidence":"host checks and relevant measurements",'
@@ -124,14 +132,16 @@ def target_curriculum_prompt(context: TargetCurriculumContext,
             "remaining_seconds": context.remaining_seconds,
             "practice_seconds_remaining": context.practice_seconds_remaining,
             "available_tools": list(context.available_tools),
+            "context_files": list(context.context_files),
             "used_project_ids": list(context.used_project_ids), "project_grammar": grammar}, sort_keys=True))
 
 
 class TargetCurriculumAgent:
-    def __init__(self, complete, *, target_policy=None, held_out_information_sha256=()):
+    def __init__(self, complete, *, target_policy=None, held_out_information_sha256=(), clock=time.monotonic):
         if not callable(complete):
             raise TypeError("complete must be callable")
         self.complete = complete
+        self.clock = clock
         self.target_policy = target_policy
         self._held_out = frozenset(_digest(item, "held-out information identity")
                                    for item in held_out_information_sha256)
@@ -146,18 +156,35 @@ class TargetCurriculumAgent:
                       "the current context below owns the goal, budgets and host verdicts:\n"
                       + session.messages[-1]["content"] + "\n" + prompt)
         turn = [{"role": "user", "content": prompt}]
-        for attempt in range(1, 4):
-            response = self.complete([system, *turn])
+        from .context_files import context_wire
+        deadline = self.clock() + context.remaining_seconds
+        attempt, diagnostic = 0, 'no proposal admitted'
+        while self.clock() < deadline:
+            attempt += 1
+            response = self.complete(context_wire([system, *turn]))
             turn.append({"role": "assistant", "content": response})
+            if self.clock() >= deadline:
+                break
             try:
+                if isinstance(response, str) and response.lstrip().startswith('{'):
+                    request = json.loads(response)
+                    if not isinstance(request, dict) or set(request) != {'read_artifact'}:
+                        raise ValueError('expected one read_artifact request')
+                    try:
+                        if context.artifact_reader is None:
+                            raise ValueError('no advertised context reader')
+                        page = context.artifact_reader(**request['read_artifact'])
+                    except (OSError, ValueError, TypeError) as error:
+                        page = {'error': str(error)}
+                    turn.append(dict(role='user', content=json.dumps(dict(page, event='artifact-page'))))
+                    continue
                 decision = self.parse(response, context)
             except (ValueError, TypeError, KeyError) as exc:
-                if attempt == 3:
-                    raise ValueError(f"Phase 2 selection failed after 3 attempts: {exc}") from exc
+                diagnostic = str(exc)
                 turn.append({"role": "user", "content": f"Invalid proposal: {exc}. Correct only this decision; target and budgets are unchanged."})
                 continue
             return decision, CurriculumSession(tuple([*history, *turn]), session.turns + attempt)
-        raise AssertionError("unreachable")
+        raise ValueError(f"Phase 2 selection elapsed-time budget exhausted: {diagnostic}")
 
     def parse(self, text, context):
         if self.target_policy is not None and self.target_policy.target != context.target.runtime["target"]:

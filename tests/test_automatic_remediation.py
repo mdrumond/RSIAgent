@@ -127,7 +127,7 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
     assert budget.elapsed_seconds == 0
 
 
-@pytest.mark.parametrize("standalone", [False, True])
+@pytest.mark.parametrize("standalone", [False, "envelope", "list", "single"])
 def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone):
     from types import SimpleNamespace
     from tests.test_a3_reviewed_phase2 import native_source
@@ -153,7 +153,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
             return value
         def evaluate(self, source, directory, **kwargs):
             return dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
-    config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path/'validation.sh'), max_cases=1)
+    config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path/'validation.sh'), max_cases=2)
     original_dir = tmp_path/'external'
     first = OptimizerTaskExecutor(original_dir, task, snapshot(), config,
         agent=Agent([dict(action='cases', signatures=[], summary='freeze'), candidate('bad')]), backend=FrozenBackend(10))
@@ -169,18 +169,24 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         submission = first.store.submission(first.job_id)
         original = {k: v for k, v in submission.items() if k not in {
             'memory_snapshot', 'max_attempts', 'max_seconds', 'name'}}
+        if standalone == 'list':
+            original['signature'] = original['signature']['signatures']
+        elif standalone == 'single':
+            original['signature'] = original['signature']['signatures'][0]
         row['outcome'].update(source_type='optimizer', original_spec=original,
             task=dict(task_id='original', submission=original))
         atomic(store.root / (row['feedback_id'] + '.json'), canonical(row))
     received = []
     def factory(directory, task, memory, bound, **kwargs):
         received.append(memory)
+        assert type(bound['phase2_attempt_seconds']) is int and bound['phase2_attempt_seconds'] == 30
+        assert bound['max_cases'] == 2
         return OptimizerTaskExecutor(directory, task, memory, bound,
             agent=Agent([candidate('good')]), backend=FrozenBackend(12), **kwargs)
     monkeypatch.setattr('benchmarks.ascend.phase2_optimizer_execution.OptimizerTaskExecutor', factory)
     runner = SimpleNamespace(root=source, initial_memory=b'')
-    retry = optimizer_retry_adapter(runner, store, config)
-    retry(row, tmp_path/'retried', 30)
+    retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
+    retry(row, tmp_path/'retried', 30.75)
     retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
     assert store.link_original_retry(row['feedback_id'], retried['feedback_id'])['lifecycle'] == 'fixed'
     assert received[0]['phase'] == 'committed-phase1'
@@ -239,3 +245,28 @@ def test_retry_dispatch_stops_when_campaign_time_is_spent(tmp_path, initially_ex
     automatic.retry_ready(state)
     assert len(dispatched) == (0 if initially_expired else 1)
     assert sum(len(row['retries']) for row in automatic.state['failures'].values()) == len(dispatched)
+
+
+@pytest.mark.parametrize("late_decision", ["wave", "invalid"])
+def test_selection_uses_failure_allowance_and_discards_late_wave(tmp_path, late_decision):
+    from test_generic_failure_feedback import phase1
+    phase1(tmp_path/'source', spec=_project('failed', 'gm-ub-movement'))
+    now, prompts, executed = [0.0], [], []
+    def complete(messages):
+        prompts.append(messages)
+        prompt = messages[1]['content']
+        if len(prompts) == 1:
+            supplied = json.loads(prompt.rsplit('\n', 1)[-1])
+            assert 0 < supplied['remaining_seconds'] <= 5
+            now[0] += 6
+            return (_wave(prompt, [_project('must-not-run', 'gm-ub-movement')])
+                    if late_decision == 'wave' else '{invalid')
+        return 'DECISION: STALLED\n{"reason":"No eligible work remains."}'
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}', CurriculumAgent(complete, clock=lambda:now[0]),
+        lambda request:executed.append(request), max_parallel=1, project_target=1,
+        max_seconds=100, clock=lambda:now[0])
+    automatic = AutomaticRemediation(runner, target='a3', seconds=5,
+        sources=[dict(type='phase1', root=str(tmp_path/'source'))])
+    assert runner.run()['status'] == 'STALLED'
+    assert len(prompts) == 2 and not executed
+    assert next(iter(automatic.state['failures'].values()))['remaining_seconds'] == 0
