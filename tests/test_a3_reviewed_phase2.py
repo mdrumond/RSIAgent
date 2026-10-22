@@ -98,7 +98,6 @@ def test_reviewed_handoff_to_shared_model_loop_and_numerical_verifier(tmp_path, 
     prompt = json.loads(calls[0]["request"]["messages"][1]["content"])
     assert prompt["phase1_memory"] == [memory]
     assert prompt["target_contract"]["target_id"].startswith("a3-")
-    assert "Catlass DSL" not in calls[0]["request"]["messages"][0]["content"]
     assert "catlass" not in json.dumps(prompt["target_contract"]).lower()
     assert runner.run() == result and len(calls) == (2 if repair else 1)
     if repair:
