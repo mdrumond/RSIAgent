@@ -143,3 +143,23 @@ def test_legacy_ready_phase2_retains_history_and_dispatches_original_retry(tmp_p
     assert retry['frozen_submission'] == task['submission']
     assert retry['suite_sha256'] == baseline['suite_sha256']
     assert path.read_bytes() == retained
+
+
+def test_later_failed_original_retry_preserves_authenticated_fix(tmp_path):
+    store = FeedbackStore(tmp_path / 'feedback')
+    ids = {}
+    for name, verified in [('original', False), ('successful', True), ('later-failed', False)]:
+        root = tmp_path / name
+        phase1(root, verified=verified)
+        store.import_phase1(root)
+        ids[name] = next(row['feedback_id'] for row in store.records()
+                         if row['outcome']['source_root'] == str(root.resolve()))
+    store.link_original_retry(ids['original'], ids['successful'])
+    record = store.link_original_retry(ids['original'], ids['later-failed'])
+    assert record['lifecycle'] == 'fixed'
+    assert record['investigation']['status'] == 'resolved'
+    assert record['investigation']['retries'] == [ids['successful'], ids['later-failed']]
+    # Retaining fixed status still requires intact evidence, not a stale status bit.
+    path = tmp_path / 'successful/waves/wave-1/branches/original/execution-evidence.bin'
+    path.write_bytes(b'changed host evidence')
+    assert store.link_original_retry(ids['original'], ids['later-failed'])['lifecycle'] == 'failed'
