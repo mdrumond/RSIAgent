@@ -176,8 +176,9 @@ class FeedbackStore:
             missing = []
             for role, ref in case['artifacts'].items():
                 try:
-                    if sha(Path(ref['retained_path']).read_bytes()) != ref['sha256']:
-                        raise ValueError('artifact digest mismatch')
+                    with Path(ref['retained_path']).open('rb') as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != ref['sha256']:
+                            raise ValueError('artifact digest mismatch')
                 except (OSError, ValueError) as error:
                     missing.append(f'{role}: {error}')
             required = {'source', 'inputs', 'expected', 'observed'}
@@ -192,22 +193,35 @@ class FeedbackStore:
         """Read only artifacts explicitly linked to this observation's failure cases."""
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('evidence page requires nonnegative offset and limit 1..8192')
-        data = self.failure_artifact_bytes(feedback_id, digest)
-        return dict(sha256=digest, offset=offset, size=len(data),
-            text=data[offset:offset + limit].decode('utf-8', errors='replace'),
-            has_more=offset + limit < len(data),
-            next_offset=offset + limit if offset + limit < len(data) else None)
+        ref = self._failure_artifact_ref(feedback_id, digest)
+        with Path(ref['retained_path']).open('rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != digest:
+                raise ValueError('artifact digest mismatch')
+            size = stream.seek(0, 2)
+            stream.seek(offset)
+            page = stream.read(limit)
+        return dict(sha256=digest, offset=offset, size=size,
+            text=page.decode('utf-8', errors='replace'),
+            has_more=offset + limit < size,
+            next_offset=offset + limit if offset + limit < size else None)
+
+    def _failure_artifact_ref(self, feedback_id, digest):
+        if not (self.root / (feedback_id + '.json')).is_file():
+            raise KeyError(feedback_id)
+        cases = _read(self.root / 'failure-cases' / (feedback_id + '.json'), [])
+        for case in cases:
+            for ref in case['artifacts'].values():
+                if ref['sha256'] == digest:
+                    return ref
+        raise FileNotFoundError('artifact is not linked to this failing example')
 
     def failure_artifact_bytes(self, feedback_id, digest):
         """Return exact authenticated bytes, restricted to this failure's linked artifacts."""
-        for case in self.failure_cases(feedback_id):
-            for ref in case['artifacts'].values():
-                if ref['sha256'] == digest:
-                    data = Path(ref['retained_path']).read_bytes()
-                    if sha(data) != digest:
-                        raise ValueError('artifact digest mismatch')
-                    return data
-        raise FileNotFoundError('artifact is not linked to this failing example')
+        ref = self._failure_artifact_ref(feedback_id, digest)
+        data = Path(ref['retained_path']).read_bytes()
+        if sha(data) != digest:
+            raise ValueError('artifact digest mismatch')
+        return data
 
     def _retain_failure_cases(self, outcome, descriptors):
         if not descriptors:

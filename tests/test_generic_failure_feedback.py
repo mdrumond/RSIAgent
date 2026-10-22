@@ -303,3 +303,37 @@ def test_compile_failure_retains_contract_and_diagnostics_without_output(tmp_pat
     diagnostics = json.loads(store.failure_artifact_bytes(store.records()[0]['feedback_id'], case['artifacts']['diagnostics']['sha256']))
     assert diagnostics['compile_diagnostic'] == 'unknown identifier'
     assert diagnostics['output'] is None
+
+
+def test_failure_artifact_paging_streams_requested_file_only(tmp_path, monkeypatch):
+    from pathlib import Path
+    phase1(tmp_path / 'source')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_phase1(tmp_path / 'source')
+    feedback_id = store.records()[0]['feedback_id']
+    data = b'0123456789' * 200000
+    artifact = tmp_path / 'large-inputs.json'
+    artifact.write_bytes(data)
+    digest = sha(data)
+    missing = tmp_path / 'missing-output.json'
+    write(store.root / 'failure-cases' / (feedback_id + '.json'), [dict(
+        classification='host-mismatch', artifacts=dict(
+            inputs=dict(sha256=digest, retained_path=str(artifact)),
+            observed=dict(sha256='1' * 64, retained_path=str(missing))))])
+    original_read_bytes = Path.read_bytes
+    def forbid_payload_materialization(path):
+        if path in {artifact, missing}:
+            pytest.fail('paged reads must not materialize payloads or read sibling artifacts')
+        return original_read_bytes(path)
+    monkeypatch.setattr(Path, 'read_bytes', forbid_payload_materialization)
+    page = store.read_failure_artifact(feedback_id, digest, offset=123, limit=17)
+    assert page['text'] == data[123:140].decode()
+    assert page['size'] == len(data)
+    assert page['has_more'] and page['next_offset'] == 140
+    # Availability checks also authenticate incrementally and explain missing siblings.
+    assert not store.failure_cases(feedback_id)[0]['availability']['complete']
+    artifact.write_bytes(b'changed' + data[7:])
+    with pytest.raises(ValueError, match='digest'):
+        store.read_failure_artifact(feedback_id, digest, offset=123, limit=17)
+    with pytest.raises(FileNotFoundError, match='not linked'):
+        store.read_failure_artifact(feedback_id, '2' * 64)
