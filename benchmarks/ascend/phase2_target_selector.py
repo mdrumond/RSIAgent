@@ -160,6 +160,7 @@ class TargetCurriculumAgent:
         deadline = self.clock() + context.remaining_seconds
         attempt, diagnostic = 0, 'no proposal admitted'
         while self.clock() < deadline:
+            attempt += 1
             response = self.complete(context_wire([system, *turn]))
             turn.append({"role": "assistant", "content": response})
             if self.clock() >= deadline:
@@ -177,7 +178,6 @@ class TargetCurriculumAgent:
                         page = {'error': str(error)}
                     turn.append(dict(role='user', content=json.dumps(dict(page, event='artifact-page'))))
                     continue
-                attempt += 1
                 decision = self.parse(response, context)
             except (ValueError, TypeError, KeyError) as exc:
                 diagnostic = str(exc)

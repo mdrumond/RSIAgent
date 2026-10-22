@@ -75,7 +75,7 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         targets = [row for row in state["attempts"] if row["kind"] == "target"]
         if not targets:
             raise ValueError("execute the fixed target before curriculum review")
-        refs, reader = self._context_files(self._seed_context_state(state))
+        refs, reader = self._context_files(state)
         from .context_files import ContextFiles
         from .agent_presentation import _preview
         files = ContextFiles(self.root / 'curriculum' / 'context')
