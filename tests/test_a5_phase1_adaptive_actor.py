@@ -593,7 +593,11 @@ def test_optional_treatment_actions_have_deterministic_disabled_observations(tmp
 
     AdaptiveActorProjectExecutor(executor, actor, object())(_request(tmp_path, executor))
 
-    assert actor.observations[:2] == [
+    disabled = dict(actor.observations[0])
+    explanation, = disabled.pop("status_explanations")
+    assert explanation["code"] == "disabled-by-treatment"
+    assert "experimental treatment" in explanation["description"]
+    assert [disabled, actor.observations[1]] == [
         {
             "event": "knowledge-query", "available": False,
             "reason": "disabled-by-treatment",
@@ -857,3 +861,29 @@ def test_print_source_without_runtime_trace_does_not_claim_tool_observation(tmp_
     result = AdaptiveActorProjectExecutor(executor, actor, object())(
         _request(tmp_path, executor, _special_spec()))
     assert not any(f.statement.startswith("verified-debug-print:") for f in result.memory.host_facts)
+
+
+def test_compile_repair_submit_explains_actual_actor_missing_requirement(tmp_path):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+        '{"write":{"slot":"kernel","content":"compile failure"}}',
+        '{"run":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+    result = AdaptiveActorProjectExecutor(executor, actor, object())(
+        _request(tmp_path, executor, _special_spec(failure="compile")))
+    assert result.evidence.verified
+    rejected = actor.observations[2]
+    assert rejected["missing"] == ["observed-compile"]
+    explanation, = rejected["status_explanations"]
+    assert explanation["field"] == "missing"
+    assert explanation["code"] == "observed-compile"
+    assert "compiler failure followed by a verified repair" in explanation["description"]
+    assert "compiler diagnostics" in explanation["next_action"]
+    assert "no specific explanation" not in explanation["description"]
