@@ -96,6 +96,7 @@ class AdaptiveProjectRequest:
     oracle: ReferenceOutput
     memory_root: Path | None = None
     remaining_seconds: float | None = None
+    failure_context: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -540,6 +541,8 @@ class AdaptivePhase1Coordinator:
             request.branch_root,
             request.inputs,
             request.oracle,
+            failure_context=(self.failure_feedback.project_context(request.assignment.project_id)
+                             if self.failure_feedback else None),
             remaining_seconds=(self.automatic_remediation.project_remaining(request)
                                if self.automatic_remediation else self._remaining_seconds()),
         ))

@@ -16,7 +16,8 @@ invalid specifications and suspected unsupported/impossible requirements. A budg
 exhaustion never proves impossibility. Explain evidence-based deferrals; do not
 invent projects to repair infrastructure. Read retained source/host diagnostics
 with {"read_artifact":{"sha256":"exact hash","offset":0,"limit":8192}};
-at most six reads per selection. Raw profiling stays remote; use compact digests.
+at most six reads per selection. Failure cases include exact input/expected/observed
+artifact references and availability explanations; read these before selecting a repair. Raw profiling stays remote; use compact digests.
 The selection-index lists EVERY selected failure, including observations outside
 the current detailed page. Use its classifications/summaries to defer infrastructure
 or provider failures without inventing kernel work; its hashes are also readable.
@@ -28,7 +29,11 @@ outside the strict WaveSpec: [{"feedback_id":"...","status":"investigating",
 "classification":"learnable","reason":"...","project_id":"probe-id",
 "control_project_id":"control-id","hypothesis":"...","observation":"..."}].
 Prioritize remediation; fill remaining wave slots with new projects. Only remedial
-projects require probe/control lineage in this list.
+projects require probe/control lineage in this list. Use failure_mode=none and omit
+failure-repair for exploratory probes doing a different computation. A repair
+requires the attached observed failing case for the same graph, dtype, exact
+inputs, expected results and comparison policy; never ask the actor to invent
+or rediscover a mismatch. The observer supplies the failing example.
 Classifications: learnable, infrastructure, provider, invalid-specification,
 suspected-unsupported, suspected-impossible. Status: investigating, deferred,
 ready-to-retry. Deferred needs reason; budget exhaustion alone is not a reason
@@ -114,7 +119,8 @@ class FailureCurriculum:
                     investigations=[r for r in self.lineage if r['feedback_id'] == row['feedback_id']][-3:],
                     interpretation=out['interpretation'],
                     host_result=json.dumps(out['result'].get('result'), sort_keys=True)[:4096],
-                    speedup=out['result'].get('speedup'), evidence=out['evidence']))
+                    speedup=out['result'].get('speedup'), evidence=out['evidence'],
+                    failure_cases=self.store.failure_cases(row['feedback_id'])))
         # Keep source/evidence hash-readable, never put entire candidate/report in context.
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
@@ -141,6 +147,14 @@ class FailureCurriculum:
                 return dict(sha256=digest, offset=offset, size=len(task),
                     text=task[offset:offset+limit].decode(errors='replace'),
                     next_offset=offset+limit if offset+limit < len(task) else None)
+            try:
+                data = self.store.failure_artifact_bytes(row['feedback_id'], digest)
+            except (ValueError, FileNotFoundError):
+                pass
+            else:
+                return dict(sha256=digest, offset=offset, size=len(data),
+                    text=data[offset:offset+limit].decode(errors='replace'),
+                    next_offset=offset+limit if offset+limit < len(data) else None)
             for ref in row['outcome']['evidence'].values():
                 if ref['sha256'] == digest:
                     return self.store.read_evidence(digest, offset=offset, limit=limit)
@@ -180,7 +194,19 @@ class FailureCurriculum:
         if wave is None and any(latest.get(key, {}).get('status') not in
                 {'ready-to-retry', 'deferred'} for key in self.ids):
             raise ValueError('terminal feedback curriculum must recommend retry or explain deferral for every selected failure')
+        if wave is not None:
+            for project in wave.projects:
+                spec = project.spec
+                keys = [row['feedback_id'] for row in rows if row.get('project_id') == spec.project_id]
+                if keys and getattr(spec, 'failure_mode', None) is not None:
+                    from .failure_handoff import FailureContext
+                    FailureContext(dict(root=str(self.store.root), feedback_ids=keys), spec).require_repair_evidence(spec)
         return tuple(rows)
+
+    def project_context(self, project_id):
+        keys = list(dict.fromkeys(row['feedback_id'] for row in self.lineage
+                                 if row.get('project_id') == project_id and row['feedback_id'] in self.ids))
+        return dict(root=str(self.store.root), feedback_ids=keys) if keys else None
 
     def record(self, rows, state=None):
         if state is not None:

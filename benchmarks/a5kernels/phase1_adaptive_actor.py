@@ -204,6 +204,15 @@ class _ProjectActions:
         self.host_facts: list[HostFact] = []
         self.observed_failures: dict[FailureMode, int] = {}
         self.latest_run_at: int | None = None
+        self.failure_context = None
+        if request.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureContext
+            self.failure_context = FailureContext(request.failure_context, request.spec,
+                                                  prepared.inputs, prepared.expected)
+            self.failure_context.require_repair_evidence(request.spec)
+            if self.failure_context.compatible:
+                # Historical authenticated negative evidence predates every action here.
+                self.observed_failures[request.spec.failure_mode] = -1
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         from benchmarks.ascend.execution import process_deadline
@@ -525,6 +534,9 @@ class AdaptiveActorProjectExecutor:
         actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
         actions.read_artifacts = MemoryArtifactReader(request, artifacts)
+        if actions.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureArtifactReader
+            actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "
@@ -533,6 +545,13 @@ class AdaptiveActorProjectExecutor:
                    "Unavailable tools are reported explicitly. Do not deliberately run "
                    "hanging kernels; bounded termination does not guarantee device recovery.\n")
         opening = (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
+        if actions.failure_context is not None:
+            opening += ("\nLinked observed failures (unverified context, not reusable memory): "
+                        + json.dumps(actions.failure_context.presentation(), sort_keys=True)
+                        + "\nRead the supplied source, exact inputs, expected and observed results using "
+                        "read-artifact. A compatible attached case satisfies the negative-example "
+                        "requirement; repair it and host-verify your current source. Do not invent "
+                        "a new mismatch. Incompatible cases are context only.\n")
         opening += prepared.instruction + "\nPre-wave memory (immutable, readable index): " + json.dumps(
             memory_presentation(request.pre_wave_memory, artifacts),
             sort_keys=True, separators=(",", ":"))
