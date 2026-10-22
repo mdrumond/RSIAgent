@@ -212,7 +212,10 @@ def test_optimizer_failed_candidate_survives_successful_best(tmp_path):
         failure_case=dict(schema='failure-case-v1', classification='host-mismatch', description='actual zero, expected one',
             inputs={'x': 1}, expected={'output': 1}, observed={'output': 0}, state={}, policy={'exact': True}))
     evaluation = jobs.put_artifact(key, 'evaluation', canonical(content))
-    jobs.add_event(key, 'optimizer-state', dict(best=dict(speedup=2, content={'status': 'verified'}),
+    frozen = dict(suite_sha256='1' * 64,
+        manifest=dict(policy={'exact': True}, submission=jobs.submission(key)))
+    baseline = jobs.put_artifact(key, 'baseline', canonical(frozen))
+    jobs.add_event(key, 'optimizer-state', dict(best=dict(speedup=2, content={'status': 'verified'}), baseline=baseline,
         history=[dict(candidate_sha256=sha(b'bad source'), source=source, result=evaluation, content=content)]))
     jobs.transition(key, 'completed')
     store = FeedbackStore(tmp_path / 'feedback')
@@ -221,7 +224,17 @@ def test_optimizer_failed_candidate_survives_successful_best(tmp_path):
     failed = next(row for row in records if not row['outcome']['verified'])
     assert any(row['outcome']['verified'] for row in records)
     assert store.failure_cases(failed['feedback_id'])[0]['availability']['complete']
+    from benchmarks.ascend.failure_curriculum import retry_spec
+    from benchmarks.ascend.phase2_feedback import _baseline_identity
+    retry = retry_spec({'selected': [failed]}, 'a3')
+    assert retry['suite_sha256'] == frozen['suite_sha256']
+    assert retry['policy'] == frozen['manifest']['policy']
+    assert retry['frozen_submission'] == frozen['manifest']['submission']
+    assert _baseline_identity(failed['outcome']) == (frozen['suite_sha256'], frozen['manifest']['policy'])
     assert store.import_optimizer(jobs.root)['existing'] == 2
+    jobs.artifact_path(key, baseline['sha256']).write_bytes(b'changed baseline')
+    with pytest.raises(ValueError, match='digest'):
+        retry_spec({'selected': [failed]}, 'a3')
 
 
 def test_legacy_failure_explains_missing_reproducer(tmp_path):

@@ -89,6 +89,8 @@ _DESCRIPTIONS = {
                                 'Read the supplied failing source and compiler diagnostics. If none is available, report that missing evidence; do not invent a failure.'),
 }
 
+_DESCRIPTIONS['observed-compile'] = _DESCRIPTIONS['observed-compile-failure']
+
 _DESCRIPTIONS.update({
     'demonstrated-benefit': ('The memory treatment passed while the paired no-memory control failed.',
                              'Retain both traces as evidence of benefit for this experiment, without inferring universal usefulness.'),
