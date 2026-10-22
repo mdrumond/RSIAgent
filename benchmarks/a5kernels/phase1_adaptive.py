@@ -699,11 +699,23 @@ class AdaptivePhase1Coordinator:
                     *(base64.b64encode(canonical_bytes(row)).decode("ascii")
                       for row in seed["phase1_memory"]), *state["memory_bytes_base64"]]}
 
+    def _context_files(self, state):
+        from benchmarks.ascend.context_files import ContextFiles
+        files = ContextFiles(self.root / 'curriculum' / 'context')
+        refs = []
+        for row, encoded in zip(state['prior_outcomes'], state['memory_bytes_base64'], strict=True):
+            memory = json.loads(base64.b64decode(encoded, validate=True))
+            refs.append(files.put('project-memory-' + row['project_id'], memory))
+        for row in state.get('failed_outcomes', []):
+            refs.append(files.put('failed-project-' + row['project_id'], row))
+        return tuple(refs), files.read
+
     def _context(self, state, snapshot):
         remaining = max(0, self.project_target - len(state["prior_outcomes"]))
         context_state = self._seed_context_state(state)
         if self.automatic_remediation and self.automatic_remediation.feedback.ids:
             remaining = max(remaining, self.automatic_remediation.wave_slots(state))
+        refs, reader = self._context_files(context_state)
         return CurriculumContext(
             self.objective,
             state["wave_index"],
@@ -722,6 +734,7 @@ class AdaptivePhase1Coordinator:
             self._curriculum_feedback(context_state),
             self.failure_feedback.context(state) if self.failure_feedback else (),
             remaining_seconds=self._remaining_seconds(),
+            context_files=refs, artifact_reader=reader,
         )
 
     @staticmethod

@@ -75,13 +75,24 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         targets = [row for row in state["attempts"] if row["kind"] == "target"]
         if not targets:
             raise ValueError("execute the fixed target before curriculum review")
-        return TargetCurriculumContext(self.target, targets[-1],
+        refs, reader = self._context_files(self._seed_context_state(state))
+        from .context_files import ContextFiles
+        from .agent_presentation import _preview
+        files = ContextFiles(self.root / 'curriculum' / 'context')
+        observed = files.put('latest-target-attempt', targets[-1])
+        memory_reader = reader
+        def reader(**payload):
+            if payload.get('sha256') == observed['sha256']:
+                return files.read(**payload)
+            return memory_reader(**payload)
+        return TargetCurriculumContext(self.target, _preview(targets[-1]),
             tuple([*self._curriculum_feedback(state),
                    *[row for row in state["attempts"][-2:] if row["kind"] == "practice"]]),
             self.time.remaining,
             self.time.practice_remaining, self.available_tools,
             used_project_ids=tuple(sorted({row["project_id"]
-                for row in [*self.seed_outcomes, *state["attempts"]]})))
+                for row in [*self.seed_outcomes, *state["attempts"]]})),
+            context_files=(*refs, observed), artifact_reader=reader)
 
     def _select_pending(self, state):
         snapshot = self._memory_snapshot(state)
