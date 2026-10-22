@@ -32,6 +32,9 @@ class ContextFiles:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('artifact page requires nonnegative offset and limit 1..8192')
         page = artifact_page_presentation(dict(sha256=sha256, offset=offset, limit=limit), self.artifacts)
+        return self.record_read(page)
+
+    def record_read(self, page):
         # Save before returning: a subsequent provider error or elapsed deadline
         # must not discard the full page when no session can be committed.
         with (self.root / 'read-pages.jsonl').open('ab') as stream:
