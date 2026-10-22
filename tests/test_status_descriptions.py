@@ -84,3 +84,19 @@ def test_learner_stage_is_explained_without_promoting_practice_to_target_success
     assert row['field'] == 'learner_stage'
     assert row['code'] == view['learner_stage'] == 'practice'
     assert 'practice success alone' in row['next_action']
+
+
+@pytest.mark.parametrize('code', [
+    'disabled-by-treatment', 'diagnostic-backend-not-bound', 'correctness-failed',
+])
+def test_registered_reason_codes_are_explained_without_interpreting_prose(code):
+    raw = {'reason': code}
+    view = describe_statuses(raw)
+    row, = view['status_explanations']
+    assert row['field'] == 'reason'
+    assert row['code'] == view['reason'] == raw['reason']
+    assert row['description'] and row['next_action']
+    prose = {'reason': 'The diagnostic was unavailable after an interrupted request.'}
+    assert describe_statuses(prose) == prose
+    if code == 'disabled-by-treatment':
+        assert 'preserve the configured experimental restrictions' in row['next_action']

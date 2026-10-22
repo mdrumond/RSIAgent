@@ -96,6 +96,12 @@ _DESCRIPTIONS.update({
                            'Inspect both traces and record possible regression evidence without changing memory admission automatically.'),
     'READY': ('The Phase 2 curriculum declared readiness after a verified target attempt and no further useful practice.',
               'Inspect the target attempt evidence and curriculum reason; readiness does not establish correctness on other targets.'),
+    'disabled-by-treatment': ('This tool is intentionally unavailable in the selected experimental treatment.',
+                              'Continue using the tools allowed by this treatment; preserve the configured experimental restrictions.'),
+    'diagnostic-backend-not-bound': ('No diagnostic backend is configured for this actor execution.',
+                                    'Use the available correctness evidence and report the unavailable diagnostic explicitly.'),
+    'correctness-failed': ('The candidate failed correctness verification, so final profiling was not performed.',
+                           'Read the correctness failure evidence and repair and verify the candidate before interpreting performance.'),
     'passed': ('The evaluated workflow passed its configured acceptance checks for the recorded cases.',
                'Consult the retained verification evidence and case coverage before generalizing this result.'),
     'transport-qualified': ('Transport and execution prerequisites were qualified; kernel correctness has not been established by this qualification.',
@@ -213,7 +219,7 @@ def explain_status(code, *, field='status', context=None):
 def describe_statuses(payload):
     """Copy a presentation tree, adding explanations without altering raw fields.
 
-    Only named status fields and missing requirements are interpreted. Arbitrary
+    Only named status fields, registered reason codes, and missing requirements are interpreted. Arbitrary
     prose, source, artifact payloads, and immutable evidence remain untouched.
     """
     if isinstance(payload, (list, tuple)):
@@ -229,6 +235,9 @@ def describe_statuses(payload):
         code = payload.get(field)
         if isinstance(code, str):
             explanations.append({'field': field, **explain_status(code, field=field, context=payload)})
+    reason = payload.get('reason')
+    if isinstance(reason, str) and reason in _DESCRIPTIONS:
+        explanations.append({'field': 'reason', **explain_status(reason, field='reason', context=payload)})
     missing = payload.get('missing')
     if isinstance(missing, (list, tuple)):
         for code in missing:
