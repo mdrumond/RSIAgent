@@ -443,6 +443,17 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
+    if context.phase2_feedback:
+        instructions += (
+            "First review eligible original failures against current memory. When an "
+            "applicable cause/repair lesson and host-backed probe/control exist, recommend "
+            "the original retry next unless a concrete execution blocker remains. "
+            "Do not express that retry as a new WAVE project: novelty applies to new projects. "
+            "If no further learning project is needed, return DECISION: SATURATED with "
+            "failure_investigations containing status=ready-to-retry and the existing linked "
+            "project_id/control_project_id. SATURATED ends this learning selection so the host "
+            "can retry the original; it does not mean the original is fixed.\n"
+        )
     guidance = (ASCEND_EXPERIMENT_GUIDANCE + METRIC_SWEEP_GUIDANCE
                 if target_policy is None else target_policy.guidance)
     return instructions + guidance + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))

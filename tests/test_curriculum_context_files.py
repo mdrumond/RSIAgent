@@ -120,6 +120,43 @@ def test_native_phase2_reads_and_more_than_three_corrections_share_time(tmp_path
         TargetCurriculumAgent(complete, clock=lambda:now[0]).select(replace(context, remaining_seconds=.5))
 
 
+@pytest.mark.parametrize('native', [False, True])
+def test_read_audit_survives_provider_interruption(tmp_path, native):
+    files = ContextFiles(tmp_path/'context')
+    ref = files.put('observed-case', {'expected': [3, 7], 'observed': [0, 0]})
+    calls = []
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({'read_artifact': ref['read_artifact']})
+        raise OSError('provider disconnected')
+    if native:
+        from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
+        from test_ascend_phase2_targets import qualified, context as target_context
+        target, _, _ = qualified(tmp_path/'reference')
+        context = replace(target_context(target), context_files=(ref,), artifact_reader=files.read)
+        agent = TargetCurriculumAgent(complete)
+    else:
+        context = CurriculumContext('Learn.', 1, 'a'*64, (), (),
+            context_files=(ref,), artifact_reader=files.read)
+        agent = CurriculumAgent(complete)
+    with pytest.raises(OSError, match='provider disconnected'):
+        agent.select(context)
+    pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
+    assert len(pages) == 1
+    assert json.loads(pages[0]['text']) == {'expected': [3, 7], 'observed': [0, 0]}
+    now = [0]
+    def read_then_expire(messages):
+        now[0] += 1
+        return json.dumps({'read_artifact': ref['read_artifact']})
+    agent = (TargetCurriculumAgent if native else CurriculumAgent)(
+        read_then_expire, clock=lambda: now[0])
+    with pytest.raises(ValueError, match='budget exhausted'):
+        agent.select(replace(context, remaining_seconds=.5))
+    pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
+    assert len(pages) == 2 and pages[1] == pages[0]
+
+
 def test_optimizer_context_pages_resume_without_resending_prior_page_bodies(tmp_path):
     from test_ascend_phase2_optimizer_tasks import seed, proposal
     from benchmarks.ascend.phase2_optimizer_tasks import select_optimizer_task

@@ -172,9 +172,15 @@ class FailureCurriculum:
         return eligible
 
     def read(self, sha256, offset=0, limit=8192):
+        if not hasattr(self, 'context_files'):
+            from .context_files import ContextFiles
+            self.context_files = ContextFiles(self.root / 'curriculum' / 'context')
+        if sha256 in self.context_files.advertised:
+            return self.context_files.read(sha256, offset, limit)
+        return self.context_files.record_read(self._read_evidence(sha256, offset, limit))
+
+    def _read_evidence(self, sha256, offset=0, limit=8192):
         digest = sha256
-        if hasattr(self, 'context_files') and digest in self.context_files.advertised:
-            return self.context_files.read(digest, offset, limit)
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
         for row in self.selection['selected'] + self.selection['controls']:
