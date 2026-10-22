@@ -207,6 +207,8 @@ def test_dependency_builder_fails_closed_then_wires_read_only_kdb(tmp_path):
 def test_executor_binds_direct_model_and_profiling_treatment(
     tmp_path, model, profiling, guidance, proposal, expected_commands,
 ):
+    guidance_payload = f"Profiling treatment supplied for {tmp_path}"
+    guidance = guidance_payload if guidance is not None else None
     gate_root = tmp_path / "gate"
     gate_root.mkdir()
     guide_path, guide, report = _guide_and_report(gate_root)
@@ -308,6 +310,8 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert (memory_path / memory.artifact_store / "objects").is_dir()
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
+    instruction = provider_calls[0]["request"]["messages"][1]["content"]
+    assert (guidance_payload in instruction) == (guidance is not None)
     assert "previous-project-action" not in memory.actions
     distillation_messages = provider_calls[-1]["request"]["messages"]
     prior_messages = provider_calls[-2]["request"]["messages"]
