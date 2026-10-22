@@ -105,3 +105,41 @@ def test_feedback_refresh_drops_fixed_items(tmp_path):
     assert len(curriculum.refresh('a3')['selected']) == 1
     store.update_investigation(store.records()[0]['feedback_id'], status='deferred', reason='provider unavailable')
     assert curriculum.refresh('a3')['selected'] == []
+
+
+def test_legacy_ready_phase2_retains_history_and_dispatches_original_retry(tmp_path):
+    from benchmarks.ascend.failure_curriculum import retry_spec, select_feedback
+    from test_phase2_feedback import campaign
+
+    source = tmp_path / 'phase2'
+    task = dict(task_id='original', submission=dict(source='reference', entrypoint='forward', signatures=[]))
+    baseline = dict(suite_sha256='1' * 64, manifest=dict(
+        policy=dict(name='frozen-policy'), submission=task['submission']))
+    campaign(source, task=task, baseline=baseline)
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_campaign(source)
+    record = store.records()[0]
+    feedback_id = record['feedback_id']
+    path = store.root / (feedback_id + '.json')
+    legacy = json.loads(path.read_bytes())
+    legacy['outcome'].pop('source_type')
+    legacy['outcome'].pop('original_spec')
+    legacy['investigation'].update(status='ready-to-retry', evidence=['committed-probe'],
+                                   projects=['probe'], retries=['older-retry'])
+    write(path, legacy)
+    retained = path.read_bytes()
+
+    assert store.import_campaign(source)['existing'] == 1
+    assert path.read_bytes() == retained
+    selected = select_feedback(store.root, 'a3', retry_id=feedback_id)
+    ready = selected['selected'][0]
+    assert ready['outcome']['source_type'] == 'phase2'
+    assert ready['outcome']['original_spec'] == legacy['outcome']['task']
+    assert ready['investigation'] == legacy['investigation']
+    assert ready['lifecycle'] == 'remediated'
+    # This is the optimizer branch selected by automatic retry dispatch.
+    retry = retry_spec(selected, 'a3')
+    assert retry['task'] == legacy['outcome']['task']
+    assert retry['frozen_submission'] == task['submission']
+    assert retry['suite_sha256'] == baseline['suite_sha256']
+    assert path.read_bytes() == retained
