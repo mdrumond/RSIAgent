@@ -120,6 +120,12 @@ class FeedbackStore:
 
     @staticmethod
     def _present(record):
+        # Before generic feedback, every stored observation was Phase 2. Supply
+        # additive dispatch metadata on reads without rewriting immutable history.
+        outcome = record['outcome']
+        outcome.setdefault('source_type', 'phase2')
+        if outcome['source_type'] == 'phase2':
+            outcome.setdefault('original_spec', outcome['task'])
         control = record['outcome']['category'] in {'verified-success', 'verified-timing-unknown'}
         record['lifecycle'] = None if control else {
             'resolved': 'fixed', 'ready-to-retry': 'remediated'
