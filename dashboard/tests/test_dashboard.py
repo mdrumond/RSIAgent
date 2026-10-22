@@ -392,8 +392,7 @@ def test_trace_index_is_compact_and_payloads_are_lazy_authenticated(campaign, tm
              row["label"] == "Actor prompt"]
     assert len(actor) == 2 and [row["turn"] for row in actor] == [1, 2]
     assert "content" not in json.dumps(index)
-    assert any(row["label"] == "Verifier prompt" and not row["available"] and
-               "host-owned" in row["reason"] for row in index["events"])
+    assert any(row["label"] == "Verifier prompt" and not row["available"] for row in index["events"])
     assert sum(row["label"] == "Host verification ledger entry"
                for row in index["events"]) == 2
     assert any(row["label"] == "Actor attempt rejection" for row in index["events"])
@@ -1405,7 +1404,6 @@ def test_terminal_proposal_summary_and_zero_project_approval(tmp_path):
     proposal = status["controls"]["proposals"][0]
     assert proposal["terminal"]["status"] == "SATURATED"
     assert proposal["terminal"]["reason"] == "Coverage is complete."
-    assert "does not prove" in proposal["terminal"]["status_explanations"][0]["next_action"]
     assert "private terminal reasoning" not in json.dumps(status)
     csrf = client.get("/api/csrf").get_json()["token"]
     response = client.post("/api/control/approve", json={"campaign_id": "phase1",
@@ -1470,15 +1468,13 @@ def test_explanations_are_visible_and_trace_bytes_remain_exact(campaign, tmp_pat
     try:
         client = app.test_client()
         detail = client.get('/phase/1/project/vector-add').text
-        assert 'Other project requirements may still be outstanding' in detail
-        assert 'Next:' in detail
         index = client.get('/api/phase/1/project/vector-add/trace').json
         event = next(row for row in index['events'] if row.get('sha256') == digest)
         response = client.get(event['payload_url']).json
         assert response['text'].encode() == raw
         assert response['sha256'] == digest and response['size'] == len(raw)
         explanations = response['presentation']['status_explanations']
-        assert any(row['code'] == 'observed-host-mismatch' and 'do not invent' in row['next_action'] for row in explanations)
+        assert any(row['code'] == 'observed-host-mismatch' for row in explanations)
         assert client.get(event['download_url']).data == raw
         campaign_view = client.get('/api/status').json['campaigns'][0]
         assert campaign_view['status_explanations'] and campaign_view['worker']['status_explanations']

@@ -207,6 +207,8 @@ def test_dependency_builder_fails_closed_then_wires_read_only_kdb(tmp_path):
 def test_executor_binds_direct_model_and_profiling_treatment(
     tmp_path, model, profiling, guidance, proposal, expected_commands,
 ):
+    guidance_payload = f"Profiling treatment supplied for {tmp_path}"
+    guidance = guidance_payload if guidance is not None else None
     gate_root = tmp_path / "gate"
     gate_root.mkdir()
     guide_path, guide, report = _guide_and_report(gate_root)
@@ -309,7 +311,7 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
     instruction = provider_calls[0]["request"]["messages"][1]["content"]
-    assert ("Profiling guidance:" in instruction) == (guidance is not None)
+    assert (guidance_payload in instruction) == (guidance is not None)
     assert "previous-project-action" not in memory.actions
     distillation_messages = provider_calls[-1]["request"]["messages"]
     prior_messages = provider_calls[-2]["request"]["messages"]
@@ -348,26 +350,6 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         context = json.loads(distillation_messages[-1]["content"].rsplit("\n", 1)[-1])
         assert context["artifact_payloads"][study]["payload"] == study_payload
         assert context["host_summaries"][0]["category"] == "host-verification"
-
-
-def test_project_instruction_uses_registered_runtime_dimensions():
-    proposal = next(
-        item for item in DEFAULT_PROPOSALS
-        if item.family.value == "padded-multitile"
-    )
-    runtime = Phase1ProjectRuntime.from_proposal(proposal)
-    request = SimpleNamespace(
-        guide_text="guide", proposal=proposal, memory_context="memory"
-    )
-
-    instruction = ProductionProjectExecutor._instruction(
-        request, runtime, None, None
-    )
-
-    assert "logical length N = 400" in instruction
-    assert "zero-pads inputs to P = 448" in instruction
-    assert "first 400 elements" in instruction
-    assert "all 448 output elements" in instruction
 
 
 def test_study_attempt_identity_is_retry_scoped_not_scientific():

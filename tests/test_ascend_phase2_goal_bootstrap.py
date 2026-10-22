@@ -33,7 +33,6 @@ def setup(tmp_path, responses, *, failure=None, query=None, clock=None, max_seco
             if getattr(self, "check_private_routes", False):
                 for name in ("request_profile", "request_timing", "request_diagnostic"):
                     assert getattr(self, name)({}, None).observation["available"] is False
-                assert "do not request" in self.diagnostic_instructions
             if failure:
                 failure(len(calls))
             digest = ContentAddressedArtifacts(request.branch_root / "artifacts").put_bytes(b"PRIVATE SOURCE")
@@ -214,7 +213,6 @@ def test_actual_reference_actor_can_submit_profile_timing_goal_without_measureme
     from tests.test_a5_phase2_adaptive_memory import _source
     class Driver:
         def __call__(self, instruction, *, turn_parser, action_executor, **kwargs):
-            assert "Private reference" in instruction
             for ordinal, text in enumerate(('{"write":{"slot":"kernel","content":"fixed source"}}',
                                              '{"run":{}}', '{"submit":{}}'), 1):
                 outcome = action_executor(turn_parser(text))

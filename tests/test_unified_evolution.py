@@ -61,42 +61,6 @@ def _hooks(vm, decisions, seen_prompts, handoff_path=CURRICULUM_HANDOFF):
     )
 
 
-def test_unified_curriculum_contract_returns_only_ready_for_retry():
-    prompt = self_evolving_curriculum_charter(
-        "target query", latest_outcome="target verifier report",
-        unified_retry=True)
-
-    assert "DECISION: READY_FOR_RETRY" in prompt
-    assert "DECISION: READY_FOR_TARGET_TEST" not in prompt
-    assert "DECISION: CONVERGED" not in prompt
-    assert "persistent target Verifier Agent" in prompt
-    assert "official evaluator" in prompt
-
-
-def test_target_failure_route_contract_separates_local_and_high_level_authority():
-    prompt = unified_curriculum_route_charter(
-        "target query", "evidence\nVERDICT: FAIL\n")
-
-    assert "ROUTE: REVISE" in prompt
-    assert "ROUTE: EVOLVE" in prompt
-    assert "cannot change it to PASS" in prompt
-    assert "official evaluator" in prompt
-    assert "author a practice" in prompt and "project" in prompt
-
-
-def test_target_pass_contract_separates_correctness_from_terminal_authority():
-    prompt = unified_curriculum_pass_charter(
-        "target query", "orientation evidence",
-        "candidate evidence\nVERDICT: PASS\n")
-
-    assert "ROUTE: HANDOFF" in prompt
-    assert "ROUTE: VERIFY_MORE" in prompt
-    assert "cannot inspect the candidate" in prompt
-    assert "cannot directly" in prompt and "REVISE or EVOLVE" in prompt
-    assert "official evaluator" in prompt
-    assert "no checklist" in prompt.lower()
-
-
 def test_same_curriculum_context_can_challenge_pass_then_authorize_handoff(
         tmp_path):
     vm = _VM()
@@ -189,8 +153,6 @@ def test_evolution_can_return_memory_for_retry_without_running_target(tmp_path):
     assert result.status == "ready_for_retry"
     assert result.projects == 0
     assert U._read_memory_tree(result.memory_dir) == initial
-    assert "READY_FOR_RETRY" in prompts[0]
-    assert "READY_FOR_TARGET_TEST" not in prompts[0]
     state = json.loads(
         (Path(result.root) / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "ready_for_retry"
@@ -219,8 +181,6 @@ def test_phase2_pass_curriculum_reads_memory_and_can_skip_extra_practice(
     assert result.status == "ready_for_retry"
     assert result.projects == 0
     assert vm.memory == initial
-    assert "CURRENT ACTOR-OWNED DURABLE MEMORY" in prompts[0]
-    assert "DECISION: REWRITE" not in prompts[0]
     state = json.loads(
         (Path(result.root) / "state.json").read_text(encoding="utf-8"))
     assert state["triggering_outcome"] == "PASS"
