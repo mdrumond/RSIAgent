@@ -267,6 +267,7 @@ class OptimizationLoop:
             result = self._read(pending['evaluation'])
             value = score(baseline, result)
             history = {'candidate_sha256': pending['sha256'], 'result': pending['evaluation'],
+                       'source': self.state['candidate'],
                        'configuration_sha256': pending.get('configuration_sha256', pending['sha256']),
                        'block_count': pending['block_count'],
                        'content': result, 'speedup': value, 'summary': pending['summary']}
@@ -336,7 +337,8 @@ class OptimizationLoop:
         context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
         if self.agent.identity.get('coding_engine') == 'pi':
             context['knowledge_available'] = self.knowledge is not None
-        if self.single_evaluation or self.prepare_only:
+        if (self.single_evaluation or self.prepare_only or
+                any(item.get('content', {}).get('failure_case') for item in context.get('history', []))):
             # Keep every lesson addressable, but don't replay hundreds of full
             # entries or accumulated compiler/profiler logs on every turn.
             rows = context.get('memory_summary', [])

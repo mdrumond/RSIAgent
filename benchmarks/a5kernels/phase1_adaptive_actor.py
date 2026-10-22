@@ -10,6 +10,7 @@ import re
 from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from benchmarks.ascend.failure_cases import retain_phase1_failure
 from benchmarks.ascend.agent_presentation import (
     artifact_page_presentation, compact_observation, memory_presentation, mismatch_summary,
 )
@@ -30,6 +31,7 @@ from benchmarks.a5kernels.phase1_project_executor import (
     ProjectCompileResult,
     ProjectExecutionResult,
     ProjectExecutor,
+    _tensor_payload, _expected_payload,
 )
 from benchmarks.a5kernels.phase1_project import EvidenceClassification
 from benchmarks.a5kernels.trial import (
@@ -204,6 +206,15 @@ class _ProjectActions:
         self.host_facts: list[HostFact] = []
         self.observed_failures: dict[FailureMode, int] = {}
         self.latest_run_at: int | None = None
+        self.failure_context = None
+        if request.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureContext
+            self.failure_context = FailureContext(request.failure_context, request.spec,
+                                                  prepared.inputs, prepared.expected)
+            self.failure_context.require_repair_evidence(request.spec)
+            if self.failure_context.compatible:
+                # Historical authenticated negative evidence predates every action here.
+                self.observed_failures[request.spec.failure_mode] = -1
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         from benchmarks.ascend.execution import process_deadline
@@ -285,6 +296,12 @@ class _ProjectActions:
         self.admitted[digest] = "compile"
         if not result.observation.passed:
             self.observed_failures[FailureMode.COMPILE] = len(self.actions)
+            retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
+                "compile-failure", result.observation.diagnostic, {
+                    "diagnostics": result.artifact,
+                    "inputs": {"tensors": [_tensor_payload(x) for x in self.prepared.inputs]},
+                    "expected": _expected_payload(self.prepared.expected)},
+                self.prepared.expected.dtype)
         return self._observation({
             "event": "host-compile", "source_sha256": self.source_sha256,
             "passed": result.observation.passed,
@@ -317,6 +334,10 @@ class _ProjectActions:
             )
             self.admitted[digest] = role
             retained[name] = {"sha256": digest, "payload": payload}
+        if not result.evidence.verified:
+            retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
+                result.evidence.classification.value, result.evidence.detail, result.artifacts,
+                self.prepared.expected.dtype)
         # Source intent cannot establish that a device print executed. This
         # backend exposes correctness artifacts, but no retained print trace.
         return self._observation({
@@ -504,7 +525,13 @@ class AdaptiveActorProjectExecutor:
         if remaining is not None and remaining <= 0:
             raise RuntimeError("project time budget exhausted")
         max_seconds = min(self.max_seconds, remaining) if remaining is not None else self.max_seconds
-        prepared = self.executor.prepare(request.spec)
+        executor = self.executor
+        if request.failure_context is not None and request.spec.failure_mode is not FailureMode.NONE:
+            from benchmarks.ascend.failure_handoff import FailureContext
+            failure = FailureContext(request.failure_context, request.spec)
+            failure.require_repair_evidence(request.spec)
+            executor = executor.bind_case(request.spec, failure.inputs)
+        prepared = executor.prepare(request.spec)
         if (
             prepared.spec != request.spec
             or prepared.inputs != request.inputs
@@ -515,7 +542,7 @@ class AdaptiveActorProjectExecutor:
         artifacts = ContentAddressedArtifacts(root / "artifacts")
         memory_sha256 = artifacts.put_bytes(request.pre_wave_memory)
         actions = _ProjectActions(
-            self.executor, request, prepared, artifacts,
+            executor, request, prepared, artifacts,
             max_actions=self.max_actions, max_seconds=max(0.001, max_seconds-(time.monotonic()-started)), max_source_bytes=self.max_source_bytes,
             query_knowledge=self.query_knowledge,
             request_profile=self.request_profile,
@@ -525,6 +552,9 @@ class AdaptiveActorProjectExecutor:
         actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
         actions.read_artifacts = MemoryArtifactReader(request, artifacts)
+        if actions.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureArtifactReader
+            actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "
@@ -533,6 +563,13 @@ class AdaptiveActorProjectExecutor:
                    "Unavailable tools are reported explicitly. Do not deliberately run "
                    "hanging kernels; bounded termination does not guarantee device recovery.\n")
         opening = (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
+        if actions.failure_context is not None:
+            opening += ("\nLinked observed failures (unverified context, not reusable memory): "
+                        + json.dumps(actions.failure_context.presentation(), sort_keys=True)
+                        + "\nRead the supplied source, exact inputs, expected and observed results using "
+                        "read-artifact. A compatible attached case satisfies the negative-example "
+                        "requirement; repair it and host-verify your current source. Do not invent "
+                        "a new mismatch. Incompatible cases are context only.\n")
         opening += prepared.instruction + "\nPre-wave memory (immutable, readable index): " + json.dumps(
             memory_presentation(request.pre_wave_memory, artifacts),
             sort_keys=True, separators=(",", ":"))
