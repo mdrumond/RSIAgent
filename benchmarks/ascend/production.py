@@ -41,7 +41,7 @@ def compose_adaptive_controller(
     diagnostic_instructions=None,
     unavailable_capabilities=(),
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
-    project_actor=None,
+    project_actor=None, usefulness_enabled=False, usefulness_pair_seconds=600,
 ):
     """One action loop, curriculum and progressive-memory controller for both targets."""
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -74,6 +74,11 @@ def compose_adaptive_controller(
             root, objective, reviewed_snapshot, curriculum, project_actor,
             project_target=project_target, trace_hook=trace_hook,
         )
+    from benchmarks.ascend.memory_usefulness import build_usefulness_verifier
+    coordinator.usefulness_verifier = build_usefulness_verifier(
+        root=root, provider=provider, profile=profile, curriculum=curriculum,
+        project_actor=project_actor, enabled=usefulness_enabled,
+        pair_seconds=usefulness_pair_seconds, remaining_seconds=coordinator._remaining_seconds)
     return project_actor, coordinator
 
 
@@ -150,6 +155,7 @@ def build_native_adaptive_phase1(
     profiling_guidance=None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
     project_workers=(),
+    usefulness_enabled=False, usefulness_pair_seconds=600,
 ):
     """Compose native A3 learning without a Catlass checkout requirement.
 
@@ -281,6 +287,7 @@ def build_native_adaptive_phase1(
         unavailable_capabilities=tuple(capability for capability, action in (
             (Capability.PROFILING, request_profile), (Capability.TIMING_SWEEP, request_timing),
         ) if action is None),
+        usefulness_enabled=usefulness_enabled, usefulness_pair_seconds=usefulness_pair_seconds,
     )
     return coordinator
 

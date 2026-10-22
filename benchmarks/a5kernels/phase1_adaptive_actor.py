@@ -682,16 +682,19 @@ class AdaptiveActorProjectExecutor:
             "host-verification", result.evidence.detail,
             result.artifact_sha256["classification"],
         ))
-        learned = self.actor.distill(
-            outcome, admitted_artifacts=actions.admitted,
-            host_summaries=tuple(asdict(fact) for fact in facts),
-        )
-        if not isinstance(learned.distillation, AgentDistillation):
-            raise RuntimeError("terminal project omitted structured distillation")
-        if learned.terminal_response is None:
-            raise RuntimeError("terminal project omitted exact distillation response")
-        distillation = learned.distillation
-        artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
+        if not getattr(request, "publish_learning", True):
+            distillation = AgentDistillation(True, (), tuple(sorted(actions.admitted)))
+        else:
+            learned = self.actor.distill(
+                outcome, admitted_artifacts=actions.admitted,
+                host_summaries=tuple(asdict(fact) for fact in facts),
+            )
+            if not isinstance(learned.distillation, AgentDistillation):
+                raise RuntimeError("terminal project omitted structured distillation")
+            if learned.terminal_response is None:
+                raise RuntimeError("terminal project omitted exact distillation response")
+            distillation = learned.distillation
+            artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
         assert actions.source_sha256 is not None
         memory = Phase1ProjectMemory(
             request.spec, actions.source_sha256, tuple(actions.actions), facts,
