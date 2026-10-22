@@ -159,6 +159,133 @@ class FeedbackStore:
                 continue
         raise FileNotFoundError('linked evidence is not retained locally')
 
+    def failure_cases(self, feedback_id):
+        """Return host-retained reproducers without changing immutable outcomes or IDs."""
+        record = _read(self.root / (feedback_id + '.json'))
+        if record is None:
+            raise KeyError(feedback_id)
+        cases = _read(self.root / 'failure-cases' / (feedback_id + '.json'), [])
+        if not cases:
+            return [dict(schema='failure-case-v1', classification=record['outcome']['category'],
+                description='No complete failing example was retained for this historical observation.',
+                artifacts={}, availability=dict(complete=False, reason='Failing inputs, expected results, or observed outputs are unavailable.'))]
+        for case in cases:
+            missing = []
+            for role, ref in case['artifacts'].items():
+                try:
+                    if sha(Path(ref['retained_path']).read_bytes()) != ref['sha256']:
+                        raise ValueError('artifact digest mismatch')
+                except (OSError, ValueError) as error:
+                    missing.append(f'{role}: {error}')
+            required = {'source', 'inputs', 'expected', 'observed'}
+            if case['classification'] == 'compile-failure':
+                required = {'source', 'diagnostics'}
+            missing += [f'{role}: not retained' for role in sorted(required - case['artifacts'].keys())]
+            case['availability'] = dict(complete=not missing,
+                reason='Authenticated observed failure is available.' if not missing else '; '.join(missing))
+        return cases
+
+    def read_failure_artifact(self, feedback_id, digest, offset=0, limit=8192):
+        """Read only artifacts explicitly linked to this observation's failure cases."""
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
+            raise ValueError('evidence page requires nonnegative offset and limit 1..8192')
+        data = self.failure_artifact_bytes(feedback_id, digest)
+        return dict(sha256=digest, offset=offset, size=len(data),
+            text=data[offset:offset + limit].decode('utf-8', errors='replace'),
+            has_more=offset + limit < len(data),
+            next_offset=offset + limit if offset + limit < len(data) else None)
+
+    def failure_artifact_bytes(self, feedback_id, digest):
+        """Return exact authenticated bytes, restricted to this failure's linked artifacts."""
+        for case in self.failure_cases(feedback_id):
+            for ref in case['artifacts'].values():
+                if ref['sha256'] == digest:
+                    data = Path(ref['retained_path']).read_bytes()
+                    if sha(data) != digest:
+                        raise ValueError('artifact digest mismatch')
+                    return data
+        raise FileNotFoundError('artifact is not linked to this failing example')
+
+    def _retain_failure_cases(self, outcome, descriptors):
+        if not descriptors:
+            return
+        from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        artifacts = ContentAddressedArtifacts(self.root / 'failure-artifacts')
+        cases = []
+        for descriptor in descriptors:
+            descriptor = dict(descriptor)
+            refs = {}
+            for role, ref in descriptor.pop('artifacts', {}).items():
+                path = Path(ref['retained_path'])
+                data = path.read_bytes()
+                if sha(data) != ref['sha256']:
+                    raise ValueError('failure artifact digest mismatch')
+                digest = artifacts.put_bytes(data)
+                refs[role] = dict(sha256=digest, retained_path=str(artifacts._path(digest)))
+            for role in ('inputs', 'state', 'expected', 'observed', 'diagnostics'):
+                if role in descriptor:
+                    digest = artifacts.put_json(descriptor.pop(role))
+                    refs[role] = dict(sha256=digest, retained_path=str(artifacts._path(digest)))
+            descriptor['artifacts'] = refs
+            cases.append(descriptor)
+        record = next(row for row in self.records() if _same_observation(row['outcome'], outcome))
+        path = self.root / 'failure-cases' / (record['feedback_id'] + '.json')
+        # Reimport may relocate files, but cannot replace an already retained case.
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic(path, canonical(cases))
+
+    @staticmethod
+    def _phase1_failure_cases(branch, spec=None):
+        from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        artifacts = ContentAddressedArtifacts(branch / 'artifacts')
+        index = _read(artifacts.root / 'failure-cases.json', [])
+        cases = []
+        for row in index:
+            case = artifacts.read_json(row['sha256'])
+            case['artifacts'] = {role: dict(ref, retained_path=str(artifacts._path(ref['sha256'])))
+                                 for role, ref in case['artifacts'].items()}
+            cases.append(case)
+        if not cases:
+            # Older executions already retained their exact final host evidence.
+            retained = _read(branch / 'execution-evidence.bin', {})
+            classification = retained.get('classification')
+            refs = retained.get('artifacts', {})
+            source = retained.get('source_sha256')
+            if classification and classification != 'host-verified' and source and refs:
+                spec = spec or _read(branch / 'outcome.json', {}).get('spec')
+                descriptor = dict(schema='failure-case-v1', classification=classification,
+                    description=retained.get('detail', 'Retained host execution failed.'),
+                    candidate_sha256=source,
+                    artifacts={role: dict(sha256=digest, retained_path=str(artifacts._path(digest)))
+                        for role, digest in dict(source=source, **refs).items()})
+                if spec:
+                    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+                    from .failure_cases import phase1_policy
+                    project = ProjectSpec.from_mapping(spec)
+                    descriptor.update(project_spec=spec,
+                        policy=phase1_policy(artifacts.read_json(refs['expected'])['dtype']),
+                        project_contract=dict(graph=project.graph.as_dict(), dtype=project.dtype.value,
+                            inputs_sha256=refs['inputs'], expected_sha256=refs['expected'],
+                            policy='phase1-classify-execution-v1'))
+                cases.append(descriptor)
+        return cases
+
+    @staticmethod
+    def _optimizer_failure_case(result, evidence):
+        case = result.get('failure_case')
+        if case:
+            case = dict(case, artifacts={role: ref for role, ref in evidence.items() if role == 'source'})
+            return [case]
+        # Compilation has no actual output. Preserve source and diagnostics explicitly.
+        failed = next((row for row in result.get('cases', []) if row.get('error')), None)
+        if failed:
+            return [dict(schema='failure-case-v1', classification='compile-failure' if not failed.get('compilation') else 'runtime-failure',
+                description=failed['error'], candidate_sha256=result.get('candidate_sha256'),
+                suite_sha256=result.get('suite_sha256'), case=failed.get('case'),
+                diagnostics=failed, artifacts={role: ref for role, ref in evidence.items() if role == 'source'})]
+        return []
+
     def update_investigation(self, feedback_id, *, merge=None, **fields):
         """Optionally merge against current state under the same publication lock."""
         if set(fields) - {'status', 'classification', 'reason', 'projects', 'retries', 'evidence'}:
@@ -287,6 +414,8 @@ class FeedbackStore:
                         classification=row.get('evidence', {}).get('classification')),
                     evidence=evidence, interpretation='Observation, not verified reusable knowledge')
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+                if branch:
+                    self._retain_failure_cases(outcome, self._phase1_failure_cases(branch, spec))
             except (KeyError, TypeError, OSError, ValueError) as error:
                 report['warnings'].append(f'{root}: unreadable committed project: {error}')
         return report
@@ -338,6 +467,27 @@ class FeedbackStore:
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+                for candidate in state.get('history', []):
+                    content = candidate.get('content', {})
+                    if not candidate.get('result') or content.get('status') == 'verified':
+                        continue
+                    source = candidate.get('source')
+                    if not source:
+                        source = next((event['payload'] for event in events if event['kind'] == 'artifact'
+                            and event['payload'].get('sha256') == candidate.get('candidate_sha256')), None)
+                    refs = {}
+                    for role, ref in dict(source=source, evaluation=candidate['result']).items():
+                        if ref:
+                            data = store.read_artifact(job['job_id'], ref['sha256'])
+                            refs[role] = dict(ref, retained_path=str(store.artifact_path(job['job_id'], ref['sha256'])))
+                    # Configuration distinguishes repeated source with different launch settings.
+                    identity = candidate.get('configuration_sha256', candidate['candidate_sha256'])
+                    failed_result = dict(job_id=job['job_id'], verified=False,
+                        source_sha256=candidate['candidate_sha256'], result=content)
+                    failed = dict(outcome, attempt_id=job['job_id'] + ':candidate:' + identity,
+                        verified=False, result=failed_result, evidence=refs, category=_category(task, failed_result))
+                    report['imported' if self._put(failed, report['warnings']) else 'existing'] += 1
+                    self._retain_failure_cases(failed, self._optimizer_failure_case(content, refs))
             except (KeyError, TypeError, ValueError, OSError) as error:
                 report['warnings'].append(f'{manifest}: unreadable optimizer job: {error}')
         return report
@@ -445,6 +595,11 @@ class FeedbackStore:
                     outcome = self._outcome(campaign, row, metadata, report)
                     outcome.update(category=_category(row['task'], result), completed=True)
                     report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+                    refs = {}
+                    source = outcome['evidence'].get('candidate')
+                    if source:
+                        refs['source'] = dict(source, retained_path=str(Path(source['job_root']) / source['job_id'] / 'artifacts' / source['sha256']))
+                    self._retain_failure_cases(outcome, self._optimizer_failure_case(result.get('result', {}), refs))
                 except (KeyError, TypeError, ValueError, OSError) as error:
                     report['warnings'].append(f'{campaign}: unreadable attempt record: {error}')
             pending = state.get('pending') if qualification else _read_import(campaign / 'pending.json', report['warnings'])

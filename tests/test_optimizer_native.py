@@ -155,3 +155,22 @@ def test_mutated_prepared_reference_is_rejected_before_compilation(tmp_path, mon
     monkeypatch.setattr(native, '_compile_case', lambda *a, **k: pytest.fail('compiled mutated suite'))
     with pytest.raises(ValueError, match='baseline'):
         native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test')
+
+
+def test_failed_case_retains_exact_inputs_outputs_and_layout(tmp_path, monkeypatch):
+    prepared = reference()
+    def compile_case(*args, **kwargs):
+        return lambda inputs, states: [inputs[0] * 0, inputs[0] + 1], {'binary_sha256': 'fake'}
+    monkeypatch.setattr(native, '_compile_case', compile_case)
+    result = native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test', block_count=2)
+    case = result['failure_case']
+    tensor = case['inputs']['args']['items'][0]
+    raw = prepared.cases[0]['args'][0].contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    assert bytes.fromhex(tensor['bytes_hex']) == raw
+    assert tensor['strides'] == [1, 3]
+    assert case['inputs']['args']['items'][1] == 2
+    assert [float(value) for value in case['observed']['a']['preview']] == [0.0] * 6
+    assert case['expected']['a']['bytes_hex'] != case['observed']['a']['bytes_hex']
+    assert case['block_count'] == 2
+    assert case['suite_sha256'] == prepared.manifest['suite_sha256']
+    assert case['metrics']
