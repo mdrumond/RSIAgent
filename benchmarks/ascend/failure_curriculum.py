@@ -43,13 +43,19 @@ the probe may have failed usefully. This recommends a retry, never proves a root
 cause or resolves the original task. Terminal decisions may carry the same list.
 The goal of remediation is to improve outcomes on the original failed project.
 Once a linked experiment has committed host evidence and a verified control,
-prefer recommending ready-to-retry over generating further probes when that
-evidence suggests a plausible repair. The original retry is itself an experiment:
+make ready-to-retry the default when that evidence suggests a plausible repair. The original retry is itself an experiment:
 it tests whether the learned knowledge transfers. You do not need a complete
 root-cause explanation before recommending it. Further investigation may be
 appropriate. If you keep a failure investigating despite eligible probe/control
 evidence, use the existing reason field to identify the remaining uncertainty and
-explain why another probe is more useful than retrying the original now. Consider
+explain why another probe is more useful than retrying the original now. The
+selection-index exposes host-derived retry_eligible_pairs. Every selection,
+including an otherwise new-project-only wave, must explicitly update each eligible
+failure still investigating with a nonempty reason. Continuing investigating also
+requires a separate nonempty retry_skip_reason stating the remaining uncertainty
+and why the proposed probe is more useful than retrying the original now. Missing
+updates or retry_skip_reason will be rejected. Explicit deferral uses its existing
+reason; ready-to-retry needs no retry_skip_reason. Consider
 the remaining elapsed allowance and leave time for the original retry. A passing
 remedial project alone never proves the original is fixed.
 Never mark a failure resolved: only a successful original-target retry can do so.'''
@@ -126,16 +132,31 @@ class FailureCurriculum:
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
         chosen = [r for r in rows if r['role'] == 'selected'][start:start+8] + [r for r in rows if r['role'] == 'controls'][:2]
         manifest = []
+        eligible = self.retry_eligible_pairs(state)
         latest = {row['feedback_id']: row for row in self.lineage}
         for row in self.selection['selected']:
             out = row['outcome']
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
+                retry_eligible_pairs=eligible.get(row['feedback_id'], []),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
                 task_sha256=sha(canonical(out['task'])),
                 evidence={role: ref['sha256'] for role, ref in out['evidence'].items()}))
         return (*(_preview(row) for row in chosen), {'role': 'selection-index', 'selected': manifest})
+
+    def retry_eligible_pairs(self, state):
+        """Only committed linked probe/control evidence makes an original eligible."""
+        eligible = {}
+        for row in self.lineage:
+            key = row['feedback_id']
+            if key not in self.ids or not self._supported(row, state):
+                continue
+            pair = dict(project_id=row['project_id'], control_project_id=row['control_project_id'], host_supported=True)
+            pairs = eligible.setdefault(key, [])
+            if pair not in pairs:
+                pairs.append(pair)
+        return eligible
 
     def read(self, sha256, offset=0, limit=8192):
         digest = sha256
@@ -190,6 +211,22 @@ class FailureCurriculum:
                 raise ValueError('retry recommendation requires a previously linked probe/control')
             elif not self._supported(row, self.state):
                 raise ValueError('retry recommendation requires committed host probe/control evidence')
+        eligible = self.retry_eligible_pairs(getattr(self, 'state', {}))
+        submitted = {row['feedback_id']: row for row in rows}
+        current = {row['feedback_id']: row['investigation'] for row in self.selection['selected']}
+        current.update({row['feedback_id']: row for row in self.lineage})
+        for key in eligible:
+            if current[key]['status'] in {'deferred', 'resolved'}:
+                continue
+            update = submitted.get(key)
+            if update is None:
+                if current[key]['status'] == 'ready-to-retry':
+                    continue
+                raise ValueError('retry-eligible failure requires an explicit investigation update with reason: ' + key)
+            if update['status'] == 'investigating' and (
+                    not isinstance(update.get('retry_skip_reason'), str)
+                    or not update['retry_skip_reason'].strip()):
+                raise ValueError('retry-eligible investigation requires retry_skip_reason explaining why another probe is preferable: ' + key)
         latest = {row['feedback_id']: row for row in [*self.lineage, *rows]}
         if wave is None and any(latest.get(key, {}).get('status') not in
                 {'ready-to-retry', 'deferred'} for key in self.ids):
@@ -261,7 +298,9 @@ class FailureCurriculum:
                 other = [r for r in current['projects'] if
                          not isinstance(r, dict) or r.get('campaign_root') != str(self.root)]
                 other_evidence = [e for e in current['evidence'] if e not in evidence]
-                return dict(status=status, classification=latest['classification'], reason=latest['reason'],
+                return dict(status=status, classification=latest['classification'],
+                    reason=(latest['reason'] + '\nRetry skipped: ' + latest['retry_skip_reason']
+                            if status == 'investigating' and latest.get('retry_skip_reason') else latest['reason']),
                     projects=[*other, *(dict(row, campaign_root=str(self.root)) for row in rows)],
                     evidence=[*other_evidence, *evidence])
             self.store.update_investigation(key, merge=merge)
