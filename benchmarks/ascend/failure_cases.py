@@ -20,6 +20,8 @@ def retain_phase1_failure(artifacts, spec, source, classification, description, 
         return
     refs = {'source': {'sha256': source}}
     refs.update({role: {'sha256': artifacts.put_json(value)} for role, value in payloads.items()})
+    if classification == 'compile-failure' and 'observed' in refs:
+        refs.setdefault('diagnostics', refs['observed'])
     descriptor = dict(schema='failure-case-v1', classification=classification,
         description=description, candidate_sha256=source, project_spec=spec.as_dict(),
         policy=phase1_policy(dtype), artifacts=refs)
@@ -59,7 +61,23 @@ def optimizer_failure(prepared, row, actual, candidate_sha256, error):
     from optimizer.reference import POLICY
     import torch
     state = prepared.model.state_dict() if isinstance(prepared.model, torch.nn.Module) else {}
+    from optimizer.reference import _leaves
+    samples = []
+    actual_leaves = dict(_leaves(actual))
+    for path, expected in _leaves(row['output']):
+        observed = actual_leaves.get(path)
+        if not isinstance(expected, torch.Tensor) or not isinstance(observed, torch.Tensor) or expected.shape != observed.shape:
+            continue
+        want, got = expected.detach().cpu().reshape(-1), observed.detach().cpu().reshape(-1)
+        differing = want != got
+        if want.dtype.is_floating_point:
+            differing &= ~(torch.isnan(want) & torch.isnan(got))
+        for index in differing.nonzero().reshape(-1)[:8 - len(samples)].tolist():
+            samples.append(dict(path=path, index=index, expected=repr(want[index].item()), observed=repr(got[index].item())))
+        if len(samples) == 8:
+            break
     return dict(schema='failure-case-v1', classification='host-mismatch', description=str(error),
         candidate_sha256=candidate_sha256, suite_sha256=prepared.manifest['suite_sha256'],
         case=row['case'], policy=POLICY, inputs=tensor_payload(dict(args=row['args'], kwargs=row['kwargs'])),
-        state=tensor_payload(state), expected=tensor_payload(row['output']), observed=tensor_payload(actual))
+        state=tensor_payload(state), expected=tensor_payload(row['output']), observed=tensor_payload(actual),
+        mismatch_samples=samples)
