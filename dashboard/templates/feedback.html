@@ -18,7 +18,9 @@
 <p>{{ outcome.target }} / {{ outcome.language }} · {{ outcome.category }} · original attempt {{ outcome.attempt_id }}{% if not outcome.completed %} (interrupted, not completed){% endif %}</p>
 <p><b>Host correctness:</b> {{ 'verified' if outcome.verified else 'not verified' }}. <b>Performance:</b> {% if outcome.category == 'verified-slow' %}shortfall{% elif outcome.category == 'verified-success' %}goal met{% else %}unknown / not established{% endif %}{% if outcome.result.speedup is defined %} ({{ outcome.result.speedup }}×){% endif %}.</p>
 <p><b>Investigation:</b> {{ state.status }}{% if state.classification %} · {{ state.classification }}{% endif %}{% if state.reason %} — {{ state.reason }}{% endif %}</p>
+{{ explain(row) }}{{ explain(outcome) }}{{ explain(state) }}
 <p>Source: <code>{{ outcome.source_root }}</code></p>
+<details class="failure-cases" data-failure-cases-url="{{ url_for('failure_cases', identifier=row.feedback_id) }}" data-artifact-base="/api/feedback/{{ row.feedback_id }}/failure-artifacts/"><summary>Failing examples: inputs, expected and actual results</summary><p class="failure-cases-status">Open to inspect retained failing examples. Missing historical evidence will be identified explicitly.</p><div class="failure-cases-content"></div></details>
 <details><summary>Original project and runtime</summary><pre>{{ outcome.task|tojson(indent=2) }}</pre><pre>{{ outcome.runtime|tojson(indent=2) }}</pre></details>
 {% for role, ref in outcome.evidence.items() %}<details class="trace-event" data-trace-url="{{ url_for('feedback_evidence', identifier=row.feedback_id, role=role) }}"><summary>{{ role }} · {{ ref.sha256 }} (bounded preview)</summary><pre class="trace-payload"></pre></details>{% endfor %}
 {% if state.projects %}<details open><summary>Investigation projects</summary>{% for item in controls.feedback.projects(row, controls.campaigns) %}{% if item.url %}<a href="{{ item.url }}">{{ item.record.project_id }}</a>{% endif %}<pre>{{ item.record|tojson(indent=2) }}</pre>{% endfor %}</details>{% endif %}
@@ -26,5 +28,5 @@
 {% if state.retries %}<p>Retries: {% for identifier in state.retries %}<a href="#{{ identifier }}">{{ identifier }}</a> {% endfor %}</p>{% endif %}
 </article>{% else %}<p>No imported outcomes. Automatic remediation is an optional campaign setting.</p>{% endfor %}
 {% if controls.enabled and controls.feedback.root %}</form></section>{% endif %}
-{% for operation in operations %}<p class="operation {{ operation.status }}">{{ operation.action }}: {{ operation.status }}{% if operation.error %} — {{ operation.error }}{% endif %}</p>{% endfor %}
+{% for operation in operations %}<p class="operation {{ operation.status }}">{{ operation.action }}: {{ operation.status }}{% if operation.error %} — {{ operation.error }}{% endif %}</p>{{ explain(operation) }}{% endfor %}
 {% endblock %}

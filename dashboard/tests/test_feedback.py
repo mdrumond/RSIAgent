@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+from pathlib import Path
 from contextlib import redirect_stdout
 import subprocess
 import time
@@ -8,6 +9,7 @@ import time
 import pytest
 
 from dashboard.app import create_app
+from benchmarks.ascend.status_descriptions import describe_statuses
 
 
 def write(path, value):
@@ -46,8 +48,8 @@ def feedback(tmp_path):
 
 
 def presented(row):
-    return {**row, 'lifecycle': 'failed', 'outcome': {
-        **row['outcome'], 'source_type': 'phase2', 'original_spec': row['outcome']['task']}}
+    return describe_statuses({**row, 'lifecycle': 'failed', 'outcome': {
+        **row['outcome'], 'source_type': 'phase2', 'original_spec': row['outcome']['task']}})
 
 
 def submit(client, action, body):
@@ -290,3 +292,48 @@ def test_phase1_original_missing_native_acceptance_rejected(feedback):
     write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
     assert submit(client, 'retry-feedback', dict(preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
     assert not calls
+
+
+def test_failure_case_paging_download_and_legacy_unavailability(feedback):
+    client, app, config, row, calls = feedback
+    identifier = row['feedback_id']
+    base = f'/api/feedback/{identifier}'
+    legacy = client.get(base + '/failure-cases').get_json()[0]
+    assert not legacy['availability']['complete']
+    assert 'historical observation' in legacy['description']
+    root = config.parent / 'feedback'
+    source = b'kernel source\n'
+    inputs = b'{"values":[' + b'1,' * 5000 + b'1]}'
+    refs = {}
+    for role, data in dict(source=source, inputs=inputs, expected=b'[2]', observed=b'[0]',
+                           diagnostics=b'index 0: expected 2; observed 0').items():
+        digest = hashlib.sha256(data).hexdigest()
+        path = root / 'retained' / digest
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        refs[role] = dict(sha256=digest, retained_path=str(path))
+    write(root / 'failure-cases' / (identifier + '.json'), [dict(schema='failure-case-v1',
+        classification='host-mismatch', description='Addition returned zeros.',
+        policy=dict(atol=1e-5), artifacts=refs)])
+    before = (root / (identifier + '.json')).read_bytes()
+    cases = client.get(base + '/failure-cases').get_json()
+    assert cases[0]['availability']['complete']
+    assert cases[0]['policy'] == dict(atol=1e-5)
+    assert 'differs from the host reference' in cases[0]['status_explanations'][0]['description']
+    url = base + '/failure-artifacts/' + refs['inputs']['sha256']
+    first = client.get(url).get_json()
+    assert first['size'] == len(inputs) and first['has_more']
+    second = client.get(url + '?offset=' + str(first['next_offset'])).get_json()
+    assert (first['text'] + second['text']).encode() == inputs and not second['has_more']
+    download = client.get(url + '/download')
+    assert download.data == inputs
+    assert download.headers['Content-Disposition'].startswith('attachment')
+    assert client.get(url + '?offset=-1').status_code == 409
+    assert client.get(base + '/failure-artifacts/' + 'f' * 64).status_code == 404
+    assert client.get('/feedback').status_code == 200
+    assert 'Failing examples: inputs, expected and actual results' in client.get('/feedback').text
+    Path(refs['inputs']['retained_path']).write_bytes(b'corrupt')
+    unavailable = client.get(base + '/failure-cases').get_json()[0]
+    assert not unavailable['availability']['complete']
+    assert 'digest mismatch' in unavailable['availability']['reason']
+    assert client.get(url + '/download').status_code == 409
+    assert (root / (identifier + '.json')).read_bytes() == before and not calls

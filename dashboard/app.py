@@ -31,6 +31,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     register_feedback(app, controls, csrf_token)
     from .usefulness import register_usefulness
     register_usefulness(app, controls)
+    from .presentation import register_presentation
+    register_presentation(app)
     last = [0.0]
 
     def view():
