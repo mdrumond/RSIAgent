@@ -214,6 +214,31 @@ def freeze_committed_phase1(root, initial_memory):
     _published_evidence(root, state, initial_memory)
     files = {'state.json': state_bytes, 'campaign-identity.json': canonical(identity),
              'initial-memory.bin': initial_memory}
+    entries = []
+    try:
+        inherited = json.loads(initial_memory)
+    except (ValueError, UnicodeDecodeError):
+        inherited = None
+    if isinstance(inherited, dict) and inherited.get('schema') == 'ascend-phase2-curriculum-seed-v1':
+        from benchmarks.ascend.phase2_curriculum import reviewed_seed
+        authenticated, directory = reviewed_seed(root, inherited['snapshot_id'])
+        if json.loads(authenticated) != inherited:
+            raise ValueError('reviewed seed differs from committed initial memory')
+        entries.extend(inherited['phase1_memory'])
+        manifest = json.loads(_read(directory, 'snapshot.json'))
+        for name in [*manifest['files'], 'snapshot.json']:
+            data = _read(directory, name)
+            if name in manifest['files'] and sha(data) != manifest['files'][name]:
+                raise ValueError('inherited reviewed snapshot changed')
+            files['reviewed-seed/' + name] = data
+        from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
+        for entry in entries:
+            memory = Phase1ProjectMemory.from_mapping(entry)
+            for digest in {memory.source_revision, *memory.admitted_artifact_sha256,
+                           *(fact.evidence_sha256 for fact in memory.host_facts)}:
+                data = _read(directory, f'artifacts/objects/{digest[:2]}/{digest[2:]}')
+                if sha(data) != digest:
+                    raise ValueError('inherited reviewed memory CAS mismatch')
     for wave_id in state['completed_waves']:
         wave = root / 'waves' / wave_id
         _verify_wave(wave)
@@ -242,8 +267,8 @@ def freeze_committed_phase1(root, initial_memory):
     body = dict(schema='optimizer-memory-snapshot-v1', phase='committed-phase1',
         source_identity=identity, terminal=state.get('terminal'),
         phase1_snapshot_id=sha(state_bytes),
-        memory_entries=[json.loads(base64.b64decode(raw, validate=True))
-                        for raw in state['memory_bytes_base64']],
+        memory_entries=entries + [json.loads(base64.b64decode(raw, validate=True))
+                                  for raw in state['memory_bytes_base64']],
         files={name: dict(sha256=sha(data), base64=base64.b64encode(data).decode())
                for name, data in sorted(files.items())})
     return {**body, 'snapshot_id': sha(canonical(body))}

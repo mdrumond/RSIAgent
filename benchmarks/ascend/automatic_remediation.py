@@ -140,6 +140,8 @@ class AutomaticRemediation:
 
     def retry_ready(self, state):
         for row in self.feedback.selection['selected']:
+            if self.runner._remaining_seconds() <= 0:
+                return
             key = row['feedback_id']
             if row['investigation']['status'] != 'ready-to-retry':
                 continue

@@ -47,13 +47,13 @@ def test_unknown_harness_revision_is_not_fabricated(tmp_path, metadata):
         cli._harness_revision(tmp_path)
 
 
-def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session", seed=b"seed"):
+def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session", seed=b"seed", settings_extra=None):
     manifest = write(tmp_path / "sources.json", {
         "schema": "ascend-sft-sources-v2", "sources": [{"name": "catlass",
         "repository": "https://example.invalid/catlass", "revision": "a" * 40,
         "license": "Apache-2.0", "include": ["**/*.py"]}]})
     config = write(tmp_path / "settings.json", {"model": "openai/gpt-5.6-sol",
-        "phase1_arguments": list(extra), "source_manifest": str(manifest)})
+        "phase1_arguments": list(extra), "source_manifest": str(manifest), **(settings_extra or {})})
     memory = tmp_path / "seed"
     memory.write_bytes(seed)
     argv = ["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),
@@ -1193,3 +1193,13 @@ def test_binding_print_capability_and_native_runtime_observations(tmp_path):
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")
+
+
+def test_automatic_remediation_pins_external_optimizer_worker_configuration(tmp_path):
+    worker = write(tmp_path/'optimizer-worker.json', {'execution': 'local', 'physical_device': 1})
+    job = start(tmp_path, settings_extra={'automatic_remediation': True,
+                                        'optimizer_worker_config': str(worker)})
+    assert job['optimizer_worker_config_sha256'] == hashlib.sha256(worker.read_bytes()).hexdigest()
+    write(worker, {'execution': 'local', 'physical_device': 2})
+    with pytest.raises(ValueError, match='optimizer worker configuration changed'):
+        cli.build_controller(job)

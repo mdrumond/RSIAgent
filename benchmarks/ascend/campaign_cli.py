@@ -118,6 +118,10 @@ def build_controller(job):
     if hashlib.sha256(config_bytes).hexdigest() != job["config_sha256"]:
         raise ValueError("runtime settings changed; use a new campaign configuration")
     settings = json.loads(config_bytes)
+    if job['phase'] == 1 and settings.get('automatic_remediation') and settings.get('optimizer_worker_config'):
+        worker_bytes = Path(settings['optimizer_worker_config']).read_bytes()
+        if hashlib.sha256(worker_bytes).hexdigest() != job.get('optimizer_worker_config_sha256'):
+            raise ValueError('optimizer worker configuration changed on resume')
     captured = []
 
     def capture(**options):
@@ -1022,7 +1026,7 @@ def main(argv=None, *, screen=start_screen):
         if args.worker_config is not None:
             job["worker_config"] = str(args.worker_config.resolve(strict=True))
             job["worker_config_sha256"] = hashlib.sha256(args.worker_config.read_bytes()).hexdigest()
-        if job.get("optimizer_goal") and settings.get("optimizer_worker_config"):
+        if (job.get("optimizer_goal") or args.phase == 1 and settings.get("automatic_remediation")) and settings.get("optimizer_worker_config"):
             job["optimizer_worker_config_sha256"] = hashlib.sha256(
                 Path(settings["optimizer_worker_config"]).read_bytes()).hexdigest()
         if goal is not None:
