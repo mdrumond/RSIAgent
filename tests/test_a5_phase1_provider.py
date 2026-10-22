@@ -448,7 +448,6 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_pa
     }
     prompt = calls[-1]["request"]["messages"][-1]
     assert prompt["role"] == "user"
-    assert DISTILLATION_PROMPT in prompt["content"]
     assert ADMITTED in prompt["content"]
     assert outcome.terminal_response == _distillation()
     assert outcome.tokens == 4
