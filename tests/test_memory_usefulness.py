@@ -188,3 +188,23 @@ def test_factory_caps_every_provider_call_by_local_pair_and_parent(tmp_path, ins
         assert calls == [10, 7, 3]
         assert [request.remaining_seconds for request in arms] == [2.5, 2.5]
     assert verifier._experiment_remaining is None
+
+
+def test_semantic_failure_arms_retain_linkable_evidence(tmp_path):
+    import hashlib
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+    evidence = {'actor_status': 'completed-unverified', 'source_sha256': 'a' * 64}
+    def execute(request):
+        raise SemanticProjectFailure('Host verification failed', evidence)
+    verifier = UsefulnessVerifier(tmp_path, CurriculumAgent(lambda messages:
+        _wave(messages[-1]['content'], [_project('failed-copy', 'gm-ub-movement')])),
+        execute, lambda stage, body: stage, enabled=True)
+    assessment = verifier.assess_lesson({'claim': 'copy'},
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'failed-source')
+    assert assessment['outcome'] == 'neither-succeeded'
+    expected = canonical_bytes({'verified': False, 'detail': 'Host verification failed', 'evidence': evidence})
+    for arm in ('control', 'treatment'):
+        path = tmp_path / assessment['experiment_id'] / arm / 'evidence.json'
+        assert path.read_bytes() == expected
+        assert assessment['arms'][arm]['evidence_sha256'] == hashlib.sha256(expected).hexdigest()
