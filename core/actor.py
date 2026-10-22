@@ -1,9 +1,8 @@
 """Program synthesis — the system prompt (GENERAL principles only) + turn parsing.
 
-THIS FILE IS THE AUDITED SURFACE (Constraint #0). Nothing in it may encode knowledge
-of any specific benchmark task, its setup, or its grader: tests/test_no_leakage.py
-scans this file against tests/blocklist_012.txt on every change. Principles below must
-be defensible as general engineering practice for ANY machine task.
+Nothing in this prompt surface may encode knowledge of any specific benchmark task,
+its setup, or its grader (Constraint #0). Principles below must be defensible as
+general engineering practice for ANY machine task.
 """
 import re
 from dataclasses import dataclass, field
