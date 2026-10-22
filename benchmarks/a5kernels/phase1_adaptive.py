@@ -97,6 +97,7 @@ class AdaptiveProjectRequest:
     memory_root: Path | None = None
     remaining_seconds: float | None = None
     publish_learning: bool = True
+    failure_context: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -542,13 +543,22 @@ class AdaptivePhase1Coordinator:
             return self._execute_bound(request)
 
     def _execute_bound(self, request: WaveProjectRequest) -> WaveProjectResult:
+        failure_context = (self.failure_feedback.project_context(request.assignment.project_id)
+                           if self.failure_feedback else None)
+        inputs, oracle = request.inputs, request.oracle
+        if failure_context is not None and request.assignment.spec.failure_mode.value != 'none':
+            from benchmarks.ascend.failure_handoff import FailureContext
+            failure = FailureContext(failure_context, request.assignment.spec)
+            failure.require_repair_evidence(request.assignment.spec)
+            inputs, oracle = failure.inputs, failure.expected
         result = self.execute_project(AdaptiveProjectRequest(
             request.assignment.spec,
             request.assignment.authored_ordinal,
             request.pre_wave_memory,
             request.branch_root,
-            request.inputs,
-            request.oracle,
+            inputs,
+            oracle,
+            failure_context=failure_context,
             remaining_seconds=(self.automatic_remediation.project_remaining(request)
                                if self.automatic_remediation else self._remaining_seconds()),
         ))
