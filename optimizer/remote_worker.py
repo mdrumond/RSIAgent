@@ -37,14 +37,21 @@ def execute(request):
     elif operation == 'evaluate' or request.get('source') is not None:
         result = evaluate(baseline, request['source'], directory / 'evaluation', arch=request['arch'],
                           block_count=request['block_count'], benchmark=operation == 'evaluate', profile=operation == 'profile',
-                          cache_directory=cache_directory)
+                          cache_directory=cache_directory,
+                          profile_policy=request.get('profiling'), diagnostic_only=operation == 'profile')
     else:
         prepared = load_reference(baseline, 'npu:0')
-        result = {'suite_sha256': prepared.manifest['suite_sha256'], 'cases': []}
-        for row in prepared.cases:
+        from .profile_policy import select
+        selected, coverage = select(prepared, request.get('profiling'))
+        coverage['implementations'] = ['torch']
+        result = {'suite_sha256': prepared.manifest['suite_sha256'], 'cases': [], 'profiling_coverage': coverage}
+        for row in selected:
             args, kwargs = copy.deepcopy((row['args'], row['kwargs']))
             fn = lambda args=args, kwargs=kwargs: prepared.invoke(*args, **kwargs)
-            result['cases'].append({'case': row['case']['id'], 'profiling': {'torch': profile(fn, directory / (row['case']['id'] + '-torch-profile'))}})
+            identity = {'suite_sha256': prepared.manifest['suite_sha256'], 'case': row['case']['id'],
+                        'implementation': 'torch'}
+            result['cases'].append({'case': row['case']['id'], 'profiling': {'torch': profile(fn,
+                directory / (row['case']['id'] + '-torch-profile'), groups=coverage['policy']['groups'], identity=identity)}})
     return result
 
 
@@ -60,6 +67,11 @@ def publish(directory, result):
         allowed |= 'compact' in relative.parts and path.suffix in {'.csv', '.json'}
         # Raw timing rows are compact evidence; profiler timelines stay remote.
         allowed |= path.name.startswith(('op_summary', 'kernel_details', 'task_time')) and path.suffix == '.csv'
+        # Diagnostic analysis runs remotely. Digests carry report hashes/paths;
+        # normalized tables and raw profiling trees are not portable artifacts.
+        diagnostic = any(part.endswith('-profile') for part in relative.parts)
+        if diagnostic and ('raw' in relative.parts or 'compact' in relative.parts):
+            allowed = False
         if allowed:
             data = path.read_bytes()
             files.append({'path': str(relative), 'sha256': sha(data), 'size': len(data)})

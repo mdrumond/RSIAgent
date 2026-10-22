@@ -17,6 +17,8 @@ from .transport import CheckedTransport, ObservationUnavailable, WorkerStopped, 
 def load_config(path, worker_config_path=None):
     from benchmarks.ascend.execution import apply_worker_config, execution_mode
     config = apply_worker_config(json.loads(Path(path).read_text()), worker_config_path)
+    from .profile_policy import policy
+    policy(config.get('profiling'))
     if execution_mode(config) == 'local':
         if not Path(config.get('guide', '')).is_absolute():
             raise ValueError('local worker requires an absolute guide path')
@@ -96,7 +98,7 @@ class RemoteBackend:
         command = (f'test -d {quoted(self.config["remote_workspace"])} && mkdir -p {quoted(str(remote_directory))} '
                    f'&& tar -xzf {quoted(str(upload))} -C {quoted(str(remote_directory))} '
                    f'&& cd {quoted(str(remote_directory / "source"))} '
-                   f'&& timeout --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
+                   f'&& timeout --foreground --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
                    f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
         failure = None
         try:
@@ -166,7 +168,9 @@ class RemoteBackend:
         return self._operation('compile', directory, source=source, block_count=block_count)
 
     def profile(self, source, directory, *, block_count=1):
-        return self._operation('profile', directory, source=source, block_count=block_count)
+        from .profile_policy import policy
+        return self._operation('profile', directory, source=source, block_count=block_count,
+                               profiling=policy(self.config.get('profiling')))
 
 
 class LocalBackend(RemoteBackend):
@@ -280,6 +284,10 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
         # caller pins a versioned identity; callable names are not stable IDs.
         if transport_factory is not None:
             identity['transport_identity'] = config['transport_identity']
+        # Preserve legacy resume identities when no policy was explicitly set.
+        if 'profiling' in config:
+            from .profile_policy import policy
+            identity['profiling'] = policy(config['profiling'])
         previous = next((event['payload'] for event in store.events(job_id)
                          if event['kind'] == 'worker-configuration'), None)
         if previous is not None and previous != identity:
