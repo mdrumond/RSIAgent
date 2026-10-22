@@ -198,7 +198,8 @@ class FailureCurriculum:
             for project in wave.projects:
                 spec = project.spec
                 keys = [row['feedback_id'] for row in rows if row.get('project_id') == spec.project_id]
-                if keys and getattr(spec, 'failure_mode', None) is not None:
+                mode = getattr(spec, 'failure_mode', None)
+                if mode is not None and mode.value != 'none':
                     from .failure_handoff import FailureContext
                     FailureContext(dict(root=str(self.store.root), feedback_ids=keys), spec).require_repair_evidence(spec)
         return tuple(rows)

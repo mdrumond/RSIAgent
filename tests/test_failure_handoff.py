@@ -111,6 +111,8 @@ def test_selection_rejects_incompatible_repair_but_accepts_exploratory_probe(tmp
     prior = SimpleNamespace(prior_outcomes=[])
     with pytest.raises(ValueError, match='same computation'):
         curriculum.admit([row], wave, prior)
+    with pytest.raises(ValueError, match='No failure cases were linked'):
+        curriculum.admit([], wave, prior)
     value = changed.as_dict()
     value['failure_mode'] = 'none'
     value['capabilities'].remove('failure-repair')
