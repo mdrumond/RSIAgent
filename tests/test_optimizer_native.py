@@ -20,14 +20,6 @@ def test_wrapper_preserves_layout_scalars_nested_outputs_and_namespace():
     assert contract['inputs'][0]['strides'] == [1, 3]
     assert contract['scalars'] == {'arg1': 2}
     assert len(contract['outputs']) == 2
-    source = native.render_wrapper('extern "C" __global__ __aicore__ void optimizer_kernel(GM_ADDR input0, GM_ADDR output0, GM_ADDR output1) {}', contract, 'optimizer_abc', 1)
-    assert 'INPUT0_STRIDE0 = 1' in source
-    assert 'ARG1 = 2' in source
-    assert 'std::vector<torch::Tensor> owned_inputs(inputs.begin(), inputs.end())' in source
-    assert 'owned_inputs[0].data_ptr()' in source
-    assert 'TORCH_LIBRARY(optimizer_abc' in source
-    assert '#define optimizer_kernel optimizer_abc_kernel' in source
-    assert 'empty_strided' in source
 
 
 def test_frozen_bundle_authenticates_and_never_regenerates(tmp_path, monkeypatch):

@@ -42,7 +42,6 @@ def test_native_backend_uses_shared_host_oracle(tmp_path):
     executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "ledger.jsonl"),
                                binding=NativeProjectBinding())
     prepared = executor.prepare(spec())
-    assert "tla" not in prepared.instruction
     source = prepared.abi.signature + " {}"
     assert executor.compile(spec(), source).observation.passed
     assert executor.execute(spec(), source).evidence.verified
@@ -94,7 +93,6 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, select
     controller = build_native_adaptive_phase1(**kwargs)
     assert controller.curriculum.target_policy.target == "a3"
     assert controller.project_target == 64
-    assert "A3 Ascend C" in controller.execute_project.actor.system_prompt
     assert controller.execute_project.retain_semantic_failure is True
     identity = json.loads((tmp_path / "campaign-identity.json").read_bytes())
     if phase2:

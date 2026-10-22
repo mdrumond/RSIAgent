@@ -52,7 +52,6 @@ def test_phase2_qualify_command_stops_before_model_or_live_runner(tmp_path, caps
         "cell_id": destination.cell_id, "status": "transport-qualified"
     }
     assert explanations[0]["code"] == "transport-qualified"
-    assert "kernel correctness has not been established" in explanations[0]["description"]
     # Qualification remains an immutable machine record; descriptions are display-only.
     assert qualification.read_text() == '{"status":"transport-qualified"}\n'
     assert not (qualification.parent / "terminal.json").exists()

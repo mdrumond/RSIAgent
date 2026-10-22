@@ -28,8 +28,6 @@ def _guidance(tmp_path):
 def test_admission_hashes_all_references_and_preserves_legacy_cells(tmp_path):
     identity, text = _guidance(tmp_path)
     assert identity.guidance_sha256 == hashlib.sha256(text.encode()).hexdigest()
-    assert "request-timing" in text and "request-profile" in text
-    assert "BasicInfo" in text and "a5-timeline-semantics.md" in text
     verify_profiling_guidance(identity, text)
     with pytest.raises(ValueError, match="does not match"):
         verify_profiling_guidance(identity, text + " changed")

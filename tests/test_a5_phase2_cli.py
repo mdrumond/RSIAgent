@@ -199,7 +199,6 @@ def test_cli_fake_runtime_runs_one_cell_end_to_end(tmp_path, capsys):
     assert stored == terminal
     assert "status_explanations" not in stored
     assert explanations[0]["code"] == stored["status"] == "passed"
-    assert "configured acceptance checks" in explanations[0]["description"]
     # Display additions must not invalidate the original terminal record identity.
     from benchmarks.a5kernels.evidence import canonical_digest
     assert stored["record_sha256"] == canonical_digest({

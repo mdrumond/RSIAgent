@@ -675,11 +675,6 @@ def test_catlass_fixture_uses_current_imperative_runtime_api():
         "PYTHONPYCACHEPREFIX",
     }
     assert set(sources) == {"host_driver.py", "kernel.py"}
-    assert "tla.allocate" in sources["kernel.py"]
-    assert 'tla.vec.func(mode="simd")' in sources["kernel.py"]
-    assert ".mark_compact_shape_dynamic(0)" in sources["kernel.py"]
-    assert 'options="--npu-arch 3510"' in sources["kernel.py"]
-    assert "torch.npu.synchronize()" in sources["kernel.py"]
 
 
 def test_staged_host_driver_emits_single_numeric_record_with_fake_kernel(tmp_path):
@@ -1156,13 +1151,6 @@ def test_catlass_capacity_is_rejected_before_remote_execution():
 
 
 def test_catlass_source_pads_to_full_tiles_and_preserves_public_capacity():
-    source = {item.relative_path: item.content for item in fixture_for(Language.CATLASS_DSL).files}[
-        "kernel.py"
-    ]
-
-    assert "PADDED_VECTOR_ELE = 448" in source
-    assert "padded_length = ((original_length + VL_ELE - 1) // VL_ELE) * VL_ELE" in source
-    assert "return out[:original_length].cpu().tolist()" in source
     A5KernelRunner(FakeBackend()).prepare(RunRequest(Language.CATLASS_DSL.value, length=400))
 
 

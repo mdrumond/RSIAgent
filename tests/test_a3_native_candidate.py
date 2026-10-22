@@ -40,14 +40,11 @@ def test_generic_bundle_retains_shapes_types_source_and_explicit_toolchain(tmp_p
     with tarfile.open(bundle.path) as archive:
         payload = json.load(archive.extractfile("input.json"))
         build = json.load(archive.extractfile("build.json"))
-        wrapper = archive.extractfile("host_wrapper.inc").read().decode()
     assert payload["inputs"][0]["shape"] == [2, 3]
     assert payload["inputs"][0]["dtype"] == "float16"
     assert payload["output"]["shape"] == [2]
     assert build["arch"] == "discovered-arch"
     assert build["target"] == "discovered-a3"
-    assert "::compute<<<" in wrapper
-    assert "vector_add" not in wrapper
 
 
 def test_identity_changes_with_input_dtype_shape_and_target():

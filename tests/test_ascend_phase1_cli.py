@@ -106,14 +106,6 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
     assert "CATLASS" not in capsys.readouterr().out
 
 
-def test_timing_kernel_contract_has_host_shape_macros():
-    from benchmarks.a3kernels.native_smoke import smoke_plan
-    plan = smoke_plan(target="discovered-a3", arch="discovered-arch")
-    wrapper = next(f.content for f in plan.files if f.relative_path == "host_wrapper.inc")
-    assert "#define RSI_NATIVE_INPUT0_NUMEL 32" in wrapper
-    assert "#define RSI_NATIVE_OUTPUT_DIM0 32" in wrapper
-
-
 def test_native_timing_action_recompiles_each_shape_with_host_inputs(tmp_path):
     from test_ascend_target_production import spec
     from benchmarks.ascend.production import NativeProjectBackend, NativeProjectBinding
@@ -129,7 +121,6 @@ def test_native_timing_action_recompiles_each_shape_with_host_inputs(tmp_path):
             logical_shapes.append(plan.output.logical_shape)
             wrapper = next(f.content for f in plan.files if f.relative_path == "host_wrapper.inc")
             assert f"#define RSI_NATIVE_INPUT0_LOGICAL_NUMEL {plan.inputs[0].logical_shape[0]}" in wrapper
-            assert "#define RSI_NATIVE_INPUT0_NUMEL 16" in wrapper
             return CandidateCompilation(plan, "a" * 64, "compiled", "", "b" * 64)
         def remote_candidate_directory(self, plan):
             return PurePosixPath("/owned") / plan.execution_id

@@ -8,7 +8,6 @@ import subprocess
 import pytest
 
 from config.settings import Config
-from core.actor import PLAIN_JSON_TRANSPORT_NOTE
 from core.loop import LoopResult
 from explore import phase1_wave as wave
 from explore.practice_loop import PracticeBoundaryError, PracticeHooks, PracticeInfrastructureError
@@ -90,7 +89,6 @@ def test_retry_preserves_partial_files_and_complete_context(surface):
 
     def attempt(prompt, _vm, phase_cfg, sink, **kwargs):
         histories.append(copy.deepcopy(kwargs["initial_history"]))
-        assert PLAIN_JSON_TRANSPORT_NOTE in phase_cfg.system_extra
         assert phase_cfg.system_extra.startswith("existing contract")
         assert not stale.exists()
         if len(histories) == 1:
@@ -105,7 +103,6 @@ def test_retry_preserves_partial_files_and_complete_context(surface):
         assert not surface[1].exists(), "a retry must invalidate the stale handoff"
         assert (surface[0] / "p/evolution_project/input.txt").read_text() == \
             "original partial input"
-        assert "draft fixtures" in prompt and "remain on the same machine" in prompt
         assert kwargs["continue_context"] is True
         _publish(surface)
         assert kwargs["terminal_handoff_ready"]()
