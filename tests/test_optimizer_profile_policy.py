@@ -87,14 +87,28 @@ def test_invalid_policy_rejected(value):
         policy(value)
 
 
-def test_remote_backend_forwards_effective_policy(tmp_path, monkeypatch):
-    from optimizer.worker import RemoteBackend
-    backend = object.__new__(RemoteBackend)
+@pytest.mark.parametrize('backend_name', ['RemoteBackend', 'LocalBackend'])
+def test_remote_backend_forwards_effective_policy(tmp_path, monkeypatch, backend_name):
+    from optimizer import worker
+    backend = object.__new__(getattr(worker, backend_name))
     backend.config = {}
     monkeypatch.setattr(backend, '_operation', lambda operation, directory, **payload: payload)
     assert backend.profile('source', tmp_path)['profiling'] == {'max_cases': 1, 'groups': ['PipeUtilization']}
     backend.config = {'profiling': {'max_cases': 2, 'groups': ['Memory', 'PipeUtilization']}}
     assert backend.profile(None, tmp_path)['profiling']['max_cases'] == 2
+
+
+def test_local_worker_validates_profiling_before_early_return(tmp_path):
+    from optimizer.worker import load_config
+    settings = {'execution': 'local', 'guide': str(tmp_path / 'guide'),
+                'profiling': {'max_cases': 0}}
+    path = tmp_path / 'worker.json'
+    path.write_text(json.dumps(settings))
+    with pytest.raises(ValueError):
+        load_config(path)
+    settings['profiling'] = {'max_cases': 2, 'groups': ['Memory']}
+    path.write_text(json.dumps(settings))
+    assert load_config(path)['profiling'] == settings['profiling']
 
 
 def test_remote_reference_profile_selects_one_and_binds_suite_identity(tmp_path, monkeypatch):
