@@ -101,10 +101,12 @@ def test_remote_backend_forwards_effective_policy(tmp_path, monkeypatch, backend
 def test_local_worker_validates_profiling_before_early_return(tmp_path):
     from optimizer.worker import load_config
     settings = {'execution': 'local', 'guide': str(tmp_path / 'guide'),
+                'workspace': str(tmp_path / 'workspace'),
+                'physical_device': 0, 'arch': 'test-arch',
                 'profiling': {'max_cases': 0}}
     path = tmp_path / 'worker.json'
     path.write_text(json.dumps(settings))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match='max_cases'):
         load_config(path)
     settings['profiling'] = {'max_cases': 2, 'groups': ['Memory']}
     path.write_text(json.dumps(settings))
