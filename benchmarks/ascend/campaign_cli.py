@@ -106,6 +106,16 @@ def _composed_target_runtime(actor, declared):
     return dict(actual)
 
 
+def _validate_remediation_settings(settings, *, phase, target, approval):
+    if phase != 1 or not settings.get('automatic_remediation'):
+        return
+    if approval:
+        raise ValueError('automatic remediation does not support approval mode')
+    if target != 'a3' and (settings.get('optimizer_worker_config') or any(
+            row.get('type') in {'phase2', 'optimizer'} for row in settings.get('feedback_sources', []))):
+        raise ValueError('external automatic remediation requires an A3 campaign')
+
+
 def build_controller(job):
     """Reuse the existing native/Catlass CLI bindings, replacing only execution."""
     from .phase1_cli import main as target_main
@@ -118,6 +128,8 @@ def build_controller(job):
     if hashlib.sha256(config_bytes).hexdigest() != job["config_sha256"]:
         raise ValueError("runtime settings changed; use a new campaign configuration")
     settings = json.loads(config_bytes)
+    _validate_remediation_settings(settings, phase=job['phase'], target=job['target'],
+                                   approval=job.get('approval_mode', False))
     if job['phase'] == 1 and settings.get('automatic_remediation') and settings.get('optimizer_worker_config'):
         worker_bytes = Path(settings['optimizer_worker_config']).read_bytes()
         if hashlib.sha256(worker_bytes).hexdigest() != job.get('optimizer_worker_config_sha256'):
@@ -173,7 +185,7 @@ def build_controller(job):
                 store=settings.get('feedback_root', job.get('feedback_root')),
                 sources=settings.get('feedback_sources', []),
                 seconds=settings.get('failure_active_seconds', 1800))
-            if settings.get('optimizer_worker_config'):
+            if job['target'] == 'a3' and settings.get('optimizer_worker_config'):
                 automatic.retry_external = optimizer_retry_adapter(coordinator, automatic.store,
                     load_config(settings['optimizer_worker_config']))
         if job.get("optimizer_goal"):
@@ -930,6 +942,10 @@ def main(argv=None, *, screen=start_screen):
             parser.error("start requires an empty campaign root; use resume")
         config = args.config.resolve()
         settings = _read(config)
+        try:
+            _validate_remediation_settings(settings, phase=args.phase, target=args.target, approval=args.approval_mode)
+        except ValueError as error:
+            parser.error(str(error))
         arguments = settings["phase1_arguments"]
         reserved = {"--root", "--objective", "--initial-memory", "--target", "--project-target", "--max-projects", "--max-seconds"}
         if not isinstance(arguments, list) or any(not isinstance(a, str) for a in arguments):
