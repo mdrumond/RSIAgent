@@ -611,3 +611,74 @@ def test_hidden_mixed_failure_task_is_hash_readable_without_advancing_wave(tmp_p
     original = next(row for row in selection['selected'] if row['feedback_id'] == hidden['feedback_id'])
     assert task == original['outcome']['task']
     assert len(manifest) == 10 and len(visible) == 8
+
+
+def eligible_feedback(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    from test_a5_phase1_adaptive import _memory
+    _, selection, feedback = setup(tmp_path)
+    runner = AdaptivePhase1Coordinator(feedback.root, 'Investigate or retry.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=4)
+    runner.failure_feedback = feedback
+    state = runner._load_state()
+    control = _project('control', 'gm-ub-movement')
+    state.update(prior_outcomes=[dict(project_id='control', spec=control, verified=True, summary='host passed')],
+        memory_bytes_base64=[base64.b64encode(canonical(_memory(ProjectSpec.from_mapping(control)).as_dict())).decode()],
+        failed_outcomes=[dict(project_id='probe', spec=_project('probe', 'padded-tail'), verified=False,
+            summary='host mismatch', evidence=dict(sha256='a'*64, source_sha256='b'*64, classification='host-mismatch'))])
+    feedback.lineage = [investigation(selection)]  # Legacy rows need no skip field.
+    context = runner._context(state, runner._memory_snapshot(state))
+    wave = SimpleNamespace(projects=[SimpleNamespace(spec=SimpleNamespace(project_id='next-probe'))])
+    return feedback, selection, state, context, wave
+
+
+@pytest.mark.parametrize('skip', [None, '', '   '])
+def test_eligible_failure_requires_explicit_update_and_nonblank_skip_reason(tmp_path, skip):
+    feedback, selection, _, context, wave = eligible_feedback(tmp_path)
+    with pytest.raises(ValueError, match='explicit investigation update'):
+        feedback.admit([], wave, context)  # An otherwise unlinked new wave cannot hide it.
+    row = dict(investigation(selection), project_id='next-probe', retry_skip_reason=skip)
+    with pytest.raises(ValueError, match='requires retry_skip_reason'):
+        feedback.admit([row], wave, context)
+
+
+def test_failed_probe_eligibility_visible_and_justified_skip_persisted(tmp_path):
+    feedback, selection, state, context, wave = eligible_feedback(tmp_path)
+    manifest = feedback.context(state)[-1]['selected'][0]
+    assert manifest['retry_eligible_pairs'] == [dict(project_id='probe', control_project_id='control', host_supported=True)]
+    justification = 'Alignment remains uncertain; the next probe isolates padding more directly than another original retry.'
+    row = dict(investigation(selection), project_id='next-probe', retry_skip_reason=justification)
+    assert feedback.admit([row], wave, context) == (row,)
+    feedback.record([row], state)
+    original = next(record for record in feedback.store.records() if record['feedback_id'] in feedback.ids)
+    assert justification in original['investigation']['reason']
+    assert original['investigation']['projects'][-1]['retry_skip_reason'] == justification
+
+
+def test_eligible_ready_retry_or_explicit_deferral_needs_no_skip_reason(tmp_path):
+    feedback, selection, _, context, _ = eligible_feedback(tmp_path)
+    ready = dict(investigation(selection), status='ready-to-retry')
+    assert feedback.admit([ready], None, context) == (ready,)
+    deferred = dict(feedback_id=ready['feedback_id'], status='deferred', classification='provider',
+                    reason='Provider unavailable; defer rather than spend the retry allowance.')
+    assert feedback.admit([deferred], None, context) == (deferred,)
+
+
+def test_missing_retry_justification_is_corrected_before_wave_execution(tmp_path):
+    feedback, selection, state, context, _ = eligible_feedback(tmp_path)
+    calls = []
+    def complete(messages):
+        calls.append(messages)
+        prompt = messages[1]['content']
+        payload = json.loads(_wave(prompt, [_project('next-probe', 'padded-tail')]).split('\n', 1)[1])
+        if len(calls) > 1:
+            assert 'explicit investigation update' in messages[-1]['content']
+            payload['failure_investigations'] = [dict(investigation(selection), project_id='next-probe',
+                retry_skip_reason='Padding uncertainty remains; this probe separates sentinel effects before the original retry.')]
+        return 'DECISION: WAVE\n' + json.dumps(payload)
+    agent = CurriculumAgent(complete)
+    agent.failure_feedback = feedback
+    decision, _ = agent.select(context, remaining_projects=1)
+    assert len(calls) == 2
+    assert decision.failure_investigations[0]['retry_skip_reason']

@@ -11,7 +11,7 @@ from benchmarks.a5kernels.phase1_curriculum_selector import (
     CurriculumSession, _grammar, _HELD_OUT_WORDS, _digest, project_information_sha256,
 )
 from benchmarks.ascend.phase2_targets import TargetContract
-from benchmarks.ascend.targets import CurriculumPolicy
+from benchmarks.ascend.targets import CurriculumPolicy, METRIC_SWEEP_GUIDANCE
 
 
 SYSTEM = """You are the target-driven Ascend Phase-2 Curriculum Agent.
@@ -23,7 +23,7 @@ target may still benefit from practice, but every practice requires a fresh targ
 attempt. Never relax correctness, change the target, invent measurements or impose
 an unmeasured speedup threshold. Never mention or reconstruct held-out benchmarks
 in practice projects. Reference source is intentionally private.
-Return one exact decision wire form and JSON, without Markdown or extra text."""
+Return one exact decision wire form and JSON, without Markdown or extra text.""" + METRIC_SWEEP_GUIDANCE
 
 
 @dataclass(frozen=True)

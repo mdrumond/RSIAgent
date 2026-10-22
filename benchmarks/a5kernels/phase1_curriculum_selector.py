@@ -14,7 +14,7 @@ import time
 import re
 from typing import Callable, Mapping, Sequence
 
-from benchmarks.ascend.targets import CurriculumPolicy
+from benchmarks.ascend.targets import CurriculumPolicy, METRIC_SWEEP_GUIDANCE
 
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_curriculum import (
@@ -437,7 +437,8 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
-    guidance = ASCEND_EXPERIMENT_GUIDANCE if target_policy is None else target_policy.guidance
+    guidance = (ASCEND_EXPERIMENT_GUIDANCE + METRIC_SWEEP_GUIDANCE
+                if target_policy is None else target_policy.guidance)
     return instructions + guidance + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 

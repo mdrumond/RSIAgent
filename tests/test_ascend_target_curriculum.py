@@ -104,3 +104,18 @@ def test_legacy_agent_derives_simt_labels_for_new_proposals():
     labels = {item.value for item in decision.wave.projects[0].spec.capabilities}
     assert "simt-reduction" in labels
     assert "vector-reduction" not in labels
+
+
+@pytest.mark.parametrize('native', [False, True])
+def test_phase1_curriculum_batches_metric_sweeps_without_banning_correctness(native):
+    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
+    from benchmarks.ascend.targets import METRIC_SWEEP_GUIDANCE
+    context = CurriculumContext('Learn useful experiments.', 1, 'a'*64, (), ())
+    policy = a3_curriculum_policy() if native else None
+    prompt = curriculum_prompt(context, target_policy=policy)
+    assert METRIC_SWEEP_GUIDANCE in prompt
+    assert 'timing_lengths listing the values' in prompt
+    assert 'correctness' in prompt and 'failure isolation remain valid' in prompt
+    assert 'explain the capability limit' in prompt
+    if native:
+        assert METRIC_SWEEP_GUIDANCE in policy.guidance

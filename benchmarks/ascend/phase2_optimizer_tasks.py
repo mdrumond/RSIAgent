@@ -15,6 +15,7 @@ from optimizer.jobs import atomic, canonical
 from optimizer.memory import verify_snapshot
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .agent_presentation import memory_presentation, compact_observation, artifact_page_presentation
+from .targets import METRIC_SWEEP_GUIDANCE
 
 
 SYSTEM = '''You are the Phase 2 Curriculum Agent. Propose one bounded, useful new
@@ -43,7 +44,7 @@ You may return {"query":"specific kernel code search"} or
 {"read_artifact":{"sha256":"hash","offset":0,"limit":8192}} before proposing.
 Use the remaining time for tool reads and corrections. Query KDB before
 proposing when enabled. Memory is a bounded index; full evidence is hash-readable.
-Return JSON only. No private chain of thought.'''
+Return JSON only. No private chain of thought.''' + METRIC_SWEEP_GUIDANCE
 
 
 def _save(path, value):
