@@ -47,6 +47,9 @@ def test_presentation_is_idempotent_and_does_not_rewrite_evidence():
     ('RECOVERY_REQUIRED', 'recovered'), ('waiting-approval', 'approval'),
     ('context-budget-exhausted', 'context limit'), ('could-not-confirm', 'enough evidence'),
     ('infrastructure-failed', 'infrastructure'), ('proposed', 'not yet'),
+    ('checking-correctness', 'frozen reference'), ('checking-reference', 'reference'),
+    ('succeeded', 'correctness is a separate'), ('practice', 'practice project'),
+    ('target', 'original target'), ('review', 'reviewing'), ('qualification', 'qualification'),
 ])
 def test_ordinary_codes_have_specific_explanations(code, phrase):
     explanation = explain_status(code)
@@ -72,3 +75,11 @@ def test_large_failure_log_keeps_explanation_and_exact_raw_hash(tmp_path):
     assert store.read_json(view['full_observation_sha256']) == raw
     assert view['missing'] == raw['missing']
     assert {row['field'] for row in view['status_explanations']} == {'classification', 'missing'}
+
+
+def test_learner_stage_is_explained_without_promoting_practice_to_target_success():
+    view = describe_statuses({'learner_stage': 'practice'})
+    row, = view['status_explanations']
+    assert row['field'] == 'learner_stage'
+    assert row['code'] == view['learner_stage'] == 'practice'
+    assert 'practice success alone' in row['next_action']
