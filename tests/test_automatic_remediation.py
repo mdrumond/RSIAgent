@@ -9,7 +9,8 @@ from test_a5_phase1_adaptive import _project, _wave, _result
 
 
 @pytest.mark.parametrize("assessment_error", [False, True])
-def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error):
+@pytest.mark.parametrize("ready_wave", [False, True])
+def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error, ready_wave):
     calls, executions = [], []
     runner = None
     automatic = None
@@ -29,6 +30,10 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
             payload['failure_investigations'] = [row]
             return 'DECISION: WAVE\n' + json.dumps(payload)
         row.update(status='ready-to-retry', reason='host control and probe isolated movement')
+        if ready_wave:
+            payload = json.loads(_wave(prompt, [_project('new-work', 'simd-vector')]).split('\n', 1)[1])
+            payload['failure_investigations'] = [row]
+            return 'DECISION: WAVE\n' + json.dumps(payload)
         return 'DECISION: SATURATED\n' + json.dumps(dict(reason='ready', failure_investigations=[row]))
     def execute(request):
         executions.append(request)
@@ -59,6 +64,9 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
     assert [r.spec.project_id for r in executions].count('original') == 2
     retries = [r for r in executions if 'original-retries' in str(r.branch_root)]
     assert retries[0].spec == executions[0].spec
+    if ready_wave:
+        order = [request.spec.project_id for request in executions]
+        assert order.index('original', 1) < order.index('new-work')
     assert retries[0].pre_wave_memory != executions[0].pre_wave_memory
     assert assessments and assessments[0][1] == retries[0].pre_wave_memory
     assert assessments[0][0].project_spec == executions[0].spec
