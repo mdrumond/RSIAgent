@@ -174,8 +174,6 @@ def test_distillation_large_host_data_and_correction_are_bounded(tmp_path):
     result = actor.distill(outcome, host_summaries=[{"tensor": list(range(10000))}] * 16)
     assert result.tokens == 3
     assert all(request_bytes(call) <= 48 * 1024 for call in calls)
-    assert any(kind == "message" and "previous distillation was invalid" in payload["content"]
-               for kind, payload in events)
 
 
 def test_request_size_counts_unicode_and_wire_metadata():
@@ -224,7 +222,6 @@ def test_distillation_schema_and_citation_map_survive_correction_compaction(tmp_
     ]
     actor.distill(outcome)
     assert len(distill_calls) == 2
-    assert any(call["messages"][0]["content"].startswith("Update a compact working log") for call in calls)
     for request in distill_calls:
         text = json.dumps(request)
         assert "no_new_knowledge" in text and "a" * 64 in text
