@@ -163,3 +163,130 @@ def test_later_failed_original_retry_preserves_authenticated_fix(tmp_path):
     path = tmp_path / 'successful/waves/wave-1/branches/original/execution-evidence.bin'
     path.write_bytes(b'changed host evidence')
     assert store.link_original_retry(ids['original'], ids['later-failed'])['lifecycle'] == 'failed'
+
+
+def test_failure_cases_keep_failed_action_after_verified_repair(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    from test_a5_phase1_wave_runtime import project
+
+    spec = project('original')
+    root = tmp_path / 'phase1'
+    phase1(root, verified=True, spec=spec.as_dict())
+    branch = root / 'waves/wave-1/branches/original'
+    artifacts = ContentAddressedArtifacts(branch / 'artifacts')
+    source = artifacts.put_bytes(b'broken source')
+    payloads = dict(inputs={'tensors': [dict(storage=[1, 2])]}, expected={'storage': [3]},
+                    observed={'output': [0]})
+    retain_phase1_failure(artifacts, spec, source, 'host-mismatch', 'zero differs from three', payloads, 'float32')
+    # A later run of the same candidate must not overwrite the first observation.
+    retain_phase1_failure(artifacts, spec, source, 'host-mismatch', 'different case', {}, 'float32')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_phase1(root)
+    record = store.records()[0]
+    retained = (store.root / (record['feedback_id'] + '.json')).read_bytes()
+    case = store.failure_cases(record['feedback_id'])[0]
+    assert case['availability']['complete']
+    assert case['description'] == 'zero differs from three'
+    assert case['project_contract']['policy'] == 'phase1-classify-execution-v1'
+    observed = case['artifacts']['observed']['sha256']
+    assert json.loads(store.failure_artifact_bytes(record['feedback_id'], observed)) == {'output': [0]}
+    assert store.read_failure_artifact(record['feedback_id'], observed, limit=2)['has_more']
+    store.import_phase1(root)
+    assert retained == (store.root / (record['feedback_id'] + '.json')).read_bytes()
+    path = case['artifacts']['observed']['retained_path']
+    from pathlib import Path
+    Path(path).write_bytes(b'changed')
+    assert not store.failure_cases(record['feedback_id'])[0]['availability']['complete']
+    with pytest.raises(ValueError, match='digest'):
+        store.failure_artifact_bytes(record['feedback_id'], observed)
+
+
+def test_optimizer_failed_candidate_survives_successful_best(tmp_path):
+    jobs = JobStore(tmp_path / 'jobs')
+    job = jobs.create('reference', 'forward', {}, {})
+    key = job['job_id']
+    jobs.transition(key, 'running')
+    source = jobs.put_artifact(key, 'candidate', canonical('bad source'))
+    content = dict(status='incorrect', candidate_sha256=sha(b'bad source'),
+        failure_case=dict(schema='failure-case-v1', classification='host-mismatch', description='actual zero, expected one',
+            inputs={'x': 1}, expected={'output': 1}, observed={'output': 0}, state={}, policy={'exact': True}))
+    evaluation = jobs.put_artifact(key, 'evaluation', canonical(content))
+    jobs.add_event(key, 'optimizer-state', dict(best=dict(speedup=2, content={'status': 'verified'}),
+        history=[dict(candidate_sha256=sha(b'bad source'), source=source, result=evaluation, content=content)]))
+    jobs.transition(key, 'completed')
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['imported'] == 2
+    records = store.records()
+    failed = next(row for row in records if not row['outcome']['verified'])
+    assert any(row['outcome']['verified'] for row in records)
+    assert store.failure_cases(failed['feedback_id'])[0]['availability']['complete']
+    assert store.import_optimizer(jobs.root)['existing'] == 2
+
+
+def test_legacy_failure_explains_missing_reproducer(tmp_path):
+    phase1(tmp_path / 'source')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_phase1(tmp_path / 'source')
+    case = store.failure_cases(store.records()[0]['feedback_id'])[0]
+    assert not case['availability']['complete']
+    assert 'unavailable' in case['availability']['reason']
+
+
+def test_legacy_exact_execution_reproducer_imports_without_index(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from test_a5_phase1_wave_runtime import project
+    spec = project('original')
+    root = tmp_path / 'source'
+    phase1(root, spec=spec.as_dict())
+    branch = root / 'waves/wave-1/branches/original'
+    artifacts = ContentAddressedArtifacts(branch / 'artifacts')
+    refs = {role: artifacts.put_json(value) for role, value in dict(
+        inputs={'tensors': []}, expected={'dtype': 'float32', 'storage': [1]}, observed={'output': [0]}).items()}
+    write(branch / 'execution-evidence.bin', dict(classification='host-mismatch',
+        detail='observed zero, expected one', source_sha256=artifacts.put_bytes(b'zero kernel'), artifacts=refs))
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_phase1(root)['imported'] == 1
+    case = store.failure_cases(store.records()[0]['feedback_id'])[0]
+    assert case['availability']['complete']
+    assert case['project_contract']['inputs_sha256'] == refs['inputs']
+
+
+def test_phase2_failure_payload_roundtrip(tmp_path):
+    from test_phase2_feedback import campaign
+    root = tmp_path / 'phase2'
+    row = campaign(root, result=dict(verified=False, result=dict(status='incorrect',
+        failure_case=dict(schema='failure-case-v1', classification='host-mismatch', description='zero differs',
+            inputs={'x': [1]}, expected={'x': [1]}, observed={'x': [0]}, state={}, policy={'exact': True}))))
+    jobs = JobStore(root / 'execution/jobs')
+    row['result']['candidate'] = jobs.put_artifact(row['result']['job_id'], 'source', canonical('bad candidate'))
+    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_campaign(root)['imported'] == 1
+    feedback_id = store.records()[0]['feedback_id']
+    case = store.failure_cases(feedback_id)[0]
+    assert case['availability']['complete']
+    assert json.loads(store.failure_artifact_bytes(feedback_id, case['artifacts']['expected']['sha256'])) == {'x': [1]}
+
+
+@pytest.mark.parametrize('direct_run', [False, True])
+def test_compile_failure_retains_contract_and_diagnostics_without_output(tmp_path, direct_run):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    from test_a5_phase1_wave_runtime import project
+    spec = project('original')
+    root = tmp_path / 'source'
+    phase1(root, spec=spec.as_dict())
+    artifacts = ContentAddressedArtifacts(root / 'waves/wave-1/branches/original/artifacts')
+    payload = {'compile_passed': False, 'compile_diagnostic': 'unknown identifier', 'output': None}
+    retain_phase1_failure(artifacts, spec, artifacts.put_bytes(b'invalid source'), 'compile-failure',
+        'unknown identifier', {'observed' if direct_run else 'diagnostics': payload}, 'float32')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_phase1(root)
+    case = store.failure_cases(store.records()[0]['feedback_id'])[0]
+    assert case['availability']['complete']
+    assert case['project_contract']['inputs_sha256'] == case['artifacts']['inputs']['sha256']
+    assert case['project_contract']['expected_sha256'] == case['artifacts']['expected']['sha256']
+    diagnostics = json.loads(store.failure_artifact_bytes(store.records()[0]['feedback_id'], case['artifacts']['diagnostics']['sha256']))
+    assert diagnostics['compile_diagnostic'] == 'unknown identifier'
+    assert diagnostics['output'] is None
