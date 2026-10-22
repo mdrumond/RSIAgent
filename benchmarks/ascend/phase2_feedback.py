@@ -475,7 +475,7 @@ class FeedbackStore:
                     if not source:
                         source = next((event['payload'] for event in events if event['kind'] == 'artifact'
                             and event['payload'].get('sha256') == candidate.get('candidate_sha256')), None)
-                    refs = {}
+                    refs = {role: ref for role, ref in evidence.items() if role == 'baseline'}
                     for role, ref in dict(source=source, evaluation=candidate['result']).items():
                         if ref:
                             data = store.read_artifact(job['job_id'], ref['sha256'])
