@@ -23,6 +23,24 @@ def digest(value):
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
 
+def actor_project(spec):
+    """Keep host semantics while withholding curriculum-authored teaching prose."""
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    value = spec.as_dict()
+    value['project_id'] = 'usefulness-project'
+    value['hypothesis'] = 'Implement the specified computation and satisfy its host acceptance checks.'
+    names = {}
+    for index, item in enumerate(value['graph']['inputs']):
+        names[item['name']] = 'input' + str(index)
+        item['name'] = names[item['name']]
+    for index, item in enumerate(value['graph']['nodes']):
+        names[item['name']] = 'node' + str(index)
+        item['name'] = names[item['name']]
+        item['operands'] = [names[name] for name in item['operands']]
+    value['graph']['output'] = names[value['graph']['output']]
+    return ProjectSpec.from_mapping(value)
+
+
 def paired_outcome(control, treatment):
     if any(arm.get('verified') is None for arm in (control, treatment)):
         return 'inconclusive'
@@ -46,8 +64,9 @@ class UsefulnessVerifier:
 
     def _append(self, directory, kind, **body):
         events = list(directory.glob('[0-9]*.json'))
+        sequence = max((int(path.stem) for path in events if path.stem.isdigit()), default=-1) + 1
         event = {'schema': 'memory-usefulness-event-v1', 'kind': kind, **body}
-        with (directory / f'{len(events):04d}.json').open('x') as stream:
+        with (directory / f'{sequence:04d}.json').open('x') as stream:
             json.dump(event, stream, sort_keys=True, allow_nan=False)
             stream.flush()
         return event
@@ -74,14 +93,23 @@ class UsefulnessVerifier:
         directory.mkdir(parents=True, exist_ok=True)
         with (directory / '.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            events = [json.loads(path.read_bytes()) for path in sorted(directory.glob('[0-9]*.json'))]
-            if events:
-                if events[-1]['kind'] == 'assessment':
+            events, unreadable = [], []
+            for path in sorted(directory.glob('[0-9]*.json')):
+                try:
+                    event = json.loads(path.read_bytes())
+                    if not isinstance(event, dict) or not isinstance(event.get('kind'), str):
+                        raise ValueError('Invalid usefulness event')
+                    events.append(event)
+                except (OSError, ValueError):
+                    unreadable.append(path.name)
+            if events or unreadable:
+                if events and events[-1]['kind'] == 'assessment':
                     return events[-1]
                 # A retained operation might still be running. Never duplicate it.
                 return self._append(directory, 'assessment', experiment_id=experiment_id,
                     lesson_id=lesson_id, outcome='inconclusive',
-                    reason='Interrupted experiment; inspect retained arm operations before any new experiment.')
+                    reason='Interrupted experiment; inspect retained arm operations before any new experiment.',
+                    unreadable_events=unreadable)
             self._append(directory, 'started', experiment_id=experiment_id,
                          lesson_id=lesson_id, source_id=source_id, lesson=lesson,
                          prior_memory_sha256=hashlib.sha256(prior_memory).hexdigest(),
@@ -119,8 +147,10 @@ class UsefulnessVerifier:
                 decision, _ = curriculum.select(context, remaining_projects=1)
                 if not isinstance(decision, WaveDecision) or len(decision.wave.projects) != 1:
                     raise ValueError('usefulness curriculum must generate exactly one project')
-                spec = decision.wave.projects[0].spec
+                authored = decision.wave.projects[0].spec
+                spec = actor_project(authored)
                 self._append(directory, 'project-frozen', project=spec.as_dict(),
+                             curriculum_project=authored.as_dict(),
                              project_sha256=digest(spec.as_dict()), inspection=inspection)
                 inputs = materialize_inputs(spec)
                 oracle = evaluate_reference(spec, inputs)
