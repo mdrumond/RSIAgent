@@ -78,7 +78,8 @@ def _verified_retry(outcome):
             return False
         submission = outcome['task']['submission']
         if 'signatures' not in submission and 'signature' in submission:
-            submission = dict(submission, signatures=submission['signature']['signatures'])
+            from optimizer.cases import normalize_job_submission
+            submission = normalize_job_submission(submission)
         verify_attempt_result(JobStore(ref['job_root']), outcome['result'],
                               attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'],
                               task_submission=submission)
@@ -479,7 +480,8 @@ class FeedbackStore:
                 outcome = dict(source_type='optimizer', source_root=str(root),
                     attempt_id=job['job_id'], completed=True, kind='optimizer',
                     target=observed_target, language=observed_language, original_spec=original,
-                    task=task, runtime={}, job_incarnation=events[0]['sha256'],
+                    task=task, runtime=next((event['payload'] for event in reversed(events)
+                        if event['kind'] == 'worker-configuration'), {}), job_incarnation=events[0]['sha256'],
                     verified=bool(best), result=result, evidence=evidence,
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
