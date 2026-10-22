@@ -336,6 +336,11 @@ class AdaptivePhase1Coordinator:
             wave = WaveSpec.from_mapping(pending["wave"])
             if self.failure_feedback is not None:
                 self.failure_feedback.record(pending.get('failure_investigations', []), state)
+            if remediate:
+                # Preserve the admitted wave, but apply ready repairs first.
+                remediate.refresh(state)
+                remediate.retry_ready(state)
+                remediate.refresh(state)
             if self._time_exhausted(state):
                 return self._report(state)
             coordinator = LiveWaveCoordinator(

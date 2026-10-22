@@ -1208,6 +1208,8 @@ def test_automatic_remediation_pins_external_optimizer_worker_configuration(tmp_
 
 @pytest.mark.parametrize('arguments,settings', [
     (('--approval-mode',), {'automatic_remediation':True}),
+    ((), {'automatic_remediation':True,'feedback_sources':[{'type':'phase2','root':'retained'}]}),
+    ((), {'automatic_remediation':True,'feedback_sources':[{'type':'optimizer','root':'retained'}]}),
     (('--target','a5'), {'automatic_remediation':True,'optimizer_worker_config':'unused-worker.json'}),
     (('--target','a5'), {'automatic_remediation':True,'feedback_sources':[{'type':'phase2','root':'retained'}]}),
 ])
