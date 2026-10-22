@@ -263,6 +263,8 @@ class AdaptivePhase1Coordinator:
         self._atomic_json(self.root / "state.json", state)
         executed_waves = 0
         while True:
+            if self._time_exhausted(state):
+                return self._report(state)
             remediate = self.automatic_remediation
             obligations = remediate.refresh(state) if remediate else False
             if obligations:
@@ -279,14 +281,23 @@ class AdaptivePhase1Coordinator:
             if pending is None:
                 if approved_only:
                     raise ValueError("no approved wave is pending")
-                with remediate.active() if remediate else nullcontext():
-                    decision, session = self._select(
-                        self._context(state, snapshot), self._session(state),
-                        remaining_projects=max(1, remediate.wave_slots(state) if obligations else
-                                               self.project_target - len(state["prior_outcomes"])),
-                    )
+                try:
+                    with remediate.active() if remediate else nullcontext():
+                        decision, session = self._select(
+                            self._context(state, snapshot), self._session(state),
+                            remaining_projects=max(1, remediate.wave_slots(state) if obligations else
+                                                   self.project_target - len(state["prior_outcomes"])),
+                        )
+                except ValueError:
+                    if remediate and remediate.selection_remaining() <= 0:
+                        continue
+                    raise
                 if self._time_exhausted(state):
                     return self._report(state)
+                if remediate and remediate.selection_remaining() <= 0:
+                    state = {**state, 'session': self._session_dict(session)}
+                    self._atomic_json(self.root / 'state.json', state)
+                    continue
                 if isinstance(decision, TerminalDecision):
                     state = {
                         **state,
@@ -747,7 +758,8 @@ class AdaptivePhase1Coordinator:
             remaining,
             self._curriculum_feedback(context_state),
             self.failure_feedback.context(state) if self.failure_feedback else (),
-            remaining_seconds=self._remaining_seconds(),
+            remaining_seconds=(self.automatic_remediation.selection_remaining()
+                               if self.automatic_remediation else self._remaining_seconds()),
             context_files=refs, artifact_reader=reader,
         )
 

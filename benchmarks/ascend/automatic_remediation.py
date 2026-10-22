@@ -117,6 +117,10 @@ class AutomaticRemediation:
                 stack.enter_context(self.budgets[key].active())
             yield
 
+    def selection_remaining(self):
+        return min([self.runner._remaining_seconds(),
+                    *(self.budgets[key].remaining_seconds for key in self.feedback.ids)])
+
     def project_keys(self, request):
         branch = request.branch_root.resolve()
         retry_parent = (self.runner.root / 'original-retries').resolve()
@@ -143,7 +147,7 @@ class AutomaticRemediation:
             if self.runner._remaining_seconds() <= 0:
                 return
             key = row['feedback_id']
-            if row['investigation']['status'] != 'ready-to-retry':
+            if self.budgets[key].expired or row['investigation']['status'] != 'ready-to-retry':
                 continue
             obligation = self.state['failures'][key]
             if obligation['pending'] is None:
@@ -251,10 +255,9 @@ def optimizer_retry_adapter(runner, store, config):
         expected = retry_spec(dict(selected=[row]), 'a3')
         task = expected['task']
         if row['outcome']['source_type'] == 'optimizer':
-            submission = dict(task['submission'])
-            submission['signatures'] = submission.pop('signature')['signatures']
-            task = dict(task, submission=submission)
-        bound = dict(config, phase2_attempt_seconds=max(1, seconds))
+            from optimizer.cases import normalize_job_submission
+            task = dict(task, submission=normalize_job_submission(task['submission']))
+        bound = dict(config, phase2_attempt_seconds=max(1, int(seconds)), max_cases=expected['max_cases'])
         executor = OptimizerTaskExecutor(directory, task, memory, bound, expected_baseline=expected)
         executor.prepare()
         result = executor.attempt('original-retry', memory_snapshot=memory)
