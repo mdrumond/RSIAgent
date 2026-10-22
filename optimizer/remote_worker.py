@@ -47,7 +47,7 @@ def execute(request):
 
 
 def publish(directory, result):
-    """Explicit allowlist: never transfer tensor payloads, binaries or timelines."""
+    """Allowlisted results include the first failing reproducer; full frozen bundles, binaries and timelines stay on the worker."""
     atomic(directory / 'result.json', canonical(result))
     files = []
     for path in sorted(directory.rglob('*')):
