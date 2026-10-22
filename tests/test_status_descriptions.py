@@ -100,3 +100,17 @@ def test_registered_reason_codes_are_explained_without_interpreting_prose(code):
     assert describe_statuses(prose) == prose
     if code == 'disabled-by-treatment':
         assert 'preserve the configured experimental restrictions' in row['next_action']
+
+
+@pytest.mark.parametrize('code', ['profiling', 'performance-study'])
+def test_measurement_fact_and_missing_requirement_have_distinct_explanations(code):
+    raw = {'facts': [{'category': code, 'evidence_sha256': 'a' * 64}], 'missing': [code]}
+    view = describe_statuses(raw)
+    retained, = view['facts'][0]['status_explanations']
+    missing, = view['status_explanations']
+    assert view['facts'][0]['category'] == retained['code'] == code
+    assert view['missing'] == [missing['code']] == [code]
+    assert 'retained host fact' in retained['description']
+    assert 'have not been retained' in missing['description']
+    assert 'have not been retained' not in explain_status(code)['description']
+    assert raw['facts'][0] == {'category': code, 'evidence_sha256': 'a' * 64}
