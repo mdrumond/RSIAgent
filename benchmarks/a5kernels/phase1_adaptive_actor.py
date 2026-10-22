@@ -521,7 +521,13 @@ class AdaptiveActorProjectExecutor:
         if remaining is not None and remaining <= 0:
             raise RuntimeError("project time budget exhausted")
         max_seconds = min(self.max_seconds, remaining) if remaining is not None else self.max_seconds
-        prepared = self.executor.prepare(request.spec)
+        executor = self.executor
+        if request.failure_context is not None and request.spec.failure_mode is not FailureMode.NONE:
+            from benchmarks.ascend.failure_handoff import FailureContext
+            failure = FailureContext(request.failure_context, request.spec)
+            failure.require_repair_evidence(request.spec)
+            executor = executor.bind_case(request.spec, failure.inputs)
+        prepared = executor.prepare(request.spec)
         if (
             prepared.spec != request.spec
             or prepared.inputs != request.inputs
@@ -532,7 +538,7 @@ class AdaptiveActorProjectExecutor:
         artifacts = ContentAddressedArtifacts(root / "artifacts")
         memory_sha256 = artifacts.put_bytes(request.pre_wave_memory)
         actions = _ProjectActions(
-            self.executor, request, prepared, artifacts,
+            executor, request, prepared, artifacts,
             max_actions=self.max_actions, max_seconds=max(0.001, max_seconds-(time.monotonic()-started)), max_source_bytes=self.max_source_bytes,
             query_knowledge=self.query_knowledge,
             request_profile=self.request_profile,

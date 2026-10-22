@@ -24,12 +24,35 @@ class FailureContext:
         self.feedback_ids = tuple(context['feedback_ids'])
         self.cases = [dict(case, feedback_id=key) for key in self.feedback_ids
                       for case in self.store.failure_cases(key)]
-        contract = phase1_contract(spec, inputs, expected)
+        from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+        from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
+        from .failure_cases import phase1_policy
         mode = {'compile': 'compile-failure', 'host-mismatch': 'host-mismatch'}.get(spec.failure_mode.value)
-        self.compatible = [case for case in self.cases if
-                           case.get('classification') == mode and
-                           case.get('availability', {}).get('complete') is True and
-                           case.get('project_contract') == contract]
+        self.compatible = []
+        self.inputs = self.expected = None
+        target_inputs = materialize_inputs(spec)
+        target_layout = [(x.shape, x.physical_shape) for x in target_inputs]
+        for case in self.cases:
+            if (case.get('classification') != mode or
+                    case.get('availability', {}).get('complete') is not True or
+                    not case.get('project_spec')):
+                continue
+            original = ProjectSpec.from_mapping(case['project_spec'])
+            original_inputs = materialize_inputs(original)
+            original_expected = evaluate_reference(original, original_inputs)
+            if (original.graph != spec.graph or original.dtype != spec.dtype or
+                    [(x.shape, x.physical_shape) for x in original_inputs] != target_layout or
+                    case.get('project_contract') != phase1_contract(original, original_inputs, original_expected) or
+                    case.get('policy') != phase1_policy(original_expected.dtype)):
+                continue
+            # Digest-checked retained bytes must describe the host-rematerialized original case.
+            contract = case['project_contract']
+            if any(case.get('artifacts', {}).get(role, {}).get('sha256') != contract[role + '_sha256']
+                   for role in ('inputs', 'expected')):
+                continue
+            self.compatible.append(case)
+            if self.inputs is None:
+                self.inputs, self.expected = original_inputs, original_expected
 
     def presentation(self):
         ordered = self.compatible + [case for case in self.cases if case not in self.compatible]
@@ -65,6 +88,9 @@ class FailureContext:
 class FailureArtifactReader:
     def __init__(self, current, failure):
         self.current, self.failure = current, failure
+
+    def put_json(self, value):
+        return self.current.put_json(value)
 
     def read_bytes(self, digest):
         try:
