@@ -267,3 +267,26 @@ def test_phase2_failure_payload_roundtrip(tmp_path):
     case = store.failure_cases(feedback_id)[0]
     assert case['availability']['complete']
     assert json.loads(store.failure_artifact_bytes(feedback_id, case['artifacts']['expected']['sha256'])) == {'x': [1]}
+
+
+@pytest.mark.parametrize('direct_run', [False, True])
+def test_compile_failure_retains_contract_and_diagnostics_without_output(tmp_path, direct_run):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    from test_a5_phase1_wave_runtime import project
+    spec = project('original')
+    root = tmp_path / 'source'
+    phase1(root, spec=spec.as_dict())
+    artifacts = ContentAddressedArtifacts(root / 'waves/wave-1/branches/original/artifacts')
+    payload = {'compile_passed': False, 'compile_diagnostic': 'unknown identifier', 'output': None}
+    retain_phase1_failure(artifacts, spec, artifacts.put_bytes(b'invalid source'), 'compile-failure',
+        'unknown identifier', {'observed' if direct_run else 'diagnostics': payload}, 'float32')
+    store = FeedbackStore(tmp_path / 'feedback')
+    store.import_phase1(root)
+    case = store.failure_cases(store.records()[0]['feedback_id'])[0]
+    assert case['availability']['complete']
+    assert case['project_contract']['inputs_sha256'] == case['artifacts']['inputs']['sha256']
+    assert case['project_contract']['expected_sha256'] == case['artifacts']['expected']['sha256']
+    diagnostics = json.loads(store.failure_artifact_bytes(store.records()[0]['feedback_id'], case['artifacts']['diagnostics']['sha256']))
+    assert diagnostics['compile_diagnostic'] == 'unknown identifier'
+    assert diagnostics['output'] is None

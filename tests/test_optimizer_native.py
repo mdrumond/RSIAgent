@@ -174,3 +174,5 @@ def test_failed_case_retains_exact_inputs_outputs_and_layout(tmp_path, monkeypat
     assert case['block_count'] == 2
     assert case['suite_sha256'] == prepared.manifest['suite_sha256']
     assert case['metrics']
+    assert case['mismatch_samples']
+    assert case['mismatch_samples'][0]['expected'] != case['mismatch_samples'][0]['observed']
