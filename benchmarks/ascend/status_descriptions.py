@@ -79,10 +79,10 @@ _DESCRIPTIONS = {
                           'Inspect both failures and retain the outcome without declaring the memory useless.'),
     'inconclusive': ('The available evidence does not establish the requested conclusion.',
                      'Read the missing evidence or failed checks; record uncertainty rather than assigning a stronger result.'),
-    'performance-study': ('Required elapsed-time measurements have not been retained for this project.',
-                          'Host-verify the candidate and run the configured timing study; retain its measurement artifact.'),
-    'profiling': ('Required profiler evidence has not been retained for this project.',
-                  'Run the configured profiling action for a verified candidate and retain the required metric evidence.'),
+    'performance-study': ('This item concerns elapsed-time measurements of candidate performance.',
+                          'Read the measurement evidence and verification scope before interpreting performance.'),
+    'profiling': ('This item concerns profiler measurements and diagnostic evidence.',
+                  'Read the referenced profiler evidence and its collection conditions.'),
     'observed-host-mismatch': ('This repair exercise lacks an accepted failing execution whose output differs from the host reference, followed by a verified repair.',
                                'Read the supplied original reproducer and linked evidence. If none is available, report that missing evidence; do not invent a failing input.'),
     'observed-compile-failure': ('This repair exercise lacks an accepted compiler failure followed by a verified repair.',
@@ -196,6 +196,21 @@ _DESCRIPTIONS.update({
                 'Inspect its retained progress and approval state before running further work.'),
 })
 
+_FIELD_DESCRIPTIONS = {
+    ('missing', 'performance-study'): (
+        'Required elapsed-time measurements have not been retained for this project.',
+        'Host-verify the candidate and run the configured timing study; retain its measurement artifact.'),
+    ('missing', 'profiling'): (
+        'Required profiler evidence has not been retained for this project.',
+        'Run the configured profiling action for a verified candidate and retain the required metric evidence.'),
+    ('category', 'performance-study'): (
+        'This retained host fact contains performance-study evidence.',
+        'Read its linked timing measurements and verified candidate identity before comparing performance.'),
+    ('category', 'profiling'): (
+        'This retained host fact contains profiling evidence.',
+        'Read its linked profiler measurements, candidate identity, and collection conditions.'),
+}
+
 _FIELDS = {'status', 'classification', 'lifecycle', 'outcome', 'category', 'stage', 'learner_stage'}
 
 
@@ -210,6 +225,7 @@ def explain_status(code, *, field='status', context=None):
     description, action = _DESCRIPTIONS.get(code, (
         f'The {field} code is {code!r}; no specific explanation is registered.',
         'Read the accompanying detail, reason, error, and evidence before interpreting this code.'))
+    description, action = _FIELD_DESCRIPTIONS.get((field, code), (description, action))
     if field == 'lifecycle' and code == 'failed':
         description = 'The original failure has not yet been confirmed fixed by an accepted retry.'
         action = 'Inspect the investigation state and original retry evidence.'
