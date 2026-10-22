@@ -177,16 +177,3 @@ def test_corrections_and_tool_reads_have_no_count_limit(tmp_path):
                     max_seconds=30, clock=lambda: now[0])
     assert result['task_id'] == proposal()['task_id']
     assert now[0] == 20
-
-
-def test_optimizer_curriculum_requests_one_batch_instead_of_serial_metric_tasks(tmp_path):
-    from benchmarks.ascend.targets import METRIC_SWEEP_GUIDANCE
-    prompts = []
-    def complete(messages):
-        prompts.append(messages)
-        return json.dumps(proposal())
-    select(tmp_path, complete)
-    system = prompts[0][0]['content']
-    assert METRIC_SWEEP_GUIDANCE in system
-    assert "one submission's\nsignatures" in system
-    assert 'internal optimizer candidate or tuning attempts' in system

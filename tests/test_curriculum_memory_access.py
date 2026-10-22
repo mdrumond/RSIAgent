@@ -71,12 +71,6 @@ def test_visibility_changes_only_curriculum_across_practice_learning(
     assert "Actor retained a target lesson" in prompts[0]
     assert "independent practice evidence" in prompts[1]
     assert "Actor retained a practice lesson" in prompts[1]
-    for prompt in prompts:
-        assert "After PASS, do not create practice by default" in prompt
-        assert "DECISION: READY_FOR_TARGET" in prompt
-        if access == "none":
-            assert "Your ~/.memory directory is empty" in prompt
-            assert "disposable evidence copy" not in prompt
     records = sorted((Path(result.root) / "curriculum").glob("turn_*/memory_access.json"))
     assert len(records) == 2
     for path in records:

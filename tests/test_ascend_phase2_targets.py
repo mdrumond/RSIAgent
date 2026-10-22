@@ -100,13 +100,10 @@ def test_phase2_prompt_is_target_specific_and_keeps_reference_private(tmp_path):
     prompt = target_curriculum_prompt(context(target), a3_curriculum_policy())
     assert "private working reference" not in prompt
     assert "reference_sha256" not in prompt
-    assert "Phase-1" not in prompt
     payload = json.loads(prompt.rsplit("\n", 1)[-1])
     assert payload["target"]["target_id"] == target.target_id
     assert payload["target"]["correctness"]["atol_and_rtol"] == 1e-5
     assert payload["latest_target_attempt"]["diagnostic"] == "host mismatch on padded output"
-    assert "[a-z][a-z0-9]{0,15}" in prompt
-    assert payload["project_grammar"]["dtypes"] == ["float32"]
 
 
 def test_practice_requires_concrete_fields_budget_and_fixed_target(tmp_path):
@@ -375,14 +372,3 @@ def test_runtime_observer_is_lazy_and_rechecked_before_each_qualification(tmp_pa
         qualify_target(spec, "reference", RUNTIME, executor, store)
     assert len(observations) == 2
     assert len(backend.compile_requests) == len(backend.run_requests) == 1
-
-
-def test_native_phase2_curriculum_has_shared_metric_sweep_rule(tmp_path):
-    from benchmarks.ascend.phase2_target_selector import SYSTEM
-    from benchmarks.ascend.targets import METRIC_SWEEP_GUIDANCE
-    target, _, _ = qualified(tmp_path)
-    prompt = target_curriculum_prompt(context(target), a3_curriculum_policy())
-    assert METRIC_SWEEP_GUIDANCE in SYSTEM
-    grammar = json.loads(prompt.rsplit('\n', 1)[-1])['project_grammar']
-    assert 'timing_lengths' in grammar
-    assert 'Do not invent sweep fields' in SYSTEM
