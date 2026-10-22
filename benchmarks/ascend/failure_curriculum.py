@@ -16,8 +16,9 @@ invalid specifications and suspected unsupported/impossible requirements. A budg
 exhaustion never proves impossibility. Explain evidence-based deferrals; do not
 invent projects to repair infrastructure. Read retained source/host diagnostics
 with {"read_artifact":{"sha256":"exact hash","offset":0,"limit":8192}};
-at most six reads per selection. Failure cases include exact input/expected/observed
-artifact references and availability explanations; read these before selecting a repair. Raw profiling stays remote; use compact digests.
+Reads share the remaining elapsed allowance. Optional detailed failure-case files
+include exact input/expected/observed artifact references and availability explanations;
+read them when those details are needed for a repair. Raw profiling stays remote; use compact digests.
 The selection-index lists EVERY selected failure, including observations outside
 the current detailed page. Use its classifications/summaries to defer infrastructure
 or provider failures without inventing kernel work; its hashes are also readable.
@@ -44,6 +45,10 @@ linked, committed experiment with retained host evidence and a verified control;
 the probe may have failed usefully. This recommends a retry, never proves a root
 cause or resolves the original task. Terminal decisions may carry the same list.
 The goal of remediation is to improve outcomes on the original failed project.
+The original retry is a fresh repair attempt using current memory, not a replay of
+the old candidate, and is exempt from new-project novelty. A known applicable cause
+and repair lesson means retry next unless a concrete execution blocker remains.
+Missing coverage of unrelated operators or layouts does not justify delaying it.
 Once a linked experiment has committed host evidence and a verified control,
 make ready-to-retry the default when that evidence suggests a plausible repair. The original retry is itself an experiment:
 it tests whether the learned knowledge transfers. You do not need a complete
@@ -115,6 +120,8 @@ class FailureCurriculum:
 
     def context(self, state):
         self.state = state
+        from .context_files import ContextFiles
+        self.context_files = ContextFiles(self.root / "curriculum" / "context")
         rows = []
         for role in ('selected', 'controls'):
             for row in self.selection[role]:
@@ -128,7 +135,8 @@ class FailureCurriculum:
                     interpretation=out['interpretation'],
                     host_result=json.dumps(out['result'].get('result'), sort_keys=True)[:4096],
                     speedup=out['result'].get('speedup'), evidence=out['evidence'],
-                    failure_cases=self.store.failure_cases(row['feedback_id'])))
+                    failure_cases_file=self.context_files.put('failure-cases-' + row['feedback_id'],
+                        self.store.failure_cases(row['feedback_id']))))
         # Keep source/evidence hash-readable, never put entire candidate/report in context.
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
@@ -140,6 +148,7 @@ class FailureCurriculum:
             out = row['outcome']
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
+                failure_cases_file=next(item['failure_cases_file'] for item in rows if item['feedback_id'] == row['feedback_id']),
                 retry_eligible_pairs=eligible.get(row['feedback_id'], []),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
@@ -162,6 +171,8 @@ class FailureCurriculum:
 
     def read(self, sha256, offset=0, limit=8192):
         digest = sha256
+        if hasattr(self, 'context_files') and digest in self.context_files.advertised:
+            return self.context_files.read(digest, offset, limit)
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
         for row in self.selection['selected'] + self.selection['controls']:

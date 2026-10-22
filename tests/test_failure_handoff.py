@@ -96,7 +96,8 @@ def test_different_probe_cannot_inherit_negative_credit(tmp_path):
 def test_curriculum_can_read_cases_and_rejects_missing_repair_evidence(tmp_path):
     executor, spec, store, context = observed_failure(tmp_path)
     curriculum = FailureCurriculum(tmp_path, store.root, select_feedback(store.root, 'a3'))
-    descriptor = curriculum.context({})[0]['failure_cases'][0]
+    ref = curriculum.context({})[0]['failure_cases_file']
+    descriptor = json.loads(curriculum.read(**ref['read_artifact'])['text'])[0]
     digest = descriptor['artifacts']['expected']['sha256']
     expected = json.loads(curriculum.read(digest)['text'])
     assert expected['storage'] == list(executor.prepare(spec).expected.storage)

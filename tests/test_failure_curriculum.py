@@ -190,7 +190,7 @@ def test_feedback_artifact_reads_preserve_selection_turn_accounting(tmp_path):
     prior = PriorOutcome('working', ProjectInformation.from_project(_project('working', 'gm-ub-movement')), True, 'passed')
     context = CurriculumContext('learn', 1, 'a'*64, (), (prior,), phase2_feedback=feedback.context({}))
     _, session = agent.select(context)
-    assert session.turns == 2
+    assert session.turns == 1
 
 
 @pytest.mark.parametrize('speedup,resolved', [(None, False), (.5, False), (2, True)])

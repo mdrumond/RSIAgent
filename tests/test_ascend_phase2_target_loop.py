@@ -260,11 +260,15 @@ def test_duplicate_practice_correction_is_bounded_without_consuming_attempts(tmp
     c.run_attempt()
     calls = []
     duplicate = replace(practice(c), project_id=c.seed_outcomes[0]["project_id"])
-    c.curriculum = TargetCurriculumAgent(lambda messages: (
-        calls.append(messages), wire("PRACTICE", duplicate))[1])
-    with pytest.raises(ValueError, match="after 3 attempts.*fresh project ID"):
+    selection_time = [0]
+    def invalid(messages):
+        calls.append(messages)
+        selection_time[0] += 20
+        return wire("PRACTICE", duplicate)
+    c.curriculum = TargetCurriculumAgent(invalid, clock=lambda: selection_time[0])
+    with pytest.raises(ValueError, match="elapsed-time budget exhausted.*fresh project ID"):
         c.resume()
-    assert len(calls) == 3
+    assert len(calls) > 3
     assert len(requests) == 1
     assert not (c.root / "pending.json").exists()
     assert c.report()["practice_attempts"] == 0

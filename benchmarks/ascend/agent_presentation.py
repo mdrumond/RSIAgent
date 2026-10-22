@@ -197,7 +197,10 @@ def memory_presentation(raw, artifacts):
     optimizer_remaining = 8192
     for content, origin in entries:
         project = json.loads(content)
-        row = {"sha256": artifacts.put_bytes(content),
+        digest = artifacts.put_bytes(content)
+        row = {"sha256": digest, "size_bytes": len(content),
+               "filename": "project-memory-" + str(project.get("project_spec", {}).get("project_id", project.get("task_id", digest[:12]))) + ".json",
+               "read_artifact": {"sha256": digest, "offset": 0, "limit": 8192},
                "origin": origin,
                "project_id": project.get("project_spec", {}).get("project_id", project.get("task_id"))}
         if project.get("task_id"):
