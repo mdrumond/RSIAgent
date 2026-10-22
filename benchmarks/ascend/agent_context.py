@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 import json
 
+from .status_descriptions import describe_statuses
+
 
 class ContextBudgetError(ValueError):
     """A local context limit, not an infrastructure failure or kernel result."""
@@ -79,7 +81,7 @@ class WorkingContext:
                 "Agent-written working log (not verification evidence):\n" + self.work_log})
         if self.host_state:
             middle.append({"role": "user", "content": "Host-owned current state:\n" +
-                           json.dumps(self.host_state, sort_keys=True)})
+                           json.dumps(describe_statuses(self.host_state), sort_keys=True)})
         return self.fixed + middle + self.recent + self.pinned + self.tail
 
     def prepare(self, profile, budget, summarize):

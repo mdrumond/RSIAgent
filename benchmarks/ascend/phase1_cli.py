@@ -4,6 +4,7 @@ import argparse
 from dataclasses import replace
 import hashlib
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 from pathlib import Path
 import sys
 
@@ -229,7 +230,7 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             **({"project_workers": tuple(workers)} if parallel else {}),
             profiling_guidance=guidance,
         ), args.action)()
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    print(json.dumps(describe_statuses(result), sort_keys=True, separators=(",", ":")))
 
 
 if __name__ == "__main__":
