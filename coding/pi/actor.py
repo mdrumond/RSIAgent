@@ -92,7 +92,12 @@ class PiActorDriver(DirectActorDriver):
                 self._trace("message", {"role": "assistant", "content": text})
                 action = turn_parser(text)
                 if action is None:
-                    latest = json.dumps({"host": {"event": "invalid-action"}})
+                    latest = json.dumps({"host": {
+                        "event": "invalid-action",
+                        "description": "The response could not be parsed as an accepted action. No action was executed.",
+                        "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
+                        "allowed_actions": sorted(allowed),
+                    }})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation
