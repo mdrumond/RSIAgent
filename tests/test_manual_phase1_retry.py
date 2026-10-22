@@ -1,4 +1,5 @@
 import json
+import base64
 
 import pytest
 
@@ -53,7 +54,12 @@ def test_manual_retry_executes_original_spec_with_reviewed_memory_and_links_life
     retry = ManualPhase1Retry(runner, job, dict(selected=[original]))
     assert retry.resume()['status'] == ('FIXED' if verified else 'FAILED')
     assert requests[0].spec.as_dict() == original_spec
-    assert 'phase1-copy' in requests[0].pre_wave_memory.decode() or 'phase1_memory' in requests[0].pre_wave_memory.decode()
+    envelope = json.loads(requests[0].pre_wave_memory)
+    reviewed = json.loads(base64.b64decode(envelope['initial_memory_base64']))
+    assert reviewed == dict(schema='ascend-phase2-curriculum-seed-v1',
+                            snapshot_id=runner.snapshot.snapshot_id,
+                            phase1_memory=list(runner.snapshot.memory_entries()))
+    assert envelope['project_memory_base64'] == []
     first = requests[0].pre_wave_memory
     assert retry.resume()['status'] == ('FIXED' if verified else 'FAILED')
     assert len(requests) == 1

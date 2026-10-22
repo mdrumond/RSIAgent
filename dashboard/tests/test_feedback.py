@@ -45,6 +45,11 @@ def feedback(tmp_path):
     app.extensions['dashboard_controls'].close()
 
 
+def presented(row):
+    return {**row, 'lifecycle': 'failed', 'outcome': {
+        **row['outcome'], 'source_type': 'phase2', 'original_spec': row['outcome']['task']}}
+
+
 def submit(client, action, body):
     csrf = client.get('/api/csrf').get_json()['token']
     body['confirmation'] = f"{action}:{body.get('preset_id', 'phase2')}"
@@ -65,11 +70,14 @@ def completed(client, response):
 
 def test_feedback_readonly_separates_correctness_performance_and_investigation(feedback):
     client, app, config, row, calls = feedback
+    retained = config.parent / 'feedback' / (row['feedback_id'] + '.json')
+    original_bytes = retained.read_bytes()
     body = client.get('/feedback').get_data(as_text=True)
     assert 'verified-slow' in body and 'shortfall' in body and 'Host correctness:' in body
     assert 'original attempt attempt-001' in body and 'Investigation:</b> open' in body
-    assert client.get('/api/feedback').get_json() == [{**row, 'lifecycle': 'failed'}]
+    assert client.get('/api/feedback').get_json() == [presented(row)]
     assert not calls
+    assert retained.read_bytes() == original_bytes
     settings = json.loads(config.read_text())
     settings['controls']['enabled'] = False
     write(config, settings)
@@ -77,7 +85,7 @@ def test_feedback_readonly_separates_correctness_performance_and_investigation(f
     try:
         view = readonly.test_client()
         assert 'data-feedback-action' not in view.get('/feedback').get_data(as_text=True)
-        assert view.get('/api/feedback').get_json() == [{**row, 'lifecycle': 'failed'}]
+        assert view.get('/api/feedback').get_json() == [presented(row)]
         assert view.post('/api/control/investigate', json={}).status_code == 403
     finally:
         readonly.extensions['dashboard_controls'].close()
@@ -99,6 +107,8 @@ def test_import_and_bounded_phase1_use_existing_async_runner(feedback):
 
 def test_retry_is_one_original_goal_with_reviewed_memory_and_no_approval_flag(feedback):
     client, app, config, row, calls = feedback
+    retained = config.parent / 'feedback' / (row['feedback_id'] + '.json')
+    original_bytes = retained.read_bytes()
     completed(client, submit(client, 'retry-feedback', dict(
         preset_id='phase2', feedback_ids=[row['feedback_id']])))
     argv = calls[-1]
@@ -107,7 +117,8 @@ def test_retry_is_one_original_goal_with_reviewed_memory_and_no_approval_flag(fe
     assert argv[argv.index('--phase1-root') + 1] == '/reviewed-phase1'
     assert argv[argv.index('--review') + 1] == '/review.json'
     assert argv[-2:] == ['--retry-feedback-id', row['feedback_id']]
-    assert client.get('/api/feedback').get_json() == [{**row, 'lifecycle': 'failed'}]  # start does not rewrite history
+    assert client.get('/api/feedback').get_json() == [presented(row)]
+    assert retained.read_bytes() == original_bytes  # start does not rewrite history
 
 
 @pytest.mark.parametrize('status', ['resolved', 'deferred'])
