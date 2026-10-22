@@ -147,12 +147,15 @@ def test_read_audit_survives_provider_interruption(tmp_path, native):
     assert json.loads(pages[0]['text']) == {'expected': [3, 7], 'observed': [0, 0]}
     now = [0]
     def read_then_expire(messages):
-        now[0] += 1
         return json.dumps({'read_artifact': ref['read_artifact']})
+    def read_and_expire(**payload):
+        page = files.read(**payload)
+        now[0] += 1
+        return page
     agent = (TargetCurriculumAgent if native else CurriculumAgent)(
         read_then_expire, clock=lambda: now[0])
     with pytest.raises(ValueError, match='budget exhausted'):
-        agent.select(replace(context, remaining_seconds=.5))
+        agent.select(replace(context, remaining_seconds=.5, artifact_reader=read_and_expire))
     pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
     assert len(pages) == 2 and pages[1] == pages[0]
 
