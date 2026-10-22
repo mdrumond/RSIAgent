@@ -16,6 +16,7 @@ from optimizer.memory import verify_snapshot
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .agent_presentation import memory_presentation, compact_observation, artifact_page_presentation
 from .targets import METRIC_SWEEP_GUIDANCE
+from .context_files import context_wire
 
 
 SYSTEM = '''You are the Phase 2 Curriculum Agent. Propose one bounded, useful new
@@ -37,6 +38,9 @@ Keep computation, memory, and runtime bounded. Use consistent dimensions across
 matmul inputs/residuals. Generated shape variants may be rejected; every supplied
 representative must execute. Do not claim correctness, speed, Cube use, or fusion
 from a reference: the host runs and freezes it, then independently checks kernels.
+The original retry is a fresh repair using current memory, not a replay of the old
+candidate. When an applicable cause and repair are known, retry next unless a concrete
+execution blocker remains; unrelated operator/layout coverage is not a reason to delay.
 For kind=practice, target the supplied diagnosed weakness and retry plan; do not
 replace the fixed final target. For kind=goal, choose a genuinely new composition,
 not merely a renamed Phase 1 task. Never name held-out benchmarks.
@@ -123,7 +127,7 @@ def _select_optimizer_task(*, complete, snapshot, objective, root, kind,
                 reads=0, queries=0, citations=[])
             _save(path, state)
         if state['pending'] is None:
-            state['pending'] = complete(state['messages'])
+            state['pending'] = complete(context_wire(state['messages']))
             _save(path, state)
         response = state['pending']
         if remaining_seconds() <= 0:
