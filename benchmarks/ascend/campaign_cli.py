@@ -112,9 +112,11 @@ def _validate_remediation_settings(settings, *, phase, target, approval):
         return
     if approval:
         raise ValueError('automatic remediation does not support approval mode')
-    if target != 'a3' and (settings.get('optimizer_worker_config') or any(
-            row.get('type') in {'phase2', 'optimizer'} for row in settings.get('feedback_sources', []))):
+    external = any(row.get('type') in {'phase2', 'optimizer'} for row in settings.get('feedback_sources', []))
+    if target != 'a3' and (settings.get('optimizer_worker_config') or external):
         raise ValueError('external automatic remediation requires an A3 campaign')
+    if external and not settings.get('optimizer_worker_config'):
+        raise ValueError('external automatic remediation requires optimizer_worker_config')
 
 
 def build_controller(job):
