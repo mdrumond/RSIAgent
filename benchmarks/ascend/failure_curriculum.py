@@ -28,6 +28,8 @@ Add optional top-level failure_investigations to the ordinary DECISION JSON,
 outside the strict WaveSpec: [{"feedback_id":"...","status":"investigating",
 "classification":"learnable","reason":"...","project_id":"probe-id",
 "control_project_id":"control-id","hypothesis":"...","observation":"..."}].
+For remedial metric studies, use one supported bounded sweep rather than serial
+one-parameter projects; correctness and failure-isolation probes remain distinct.
 Prioritize remediation; fill remaining wave slots with new projects. Only remedial
 projects require probe/control lineage in this list. Use failure_mode=none and omit
 failure-repair for exploratory probes doing a different computation. A repair
