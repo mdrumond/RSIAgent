@@ -111,6 +111,6 @@ def test_measurement_fact_and_missing_requirement_have_distinct_explanations(cod
     assert view['facts'][0]['category'] == retained['code'] == code
     assert view['missing'] == [missing['code']] == [code]
     assert 'retained host fact' in retained['description']
-    assert 'have not been retained' in missing['description']
-    assert 'have not been retained' not in explain_status(code)['description']
+    assert 'not been retained' in missing['description']
+    assert 'not been retained' not in explain_status(code)['description']
     assert raw['facts'][0] == {'category': code, 'evidence_sha256': 'a' * 64}
