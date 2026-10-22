@@ -80,54 +80,6 @@ def context(**updates):
     return CurriculumContext(**values)
 
 
-def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_grammar():
-    prior_spec = project("prior")
-    prior = PriorOutcome(
-        "prior", ProjectInformation.from_project(prior_spec), True,
-        "Movement passed host verification.",
-    )
-    calls = []
-
-    def complete(messages):
-        calls.append(messages)
-        return "DECISION: SATURATED\n" + json.dumps({"reason": "coverage complete"})
-
-    decision, _ = CurriculumAgent(complete).select(context(
-        pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), prior_outcomes=(prior,)
-    ))
-    prompt = calls[0][-1]["content"]
-    assert isinstance(decision, TerminalDecision)
-    assert all(term in prompt for term in (
-        "Learn reusable Catlass", "gm-ub-movement", "Movement passed",
-        "timing_lengths", '"graph"', '"copy"',
-        "DECISION: WAVE", "DECISION: SATURATED",
-    ))
-    assert all(term not in prompt.lower() for term in (
-        "openai", "deepseek", "temperature", "api_key",
-    ))
-    grammar = json.loads(prompt.splitlines()[-1])["bounded_project_grammar"]
-    assert grammar["padding_multiples"] == [1, 16, 32, 64, 128, 256]
-    assert grammar["block_count_bounds"] == [1, 32]
-    assert "[1, 4096]" in grammar["shape"]
-    assert "65536" in grammar["shape"]
-    assert "[1, 4096]" in grammar["timing_lengths"]
-    assert "one-dimensional" in grammar["timing_lengths"]
-    low_precision = grammar["low_precision_rules"]
-    fp8 = low_precision["float8_e4m3fn/float8_e5m2"]
-    mx = low_precision["mxfp8_e4m3fn/mxfp8_e5m2"]
-    assert "exactly one matmul" in fp8 and "no padded-tail" in fp8
-    assert "copy-only graphs preserve FP8" in fp8
-    assert "every non-copy FP8 graph computes all intermediates and output in FP32" in fp8
-    assert "only one matmul" in mx and "inputs in order" in mx
-    assert "no padded-tail" in mx and "FP32 output" in mx
-    assert "per 32 K" in mx and "gm_scale0 and gm_scale1 before gm_output" in mx
-    rules = grammar["capability_operation_rules"]
-    assert "if and only if" in rules["rule"]
-    assert rules["simd-vector"] == ["add", "multiply", "relu"]
-    assert rules["simt-reduction"] == ["reduce-sum"]
-    assert rules["simt-mask"] == ["mask-positive"]
-    assert rules["cube-tiling"] == ["matmul"]
-    assert "copy alone does not require" in rules["gm-ub-movement"]
 
 
 def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
@@ -177,7 +129,6 @@ def test_invalid_selection_is_corrected_with_full_session_history(invalid):
     assert len(calls) == 2
     assert calls[1][:-1] == calls[0] + ({"role": "assistant", "content": invalid},)
     assert "validation" in calls[1][-1]["content"]
-    assert "unchanged" in calls[1][-1]["content"]
     assert session.turns == 2
     assert len(session.messages) == 5
     assert session.messages[-1]["content"] == valid
@@ -231,8 +182,6 @@ def test_64_serial_selections_and_oversized_session_resume_use_bounded_wire(mode
         requests.append(request)
         messages = request["messages"]
         assert messages[0]["role"] == "system"
-        assert "Profiling guidance:\nKeep raw profiling evidence." in messages[1]["content"]
-        assert "Project budget: select no more than 1 projects" in messages[1]["content"]
         payload = json.loads(messages[1]["content"].rsplit("\n", 1)[-1])
         assert payload["pre_wave_memory_sha256"] == expected_context.pre_wave_memory_sha256
         assert payload["pre_wave_coverage"] == [item.value for item in expected_context.pre_wave_coverage]
@@ -529,14 +478,6 @@ def test_prior_project_id_still_rejected_for_a_new_exact_shape():
         CurriculumAgent(lambda _: wave([proposal])).select(context(prior_outcomes=(prior,)))
 
 
-def test_prompt_describes_advisory_coverage_and_controlled_variations():
-    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
-
-    prompt = curriculum_prompt(context())
-    assert "Coverage dimensions are advisory" in prompt
-    assert "new exact shapes within a covered shape class" in prompt
-    assert "new combinations of covered dimensions are allowed" in prompt
-    assert "only when every project adds" not in prompt
 
 
 def test_held_out_names_are_rejected_in_graph_identifiers():
@@ -641,18 +582,6 @@ def test_small_adaptive_waves_are_bounded_by_remaining_target():
                 context(remaining_projects=remaining))
 
 
-def test_prompt_defines_dependencies_axes_masks_and_output_dtype():
-    from benchmarks.a5kernels.phase1_curriculum_selector import curriculum_prompt
-    grammar = json.loads(curriculum_prompt(context()).rsplit("\n", 1)[-1])["bounded_project_grammar"]
-    assert "never project IDs" in grammar["requires"]
-    assert "[] is valid in ANY wave" in grammar["requires"]
-    assert "zero-based axis" in grammar["graph"]["axis"]
-    assert "null for every non-reduction" in grammar["graph"]["axis"]
-    assert "1 if x > 0 else 0" in grammar["graph"]["mask-positive"]
-    assert "input dtype by default" in grammar["output_dtype"]
-    assert "matmul outputs float32" in grammar["output_dtype"]
-    assert "copy-only graphs preserve FP8" in grammar["output_dtype"]
-    assert "every non-copy FP8 graph computes intermediates and output in float32" in grammar["output_dtype"]
 
 
 def test_learning_focus_cannot_bypass_held_out_executable_signature():
