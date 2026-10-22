@@ -47,6 +47,7 @@ def test_presentation_is_idempotent_and_does_not_rewrite_evidence():
     ('RECOVERY_REQUIRED', 'recovered'), ('waiting-approval', 'approval'),
     ('context-budget-exhausted', 'context limit'), ('could-not-confirm', 'enough evidence'),
     ('infrastructure-failed', 'infrastructure'), ('proposed', 'not yet'),
+    ('passed', 'acceptance checks'), ('transport-qualified', 'kernel correctness has not'),
     ('checking-correctness', 'frozen reference'), ('checking-reference', 'reference'),
     ('succeeded', 'correctness is a separate'), ('practice', 'practice project'),
     ('target', 'original target'), ('review', 'reviewing'), ('qualification', 'qualification'),
