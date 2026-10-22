@@ -60,7 +60,7 @@ def test_coordinator_context_exposes_full_memory_without_feedback(tmp_path):
         assert json.loads(messages[-1]['content'])['text'] == canonical(memory)[:8192].decode()
         return 'DECISION: SATURATED\n{"reason":"learned from existing work"}'
     _, session = CurriculumAgent(complete).select(context)
-    assert session.turns == 1 and len(calls) == 2
+    assert session.turns == 2 and len(calls) == 2
 
 
 def test_failure_context_preserves_every_row_in_readable_file(tmp_path):
@@ -93,7 +93,7 @@ def test_multiple_reads_keep_full_audit_but_only_latest_page_on_wire(tmp_path):
     audit = [json.loads(row['content']) for row in session.messages
              if row['role']=='user' and row['content'].startswith('{')]
     assert sum(bool(row.get('text')) for row in audit) == 2
-    assert session.turns == 1
+    assert session.turns == 3
 
 
 def test_native_phase2_reads_and_more_than_three_corrections_share_time(tmp_path):
@@ -113,7 +113,7 @@ def test_native_phase2_reads_and_more_than_three_corrections_share_time(tmp_path
             return 'DECISION: READY\n{"reason":"incorrect proposal"}'
         return 'DECISION: RETRY_TARGET\n{"reason":"apply observed repair"}'
     decision, session = TargetCurriculumAgent(complete, clock=lambda:now[0]).select(context)
-    assert decision.action=='retry-target' and len(calls)==6 and session.turns==5
+    assert decision.action=='retry-target' and len(calls)==6 and session.turns==6
     assert json.loads(calls[1][-1]['content'])['text'] == canonical({'actual':'mismatch','details':['a','b']}).decode()
     now[0]=0
     with pytest.raises(ValueError, match='elapsed-time budget exhausted'):
@@ -132,7 +132,7 @@ def test_optimizer_context_pages_resume_without_resending_prior_page_bodies(tmp_
             raise OSError('provider unavailable')
         presentation = json.loads(messages[1]['content'])['memory']
         ref = presentation['projects'][0]
-        return json.dumps({'read_artifact':dict(ref['read_artifact'], offset=(len(calls)-1)*8192)})
+        return json.dumps({'read_artifact':dict(sha256=ref['sha256'], offset=(len(calls)-1)*8192, limit=8192)})
     options = dict(snapshot=snapshot, objective='Learn.', root=tmp_path/'selection', remaining_seconds=lambda:100)
     with pytest.raises(OSError):
         select_optimizer_task(complete=interrupted, **options)
@@ -144,3 +144,26 @@ def test_optimizer_context_pages_resume_without_resending_prior_page_bodies(tmp_
     assert selected['task_id']==proposal()['task_id']
     pages = [json.loads(row['content']) for row in resumed[0][2:] if row['role']=='user']
     assert len(pages)==2 and 'text' not in pages[0] and pages[1]['text']
+
+
+def test_large_context_indexes_every_memory_without_inlining_all_references(tmp_path):
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Learn.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=20)
+    entries = [dict(project_spec={'project_id':f'project-{i}'}, observed={'index':i}) for i in range(20)]
+    state = runner._load_state()
+    state['memory_bytes_base64'] = [base64.b64encode(canonical(row)).decode() for row in entries]
+    refs, reader = runner._context_files(state)
+    assert len(refs) == 5
+    index = read_all(reader, refs[0])
+    assert len(index['files']) == 20
+    assert read_all(reader, index['files'][0]) == entries[0]
+    assert read_all(reader, index['files'][-1]) == entries[-1]
+
+
+def test_context_files_uses_authenticated_snapshot_without_seed_directory_lookup(tmp_path):
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Learn.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=1)
+    entry = dict(project_spec={'project_id':'reviewed-seed'}, host_facts=[{'observed':True}])
+    runner.snapshot = SimpleNamespace(verify=lambda:None, memory_entries=lambda:[entry])
+    refs, reader = runner._context_files(runner._load_state())
+    assert read_all(reader, refs[0]) == entry

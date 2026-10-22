@@ -523,6 +523,7 @@ class CurriculumAgent:
         attempt = 0
         diagnostic = "no proposal admitted"
         while self.clock() < deadline:
+            attempt += 1
             # Provider failures are not proposal-validation failures. Let the
             # caller's existing infrastructure handling observe them unchanged.
             # The current host context contains all authoritative prior outcomes.
@@ -554,7 +555,6 @@ class CurriculumAgent:
                     page = dict(page, event='artifact-page')
                     history.append({'role': 'user', 'content': json.dumps(page, sort_keys=True)})
                     continue
-                attempt += 1
                 decision = self._parse_and_validate(completion, context)
                 if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
                     raise ValueError("wave exceeds remaining project budget; select a smaller wave")

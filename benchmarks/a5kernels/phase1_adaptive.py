@@ -670,11 +670,25 @@ class AdaptivePhase1Coordinator:
         from benchmarks.ascend.context_files import ContextFiles
         files = ContextFiles(self.root / 'curriculum' / 'context')
         refs = []
-        for row, encoded in zip(state['prior_outcomes'], state['memory_bytes_base64'], strict=True):
-            memory = json.loads(base64.b64decode(encoded, validate=True))
-            refs.append(files.put('project-memory-' + row['project_id'], memory))
+        entries = []
+        if hasattr(self, 'snapshot'):
+            self.snapshot.verify()
+            entries.extend(self.snapshot.memory_entries())
+        entries.extend(json.loads(base64.b64decode(encoded, validate=True))
+                       for encoded in state['memory_bytes_base64'])
+        seen = set()
+        for memory in entries:
+            digest = hashlib.sha256(canonical_bytes(memory)).hexdigest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            project_id = memory.get('project_spec', {}).get('project_id', memory.get('task_id', digest[:12]))
+            refs.append(files.put('project-memory-' + project_id, memory))
         for row in state.get('failed_outcomes', []):
             refs.append(files.put('failed-project-' + row['project_id'], row))
+        if len(refs) > 5:
+            index = files.put('context-file-index', {'files': refs})
+            refs = [index, *refs[-4:]]
         return tuple(refs), files.read
 
     def _context(self, state, snapshot):

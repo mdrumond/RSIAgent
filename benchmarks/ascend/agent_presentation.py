@@ -166,7 +166,8 @@ def memory_presentation(raw, artifacts):
     """Index every original memory; show readable bounded lessons, not base64."""
     digest = artifacts.put_bytes(raw)
     result = {"sha256": digest, "bytes": len(raw), "projects": [],
-              "note": "Presentation only. Full immutable memories available via read-artifact."}
+              "note": "Presentation only. Full immutable memories available via read-artifact.",
+              "file_reader": {"action": "read_artifact", "hash_field": "sha256", "offset": 0, "limit": 8192}}
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
@@ -200,7 +201,6 @@ def memory_presentation(raw, artifacts):
         digest = artifacts.put_bytes(content)
         row = {"sha256": digest, "size_bytes": len(content),
                "filename": "project-memory-" + str(project.get("project_spec", {}).get("project_id", project.get("task_id", digest[:12]))) + ".json",
-               "read_artifact": {"sha256": digest, "offset": 0, "limit": 8192},
                "origin": origin,
                "project_id": project.get("project_spec", {}).get("project_id", project.get("task_id"))}
         if project.get("task_id"):
