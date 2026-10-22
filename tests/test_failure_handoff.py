@@ -180,3 +180,32 @@ def test_coordinator_passes_frozen_case_to_project_adapter(tmp_path):
     assert received[0].inputs == executor.prepare(spec).inputs != generated.inputs
     assert received[0].oracle == executor.prepare(spec).expected
     assert received[0].failure_context == context
+
+
+def test_failed_bound_repair_preserves_exact_case_for_next_generation(tmp_path):
+    executor, original, store, context = observed_failure(tmp_path)
+    first = replace(original, project_id='first-failed-repair')
+    failure = FailureContext(context, first)
+    request = replace(_request(tmp_path / 'first', executor, first), failure_context=context,
+                      inputs=failure.inputs, oracle=failure.expected)
+    actor = ScriptedActor(['{"write":{"slot":"kernel","content":"another broken source"}}', '{"run":{}}'])
+    failed = AdaptiveActorProjectExecutor(executor, actor, object(), retain_semantic_failure=True)(request)
+    assert not failed.evidence.verified
+    campaign = tmp_path / 'second-campaign'
+    phase1(campaign, spec=first.as_dict())
+    branch = campaign / 'waves/wave-1/branches' / first.project_id
+    from shutil import copytree
+    copytree(request.branch_root / 'artifacts', branch / 'artifacts')
+    (branch / 'execution-evidence.bin').write_bytes(failed.evidence_payload)
+    assert store.import_phase1(campaign)['imported'] == 1
+    key = next(row['feedback_id'] for row in store.records() if row['outcome']['attempt_id'] == first.project_id)
+    second = replace(original, project_id='second-successful-repair')
+    next_context = dict(root=str(store.root), feedback_ids=[key])
+    next_case = FailureContext(next_context, second)
+    next_case.require_repair_evidence(second)
+    assert next_case.inputs == request.inputs != executor.prepare(first).inputs
+    final_request = replace(_request(tmp_path / 'second', executor, second), failure_context=next_context,
+                            inputs=next_case.inputs, oracle=next_case.expected)
+    fixed_actor = ScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}', '{"run":{}}', '{"submit":{}}'])
+    assert AdaptiveActorProjectExecutor(executor, fixed_actor, object())(final_request).evidence.verified
+    assert executor._backend.run_requests[-1].inputs == request.inputs

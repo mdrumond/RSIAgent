@@ -1,6 +1,8 @@
 """Authenticated failure context, kept separate from reusable verified memory."""
 from __future__ import annotations
 
+import json
+
 from .phase2_feedback import FeedbackStore
 
 
@@ -25,7 +27,7 @@ class FailureContext:
         self.cases = [dict(case, feedback_id=key) for key in self.feedback_ids
                       for case in self.store.failure_cases(key)]
         from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-        from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
+        from benchmarks.a5kernels.phase1_project import HostTensor, materialize_inputs, evaluate_reference
         from .failure_cases import phase1_policy
         mode = {'compile': 'compile-failure', 'host-mismatch': 'host-mismatch'}.get(spec.failure_mode.value)
         self.compatible = []
@@ -38,14 +40,23 @@ class FailureContext:
                     not case.get('project_spec')):
                 continue
             original = ProjectSpec.from_mapping(case['project_spec'])
-            original_inputs = materialize_inputs(original)
-            original_expected = evaluate_reference(original, original_inputs)
+            refs = case.get('artifacts', {})
+            try:
+                payload = json.loads(self.store.failure_artifact_bytes(case['feedback_id'], refs['inputs']['sha256']))
+                original_inputs = tuple(HostTensor(tuple(row['shape']), tuple(row['physical_shape']),
+                                                   tuple(row['storage'])) for row in payload['tensors'])
+                original_layout = [(x.shape, x.physical_shape) for x in materialize_inputs(original)]
+                if [(x.shape, x.physical_shape) for x in original_inputs] != original_layout:
+                    continue
+                original_expected = evaluate_reference(original, original_inputs)
+            except (KeyError, TypeError, ValueError, OSError):
+                continue
             if (original.graph != spec.graph or original.dtype != spec.dtype or
                     [(x.shape, x.physical_shape) for x in original_inputs] != target_layout or
                     case.get('project_contract') != phase1_contract(original, original_inputs, original_expected) or
                     case.get('policy') != phase1_policy(original_expected.dtype)):
                 continue
-            # Digest-checked retained bytes must describe the host-rematerialized original case.
+            # Retained exact inputs and recomputed host oracle must match authenticated hashes.
             contract = case['project_contract']
             if any(case.get('artifacts', {}).get(role, {}).get('sha256') != contract[role + '_sha256']
                    for role in ('inputs', 'expected')):

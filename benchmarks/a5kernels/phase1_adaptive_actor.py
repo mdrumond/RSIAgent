@@ -31,6 +31,7 @@ from benchmarks.a5kernels.phase1_project_executor import (
     ProjectCompileResult,
     ProjectExecutionResult,
     ProjectExecutor,
+    _tensor_payload, _expected_payload,
 )
 from benchmarks.a5kernels.phase1_project import EvidenceClassification
 from benchmarks.a5kernels.trial import (
@@ -296,7 +297,10 @@ class _ProjectActions:
         if not result.observation.passed:
             self.observed_failures[FailureMode.COMPILE] = len(self.actions)
             retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
-                "compile-failure", result.observation.diagnostic, {"diagnostics": result.artifact},
+                "compile-failure", result.observation.diagnostic, {
+                    "diagnostics": result.artifact,
+                    "inputs": {"tensors": [_tensor_payload(x) for x in self.prepared.inputs]},
+                    "expected": _expected_payload(self.prepared.expected)},
                 self.prepared.expected.dtype)
         return self._observation({
             "event": "host-compile", "source_sha256": self.source_sha256,
