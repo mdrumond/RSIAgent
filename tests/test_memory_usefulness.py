@@ -147,3 +147,44 @@ def test_factory_requests_follow_current_rebound_parent_allowance(tmp_path):
     with pytest.raises(TimeoutError):
         verifier.curriculum._complete([])
     assert len(requests) == 4
+
+
+@pytest.mark.parametrize('seconds', [float('nan'), float('inf'), float('-inf'), 0, -1, True, '600'])
+def test_pair_allowance_requires_finite_positive_number(tmp_path, seconds):
+    with pytest.raises(ValueError, match='finite and positive'):
+        UsefulnessVerifier(tmp_path, None, None, None, pair_seconds=seconds)
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize('inspection_seconds', [3, 11])
+def test_factory_caps_every_provider_call_by_local_pair_and_parent(tmp_path, inspection_seconds):
+    from benchmarks.ascend.memory_usefulness import build_usefulness_verifier
+    now, calls, arms = [0.0], [], []
+    class Provider:
+        def complete(self, profile, messages, *, max_seconds):
+            calls.append(max_seconds)
+            if 'memory usefulness verifier' in messages[0]['content']:
+                stage = json.loads(messages[-1]['content'])['stage']
+                now[0] += inspection_seconds if stage == 'inspect' else 0
+                return SimpleNamespace(text=stage)
+            now[0] += 2
+            return SimpleNamespace(text=_wave(messages[-1]['content'],
+                [_project('timed-copy', 'gm-ub-movement')]))
+    def execute(request):
+        arms.append(request)
+        now[0] += 1
+        return _result(request.spec, True, 'pass')
+    verifier = build_usefulness_verifier(root=tmp_path, provider=Provider(), profile=object(),
+        curriculum=CurriculumAgent(lambda _: pytest.fail('production binding required')),
+        project_actor=execute, enabled=True, pair_seconds=10, remaining_seconds=lambda: 100)
+    verifier.clock = lambda: now[0]
+    result = verifier.assess_lesson({'claim': 'copy'},
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'source')
+    if inspection_seconds > 10:
+        assert result['outcome'] == 'inconclusive'
+        assert calls == [10] and arms == []
+    else:
+        assert result['outcome'] == 'both-succeeded'
+        assert calls == [10, 7, 3]
+        assert [request.remaining_seconds for request in arms] == [2.5, 2.5]
+    assert verifier._experiment_remaining is None

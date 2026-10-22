@@ -6,6 +6,7 @@ change retrieval, or promote learning from either experiment arm.
 from dataclasses import asdict
 from copy import copy
 import time
+import math
 import fcntl
 import hashlib
 import json
@@ -33,13 +34,15 @@ def paired_outcome(control, treatment):
 class UsefulnessVerifier:
     def __init__(self, root, curriculum, execute_project, verify, *, enabled=False,
                  pair_seconds=600, memory_root=None, remaining_seconds=None, clock=time.monotonic):
-        if pair_seconds <= 0:
-            raise ValueError('pair allowance must be positive')
+        if (isinstance(pair_seconds, bool) or not isinstance(pair_seconds, (int, float))
+                or not math.isfinite(pair_seconds) or pair_seconds <= 0):
+            raise ValueError('pair allowance must be finite and positive')
         self.root, self.curriculum = Path(root), curriculum
         self.execute_project, self.verify = execute_project, verify
         self.enabled, self.pair_seconds = enabled, pair_seconds
         self.memory_root = memory_root
         self.remaining_seconds, self.clock = remaining_seconds, clock
+        self._experiment_remaining = None
 
     def _append(self, directory, kind, **body):
         events = list(directory.glob('[0-9]*.json'))
@@ -87,12 +90,13 @@ class UsefulnessVerifier:
             arms = {}
             def remaining():
                 available = max(0, deadline - self.clock())
-                return max(0, self.remaining_seconds()) if self.remaining_seconds else available
+                return min(available, max(0, self.remaining_seconds())) if self.remaining_seconds else available
             def require_time():
                 available = remaining()
                 if available <= 0:
                     raise TimeoutError('Memory usefulness active-time allowance exhausted')
                 return available
+            self._experiment_remaining = require_time
             try:
                 require_time()
                 inspection = self.verify('inspect', {'lesson': lesson, 'host_facts': host_facts})
@@ -150,6 +154,7 @@ class UsefulnessVerifier:
                 require_time()
                 interpretation = self.verify('interpret', {'lesson': lesson, 'arms': arms,
                     'outcome': outcome, 'warning': 'Both succeeding does not establish uselessness.'})
+                require_time()
                 return self._append(directory, 'assessment', experiment_id=experiment_id,
                     lesson_id=lesson_id, outcome=outcome, arms=arms, interpretation=interpretation)
             except Exception as error:
@@ -157,6 +162,8 @@ class UsefulnessVerifier:
                 return self._append(directory, 'assessment', experiment_id=experiment_id,
                     lesson_id=lesson_id, outcome='inconclusive', reason=str(error), arms=arms,
                     error_type=type(error).__name__)
+            finally:
+                self._experiment_remaining = None
 
 
 def build_usefulness_verifier(*, root, provider, profile, curriculum, project_actor,
@@ -166,7 +173,9 @@ def build_usefulness_verifier(*, root, provider, profile, curriculum, project_ac
     curriculum = copy(curriculum)
     curriculum.failure_feedback = None
     def allowance():
-        available = verifier.remaining_seconds() if verifier.remaining_seconds else pair_seconds
+        available = (verifier._experiment_remaining() if verifier._experiment_remaining
+                     else min(pair_seconds, verifier.remaining_seconds()) if verifier.remaining_seconds
+                     else pair_seconds)
         if available <= 0:
             raise TimeoutError('Memory usefulness parent allowance exhausted')
         return available
