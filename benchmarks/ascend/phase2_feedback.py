@@ -396,13 +396,18 @@ class FeedbackStore:
     def link_original_retry(self, feedback_id, retry_id):
         """Record an attempt; only authenticated original acceptance marks it fixed."""
         known = {row['feedback_id']: row for row in self.records()}
-        original, retry = known[feedback_id], known[retry_id]
+        original = known[feedback_id]
+        if retry_id not in known:
+            raise KeyError(retry_id)
         if feedback_id == retry_id:
             raise ValueError('retry must have a distinct execution identity')
         def merge(current):
             updates = dict(retries=list(dict.fromkeys([*current['retries'], retry_id])))
-            updates['status'] = ('resolved' if self._original_retry(original['outcome'], retry['outcome'])
-                                 else 'open')
+            # A later unsuccessful experiment does not erase a demonstrated fix.
+            # Reload under the publication lock to include concurrently linked attempts.
+            attempts = {row['feedback_id']: row['outcome'] for row in self.records()}
+            updates['status'] = ('resolved' if any(self._original_retry(
+                original['outcome'], attempts.get(key, {})) for key in updates['retries']) else 'open')
             return updates
         return self.update_investigation(feedback_id, merge=merge)
 
