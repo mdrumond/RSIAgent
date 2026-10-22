@@ -148,7 +148,11 @@ class UsefulnessVerifier:
                             'evidence_sha256': hashlib.sha256(result.evidence_payload).hexdigest()}
                         (branch / 'evidence.json').write_bytes(result.evidence_payload)
                     except SemanticProjectFailure as error:
-                        arms[name] = {'verified': False, 'detail': error.summary, 'evidence': error.evidence}
+                        payload = canonical_bytes({'verified': False, 'detail': error.summary,
+                                                   'evidence': error.evidence})
+                        (branch / 'evidence.json').write_bytes(payload)
+                        arms[name] = {'verified': False, 'detail': error.summary, 'evidence': error.evidence,
+                                      'evidence_sha256': hashlib.sha256(payload).hexdigest()}
                     self._append(directory, 'arm-completed', arm=name, **arms[name])
                 outcome = paired_outcome(arms['control'], arms['treatment'])
                 require_time()
