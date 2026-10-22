@@ -185,12 +185,17 @@ class UsefulnessVerifier:
                                       'evidence_sha256': hashlib.sha256(payload).hexdigest()}
                     self._append(directory, 'arm-completed', arm=name, **arms[name])
                 outcome = paired_outcome(arms['control'], arms['treatment'])
-                require_time()
-                interpretation = self.verify('interpret', {'lesson': lesson, 'arms': arms,
-                    'outcome': outcome, 'warning': 'Both succeeding does not establish uselessness.'})
-                require_time()
+                interpretation, interpretation_error = None, None
+                try:
+                    require_time()
+                    interpretation = self.verify('interpret', {'lesson': lesson, 'arms': arms,
+                        'outcome': outcome, 'warning': 'Both succeeding does not establish uselessness.'})
+                    require_time()
+                except Exception as error:
+                    interpretation_error = dict(error_type=type(error).__name__, reason=str(error))
                 return self._append(directory, 'assessment', experiment_id=experiment_id,
-                    lesson_id=lesson_id, outcome=outcome, arms=arms, interpretation=interpretation)
+                    lesson_id=lesson_id, outcome=outcome, arms=arms, interpretation=interpretation,
+                    interpretation_error=interpretation_error)
             except Exception as error:
                 # Assessment is best effort and never gates original publication.
                 return self._append(directory, 'assessment', experiment_id=experiment_id,

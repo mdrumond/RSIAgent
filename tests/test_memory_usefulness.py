@@ -262,3 +262,32 @@ def test_partial_retained_event_does_not_block_resume_or_repeat_execution(tmp_pa
     assert (directory/'0003.json').is_file()
     assert verifier.assess_lesson(lesson, prior, 'retained') == result
     assert len(list(directory.glob('[0-9]*.json'))) == 3
+
+
+@pytest.mark.parametrize('interpretation_failure', ['deadline', 'provider'])
+def test_completed_host_pair_survives_optional_interpretation_failure(tmp_path, interpretation_failure):
+    import hashlib
+    now, requests, stages = [0.0], [], []
+    def execute(request):
+        requests.append(request)
+        if len(requests) == 2 and interpretation_failure == 'deadline':
+            now[0] = 10
+        return _result(request.spec, len(requests) == 2, 'retained host verdict')
+    def verify(stage, evidence):
+        stages.append(stage)
+        if stage == 'interpret':
+            raise RuntimeError('provider unavailable')
+        return stage
+    verifier = UsefulnessVerifier(tmp_path, CurriculumAgent(lambda messages:
+        _wave(messages[-1]['content'], [_project('host-pair', 'gm-ub-movement')])),
+        execute, verify, enabled=True, clock=lambda: now[0], remaining_seconds=lambda: max(0, 10-now[0]))
+    result = verifier.assess_lesson({'claim': 'new'},
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'host-pair')
+    assert result['outcome'] == 'demonstrated-benefit'
+    assert result['arms']['control']['verified'] is False
+    assert result['arms']['treatment']['verified'] is True
+    assert result['interpretation_error']['error_type'] == ('TimeoutError' if interpretation_failure == 'deadline' else 'RuntimeError')
+    assert stages == (['inspect'] if interpretation_failure == 'deadline' else ['inspect', 'interpret'])
+    for arm in ('control', 'treatment'):
+        data = (tmp_path/result['experiment_id']/arm/'evidence.json').read_bytes()
+        assert hashlib.sha256(data).hexdigest() == result['arms'][arm]['evidence_sha256']
