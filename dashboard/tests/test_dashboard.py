@@ -1403,7 +1403,9 @@ def test_terminal_proposal_summary_and_zero_project_approval(tmp_path):
                         command_runner=run).test_client()
     status = client.get("/api/status").get_json()
     proposal = status["controls"]["proposals"][0]
-    assert proposal["terminal"] == {"status": "SATURATED", "reason": "Coverage is complete."}
+    assert proposal["terminal"]["status"] == "SATURATED"
+    assert proposal["terminal"]["reason"] == "Coverage is complete."
+    assert "does not prove" in proposal["terminal"]["status_explanations"][0]["next_action"]
     assert "private terminal reasoning" not in json.dumps(status)
     csrf = client.get("/api/csrf").get_json()["token"]
     response = client.post("/api/control/approve", json={"campaign_id": "phase1",
