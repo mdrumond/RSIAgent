@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import time
+from pathlib import Path
 
 from .phase2_time import Phase2TimeBudget
 
@@ -68,13 +69,49 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         targets = [row for row in state["attempts"] if row["kind"] == "target"]
         if not targets:
             raise ValueError("execute the fixed target before curriculum review")
-        return TargetCurriculumContext(self.target, targets[-1],
+        refs, reader = self._context_files(state)
+        from .context_files import ContextFiles
+        from .agent_presentation import _preview
+        files = ContextFiles(self.root / 'curriculum' / 'context')
+        observed = files.put('latest-target-attempt', targets[-1])
+        from .phase2_feedback import FeedbackStore
+        from .failure_handoff import FailureArtifactReader
+        from .agent_presentation import artifact_page_presentation
+        from types import SimpleNamespace
+        cases, raw_refs = [], {}
+        for attempt in state['attempts']:
+            branch = self.root / 'waves' / attempt['wave_id'] / 'branches' / attempt['project_id']
+            retained = FeedbackStore._phase1_failure_cases(branch, attempt['spec'])
+            cases.extend(retained)
+            for case in retained:
+                raw_refs.update({ref['sha256']: ref for ref in case['artifacts'].values()})
+        case_file = files.put('native-failure-cases', cases)
+        def raw_bytes(digest):
+            if digest not in raw_refs:
+                raise FileNotFoundError('artifact is not linked native failure evidence')
+            data = Path(raw_refs[digest]['retained_path']).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise ValueError('native failure artifact digest mismatch')
+            return data
+        failure_reader = FailureArtifactReader(files.artifacts, SimpleNamespace(read_bytes=raw_bytes))
+        memory_reader = reader
+        def reader(**payload):
+            if payload.get('sha256') in {observed['sha256'], case_file['sha256']}:
+                return files.read(**payload)
+            if payload.get('sha256') in raw_refs:
+                offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
+                if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
+                    raise ValueError('artifact page requires nonnegative offset and limit 1..8192')
+                return files.record_read(artifact_page_presentation(payload, failure_reader))
+            return memory_reader(**payload)
+        return TargetCurriculumContext(self.target, _preview(targets[-1]),
             tuple([*self._curriculum_feedback(state),
                    *[row for row in state["attempts"][-2:] if row["kind"] == "practice"]]),
             self.time.remaining,
             self.time.practice_remaining, self.available_tools,
             used_project_ids=tuple(sorted({row["project_id"]
-                for row in [*self.seed_outcomes, *state["attempts"]]})))
+                for row in [*self.seed_outcomes, *state["attempts"]]})),
+            context_files=(*refs, observed, case_file), artifact_reader=reader)
 
     def _select_pending(self, state):
         snapshot = self._memory_snapshot(state)

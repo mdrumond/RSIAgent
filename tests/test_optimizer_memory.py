@@ -114,3 +114,33 @@ def test_cli_discover_create_inspect_runtime(tmp_path, capsys):
     created = json.loads(capsys.readouterr().out)
     main(['inspect', '--store', str(store), created['job_id']])
     assert json.loads(capsys.readouterr().out) == created
+
+
+def test_committed_phase1_export_keeps_authenticated_inherited_reviewed_memory(tmp_path):
+    from tests.test_a3_reviewed_phase2 import native_source
+    from benchmarks.ascend.phase2 import admit_native_snapshot
+    from benchmarks.ascend.phase2_curriculum import reviewed_seed
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from optimizer.memory import freeze_committed_phase1
+    from optimizer.jobs import atomic, canonical
+    source, review, memory = native_source(tmp_path/'original')
+    root = tmp_path/'remediation'
+    admitted = admit_native_snapshot(source, b'', review, root)
+    initial, _ = reviewed_seed(root, admitted.snapshot_id)
+    runner = AdaptivePhase1Coordinator(root, 'Keep reviewed knowledge.', initial,
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=1)
+    state = runner._load_state()
+    atomic(root/'campaign-identity.json', (source/'campaign-identity.json').read_bytes())
+    exported = freeze_committed_phase1(root, initial)
+    assert exported['memory_entries'] == [memory]
+    assert exported['phase'] == 'committed-phase1'
+    assert 'reviewed-seed/review.json' in exported['files']
+    assert 'reviewed-seed/snapshot.json' in exported['files']
+    cas = f"reviewed-seed/artifacts/objects/{memory['source_revision'][:2]}/{memory['source_revision'][2:]}"
+    assert cas in exported['files']
+    verify_snapshot(exported)
+    directory = next(root.glob('cells/*/snapshot'))
+    (directory/'artifacts/objects'/memory['source_revision'][:2]/memory['source_revision'][2:]).write_bytes(b'corrupt')
+    with pytest.raises(ValueError, match='snapshot bytes changed|CAS mismatch'):
+        freeze_committed_phase1(root, initial)

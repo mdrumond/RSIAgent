@@ -76,9 +76,13 @@ def _verified_retry(outcome):
         ref = outcome['evidence']['result_artifact']
         if not Path(ref['job_root']).is_dir():
             return False
+        submission = outcome['task']['submission']
+        if 'signatures' not in submission and 'signature' in submission:
+            from optimizer.cases import normalize_job_submission
+            submission = normalize_job_submission(submission)
         verify_attempt_result(JobStore(ref['job_root']), outcome['result'],
                               attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'],
-                              task_submission=outcome['task']['submission'])
+                              task_submission=submission)
         return outcome['result'].get('verified') is True
     except (KeyError, OSError, ValueError, TypeError):
         return False
@@ -476,7 +480,8 @@ class FeedbackStore:
                 outcome = dict(source_type='optimizer', source_root=str(root),
                     attempt_id=job['job_id'], completed=True, kind='optimizer',
                     target=observed_target, language=observed_language, original_spec=original,
-                    task=task, runtime={}, job_incarnation=events[0]['sha256'],
+                    task=task, runtime=next((event['payload'] for event in reversed(events)
+                        if event['kind'] == 'worker-configuration'), {}), job_incarnation=events[0]['sha256'],
                     verified=bool(best), result=result, evidence=evidence,
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
@@ -516,15 +521,21 @@ class FeedbackStore:
                 or original['language'] not in {'ascend-c', 'catlass-dsl'}):
             return False
         try:
+            if original['source_type'] == 'phase2' or retry['evidence'].get('result_artifact'):
+                baseline = _baseline_identity(original)
+                return (baseline is not None and baseline == _baseline_identity(retry)
+                        and _verified_retry(retry)
+                        and _category(original['task'], retry['result']) == 'verified-success')
             if original['source_type'] == 'optimizer':
                 from optimizer.loop import score
                 def artifact(outcome, role):
                     ref = outcome['evidence'][role]
                     return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
                 baseline = artifact(original, 'baseline')
-                if baseline != artifact(retry, 'baseline'):
+                retry_baseline = artifact(retry, 'baseline')
+                if _baseline_identity(original) is None or _baseline_identity(original) != _baseline_identity(retry):
                     return False
-                measured = score(baseline, artifact(retry, 'evaluation'))
+                measured = score(retry_baseline, artifact(retry, 'evaluation'))
                 return measured is not None and measured >= 1.0
             plan_ref = retry['evidence']['plan']
             plan_data = Path(plan_ref['retained_path']).read_bytes()
