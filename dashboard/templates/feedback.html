@@ -4,7 +4,7 @@
 {% if not controls.feedback.root %}<p>Configure <code>feedback_root</code> to view imported outcomes.</p>{% endif %}
 {% if controls.enabled and controls.feedback.root %}<section class="control-panel">
 <button data-action="import-feedback" data-subject="phase2">Import configured failures</button>
-<p>Use a fresh destination preset for each investigation or retry. Phase 1 starts awaiting curriculum approval. Retry explicitly starts one original failed project using the preset's reviewed memory.</p>
+<p>Use a fresh destination preset for each investigation or retry. Phase 1 starts awaiting curriculum approval. Retry uses a Phase 2 destination preset's reviewed memory to rerun the original Phase 1 specification or frozen optimizer suite.</p>
 <form data-feedback-form>
 <label>Destination <select name="preset_id">{% for preset in controls.presets.values() %}{% if preset.target == 'a3' %}<option value="{{ preset.id }}">{{ preset.id }} (Phase {{ preset.phase }})</option>{% endif %}{% endfor %}</select></label>
 <label>Phase 1 project budget <input name="project_target" type="number" min="1" required></label>

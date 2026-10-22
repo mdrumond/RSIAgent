@@ -200,7 +200,7 @@ class AutomaticRemediation:
             # is optional evidence and cannot undo or delay that transition.
             atomic(marker, canonical(dict(complete=False, error_type=type(error).__name__, error=str(error))))
 
-    def _phase1_retry(self, row, directory, state):
+    def _phase1_retry(self, row, directory, state, *, retain_campaign=False):
         from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveProject, WaveSpec
         from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator
         spec = ProjectSpec.from_mapping(row['outcome']['original_spec'])
@@ -216,7 +216,7 @@ class AutomaticRemediation:
                                    self.runner._execute, 1, allow_semantic_failures=True)
         result = live.resume()
         pending = dict(session=state['session'])
-        blank = dict(state, prior_outcomes=[], failed_outcomes=[], memory_bytes_base64=[],
+        blank = state if retain_campaign else dict(state, prior_outcomes=[], failed_outcomes=[], memory_bytes_base64=[],
                      coverage=[], completed_waves=[], wave_index=0)
         deltas = tuple(self._retry_delta(directory, wave.wave_id, spec.project_id)
                        if result.commits else None for _ in wave.projects)

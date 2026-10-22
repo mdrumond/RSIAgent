@@ -86,7 +86,7 @@ def test_feedback_readonly_separates_correctness_performance_and_investigation(f
 def test_import_and_bounded_phase1_use_existing_async_runner(feedback):
     client, app, config, row, calls = feedback
     completed(client, submit(client, 'import-feedback', {}))
-    assert calls[0][2:] == ['feedback-phase2', '--feedback-root',
+    assert calls[0][2:] == ['feedback', '--source-type', 'all', '--feedback-root',
                            str(config.parent / 'feedback'), '--dashboard-config', str(config)]
     completed(client, submit(client, 'investigate', dict(
         preset_id='phase1', feedback_ids=[row['feedback_id']], project_target=3)))
@@ -258,3 +258,24 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
         assert screens == ['collector', 'campaign']  # callbacks only; no processes launched
     else:
         assert not screens
+
+
+def test_phase1_original_uses_reviewed_retry_preset_and_frozen_spec(feedback):
+    from test_a5_phase1_adaptive import _project
+    client, app, config, row, calls = feedback
+    row['outcome'].update(source_type='phase1', original_spec=_project('original', 'gm-ub-movement'))
+    row['outcome']['task'] = row['outcome']['original_spec']
+    write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
+    completed(client, submit(client, 'retry-feedback', dict(preset_id='phase2', feedback_ids=[row['feedback_id']])))
+    argv = calls[-1]
+    assert argv[argv.index('--phase')+1] == '2'
+    assert '--phase1-root' in argv and '--review' in argv
+    assert argv[-2:] == ['--retry-feedback-id', row['feedback_id']]
+
+
+def test_phase1_original_missing_native_acceptance_rejected(feedback):
+    client, app, config, row, calls = feedback
+    row['outcome'].update(source_type='phase1', original_spec=None)
+    write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
+    assert submit(client, 'retry-feedback', dict(preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
+    assert not calls

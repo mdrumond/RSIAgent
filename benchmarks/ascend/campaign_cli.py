@@ -176,7 +176,13 @@ def build_controller(job):
             if settings.get('optimizer_worker_config'):
                 automatic.retry_external = optimizer_retry_adapter(coordinator, automatic.store,
                     load_config(settings['optimizer_worker_config']))
-        if job.get("optimizer_goal"):
+        if job.get('phase1_original_retry'):
+            from .manual_retry import ManualPhase1Retry
+            data = (Path(job['root']) / 'phase2-feedback.json').read_bytes()
+            if hashlib.sha256(data).hexdigest() != job['feedback_selection_sha256']:
+                raise ValueError('Frozen original retry selection changed')
+            coordinator = ManualPhase1Retry(coordinator, job, json.loads(data))
+        elif job.get("optimizer_goal"):
             coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
         elif job.get("target_goal") is not None or job.get("autonomous_goal"):
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
@@ -724,7 +730,7 @@ def campaign_worker(job, *, builder=build_controller):
                     adoption["project_target"] = job["project_target"]
                     _write(adoption_path, adoption)
             result = coordinator.report() if job.get("approval_mode") else coordinator.resume()
-            if job.get('retry_feedback_id'):
+            if job.get('retry_feedback_id') and not job.get('phase1_original_retry'):
                 from .failure_curriculum import link_retry
                 link_retry(job)
             worker_status = _worker_status(result) if job.get("approval_mode") else "complete"
@@ -832,9 +838,9 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'], help='import retained Phase 2 observations without running agents')
+    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'], help='import retained failure observations without running agents')
     feedback.add_argument('--feedback-root', type=Path, required=True)
-    feedback.add_argument('--source-type', choices=('phase1', 'phase2', 'optimizer'), default='phase2')
+    feedback.add_argument('--source-type', choices=('all', 'phase1', 'phase2', 'optimizer'), default='phase2')
     sources = feedback.add_mutually_exclusive_group(required=True)
     sources.add_argument('--source-root', type=Path, action='append')
     sources.add_argument('--dashboard-config', type=Path)
@@ -888,14 +894,24 @@ def main(argv=None, *, screen=start_screen):
     args = parser.parse_args(argv)
     if args.command in {'feedback', 'feedback-phase2'}:
         from .phase2_feedback import FeedbackStore
-        roots = args.source_root
-        if args.dashboard_config:
-            roots = [row['root'] for row in _read(args.dashboard_config).get('campaigns', [])
-                     if str(row.get('phase')) == ('1' if args.source_type == 'phase1' else '2')]
         store = FeedbackStore(args.feedback_root)
-        importer = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
-                    'optimizer': store.import_optimizer}[args.source_type]
-        print(json.dumps({'reports': [importer(root) for root in roots]}))
+        importers = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
+                     'optimizer': store.import_optimizer}
+        sources = []
+        if args.dashboard_config:
+            config = _read(args.dashboard_config)
+            sources = [('phase1' if str(row.get('phase')) == '1' else 'phase2', row['root'])
+                       for row in config.get('campaigns', []) if str(row.get('phase')) in {'1', '2'}]
+            optimizer = config.get('optimizer', {})
+            if optimizer.get('root'):
+                sources.append(('optimizer', optimizer['root']))
+            if args.source_type != 'all':
+                sources = [(kind, root) for kind, root in sources if kind == args.source_type]
+        else:
+            if args.source_type == 'all':
+                parser.error('--source-type all requires --dashboard-config')
+            sources = [(args.source_type, root) for root in args.source_root]
+        print(json.dumps({'reports': [importers[kind](root) for kind, root in dict.fromkeys(sources)]}))
         return
     control = args.control.resolve()
     if args.command == "adopt":
@@ -959,7 +975,13 @@ def main(argv=None, *, screen=start_screen):
             try:
                 selection = select_feedback(args.feedback_root, args.target, args.failure_id,
                                             retry_id=args.retry_feedback_id)
-                retry = retry_spec(selection, args.target) if args.retry_feedback_id else None
+                if args.retry_feedback_id and selection['selected'][0]['outcome'].get('source_type') == 'phase1':
+                    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+                    original = selection['selected'][0]['outcome'].get('original_spec')
+                    ProjectSpec.from_mapping(original)
+                    retry = dict(source_type='phase1', original_spec=original)
+                else:
+                    retry = retry_spec(selection, args.target) if args.retry_feedback_id else None
             except (ValueError, KeyError, OSError) as error:
                 parser.error(str(error))
         control.mkdir(parents=True, exist_ok=False)
@@ -988,6 +1010,10 @@ def main(argv=None, *, screen=start_screen):
                 feedback_selection_sha256=hashlib.sha256((root / 'phase2-feedback.json').read_bytes()).hexdigest())
             if retry:
                 public.update(retry_feedback_id=args.retry_feedback_id, retry_spec=retry)
+                if retry.get('source_type') == 'phase1':
+                    public['phase1_original_retry'] = True
+                    public.pop('optimizer_goal', None)
+                    public.pop('autonomous_goal', None)
         _write(root / "campaign-run.json", public)
         job = {**public, "root": str(root), "control": str(control), "config": str(config),
                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
