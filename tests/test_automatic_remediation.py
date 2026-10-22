@@ -208,3 +208,30 @@ def test_original_retry_propagates_only_remaining_failure_seconds(tmp_path):
         pre_wave_memory=b'{}', inputs=(), oracle=None)
     runner._execute(request)
     assert 0 < received[0] <= 20
+
+
+@pytest.mark.parametrize('initially_expired', [True, False])
+def test_retry_dispatch_stops_when_campaign_time_is_spent(tmp_path, initially_expired):
+    from test_generic_failure_feedback import phase1
+    for name in ('first', 'second'):
+        phase1(tmp_path/name, spec=_project(name, 'gm-ub-movement'))
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded retries.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', sources=[
+        dict(type='phase1', root=str(tmp_path/name)) for name in ('first', 'second')])
+    state = runner._load_state()
+    automatic.refresh(state)
+    for record in automatic.store.records():
+        automatic.store.update_investigation(record['feedback_id'], status='ready-to-retry', evidence=['probe'])
+    automatic.refresh(state)
+    remaining, dispatched = [0 if initially_expired else 1], []
+    runner._remaining_seconds = lambda: remaining[0]
+    def execute_original(row, directory, state):
+        dispatched.append(directory)
+        phase1(directory, verified=True, spec=row['outcome']['original_spec'])
+        automatic.store.import_phase1(directory)
+        remaining[0] = 0
+    automatic._phase1_retry = execute_original
+    automatic.retry_ready(state)
+    assert len(dispatched) == (0 if initially_expired else 1)
+    assert sum(len(row['retries']) for row in automatic.state['failures'].values()) == len(dispatched)
