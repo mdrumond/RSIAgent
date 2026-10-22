@@ -606,7 +606,7 @@ class AdaptivePhase1Coordinator:
         for wave_id in state["completed_waves"]:
             plan = self._read_json(self.root / "waves" / wave_id / "plan.json")
             wave = WaveSpec.from_mapping(plan["wave"])
-            prior = self._memory_snapshot({**state, "memory_bytes_base64": previous})
+            prior = self._assessment_snapshot(state, wave_id, previous)
             for project in wave.projects:
                 path = self.root / "waves" / wave_id / "branches" / project.spec.project_id / "memory-delta.bin"
                 if not path.exists():
@@ -618,6 +618,9 @@ class AdaptivePhase1Coordinator:
                 memory = Phase1ProjectMemory.from_mapping(json.loads(raw))
                 verifier.assess_memory(memory, prior, f"{wave_id}/{project.spec.project_id}")
                 previous.append(delta["memory_base64"])
+
+    def _assessment_snapshot(self, state, wave_id, previous):
+        return self._memory_snapshot({**state, "memory_bytes_base64": previous})
 
     def _read_delta(self, wave_id: str, project_id: str) -> dict[str, object]:
         path = self.root / "waves" / wave_id / "branches" / project_id / "memory-delta.bin"

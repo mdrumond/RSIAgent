@@ -393,3 +393,22 @@ def test_target_driven_memory_assessed_in_parent_time_scope(tmp_path):
     coordinator.usefulness_verifier = SimpleNamespace(enabled=True, assess_memory=assess)
     coordinator.run_attempt()
     assert calls == ['attempt-001/' + coordinator.target.spec.project_id]
+
+
+def test_assessment_replay_uses_exact_pre_attempt_memory_without_source_or_future_feedback(tmp_path):
+    from types import SimpleNamespace
+    coordinator, _, requests = build(tmp_path, [])
+    assessments = []
+    coordinator.usefulness_verifier = SimpleNamespace(enabled=True,
+        assess_memory=lambda memory, prior, source: assessments.append((prior, source)))
+    replies = iter([wire('PRACTICE', practice(coordinator)), wire('RETRY_TARGET'), wire('READY')])
+    coordinator.curriculum = TargetCurriculumAgent(lambda _: next(replies))
+    assert coordinator.run()['status'] == 'READY'
+    coordinator.resume()  # Reconcile again with the complete future attempt history.
+    expected = {request.branch_root.parent.parent.name + '/' + request.spec.project_id:
+                request.pre_wave_memory for request in requests}
+    assert len(requests) == 3
+    assert {source for prior, source in assessments} == set(expected)
+    for prior, source in assessments:
+        assert prior == expected[source]
+    assert json.loads(assessments[0][0])['phase2_feedback'] == []

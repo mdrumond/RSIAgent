@@ -64,6 +64,13 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         value["phase2_feedback"] = state.get("attempts", [])[-2:]
         return canonical_bytes(value)
 
+    def _assessment_snapshot(self, state, wave_id, previous):
+        # Replay the same feedback visible before this producing attempt, even
+        # when reconciling lessons after later attempts have committed.
+        index = next(i for i, attempt in enumerate(state["attempts"]) if attempt["wave_id"] == wave_id)
+        return self._memory_snapshot({**state, "memory_bytes_base64": previous,
+                                      "attempts": state["attempts"][:index]})
+
     def _context(self, state, snapshot):
         targets = [row for row in state["attempts"] if row["kind"] == "target"]
         if not targets:
