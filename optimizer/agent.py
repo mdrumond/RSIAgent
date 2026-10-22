@@ -5,6 +5,7 @@ from benchmarks.a3_experiments import BackendModel
 from benchmarks.a3_model_profiles import load_a3_model_profile
 from coding.pi import PiCodingSession, ENGINE_IDENTITY, runtime_preflight
 from coding.pi.adapters import OPTIMIZER_SCHEMAS
+from benchmarks.ascend.status_descriptions import explain_status
 
 
 SYSTEM = """Optimize deterministic inference Torch code using Ascend C on A3.
@@ -69,7 +70,7 @@ class OptimizerAgent:
         if context.get("knowledge_available") is False:
             allowed = [name for name in allowed if name != "query-knowledge"]
         name, args = self.session.next_action({**context, "guide": self.guide,
-            "stage": stage, "contract": SYSTEM, "current_stage_instruction": directive}, allowed,
+            "stage": stage, "stage_explanation": explain_status(stage, field="stage"), "contract": SYSTEM, "current_stage_instruction": directive}, allowed,
             record=record,
             source=self.last_source if stage == "optimize" else None,
             write_action=(lambda s: ("compile", {"source": s, "block_count": self.last_block_count,

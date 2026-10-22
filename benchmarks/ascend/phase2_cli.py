@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -72,7 +73,7 @@ def main(argv=None, *, runner_factory=native_runner, sleeper=time.sleep):
     for attempt in range(MAX_INFRASTRUCTURE_RETRIES + 1):
         try:
             result = runner_factory(args).run()
-            print(json.dumps(result))
+            print(json.dumps(describe_statuses(result)))
             return 0
         except AttentionInfrastructureError:
             if attempt == MAX_INFRASTRUCTURE_RETRIES:

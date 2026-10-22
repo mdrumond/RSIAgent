@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 import os
 from pathlib import Path
 import re
@@ -289,7 +290,7 @@ def main(argv=None) -> int:
         else:
             _require_qualification(args)
             value = _run(args, _selected(args.cell_id))
-    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    print(json.dumps(describe_statuses(value), sort_keys=True, separators=(",", ":")))
     return status
 
 
