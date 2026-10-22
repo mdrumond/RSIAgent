@@ -36,6 +36,17 @@ to label a specification impossible. Recommend ready-to-retry only for a previou
 linked, committed experiment with retained host evidence and a verified control;
 the probe may have failed usefully. This recommends a retry, never proves a root
 cause or resolves the original task. Terminal decisions may carry the same list.
+The goal of remediation is to improve outcomes on the original failed project.
+Once a linked experiment has committed host evidence and a verified control,
+prefer recommending ready-to-retry over generating further probes when that
+evidence suggests a plausible repair. The original retry is itself an experiment:
+it tests whether the learned knowledge transfers. You do not need a complete
+root-cause explanation before recommending it. Further investigation may be
+appropriate. If you keep a failure investigating despite eligible probe/control
+evidence, use the existing reason field to identify the remaining uncertainty and
+explain why another probe is more useful than retrying the original now. Consider
+the remaining elapsed allowance and leave time for the original retry. A passing
+remedial project alone never proves the original is fixed.
 Never mark a failure resolved: only a successful original-target retry can do so.'''
 
 
