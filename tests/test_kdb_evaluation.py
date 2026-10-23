@@ -525,3 +525,48 @@ def test_legacy_gate_keeps_ordinary_observation_and_consumer_token_total(tmp_pat
     assert (result['consumer_tokens'], result['librarian_tokens'], result['tokens']) == (7, 0, 7)
     assert result['queries'] == [{'query': 'copy', 'limit': 5}]
     budget.close()
+
+
+@pytest.mark.parametrize('extra', [
+    {'knowledge_query': {'query': 'cube source'}},
+    {'read_artifact': {'collection': 'memory', 'digest': 'a'*64}},
+    {'explanation': 'Unsupported extra field'},
+])
+def test_mixed_tool_or_unknown_answer_fields_are_invalid_and_not_judged(tmp_path, extra):
+    calls = []
+    class Gate:
+        def query(self, *args):
+            pytest.fail('A mixed action must not execute a search')
+        def read_artifact(self, **kwargs):
+            pytest.fail('A mixed action must not read an artifact')
+    def complete(messages, seconds):
+        calls.append(messages[:])
+        if len(calls) > 1:
+            pytest.fail('Invalid output must not become a completed judged answer')
+        return dict(text=json.dumps(dict(answer='Claiming a source without a valid tool turn', **extra)), tokens=4)
+    budget = Budget(tmp_path/'state.json', 'mixed')
+    pilot = Pilot(complete, lambda arm: Gate(), '', budget)
+    case = Case('mixed', 'writer', 'cube', 'Find source evidence', {})
+    result = pilot.run_arm(case, 'B')
+    assert result['status'] == 'invalid'
+    assert result['checks']['error_type'] == 'ValueError'
+    assert result['queries'] == []
+    for arm in 'ABCD':
+        budget.state['runs']['mixed:'+arm] = dict(status='complete', output='answer')
+    budget.state['runs']['mixed:B'] = result
+    pilot.judge(case)
+    assert budget.state['judgments']['mixed']['reason'] == 'arm-incomplete'
+    assert len(calls) == 1
+    budget.close()
+
+
+@pytest.mark.parametrize('optional', [{}, {'citations': []}, {'citations': [], 'numerical_claims': []}])
+def test_final_answer_preserves_optional_evidence_field_compatibility(tmp_path, optional):
+    def complete(messages, seconds):
+        return dict(text=json.dumps(dict(answer='An honest analysis without source claims', **optional)), tokens=2)
+    budget = Budget(tmp_path/'state.json', 'answer')
+    result = Pilot(complete, None, '', budget).run_arm(Case('answer', 'analyzer', 'copy', 'task', {}), 'A')
+    assert result['status'] == 'complete'
+    assert result['checks']['citation_count'] == 0
+    assert result['checks']['numerical_claim_count'] == 0
+    budget.close()

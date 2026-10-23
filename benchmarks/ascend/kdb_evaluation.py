@@ -250,6 +250,8 @@ class Pilot:
                     elif set(request) == {'read_artifact'}:
                         result = read(request['read_artifact'])
                     else:
+                        if set(request) - {'answer', 'citations', 'numerical_claims'}:
+                            raise ValueError('expected one tool request or analytical answer')
                         if not isinstance(request.get('answer'), str) or not request['answer'].strip():
                             raise ValueError('missing analytical answer')
                         checks = objective_checks(request, retrieved, case.numerical_facts)
