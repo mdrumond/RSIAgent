@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from .knowledge import CollectionManifest, KnowledgeDB, SearchHit, collection_names
 
 if TYPE_CHECKING:
+    from .memory_snapshot import MemorySnapshot, ArtifactPage
     from core.loop import DomainActionResult
 
 
@@ -250,6 +251,7 @@ class KnowledgeAgent:
         database: KnowledgeDB | None = None,
         collection: str | tuple[str, ...] | list[str] | None = None,
         collections: tuple[str, ...] = (),
+        snapshots: dict[str, MemorySnapshot] | None = None,
     ):
         if collection and collections:
             raise ValueError("select collection or collections, not both")
@@ -258,6 +260,9 @@ class KnowledgeAgent:
             raise ValueError("enabled Knowledge Agent requires a database and collection")
         if not enabled and (database is not None or selected):
             raise ValueError("disabled Knowledge Agent must not receive KDB access")
+        if snapshots and (not enabled or set(snapshots) - set(selected)):
+            raise ValueError("artifact snapshots require selected enabled collections")
+        self.snapshots = dict(snapshots or {})
         self.enabled = enabled
         self.journal = journal
         self.database = database
@@ -268,6 +273,19 @@ class KnowledgeAgent:
             self.database = database.read_only_view()
             self.manifests = {name: self.database.manifest(name) for name in selected}
             self.manifest = self.manifests[self.collection]
+            try:
+                for name, snapshot in self.snapshots.items():
+                    snapshot.bind(self.manifests[name])
+            except Exception:
+                self.database.close()
+                raise
+
+    def read_artifact(self, collection: str, digest: str, *, offset: int = 0,
+                      limit: int = 16384) -> ArtifactPage:
+        """Read only hash-verified evidence admitted by a selected memory snapshot."""
+        if not self.enabled or collection not in self.snapshots:
+            raise ValueError("artifact collection is not selected")
+        return self.snapshots[collection].read_artifact(digest, offset=offset, limit=limit)
 
     def close(self) -> None:
         if self.database is not None:
