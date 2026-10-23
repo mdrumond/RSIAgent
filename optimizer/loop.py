@@ -15,6 +15,8 @@ import math
 import re
 import time
 
+from core.knowledge_presentation import compact_knowledge_result
+
 from .cases import validate_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
@@ -332,6 +334,17 @@ class OptimizationLoop:
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        # History can be paged as a whole by the coding context layer. Keep the
+        # latest bounded knowledge response readable independently of that list.
+        for entry in reversed(self.state['history']):
+            if entry.get('tool', {}).get('action') == 'query-knowledge':
+                knowledge = entry.get('content')
+                if (isinstance(knowledge, dict)
+                        and knowledge.get('event') == 'knowledge-query'
+                        and 'results_index_sha256' in knowledge
+                        and len(canonical(knowledge)) <= 3500):
+                    context['latest_knowledge'] = knowledge
+                break
         row = self.store.get(self.key)
         context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
         if self.agent.identity.get('coding_engine') == 'pi':
@@ -351,6 +364,12 @@ class OptimizationLoop:
                               'result': row.get('result'), 'summary': str(row.get('summary', ''))[:500]}
                 content = json.dumps(row.get('content'), ensure_ascii=True)
                 size = 12000 if index == len(recent) - 1 and 'tool' in row else 1500
+                if (row.get('tool', {}).get('action') == 'query-knowledge'
+                        and isinstance(row.get('content'), dict)
+                        and row['content'].get('event') == 'knowledge-query'
+                        and 'results_index_sha256' in row['content']
+                        and len(canonical(row['content'])) <= 3500):
+                    size = len(content)
                 record['content_preview'] = content[:size]
                 record['content_truncated'] = len(content) > size
                 history.append(record)
@@ -421,8 +440,12 @@ class OptimizationLoop:
                 raise ValueError('invalid memory index')
             result = snapshot['memory_entries'][index]
         elif action['action'] == 'query-knowledge' and set(action) == {'action', 'query'}:
-            result = self._action('knowledge', lambda: self.knowledge(action['query'])
-                                  if self.knowledge else {'status': 'unavailable'})
+            def query():
+                raw = self.knowledge(action['query']) if self.knowledge else {'status': 'unavailable'}
+                return compact_knowledge_result(action['query'], raw, lambda content:
+                    self.store.put_artifact(self.key, 'knowledge-source', content)['sha256'])
+
+            result = self._action('knowledge', query)
         else:
             raise ValueError('invalid tool action')
         self._tool_result(action, result)

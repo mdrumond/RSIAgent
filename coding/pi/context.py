@@ -25,6 +25,20 @@ class ContextRecords:
 
     def compact(self, value, threshold=1024):
         if isinstance(value, str):
+            # Host outcomes and optimizer previews carry JSON strings. Preserve
+            # the bounded knowledge source list through that transport envelope.
+            if len(value.encode()) <= 4096 and value.startswith('{'):
+                try:
+                    parsed = json.loads(value)
+                except ValueError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    observation = parsed.get('host', parsed)
+                    if (isinstance(observation, dict)
+                            and observation.get('event') == 'knowledge-query'
+                            and 'results_index_sha256' in observation
+                            and len(encoded(observation)) <= 3500):
+                        return self.compact(parsed, threshold)
             return self.admit(value) if len(value.encode()) > threshold else value
         if isinstance(value, list):
             if len(encoded(value)) > 4096:
