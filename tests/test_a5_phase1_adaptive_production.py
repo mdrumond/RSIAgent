@@ -485,15 +485,22 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path,
     assert result.observation["event"] == "knowledge-query"
     assert result.observation["available"] is True
     assert len(result.citations) == (1 if isinstance(selector, str) else 2)
-    expected = {"catlass": guide.read_text(), "native": native_guide.read_text()}
-    retained = result.observation["results"]
+    expected = {"catlass": guide.read_bytes(), "native": native_guide.read_bytes()}
+    from dataclasses import asdict
+    index_digest = result.observation["results_index_sha256"]
+    index = context.artifacts.read_json(index_digest)
+    retained = index["results"]
     selected = {selector} if isinstance(selector, str) else set(selector)
     assert {row["citation"]["collection"] for row in retained} == selected
+    assert [row["citation"] for row in retained] == [asdict(citation) for citation in result.citations]
     for row in retained:
         digest = row["artifact_sha256"]
-        assert context.artifacts.read_bytes(digest).decode() == row["text"]
-        assert row["text"] == expected[row["citation"]["collection"]]
-    assert result.admitted_artifacts == {row["artifact_sha256"]: "knowledge" for row in retained}
+        assert context.artifacts.read_bytes(digest) == expected[row["citation"]["collection"]]
+    assert result.admitted_artifacts == {
+        **{row["artifact_sha256"]: "knowledge" for row in retained},
+        index_digest: "knowledge",
+    }
+
 
 
 def test_kdb_manifest_must_match_supplied_embedding_backend(tmp_path):

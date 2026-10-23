@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from core.knowledge_presentation import knowledge_presentation
 from coding.pi.actor import PiActorDriver
 from coding.pi import ENGINE_IDENTITY
 
@@ -174,19 +175,19 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
             results = agent.query(action)
         finally:
             agent.close()
-        rows = []
         admitted = {}
-        for result in results:
-            digest = context.artifacts.put_bytes(result.text.encode("utf-8"))
+
+        def retain(content):
+            digest = context.artifacts.put_bytes(content)
             admitted[digest] = "knowledge"
-            rows.append({
-                "citation": asdict(result.citation),
-                "text": result.text,
-                "score": result.score,
-                "artifact_sha256": digest,
-            })
+            return digest
+
+        observation = knowledge_presentation(action.query, [
+            {"citation": asdict(result.citation), "text": result.text, "score": result.score}
+            for result in results
+        ], retain)
         return AdaptiveActionResult(
-            {"event": "knowledge-query", "available": True, "results": rows},
+            observation,
             citations=tuple(result.citation for result in results),
             admitted_artifacts=admitted,
         )
