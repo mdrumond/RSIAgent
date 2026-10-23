@@ -129,7 +129,7 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
             if not pool.results:
                 gaps.append('No candidates found in the selected collections.')
             else:
-                observation = inspect()
+                observation, correction = inspect(), None
                 while True:
                     # Old batches remain in the audit, never the next provider context.
                     state = dict(selected=[dict(id=identity, reason=reason,
@@ -138,7 +138,7 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                         rejected=[dict(id=identity, reason=reason[:512])
                                   for identity, reason in list(rejected.items())[-10:]], gaps=gaps)
                     messages = base_messages + [{'role': 'user', 'content': json.dumps(
-                        dict(state=state, observation=observation))}]
+                        dict(state=state, observation=observation, correction=correction))}]
                     event = dict(request=[dict(m) for m in messages])
                     log['requests'].append(event)
                     response = self.complete(messages, check())
@@ -148,14 +148,24 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                             or response['tokens'] < 0):
                         raise ValueError('invalid librarian completion')
                     log['tokens'] += response['tokens']
-                    decision = json.loads(response['text'])
-                    kind, accept, reject, new_gaps = self._decision(decision, inspected)
-                    updated = dict(selected)
-                    updated.update(accept)
-                    for identity in reject:
-                        updated.pop(identity, None)
-                    if len(updated) > action.limit:
-                        raise ValueError('selected evidence exceeds requested result limit')
+                    try:
+                        decision = json.loads(response['text'])
+                        kind, accept, reject, new_gaps = self._decision(decision, inspected)
+                        updated = dict(selected)
+                        updated.update(accept)
+                        for identity in reject:
+                            updated.pop(identity, None)
+                        if len(updated) > action.limit:
+                            raise ValueError('selected evidence exceeds requested result limit')
+                    except (ValueError, TypeError, KeyError) as error:
+                        event['validation_error'] = dict(type=type(error).__name__, message=str(error))
+                        correction = dict(error=event['validation_error'],
+                            last_invalid_response=response['text'][:8192],
+                            response_truncated=len(response['text']) > 8192,
+                            instruction='Return a corrected complete JSON decision using only inspected IDs. '
+                                        'No invalid selections have been accepted.')
+                        continue
+                    correction = None
                     selected = updated
                     rejected.update(reject)
                     gaps = new_gaps
