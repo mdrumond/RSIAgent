@@ -512,8 +512,27 @@ def test_knowledge_compacts_before_checkpoints_and_sources_are_readable_after_re
             earlier = context['history'][0]
             assert json.loads(earlier['content_preview']) == result
             assert earlier['content_truncated'] is False
+            from coding.pi.context import ContextRecords
+            visible = ContextRecords().snapshot(context)
+            assert isinstance(visible['history'], dict)  # The entire history was paged.
+            assert visible['latest_knowledge'] == result
             return candidate('fast')
 
+    class UnavailableAgent(Agent):
+        def complete(self, stage, context, record):
+            assert 'latest_knowledge' not in context
+            return candidate('fast')
+
+    resumed.agent = UnavailableAgent([])
+    resumed.context = {}
+    resumed.single_evaluation, resumed.prepare_only = True, False
+    resumed._model('optimize', {'history': resumed.state['history']})
+    resumed.knowledge = lambda _: callback_result
+    resumed._tool({'action': 'query-knowledge', 'query': 'racecheck synchronization hazards'}, snapshot)
+    resumed.state['history'].extend([
+        {'tool': {'action': 'compile'}, 'content': {'report': 'x' * 6000}}
+        for _ in range(4)
+    ])
     resumed.agent = InspectAgent([])
     resumed.context = {}
     resumed.single_evaluation, resumed.prepare_only = True, False

@@ -334,6 +334,17 @@ class OptimizationLoop:
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        # History can be paged as a whole by the coding context layer. Keep the
+        # latest bounded knowledge response readable independently of that list.
+        for entry in reversed(self.state['history']):
+            if entry.get('tool', {}).get('action') == 'query-knowledge':
+                knowledge = entry.get('content')
+                if (isinstance(knowledge, dict)
+                        and knowledge.get('event') == 'knowledge-query'
+                        and 'results_index_sha256' in knowledge
+                        and len(canonical(knowledge)) <= 3500):
+                    context['latest_knowledge'] = knowledge
+                break
         row = self.store.get(self.key)
         context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
         if self.agent.identity.get('coding_engine') == 'pi':
