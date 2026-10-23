@@ -172,6 +172,8 @@ def acquire_source(spec: dict, destination: Path, reuse: Path | None = None) -> 
     if git("status", "--porcelain", cwd=root):
         raise ValueError("source snapshot has local modifications")
     files, omitted = inventory_tree(root, revision)
+    # Canonical exports are revision-wide, independent of inventory selection.
+    root = canonical_root(root, revision, files)
     if "files" in spec:
         requested_files = spec["files"]
         if not isinstance(requested_files, list) or not requested_files:
@@ -189,7 +191,6 @@ def acquire_source(spec: dict, destination: Path, reuse: Path | None = None) -> 
                        for item in files if item["path"] not in allowed)
         files = [item for item in files if item["path"] in allowed]
         omitted.sort(key=lambda item: item["path"])
-    root = canonical_root(root, revision, files)
     return {
         "name": name, "repository": repository, "revision": revision,
         "root": str(root.resolve()), "status": "complete", "files": files,

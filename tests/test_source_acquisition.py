@@ -221,3 +221,36 @@ def test_allowlisted_acquisition_reaches_gated_agent_with_provenance(upstream, t
     assert hit["citation"]["repository"] == source["repository"]
     assert hit["citation"]["revision"] == source["revision"]
     assert hit["citation"]["source_sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_autocrlf_allowlist_can_expand_or_be_removed_on_offline_resume(upstream, tmp_path, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.autocrlf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    revision = git("rev-parse", "HEAD", cwd=upstream)
+    entries = [{"path": path, "sha256": hashlib.sha256((upstream / path).read_bytes()).hexdigest()}
+               for path in ("kernel.py", "LICENSE")]
+    destination = tmp_path / "artifacts"
+    pinned = {**spec(), "revision": revision}
+    first = acquire_source({**pinned, "files": entries[:1]}, destination, upstream)
+    canonical = Path(first["root"])
+    assert canonical.name == revision + "-raw"
+    real_run = subprocess.run
+
+    def no_network(args, **kwargs):
+        assert args[1] not in {"clone", "fetch"}
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", no_network)
+    expanded = acquire_source({**pinned, "files": entries}, destination)
+    complete = acquire_source(pinned, destination)
+    assert {item["path"] for item in first["files"]} == {"kernel.py"}
+    assert {item["path"] for item in expanded["files"]} == {"kernel.py", "LICENSE"}
+    assert {item["path"] for item in complete["files"]} == {
+        "kernel.py", "LICENSE", "Third_Party_Open_Source_Software_Notice", "中文.md"}
+    for result in (first, expanded, complete):
+        assert result["root"] == str(canonical)
+        for item in result["files"]:
+            data = (canonical / item["path"]).read_bytes()
+            assert hashlib.sha256(data).hexdigest() == item["sha256"]
+            assert len(data) == item["bytes"]
