@@ -23,7 +23,7 @@ def row(index):
 
 
 def identity(index):
-    return 'refs:' + str(index)
+    return 'c' + str(index + 1)
 
 
 class Gate:
@@ -94,14 +94,15 @@ def test_early_finish_never_reads_another_page_and_actor_receives_status():
     value = json.loads(result.observation)['knowledge_query']
     assert value['status'] == 'partial' and value['gaps'] == ['CANN version unverified']
     assert value['results'][0]['text'] == row(1).text
-    assert value['selection_reasons'] == {identity(1): 'Useful for the requested target'}
+    assert value['selection_reasons'] == [dict(citation=row(1).citation.as_dict(),
+        reason='Useful for the requested target')]
     assert len(calls) == len(agent.last_search_details.audit['inspections']) == 1
     agent.close()
     assert gate.closed
 
 
 def test_reformulate_can_select_new_evidence_and_abstention_is_valid():
-    agent, gate, _, calls, _ = setup([dict(action='rewrite', query='precise'), pick(99)],
+    agent, gate, _, calls, _ = setup([dict(action='rewrite', query='precise'), pick(1)],
                                     pools={'query': [row(0)], 'precise': [row(99)]})
     agent.configure_context(task='cube example', role='writer', context={'target': 'a3'})
     result = agent.search(KnowledgeQuery('query'))
@@ -159,3 +160,24 @@ def test_inspection_workload_bound_and_empty_candidate_pool():
 def test_invalid_elapsed_allocation(seconds):
     with pytest.raises(ValueError):
         AdaptiveKnowledgeAgent(None, None, seconds=seconds)
+
+
+def test_rolling_context_retains_selected_evidence_without_previous_batches():
+    agent, _, _, calls, audit = setup([pick(1, action='next'), pick(12, action='next'), pick(22)])
+    result = agent.search(KnowledgeQuery('query'))
+    assert result.results == (row(1), row(12), row(22))
+    assert [len(messages) for messages, _ in calls] == [3, 3, 3]
+    third = json.loads(calls[2][0][-1]['content'])
+    assert [entry['id'] for entry in third['state']['selected']] == [identity(1), identity(12)]
+    assert {entry['id'] for entry in third['observation']['candidates']} == {identity(i) for i in range(20, 25)}
+    assert identity(0) not in {entry['id'] for entry in third['state']['selected']}
+    assert audit[0]['inspections'][0]['candidates'][0]['text'] == row(0).text
+    assert result.audit['selected_citations'][identity(22)] == row(22).citation.as_dict()
+
+
+def test_selection_limit_rejection_preserves_previously_valid_progress():
+    too_many = dict(action='finish', selected=[dict(id=identity(i), reason='useful') for i in range(10, 16)])
+    agent, _, _, _, _ = setup([pick(1, action='next'), too_many])
+    result = agent.search(KnowledgeQuery('query', 5))
+    assert result.status == 'partial' and result.results == (row(1),)
+    assert result.audit['error_type'] == 'ValueError'
