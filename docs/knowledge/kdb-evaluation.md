@@ -66,3 +66,9 @@ judgment groups from paired comparisons and reports each role separately.
 Structured numerical checks cover only declared frozen facts; the blinded
 rubric must also assess numerical claims in prose against supplied raw columns
 and units. Six cases per role provide exploratory evidence only.
+
+Numerical-check fields distinguish registered fact mismatches
+(`unsupported_numerical_claims`) from identifiers outside the automated fact
+registry (`unregistered_numerical_claims`). An unregistered claim has no automated
+correctness verdict; the judge checks it against raw report evidence and must
+not penalize it solely for lacking a registered identifier.

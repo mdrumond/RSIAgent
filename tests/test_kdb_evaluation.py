@@ -60,7 +60,8 @@ def test_invalid_numeric_claims_and_citations_are_observed():
         {'fact': 'latency', 'value': 38.5, 'unit': 'us'},
     ]}, [], [{'fact': 'latency', 'value': 38.5, 'unit': 'us'}])
     assert checks['invalid_citations'] == 1
-    assert checks['unsupported_numerical_claims'] == 2
+    assert checks['unsupported_numerical_claims'] == 1
+    assert checks['unregistered_numerical_claims'] == 1
 
 
 def test_transport_receives_remaining_elapsed_allowance(tmp_path):
@@ -248,4 +249,33 @@ def test_incomplete_arm_skips_judge_provider(tmp_path, status):
     pilot = Pilot(forbidden, None, '', budget)
     pilot.judge(Case('case', 'writer', 'copy', 'task', {}))
     assert budget.state['judgments']['case'] == {'status': 'incomplete', 'reason': 'arm-incomplete'}
+    budget.close()
+
+
+def test_judge_receives_unchecked_report_claim_separate_from_registered_error(tmp_path):
+    # Pipe percentage is available in the raw report but not in frozen fact IDs.
+    raw_report = {'vector_time_percent': 12.5}
+    checks = objective_checks({'citations': [], 'numerical_claims': [
+        {'fact': 'vector_time_percent', 'value': 12.5, 'unit': '%'},
+        {'fact': 'ordinary_median_us', 'value': 999, 'unit': 'us'},
+    ]}, [], [{'fact': 'ordinary_median_us', 'value': 38.5, 'unit': 'us'}])
+    assert checks['unregistered_numerical_claims'] == 1
+    assert checks['unsupported_numerical_claims'] == 1
+    budget = Budget(tmp_path/'state.json', 'id')
+    for arm in 'ABCD':
+        budget.state['runs']['numbers:'+arm] = dict(status='complete', output='analysis',
+                                                  retrieved=[], checks=checks)
+    def complete(messages, seconds):
+        packet = json.loads(messages[-1]['content'])
+        assert json.loads(packet['task']) == raw_report
+        for candidate in packet['candidates'].values():
+            assert candidate['checks']['unregistered_numerical_claims'] == 1
+            assert candidate['checks']['unsupported_numerical_claims'] == 1
+        keys = packet['candidates']
+        return dict(text=json.dumps(dict(
+            scores={k: dict.fromkeys(['relevance', 'support', 'applicability', 'uncertainty', 'next_actions'], 2) for k in keys},
+            reasons={k: 'One registered mismatch; report percentage checked against raw evidence' for k in keys})), tokens=5)
+    pilot = Pilot(complete, None, '', budget)
+    pilot.judge(Case('numbers', 'analyzer', 'copy', json.dumps(raw_report), {}))
+    assert budget.state['judgments']['numbers']['status'] == 'complete'
     budget.close()
