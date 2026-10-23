@@ -185,3 +185,53 @@ def test_writer_tool_request_receives_real_evidence_before_final_answer(tmp_path
     assert result['checks']['invalid_citations'] == 0
     assert result['queries'][0]['query'] == 'Ascend C copy example'
     pilot.budget.close()
+
+
+def test_judge_receives_blinded_evidence_context_and_shared_memory(tmp_path):
+    budget = Budget(tmp_path/'state.json', 'id')
+    case = Case('judge', 'curriculum', 'copy', 'Choose next task', {'support': 'Ground sources'},
+                context={'prior_outcomes': [{'project_id': 'seen-copy'}]})
+    expected = {}
+    for arm in 'ABCD':
+        packet = dict(output='candidate-'+arm, retrieved=[{'text': 'source-'+arm}],
+                      checks={'invalid_citations': ord(arm)-65})
+        budget.state['runs'][case.case_id+':'+arm] = packet
+        expected[packet['output']] = packet
+    def complete(messages, seconds):
+        payload = json.loads(messages[-1]['content'])
+        assert payload['context'] == case.context
+        assert payload['shared_memory'] == 'complete producer snapshot'
+        assert set(payload['candidates']) == {'0', '1', '2', '3'}
+        for packet in payload['candidates'].values():
+            assert packet == expected[packet['output']]
+        return dict(text=json.dumps(dict(
+            scores={k: dict.fromkeys(['relevance', 'support', 'applicability', 'uncertainty', 'next_actions'], 3)
+                    for k in payload['candidates']},
+            reasons={k: 'Supported by inspected evidence' for k in payload['candidates']})), tokens=10)
+    pilot = Pilot(complete, None, 'complete producer snapshot', budget)
+    pilot.judge(case)
+    assert budget.state['judgments']['judge']['status'] == 'complete'
+    budget.close()
+
+
+def test_judgment_transport_failure_preserves_run_and_next_judgment(tmp_path):
+    budget = Budget(tmp_path/'state.json', 'id')
+    for case_id in ['first', 'next']:
+        for arm in 'ABCD':
+            budget.state['runs'][case_id+':'+arm] = dict(output='answer', retrieved=[], checks={})
+    calls = []
+    def complete(messages, seconds):
+        calls.append(messages)
+        if len(calls) == 1:
+            raise OSError('bounded provider transport unavailable')
+        ids = json.loads(messages[-1]['content'])['candidates']
+        return dict(text=json.dumps(dict(
+            scores={k: dict.fromkeys(['relevance', 'support', 'applicability', 'uncertainty', 'next_actions'], 2) for k in ids},
+            reasons={k: 'Evidence assessed' for k in ids})), tokens=5)
+    pilot = Pilot(complete, None, '', budget)
+    pilot.judge(Case('first', 'writer', 'copy', 'task', {}))
+    pilot.judge(Case('next', 'writer', 'copy', 'task', {}))
+    assert budget.state['judgments']['first']['status'] == 'incomplete'
+    assert budget.state['judgments']['next']['status'] == 'complete'
+    assert len(budget.state['runs']) == 8
+    budget.close()
