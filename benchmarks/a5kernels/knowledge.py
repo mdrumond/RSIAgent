@@ -556,10 +556,10 @@ class KnowledgeDB:
             for score, chunk_id, row in scored[:limit]
         ]
 
-    def ranked_candidates(self, collection: str, query: str, *, limit: int = 100,
+    def ranked_candidates(self, collection: str, query: str, *, limit: int | None = 100,
                           query_vector: Sequence[float], check_remaining: Callable[[], object] | None = None
                           ) -> tuple[list[SearchHit], list[SearchHit]]:
-        """Separate cosine and local BM25 lanes; never fuse collection-local ranks."""
+        """Separate cosine and local BM25 lanes; None retains full backfill order."""
         manifest = self.manifest(collection)
         if (self.embeddings.model, self.embeddings.revision) != (
                 manifest.embedding_model, manifest.embedding_revision):
@@ -576,7 +576,7 @@ class KnowledgeDB:
             f"CROSS JOIN chunks c ON c.rowid = {table}.rowid "
             f"WHERE {table} MATCH ? AND c.collection = ? "
             "ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?",
-            (lexical_query, collection, limit),
+            (lexical_query, collection, -1 if limit is None else limit),
         ).fetchall()
         lexical_rank = {row["chunk_id"]: rank for rank, row in enumerate(lexical, 1)}
         lexical_score = {row["chunk_id"]: row["lexical_score"] for row in lexical}
@@ -595,4 +595,4 @@ class KnowledgeDB:
             ))
         hits.sort(key=lambda hit: (-hit.score, hit.chunk_id))
         by_id = {hit.chunk_id: hit for hit in hits}
-        return hits[:limit], [by_id[row["chunk_id"]] for row in lexical]
+        return hits if limit is None else hits[:limit], [by_id[row["chunk_id"]] for row in lexical]

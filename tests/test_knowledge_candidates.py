@@ -76,7 +76,7 @@ def test_keyword_lane_keeps_exact_identifier_with_weak_vector_match(tmp_path):
     exact = next(row for row in pool.results if row.citation.path == "identifier.cpp")
     assert exact.score == 0
     assert exact.lexical_rank == 1
-    assert exact.vector_rank is None
+    assert exact.vector_rank == 21
     assert pool.results.index(exact) == 2
     default_results = gate.query(KnowledgeQuery("cube rare_api_identifier"))
     assert len(default_results) == 5
@@ -165,3 +165,28 @@ def test_one_readonly_view_per_store_and_disabled_gate_never_retrieves(tmp_path,
         journal=ProgressiveMemoryJournal(tmp_path / "disabled.jsonl"))
     assert disabled.candidate_pool(KnowledgeQuery("cube")).results == ()
     assert disabled.query(KnowledgeQuery("cube")) == ()
+
+
+def test_dedup_backfills_from_beyond_initial_top_k_without_rescanning(tmp_path, monkeypatch):
+    backend = Embeddings()
+    body = "".join(f"cube source line {n}\n" for n in range(24020))
+    refs = indexed(tmp_path, "references", {"long.cpp": body}, backend)
+    gate = agent(tmp_path, {"references": refs})
+    assert refs.connection.execute("SELECT count(*) FROM chunks").fetchone()[0] > 300
+    scans = []
+    original = gate.database.ranked_candidates
+
+    def ranked(*args, **kwargs):
+        scans.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(gate.database, "ranked_candidates", ranked)
+    pool = gate.candidate_pool(KnowledgeQuery("cube"))
+    assert len(pool.results) == 100
+    assert max(row.vector_rank for row in pool.results) > 100
+    spans = sorted((row.citation.start_line, row.citation.end_line) for row in pool.results)
+    assert all(end < next_start for (_, end), (next_start, _) in zip(spans, spans[1:]))
+    assert pool.page(90, 10) == pool.results[90:]
+    assert scans == [True]
+    gate.close()
+    refs.close()

@@ -38,7 +38,7 @@ def build_candidate_pool(databases: dict[str, KnowledgeDB], action: KnowledgeQue
     for name, database in sorted(databases.items()):
         check()
         vector_lane, lexical_lane = database.ranked_candidates(
-            name, action.query, limit=size, query_vector=vectors[0], check_remaining=check)
+            name, action.query, limit=None, query_vector=vectors[0], check_remaining=check)
         all_vector.extend((name, hit) for hit in vector_lane)
         lexical.append([(name, hit) for hit in lexical_lane])
     all_vector.sort(key=lambda row: (-row[1].score, row[0], row[1].chunk_id))

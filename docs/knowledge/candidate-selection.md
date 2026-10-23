@@ -7,7 +7,9 @@ its historical single-collection behavior.
 The default pool reserves 60 candidates for global cosine ranking and 40 for
 keyword matches. Keyword candidates come from collection-local FTS5/BM25 lists,
 visited round-robin; local BM25 values are never compared across collections.
-Unused reservations are filled from the other lane. Identical excerpts and
+Candidate lanes retain their full ranked order so duplicate suppression can
+backfill from lower-ranked excerpts without repeating retrieval. Unused
+reservations are filled from the other lane. Identical excerpts and
 overlapping excerpts from the same source are suppressed. The selected lanes
 use a repeating vector/vector/keyword/vector/keyword pattern: six vector and
 four keyword candidates per ten-result batch, and three vector plus two keyword
