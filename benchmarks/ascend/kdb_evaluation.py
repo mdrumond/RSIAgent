@@ -9,6 +9,7 @@ from collections import Counter
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import time
 
@@ -121,19 +122,23 @@ class Pilot:
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
         deadline = self.budget.clock() + min(45, self.budget.remaining())
         started, tokens, queries, retrieved = self.budget.clock(), 0, [], []
-        gate = None
+        gate, audited = None, []
         def complete(messages):
             nonlocal tokens
+            audited[:] = [dict(row) for row in messages]
             response = self.complete(messages, self.budget.allowance(deadline))
+            if not isinstance(response.get('text'), str) or type(response.get('tokens')) is not int or response['tokens'] < 0:
+                raise ValueError('invalid completion contract')
+            audited.append({'role': 'assistant', 'content': response['text']})
             tokens += response['tokens']
             self.budget.allowance(deadline)
             return response['text']
         def query(request):
             if gate is None:
                 raise ValueError('retrieval unavailable in arm A')
+            queries.append({'query': request.query, 'limit': request.limit})
             result = gate.query(request, self.budget.allowance(deadline))
             self.budget.allowance(deadline)
-            queries.append({'query': request.query, 'limit': request.limit})
             retrieved.extend(_serialized_results(result))
             return result
         def read(request):
@@ -141,7 +146,10 @@ class Pilot:
                 raise ValueError('artifact access unavailable in arm A')
             page = gate.read_artifact(**request, seconds=self.budget.allowance(deadline))
             self.budget.allowance(deadline)
-            return asdict(page) if is_dataclass(page) else page
+            page = asdict(page) if is_dataclass(page) else dict(page)
+            if isinstance(page.get('data'), bytes):
+                page['data'] = page['data'].decode('utf-8', errors='replace')
+            return page
         messages = []
         status, output, checks = 'complete', '', {}
         try:
@@ -154,6 +162,7 @@ class Pilot:
                 )
                 from benchmarks.ascend.targets import a3_curriculum_policy
                 context = dict(case.context or {})
+                context['objective'] = context.get('objective', '') + '\nCase instruction: ' + case.prompt
                 context['pre_wave_coverage'] = tuple(Capability(x) for x in context.get('pre_wave_coverage', ()))
                 context['prior_outcomes'] = tuple(PriorOutcome(
                     x['project_id'], ProjectInformation.from_project(x['spec']),
@@ -182,6 +191,8 @@ class Pilot:
                     output = complete(messages)
                     messages.append({'role': 'assistant', 'content': output})
                     request = json.loads(output)
+                    if not isinstance(request, dict):
+                        raise ValueError('response must be an object')
                     if set(request) == {'knowledge_query'}:
                         result = _serialized_results(query(KnowledgeQuery(**request['knowledge_query'])))
                     elif set(request) == {'read_artifact'}:
@@ -192,9 +203,15 @@ class Pilot:
                         checks = objective_checks(request, retrieved, case.numerical_facts)
                         break
                     messages.append({'role': 'user', 'content': json.dumps(result)})
-        except (TimeoutError, ValueError, TypeError, OSError) as error:
+        except (TimeoutError, ValueError, TypeError, OSError, KeyError) as error:
             status = 'timeout' if isinstance(error, TimeoutError) else 'invalid'
             checks['error_type'] = type(error).__name__
+            if case.role == 'curriculum':
+                messages = audited
+                output = next((row['content'] for row in reversed(audited) if row['role'] == 'assistant'), '')
+        finally:
+            if gate is not None and hasattr(gate, 'close'):
+                gate.close()
         return dict(status=status, output=output, transcript=messages, checks=checks,
                     queries=queries, retrieved=retrieved, tokens=tokens,
                     seconds=self.budget.clock() - started)
@@ -239,10 +256,16 @@ class Pilot:
                 self.budget.allowance(deadline))
             self.budget.allowance(deadline)
             judgment = json.loads(response['text'])
+            if not isinstance(judgment, dict) or not isinstance(judgment.get('scores'), dict) or not isinstance(judgment.get('reasons'), dict):
+                raise ValueError('judge requires score and reason objects')
+            if set(judgment['reasons']) != set(candidates) or any(not isinstance(v, str) or not v.strip() for v in judgment['reasons'].values()):
+                raise ValueError('judge requires reasons for every candidate')
+            if type(response.get('tokens')) is not int or response['tokens'] < 0:
+                raise ValueError('invalid judge token telemetry')
             if set(judgment['scores']) != set(candidates):
                 raise ValueError('judge candidate set differs')
             for scores in judgment['scores'].values():
-                if set(scores) != {'relevance', 'support', 'applicability', 'uncertainty', 'next_actions'} or any(type(v) is not int or not 0 <= v <= 4 for v in scores.values()):
+                if not isinstance(scores, dict) or set(scores) != {'relevance', 'support', 'applicability', 'uncertainty', 'next_actions'} or any(type(v) is not int or not 0 <= v <= 4 for v in scores.values()):
                     raise ValueError('invalid score')
             self.budget.state['judgments'][case.case_id] = {
                 'status': 'complete', 'scores': {arm: judgment['scores'][str(i)] for i, arm in enumerate(order)},
@@ -272,7 +295,8 @@ def objective_checks(answer, retrieved, facts):
     citations = {digest(r['citation']) for r in retrieved}
     requested = answer.get('citations', [])
     claims = answer.get('numerical_claims', [])
-    if not isinstance(requested, list) or not isinstance(claims, list):
+    if (not isinstance(requested, list) or not isinstance(claims, list)
+            or any(not isinstance(c, dict) for c in requested + claims)):
         raise ValueError('citations and numerical_claims must be lists')
     allowed = {f['fact']: f for f in facts}
     def supported(claim):
@@ -281,7 +305,7 @@ def objective_checks(answer, retrieved, facts):
         fact = allowed.get(claim.get('fact'))
         value = claim.get('value')
         return (fact is not None and claim.get('unit') == fact['unit']
-                and type(value) in (int, float)
+                and type(value) in (int, float) and math.isfinite(value)
                 and abs(value - fact['value']) <= fact.get('tolerance', 0))
     return dict(valid_json=True, citation_count=len(requested),
                 invalid_citations=sum(digest(c) not in citations for c in requested),

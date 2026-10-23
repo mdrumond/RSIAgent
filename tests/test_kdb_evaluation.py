@@ -97,3 +97,58 @@ def test_curriculum_uses_production_admission_and_retrieval(tmp_path):
     assert seen == ['Ascend C movement']
     assert len(result['transcript']) == 5
     pilot.budget.close()
+
+
+def test_artifact_pages_decode_and_gate_closes(tmp_path):
+    from dataclasses import dataclass
+    @dataclass
+    class Page:
+        data: bytes
+    closed = []
+    class Gate:
+        def read_artifact(self, **request):
+            return Page(b'code\xff')
+        def close(self):
+            closed.append(True)
+    replies = iter(['{"read_artifact":{"collection":"lessons","digest":"abc"}}',
+                    '{"answer":"Useful source","citations":[],"numerical_claims":[]}'])
+    messages_seen = []
+    def complete(messages, seconds):
+        messages_seen.append(messages[:])
+        return dict(text=next(replies), tokens=2)
+    pilot = Pilot(complete, lambda _: Gate(), '', Budget(tmp_path/'state.json', 'id'))
+    result = pilot.run_arm(Case('w', 'writer', 'copy', 'task', {}), 'D')
+    assert result['status'] == 'complete'
+    assert json.loads(messages_seen[-1][-1]['content'])['data'] == 'code\ufffd'
+    assert closed == [True]
+    pilot.budget.close()
+
+
+def test_curriculum_timeout_retains_query_and_provider_transcript(tmp_path):
+    closed = []
+    class Gate:
+        def query(self, request, seconds):
+            raise TimeoutError()
+        def close(self):
+            closed.append(True)
+    def complete(messages, seconds):
+        assert 'Specific case instruction' in messages[-1]['content']
+        return dict(text='{"knowledge_query":{"query":"movement"}}', tokens=2)
+    context = dict(objective='Study A3 movement', wave_index=1,
+                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[])
+    pilot = Pilot(complete, lambda _: Gate(), '', Budget(tmp_path/'state.json', 'id'))
+    result = pilot.run_arm(Case('c', 'curriculum', 'copy', 'Specific case instruction', {}, context=context), 'D')
+    assert result['status'] == 'timeout'
+    assert result['queries'][0]['query'] == 'movement'
+    assert result['transcript'][-1]['role'] == 'assistant'
+    assert closed == [True]
+    pilot.budget.close()
+
+
+def test_malformed_output_and_nonfinite_numbers():
+    with pytest.raises(ValueError):
+        objective_checks({'citations': ['bad'], 'numerical_claims': []}, [], [])
+    check = objective_checks({'citations': [], 'numerical_claims': [
+        {'fact': 'latency', 'value': float('nan'), 'unit': 'us'},
+    ]}, [], [{'fact': 'latency', 'value': 4, 'unit': 'us'}])
+    assert check['unsupported_numerical_claims'] == 1
