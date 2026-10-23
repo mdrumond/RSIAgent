@@ -56,6 +56,8 @@ def knowledge_presentation(query: str, rows: list[Mapping],
 
 def compact_knowledge_result(query: str, result, retain: Callable[[bytes], str]):
     """Accept the existing list/observation callback shapes; preserve other replies."""
+    if isinstance(result, dict) and result.get('available') is False:
+        return result
     rows = result.get('results') if isinstance(result, dict) else result
     if (isinstance(rows, list) and all(isinstance(row, Mapping)
             and isinstance(row.get('text'), str) and isinstance(row.get('citation'), Mapping)

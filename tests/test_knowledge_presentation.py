@@ -43,7 +43,8 @@ def test_large_results_remain_visible_and_exact_sources_survive_later_queries(tm
         assert ''.join(chunks) == original['text']
 
 
-@pytest.mark.parametrize('result', [{'status': 'unavailable'}, {'results': ['custom']}, None])
+@pytest.mark.parametrize('result', [{'status': 'unavailable'}, {'available': False, 'results': []},
+                                  {'results': ['custom']}, None])
 def test_unstructured_callback_responses_are_preserved(result):
     def retain(_):
         raise AssertionError('must not retain non-knowledge responses')
