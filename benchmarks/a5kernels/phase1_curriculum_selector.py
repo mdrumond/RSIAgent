@@ -538,6 +538,7 @@ class CurriculumAgent:
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
+            action = None
             try:
                 if completion.lstrip().startswith('{'):
                     request = json.loads(completion)
@@ -551,14 +552,7 @@ class CurriculumAgent:
                         if not isinstance(payload, dict) or set(payload) - {"query", "limit"}:
                             raise ValueError("knowledge_query accepts query and optional limit")
                         action = KnowledgeQuery(payload.get("query"), payload.get("limit", 5))
-                        results = self.query_knowledge(action)
-                        page = {"knowledge_query": {"available": True, "results": [
-                            {"citation": item.citation.as_dict(), "text": item.text,
-                             "score": item.score} for item in results
-                        ]}}
-                        history.append({"role": "user", "content": json.dumps(page, sort_keys=True)})
-                        continue
-                if self.failure_feedback is not None and completion.lstrip().startswith('{'):
+                if action is None and self.failure_feedback is not None and completion.lstrip().startswith('{'):
                     request = json.loads(completion)
                     if not isinstance(request, dict) or set(request) != {'read_artifact'}:
                         raise ValueError('expected one read_artifact request')
@@ -568,9 +562,10 @@ class CurriculumAgent:
                         page = {'error': str(error)}
                     history.append({'role': 'user', 'content': json.dumps(page, sort_keys=True)})
                     continue
-                decision = self._parse_and_validate(completion, context)
-                if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
-                    raise ValueError("wave exceeds remaining project budget; select a smaller wave")
+                if action is None:
+                    decision = self._parse_and_validate(completion, context)
+                    if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
+                        raise ValueError("wave exceeds remaining project budget; select a smaller wave")
             except (ValueError, TypeError) as exc:
                 diagnostic = str(exc)
                 history.append({
@@ -582,6 +577,16 @@ class CurriculumAgent:
                         "are unchanged; no project has been admitted."
                     ),
                 })
+                continue
+            if action is not None:
+                # Model request errors are repairable; gate/identity failures are
+                # infrastructure failures and must stop selection unchanged.
+                results = self.query_knowledge(action)
+                page = {"knowledge_query": {"available": True, "results": [
+                    {"citation": item.citation.as_dict(), "text": item.text,
+                     "score": item.score} for item in results
+                ]}}
+                history.append({"role": "user", "content": json.dumps(page, sort_keys=True)})
                 continue
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise CurriculumSelectionError(
