@@ -50,6 +50,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-projects", type=int, help="Deprecated metadata; does not limit execution")
     parser.add_argument("--max-seconds", type=float, default=7200)
     parser.add_argument("--profiling-guidance-skill", type=Path)
+    parser.add_argument("--curriculum-kdb", action="store_true")
     parser.add_argument("--kdb", type=Path)
     parser.add_argument("--collection", action="append")
     parser.add_argument("--bge-cache", type=Path)
@@ -124,6 +125,7 @@ def main(
             args.kdb,
             (args.collection[0] if args.collection and len(args.collection) == 1
              else tuple(args.collection) if args.collection else None),
+            curriculum_kdb=args.curriculum_kdb,
             worker_config=worker,
         ),
         objective=args.objective,
