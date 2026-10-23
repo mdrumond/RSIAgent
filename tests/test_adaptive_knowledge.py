@@ -234,3 +234,29 @@ def test_expired_query_callback_prevents_search_and_postsearch_expiry_propagates
     with pytest.raises(TimeoutError, match='caller expired'):
         agent.query(KnowledgeQuery('query'), check_remaining=check_remaining)
     assert calls[0][1] == 3 and agent.last_search_details.status == 'insufficient'
+
+
+def test_artifact_verification_retains_latest_batch_before_candidate_selection():
+    clock = Clock()
+    gate = Gate(clock, {'query': [row(0), row(1)]})
+    requests = []
+    def complete(messages, seconds):
+        clock.advance(1)
+        packet = json.loads(messages[-1]['content'])
+        requests.append(packet)
+        assert packet['state']['selected'] == []
+        if len(requests) == 1:
+            decision = dict(action='artifact', artifact=dict(collection='refs', digest='admitted'))
+        else:
+            observation = packet['observation']
+            assert observation['artifact']['data'] == 'verified artifact'
+            assert observation['candidates'] == requests[0]['observation']['candidates']
+            candidate = next(c for c in observation['candidates'] if c['citation'] == row(1).citation.as_dict())
+            assert candidate['text'] == row(1).text
+            decision = dict(action='finish', selected=[dict(id=candidate['id'], reason='Verified linked bytes')])
+        return dict(text=json.dumps(decision), tokens=1)
+    agent = AdaptiveKnowledgeAgent(gate, complete, clock=clock)
+    result = agent.search(KnowledgeQuery('query'))
+    assert len(requests) == 2 and gate.reads == [('refs', 'admitted', 0, 16384)]
+    assert result.status == 'complete' and result.results == (row(1),)
+    assert result.results[0].citation == row(1).citation
