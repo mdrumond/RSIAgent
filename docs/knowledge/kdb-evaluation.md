@@ -144,3 +144,17 @@ separate `consumer_tokens` and `librarian_tokens`; `tokens` is their total. Gate
 without internal providers default to zero librarian tokens, preserving the
 previous total for deterministic conditions. Retain the underlying librarian
 request audits as the backing evidence for these totals.
+
+Curriculum query callbacks can accept keyword-only `check_remaining`, a live
+callable returning the remaining selection seconds or raising `TimeoutError`.
+The selector determines callback support once, forwards the check through the
+production read-only gate into candidate scanning, and checks again after any
+legacy one-argument callback. Native production bounds the shared embedding lock
+wait by this same allowance and rechecks after acquisition. No late result may
+be admitted after the selection deadline; internal gate errors propagate without
+being mistaken for a callback-signature mismatch.
+
+Arm order rotates by case index plus twice the role index. Across six cases,
+each role occupies every starting position in the six-condition design; the
+four-condition design distributes 18 starting positions as 5/5/4/4. Preserve this
+schedule in frozen run identity when comparing a cohort with an older ordering.

@@ -205,14 +205,16 @@ def curriculum_knowledge(paths, embeddings):
             raise ValueError("KDB manifest does not match the embedding backend")
         identity = {item.collection: item.fingerprint for item in manifests}
 
-    def query(action):
+    def query(action, *, check_remaining=None):
+        if check_remaining is not None:
+            check_remaining()
         with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
             if {item.collection: item.fingerprint for item in database.selected_manifests(paths.collection)} != identity:
                 raise ValueError("curriculum KDB collection identity changed")
             agent = KnowledgeAgent(enabled=True, database=database, collection=paths.collection,
                 journal=ProgressiveMemoryJournal(Path(paths.root) / "curriculum-knowledge.jsonl"))
         try:
-            return agent.query(action)
+            return agent.query(action, check_remaining=check_remaining)
         finally:
             agent.close()
 

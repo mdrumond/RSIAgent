@@ -156,13 +156,18 @@ class Pilot:
             tokens += response['tokens']
             self.budget.allowance(deadline)
             return response['text']
-        def query(request):
+        def query(request, *, check_remaining=None):
             if gate is None:
                 raise ValueError('retrieval unavailable in arm A')
             audit = {'query': request.query, 'limit': request.limit}
             queries.append(audit)
-            result = gate.query(request, self.budget.allowance(deadline))
+            seconds = self.budget.allowance(deadline)
+            if check_remaining is not None:
+                seconds = min(seconds, check_remaining())
+            result = gate.query(request, seconds)
             self.budget.allowance(deadline)
+            if check_remaining is not None:
+                check_remaining()
             retrieved.extend(_serialized_results(result))
             details = getattr(gate, 'search_details', None)
             if details is not None:
@@ -280,7 +285,8 @@ class Pilot:
                 for offset in range(3):
                     role = ROLES[(index + offset) % 3]
                     case = by_role[role][index]
-                    for arm in self.arms[index % len(self.arms):] + self.arms[:index % len(self.arms)]:
+                    rotation = (index + 2 * ROLES.index(role)) % len(self.arms)
+                    for arm in self.arms[rotation:] + self.arms[:rotation]:
                         key = case.case_id + ':' + arm
                         if key in self.budget.state['runs']:
                             continue

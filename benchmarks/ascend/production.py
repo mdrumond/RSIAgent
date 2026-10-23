@@ -235,9 +235,18 @@ def build_native_adaptive_phase1(
     if config.curriculum_kdb:
         from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
         callback, identity["curriculum_kdb"] = curriculum_knowledge(config, embeddings)
-        def curriculum_query(action):
-            with query_lock:
-                return callback(action)
+        def curriculum_query(action, *, check_remaining=None):
+            if check_remaining is None:
+                with query_lock:
+                    return callback(action)
+            if not query_lock.acquire(timeout=check_remaining()):
+                check_remaining()
+                raise TimeoutError('curriculum query lock elapsed allocation exhausted')
+            try:
+                check_remaining()
+                return callback(action, check_remaining=check_remaining)
+            finally:
+                query_lock.release()
     root = Path(config.root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / "campaign-identity.json"

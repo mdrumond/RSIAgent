@@ -442,10 +442,17 @@ def test_six_arm_run_rotates_all_arms_and_preserves_fresh_workload(tmp_path):
              for role in ('curriculum', 'writer', 'analyzer') for i in range(6)]
     Recorder(None, None, '', budget, adaptive=True).run(cases)
     assert len(events) == 108
+    from collections import Counter
+    starts = {role: [] for role in ('curriculum', 'writer', 'analyzer')}
     for index in range(6):
-        arms = list('ABCDEF'[index:] + 'ABCDEF'[:index])
-        for role in ('curriculum', 'writer', 'analyzer'):
-            assert [arm for case, arm in events if case == f'{role}-{index}'] == arms
+        group_starts = []
+        for role in starts:
+            arms = [arm for case, arm in events if case == f'{role}-{index}']
+            assert sorted(arms) == list('ABCDEF')
+            starts[role].append(arms[0])
+            group_starts.append(arms[0])
+        assert len(set(group_starts)) == 3
+    assert all(Counter(arms) == dict.fromkeys('ABCDEF', 1) for arms in starts.values())
     resumed = Budget(budget.path, 'six')
     Recorder(None, None, '', resumed, adaptive=True).run(cases)
     assert len(events) == 108
@@ -570,3 +577,18 @@ def test_final_answer_preserves_optional_evidence_field_compatibility(tmp_path, 
     assert result['checks']['citation_count'] == 0
     assert result['checks']['numerical_claim_count'] == 0
     budget.close()
+
+
+def test_four_arm_schedule_balances_starting_positions_across_roles(tmp_path):
+    from collections import Counter
+    events = []
+    class Recorder(Pilot):
+        def run_arm(self, case, arm):
+            events.append((case.case_id, arm))
+            return {'status': 'invalid'}
+    budget = Budget(tmp_path/'state.json', 'balanced-four')
+    cases = [Case(f'{role}-{i}', role, str(i), 'task', {})
+             for role in ('curriculum', 'writer', 'analyzer') for i in range(6)]
+    Recorder(None, None, '', budget).run(cases)
+    first = [next(arm for case_id, arm in events if case_id == case.case_id) for case in cases]
+    assert Counter(first) == {'A': 5, 'B': 5, 'C': 4, 'D': 4}
