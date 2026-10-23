@@ -108,3 +108,22 @@ def test_native_without_kdb_rejects_curriculum_access(tmp_path):
     with pytest.raises(ValueError, match="configured KDB"):
         NativeProductionConfig(tmp_path, "a3", "arch", "local", "a" * 64, "b" * 40,
                                curriculum_kdb=True)
+
+
+@pytest.mark.parametrize("error_type", [ValueError, TypeError, OSError])
+def test_gate_failures_propagate_without_another_provider_decision(error_type):
+    calls = []
+
+    def complete(messages):
+        calls.append(messages)
+        return '{"knowledge_query":{"query":"vector"}}'
+
+    error = error_type("identity changed")
+
+    def broken_gate(action):
+        raise error
+
+    with pytest.raises(error_type, match="identity changed") as observed:
+        CurriculumAgent(complete, query_knowledge=broken_gate).select(context())
+    assert observed.value is error
+    assert len(calls) == 1
