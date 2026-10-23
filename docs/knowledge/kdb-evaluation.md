@@ -146,7 +146,8 @@ previous total for deterministic conditions. Retain the underlying librarian
 request audits as the backing evidence for these totals.
 
 Curriculum query callbacks can accept keyword-only `check_remaining`, a live
-callable returning the remaining selection seconds or raising `TimeoutError`.
+callable returning the remaining selection seconds or raising
+`CurriculumSelectionError` with the retained selection transcript on exhaustion.
 The selector determines callback support once, forwards the check through the
 production read-only gate into candidate scanning, and checks again after any
 legacy one-argument callback. Native production bounds the shared embedding lock

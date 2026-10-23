@@ -539,7 +539,9 @@ class CurriculumAgent:
         def check_remaining():
             remaining = deadline - self.clock()
             if remaining <= 0:
-                raise TimeoutError('curriculum selection elapsed allocation exhausted')
+                raise CurriculumSelectionError(
+                    f'curriculum selection time budget exhausted: {diagnostic}',
+                    history[selection_start:])
             return remaining
         attempt = 0
         diagnostic = "no proposal admitted"
@@ -555,7 +557,6 @@ class CurriculumAgent:
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
-            check_remaining()
             action = None
             try:
                 if completion.lstrip().startswith('{'):

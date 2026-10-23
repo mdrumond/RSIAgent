@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumSession
+from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumSession, CurriculumSelectionError
 from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge, _bind_campaign_identity
 from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, ProgressiveMemoryJournal
 from benchmarks.ascend.production import NativeProductionConfig
@@ -155,7 +155,7 @@ def test_curriculum_rejects_legacy_query_that_returns_after_deadline():
     def complete(messages):
         calls.append(messages)
         return '{"knowledge_query":{"query":"vector"}}'
-    with pytest.raises(TimeoutError):
+    with pytest.raises(CurriculumSelectionError, match="time budget exhausted"):
         CurriculumAgent(complete, query_knowledge=query, clock=lambda: clock.value).select(
             context(remaining_seconds=10))
     assert len(calls) == 1
@@ -176,7 +176,7 @@ def test_curriculum_deadline_interrupts_production_candidate_scan(tmp_path, monk
     def complete(messages):
         calls.append(messages)
         return '{"knowledge_query":{"query":"vector"}}'
-    with pytest.raises(TimeoutError):
+    with pytest.raises(CurriculumSelectionError, match="time budget exhausted"):
         CurriculumAgent(complete, query_knowledge=query, clock=lambda: clock.value).select(
             context(remaining_seconds=2))
     assert scans == [True]
@@ -192,3 +192,14 @@ def test_supported_callback_internal_type_error_is_not_retried_as_legacy():
         CurriculumAgent(lambda _: '{"knowledge_query":{"query":"vector"}}', query_knowledge=query).select(context())
     assert observed.value is error
     assert len(calls) == 1
+
+
+def test_curriculum_late_valid_decision_keeps_public_exhaustion_contract():
+    clock = SimpleNamespace(value=1000)
+    proposal = wave([project('late-selection')])
+    def complete(messages):
+        clock.value += 11
+        return proposal
+    with pytest.raises(CurriculumSelectionError, match='time budget exhausted') as observed:
+        CurriculumAgent(complete, clock=lambda: clock.value).select(context(remaining_seconds=10))
+    assert observed.value.messages[-1] == {'role': 'assistant', 'content': proposal}
