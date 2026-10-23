@@ -1,8 +1,10 @@
+import json
+
 import pytest
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.ascend.agent_presentation import artifact_page_presentation
-from coding.pi.context import ContextRecords, encoded
+from coding.pi.context import ContextLimitError, ContextRecords, encoded
 from core.knowledge_presentation import compact_knowledge_result, knowledge_presentation
 
 
@@ -70,3 +72,33 @@ def test_multibyte_source_excerpts_respect_inline_bound_and_retain_original(tmp_
     index = store.read_json(result['results_index_sha256'])
     for entry, row in zip(index['results'], rows):
         assert store.read_bytes(entry['artifact_sha256']).decode() == row['text']
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_serialized_transport_keeps_source_list_and_exact_read_pointers(tmp_path, wrapped):
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    store = ContentAddressedArtifacts(tmp_path)
+    rows = source_rows()
+    observation = knowledge_presentation('racecheck synchronization hazards', rows, store.put_bytes)
+    if wrapped:
+        # The adaptive Phase 1 ActionOutcome payload is a serialized host envelope.
+        wire = canonical_bytes({'host': observation}).decode('ascii')
+        context = {'latest': wire}
+    else:
+        # Optimizer history previews also serialize the compact observation.
+        wire = json.dumps(observation, ensure_ascii=True)
+        context = {'history': [{'content_preview': wire}]}
+    assert len(wire.encode()) > 1024
+    records = ContextRecords()
+    visible = records.snapshot(context)
+    result = visible['latest']['host'] if wrapped else visible['history'][0]['content_preview']
+    assert result['results'] == observation['results']
+    assert isinstance(result['results'], list)
+    index = store.read_json(result['results_index_sha256'])
+    for entry, row in zip(index['results'], rows):
+        assert store.read_bytes(entry['artifact_sha256']).decode() == row['text']
+    ordinary = json.dumps({'report': 'x' * 3000})
+    paged = records.snapshot({'latest': ordinary})['latest']
+    assert records.read(paged['record'])['text'] == ordinary
+    with pytest.raises(ContextLimitError):
+        records.snapshot(context, target=100)
