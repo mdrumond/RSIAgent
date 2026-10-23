@@ -74,11 +74,16 @@ class AdaptiveProductionPaths:
     )
 
     worker_config: dict | None = None
+    curriculum_kdb: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "root", Path(self.root))
         object.__setattr__(self, "tla_root", Path(self.tla_root))
         object.__setattr__(self, "profiling_skill_root", Path(self.profiling_skill_root))
+        if type(self.curriculum_kdb) is not bool:
+            raise TypeError("curriculum_kdb must be boolean")
+        if self.curriculum_kdb and (self.kdb is None or not self.collection):
+            raise ValueError("curriculum KDB requires a configured KDB and collection")
         if self.kdb is not None:
             object.__setattr__(self, "kdb", Path(self.kdb))
         if not self.catlass_source.startswith("/"):
@@ -187,6 +192,31 @@ def _knowledge_action(paths: AdaptiveProductionPaths, embeddings) -> ActionDepen
         )
 
     return query
+
+
+def curriculum_knowledge(paths, embeddings):
+    """Pin a read-only curriculum gate and return its collection identity."""
+    if paths.kdb is None or not paths.collection or embeddings is None:
+        raise ValueError("curriculum KDB requires a database, collections and embeddings")
+    with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
+        manifests = database.selected_manifests(paths.collection)
+        if any(item.embedding_model != embeddings.model or item.embedding_revision != embeddings.revision
+               for item in manifests):
+            raise ValueError("KDB manifest does not match the embedding backend")
+        identity = {item.collection: item.fingerprint for item in manifests}
+
+    def query(action):
+        with KnowledgeDB.open_read_only(paths.kdb, embeddings) as database:
+            if {item.collection: item.fingerprint for item in database.selected_manifests(paths.collection)} != identity:
+                raise ValueError("curriculum KDB collection identity changed")
+            agent = KnowledgeAgent(enabled=True, database=database, collection=paths.collection,
+                journal=ProgressiveMemoryJournal(Path(paths.root) / "curriculum-knowledge.jsonl"))
+        try:
+            return agent.query(action)
+        finally:
+            agent.close()
+
+    return query, {"enabled": True, "manifests": identity}
 
 
 def _measurement_action(measurements, *, profiling: bool) -> ActionDependency:
@@ -303,7 +333,7 @@ def _actor_context(cell: A5Phase1Cell, guide_bytes: bytes, profiling_guidance_te
     })
 
 
-def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=None, *, max_seconds=7200) -> None:
+def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=None, *, max_seconds=7200, curriculum_kdb=None) -> None:
     root = Path(root)
     path = root / "campaign-identity.json"
     identity = {
@@ -311,6 +341,8 @@ def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=No
         "schema": _CAMPAIGN_IDENTITY_SCHEMA,
         "cell": cell.as_dict(),
     }
+    if curriculum_kdb is not None:
+        identity["curriculum_kdb"] = curriculum_kdb
     if reviewed_snapshot is None:
         identity["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": max_seconds}
     if reviewed_snapshot is not None:
@@ -380,7 +412,13 @@ def build_adaptive_phase1(
     if not isinstance(initial_memory, bytes):
         raise TypeError("initial memory must be immutable bytes")
     actor_context = _actor_context(admitted, guide_bytes, profiling_guidance_text)
-    _bind_campaign_identity(paths.root, admitted, reviewed_snapshot, max_seconds=max_seconds)
+    curriculum_query, curriculum_identity = None, None
+    if paths.curriculum_kdb:
+        if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
+            raise ValueError("KDB-off treatment cannot enable curriculum KDB")
+        curriculum_query, curriculum_identity = curriculum_knowledge(paths, embeddings)
+    _bind_campaign_identity(paths.root, admitted, reviewed_snapshot, max_seconds=max_seconds,
+                            curriculum_kdb=curriculum_identity)
     if admitted.knowledge is KnowledgeMode.WITHOUT_KDB:
         if paths.kdb is not None or paths.collection is not None or embeddings is not None:
             raise ValueError("KDB-off treatment must not receive KDB dependencies")
@@ -442,6 +480,7 @@ def build_adaptive_phase1(
         root=paths.root, objective=objective, initial_memory=initial_memory,
         executor=executor, actor=actor, profile=profile, provider=provider,
         query_knowledge=query_knowledge,
+        curriculum_query_knowledge=curriculum_query,
         request_profile=request_profile,
         request_timing=request_timing,
         request_diagnostic=diagnostic_action(backend),
