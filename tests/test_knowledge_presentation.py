@@ -102,3 +102,16 @@ def test_serialized_transport_keeps_source_list_and_exact_read_pointers(tmp_path
     assert records.read(paged['record'])['text'] == ordinary
     with pytest.raises(ContextLimitError):
         records.snapshot(context, target=100)
+
+
+def test_long_source_line_excerpt_includes_query_match(tmp_path):
+    store = ContentAddressedArtifacts(tmp_path)
+    rows = source_rows(1)
+    rows[0]['text'] = 'Setup detail. ' * 200 + 'racecheck detects pipeline hazards. ' + 'More details. ' * 200
+    observation = knowledge_presentation('racecheck pipeline', rows, store.put_bytes)
+    excerpt = observation['results'][0]['excerpt']
+    assert len(excerpt) <= 300
+    assert 'racecheck detects pipeline hazards' in excerpt
+    assert excerpt in rows[0]['text']
+    digest = observation['results'][0]['artifact_sha256']
+    assert store.read_bytes(digest).decode() == rows[0]['text']

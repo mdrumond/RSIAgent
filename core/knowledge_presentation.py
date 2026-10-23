@@ -13,10 +13,16 @@ def _encoded(value):
 def _excerpt(text: str, query: str) -> str:
     # Select a source window, not an inferred answer or an LLM paraphrase.
     terms = set(re.findall(r'\w+', query.casefold()))
-    windows = [(match.start(), len(terms & set(re.findall(r'\w+', match.group().casefold()))))
-               for match in re.finditer(r'[^\n]+', text)]
-    start = max(windows, key=lambda row: row[1])[0] if windows else 0
-    return text[start:start + 300]
+    lines = list(re.finditer(r'[^\n]+', text))
+    if not lines:
+        return ''
+    selected = max(lines, key=lambda line:
+                   len(terms & set(re.findall(r'\w+', line.group().casefold()))))
+    line = selected.group()
+    match = next((word for word in re.finditer(r'\w+', line)
+                  if word.group().casefold() in terms), None)
+    offset = min(max(0, match.start() - 80), max(0, len(line) - 300)) if match else 0
+    return line[offset:offset + 300]
 
 
 def knowledge_presentation(query: str, rows: list[Mapping],
