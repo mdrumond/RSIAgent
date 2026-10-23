@@ -68,7 +68,8 @@ class MemorySnapshot:
 
     def direct_documents(self) -> str:
         """The complete exported document bundle for a matched direct-memory arm."""
-        return "\n".join(path.read_text() for path in sorted(self._document_paths()))
+        paths = self._document_paths() + [self.root / "snapshot.json"]
+        return "\n".join(path.read_text() for path in sorted(paths))
 
     def bind(self, manifest: CollectionManifest) -> None:
         """Check that the selected DB collection indexes exactly this snapshot."""
