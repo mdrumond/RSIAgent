@@ -119,7 +119,7 @@ def test_normalization_does_not_hide_invalid_proposals(change, diagnostic):
         return wave([item])
 
     with pytest.raises(ValueError, match=f"time budget exhausted.*{diagnostic}"):
-        CurriculumAgent(complete).select(context())
+        CurriculumAgent(complete).select(context(remaining_seconds=3000))
     assert len(calls) == 3
 
 

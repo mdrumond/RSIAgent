@@ -173,7 +173,7 @@ def test_selection_validation_exhaustion_is_bounded_and_diagnostic():
         return wave([project(capabilities=["unknown"])])
 
     with pytest.raises(ValueError, match="time budget exhausted.*unregistered capability"):
-        CurriculumAgent(complete).select(context())
+        CurriculumAgent(complete).select(context(remaining_seconds=3000))
     assert len(calls) == 3
     assert [len(messages) for messages in calls] == [2, 4, 6]
 
