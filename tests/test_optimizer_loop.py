@@ -474,3 +474,47 @@ def test_model_actions_have_no_count_ceiling_and_receive_remaining_time(tmp_path
     state = next(event['payload'] for event in reversed(store.events(key))
                  if event['kind'] == 'optimizer-state')
     assert state['turn'] > 200 and state['best']['speedup'] == 2
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+def test_knowledge_compacts_before_checkpoints_and_sources_are_readable_after_resume(tmp_path, wrapped):
+    from test_knowledge_presentation import source_rows
+    store, key = fixture(tmp_path)
+    store.transition(key, 'running')
+    rows = source_rows(8)
+    callback_result = {'results': rows} if wrapped else rows
+    loop = OptimizationLoop(store, key, Agent([]), Backend(), knowledge=lambda _: callback_result)
+    snapshot = {'files': {}, 'memory_entries': []}
+    loop._tool({'action': 'query-knowledge', 'query': 'racecheck synchronization hazards'}, snapshot)
+    result = loop.state['history'][-1]['content']
+    assert len(canonical(result)) < 4096
+    assert result['result_count'] == len(rows)
+    index = json.loads(store.read_artifact(key, result['results_index_sha256']))
+    assert len(index['results']) == len(rows)
+    # The elapsed-action checkpoint must contain the compact result too.
+    for event in store.events(key):
+        if event['kind'] == 'optimizer-state' and 'action_result' in event['payload']:
+            checkpoint = loop._read(event['payload']['action_result'])
+            assert len(canonical(checkpoint)) < 4096
+    resumed = OptimizationLoop(store, key, Agent([]), Backend())
+    resumed._tool({'action': 'query-knowledge', 'query': 'unavailable'}, snapshot)
+    assert resumed.state['history'][-1]['content'] == {'status': 'unavailable'}
+    for entry, original in zip(index['results'], rows):
+        assert store.read_artifact(key, entry['artifact_sha256']) == original['text'].encode()
+    digest = index['results'][-1]['artifact_sha256']
+    resumed._tool({'action': 'read-artifact', 'sha256': digest, 'offset': 0}, snapshot)
+    page = resumed.state['history'][-1]['content']
+    assert page['text'] == rows[-1]['text'][:1500]
+    assert page['next_offset'] == 1500
+
+    class InspectAgent(Agent):
+        def complete(self, stage, context, record):
+            earlier = context['history'][0]
+            assert json.loads(earlier['content_preview']) == result
+            assert earlier['content_truncated'] is False
+            return candidate('fast')
+
+    resumed.agent = InspectAgent([])
+    resumed.context = {}
+    resumed.single_evaluation, resumed.prepare_only = True, False
+    resumed._model('optimize', {'history': resumed.state['history']})
