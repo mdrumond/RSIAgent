@@ -73,8 +73,10 @@ def build_candidate_pool(databases: dict[str, KnowledgeDB], action: KnowledgeQue
     vector_selected, lexical_selected = deque(vector_selected), deque(lexical_selected)
     selected = []
     while vector_selected or lexical_selected:
-        for queue, count in ((vector_selected, 6), (lexical_selected, 4)):
-            for _ in range(min(count, len(queue))):
+        # Every five-result prefix includes three vector and two lexical slots.
+        for queue in (vector_selected, vector_selected, lexical_selected,
+                      vector_selected, lexical_selected):
+            if queue:
                 name, hit = queue.popleft()
                 check()
                 selected.append(validate_knowledge_hit(databases[name], name, hit))

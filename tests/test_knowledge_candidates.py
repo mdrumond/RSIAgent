@@ -50,10 +50,12 @@ def test_small_memory_does_not_outrank_stronger_global_vectors(tmp_path):
     gate = agent(tmp_path, {"memory": mem, "references": refs})
     pool = gate.candidate_pool(KnowledgeQuery("cube"))
     assert len(pool.results) == 100
-    assert all(row.citation.collection == "references" for row in pool.page(limit=6))
+    vector_slots = [0, 1, 3, 5, 6, 8]
+    assert all(pool.results[i].citation.collection == "references" for i in vector_slots)
     assert sum(row.citation.collection == "memory" for row in pool.page()) <= 1
-    assert all(row.score == pytest.approx(1) for row in pool.page(limit=6))
-    assert [row.vector_rank for row in pool.page(limit=6)] == list(range(1, 7))
+    assert all(pool.results[i].score == pytest.approx(1) for i in vector_slots)
+    assert [pool.results[i].vector_rank for i in vector_slots] == list(range(1, 7))
+    assert all(pool.results[i].vector_rank > 60 for i in [2, 4, 7, 9])
     assert sum(row.citation.collection == "memory" for row in pool.results) == 1
     assert len(gate.query(KnowledgeQuery("cube", limit=20))) == 20
     gate.close()
@@ -66,7 +68,7 @@ def test_small_memory_does_not_outrank_stronger_global_vectors(tmp_path):
 def test_keyword_lane_keeps_exact_identifier_with_weak_vector_match(tmp_path):
     backend = Embeddings()
     refs = indexed(tmp_path, "references", {
-        **{f"cube_{n:03}.cpp": f"cube example {n}\n" for n in range(20)},
+        **{f"cube_{n:03}.cpp": f"cube example {n}\n" for n in range(120)},
         "identifier.cpp": "rare_api_identifier implementation\n",
     }, backend)
     gate = agent(tmp_path, {"references": refs})
@@ -75,7 +77,10 @@ def test_keyword_lane_keeps_exact_identifier_with_weak_vector_match(tmp_path):
     assert exact.score == 0
     assert exact.lexical_rank == 1
     assert exact.vector_rank is None
-    assert pool.results.index(exact) == 6
+    assert pool.results.index(exact) == 2
+    default_results = gate.query(KnowledgeQuery("cube rare_api_identifier"))
+    assert len(default_results) == 5
+    assert any(row.citation.path == "identifier.cpp" for row in default_results)
     gate.close()
     refs.close()
 
