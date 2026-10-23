@@ -66,7 +66,7 @@ def setup(decisions, *, pools=None, seconds=90):
         decision = decisions.pop(0)
         if isinstance(decision, Exception):
             raise decision
-        return {'text': json.dumps(decision), 'tokens': 10}
+        return {'text': decision if isinstance(decision, str) else json.dumps(decision), 'tokens': 10}
     agent = AdaptiveKnowledgeAgent(gate, complete, clock=clock, seconds=seconds, audit=audit.append)
     return agent, gate, clock, calls, audit
 
@@ -115,11 +115,11 @@ def test_reformulate_can_select_new_evidence_and_abstention_is_valid():
 
 @pytest.mark.parametrize('failure', [TimeoutError(), {'action': 'finish', 'selected': [dict(id='invented', reason='bad')]}])
 def test_failure_retains_only_prior_validated_selections(failure):
-    agent, _, _, _, audit = setup([pick(1, action='next'), failure])
+    agent, _, _, _, audit = setup([pick(1, action='next'), failure] + ([] if isinstance(failure, Exception) else [TimeoutError()]))
     result = agent.search(KnowledgeQuery('query'))
     assert result.status == 'partial' and result.results == (row(1),)
     assert audit[0]['error_type'] in {'TimeoutError', 'ValueError'}
-    assert len(audit[0]['requests']) == 2
+    assert len(audit[0]['requests']) == (2 if isinstance(failure, Exception) else 3)
 
 
 def test_queries_and_external_reads_share_elapsed_budget():
@@ -177,7 +177,30 @@ def test_rolling_context_retains_selected_evidence_without_previous_batches():
 
 def test_selection_limit_rejection_preserves_previously_valid_progress():
     too_many = dict(action='finish', selected=[dict(id=identity(i), reason='useful') for i in range(10, 16)])
-    agent, _, _, _, _ = setup([pick(1, action='next'), too_many])
+    agent, _, _, _, _ = setup([pick(1, action='next'), too_many, TimeoutError()])
     result = agent.search(KnowledgeQuery('query', 5))
     assert result.status == 'partial' and result.results == (row(1),)
-    assert result.audit['error_type'] == 'ValueError'
+    assert result.audit['requests'][1]['validation_error']['type'] == 'ValueError'
+
+
+def test_malformed_decision_is_corrected_without_rescanning_or_accepting_invalid_ids():
+    malformed = '{"action":"finish","selected":[{"id":"invented","reason":"bad"}],"gaps":{}'
+    agent, gate, _, calls, audit = setup([malformed, pick(1)])
+    result = agent.search(KnowledgeQuery('query'))
+    assert result.status == 'complete' and result.results == (row(1),)
+    assert gate.calls == ['query'] and result.audit['tokens'] == 20
+    assert audit[0]['requests'][0]['response']['text'] == malformed
+    assert audit[0]['requests'][0]['validation_error']['type'] == 'JSONDecodeError'
+    correction = json.loads(calls[1][0][-1]['content'])['correction']
+    assert correction['last_invalid_response'] == malformed
+    assert len(calls[1][0]) == 3
+
+
+def test_repeated_malformed_responses_spend_original_deadline_and_preserve_progress():
+    agent, _, _, calls, audit = setup([pick(1, action='next')] + ['{bad'] * 5, seconds=18)
+    result = agent.search(KnowledgeQuery('query'))
+    assert result.status == 'partial' and result.results == (row(1),)
+    assert result.audit['error_type'] == 'TimeoutError' and agent.spent_seconds == 18
+    assert [allowance for _, allowance in calls] == [16, 12, 8, 4]
+    assert len(audit[0]['requests']) == 4
+    assert all(len(messages) == 3 for messages, _ in calls)

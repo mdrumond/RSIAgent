@@ -33,8 +33,12 @@ At most100 distinct excerpts are exposed per request as a context/workload bound
 Elapsed time controls execution:90 seconds is shared over the entire wrapper
 lifetime, including all candidate searches, provider calls and artifact reads.
 Each request is also bounded by its caller's remaining allowance. Keep one
-wrapper per arm and pass remaining time through every transport. Provider/tool
-exceptions and invalid decisions retain earlier valid selections as `partial`,
+wrapper per arm and pass remaining time through every transport. Malformed JSON or invalid decision IDs produce concise correction feedback and
+another provider request within the same original elapsed allowance. No invalid
+selection is accepted and no local JSON repair or fuzzy ID matching is performed.
+Only the latest invalid response (bounded to8192 characters) enters rolling
+context; complete raw responses and validation errors remain in audit. Transport
+failures or elapsed exhaustion retain earlier valid selections as `partial`,
 or return `insufficient` if none were selected. Empty or fewer-than-requested
 results are legitimate abstention. A provider must enforce the elapsed allowance;
 post-return checks alone cannot interrupt a blocking transport.
