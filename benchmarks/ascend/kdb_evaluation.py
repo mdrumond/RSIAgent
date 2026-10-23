@@ -178,13 +178,32 @@ class Pilot:
                 output = messages[-1]['content']
                 checks['admitted'] = True
             else:
+                tool_protocol = (
+                    'A working read-only KDB is connected. The host executes your JSON '
+                    'tool requests and returns actual results for your next turn. '
+                    'Reference source collections are searchable.'
+                    + (' Retained memory lessons and linked examples are also searchable.' if arm == 'D' else '')
+                    + ' Return exactly one JSON object per turn, choosing ONE action: '
+                    '{"knowledge_query":{"query":"search terms","limit":5}} to search; '
+                    '{"read_artifact":{"collection":"collection from result","digest":"artifact hash",'
+                    '"offset":0,"limit":16384}} to read a linked artifact admitted by the snapshot; '
+                    'or {"answer":"your final analysis","citations":[],"numerical_claims":[]} '
+                    'when ready to finish. Search results include source text and validated citations. '
+                    'Use exact returned citation objects in the final citations array. '
+                    'Do not describe connected retrieval as unavailable. '
+                    + ('As the code writer, search the connected KDB for actual code examples. '
+                       'Query before claiming to have retrieved any example. Cite inspected '
+                       'source excerpts and explain their adaptation limits. ' if case.role == 'writer' else
+                       'As the performance analyzer, query when reference material or retained '
+                       'examples would help interpret the supplied evidence or form hypotheses. ')
+                    if gate else
+                    'No retrieval tools are available. Return one final JSON object '
+                    '{"answer":"your analysis","citations":[],"numerical_claims":[]}. '
+                    'State unavailable source evidence honestly; do not claim retrieved examples. '
+                )
                 messages = [{'role': 'system', 'content': (
-                    'Analyze only. Do not implement or execute kernels. Return JSON '
-                    '{"answer":string,"citations":[],"numerical_claims":[]}. '
-                    'Numerical claims use {"fact":id,"value":number,"unit":string}. '
-                    + ('You may request {"knowledge_query":{"query":string,"limit":5}} '
-                       'or {"read_artifact":{"collection":string,"digest":string,"offset":0,"limit":16384}}. '
-                       if gate else 'No retrieval tools are available. ')
+                    'Analyze only. Do not implement or execute kernels. ' + tool_protocol
+                    + 'Numerical claims use {"fact":id,"value":number,"unit":string}. '
                 )}, {'role': 'user', 'content': case.prompt + (
                     '\nComplete memory snapshot:\n' + self.memory if arm == 'C' else '')}]
                 while True:

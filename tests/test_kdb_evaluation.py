@@ -160,3 +160,28 @@ def test_malformed_output_and_nonfinite_numbers():
         {'fact': 'latency', 'value': float('nan'), 'unit': 'us'},
     ]}, [], [{'fact': 'latency', 'value': 4, 'unit': 'us'}])
     assert check['unsupported_numerical_claims'] == 1
+
+
+def test_writer_tool_request_receives_real_evidence_before_final_answer(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.knowledge_agent import Citation
+    citation = Citation('reference', 'copy.cpp', 1, 3, 'a'*64)
+    source = 'DataCopy(destination, source, count);'
+    class Gate:
+        def query(self, request, seconds):
+            assert request.query == 'Ascend C copy example'
+            return (SimpleNamespace(citation=citation, text=source, score=1.0),)
+    def complete(messages, seconds):
+        if messages[-1]['role'] == 'user' and len(messages) == 2:
+            return dict(text='{"knowledge_query":{"query":"Ascend C copy example"}}', tokens=3)
+        observed = json.loads(messages[-1]['content'])
+        assert observed[0]['text'] == source
+        return dict(text=json.dumps(dict(answer='Adapt the inspected transfer count to the logical shape.',
+                                         citations=[observed[0]['citation']], numerical_claims=[])), tokens=5)
+    pilot = Pilot(complete, lambda _: Gate(), '', Budget(tmp_path/'state.json', 'id'))
+    result = pilot.run_arm(Case('w', 'writer', 'copy', 'Retrieve an actual copy example', {}), 'B')
+    assert result['status'] == 'complete'
+    assert result['checks']['citation_count'] == 1
+    assert result['checks']['invalid_citations'] == 0
+    assert result['queries'][0]['query'] == 'Ascend C copy example'
+    pilot.budget.close()
