@@ -106,3 +106,28 @@ def test_gate_rejects_different_snapshot_and_tampered_artifacts(tmp_path):
     ContentAddressedArtifacts(one.root / "artifacts")._path(digest).write_bytes(b"changed")
     with pytest.raises(ValueError, match="SHA-256"):
         one.read_artifact(digest)
+
+
+def test_direct_bundle_matches_complete_indexed_source_contents(tmp_path):
+    original, _ = source(tmp_path / "producer")
+    snapshot = export_snapshot([original], tmp_path / "snapshot")
+    with KnowledgeDB(tmp_path / "kdb.sqlite", Embeddings()) as database:
+        manifest = snapshot.index(database, collection="memory-v1")
+        # Reconstruct full source bodies from actual stored chunks, removing the
+        # line overlap rather than comparing the direct arm against itself.
+        reconstructed = {}
+        for row in database.connection.execute(
+            "SELECT path, start_line, text FROM chunks WHERE collection = ? "
+            "ORDER BY path, start_line", (manifest.collection,)
+        ):
+            lines = reconstructed.setdefault(row["path"], {})
+            for number, line in enumerate(row["text"].splitlines(keepends=True), row["start_line"]):
+                if number in lines:
+                    assert lines[number] == line
+                lines[number] = line
+        assert set(reconstructed) == {item.path for item in manifest.sources}
+        indexed_bundle = "\n".join(
+            "".join(lines[number] for number in sorted(lines))
+            for _, lines in sorted(reconstructed.items())
+        )
+        assert snapshot.direct_documents() == indexed_bundle
