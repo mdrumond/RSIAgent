@@ -319,3 +319,133 @@ def test_invalid_local_time_allocations_rejected(tmp_path, field, invalid):
     with pytest.raises(ValueError):
         Pilot(None, None, '', budget, **{field: invalid})
     budget.close()
+
+
+def test_six_arm_gate_context_and_direct_memory_isolation(tmp_path):
+    contexts, observed, selected = [], [], []
+    class Gate:
+        def configure_context(self, **context):
+            contexts.append(context)
+        def query(self, request, seconds):
+            selected.append(request.query)
+            return ()
+    def complete(messages, seconds):
+        if len(messages) == 2:
+            observed.append(messages[-1]['content'])
+            if len(observed) > 1:
+                return dict(text='{"knowledge_query":{"query":"task source"}}', tokens=1)
+        return dict(text='{"answer":"source analysis","citations":[]}', tokens=1)
+    budget = Budget(tmp_path/'state.json', 'six')
+    pilot = Pilot(complete, lambda arm: Gate(), 'full direct bundle', budget, adaptive=True)
+    case = Case('six', 'writer', 'copy', 'Find code for target A3', {'secret': 'hidden answer'},
+                context={'target': 'A3'})
+    results = [pilot.run_arm(case, arm) for arm in pilot.arms]
+    assert [r['status'] for r in results] == ['complete'] * 6
+    assert [text.endswith('full direct bundle') for text in observed] == [False, False, True, False, False, False]
+    assert contexts == [dict(task=case.prompt, role='writer', context=case.context)] * 5
+    assert selected == ['task source'] * 5
+    budget.close()
+
+
+def _independent_answer(score=3):
+    return dict(text=json.dumps(dict(scores={'0': dict.fromkeys(
+        ['relevance', 'support', 'applicability', 'uncertainty', 'next_actions'], score)},
+        reasons={'0': 'Supported by source evidence'})), tokens=9)
+
+
+def test_independent_judging_keeps_valid_pairs_and_raw_failures(tmp_path):
+    clock, seen = Clock(), []
+    budget = Budget(tmp_path/'state.json', 'six', clock=clock)
+    for arm in 'ABCDEF':
+        budget.state['runs']['one:'+arm] = dict(status='complete', output='answer '+arm,
+                                                retrieved=[{'text': 'source '+arm}], checks={})
+    budget.state['runs']['one:C']['status'] = 'invalid'
+    def complete(messages, seconds):
+        seen.append(messages)
+        payload = json.loads(messages[-1]['content'])
+        assert payload['shared_memory'] == 'complete snapshot'
+        assert payload['rubric'] == {'support': 'Use actual evidence'}
+        assert list(payload['candidates']) == ['0']
+        candidate = payload['candidates']['0']
+        clock.value += 2
+        if candidate['output'] == 'answer A':
+            return dict(text='malformed JSON', tokens=2)
+        return _independent_answer(4 if candidate['output'] == 'answer F' else 3)
+    pilot = Pilot(complete, None, 'complete snapshot', budget, adaptive=True, judge_seconds=60)
+    case = Case('one', 'writer', 'copy', 'task', {'support': 'Use actual evidence'})
+    pilot.judge(case)
+    grades = budget.state['judgments']['one']['grades']
+    assert grades['A']['response']['text'] == 'malformed JSON'
+    assert grades['A']['error_type'] == 'JSONDecodeError'
+    assert grades['C']['reason'] == 'arm-incomplete'
+    assert grades['F']['status'] == 'complete'
+    assert len(seen) == 5
+    pilot.judge(case)
+    assert len(seen) == 5  # Completed and invalid individual grades are not retried.
+    report = pilot.report([case])['roles']['writer']
+    assert report['matched'] == 0
+    assert report['comparisons']['E-B'] == dict(cases=['one'], matched=1, deltas=[0], wins=0, ties=1, losses=0)
+    assert report['comparisons']['F-D']['deltas'] == [5]
+    assert report['comparisons']['D-C']['matched'] == 0
+    assert report['scores']['one'] == {'B': 15, 'D': 15, 'E': 15, 'F': 20}
+    budget.close()
+
+
+def test_independent_judge_shared_deadline_and_partial_resume(tmp_path):
+    clock = Clock()
+    budget = Budget(tmp_path/'state.json', 'six', seconds=100, clock=clock)
+    for arm in 'ABCDEF':
+        budget.state['runs']['one:'+arm] = dict(status='complete', output='answer', retrieved=[], checks={})
+    calls = []
+    def complete(messages, seconds):
+        calls.append(seconds)
+        clock.value += 4
+        return _independent_answer()
+    pilot = Pilot(complete, None, '', budget, adaptive=True, judge_seconds=10)
+    pilot.judge(Case('one', 'writer', 'copy', 'task', {}))
+    assert calls == [10, 6, 2]
+    grades = budget.state['judgments']['one']['grades']
+    assert sum(g['status'] == 'complete' for g in grades.values()) == 2
+    assert sum(g.get('error_type') == 'TimeoutError' for g in grades.values()) == 1
+    resumed = Budget(budget.path, 'six', seconds=100, clock=clock)
+    Pilot(complete, None, '', resumed, adaptive=True, judge_seconds=10).judge(Case('one', 'writer', 'copy', 'task', {}))
+    assert calls == [10, 6, 2]
+    resumed.close()
+
+
+def test_independent_judgment_resume_charges_active_interruption(tmp_path):
+    clock = Clock()
+    budget = Budget(tmp_path/'state.json', 'six', seconds=100, clock=clock)
+    for arm in 'ABCDEF':
+        budget.state['runs']['one:'+arm] = dict(status='complete', output='answer', retrieved=[], checks={})
+    budget.state['judgments']['one'] = dict(status='incomplete', elapsed=4, active_since=clock.value,
+                                          grades={'A': {'status': 'running', 'request': [{'role': 'user', 'content': 'blinded'}]}})
+    budget.checkpoint()
+    clock.value += 6
+    resumed = Budget(budget.path, 'six', seconds=100, clock=clock)
+    def forbidden(*args):
+        pytest.fail('An interrupted case cannot get a fresh judging allocation')
+    Pilot(forbidden, None, '', resumed, adaptive=True, judge_seconds=10).judge(Case('one', 'writer', 'copy', 'task', {}))
+    assert resumed.state['judgments']['one']['elapsed'] == 10
+    assert resumed.state['judgments']['one']['grades']['A']['error_type'] == 'Interrupted'
+    resumed.close()
+
+
+def test_six_arm_run_rotates_all_arms_and_preserves_fresh_workload(tmp_path):
+    events = []
+    class Recorder(Pilot):
+        def run_arm(self, case, arm):
+            events.append((case.case_id, arm))
+            return {'status': 'invalid'}
+    budget = Budget(tmp_path/'state.json', 'six')
+    cases = [Case(f'{role}-{i}', role, str(i), 'task', {})
+             for role in ('curriculum', 'writer', 'analyzer') for i in range(6)]
+    Recorder(None, None, '', budget, adaptive=True).run(cases)
+    assert len(events) == 108
+    for index in range(6):
+        arms = list('ABCDEF'[index:] + 'ABCDEF'[:index])
+        for role in ('curriculum', 'writer', 'analyzer'):
+            assert [arm for case, arm in events if case == f'{role}-{index}'] == arms
+    resumed = Budget(budget.path, 'six')
+    Recorder(None, None, '', resumed, adaptive=True).run(cases)
+    assert len(events) == 108

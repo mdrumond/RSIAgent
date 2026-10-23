@@ -79,3 +79,52 @@ finite seconds. Each nested allowance remains capped by the remaining global
 `Budget`. Record cohort settings in the frozen identity and preserve prior
 cohort outputs and elapsed allocation when extending an explicitly authorized
 campaign.
+
+## Six-condition adaptive retrieval evaluation
+
+Pass `adaptive=True` to `Pilot` to select six conditions; this flag selects the
+comparison design, not the implementation of injected gates. A remains no KDB;
+B uses corrected deterministic reference retrieval; C adds the exact complete
+direct-memory bundle to B; D adds indexed memory to deterministic retrieval;
+E uses the adaptive librarian over references; F adds indexed memory to E.
+The factory must enforce those selected collections. Only C receives the direct
+bundle, and only D/F may access the frozen memory snapshot. Each case rotates
+all six arms, producing 108 fresh conversations for the frozen 18 cases.
+
+A gate can optionally implement `configure_context(task, role, context)`.
+The harness calls it once with the ordinary case prompt, role, and public
+case context. No rubric is sent to the gate. Target/runtime information belongs
+in that ordinary task/context. The gate owns a shared 90-second retrieval
+allowance across its queries and artifact reads, bounded by each supplied
+remaining-arm allowance. Provider calls inside the librarian must use the
+same actual DeepSeek profile as live validation; mocked unit tests alone do
+not validate the adaptive agent. Retain librarian decisions and provider
+telemetry in the ignored run evidence.
+
+Use a separately frozen identity with `adaptive=True`, `arm_seconds=180`,
+`judge_seconds=60`, and a fresh 7200-second elapsed `Budget`. Keep all original
+cohort state unchanged. The new design grades each completed answer independently
+against the same rubric, shared context, exact full memory, retrieved evidence,
+and objective checks. Every judge packet uses the unrelated candidate ID `0`;
+it contains no arm label. Grade order is deterministic and unrelated to treatment
+order. Sixty seconds is shared across all six judgments for one case, not renewed
+per answer. Successful grades survive other answer, judge, or transport failures.
+
+State records `judgments[case_id].grades[arm]` with its status, raw request,
+response when returned, score/reason, tokens, or error type. Interrupted judging
+is charged to the same persisted case allowance on resume. A previously attempted
+grade is never silently retried; missing grades may continue only within the
+remaining original allowance. Run identity must include model/provider identity,
+selected manifests, snapshot, source revision, arm settings, and this comparison
+mode to prevent accidental mixing with four-condition state.
+
+Six-condition reports retain partial per-arm scores. Each comparison carries
+its own `cases` and `matched` denominator, using only cases with valid answers
+and grades for both treatments. Primary comparisons are E−B (adaptive references),
+F−D (adaptive indexed memory), D−C (indexed versus direct memory), and F−E
+(memory contribution with adaptive retrieval). B−A, C−B, and D−B remain available.
+Role-level `matched` counts fully graded six-arm groups as a secondary statistic;
+it does not determine eligibility for individual paired comparisons. Report
+invalid outputs, incomplete grading, abstention, retrieval relevance, citation
+errors, latency, and tokens separately from score differences. These small,
+model-judged samples do not establish statistical effects or kernel speedups.
