@@ -6,6 +6,8 @@ outside source control; this module never imports a device backend.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 import hashlib
 import json
@@ -107,6 +109,19 @@ def _serialized_results(results):
     return [dict(citation=r.citation.as_dict(), text=r.text, score=r.score) for r in results]
 
 
+class _QueryResults(tuple):
+    def __new__(cls, results, search_details):
+        value = super().__new__(cls, results)
+        value.search_details = search_details
+        return value
+
+
+def _query_observation(results):
+    rows = _serialized_results(results)
+    details = getattr(results, 'search_details', None)
+    return rows if details is None else dict(results=rows, search_details=details)
+
+
 class Pilot:
     """A fresh gate and conversation for every arm.
 
@@ -144,10 +159,18 @@ class Pilot:
         def query(request):
             if gate is None:
                 raise ValueError('retrieval unavailable in arm A')
-            queries.append({'query': request.query, 'limit': request.limit})
+            audit = {'query': request.query, 'limit': request.limit}
+            queries.append(audit)
             result = gate.query(request, self.budget.allowance(deadline))
             self.budget.allowance(deadline)
             retrieved.extend(_serialized_results(result))
+            details = getattr(gate, 'search_details', None)
+            if details is not None:
+                if not isinstance(details, Mapping):
+                    raise TypeError('search_details must be a mapping')
+                details = deepcopy(dict(details))
+                audit['search_details'] = details
+                result = _QueryResults(result, details)
             return result
         def read(request):
             if gate is None:
@@ -223,7 +246,7 @@ class Pilot:
                     if not isinstance(request, dict):
                         raise ValueError('response must be an object')
                     if set(request) == {'knowledge_query'}:
-                        result = _serialized_results(query(KnowledgeQuery(**request['knowledge_query'])))
+                        result = _query_observation(query(KnowledgeQuery(**request['knowledge_query'])))
                     elif set(request) == {'read_artifact'}:
                         result = read(request['read_artifact'])
                     else:
@@ -241,8 +264,10 @@ class Pilot:
         finally:
             if gate is not None and hasattr(gate, 'close'):
                 gate.close()
+        librarian_tokens = getattr(gate, 'librarian_tokens', 0)
         return dict(status=status, output=output, transcript=messages, checks=checks,
-                    queries=queries, retrieved=retrieved, tokens=tokens,
+                    queries=queries, retrieved=retrieved, consumer_tokens=tokens,
+                    librarian_tokens=librarian_tokens, tokens=tokens + librarian_tokens,
                     seconds=self.budget.clock() - started)
 
     def run(self, cases):
@@ -392,7 +417,7 @@ class Pilot:
                 deltas = [t[left] - t[right] for t in totals.values()]
                 comparisons[left + '-' + right] = dict(deltas=deltas, wins=sum(d > 0 for d in deltas), ties=deltas.count(0), losses=sum(d < 0 for d in deltas))
             report['roles'][role] = dict(matched=len(matched), incomplete=len(selected)-len(matched), scores=totals, comparisons=comparisons,
-                telemetry={a: [dict(case=c.case_id, **{k: self.budget.state['runs'].get(c.case_id+':'+a, {}).get(k) for k in ('status', 'tokens', 'seconds', 'checks', 'queries')}) for c in selected] for a in ARMS})
+                telemetry={a: [dict(case=c.case_id, **{k: self.budget.state['runs'].get(c.case_id+':'+a, {}).get(k) for k in ('status', 'tokens', 'consumer_tokens', 'librarian_tokens', 'seconds', 'checks', 'queries')}) for c in selected] for a in ARMS})
         return report
 
     def _adaptive_report(self, cases):
@@ -417,7 +442,7 @@ class Pilot:
             report['roles'][role] = dict(matched=matched, incomplete=len(selected)-matched,
                 scores=totals, comparisons=comparisons, telemetry={arm: [dict(case=case.case_id,
                     **{key: self.budget.state['runs'].get(case.case_id + ':' + arm, {}).get(key)
-                       for key in ('status', 'tokens', 'seconds', 'checks', 'queries')})
+                       for key in ('status', 'tokens', 'consumer_tokens', 'librarian_tokens', 'seconds', 'checks', 'queries')})
                     for case in selected] for arm in self.arms})
         return report
 

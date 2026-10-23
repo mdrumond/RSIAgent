@@ -449,3 +449,79 @@ def test_six_arm_run_rotates_all_arms_and_preserves_fresh_workload(tmp_path):
     resumed = Budget(budget.path, 'six')
     Recorder(None, None, '', resumed, adaptive=True).run(cases)
     assert len(events) == 108
+
+
+@pytest.mark.parametrize('role', ['writer', 'curriculum'])
+def test_librarian_qualifications_and_tokens_reach_consumer_and_report(tmp_path, role):
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.knowledge_agent import Citation
+    citation = Citation('reference', 'cube.cpp', 1, 2, 'a'*64)
+    excerpt = SimpleNamespace(citation=citation, text='Original target-specific excerpt', score=0.8)
+    class Gate:
+        librarian_tokens = 0
+        search_details = None
+        def query(self, request, seconds):
+            self.librarian_tokens += 7 if self.librarian_tokens == 0 else 11
+            self.search_details = dict(status='partial', gaps=['Target runtime unverified'],
+                selection_reasons=[dict(citation=citation.as_dict(), reason=request.query)])
+            return (excerpt,)
+    gate, calls = Gate(), []
+    def complete(messages, seconds):
+        calls.append(messages[:])
+        if len(calls) > 1:
+            observation = json.loads(messages[-1]['content'])
+            if role == 'curriculum':
+                observation = observation['knowledge_query']
+            assert observation['results'][0]['text'] == excerpt.text
+            assert observation['results'][0]['citation'] == citation.as_dict()
+            assert observation['search_details']['status'] == 'partial'
+            assert observation['search_details']['gaps'] == ['Target runtime unverified']
+            expected_query = 'First layout evidence' if len(calls) == 2 else 'Follow-up compatibility'
+            assert observation['search_details']['selection_reasons'] == [dict(
+                citation=citation.as_dict(), reason=expected_query)]
+        if len(calls) < 3:
+            query = 'First layout evidence' if len(calls) == 1 else 'Follow-up compatibility'
+            return dict(text=json.dumps({'knowledge_query': {'query': query}}), tokens=len(calls)+1)
+        text = ('DECISION: STALLED\n{"reason":"Need target-runtime verification"}' if role == 'curriculum'
+                else json.dumps(dict(answer='Use as a layout idea; target runtime remains unverified',
+                                     citations=[citation.as_dict()], numerical_claims=[])))
+        return dict(text=text, tokens=5)
+    context = dict(objective='Study movement', wave_index=1,
+                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[],
+                   phase2_feedback=({'observed_attempt': 'Prior target run unavailable'},))
+    budget = Budget(tmp_path/'state.json', 'qualifications')
+    pilot = Pilot(complete, lambda arm: gate, '', budget, adaptive=True)
+    case = Case('qualified', role, 'cube', 'Find target-compatible evidence', {}, context=context)
+    result = pilot.run_arm(case, 'F')
+    assert result['status'] == 'complete'
+    assert result['consumer_tokens'] == 10
+    assert result['librarian_tokens'] == 18
+    assert result['tokens'] == 28
+    assert [row['search_details']['selection_reasons'][0]['reason'] for row in result['queries']] == [
+        'First layout evidence', 'Follow-up compatibility']
+    assert all(row['text'] == excerpt.text for row in result['retrieved'])
+    budget.state['runs']['qualified:F'] = result
+    telemetry = pilot.report([case])['roles'][role]['telemetry']['F'][0]
+    assert {key: telemetry[key] for key in ('consumer_tokens', 'librarian_tokens', 'tokens')} == dict(
+        consumer_tokens=10, librarian_tokens=18, tokens=28)
+    budget.close()
+
+
+def test_legacy_gate_keeps_ordinary_observation_and_consumer_token_total(tmp_path):
+    seen = []
+    class Gate:
+        def query(self, request, seconds):
+            return ()
+    def complete(messages, seconds):
+        if not seen:
+            seen.append(True)
+            return dict(text='{"knowledge_query":{"query":"copy"}}', tokens=3)
+        assert json.loads(messages[-1]['content']) == []
+        return dict(text='{"answer":"No source evidence"}', tokens=4)
+    budget = Budget(tmp_path/'state.json', 'legacy')
+    result = Pilot(complete, lambda arm: Gate(), '', budget).run_arm(
+        Case('legacy', 'writer', 'copy', 'Find copy evidence', {}), 'B')
+    assert result['status'] == 'complete'
+    assert (result['consumer_tokens'], result['librarian_tokens'], result['tokens']) == (7, 0, 7)
+    assert result['queries'] == [{'query': 'copy', 'limit': 5}]
+    budget.close()

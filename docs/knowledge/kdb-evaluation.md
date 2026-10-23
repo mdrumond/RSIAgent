@@ -128,3 +128,19 @@ it does not determine eligibility for individual paired comparisons. Report
 invalid outputs, incomplete grading, abstention, retrieval relevance, citation
 errors, latency, and tokens separately from score differences. These small,
 model-judged samples do not establish statistical effects or kernel speedups.
+
+Adaptive gate adapters may expose a JSON-serializable `search_details` mapping
+with `status`, `gaps`, and `selection_reasons` (citation/reason pairs). The harness
+snapshots those details per query, retains them in query telemetry, and delivers
+them with the original results to the next consumer completion. Writer/analyzer
+observations become `{results, search_details}` when details are present;
+curriculum observations add `search_details` inside `knowledge_query`. Ordinary
+tuple gates without details keep their existing observation format. The source
+excerpts and citation objects themselves are unchanged.
+
+A gate may also expose cumulative numeric `librarian_tokens` for its fresh arm,
+including all internal provider calls across searches. Run and report telemetry
+separate `consumer_tokens` and `librarian_tokens`; `tokens` is their total. Gates
+without internal providers default to zero librarian tokens, preserving the
+previous total for deterministic conditions. Retain the underlying librarian
+request audits as the backing evidence for these totals.

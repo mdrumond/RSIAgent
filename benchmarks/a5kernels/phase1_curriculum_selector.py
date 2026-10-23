@@ -586,6 +586,9 @@ class CurriculumAgent:
                     {"citation": item.citation.as_dict(), "text": item.text,
                      "score": item.score} for item in results
                 ]}}
+                details = getattr(results, 'search_details', None)
+                if details is not None:
+                    page["knowledge_query"]["search_details"] = details
                 history.append({"role": "user", "content": json.dumps(page, sort_keys=True)})
                 continue
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
