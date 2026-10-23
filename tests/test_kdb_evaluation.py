@@ -193,10 +193,10 @@ def test_judge_receives_blinded_evidence_context_and_shared_memory(tmp_path):
                 context={'prior_outcomes': [{'project_id': 'seen-copy'}]})
     expected = {}
     for arm in 'ABCD':
-        packet = dict(output='candidate-'+arm, retrieved=[{'text': 'source-'+arm}],
+        packet = dict(status='complete', output='candidate-'+arm, retrieved=[{'text': 'source-'+arm}],
                       checks={'invalid_citations': ord(arm)-65})
         budget.state['runs'][case.case_id+':'+arm] = packet
-        expected[packet['output']] = packet
+        expected[packet['output']] = {k: packet[k] for k in ('output', 'retrieved', 'checks')}
     def complete(messages, seconds):
         payload = json.loads(messages[-1]['content'])
         assert payload['context'] == case.context
@@ -218,7 +218,7 @@ def test_judgment_transport_failure_preserves_run_and_next_judgment(tmp_path):
     budget = Budget(tmp_path/'state.json', 'id')
     for case_id in ['first', 'next']:
         for arm in 'ABCD':
-            budget.state['runs'][case_id+':'+arm] = dict(output='answer', retrieved=[], checks={})
+            budget.state['runs'][case_id+':'+arm] = dict(status='complete', output='answer', retrieved=[], checks={})
     calls = []
     def complete(messages, seconds):
         calls.append(messages)
@@ -234,4 +234,18 @@ def test_judgment_transport_failure_preserves_run_and_next_judgment(tmp_path):
     assert budget.state['judgments']['first']['status'] == 'incomplete'
     assert budget.state['judgments']['next']['status'] == 'complete'
     assert len(budget.state['runs']) == 8
+    budget.close()
+
+
+@pytest.mark.parametrize('status', ['invalid', 'timeout'])
+def test_incomplete_arm_skips_judge_provider(tmp_path, status):
+    budget = Budget(tmp_path/'state.json', 'id')
+    for arm in 'ABCD':
+        budget.state['runs']['case:'+arm] = dict(status='complete', output='answer')
+    budget.state['runs']['case:B']['status'] = status
+    def forbidden(*args):
+        pytest.fail('Incomplete matched group must not spend provider allowance')
+    pilot = Pilot(forbidden, None, '', budget)
+    pilot.judge(Case('case', 'writer', 'copy', 'task', {}))
+    assert budget.state['judgments']['case'] == {'status': 'incomplete', 'reason': 'arm-incomplete'}
     budget.close()

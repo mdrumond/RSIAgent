@@ -262,6 +262,11 @@ class Pilot:
         # Labels/order are unrelated to treatment labels. Rubrics never reach agents.
         order = sorted(ARMS, key=lambda a: digest([case.case_id, a]))
         runs = self.budget.state['runs']
+        if any(runs.get(case.case_id + ':' + arm, {}).get('status') != 'complete' for arm in ARMS):
+            self.budget.state['judgments'][case.case_id] = {
+                'status': 'incomplete', 'reason': 'arm-incomplete',
+            }
+            return
         candidates = {str(i): {key: runs[case.case_id + ':' + arm].get(key, [] if key == 'retrieved' else {})
                                for key in ('output', 'retrieved', 'checks')}
                       for i, arm in enumerate(order)}
