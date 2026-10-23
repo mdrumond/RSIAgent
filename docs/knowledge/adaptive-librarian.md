@@ -18,7 +18,11 @@ outcome = librarian.last_search_details
 
 The librarian initially sees ten original, citation-validated excerpts. It can
 inspect the next batch, reformulate the query, read an admitted snapshot artifact,
-or finish. Only already-inspected IDs can be selected. Selection/rejection
+or finish. Only already-inspected short IDs (`c1`, `c2`, ...) can be selected.
+Each provider request contains the task, at most the requested number of selected
+excerpts, compact recent decisions, and the latest batch or artifact. Previous
+batches remain in the audit rather than accumulating in provider context. Select
+useful excerpts before advancing; rejecting older selections permits replacement. Selection/rejection
 reasons preserve target/runtime applicability and failed-versus-corrected example
 context. The returned excerpt bytes and citations always come from the gate,
 not model-generated text. The `execute` adapter exposes selection reasons, status and evidence gaps

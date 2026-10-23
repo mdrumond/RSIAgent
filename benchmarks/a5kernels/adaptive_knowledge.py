@@ -66,9 +66,8 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
         payload = json.loads(result.observation)
         payload['knowledge_query'].update(status=self.last_search_details.status,
             gaps=list(self.last_search_details.gaps),
-            selection_reasons={r.citation.collection + ':' + r.citation.chunk_hash:
-                self.last_search_details.audit['selected'][r.citation.collection + ':' + r.citation.chunk_hash]
-                for r in self.last_search_details.results})
+            selection_reasons=[dict(citation=self.last_search_details.audit['selected_citations'][identity], reason=reason)
+                for identity, reason in self.last_search_details.audit['selected'].items()])
         return replace(result, observation=json.dumps(payload))
 
     def query(self, action, seconds=None):
@@ -96,7 +95,8 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
         log = dict(query=action.query, context=self.context, requests=[], inspections=[], artifacts=[],
                    decisions=[], tokens=0, status='insufficient')
         inspected, selected, rejected, gaps = {}, {}, {}, []
-        messages = [{'role': 'system', 'content': self._instructions(action.limit)},
+        identities = {}
+        base_messages = [{'role': 'system', 'content': self._instructions(action.limit)},
                     {'role': 'user', 'content': json.dumps(dict(request=action.query, **self.context))}]
         pool, offset = None, 0
 
@@ -110,9 +110,11 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                 check()
                 row = pool.page(offset=offset, limit=1)[0]
                 offset += 1
-                identity = row.citation.collection + ':' + row.citation.chunk_hash
-                if identity in inspected:
+                source = (row.citation.collection, row.citation.chunk_hash)
+                if source in identities:
                     continue
+                identity = 'c' + str(len(inspected) + 1)
+                identities[source] = identity
                 inspected[identity] = row
                 batch.append(dict(id=identity, citation=row.citation.as_dict(), text=row.text,
                                   vector_rank=row.vector_rank, lexical_rank=row.lexical_rank,
@@ -127,8 +129,16 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
             if not pool.results:
                 gaps.append('No candidates found in the selected collections.')
             else:
-                messages.append({'role': 'user', 'content': json.dumps(inspect())})
+                observation = inspect()
                 while True:
+                    # Old batches remain in the audit, never the next provider context.
+                    state = dict(selected=[dict(id=identity, reason=reason,
+                        citation=inspected[identity].citation.as_dict(), text=inspected[identity].text)
+                        for identity, reason in selected.items()],
+                        rejected=[dict(id=identity, reason=reason[:512])
+                                  for identity, reason in list(rejected.items())[-10:]], gaps=gaps)
+                    messages = base_messages + [{'role': 'user', 'content': json.dumps(
+                        dict(state=state, observation=observation))}]
                     event = dict(request=[dict(m) for m in messages])
                     log['requests'].append(event)
                     response = self.complete(messages, check())
@@ -138,13 +148,16 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                             or response['tokens'] < 0):
                         raise ValueError('invalid librarian completion')
                     log['tokens'] += response['tokens']
-                    messages.append({'role': 'assistant', 'content': response['text']})
                     decision = json.loads(response['text'])
                     kind, accept, reject, new_gaps = self._decision(decision, inspected)
-                    selected.update(accept)
-                    rejected.update(reject)
+                    updated = dict(selected)
+                    updated.update(accept)
                     for identity in reject:
-                        selected.pop(identity, None)
+                        updated.pop(identity, None)
+                    if len(updated) > action.limit:
+                        raise ValueError('selected evidence exceeds requested result limit')
+                    selected = updated
+                    rejected.update(reject)
                     gaps = new_gaps
                     log['decisions'].append(decision)
                     if kind == 'finish':
@@ -170,7 +183,6 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                         observation = inspect()
                         if not observation['candidates']:
                             observation['notice'] = 'No unseen candidates in this pool. Finish or reformulate.'
-                    messages.append({'role': 'user', 'content': json.dumps(observation)})
         except (TimeoutError, OSError, ValueError, TypeError, KeyError) as error:
             log['error_type'] = type(error).__name__
             gaps.append('Retrieval elapsed allowance exhausted.' if isinstance(error, TimeoutError)
@@ -181,7 +193,8 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
         results = tuple(inspected[identity] for identity in selected)[:action.limit]
         status = 'insufficient' if not results else 'partial' if gaps else 'complete'
         log.update(status=status, seconds=elapsed, spent_seconds=self.spent_seconds,
-                   selected=selected, rejected=rejected, gaps=gaps)
+                   selected=selected, selected_citations={identity: inspected[identity].citation.as_dict()
+                       for identity in selected}, rejected=rejected, gaps=gaps)
         # Only returned citations enter the ordinary consumer provenance journal.
         for name in self.collections:
             self.journal.append(enabled=True, collection=name, query=action.query,
@@ -233,7 +246,9 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
             f'Return at most {limit} useful candidates, with explicit applicability limitations in reasons. '
             'Return exactly one JSON object with action next, rewrite, artifact or finish; optional '
             'selected and rejected lists contain {id,reason} for already inspected candidate IDs. '
-            'Selections accumulate; rejecting an earlier selection removes it. Include gaps as a list '
+            'Use the short supplied IDs exactly. Select useful current excerpts before moving to another batch; '
+            'unselected old batches will not be shown again. Selections accumulate up to the requested '
+            'limit; reject earlier selections before replacing them. Include gaps as a list '
             'of strings for missing or unverified evidence. next inspects the next batch; rewrite '
             'requires query:string; artifact requires artifact:{collection,digest,offset,limit} for '
             'a linked admitted memory artifact; finish returns current selections. Do not keep searching '
