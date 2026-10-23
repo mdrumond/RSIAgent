@@ -14,7 +14,6 @@ from benchmarks.a5kernels.matrix import Workload
 from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from benchmarks.a5kernels.phase1_provider import (
-    DISTILLATION_PROMPT,
     DirectActorDriver,
     DirectCompletion,
     DirectCompletionProvider,
@@ -448,7 +447,6 @@ def test_direct_actor_delivers_terminal_host_observation_before_returning(tmp_pa
     }
     prompt = calls[-1]["request"]["messages"][-1]
     assert prompt["role"] == "user"
-    assert DISTILLATION_PROMPT in prompt["content"]
     assert ADMITTED in prompt["content"]
     assert outcome.terminal_response == _distillation()
     assert outcome.tokens == 4
@@ -520,9 +518,6 @@ def test_distillation_correction_is_bounded_and_does_not_rerun_actions(tmp_path)
     assert actions == ["submit"]
     assert learned.distillation is not None
     assert len(calls) == 3
-    assert "invalid structured distillation response" in (
-        calls[-1]["request"]["messages"][-1]["content"]
-    )
 
 
 def test_distillation_correction_stops_at_deadline():

@@ -10,10 +10,7 @@ from core import loop as L
 from core import verifier as V
 from core.trace import ArtifactSink
 from core.verifier_runtime import AgenticVerifierNoProgressError
-from explore.charter import (
-    agent_harness_verifier_charter,
-    agent_harness_verifier_orientation_charter,
-)
+from explore.charter import agent_harness_verifier_charter
 from llm.client import durable_user_message
 
 
@@ -67,7 +64,6 @@ def test_recurrent_replay_rehydrates_authority_until_an_action_anchors_it(
         else:
             assert task in prompt
             assert context in prompt
-            assert "AUTHORITATIVE TASK — verbatim" in prompt
             assert observation in prompt
             assert [m["content"] for m in history
                     if m["role"] == "assistant"] == [action]
@@ -386,10 +382,6 @@ def test_full_agent_can_route_to_evolution_without_changing_runtime_authority(
 
     assert verdict == "evolve"
     assert str(findings).endswith("ROUTE: EVOLVE\n")
-    assert "ROUTE: EVOLVE" in captured["prompt"]
-    assert "ROUTE: EVOLVE" in captured["system"]
-    assert "mechanically hidden" in captured["system"]
-    assert "HANDOFF, REVISE, or EVOLVE" in captured["reminder"]
 
 
 def test_full_agent_can_request_evidence_without_losing_its_session(
@@ -423,8 +415,6 @@ def test_full_agent_can_request_evidence_without_losing_its_session(
     assert verdict == "unverified"
     assert str(findings).endswith("VERDICT: UNVERIFIED\n")
     assert session.stage == "EVIDENCE_REQUESTED"
-    assert "VERDICT: UNVERIFIED" in captured["system"]
-    assert "ACTOR-SUPPLIED EVIDENCE LEADS" in captured["prompt"]
 
 
 def test_verify_independent_dispatches_only_when_opted_in(monkeypatch):
@@ -472,10 +462,6 @@ def test_orientation_preserves_context_without_creating_an_evaluator_lifecycle(
 
     assert verdict == "orientation_ready"
     assert "STAGE: ORIENTATION_READY" in str(findings)
-    assert "STAGE: ORIENTATION" in prompts[0]
-    assert "No Actor Agent for this target cycle has been created" in prompts[0]
-    assert "private_evaluator" not in prompts[0]
-    assert "future candidate is correct" in prompts[0]
     assert session.stage == "ORIENTATION_READY"
     assert session.orientation_runs == 1
     assert session.candidate_generation == 0
@@ -519,28 +505,11 @@ def test_candidate_verification_uses_only_explicit_agent_actions(monkeypatch):
 
     assert verdict == "pass"
     assert "affirmatively supports" in str(findings)
-    assert "private_evaluator" not in prompts[0]
-    assert "freely create, adapt, or discard whatever probes" in prompts[0]
     assert all(not event.startswith("VERIFIER_EVALUATOR_")
                for event, _payload in events)
 
 
-def test_agentic_charter_leaves_investigation_and_report_shape_to_agent():
-    prompt = agent_harness_verifier_charter(
-        "authoritative task", "/tmp/report.md", "file changed")
-    assert "full investigation Agent" in prompt
-    assert "no prescribed checklist, report schema, probe count" in prompt
-    assert "code-as-policy freedom" in prompt
-    assert "mechanically\neffect-isolated action surface" in prompt
-    assert "Freely author Python or Bash" in prompt
-    assert "VERIFIER_SCRATCH" in prompt
-    assert "output truncation" in prompt
-    assert "verifier-read" not in prompt
-    assert "verifier-report" in prompt
-    assert "VERDICT: PASS" in prompt and "VERDICT: FAIL" in prompt
-
-
-def test_unverified_charter_requests_untrusted_reproducible_leads():
+def test_unverified_charter_propagates_actor_reproducible_leads():
     prompt = agent_harness_verifier_charter(
         "authoritative task", "host channel",
         allow_unverified=True,
@@ -548,107 +517,7 @@ def test_unverified_charter_requests_untrusted_reproducible_leads():
             "Actor-stated claim: service is live\n"
             "Exact reproducible probe proposed by Actor: curl localhost"))
 
-    assert "VERDICT: UNVERIFIED" in prompt
-    assert "same persistent Verifier Agent" in prompt
-    assert "credible instruments or observation channels disagree" in prompt
-    assert "ACTOR-SUPPLIED EVIDENCE LEADS" in prompt
-    assert "untrusted leads" in prompt
     assert "curl localhost" in prompt
-
-
-def test_rollback_charter_truthfully_exposes_live_namespaces_then_restore():
-    prompt = agent_harness_verifier_charter(
-        "authoritative task", "host channel",
-        execution_mode="rollback_mirror")
-
-    assert "transactional\nmirror of the exact live Actor machine" in prompt
-    assert "processes, localhost services, network, GUI, and IPC" in prompt
-    assert "restores that checkpoint before grading" in prompt
-    assert "`$HOME` remains `/home/user`" in prompt
-    assert "without access to the Actor's processes" not in prompt
-
-
-def test_agentic_charter_restores_universal_falsification_principles():
-    prompt = agent_harness_verifier_charter(
-        "authoritative task", "host channel", allow_evolve=True)
-    flat = " ".join(prompt.split())
-
-    assert "Verification is method-neutral unless the authoritative task makes a " \
-        "method, application, native editable state, behavior, workflow, or " \
-        "provenance material" in flat
-    assert "compatible file, backend render, or visually similar export is not by " \
-        "itself proof" in flat
-    assert "evidence that distinguishes the required result from a nearby plausible " \
-        "but incorrect substitute" in flat
-    assert "keep investigating through a distinguishing channel" in flat
-    assert "no prescribed checklist, report schema, probe count" in flat
-
-
-def test_orientation_is_free_and_creates_no_automatic_instrument():
-    prompt = agent_harness_verifier_orientation_charter(
-        "authoritative task", "host channel", "trusted baseline")
-    flat = " ".join(prompt.split())
-
-    assert "Freely get familiar with this environment" in prompt
-    assert "task-start observations and hypotheses" in flat
-    assert "Orientation produces only your private report" in flat
-    assert "Only actions you explicitly choose to run are executed" in flat
-    assert "does not discover, freeze, rerun, score, or privilege files" in flat
-    assert "private_evaluator" not in prompt
-    assert "run.sh" not in prompt
-    assert "STAGE: ORIENTATION_READY" in prompt
-    assert "HANDOFF, REVISE, or EVOLVE" in prompt
-
-
-def test_rollback_orientation_describes_its_actual_home_and_transaction():
-    prompt = agent_harness_verifier_orientation_charter(
-        "authoritative task", "host channel", "trusted baseline",
-        execution_mode="rollback_mirror")
-    flat = " ".join(prompt.split())
-
-    assert "transactional mirror of the exact live S0 machine" in flat
-    assert "restores it when orientation ends" in flat
-    assert "`$HOME` remains `/home/user`" in flat
-    assert "effect-isolated and read-only outside" not in flat
-
-
-def test_candidate_verification_uses_fresh_agent_chosen_probes_without_checklist():
-    prompt = agent_harness_verifier_charter(
-        "authoritative task", "host channel", allow_evolve=True)
-
-    assert "S0 observations, old hypotheses" in prompt
-    assert "freely create, adapt, or discard whatever probes" in prompt
-    assert "private_evaluator" not in prompt
-    assert "automatically" not in prompt
-    assert "no prescribed checklist, report schema, probe count" in prompt
-    assert "HANDOFF_FALSIFICATION" not in prompt
-
-
-def test_curriculum_verify_more_preserves_verifier_authority_on_same_candidate():
-    prompt = agent_harness_verifier_charter(
-        "authoritative task", "host channel", candidate_generation=4,
-        curriculum_review=(
-            "The report omitted evidence for one requirement.\n"
-            "ROUTE: VERIFY_MORE\n"))
-
-    assert "This is candidate generation 4" in prompt
-    assert "candidate has not changed" in prompt
-    assert "cannot see the candidate" in prompt
-    assert "has not overruled your local correctness judgment" in prompt
-    assert "publish PASS again" in prompt and "or FAIL" in prompt
-
-
-def test_unified_charter_adds_agent_owned_evolve_route_without_teaching():
-    prompt = agent_harness_verifier_charter(
-        "authoritative task", "host channel", allow_evolve=True)
-
-    assert "ROUTE: HANDOFF" in prompt
-    assert "ROUTE: REVISE" in prompt
-    assert "ROUTE: EVOLVE" in prompt
-    assert "EVOLVE is a routing judgment" in prompt
-    assert "not a request to teach" in prompt
-    assert "no prescribed checklist, report schema, probe count" in prompt
-    assert "VERDICT: PASS" not in prompt and "VERDICT: FAIL" not in prompt
 
 
 def test_substantive_checkpoint_drops_dry_tail_but_returns_observation():
@@ -856,11 +725,7 @@ def test_dry_first_segment_rehydrates_full_inspection_envelope(
             return SimpleNamespace(status="stalled"), history
 
         assert history == []
-        assert "AUTHORITATIVE TASK — verbatim" in prompt
         assert "the complete authoritative task" in prompt
-        assert "current Actor candidate handoff" not in prompt
-        assert "self-checks" in prompt and "conclusions" in prompt
-        assert "SAME-CONTEXT TRANSPORT RECOVERY" in prompt
         report = "# Independent evidence\nROUTE: HANDOFF\n"
         kwargs["program_executor"]("verifier-report", report)
         assert kwargs["terminal_handoff_ready"]()

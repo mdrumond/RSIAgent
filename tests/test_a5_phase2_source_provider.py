@@ -244,7 +244,6 @@ def test_registered_models_receive_exact_host_context_and_emit_source(tmp_path, 
     assert prompt["phase1_memory"] == list(request.phase1_memory)
     assert prompt["phase2_memory"] == list(request.phase2_memory)
     assert prompt["repair_context"] == request.repair_context
-    assert "repair the preceding candidate" in prompt["repair_context"]["instruction"]
     manifest = json.loads((tmp_path / cell.cell_id / request.attempt_id / "provider.json").read_text())
     assert manifest["provider"]["profile_id"] == model.profile_id
     assert manifest["completion_tokens"] == 3

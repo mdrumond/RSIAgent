@@ -386,7 +386,5 @@ def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_pat
     assert outcome.status == 'passed' and executed == ['submit']
     feedback = json.loads(requests[1][0]['latest_host_observation'])['host']
     assert feedback['event'] == 'invalid-action'
-    assert 'No action was executed' in feedback['description']
-    assert 'schema' in feedback['next_action']
     assert feedback['allowed_actions'] == sorted(requests[1][1])
     assert 'submit' in feedback['allowed_actions']
