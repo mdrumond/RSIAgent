@@ -249,35 +249,50 @@ class KnowledgeAgent:
         enabled: bool,
         journal: ProgressiveMemoryJournal,
         database: KnowledgeDB | None = None,
+        databases: dict[str, KnowledgeDB] | None = None,
         collection: str | tuple[str, ...] | list[str] | None = None,
         collections: tuple[str, ...] = (),
         snapshots: dict[str, MemorySnapshot] | None = None,
     ):
+        if database is not None and databases is not None:
+            raise ValueError("select database or databases, not both")
         if collection and collections:
             raise ValueError("select collection or collections, not both")
-        selected = collection_names(collections or collection) if (collections or collection) else ()
-        if enabled and (database is None or not selected):
+        selector = collections or collection or tuple(databases or ())
+        selected = collection_names(selector) if selector else ()
+        stores = dict(databases or {}) if database is None else {name: database for name in selected}
+        if enabled and (not stores or not selected or set(stores) != set(selected)):
             raise ValueError("enabled Knowledge Agent requires a database and collection")
-        if not enabled and (database is not None or selected):
+        if not enabled and (database is not None or stores or selected):
             raise ValueError("disabled Knowledge Agent must not receive KDB access")
         if snapshots and (not enabled or set(snapshots) - set(selected)):
             raise ValueError("artifact snapshots require selected enabled collections")
         self.snapshots = dict(snapshots or {})
         self.enabled = enabled
         self.journal = journal
-        self.database = database
+        self.database = None
+        self.databases = {}
         self.collections = selected
         self.collection = selected[0] if selected else None
         self.manifest = None
-        if database is not None:
-            self.database = database.read_only_view()
-            self.manifests = {name: self.database.manifest(name) for name in selected}
-            self.manifest = self.manifests[self.collection]
+        if stores:
+            views = {}
             try:
+                for name, store in stores.items():
+                    if id(store) not in views:
+                        views[id(store)] = store.read_only_view()
+                    self.databases[name] = views[id(store)]
+                self.database = self.databases[selected[0]]
+                self.manifests = {name: self.databases[name].manifest(name) for name in selected}
+                self.manifest = self.manifests[self.collection]
+                identities = {(m.embedding_model, m.embedding_revision) for m in self.manifests.values()}
+                if len(identities) != 1:
+                    raise ValueError("selected collections require the same embedding model and revision")
                 for name, snapshot in self.snapshots.items():
                     snapshot.bind(self.manifests[name])
             except Exception:
-                self.database.close()
+                for view in views.values():
+                    view.close()
                 raise
 
     def read_artifact(self, collection: str, digest: str, *, offset: int = 0,
@@ -288,8 +303,15 @@ class KnowledgeAgent:
         return self.snapshots[collection].read_artifact(digest, offset=offset, limit=limit)
 
     def close(self) -> None:
-        if self.database is not None:
-            self.database.close()
+        for view in {id(view): view for view in self.databases.values()}.values():
+            view.close()
+
+    def candidate_pool(self, action: KnowledgeQuery, *, size: int = 100, check_remaining=None):
+        """Freeze a globally selected candidate pool for deterministic or adaptive use."""
+        from .knowledge_candidates import CandidatePool, build_candidate_pool
+        if not self.enabled:
+            return CandidatePool(())
+        return build_candidate_pool(self.databases, action, size=size, check_remaining=check_remaining)
 
     def query(self, action: KnowledgeQuery) -> tuple[KnowledgeResult, ...]:
         if not self.enabled:
@@ -298,12 +320,7 @@ class KnowledgeAgent:
             )
             return ()
         assert self.database is not None and self.collection is not None
-        candidates = [validate_knowledge_hit(self.database, name, hit)
-                      for name in self.collections
-                      for hit in self.database.query(name, action.query, limit=action.limit)]
-        results = tuple(sorted(candidates, key=lambda result: (
-            -result.score, result.citation.collection, result.citation.chunk_hash
-        ))[:action.limit])
+        results = self.candidate_pool(action).page(limit=action.limit)
         for name in self.collections:
             self.journal.append(
                 enabled=True, collection=name, query=action.query,
