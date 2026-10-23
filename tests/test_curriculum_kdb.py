@@ -9,7 +9,7 @@ from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
 from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, ProgressiveMemoryJournal
 from benchmarks.ascend.production import NativeProductionConfig
 from test_a5_knowledge_agent import _database, FakeEmbeddings
-from test_a5_phase1_curriculum_selector import context, project, wave
+from test_a5_phase1_curriculum_selector import context, project, wave, outcome
 from test_a5_phase1_adaptive_production import _cell
 
 
@@ -51,13 +51,15 @@ def test_repeated_queries_drive_selection_and_survive_session_serialization(tmp_
 
 def test_disabled_retrieval_and_invalid_query_do_not_call_gate():
     replies = iter(['{"knowledge_query":{"query":"vector"}}', 'DECISION: STALLED\n{"reason":"No access"}'])
-    decision, session = CurriculumAgent(lambda _: next(replies)).select(context())
+    decision, session = CurriculumAgent(lambda _: next(replies)).select(
+        context(prior_outcomes=(outcome(project("prior")),)))
     assert decision.status == "STALLED"
     assert session.turns == 2
     calls = []
     replies = iter(['{"knowledge_query":{"query":"vector","collection":"secret"}}',
                     'DECISION: SATURATED\n{"reason":"Enough evidence"}'])
-    decision, _ = CurriculumAgent(lambda _: next(replies), query_knowledge=calls.append).select(context())
+    decision, _ = CurriculumAgent(lambda _: next(replies), query_knowledge=calls.append).select(
+        context(prior_outcomes=(outcome(project("prior")),)))
     assert decision.status == "SATURATED"
     assert calls == []
 
@@ -65,7 +67,8 @@ def test_disabled_retrieval_and_invalid_query_do_not_call_gate():
 def test_retrieval_is_optional_when_enabled():
     calls = []
     decision, session = CurriculumAgent(lambda _: 'DECISION: STALLED\n{"reason":"Blocked"}',
-                                      query_knowledge=calls.append).select(context())
+                                      query_knowledge=calls.append).select(
+        context(prior_outcomes=(outcome(project("prior")),)))
     assert decision.status == "STALLED"
     assert session.turns == 1
     assert calls == []
