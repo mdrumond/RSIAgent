@@ -429,6 +429,10 @@ def adopt_campaign(root, control, objective, initial_memory, config, legacy_revi
         "measurement_actions": {"profiling": True, "timing": True},
         "kdb_collection": native.get("collection") if knowledge == "with-kdb" else None,
     }
+    if native.get("curriculum_kdb", False):
+        if knowledge != "with-kdb":
+            raise ValueError("KDB-off treatment cannot enable curriculum KDB")
+        expected_identity["curriculum_kdb"] = {"enabled": True, "manifests": {}}
     if knowledge == "with-kdb":
         import sqlite3
         from benchmarks.a5kernels.knowledge import CollectionManifest, collection_names
@@ -439,6 +443,9 @@ def adopt_campaign(root, control, objective, initial_memory, config, legacy_revi
                 for name in collection_names(native["collection"])]
         finally:
             connection.close()
+        if native.get("curriculum_kdb", False):
+            expected_identity["curriculum_kdb"]["manifests"] = {
+                manifest.collection: manifest.fingerprint for manifest in manifests}
         expected_identity["kdb_manifest"] = (manifests[0].fingerprint
             if isinstance(native["collection"], str)
             else {manifest.collection: manifest.fingerprint for manifest in manifests})
