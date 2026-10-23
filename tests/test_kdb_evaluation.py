@@ -279,3 +279,43 @@ def test_judge_receives_unchecked_report_claim_separate_from_registered_error(tm
     pilot.judge(Case('numbers', 'analyzer', 'copy', json.dumps(raw_report), {}))
     assert budget.state['judgments']['numbers']['status'] == 'complete'
     budget.close()
+
+
+@pytest.mark.parametrize('arm_seconds,judge_seconds,global_seconds,expected_arm,expected_judge', [
+    (45, 30, 1800, 45, 30),
+    (180, 60, 7200, 180, 60),
+    (180, 60, 12, 12, 12),
+])
+def test_configured_local_deadlines_obey_remaining_global_budget(
+        tmp_path, arm_seconds, judge_seconds, global_seconds, expected_arm, expected_judge):
+    clock = Clock()
+    budget = Budget(tmp_path/'state.json', 'id', seconds=global_seconds, clock=clock)
+    allowances = []
+    def complete(messages, seconds):
+        allowances.append(seconds)
+        if len(allowances) == 1:
+            return dict(text='{"answer":"Analysis","citations":[],"numerical_claims":[]}', tokens=2)
+        candidates = json.loads(messages[-1]['content'])['candidates']
+        return dict(text=json.dumps(dict(
+            scores={k: dict.fromkeys(['relevance', 'support', 'applicability', 'uncertainty', 'next_actions'], 2) for k in candidates},
+            reasons={k: 'Grounded analysis' for k in candidates})), tokens=2)
+    kwargs = {} if (arm_seconds, judge_seconds) == (45, 30) else dict(arm_seconds=arm_seconds, judge_seconds=judge_seconds)
+    pilot = Pilot(complete, None, '', budget, **kwargs)
+    case = Case('timed', 'writer', 'copy', 'task', {})
+    result = pilot.run_arm(case, 'A')
+    assert result['status'] == 'complete'
+    for arm in 'ABCD':
+        budget.state['runs']['timed:'+arm] = result
+    pilot.judge(case)
+    assert budget.state['judgments']['timed']['status'] == 'complete'
+    assert allowances == [expected_arm, expected_judge]
+    budget.close()
+
+
+@pytest.mark.parametrize('field', ['arm_seconds', 'judge_seconds'])
+@pytest.mark.parametrize('invalid', [0, -1, float('nan'), float('inf'), True, '60'])
+def test_invalid_local_time_allocations_rejected(tmp_path, field, invalid):
+    budget = Budget(tmp_path/'state.json', 'id')
+    with pytest.raises(ValueError):
+        Pilot(None, None, '', budget, **{field: invalid})
+    budget.close()

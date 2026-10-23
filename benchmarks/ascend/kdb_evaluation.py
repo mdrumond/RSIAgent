@@ -113,14 +113,19 @@ class Pilot:
     returns a fresh read-only gate with query(KnowledgeQuery, seconds) and
     read_artifact(**request, seconds=seconds). No shell or file tool is offered.
     """
-    def __init__(self, complete, gate_factory, memory_documents, budget):
+    def __init__(self, complete, gate_factory, memory_documents, budget, *,
+                 arm_seconds=45, judge_seconds=30):
+        for name, value in (('arm_seconds', arm_seconds), ('judge_seconds', judge_seconds)):
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f'{name} must be positive finite seconds')
+        self.arm_seconds, self.judge_seconds = arm_seconds, judge_seconds
         self.complete, self.gate_factory = complete, gate_factory
         self.memory = memory_documents
         self.budget = budget
 
     def run_arm(self, case, arm):
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
-        deadline = self.budget.clock() + min(45, self.budget.remaining())
+        deadline = self.budget.clock() + min(self.arm_seconds, self.budget.remaining())
         started, tokens, queries, retrieved = self.budget.clock(), 0, [], []
         gate, audited = None, []
         def complete(messages):
@@ -270,7 +275,7 @@ class Pilot:
         candidates = {str(i): {key: runs[case.case_id + ':' + arm].get(key, [] if key == 'retrieved' else {})
                                for key in ('output', 'retrieved', 'checks')}
                       for i, arm in enumerate(order)}
-        deadline = self.budget.clock() + min(30, self.budget.remaining())
+        deadline = self.budget.clock() + min(self.judge_seconds, self.budget.remaining())
         try:
             response = self.complete([{'role': 'system', 'content': (
                 'Grade independently against the evidence-backed rubric. Return JSON '

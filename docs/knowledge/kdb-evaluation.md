@@ -72,3 +72,10 @@ Numerical-check fields distinguish registered fact mismatches
 registry (`unregistered_numerical_claims`). An unregistered claim has no automated
 correctness verdict; the judge checks it against raw report evidence and must
 not penalize it solely for lacking a registered identifier.
+
+For a separately identified extended cohort, pass `arm_seconds=180` and
+`judge_seconds=60` to `Pilot`; defaults remain 45 and 30. Both accept positive
+finite seconds. Each nested allowance remains capped by the remaining global
+`Budget`. Record cohort settings in the frozen identity and preserve prior
+cohort outputs and elapsed allocation when extending an explicitly authorized
+campaign.
