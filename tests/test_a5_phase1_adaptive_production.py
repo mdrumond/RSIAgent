@@ -486,8 +486,13 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path,
     retained = result.observation["results"][0]
     assert retained["citation"]["path"].endswith("guide.md")
     digest = retained["artifact_sha256"]
-    assert context.artifacts.read_bytes(digest).decode() == retained["text"]
-    assert result.admitted_artifacts == {digest: "knowledge"}
+    assert context.artifacts.read_bytes(digest) == guide.read_bytes()
+    from dataclasses import asdict
+    index_digest = result.observation["results_index_sha256"]
+    index = context.artifacts.read_json(index_digest)
+    assert [row["citation"] for row in index["results"]] == [
+        asdict(citation) for citation in result.citations]
+    assert result.admitted_artifacts == {digest: "knowledge", index_digest: "knowledge"}
 
 
 def test_kdb_manifest_must_match_supplied_embedding_backend(tmp_path):
