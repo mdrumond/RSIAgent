@@ -84,13 +84,20 @@ def test_curriculum_uses_production_admission_and_retrieval(tmp_path):
         def query(self, request, seconds):
             seen.append(request.query)
             return ()
+    clock = Clock()
     replies = iter(['{"knowledge_query":{"query":"Ascend C movement"}}',
                     'DECISION: STALLED\n{"reason":"Need target evidence"}'])
     def complete(messages, seconds):
-        return dict(text=next(replies), tokens=2)
+        clock.value += 1
+        try:
+            text = next(replies)
+        except StopIteration:
+            raise TimeoutError() from None
+        return dict(text=text, tokens=2)
     context = dict(objective='Study A3 movement', wave_index=1,
-                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[])
-    pilot = Pilot(complete, lambda _: Gate(), 'lesson', Budget(tmp_path/'state.json', 'id'))
+                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[],
+                   phase2_feedback=({'observed_attempt': 'Prior target run unavailable'},))
+    pilot = Pilot(complete, lambda _: Gate(), 'lesson', Budget(tmp_path/'state.json', 'id', clock=clock))
     result = pilot.run_arm(Case('c', 'curriculum', 'movement', 'task', {}, context=context), 'D')
     assert result['status'] == 'complete'
     assert result['checks']['admitted']
@@ -135,7 +142,8 @@ def test_curriculum_timeout_retains_query_and_provider_transcript(tmp_path):
         assert 'Specific case instruction' in messages[-1]['content']
         return dict(text='{"knowledge_query":{"query":"movement"}}', tokens=2)
     context = dict(objective='Study A3 movement', wave_index=1,
-                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[])
+                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[],
+                   phase2_feedback=({'observed_attempt': 'Prior target run unavailable'},))
     pilot = Pilot(complete, lambda _: Gate(), '', Budget(tmp_path/'state.json', 'id'))
     result = pilot.run_arm(Case('c', 'curriculum', 'copy', 'Specific case instruction', {}, context=context), 'D')
     assert result['status'] == 'timeout'
