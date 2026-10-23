@@ -38,7 +38,7 @@ def build_candidate_pool(databases: dict[str, KnowledgeDB], action: KnowledgeQue
     for name, database in sorted(databases.items()):
         check()
         vector_lane, lexical_lane = database.ranked_candidates(
-            name, action.query, limit=size, query_vector=vectors[0], check_remaining=check)
+            name, action.query, limit=None, query_vector=vectors[0], check_remaining=check)
         all_vector.extend((name, hit) for hit in vector_lane)
         lexical.append([(name, hit) for hit in lexical_lane])
     all_vector.sort(key=lambda row: (-row[1].score, row[0], row[1].chunk_id))
@@ -64,18 +64,18 @@ def build_candidate_pool(databases: dict[str, KnowledgeDB], action: KnowledgeQue
             accepted.append((name, replace(hit, vector_rank=global_ranks.get((name, hit.chunk_id)))))
         return accepted
 
-    vector_count = (size * 6 + 9) // 10
-    vector_selected = take(vector_queue, vector_count)
-    lexical_selected = take(lexical_queue, size - vector_count)
-    # Unused reservations can be consumed by either lane.
-    vector_selected += take(vector_queue, size - len(vector_selected) - len(lexical_selected))
-    lexical_selected += take(lexical_queue, size - len(vector_selected) - len(lexical_selected))
-    vector_selected, lexical_selected = deque(vector_selected), deque(lexical_selected)
     selected = []
-    while vector_selected or lexical_selected:
-        for queue, count in ((vector_selected, 6), (lexical_selected, 4)):
-            for _ in range(min(count, len(queue))):
-                name, hit = queue.popleft()
+    # Allocate at acceptance time: preselecting vectors would swallow the keyword
+    # lane entirely when a small corpus fits inside the vector reservation.
+    while len(selected) < size and (vector_queue or lexical_queue):
+        for preferred in (vector_queue, vector_queue, lexical_queue,
+                          vector_queue, lexical_queue):
+            other = lexical_queue if preferred is vector_queue else vector_queue
+            accepted = take(preferred, 1) or take(other, 1)
+            if accepted:
+                name, hit = accepted[0]
                 check()
                 selected.append(validate_knowledge_hit(databases[name], name, hit))
+            if len(selected) == size:
+                break
     return CandidatePool(tuple(selected))

@@ -53,3 +53,9 @@ profile, not merely mocked providers. Freeze diagnostic relevance labels,
 collection manifests and snapshots before those calls. The comparison harness
 can then use fresh wrappers in adaptive reference and indexed-memory conditions;
 never pass hidden rubrics or target repair answers to this wrapper.
+
+Tuple queries also accept `check_remaining=callback` for curriculum deadline
+propagation. The callback's returned remaining seconds cap the nested search
+allowance, and the callback is checked before and after search. An expired caller
+prevents a new search and propagates its own timeout instead of starting a fresh
+90-second allocation. Existing tuple-query calls without a callback remain valid.

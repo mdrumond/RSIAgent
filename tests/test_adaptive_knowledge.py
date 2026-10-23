@@ -204,3 +204,33 @@ def test_repeated_malformed_responses_spend_original_deadline_and_preserve_progr
     assert [allowance for _, allowance in calls] == [16, 12, 8, 4]
     assert len(audit[0]['requests']) == 4
     assert all(len(messages) == 3 for messages, _ in calls)
+
+
+def test_query_caps_nested_provider_to_caller_remaining_allowance():
+    agent, _, clock, calls, _ = setup([pick(1)])
+    deadline = clock() + 8
+    checks = []
+    def check_remaining():
+        checks.append(clock())
+        if clock() >= deadline:
+            raise TimeoutError('caller expired')
+        return deadline - clock()
+    assert agent.query(KnowledgeQuery('query'), seconds=30, check_remaining=check_remaining) == (row(1),)
+    assert calls[0][1] == 6 and checks == [0, 6]
+
+
+def test_expired_query_callback_prevents_search_and_postsearch_expiry_propagates():
+    agent, gate, clock, calls, _ = setup([pick(1)])
+    def expired():
+        raise TimeoutError('caller expired')
+    with pytest.raises(TimeoutError, match='caller expired'):
+        agent.query(KnowledgeQuery('query'), check_remaining=expired)
+    assert not gate.calls and not calls and agent.spent_seconds == 0
+    deadline = clock() + 5
+    def check_remaining():
+        if clock() >= deadline:
+            raise TimeoutError('caller expired')
+        return deadline - clock()
+    with pytest.raises(TimeoutError, match='caller expired'):
+        agent.query(KnowledgeQuery('query'), check_remaining=check_remaining)
+    assert calls[0][1] == 3 and agent.last_search_details.status == 'insufficient'

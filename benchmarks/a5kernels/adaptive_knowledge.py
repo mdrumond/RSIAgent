@@ -70,8 +70,15 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                 for identity, reason in self.last_search_details.audit['selected'].items()])
         return replace(result, observation=json.dumps(payload))
 
-    def query(self, action, seconds=None):
-        return self.search(action, seconds=seconds).results
+    def query(self, action, seconds=None, *, check_remaining=None):
+        if check_remaining is not None:
+            remaining = check_remaining()
+            if remaining is not None:
+                seconds = remaining if seconds is None else min(seconds, remaining)
+        result = self.search(action, seconds=seconds).results
+        if check_remaining is not None:
+            check_remaining()
+        return result
 
     def read_artifact(self, collection, digest, offset=0, limit=16384, *, seconds=None):
         started, deadline = self.clock(), self._deadline(seconds)

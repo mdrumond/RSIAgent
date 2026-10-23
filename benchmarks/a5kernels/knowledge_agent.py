@@ -313,21 +313,26 @@ class KnowledgeAgent:
             return CandidatePool(())
         return build_candidate_pool(self.databases, action, size=size, check_remaining=check_remaining)
 
-    def query(self, action: KnowledgeQuery) -> tuple[KnowledgeResult, ...]:
+    def query(self, action: KnowledgeQuery, *, check_remaining=None) -> tuple[KnowledgeResult, ...]:
+        check = check_remaining or (lambda: None)
+        check()
         if not self.enabled:
             self.journal.append(
                 enabled=False, collection=None, query=action.query, citations=()
             )
+            check()
             return ()
         assert self.database is not None and self.collection is not None
-        results = self.candidate_pool(action).page(limit=action.limit)
+        results = self.candidate_pool(action, check_remaining=check).page(limit=action.limit)
         for name in self.collections:
+            check()
             self.journal.append(
                 enabled=True, collection=name, query=action.query,
                 citations=tuple(result.citation for result in results
                                 if result.citation.collection == name),
                 manifest=self.manifests[name],
             )
+        check()
         return results
 
     def execute(self, action: KnowledgeQuery) -> "DomainActionResult":
