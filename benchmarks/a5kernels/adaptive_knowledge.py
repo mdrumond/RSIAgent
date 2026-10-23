@@ -105,13 +105,13 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
         identities = {}
         base_messages = [{'role': 'system', 'content': self._instructions(action.limit)},
                     {'role': 'user', 'content': json.dumps(dict(request=action.query, **self.context))}]
-        pool, offset = None, 0
+        pool, offset, latest_batch = None, 0, []
 
         def check():
             return self._allowance(deadline)
 
         def inspect():
-            nonlocal offset
+            nonlocal offset, latest_batch
             batch = []
             while pool is not None and offset < len(pool.results) and len(batch) < 10 and len(inspected) < 100:
                 check()
@@ -126,6 +126,7 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                 batch.append(dict(id=identity, citation=row.citation.as_dict(), text=row.text,
                                   vector_rank=row.vector_rank, lexical_rank=row.lexical_rank,
                                   cosine=row.score))
+            latest_batch = batch
             log['inspections'].append(dict(offset=offset, candidates=batch))
             return dict(candidates=batch, inspected=len(inspected), inspection_remaining=100-len(inspected),
                         pool_remaining=max(0, len(pool.results)-offset), seconds_remaining=check())
@@ -188,7 +189,7 @@ class AdaptiveKnowledgeAgent(KnowledgeAgent):
                         if isinstance(payload.get('data'), bytes):
                             payload['data'] = payload['data'].decode('utf-8', errors='replace')
                         log['artifacts'].append(dict(request=request, response=payload))
-                        observation = dict(artifact=payload)
+                        observation = dict(candidates=latest_batch, artifact=payload)
                     else:
                         if len(inspected) == 100:
                             gaps.append('Candidate inspection limit reached before sufficient evidence was confirmed.')
