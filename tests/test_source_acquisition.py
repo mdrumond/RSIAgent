@@ -162,3 +162,62 @@ def test_autocrlf_checkout_exports_canonical_blobs_without_changing_input(upstre
     assert git("status", "--porcelain", cwd=checkout) == ""
     pinned = {**spec(), "revision": result["revision"]}
     assert acquire_source(pinned, tmp_path / "artifacts")["root"] == str(root)
+
+
+def test_file_allowlist_filters_acquisition_and_retains_hashes(upstream, tmp_path):
+    data = (upstream / "kernel.py").read_bytes()
+    requested = {**spec(), "files": [
+        {"path": "kernel.py", "sha256": hashlib.sha256(data).hexdigest()},
+        {"path": "LICENSE", "sha256": hashlib.sha256((upstream / "LICENSE").read_bytes()).hexdigest()},
+    ]}
+    result = acquire_source(requested, tmp_path / "artifacts", upstream)
+    assert {item["path"] for item in result["files"]} == {"kernel.py", "LICENSE"}
+    assert result["licenses"] == ["LICENSE"]
+    assert {item["path"] for item in result["omitted"]
+            if item["reason"] == "outside-source-allowlist"} == {
+                "Third_Party_Open_Source_Software_Notice", "中文.md"}
+    assert next(item for item in result["files"] if item["path"] == "kernel.py") == {
+        "path": "kernel.py", "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+    # A resumed snapshot is rechecked against the requested allowlist.
+    requested["revision"] = result["revision"]
+    requested["files"][0]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="hash mismatch"):
+        acquire_source(requested, tmp_path / "artifacts")
+
+
+@pytest.mark.parametrize("files", [[], [{"path": "missing.md", "sha256": "0" * 64}],
+    [{"path": "../kernel.py", "sha256": "0" * 64}],
+    [{"path": "kernel.py", "sha256": "0" * 64}] * 2,
+    [{"path": "kernel.py"}]])
+def test_file_allowlist_rejects_unavailable_or_ambiguous_content(upstream, tmp_path, files):
+    with pytest.raises(ValueError, match="allowlist"):
+        acquire_source({**spec(), "files": files}, tmp_path / "artifacts", upstream)
+
+
+def test_allowlisted_acquisition_reaches_gated_agent_with_provenance(upstream, tmp_path):
+    from benchmarks.a5kernels.expanded_kdb import ingest, query
+
+    class Embeddings:
+        model = "test-model"
+        revision = "test-revision"
+
+        def embed(self, texts):
+            return [[1.0, 0.0] for _ in texts]
+
+    data = (upstream / "kernel.py").read_bytes()
+    source = acquire_source({**spec(), "document_language": "en", "files": [
+        {"path": "kernel.py", "sha256": hashlib.sha256(data).hexdigest()}
+    ]}, tmp_path / "artifacts", upstream)
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text(json.dumps({"schema_version": 1, "sources": [source]}))
+    database = tmp_path / "knowledge.sqlite3"
+    report = ingest(inventory, database, Embeddings())
+    result = query(database, Embeddings(), "add", tmp_path / "journal.jsonl",
+                   collections=(report["collections"][0]["collection"],))
+    assert len(result["results"]) == 1
+    hit = result["results"][0]
+    assert hit["text"] == data.decode()
+    assert hit["citation"]["path"] == "kernel.py"
+    assert hit["citation"]["repository"] == source["repository"]
+    assert hit["citation"]["revision"] == source["revision"]
+    assert hit["citation"]["source_sha256"] == hashlib.sha256(data).hexdigest()
