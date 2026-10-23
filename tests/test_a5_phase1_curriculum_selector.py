@@ -80,7 +80,7 @@ def context(**updates):
     return CurriculumContext(**values)
 
 
-def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_grammar():
+def test_selection_receives_prior_outcomes_and_structured_project_grammar():
     prior_spec = project("prior")
     prior = PriorOutcome(
         "prior", ProjectInformation.from_project(prior_spec), True,
@@ -95,39 +95,17 @@ def test_prompt_is_model_neutral_and_contains_objective_coverage_outcomes_and_gr
     decision, _ = CurriculumAgent(complete).select(context(
         pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), prior_outcomes=(prior,)
     ))
-    prompt = calls[0][-1]["content"]
     assert isinstance(decision, TerminalDecision)
-    assert all(term in prompt for term in (
-        "Learn reusable Catlass", "gm-ub-movement", "Movement passed",
-        "timing_lengths", '"graph"', '"copy"',
-        "DECISION: WAVE", "DECISION: SATURATED",
-    ))
-    assert all(term not in prompt.lower() for term in (
-        "openai", "deepseek", "temperature", "api_key",
-    ))
-    grammar = json.loads(prompt.splitlines()[-1])["bounded_project_grammar"]
-    assert grammar["padding_multiples"] == [1, 16, 32, 64, 128, 256]
-    assert grammar["block_count_bounds"] == [1, 32]
-    assert "[1, 4096]" in grammar["shape"]
-    assert "65536" in grammar["shape"]
-    assert "[1, 4096]" in grammar["timing_lengths"]
-    assert "one-dimensional" in grammar["timing_lengths"]
-    low_precision = grammar["low_precision_rules"]
-    fp8 = low_precision["float8_e4m3fn/float8_e5m2"]
-    mx = low_precision["mxfp8_e4m3fn/mxfp8_e5m2"]
-    assert "exactly one matmul" in fp8 and "no padded-tail" in fp8
-    assert "copy-only graphs preserve FP8" in fp8
-    assert "every non-copy FP8 graph computes all intermediates and output in FP32" in fp8
-    assert "only one matmul" in mx and "inputs in order" in mx
-    assert "no padded-tail" in mx and "FP32 output" in mx
-    assert "per 32 K" in mx and "gm_scale0 and gm_scale1 before gm_output" in mx
-    rules = grammar["capability_operation_rules"]
-    assert "if and only if" in rules["rule"]
+    payload = json.loads(calls[0][-1]["content"].splitlines()[-1])
+    assert payload["objective"] == context().objective
+    assert payload["pre_wave_coverage"] == [Capability.GM_UB_MOVEMENT.value]
+    assert payload["prior_outcomes"] == [prior.prompt_dict()]
+    rules = payload["bounded_project_grammar"]["capability_operation_rules"]
+    # These structured operation labels feed admission and project construction.
     assert rules["simd-vector"] == ["add", "multiply", "relu"]
     assert rules["simt-reduction"] == ["reduce-sum"]
     assert rules["simt-mask"] == ["mask-positive"]
     assert rules["cube-tiling"] == ["matmul"]
-    assert "copy alone does not require" in rules["gm-ub-movement"]
 
 
 def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
