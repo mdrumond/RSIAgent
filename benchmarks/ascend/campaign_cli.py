@@ -999,6 +999,9 @@ def main(argv=None, *, screen=start_screen):
         _write(control / "job.json", job)
     else:
         job = _read(control / "job.json")
+    if job.get('phase') in (2, '2') and args.command in {
+            'resume', 'continue', 'sample', 'approve', 'reject', 'run-approved', '_campaign'}:
+        parser.error('Ascend Phase 2 execution is retired; use run_ascend_subjects.py; historical status, collection and packaging remain available')
     if args.command in {"start", "resume", "continue"}:
         with (control / "campaign.lock").open("a") as lock:
             try:

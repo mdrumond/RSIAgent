@@ -16,6 +16,11 @@ dispatching device execution:
 | `run_a5_phase2.py` | `qualify`, `run` |
 | `python -m benchmarks.ascend.phase2_cli --target a3` | `admit`, `run` |
 
+Existing Phase 2 control files also reject resume, continuation, curriculum
+sampling/approval/rejection, and private compute-worker dispatch. Historical
+`status`, `collect`, `package`, and artifact-collector workers remain available;
+these paths do not resume training.
+
 For a new campaign, create an ordered subject configuration and reuse your
 ignored provider/runtime settings with the subject launcher. Use a new campaign
 root rather than relabeling an existing Phase 2 checkpoint. See
