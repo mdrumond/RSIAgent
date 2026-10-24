@@ -176,13 +176,13 @@ class ProjectVerifierAgent:
                     offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
                     if type(offset) is not int or not 0 <= offset <= len(data) or type(limit) is not int or not 1 <= limit <= 65536:
                         raise ValueError('invalid artifact page')
-                    page = data[offset:offset + limit]
+                    page = data[offset:offset + min(limit,8192)]
                     if page or not data:
                         read.add(digest)
                         observed.setdefault(digest, []).append((offset, offset + len(page)))
                     observation = {'sha256': digest, 'offset': offset, 'size': len(data),
                                    'text': page.decode('utf-8', errors='replace'),
-                                   'next_offset': offset + limit if offset + limit < len(data) else None}
+                                   'next_offset': offset + len(page) if offset + len(page) < len(data) else None}
                 elif set(value) == {'knowledge_query'}:
                     payload = value['knowledge_query']
                     if self.query_knowledge is None:
