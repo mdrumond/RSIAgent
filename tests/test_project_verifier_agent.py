@@ -241,3 +241,12 @@ def test_snippet_requires_all_quoted_bytes_observed_across_pages(quoted_source):
                       if event['kind'] == 'tool' and 'read_artifact' in event['payload']['action']
                       and event['payload']['action']['read_artifact']['sha256'] == target]
     assert observed_pages == [first, tail, gap]
+
+
+def test_provider_metadata_is_corrected_before_executing_valid_tool():
+    malformed=dict(read(R),type='json_object')
+    h=Harness([malformed,*prerequisites(),decision(memory())])
+    result=h.agent.review(request())
+    assert result['decision']=='accept'
+    assert len([event for event in h.agent.last_trace if event['kind']=='feedback'])==1
+    assert [sha for sha,_ in h.reads].count(R)==1
