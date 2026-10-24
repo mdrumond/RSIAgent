@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -150,3 +151,68 @@ def test_remote_agent_uses_relative_transfer_and_cwd_with_absolute_payloads(tmp_
     submit = next(call for call in remote.calls if call[2] == 'run')
     assert submit[submit.index('--cwd')+1] == 'task'
     assert '/owned/task/candidates/' in Path(submit[submit.index('--file')+1]).read_text()
+
+
+def test_queue_expiry_cancels_owned_handle_without_resubmitting(tmp_path):
+    now = [1000.0]
+    remote = Remote()
+    def delayed(argv, **options):
+        if argv[2] == 'observe':
+            remote.calls.append(argv)
+            now[0] += 11
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='queued', handle=argv[3])), '')
+        if argv[2] == 'cancel':
+            remote.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='cancelled', handle=argv[3])), '')
+        return remote(argv, **options)
+    candidate = backend(tmp_path, delayed, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    for _ in range(2):
+        with pytest.raises(_PendingObservation, match='elapsed allocation expired'):
+            candidate.compile(plan, tmp_path/'bundle')
+    assert len([call for call in remote.calls if call[2] == 'run']) == 1
+    assert [call[3] for call in remote.calls if call[2] == 'cancel'] == ['remote:fixture:job:1']
+    record = json.loads((candidate.root/plan.execution_id/'compile'/'operation.json').read_text())
+    assert record['expired'] is True
+    assert record['cancel_requested'] is True
+
+
+def test_payload_dispatched_after_frozen_expiry_does_not_execute(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote, timeout=10, wall_clock=lambda: time.time()-100)
+    marker = tmp_path/'must-not-be-created'
+    candidate.run_remote(('python', '-c', 'import pathlib,sys;pathlib.Path(sys.argv[1]).touch()', str(marker)), key='late')
+    script = candidate.root/'late'/'command.sh'
+    result = subprocess.run(('bash', str(script)), capture_output=True, text=True, check=False)
+    assert result.returncode == 124
+    assert not marker.exists()
+
+
+def test_distinct_replays_run_fresh_but_same_replay_uses_cache(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    compilation = candidate.compile(plan, tmp_path/'bundle')
+    measurements = CplNativeMeasurements(compilation=compilation, candidate_backend=candidate,
+        expected_output=EXPECTED, evidence_directory=tmp_path/'measurements',
+        environment_identity=dict(cann_version='cann', profiler_version='msprof'))
+    first = measurements.timing(warm_up=1, launch_count=2, replay_id='first')
+    assert measurements.timing(warm_up=1, launch_count=2, replay_id='first') == first
+    measurements.timing(warm_up=1, launch_count=2, replay_id='second')
+    scripts = [Path(call[call.index('--file')+1]).read_text() for call in remote.calls if call[2] == 'run']
+    assert sum('native_measurement_driver.py' in script for script in scripts) == 2
+
+
+def test_compile_from_two_directories_then_measurement_reuses_canonical_bundle(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    first = candidate.compile(plan, tmp_path/'actor-compile')
+    second = candidate.compile(plan, tmp_path/'measurement-compile')
+    assert second == first
+    result = CplNativeMeasurements(compilation=second, candidate_backend=candidate,
+        expected_output=EXPECTED, evidence_directory=tmp_path/'measurements',
+        environment_identity=dict(cann_version='cann', profiler_version='msprof')).timing(launch_count=2)
+    assert result['summary']['median_us'] == 11
+    assert len([call for call in remote.calls if call[2] == 'upload']) == 1
+    assert len([call for call in remote.calls if call[2] == 'run']) == 3

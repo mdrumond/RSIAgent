@@ -3,7 +3,6 @@ import hashlib
 import json
 import math
 from pathlib import Path, PurePosixPath
-import shlex
 from statistics import median
 import subprocess
 import time
@@ -31,7 +30,7 @@ class CplNativeCandidateBackend:
 
     def __init__(self, *, cpl_remote, target, runtime, remote_workspace, physical_device,
                  state_directory, profile='bz-a3-1', timeout=600, remaining_seconds=None, registry_workspace=None,
-                 process_runner=subprocess.run, clock=time.monotonic):
+                 process_runner=subprocess.run, clock=time.monotonic, wall_clock=time.time):
         workspace = PurePosixPath(remote_workspace)
         if not workspace.is_absolute() or '..' in workspace.parts:
             raise ValueError('remote_workspace must be an absolute registry task workspace')
@@ -48,6 +47,7 @@ class CplNativeCandidateBackend:
             workspace.relative_to(self.registry_workspace)
         self.root, self.timeout = Path(state_directory), timeout
         self.remaining_seconds, self._run, self.clock = remaining_seconds, process_runner, clock
+        self.wall_clock = wall_clock
         self.runtime_identity = dict(target=target, runtime=runtime, profile=profile,
                                      physical_device=physical_device, logical_device=0)
 
@@ -68,7 +68,7 @@ class CplNativeCandidateBackend:
             raise ProjectInfrastructureError('CPL response must be an object')
         return value
 
-    def _operation(self, key, arguments, *, kind):
+    def _operation(self, key, arguments, *, kind, expires_at=None):
         """Never submit again after an uncertain submission or observable handle."""
         path = self.root / key / 'operation.json'
         identity = dict(route=self.runtime_identity, workspace=str(self._workspace), arguments=list(arguments))
@@ -77,7 +77,25 @@ class CplNativeCandidateBackend:
             raise ProjectInfrastructureError('retained CPL operation identity changed')
         if 'result' in record:
             return record['result']
-        deadline = self.clock() + self._allowance()
+        if 'expires_at' not in record:
+            if record['state'] != 'new':
+                raise ProjectInfrastructureError('retained operation lacks frozen elapsed expiry; inspect its handle')
+            record['expires_at'] = expires_at if expires_at is not None else self.wall_clock()+self._allowance()
+        def check_expiry():
+            expired = self.wall_clock() >= record['expires_at']
+            expired |= self.remaining_seconds is not None and self.remaining_seconds() <= 0
+            if not expired:
+                return
+            if kind == 'job' and record.get('handle') and record['state'] not in ('completed', 'failed', 'cancelled'):
+                cancelled = self._call(('cancel', record['handle']), seconds=min(30, self.timeout))
+                if cancelled.get('handle') != record['handle']:
+                    raise ProjectInfrastructureError('CPL cancellation returned a foreign handle')
+                record.update(state=cancelled.get('state'), cancel_requested=True)
+            record['expired'] = True
+            _save(path, record)
+            raise _PendingObservation('CPL elapsed allocation expired; retained handle '+str(record.get('handle')))
+        check_expiry()
+        deadline = self.clock() + min(self._allowance(), record['expires_at']-self.wall_clock())
         if not record.get('handle'):
             if record['state'] != 'new':
                 raise _PendingObservation('CPL submission outcome is ambiguous; do not resubmit')
@@ -94,15 +112,21 @@ class CplNativeCandidateBackend:
         else:
             value = dict(state=record['state'], handle=record['handle'])
         while value.get('state') not in ('completed', 'failed', 'cancelled'):
+            check_expiry()
             if not record.get('handle') or self.clock() >= deadline:
                 raise _PendingObservation('CPL operation pending; retain and observe '+str(record.get('handle')))
-            value = self._call(('observe', record['handle'], '--wait', '--timeout',
-                                str(max(1, min(30, int(deadline-self.clock()))))),
-                               seconds=max(.001, deadline-self.clock()))
+            try:
+                value = self._call(('observe', record['handle'], '--wait', '--timeout',
+                                    str(max(1, min(30, int(deadline-self.clock()))))),
+                                   seconds=max(.001, deadline-self.clock()))
+            except _PendingObservation:
+                check_expiry()
+                raise
             if value.get('handle') != record['handle']:
                 raise ProjectInfrastructureError('CPL observation returned a foreign handle')
             record['state'] = value.get('state')
             _save(path, record)
+        check_expiry()
         if kind == 'transfer':
             if value.get('state') != 'completed':
                 raise ProjectInfrastructureError('CPL upload did not complete')
@@ -135,16 +159,23 @@ class CplNativeCandidateBackend:
         directory = self.root / key
         directory.mkdir(parents=True, exist_ok=True)
         script = directory / 'command.sh'
+        command = directory / 'command.json'
+        payload = json.loads(command.read_text()) if command.exists() else dict(
+            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance())
+        if payload['argv'] != [str(arg) for arg in argv]:
+            raise ProjectInfrastructureError('retained CPL command changed')
+        _save(command, payload)
         body = 'set -eu\nexport ASCEND_RT_VISIBLE_DEVICES='+str(self._device)+'\n'
-        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+'\n'
-        body += 'timeout --signal=TERM --kill-after=10s '+str(self._allowance())+'s '
-        body += shlex.join(tuple(str(a) for a in argv))+'\n'
-        # Freeze original server-side elapsed allowance on resume.
+        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+"\npython - <<'CPL_PAYLOAD'\n"
+        body += 'import json,os,sys,time\nremaining='+repr(payload['expires_at'])+'-time.time()\n'
+        body += 'if remaining <= 0: sys.exit(124)\n'
+        body += 'command=json.loads('+repr(json.dumps(payload['argv']))+')\n'
+        body += "os.execvp('timeout', ['timeout','--signal=TERM','--kill-after=10s',str(remaining)+'s',*command])\nCPL_PAYLOAD\n"
         if not script.exists():
             script.write_text(body)
         arguments = ('run', self.target, '--runtime', self.runtime,
                      '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
-        value = self._operation(key, arguments, kind='job')
+        value = self._operation(key, arguments, kind='job', expires_at=payload['expires_at'])
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
         result.job_handle = value['handle']
         return result
@@ -156,7 +187,7 @@ class CplNativeCandidateBackend:
     def compile(self, plan, local_directory):
         self._require_plan(plan)
         key = plan.execution_id
-        bundle = self.build_bundle(plan, Path(local_directory) / (key+'.tar'))
+        bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
         archive = self._workspace / (key+'.tar')
         self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')
         result = self.run_remote(('bash', '-c', _COMPILE_SCRIPT, 'rsi-native', str(archive),
@@ -231,7 +262,8 @@ class CplNativeMeasurements(NativeMeasurementBackend):
                 '--warm-up', str(warm_up), '--launch-count', str(launch_count)]
         if metric:
             argv += ['--metric', 'ArithmeticUtilization' if metric == 'Basic' else metric]
-        result = backend.run_remote(argv, key='measurements/'+request_id, cwd=directory)
+        replay_key = canonical_digest(dict(request_id=request_id, replay_id=replay))
+        result = backend.run_remote(argv, key='measurements/'+replay_key, cwd=directory)
         if result.returncode:
             raise ProjectInfrastructureError(result.stderr or result.stdout or 'native measurement failed')
         self._verify_values(_parse_output(result.stdout, len(self._expected)))

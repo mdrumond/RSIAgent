@@ -34,3 +34,19 @@ continuing. Completed source/library identities remain bound to the immutable
 candidate, selected route/runtime, and physical device. Timing verifies values
 against the host-owned reference and retains samples, environment, compact raw
 evidence and the full CPL job handle. Vendor profiler reports remain remote.
+
+Elapsed expiry is frozen in retained state and in the file-backed payload as an
+absolute UTC deadline, including time spent queued. The remote Python launcher
+refuses expired work before starting a compiler/kernel and gives `timeout` only
+the remaining allocation. Local observation also requests cancellation of an
+owned queued/running job when its allocation expires. A transport disconnect
+before expiry preserves observe-only recovery; it does not cancel or resubmit.
+These deadline checks rely on the ordinary synchronized host clocks used by
+elapsed campaign recovery. Retained pending state predating frozen-expiry
+support must be inspected through its original handle before reuse.
+
+Bundles are cached under the transport state root, so compiling the same plan
+from an Actor directory and then a measurement directory observes the same
+operation. Each explicit measurement replay identity has its own retained job;
+repeating that same replay returns its cached evidence, while a distinct replay
+with identical dimensions launches a fresh measurement.
