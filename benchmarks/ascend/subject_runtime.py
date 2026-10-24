@@ -1,0 +1,464 @@
+"""Compose the unified subject campaign using configured production bindings."""
+import argparse
+from copy import copy
+from contextlib import redirect_stdout
+import hashlib
+import io
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import time
+
+from optimizer.jobs import atomic, canonical
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from benchmarks.a5kernels.phase1_adaptive import AdaptiveProjectRequest
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumContext, WaveDecision
+from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
+from benchmarks.a5kernels.phase1_provider import direct_profile
+from .project_verifier import ProjectVerifierAgent
+from .subject_campaign import SubjectCampaign
+from .subject_execution import SubjectExecutor, optimizer_snapshot
+from .subjects import load_subjects
+from .subject_memory import digest as memory_digest
+from .subject_knowledge import SubjectKnowledge, memory_artifacts
+
+
+def generation_memory(snapshot, subject_id, store, *, max_bytes=8192):
+    """Small advisory context; complete immutable records remain in the snapshot."""
+    envelope = json.loads(snapshot)
+    seed = envelope['initial_memory'].encode('utf-8')
+    header = dict(snapshot_sha256=store.put_bytes(snapshot), memory_count=len(envelope['memories']),
+        initial_memory=dict(sha256=store.put_bytes(seed), bytes=len(seed), preview=seed[:1024].decode('utf-8', errors='ignore')))
+    rows = [header]
+    records = list(reversed(envelope['memories']))
+    records.sort(key=lambda record: record['provenance'].get('subject_id') != subject_id)
+    for record in records:
+        proposal = record['proposal']
+        row = dict(memory_id=record['memory_id'], version=memory_digest(record),
+            subject_id=record['provenance'].get('subject_id'),
+            **{key: proposal[key][:384] for key in ('summary', 'preconditions', 'expectations')})
+        if len(canonical([*rows, row])) <= max_bytes:
+            rows.append(row)
+    return tuple(rows)
+
+
+class _SelectionResults(tuple):
+    def __new__(cls, rows, details):
+        value = super().__new__(cls, rows)
+        value.search_details = details
+        return value
+
+
+def referenced_settings(settings):
+    """Freeze ignored runtime JSON bytes without persisting their contents."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('--config'); parser.add_argument('--worker-config')
+    options, _ = parser.parse_known_args(settings.get('phase1_arguments', []))
+    paths = dict(config=options.config, worker=options.worker_config)
+    if isinstance(settings.get('optimizer_worker_config'), str):
+        paths['optimizer_worker'] = settings['optimizer_worker_config']
+    return {role: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for role, path in paths.items() if path is not None}
+
+
+def bounded_completion(provider, profile, messages, remaining_seconds):
+    """Use a private provider copy and bound both retry and HTTP timeouts."""
+    from benchmarks.a5kernels.phase1_provider import openai_compatible_transport, DirectCompletion
+    deadline = provider.clock() + remaining_seconds
+    selected = copy(provider)
+    selected.retry_max_seconds = remaining_seconds
+    transport = provider._transport
+    def bounded_transport(**options):
+        available = deadline - provider.clock()
+        if available <= 0:
+            raise TimeoutError('subject role provider elapsed allowance exhausted')
+        if transport is openai_compatible_transport:
+            from openai import OpenAI
+            response = OpenAI(api_key=options['api_key'], base_url=options['base_url'],
+                timeout=available, max_retries=0).chat.completions.create(**options['request'])
+            result = DirectCompletion(response.choices[0].message.content, response.usage.completion_tokens)
+        else:
+            # Injected transports own their I/O bounds, just as in the Actor API.
+            result = transport(**options)
+        if provider.clock() >= deadline:
+            raise TimeoutError('subject role provider returned after its elapsed allowance')
+        return result
+    selected._transport = bounded_transport
+    from benchmarks.a5kernels.phase1_live import InfrastructureFailure
+    try:
+        return selected.complete(profile, messages).text
+    except InfrastructureFailure:
+        if provider.clock() >= deadline:
+            raise TimeoutError('subject role provider elapsed allowance exhausted') from None
+        raise
+
+
+def compose_production(settings, *, target, root, initial_memory, max_seconds):
+    """Capture existing CLI composition without invoking its learning loop."""
+    from .phase1_cli import main as native_main
+    from .production import build_native_adaptive_phase1
+    from benchmarks.a5kernels.phase1_adaptive_cli import main as a5_main
+    from benchmarks.a5kernels.phase1_adaptive_production import build_adaptive_phase1
+    arguments = settings['phase1_arguments']
+    if not isinstance(arguments, list) or any(not isinstance(item, str) for item in arguments):
+        raise ValueError('phase1_arguments must be a string list')
+    forbidden = ('--root', '--objective', '--initial-memory', '--target', '--max-seconds', '--project-target')
+    if any(item.split('=', 1)[0] in forbidden for item in arguments):
+        raise ValueError('phase1_arguments cannot override subject campaign identity or budget')
+    captured = []
+    root.mkdir(parents=True, exist_ok=True)
+    seed = root / 'initial-memory.bin'
+    if seed.exists() and seed.read_bytes() != initial_memory:
+        raise ValueError('initial memory changed')
+    seed.write_bytes(initial_memory)
+
+    def capture(builder, options):
+        built = builder(**options)
+        coordinator = getattr(built, 'coordinator', built)
+        actor = coordinator.execute_project
+        captured.append(dict(coordinator=coordinator, actor=actor,
+            provider=actor.actor.provider, profile=actor.profile,
+            paths=options.get('paths', options.get('config')), embeddings=options.get('embeddings')))
+        return SimpleNamespace(run=lambda: {})
+
+    argv = ['--target', target, 'run', '--root', str(root / 'binding'),
+            '--objective', 'Subject curriculum production binding', '--initial-memory', str(seed),
+            '--max-seconds', str(max_seconds), *arguments]
+    with redirect_stdout(io.StringIO()):
+        native_main(argv, native_parallel=False,
+            native_builder=lambda **options: capture(build_native_adaptive_phase1, options),
+            a5_main=lambda args: a5_main(args, builder=lambda **options: capture(build_adaptive_phase1, options)))
+    return captured[0]
+
+
+def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
+                           max_seconds=7200, compose=compose_production):
+    subjects = tuple(subjects)
+    if target == 'a5' and any((getattr(subject, 'task', None) or {}).get('kind') == 'optimizer'
+                              for subject in subjects):
+        raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest(),
+                    referenced_json_sha256=referenced_settings(settings))
+    identity_path = root / 'subject-runtime.json'
+    if identity_path.exists() and json.loads(identity_path.read_bytes()) != identity:
+        raise ValueError('subject runtime settings or target changed on resume')
+    atomic(identity_path, canonical(identity))
+    bound = compose(settings, target=target, root=root, initial_memory=initial_memory,
+                    max_seconds=max_seconds)
+    actor, provider, profile = bound['actor'], bound['provider'], bound['profile']
+    policy = bound['coordinator'].curriculum.target_policy
+    store = ContentAddressedArtifacts(root / 'artifacts')
+    plans_path = root / 'project-plans.json'
+    plans = json.loads(plans_path.read_bytes()) if plans_path.exists() else {}
+    current = {}
+    campaign = None
+
+    def role_complete(role):
+        name = settings.get(role + '_model')
+        selected = profile if name is None else direct_profile(next(
+            item for item in MODEL_IDENTITIES if item.backend_model.value == name))
+        def complete(messages, *, remaining_seconds):
+            return bounded_completion(provider, selected, messages, remaining_seconds)
+        return complete
+
+    curriculum_complete, verifier_complete = role_complete('curriculum'), role_complete('verifier')
+    paths, embeddings = bound.get('paths'), bound.get('embeddings')
+    knowledge = SubjectKnowledge(root, store, lambda: campaign.memory, paths=paths, embeddings=embeddings,
+        reference_query=getattr(bound['coordinator'].curriculum, 'query_knowledge', None))
+    reference_query = knowledge.reference_query
+
+    def check(payload, *, remaining_seconds):
+        from .execution import process_deadline
+        request = current['request']
+        item = plans[request.project_id]
+        if 'spec' not in item:
+            raise ValueError('extra graph checks require a graph subject project')
+        change = payload['check']
+        if set(change) != {'spec'}:
+            raise ValueError('additional check requires a complete variant spec')
+        variant = ProjectSpec.from_mapping(change['spec'])
+        policy.admit(variant)
+        source = store.read_bytes(request.source_sha256).decode('utf-8')
+        with process_deadline(time.monotonic() + remaining_seconds):
+            result = actor.executor.execute(variant, source)
+        refs = {name: store.put_json(value) for name, value in result.artifacts.items()}
+        return dict(host_verified=result.evidence.verified, artifacts=refs,
+                    classification=result.evidence.classification.value, original_spec=item['spec'],
+                    variant_spec=variant.as_dict())
+
+    class RuntimeVerifier(ProjectVerifierAgent):
+        def review(self, request, **options):
+            current['request'] = request
+            return super().review(request, **options)
+
+    verifier = RuntimeVerifier(verifier_complete, knowledge.read_artifact,
+        query_knowledge=knowledge.query, request_check=check)
+    optimizer_config = settings.get('optimizer_worker_config')
+    if isinstance(optimizer_config, str):
+        optimizer_config = json.loads(Path(optimizer_config).read_bytes())
+    if optimizer_config is not None:
+        from .phase2_optimizer_execution import OptimizerTaskExecutor
+        def optimizer_factory(directory, task, snapshot):
+            runtime = getattr(actor.executor, 'runtime_identity', None)
+            if (runtime is None or optimizer_config.get('arch') != runtime.get('architecture', getattr(paths, 'arch', None))
+                    or str(optimizer_config.get('physical_device')) != runtime.get('device')):
+                raise ValueError('optimizer worker must match the composed target architecture and device')
+            return OptimizerTaskExecutor(directory, task, snapshot, optimizer_config)
+    else:
+        optimizer_factory = None
+    executor = SubjectExecutor(actor, optimizer_factory)
+
+    if knowledge.database_path is not None:
+        def actor_knowledge(payload, context):
+            from .execution import _deadline
+            allowance = _deadline.get() - time.monotonic()
+            if hasattr(campaign, 'budget'):
+                allowance = min(allowance, campaign._remaining())
+            return knowledge.actor_query(payload, context, remaining_seconds=allowance)
+        actor.query_knowledge = actor_knowledge
+
+    def execute(item, snapshot, directory, *, remaining_seconds):
+        previous = plans.get(item['project_id'])
+        if previous is not None and {key: value for key, value in previous.items() if key != '_ordinal'} != item:
+            raise ValueError('retained project plan changed')
+        checkpoint = Path(directory) / 'subject-execution.json'
+        ordinal = (previous or {}).get('_ordinal')
+        if ordinal is None:
+            ordinal = (json.loads(checkpoint.read_bytes())['identity']['ordinal'] if checkpoint.exists()
+                       else max((row.get('_ordinal', 0) for row in plans.values()), default=0) + 1)
+        plans[item['project_id']] = dict(item, _ordinal=ordinal)
+        atomic(plans_path, canonical(plans))
+        if item.get('task', {}).get('kind') == 'optimizer':
+            envelope = json.loads(snapshot)
+            seed = envelope['initial_memory'].encode('utf-8')
+            files = {'initial-memory.txt': seed}
+            for record in envelope['memories']:
+                files['memories/' + memory_digest(record) + '.json'] = canonical(record)
+                for digest in memory_artifacts(record):
+                    files['artifacts/' + digest] = store.read_bytes(digest)
+            entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
+                            artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
+            frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
+            return executor.optimizer(directory, item['task']['task'], frozen,
+                attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
+        spec = ProjectSpec.from_mapping(item['spec'])
+        envelope = json.loads(snapshot)
+        branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
+        for memory in envelope['memories']:
+            for digest in memory_artifacts(memory):
+                branch_artifacts.put_bytes(store.read_bytes(digest))
+        inputs = materialize_inputs(spec)
+        request = AdaptiveProjectRequest(spec, ordinal, snapshot, directory, inputs,
+            evaluate_reference(spec, inputs), memory_root=root, remaining_seconds=remaining_seconds,
+            publish_learning=False)
+        contract = item.get('task', {}).get('contract')
+        if contract is not None:
+            from .phase2_targets import TargetContract
+            qualification = ContentAddressedArtifacts(Path(item['task']['artifact_root']))
+            target_contract = TargetContract.from_mapping(contract)
+            reference = qualification.read_json(target_contract.reference_sha256)
+            for digest in [target_contract.reference_sha256, reference['source_sha256'],
+                           *reference['artifacts'].values(), *(row['evidence_sha256'] for row in reference['timings'])]:
+                store.put_bytes(qualification.read_bytes(digest))
+        else:
+            target_contract = None
+        return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+
+    def select_wave(context, snapshot, history, *, remaining_seconds, project_limit=64):
+        deadline = time.monotonic() + remaining_seconds
+        def available():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError('subject wave authoring elapsed allowance exhausted')
+            return seconds
+        subject = context['current_subject']
+        repairs = [row for row in context['repairs'] if row['subject_id'] == subject['subject_id']]
+        if subject['task'] is not None:
+            task = subject['task']
+            item = dict(project_id=f"{subject['subject_id']}-{len(history) + 1}", task=task,
+                        repairs=[row['repair_id'] for row in repairs])
+            if task.get('kind') == 'target':
+                item['spec'] = task['contract']['spec']
+            elif task.get('kind') != 'optimizer':
+                raise ValueError('subject task kind must be target or optimizer')
+            return [item]
+        def complete_wave(messages):
+            wire = list(messages)
+            while True:
+                response = curriculum_complete(wire, remaining_seconds=available())
+                try:
+                    header, body = response.strip().split('\n', 1)
+                    ids = [row['spec']['project_id'] for row in json.loads(body)['projects']] if header == 'DECISION: WAVE' else []
+                    reused = set(ids) & history.keys()
+                except (ValueError, KeyError, TypeError):
+                    return response  # The ordinary selector supplies structural feedback.
+                if not reused:
+                    return response
+                wire.extend(({'role': 'assistant', 'content': response}, {'role': 'user', 'content':
+                    'These project IDs were already executed; author fresh IDs for the same frozen wave context: '
+                    + json.dumps(sorted(reused))}))
+        def query_wave(action, *, check_remaining=None):
+            from benchmarks.a5kernels.knowledge_agent import KnowledgeResult, Citation
+            if check_remaining is not None:
+                check_remaining()
+            result = knowledge.query({'query': action.query, 'limit': action.limit}, remaining_seconds=available(),
+                snapshot=snapshot, branch_root=root / 'curriculum-selection' / hashlib.sha256(snapshot).hexdigest())
+            hits = result['hits'][:action.limit]
+            allowance = max(64, 4096 // max(1, len(hits)))
+            rows, pointers = [], []
+            for index, hit in enumerate(hits):
+                data = hit['text'].encode('utf-8')
+                pointers.append(dict(result_index=index, sha256=store.put_bytes(data), bytes=len(data),
+                                     truncated=len(data) > allowance))
+                rows.append(KnowledgeResult(Citation.from_mapping(hit['citation']),
+                    data[:allowance].decode('utf-8', errors='ignore'), hit['score']))
+            available()
+            return _SelectionResults(rows, dict(snapshot_sha256=hashlib.sha256(snapshot).hexdigest(), artifacts=pointers))
+        selector = CurriculumAgent(complete_wave, target_policy=policy,
+            unavailable_capabilities=bound['coordinator'].curriculum.unavailable_capabilities,
+            query_knowledge=query_wave if knowledge.database_path is not None or reference_query is not None else None,
+            require_fresh_project_ids=True)
+        objective = subject['objective'] + '\nOpen repair obligations: ' + json.dumps(repairs)
+        objective += '\nAuthor experiments that satisfy these obligations; project IDs must be new: ' + json.dumps(list(history))
+        value = CurriculumContext(objective=objective, wave_index=len(campaign.state['waves']) + 1,
+            pre_wave_memory_sha256=hashlib.sha256(snapshot).hexdigest(), pre_wave_coverage=(),
+            prior_outcomes=(), curriculum_memory=generation_memory(snapshot, subject['subject_id'], store),
+            remaining_seconds=remaining_seconds, remaining_projects=project_limit)
+        decision, _ = selector.select(value, remaining_projects=project_limit)
+        if not isinstance(decision, WaveDecision):
+            raise ValueError('subject curriculum must author a wave before progression review')
+        items = [dict(project_id=project.spec.project_id, spec=project.spec.as_dict(), repairs=[])
+                 for project in decision.wave.projects]
+        if repairs:
+            messages = [{'role': 'system', 'content': (
+                'Link only experiments that address these repair obligations. Return JSON '
+                '{"links":[{"project_id":"...","repair_ids":["..."]}]}. Include controls '
+                'with their probe when both are necessary. Unrelated projects have empty repair_ids.')},
+                {'role': 'user', 'content': json.dumps(dict(projects=items, repairs=repairs))}]
+            while True:
+                response = curriculum_complete(messages, remaining_seconds=available())
+                try:
+                    links = json.loads(response)['links']
+                    by_id = {row['project_id']: row['repair_ids'] for row in links}
+                    known_repairs = {row['repair_id'] for row in repairs}
+                    if (set(by_id) != {item['project_id'] for item in items}
+                            or any(not isinstance(ids, list) or not set(ids) <= known_repairs for ids in by_id.values())):
+                        raise ValueError('links must name authored projects and existing repair IDs')
+                    for item in items:
+                        item['repairs'] = by_id[item['project_id']]
+                    break
+                except (KeyError, ValueError, TypeError) as error:
+                    messages.extend(({'role': 'assistant', 'content': response},
+                                     {'role': 'user', 'content': str(error)}))
+        available()
+        return items
+
+    campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
+        execute=execute, verifier=verifier, complete=curriculum_complete,
+        max_seconds=max_seconds, index_memory=knowledge.index)
+    campaign.role_complete = role_complete
+    campaign.model_identity = profile.identity.as_dict()
+    campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
+
+    def select_trial(proposal, *, remaining_seconds):
+        lesson = {key: str(proposal.get(key, ''))[:1024] for key in
+                  ('summary', 'applicability', 'preconditions', 'expectations', 'limitations')}
+        lesson['proposal_sha256'] = store.put_bytes(canonical(proposal))
+        lesson['source_examples'] = {key: {field: value for field, value in proposal[key].items() if field != 'text'}
+                                     for key in ('before', 'after') if proposal.get(key) is not None}
+        context = dict(current_subject=dict(subject_id='memory-transfer', task=None, objective=(
+            'Author exactly ONE SMALL transfer project that could benefit from this proposed lesson. '
+            'Use different inputs/extents from its source project. Freeze ordinary host acceptance. '
+            'Do not include lesson advice, code snippets or solution strategy in the task/hypothesis. '
+            'Proposed lesson for selecting the workload only: ' + json.dumps(lesson))), repairs=[])
+        return select_wave(context, campaign.memory.snapshot(), {}, remaining_seconds=remaining_seconds,
+                           project_limit=1)[0]
+
+    def execute_trial_arm(item, snapshot, directory, *, remaining_seconds):
+        """Fresh production session and isolated compilation workspace per arm."""
+        deadline = time.monotonic() + remaining_seconds
+        def available():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError('trial arm elapsed allocation exhausted before execution')
+            return seconds
+        if referenced_settings(settings) != identity['referenced_json_sha256']:
+            raise ValueError('referenced runtime settings changed before trial composition')
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        selection = argparse.ArgumentParser(add_help=False)
+        selection.add_argument('--worker-config'); selection.add_argument('--config')
+        arguments = list(settings.get('phase1_arguments', []))
+        options, _ = selection.parse_known_args(arguments)
+        base = options.worker_config or (options.config if target == 'a3' else None)
+        worker = json.loads(Path(base).read_bytes()) if base else {}
+        field = 'workspace' if worker.get('execution') == 'local' else 'remote_workspace'
+        if not worker.get(field):
+            raise ValueError('trial arms require a configured execution workspace')
+        arm_id = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()
+        worker[field] = str(Path(worker[field]) / 'subject-trials' / arm_id)
+        worker.pop('physical_devices', None)
+        if campaign.runtime_identity is not None:
+            worker['physical_device'] = int(campaign.runtime_identity['device'])
+        for key in ('cache_directory', 'compile_cache_directory'):
+            if key in worker:
+                worker[key] = str(Path(worker[field]) / key)
+        path = directory / 'worker.json'
+        atomic(path, canonical(worker)); path.chmod(0o600)
+        filtered, skip = [], False
+        for argument in arguments:
+            if skip:
+                skip = False
+            elif argument == '--worker-config':
+                skip = True
+            elif not argument.startswith('--worker-config='):
+                filtered.append(argument)
+        arm_settings = dict(settings, phase1_arguments=[*filtered, '--worker-config', str(path)])
+        if optimizer_config is not None:
+            arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
+            for key in ('cache_directory', 'compile_cache_directory'):
+                if key in arm_settings['optimizer_worker_config']:
+                    arm_settings['optimizer_worker_config'][key] = str(Path(worker[field]) / key)
+        retained = directory / 'runtime' / 'subject-runtime.json'
+        allocation = json.loads(retained.read_bytes())['max_seconds'] if retained.exists() else remaining_seconds
+        from .execution import process_deadline
+        with process_deadline(deadline):
+            child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
+                subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
+        available()
+        for record in json.loads(snapshot)['memories']:
+            for digest in memory_artifacts(record):
+                child.artifacts.put_bytes(store.read_bytes(digest))
+        return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
+
+    campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
+    return campaign
+
+
+def main(argv=None, *, builder=build_subject_campaign):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action', choices=('run', 'resume', 'report'))
+    parser.add_argument('--subjects', type=Path)
+    parser.add_argument('--config', type=Path)
+    parser.add_argument('--target', choices=('a3', 'a5'))
+    parser.add_argument('--root', type=Path, required=True)
+    parser.add_argument('--initial-memory', type=Path)
+    parser.add_argument('--max-seconds', type=float, default=7200)
+    args = parser.parse_args(argv)
+    if args.action == 'report':
+        state = json.loads((args.root / 'subject-campaign.json').read_bytes())
+        state['subjects'] = json.loads((args.root / 'subjects.json').read_bytes())
+        print(json.dumps(state, sort_keys=True))
+        return state
+    if any(value is None for value in (args.config, args.subjects, args.target, args.initial_memory)):
+        parser.error('run/resume requires --config, --subjects, --target and --initial-memory')
+    campaign = builder(json.loads(args.config.read_bytes()), target=args.target, root=args.root,
+        subjects=load_subjects(args.subjects), initial_memory=args.initial_memory.read_bytes(),
+        max_seconds=args.max_seconds)
+    result = getattr(campaign, args.action)()
+    print(json.dumps(result, sort_keys=True))
+    return result
