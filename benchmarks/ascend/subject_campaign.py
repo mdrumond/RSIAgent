@@ -1,0 +1,263 @@
+"""One subject curriculum for learning, qualified targets and optimization."""
+from dataclasses import asdict
+import hashlib
+import fcntl
+import json
+from pathlib import Path
+import time
+
+from optimizer.jobs import atomic, canonical
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from .project_verifier import ProjectReview
+from .subjects import SubjectScheduler, SubjectCurriculumAgent
+from .subject_memory import SubjectMemory, StaleMemory
+from .time_budget import AttemptTimeBudget
+
+
+class SubjectCampaign:
+    def __init__(self, root, subjects, initial_memory, *, select_wave, execute, verifier,
+                 complete, max_seconds=7200, memory_gate=None, index_memory=None,
+                 clock=time.monotonic):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.scheduler = SubjectScheduler(self.root, subjects)
+        self.memory = SubjectMemory(self.root / 'memory', initial_memory, index=index_memory)
+        self.artifacts = ContentAddressedArtifacts(self.root / 'artifacts')
+        self.select_wave, self.execute, self.verifier = select_wave, execute, verifier
+        self.policy = SubjectCurriculumAgent(complete)
+        self.seconds, self.clock, self.memory_gate = max_seconds, clock, memory_gate
+        self.path = self.root / 'subject-campaign.json'
+        self.state = json.loads(self.path.read_bytes()) if self.path.exists() else dict(
+            schema='ascend-subject-campaign-v1', waves=[], projects={}, pending=None,
+            needs_decision=False, terminal=None)
+
+    def _save(self):
+        atomic(self.path, canonical(self.state))
+
+    def _remaining(self):
+        available = self.budget.deadline - self.clock()
+        if available <= 0:
+            raise TimeoutError('subject campaign elapsed allocation exhausted')
+        return available
+
+    def report(self):
+        return dict(self.state, subjects=self.scheduler.context(), accepted_memory=self.memory.records())
+
+    def _decision_context(self):
+        # Policy sees coverage and concise evidence, not repeated source/log bodies.
+        from .subject_memory import digest
+        accepted, counts = {}, {}
+        for record in self.memory.records():
+            subject = record['provenance'].get('subject_id', 'seed')
+            counts[subject] = counts.get(subject, 0) + 1
+            proposal = record['proposal']
+            wave = record['provenance'].get('wave_index',0)
+            if subject in accepted and accepted[subject]['wave_index'] > wave:
+                continue
+            accepted[subject] = dict(memory_id=record['memory_id'], version=digest(record),
+                subject_id=subject, wave_index=wave, **{key:str(proposal[key])[:256] for key in
+                    ('summary','applicability','preconditions','expectations','limitations')})
+        reviews, rejected = {}, {}
+        for key, row in self.state.get('memory_reviews', {}).items():
+            subject = row.get('subject_id', 'seed')
+            if row['outcome']=='rejected': rejected[subject]=rejected.get(subject,0)+1
+            judgment = row.get('judgment') or {}
+            if subject in reviews and reviews[subject][1].get('sequence',0) > row.get('sequence',0):
+                continue
+            reviews[subject] = (key, dict(row, judgment={field:(str(value)[:1024] if isinstance(value,str) else value)
+                for field,value in judgment.items()}))
+        projects = {}
+        recent=sorted(self.state['projects'].items(),key=lambda pair:(pair[1].get('wave_index',0),pair[0]))[-4:]
+        for key, row in recent:
+            review = row.get('review') or {}
+            projects[key] = dict(objective=row['objective'][:1024], review_sha256=row.get('review_sha256'),
+                review={field:review.get(field) for field in ('decision','reason','evidence','repair')})
+        return dict(accepted=list(accepted.values()), accepted_counts=counts,
+            rejected_counts=rejected, memory_reviews=dict(reviews.values()), projects=projects,
+            initial_memory=self.memory.initial[:2048],
+            initial_memory_sha256=hashlib.sha256(self.memory.initial.encode()).hexdigest(),
+            decision_error=self.state.get('decision_error'))
+
+    def _settle_reviews(self):
+        if self.memory_gate is None:
+            return
+        for result in self.memory_gate.poll(remaining_seconds=self._remaining()):
+            self.scheduler.resolve_review(result['review_id'], result['outcome'])
+
+    def _review(self, project_id, record):
+        if record.get('review') is not None:
+            return
+        outcome = record['outcome']
+        linked = {key: self.state['projects'].get(key) for key in record.get('repairs', [])}
+        artifacts = dict(outcome['artifacts'])
+        plan = record.get('plan')
+        if plan is None:
+            plan = next((item for item in (self.state.get('pending') or {}).get('items',[])
+                         if item['project_id']==project_id), None)
+        project = None
+        if plan is not None:
+            contract = self.artifacts.put_json(plan)
+            artifacts['evidence:project-contract'] = contract
+            project = dict(project_id=project_id, contract_sha256=contract,
+                hypothesis=plan.get('spec',{}).get('hypothesis'), kind=plan.get('kind','graph'))
+        for key, original in linked.items():
+            if original is not None:
+                artifacts.update({f'repair:{key}:{role}': sha for role, sha in original['outcome']['artifacts'].items()})
+        sibling_evidence = {}
+        pending = self.state.get('pending') or {}
+        for pid in pending.get('projects', []):
+            sibling = self.state['projects'].get(pid, {})
+            if pid != project_id and set(record.get('repairs', [])) & set(sibling.get('repairs', [])):
+                sibling_evidence[pid] = sibling['outcome']['observations']
+                artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
+        objective = json.dumps(dict(subject=record['objective'], project=project, sibling_evidence=sibling_evidence, repairs={
+            key: original['review'] for key, original in linked.items() if original is not None}), sort_keys=True)
+        request = ProjectReview(project_id=project_id, source_sha256=outcome['source_sha256'],
+            host_verified=outcome['host_verified'], artifacts=artifacts,
+            host_facts=tuple(outcome['observations'].get('host_facts', ())),
+            objective=objective)
+        try:
+            review = self.verifier.review(request, max_seconds=self._remaining(),
+                feedback=record.get('rewrite_feedback'))
+        finally:
+            record['verifier_trace'] = self.artifacts.put_json(self.verifier.last_trace)
+            self._save()
+        record.pop('rewrite_feedback', None)
+        record['review'] = review
+        record['review_request'] = asdict(request)
+        record['review_sha256'] = self.artifacts.put_json(review)
+        self._save()
+
+    def _publish_wave(self, pending):
+        review_ids = pending.get('review_ids')
+        if review_ids is None:
+            review_ids = [pid for pid in pending['projects']
+                      if self.state['projects'][pid]['review']['decision'] == 'accept'
+                      and self.state['projects'][pid]['review']['memory'] is not None]
+            pending['review_ids'] = review_ids
+            self._save()
+        self.scheduler.complete_wave(pending['wave_id'], review_ids)
+        subject = pending['subject']['subject_id']
+        for pid in pending['projects']:
+            record = self.state['projects'][pid]
+            review = record['review']
+            evidence = [record['review_sha256']]
+            if review['decision'] == 'repair':
+                if pid in review_ids:
+                    self.scheduler.resolve_review(pid, 'rejected')
+                self.scheduler.add_repair(pid, subject, pid, review['reason'], evidence)
+                continue
+            if review['memory'] is None:
+                if pid in review_ids:
+                    self.scheduler.resolve_review(pid, 'accepted')
+                continue
+            provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
+                review_sha256=record['review_sha256'], request=record['review_request'])
+            if self.memory_gate is None:
+                try:
+                    self.memory.accept(pid, review['memory'], provenance)
+                except StaleMemory as error:
+                    record.setdefault('prior_reviews', []).append(review)
+                    record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'],
+                        current_memories=self.memory.records())
+                    record['review'] = None
+                    self._save()
+                    self._review(pid, record)
+                    return self._publish_wave(pending)
+                self.scheduler.resolve_review(pid, 'accepted')
+            else:
+                self.memory_gate.submit(pid, review['memory'], provenance,
+                    record['review_request'], remaining_seconds=self._remaining())
+        linked_repairs = {}
+        for pid in pending['projects']:
+            for repair_id in self.state['projects'][pid].get('repairs', []):
+                linked_repairs.setdefault(repair_id, []).append(self.state['projects'][pid])
+        for repair_id, records in linked_repairs.items():
+            if all(row['review']['decision'] == 'accept' for row in records):
+                self.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in records])
+        if pending['wave_id'] not in self.state['waves']:
+            self.state['waves'].append(pending['wave_id'])
+        self.state.update(pending=None, needs_decision=True)
+        self._save()
+
+    def _run_wave(self, pending):
+        for item in pending['items']:
+            self._remaining()
+            pid = item['project_id']
+            record = self.state['projects'].setdefault(pid, dict(
+                objective=pending['subject']['objective'], repairs=item.get('repairs', []),
+                plan=json.loads(canonical(item)), wave_index=len(self.state['waves'])+1))
+            if 'outcome' not in record:
+                directory = self.root / 'waves' / pending['wave_id'] / pid
+                record['outcome'] = self.execute(item, self.artifacts.read_bytes(
+                    pending['memory_sha256']), directory, remaining_seconds=self._remaining()).as_dict()
+                self._save()
+        # All linked probes and controls must finish before either is reviewed.
+        for pid in pending['projects']:
+            self._review(pid, self.state['projects'][pid])
+        self._publish_wave(pending)
+
+    def _run(self):
+        self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
+        try:
+            while True:
+                self._remaining()
+                self._settle_reviews()
+                if self.scheduler.is_complete():
+                    self.state['terminal'] = 'COMPLETE'
+                    self._save()
+                    return self.report()
+                if self.state['pending'] is not None:
+                    self.scheduler.start_wave(self.state['pending']['wave_id'], self.state['pending']['memory_sha256'])
+                    self._run_wave(self.state['pending'])
+                    continue
+                if self.state['needs_decision']:
+                    # Invalid provider decisions get repair feedback on the next call,
+                    # within the same elapsed allocation, never an attempt-count limit.
+                    try:
+                        self.policy.decide(self.scheduler, memory_context=self._decision_context(),
+                            remaining_seconds=self._remaining())
+                    except (ValueError, KeyError) as error:
+                        self.state['decision_error'] = str(error)
+                        self._save()
+                        continue
+                    self.state.pop('decision_error', None)
+                    self.state.update(needs_decision=False)
+                    self._save()
+                    continue
+                context = self.scheduler.context()
+                if context['current_subject'] is None:
+                    if self.memory_gate is None:
+                        raise RuntimeError('unfinished obligations require a curriculum revisit')
+                    self.memory_gate.wait(remaining_seconds=self._remaining())
+                    self.state['needs_decision'] = bool(self.scheduler.context()['repairs'])
+                    continue
+                snapshot = self.memory.snapshot()
+                wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
+                items = self.select_wave(context, snapshot, self.state['projects'],
+                                         remaining_seconds=self._remaining())
+                if not items or len({i['project_id'] for i in items}) != len(items):
+                    raise ValueError('wave must contain unique projects')
+                if set(i['project_id'] for i in items) & self.state['projects'].keys():
+                    raise ValueError('project identity already executed')
+                memory_sha = self.artifacts.put_bytes(snapshot)
+                self.state['pending'] = dict(wave_id=wave_id, subject=context['current_subject'],
+                    memory_sha256=memory_sha, items=items, projects=[i['project_id'] for i in items])
+                self._save()
+        except TimeoutError:
+            self.state['terminal'] = ('TIME_BUDGET_EXHAUSTED' if self.clock() >= self.budget.deadline
+                                      else 'REVIEW_PENDING')
+            self._save()
+            return self.report()
+        finally:
+            self.budget.close()
+
+    def run(self):
+        with (self.root / '.campaign.lock').open('a+b') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('subject campaign is already active; observe its retained work') from None
+            return self._run()
+
+    resume = run
