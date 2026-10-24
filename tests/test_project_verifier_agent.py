@@ -197,3 +197,47 @@ def test_duplicate_merge_bases_receive_feedback_before_publication():
     result=h.agent.review(request())
     assert result['memory']['base_versions']==[base]
     assert any(e['kind']=='feedback' for e in h.agent.last_trace)
+
+
+@pytest.mark.parametrize('source_present', [True, False])
+def test_empty_required_log_can_be_inspected_for_acceptance_or_sourceless_repair(source_present):
+    empty = sha(b'')
+    req = ProjectReview('empty-log', S if source_present else None, source_present,
+                        {'result': R, 'actor-log': empty})
+    responses = [read(R), read(empty)]
+    if source_present:
+        responses += [read(S), {'knowledge_query': {'query': 'increment'}}, decision(memory())]
+    else:
+        responses += [repair()]
+    h = Harness(responses)
+    h.artifacts[empty] = b''
+    result = h.agent.review(req)
+    assert result['decision'] == ('accept' if source_present else 'repair')
+    empty_reads = [event['payload']['observation'] for event in h.agent.last_trace
+                   if event['kind'] == 'tool' and event['payload']['action'] == read(empty)]
+    assert empty_reads == [dict(sha256=empty, offset=0, size=0, text='', next_offset=None)]
+
+
+@pytest.mark.parametrize('quoted_source', ['before', 'after'])
+def test_snippet_requires_all_quoted_bytes_observed_across_pages(quoted_source):
+    target = B if quoted_source == 'before' else S
+    data = BEFORE if quoted_source == 'before' else SOURCE
+    proposal = memory()
+    if quoted_source == 'before':
+        proposal.update(before=snippet(B, BEFORE.decode()), before_unavailable_reason=None)
+    first = {'read_artifact': {'sha256': target, 'offset': 0, 'limit': 5}}
+    tail = {'read_artifact': {'sha256': target, 'offset': 10, 'limit': len(data) - 10}}
+    gap = {'read_artifact': {'sha256': target, 'offset': 5, 'limit': 5}}
+    setup = [read(R), read(L), {'knowledge_query': {'query': 'increment'}}]
+    if quoted_source == 'before':
+        setup.insert(0, read(S))
+    h = Harness([*setup, first, decision(proposal), tail, decision(proposal), gap, decision(proposal)],
+                knowledge={'memories': [{'memory_id': 'old', 'version': 'v1',
+                                        'artifacts': {'before-source': B}}], 'citations': []})
+    result = h.agent.review(request())
+    assert result['memory'] == proposal
+    assert len([event for event in h.agent.last_trace if event['kind'] == 'feedback']) == 2
+    observed_pages = [event['payload']['action'] for event in h.agent.last_trace
+                      if event['kind'] == 'tool' and 'read_artifact' in event['payload']['action']
+                      and event['payload']['action']['read_artifact']['sha256'] == target]
+    assert observed_pages == [first, tail, gap]
