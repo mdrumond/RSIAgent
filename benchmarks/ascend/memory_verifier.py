@@ -18,6 +18,7 @@ import time
 from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .subject_execution import SubjectOutcome
+from .project_verifier import bounded_review_messages
 from .time_budget import AttemptTimeBudget
 
 
@@ -40,7 +41,7 @@ class MemoryVerifierAgent:
     def __init__(self, complete, *, clock=time.monotonic):
         self.complete, self.clock, self.last_trace = complete, clock, []
 
-    def review(self, proposal, arms, read_artifact, *, max_seconds):
+    def review(self, proposal, arms, read_artifact, *, max_seconds, check_remaining=None):
         deadline = self.clock() + _seconds(max_seconds)
         self.last_trace = []
         known, required = set(), set()
@@ -57,25 +58,41 @@ class MemoryVerifierAgent:
             'does not prove uselessness: logs may establish more direct reasoning, better '
             'transfer, fewer mistakes or unnecessary work. Conversely, apparent numeric '
             'gains may be accidental. Cite actual observed evidence and explain why the '
-            'memory caused useful behavior or needs improvement. Host correctness is '
-            'authoritative: never accept a failed treatment. Return one JSON action: '
+            'memory likely contributed to useful behavior or needs improvement. One properly '
+            'matched transfer pair with an explicit retained memory lookup/application and '
+            'specific avoided control mistakes can justify acceptance as a qualitative '
+            'inference, even when final metrics tie. Repeated trials or statistical '
+            'significance are not prerequisites. Distinguish this inference from measured '
+            'speedup. Prior failed candidate revisions followed by a verified final repair '
+            'are valid evidence of process quality; final failed, incomplete or mismatched '
+            'arms are inconclusive. Weak or counterproductive advice can warrant rewrite '
+            'or rejection even if the final repaired treatment is fast. Host correctness is '
+            'authoritative: never accept a failed treatment. Never add API metadata such as type or response_format. Return one JSON action: '
             '{"read_artifact":{"sha256":"...","offset":0,"limit":8192}} or '
             '{"decision":"accept|rewrite|reject|inconclusive","reason":"...",'
             '"evidence":["actually read artifact hashes"],"instructions":null|"concrete rewriting guidance"}. '
-            'Inspect supplied result/log artifacts before a substantive judgment. '
+            'Inspect supplied result/log artifacts before any terminal judgment, including inconclusive. '
             'A rewrite requires concrete instructions; other decisions have null instructions.')},
             {'role': 'user', 'content': json.dumps(dict(proposal=proposal,
                 arms={key: value.as_dict() for key, value in arms.items()}), sort_keys=True)}]
 
         def remaining():
             available = deadline - self.clock()
+            if check_remaining is not None:
+                cap = check_remaining()
+                if cap is not None:
+                    available = min(available, cap)
             if available <= 0:
                 raise TimeoutError('memory judge elapsed allocation exhausted')
             return available
 
         self.last_trace.append(dict(kind='request', messages=messages.copy()))
         while True:
-            raw = self.complete(tuple(messages), remaining_seconds=remaining())
+            working = bounded_review_messages(messages, dict(read_artifacts=sorted(read),
+                required_artifacts=sorted(required),
+                arm_host_verified={name: arm.host_verified for name, arm in arms.items()}))
+            self.last_trace.append(dict(kind='provider-request', messages=working.copy()))
+            raw = self.complete(tuple(working), remaining_seconds=remaining())
             remaining()
             self.last_trace.append(dict(kind='response', text=raw))
             messages.append(dict(role='assistant', content=raw))
@@ -96,6 +113,7 @@ class MemoryVerifierAgent:
                     offset, limit = request.get('offset', 0), request.get('limit', 8192)
                     if type(offset) is not int or not 0 <= offset <= len(data) or type(limit) is not int or not 1 <= limit <= 65536:
                         raise ValueError('invalid artifact page')
+                    limit = min(limit, 8192)
                     page = data[offset:offset + limit]
                     if page or not data:
                         read.add(digest)
@@ -111,8 +129,10 @@ class MemoryVerifierAgent:
                     evidence = value['evidence']
                     if not isinstance(evidence, list) or any(item not in read for item in evidence):
                         raise ValueError('judgment cites evidence not actually read')
-                    if value['decision'] != 'inconclusive' and (required - read or not evidence):
-                        raise ValueError('inspect both arms result/log artifacts before judgment')
+                    if required - read:
+                        raise ValueError('inspect both arms result/log artifacts before any terminal judgment')
+                    if value['decision'] != 'inconclusive' and not evidence:
+                        raise ValueError('substantive judgment requires actually read evidence references')
                     if value['decision'] == 'accept' and not arms['treatment'].host_verified:
                         raise ValueError('failed treatment cannot support memory acceptance')
                     if value['decision'] == 'rewrite':
@@ -125,7 +145,9 @@ class MemoryVerifierAgent:
                     return value
                 remaining()
             except (ValueError, KeyError, TypeError) as error:
-                observation = dict(error=str(error))
+                observation = dict(error=str(error), expected_top_level=[['read_artifact'],
+                    ['decision', 'reason', 'evidence', 'instructions']],
+                    correction='Return only one exact key set; remove API metadata and unknown keys.')
                 self.last_trace.append(dict(kind='feedback', observation=observation))
             messages.append(dict(role='user', content=json.dumps(observation, sort_keys=True)))
 
@@ -147,7 +169,7 @@ class MemoryVerifier:
             yield
 
     def evaluate(self, proposal, baseline_bytes, treatment_bytes, directory, *,
-                 remaining_seconds, task=None, sequence=0):
+                 remaining_seconds, task=None, sequence=0, check_remaining=None):
         parent_deadline = self.clock() + _seconds(remaining_seconds)
         if not isinstance(baseline_bytes, bytes) or not isinstance(treatment_bytes, bytes):
             raise TypeError('paired memories must be immutable bytes')
@@ -182,6 +204,10 @@ class MemoryVerifier:
 
             def remaining():
                 available = min(parent_deadline, budget.deadline) - self.clock()
+                if check_remaining is not None:
+                    cap = check_remaining()
+                    if cap is not None:
+                        available = min(available, cap)
                 if available <= 0:
                     raise TimeoutError('matched trial elapsed allocation exhausted')
                 return available
@@ -238,6 +264,9 @@ class MemoryVerifier:
                     finally:
                         arm_budget.close()
                         save()
+                    # Preserve completed evidence before honoring a parent stop;
+                    # never start its peer or a judge after cancellation.
+                    remaining()
                 validity = {key: value.get('valid', False) for key, value in state['arms'].items()}
                 if set(validity) != {'control', 'treatment'} or not all(validity.values()):
                     decision = _inconclusive('Incomplete, late or infrastructure-failed arms cannot establish memory benefit.')
@@ -247,9 +276,11 @@ class MemoryVerifier:
                     self.judge.last_trace = []
                     try:
                         decision = self.judge.review(proposal, arms,
-                            lambda digest, **kw: store.read_bytes(digest), max_seconds=remaining())
+                            lambda digest, **kw: store.read_bytes(digest), max_seconds=remaining(),
+                            check_remaining=remaining)
                     finally:
                         state['trace'].extend(self.judge.last_trace)
+                remaining()
                 decision.update(evaluation_id=_hash(canonical(identity)), trial_task=state['task'], validity=validity,
                     arms={name: row['outcome'] for name, row in state['arms'].items()},
                     artifacts={name + ':' + role: digest for name, row in state['arms'].items()
