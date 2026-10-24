@@ -202,11 +202,14 @@ class SubjectScheduler:
         action = decision.get('action')
         reason = _text(decision.get('reason'), 'reason')
         evidence = _evidence(decision.get('evidence'))
-        if action not in {'continue', 'advance', 'revisit', 'repair'}:
+        if action not in {'continue', 'advance', 'revisit', 'repair', 'complete'}:
             raise ValueError('unknown subject decision')
         with self._transaction() as state:
             target = state['current']
-            if action in {'revisit', 'repair'}:
+            if action == 'complete':
+                if not self.is_complete(state):
+                    raise ValueError('completion requires all subjects and reviews settled without open repairs')
+            elif action in {'revisit', 'repair'}:
                 subject_id = decision.get('subject_id')
                 if action == 'repair':
                     repair = state['repairs'].get(decision.get('repair_id'))
@@ -246,12 +249,14 @@ class SubjectCurriculumAgent:
         context = dict(scheduler.context(), memory=memory_context, remaining_seconds=remaining_seconds)
         raw = self.complete(({'role': 'system', 'content': (
             'Choose the next curriculum action using accepted memory and retained evidence. '
-            'Return JSON {"action":"continue|advance|revisit|repair","reason":"...",'
+            'Return JSON {"action":"continue|advance|revisit|repair|complete","reason":"...",'
             '"evidence":["artifact or memory reference"],"subject_id":"optional",'
             '"repair_id":"optional"}. Run the subject minimum waves before advancing; '
             'repair incomplete or accidentally successful projects; revisit a subject when '
             'memory lacks useful coverage. Pending reviews permit provisional advancement. '
-            'For a repair, name its existing repair_id; for a revisit name subject_id.')} ,
+            'For a repair, name its existing repair_id; for a revisit name subject_id. '
+            'After late memory rejection, reassess the gap: revisit a subject or choose complete '
+            'when all subject minima/reviews/repairs are settled and more work is unnecessary.')} ,
             {'role': 'user', 'content': json.dumps(context, sort_keys=True)}),
             remaining_seconds=remaining_seconds)
         decision = json.loads(raw)

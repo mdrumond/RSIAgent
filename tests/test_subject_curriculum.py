@@ -127,3 +127,17 @@ def test_invalid_decisions_preserve_state_and_do_not_skip_subjects(tmp_path):
     with pytest.raises(ValueError, match='evidence'):
         scheduler.decide(dict(action='advance', reason='Ready', evidence=[]))
     assert scheduler.state() == before
+
+
+def test_completion_acknowledges_late_review_or_can_choose_revisit(tmp_path):
+    scheduler=SubjectScheduler(tmp_path,[Subject('s','s',1)])
+    scheduler.start_wave('w','a'*64)
+    scheduler.complete_wave('w',['review'])
+    scheduler.decide(dict(action='advance',reason='provisional',evidence=['w']))
+    with pytest.raises(ValueError):
+        scheduler.decide(dict(action='complete',reason='too early',evidence=['w']))
+    scheduler.resolve_review('review','rejected')
+    scheduler.decide(dict(action='complete',reason='already covered by accepted seed',evidence=['review']))
+    assert scheduler.is_complete()
+    scheduler.decide(dict(action='revisit',subject_id='s',reason='memory gap',evidence=['review']))
+    assert not scheduler.is_complete()
