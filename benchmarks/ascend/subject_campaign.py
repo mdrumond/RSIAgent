@@ -43,6 +43,41 @@ class SubjectCampaign:
     def report(self):
         return dict(self.state, subjects=self.scheduler.context(), accepted_memory=self.memory.records())
 
+    def _decision_context(self):
+        # Policy sees coverage and concise evidence, not repeated source/log bodies.
+        from .subject_memory import digest
+        accepted, counts = {}, {}
+        for record in self.memory.records():
+            subject = record['provenance'].get('subject_id', 'seed')
+            counts[subject] = counts.get(subject, 0) + 1
+            proposal = record['proposal']
+            wave = record['provenance'].get('wave_index',0)
+            if subject in accepted and accepted[subject]['wave_index'] > wave:
+                continue
+            accepted[subject] = dict(memory_id=record['memory_id'], version=digest(record),
+                subject_id=subject, wave_index=wave, **{key:str(proposal[key])[:256] for key in
+                    ('summary','applicability','preconditions','expectations','limitations')})
+        reviews, rejected = {}, {}
+        for key, row in self.state.get('memory_reviews', {}).items():
+            subject = row.get('subject_id', 'seed')
+            if row['outcome']=='rejected': rejected[subject]=rejected.get(subject,0)+1
+            judgment = row.get('judgment') or {}
+            if subject in reviews and reviews[subject][1].get('sequence',0) > row.get('sequence',0):
+                continue
+            reviews[subject] = (key, dict(row, judgment={field:(str(value)[:1024] if isinstance(value,str) else value)
+                for field,value in judgment.items()}))
+        projects = {}
+        recent=sorted(self.state['projects'].items(),key=lambda pair:(pair[1].get('wave_index',0),pair[0]))[-4:]
+        for key, row in recent:
+            review = row.get('review') or {}
+            projects[key] = dict(objective=row['objective'][:1024], review_sha256=row.get('review_sha256'),
+                review={field:review.get(field) for field in ('decision','reason','evidence','repair')})
+        return dict(accepted=list(accepted.values()), accepted_counts=counts,
+            rejected_counts=rejected, memory_reviews=dict(reviews.values()), projects=projects,
+            initial_memory=self.memory.initial[:2048],
+            initial_memory_sha256=hashlib.sha256(self.memory.initial.encode()).hexdigest(),
+            decision_error=self.state.get('decision_error'))
+
     def _settle_reviews(self):
         if self.memory_gate is None:
             return
@@ -116,7 +151,7 @@ class SubjectCampaign:
                 if pid in review_ids:
                     self.scheduler.resolve_review(pid, 'accepted')
                 continue
-            provenance = dict(project_id=pid, subject_id=subject,
+            provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
                 review_sha256=record['review_sha256'], request=record['review_request'])
             if self.memory_gate is None:
                 try:
@@ -151,7 +186,7 @@ class SubjectCampaign:
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
                 objective=pending['subject']['objective'], repairs=item.get('repairs', []),
-                plan=json.loads(canonical(item))))
+                plan=json.loads(canonical(item)), wave_index=len(self.state['waves'])+1))
             if 'outcome' not in record:
                 directory = self.root / 'waves' / pending['wave_id'] / pid
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
@@ -180,10 +215,7 @@ class SubjectCampaign:
                     # Invalid provider decisions get repair feedback on the next call,
                     # within the same elapsed allocation, never an attempt-count limit.
                     try:
-                        self.policy.decide(self.scheduler, memory_context=dict(
-                            accepted=self.memory.records(), decision_error=self.state.get('decision_error'),
-                            projects={key: {field: record.get(field) for field in ('objective', 'review', 'review_sha256')}
-                                      for key, record in list(self.state['projects'].items())[-8:]}),
+                        self.policy.decide(self.scheduler, memory_context=self._decision_context(),
                             remaining_seconds=self._remaining())
                     except (ValueError, KeyError) as error:
                         self.state['decision_error'] = str(error)
