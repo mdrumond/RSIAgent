@@ -7,7 +7,7 @@ from coding.pi import ENGINE_IDENTITY
 
 import re
 from queue import Queue
-from threading import Lock
+from threading import Lock, Condition
 
 from benchmarks.ascend.contracts import CompileObservation, RuntimeObservation
 from benchmarks.ascend.targets import a3_curriculum_policy
@@ -71,6 +71,7 @@ def compose_adaptive_controller(
         coordinator = AdaptivePhase1Coordinator(
             root, objective, initial_memory, curriculum, project_actor,
             max_parallel=max_parallel, project_target=project_target, max_projects=max_projects, max_seconds=max_seconds,
+            allow_partial=True,
         )
     else:
         from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
@@ -141,32 +142,58 @@ class NativeProjectWorker:
 
 
 class NativeProjectPool:
-    """Exclusive slots; stop dispatch after infrastructure/unknown exceptions."""
+    """Exclusive slots; quarantine uncertain workers without poisoning healthy peers."""
 
     def __init__(self, actors):
         self.actors = Queue()
         self.failure = None
         self.lock = Lock()
+        self.condition = Condition(self.lock)
+        self.live = 0
+        self.quarantined = []
         for actor in actors:
             self.actors.put(actor)
+            self.live += 1
 
     def __call__(self, request):
         from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
-        actor = self.actors.get()
-        try:
-            with self.lock:
-                if self.failure is not None:
+        import time
+        seconds = getattr(request, "remaining_seconds", None)
+        deadline = time.monotonic() + seconds if seconds is not None else float("inf")
+        with self.condition:
+            while self.actors.empty():
+                if not self.live:
                     raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("project allocation exhausted while waiting for a healthy worker")
+                self.condition.wait(timeout=min(remaining, .1))
+            actor = self.actors.get_nowait()
+        reusable = True
+        called = False
+        try:
+            if seconds is not None:
+                remaining = max(0, deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError("project allocation exhausted before dispatch")
+                request = replace(request, remaining_seconds=remaining)
+            called = True
             return actor(request)
         except SemanticProjectFailure:
             raise
         except Exception as exc:
-            with self.lock:
-                if self.failure is None:
-                    self.failure = exc
+            if called:
+                reusable = False
+                with self.condition:
+                    self.live -= 1
+                    self.quarantined.append(actor)
+                    self.failure = self.failure or exc
             raise
         finally:
-            self.actors.put(actor)
+            with self.condition:
+                if reusable:
+                    self.actors.put(actor)
+                self.condition.notify_all()
 
 
 def build_native_adaptive_phase1(

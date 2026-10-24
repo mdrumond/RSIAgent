@@ -248,25 +248,20 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
         "--project-target", "2", "--max-projects", "2"]
     deps = dict(transport_factory=Transport, provider_transport=provider, measurement_factory=Measurement,
         environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
+    main(args, **deps)
     if interrupt:
-        with pytest.raises(RuntimeError, match="failed before verification"):
-            main(args, **deps)
-        sibling = root / "waves/wave-001/branches/copy-0"
-        preserved = {p: p.read_bytes() for p in sibling.rglob("*") if p.is_file()}
-        assert (sibling / "outcome.json").exists()
-        first_run = False
-        main(["resume" if arg == "run" else arg for arg in args], **deps)
-        assert preserved == {p: p.read_bytes() for p in preserved}
-    else:
-        main(args, **deps)
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"] == "WAVE_CLOSED"
+        assert report["published_projects"] == ["copy-0"]
+        assert report["wave_results"][-1]["status"] == "partial"
     assert {transport.device for transport in transports} == {2, 5}
     assert len({transport.state for transport in transports}) == 2
     assert all("native-workers" in str(transport.state) for transport in transports)
-    assert len(openings) == (3 if interrupt else 2)
+    assert len(openings) == 2
     # Both projects see exactly the same production context and pre-wave memory.
     assert openings[0].split("\nPre-wave memory (immutable, readable index): ")[1] == openings[1].split(
         "\nPre-wave memory (immutable, readable index): ")[1]
-    for project in ("copy-0", "copy-1"):
+    for project in (("copy-0",) if interrupt else ("copy-0", "copy-1")):
         rows = [row for row in measurements if row[0] == project]
         assert {row[2] for row in rows} == {"timing", "profile"}
         assert len({row[1] for row in rows}) == 1
@@ -278,7 +273,7 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
     assert list(json.loads(publication.read_bytes())["commits"])[0]["project_id"] == "copy-0"
     main(["resume" if arg == "run" else arg for arg in args], **deps)
     assert before == {p: p.read_bytes() for p in before}
-    assert len(openings) == (3 if interrupt else 2)
+    assert len(openings) == 2
 
 
 def test_phase2_rejects_parallel_workers_before_opening_state(tmp_path):
