@@ -225,3 +225,50 @@ def test_large_memory_document_pointer_preserves_exact_original_record(tmp_path,
     assert 'version' not in json.loads(exact) and 'artifacts' not in json.loads(exact)
     assert memory_artifacts(original) <= set(selected['artifacts'].values())
     assert service.read_artifact(selected['proposal']['after']['sha256'], remaining_seconds=60) == long_source
+
+
+def test_actor_reader_follows_selected_frozen_memory_code_and_log_links(tmp_path):
+    from benchmarks.ascend.agent_presentation import MemoryArtifactReader, artifact_page_presentation
+    service, memory, store, _ = setup(tmp_path)
+    learned = proposal(store)
+    log = store.put_bytes(b'Verified three negative and positive input cases.\n')
+    first = memory.accept('one', learned, {'request': {'artifacts': {'actor-log': log}}})
+    frozen = memory.snapshot()
+    # A later accepted version and an unaccepted pending artifact must stay out
+    # of the independently empty Actor branch store.
+    later_log = store.put_bytes(b'Later replacement execution log\n')
+    memory.accept('two', dict(learned, operation='append', base_versions=[first]),
+                  {'request': {'artifacts': {'actor-log': later_log}}})
+    pending = store.put_bytes(b'Pending unrelated source\n')
+    actor = context(tmp_path/'standalone-actor', frozen)
+    result = service.actor_query({'query': 'vector increments', 'limit': 1}, actor, remaining_seconds=60)
+    reader = MemoryArtifactReader(actor.request, actor.artifacts)
+    entry = result.observation['results'][0]
+    document = json.loads(artifact_page_presentation({'sha256': entry['artifact_sha256']}, reader)['text'])
+    source = document['proposal']['after']['sha256']
+    linked_log = document['provenance']['request']['artifacts']['actor-log']
+    assert artifact_page_presentation({'sha256': source}, reader)['text'] == SOURCE.decode()
+    assert artifact_page_presentation({'sha256': linked_log}, reader)['text'].startswith('Verified three')
+    assert {source, linked_log, learned['evidence'][0], first['version']} <= set(result.admitted_artifacts)
+    for excluded in (later_log, pending):
+        assert excluded not in result.admitted_artifacts
+        with pytest.raises(FileNotFoundError):
+            reader.read_bytes(excluded)
+
+
+def test_reference_callback_receives_positive_lock_timeout_and_elapsed_expiry(tmp_path):
+    import threading
+    now, allocations = [10.0], []
+    lock = threading.Lock()
+    def reference(action, *, check_remaining):
+        allocations.append(check_remaining())
+        assert lock.acquire(timeout=allocations[-1])
+        lock.release()
+        now[0] += 1
+        allocations.append(check_remaining())
+        return []
+    service, _, _, _ = setup(tmp_path, reference_query=reference, clock=lambda: now[0])
+    assert service.query({'query': 'vector'}, remaining_seconds=3)['hits'] == []
+    assert allocations == [3.0, 2.0]
+    with pytest.raises(TimeoutError):
+        service.query({'query': 'vector'}, remaining_seconds=0.5)
