@@ -269,7 +269,7 @@ def test_large_artifact_pages_fit_context_without_losing_admission_state():
 
 def test_large_registry_pages_hidden_before_code_and_preserves_exact_snippets():
     refs = {f'retained:{i:04}': sha(str(i).encode()) for i in range(500)}
-    refs.update({'result': R, 'actor-log': L, 'retained:before-source': B})
+    refs.update({'result': R, 'actor-log': L, 'retained:before-variant': B})
     proposal = memory()
     proposal.update(before=snippet(B, BEFORE.decode()), before_unavailable_reason=None)
     h = Harness([{'list_artifacts': {'offset': -1}},
@@ -281,12 +281,12 @@ def test_large_registry_pages_hidden_before_code_and_preserves_exact_snippets():
     initial = json.loads(h.calls[0][0][1]['content'])['project']
     assert initial['artifact_count'] == 504
     assert initial['artifacts']['source'] == S
-    assert 'retained:before-source' not in initial['artifacts']
+    assert 'retained:before-variant' not in initial['artifacts']
     assert len(json.dumps(h.calls[0][0]).encode()) < 40000
     assert any(event['kind'] == 'feedback' for event in h.agent.last_trace)
     listing = next(event['payload']['observation'] for event in h.agent.last_trace
                    if event['kind'] == 'tool' and 'list_artifacts' in event['payload']['action'])
-    assert listing == {'artifacts': {'retained:before-source': B}, 'total': 1, 'next_offset': None}
+    assert listing == {'artifacts': {'retained:before-variant': B}, 'total': 1, 'next_offset': None}
     assert h.agent.last_trace[0]['payload']['project']['artifacts'] == refs
 
 
