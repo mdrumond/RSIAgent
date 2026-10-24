@@ -142,6 +142,17 @@ def test_verifier_can_return_successful_project_for_curriculum_repair():
     assert not h.queries
 
 
+def test_project_failing_before_source_gets_evidence_backed_repair():
+    failed = ProjectReview('no-source', None, False, {'execution': R, 'actor-log': L})
+    h = Harness([read(R), repair(), read(L), decision(), repair()])
+    result = h.agent.review(failed)
+    assert result == repair()
+    assert [digest for digest, _ in h.reads] == [R, L]
+    assert len([event for event in h.agent.last_trace if event['kind'] == 'feedback']) == 2
+    with pytest.raises(ValueError):
+        ProjectReview('invalid-pass', None, True, {'result': R})
+
+
 def test_rewrite_uses_same_evidence_in_fresh_context_and_preserves_feedback():
     feedback = {'previous_proposal': memory(), 'instructions': 'Explain overflow preconditions'}
     h = Harness([*prerequisites(), decision(memory()), *prerequisites(), decision(memory())])
