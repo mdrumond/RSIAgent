@@ -130,3 +130,21 @@ def test_probe_control_wave_resolves_shared_repair_once_with_original_requiremen
     assert c.run()['terminal']=='COMPLETE'
     repair=c.scheduler.state()['repairs']['failed']
     assert len(repair['resolution_evidence'])==2
+
+
+def test_interrupted_stale_review_retains_rewrite_feedback(tmp_path):
+    class Interrupted:
+        last_trace=[]
+        def review(self, request, *, feedback, **kw):
+            assert feedback=={'reason':'stale base'}
+            raise OSError('provider disconnected')
+    c=SubjectCampaign(tmp_path,[Subject('s','s')],b'',select_wave=None,execute=None,
+        verifier=Interrupted(),complete=lambda *a,**k:None)
+    sha=c.artifacts.put_bytes(b'source\n')
+    c.state['projects']['p']=dict(outcome=SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root).as_dict(),
+        objective='s',rewrite_feedback={'reason':'stale base'})
+    c._remaining=lambda:60
+    with pytest.raises(OSError):c._review('p',c.state['projects']['p'])
+    retained=json.loads(c.path.read_text())['projects']['p']
+    assert retained['rewrite_feedback']=={'reason':'stale base'}
+    assert retained.get('review') is None
