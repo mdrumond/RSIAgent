@@ -57,14 +57,21 @@ class SubjectCampaign:
         for key, original in linked.items():
             if original is not None:
                 artifacts.update({f'repair:{key}:{role}': sha for role, sha in original['outcome']['artifacts'].items()})
-        objective = json.dumps(dict(subject=record['objective'], repairs={
+        sibling_evidence = {}
+        pending = self.state.get('pending') or {}
+        for pid in pending.get('projects', []):
+            sibling = self.state['projects'].get(pid, {})
+            if pid != project_id and set(record.get('repairs', [])) & set(sibling.get('repairs', [])):
+                sibling_evidence[pid] = sibling['outcome']['observations']
+                artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
+        objective = json.dumps(dict(subject=record['objective'], sibling_evidence=sibling_evidence, repairs={
             key: original['review'] for key, original in linked.items() if original is not None}), sort_keys=True)
         request = ProjectReview(project_id=project_id, source_sha256=outcome['source_sha256'],
             host_verified=outcome['host_verified'], artifacts=artifacts,
             host_facts=tuple(outcome['observations'].get('host_facts', ())),
             objective=objective)
         try:
-            review = self.verifier.review(request, max_seconds=min(600, self._remaining()),
+            review = self.verifier.review(request, max_seconds=self._remaining(),
                 feedback=record.get('rewrite_feedback'))
         finally:
             record['verifier_trace'] = self.artifacts.put_json(self.verifier.last_trace)
@@ -138,7 +145,9 @@ class SubjectCampaign:
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
                     pending['memory_sha256']), directory, remaining_seconds=self._remaining()).as_dict()
                 self._save()
-            self._review(pid, record)
+        # All linked probes and controls must finish before either is reviewed.
+        for pid in pending['projects']:
+            self._review(pid, self.state['projects'][pid])
         self._publish_wave(pending)
 
     def run(self):
@@ -192,7 +201,8 @@ class SubjectCampaign:
                     memory_sha256=memory_sha, items=items, projects=[i['project_id'] for i in items])
                 self._save()
         except TimeoutError:
-            self.state['terminal'] = 'TIME_BUDGET_EXHAUSTED'
+            self.state['terminal'] = ('TIME_BUDGET_EXHAUSTED' if self.clock() >= self.budget.deadline
+                                      else 'REVIEW_PENDING')
             self._save()
             return self.report()
         finally:

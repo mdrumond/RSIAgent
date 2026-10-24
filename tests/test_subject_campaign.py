@@ -116,6 +116,9 @@ def test_probe_control_wave_resolves_shared_repair_once_with_original_requiremen
             if self.calls:
                 original=json.loads(request.objective)['repairs']['failed']
                 assert original['repair']['instructions']=='add control'
+                siblings=json.loads(request.objective)['sibling_evidence']
+                assert len(siblings)==1
+                assert any(role.startswith('sibling:') for role in request.artifacts)
             return super().review(request,**kw)
     verifier=Inspecting()
     def select(context, *args, **kwargs):
@@ -148,3 +151,18 @@ def test_interrupted_stale_review_retains_rewrite_feedback(tmp_path):
     retained=json.loads(c.path.read_text())['projects']['p']
     assert retained['rewrite_feedback']=={'reason':'stale base'}
     assert retained.get('review') is None
+
+
+def test_local_verifier_timeout_does_not_exhaust_campaign_allocation(tmp_path):
+    class Slow:
+        last_trace=[]
+        def review(self,*a,**kw):raise TimeoutError('request timed out')
+    def execute(*a,**kw):
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    c=SubjectCampaign(tmp_path,[Subject('s','s')],b'',select_wave=lambda *a,**k:[dict(project_id='p')],
+        execute=execute,verifier=Slow(),complete=lambda *a,**k:None,max_seconds=100)
+    result=c.run()
+    assert result['terminal']=='REVIEW_PENDING'
+    assert result['pending'] is not None
+    assert json.loads((tmp_path/'elapsed.json').read_text())['elapsed_seconds']<100
