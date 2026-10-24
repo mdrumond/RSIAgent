@@ -185,3 +185,95 @@ def test_invalid_trial_proposal_does_not_leave_half_frozen_resume_state(tmp_path
     h.verifier.select_trial = h.select
     assert evaluate(h, tmp_path)['decision'] == 'accept'
     assert len(h.selections) == 1
+
+
+def test_large_judge_pages_fold_context_and_preserve_observed_evidence(tmp_path):
+    from benchmarks.ascend.memory_verifier import MemoryVerifierAgent
+    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    hashes = [store.put_bytes((str(i) * 16384).encode()) for i in range(8)]
+    arms = {name: SubjectOutcome(True, None,
+        {f'log:page-{index}': digest for index, digest in enumerate(hashes[start:start + 4])},
+        {'speedup': 1}, store.root) for name, start in [('control', 0), ('treatment', 4)]}
+    malformed = dict(read_artifact={'sha256': hashes[0], 'limit': 65536}, type='json_object')
+    responses = iter([malformed,
+        *[{'read_artifact': {'sha256': digest, 'limit': 65536}} for digest in hashes],
+        dict(decision='accept', reason='Both retained Actor logs establish direct transfer.',
+             evidence=hashes, instructions=None)])
+    sizes, folded = [], []
+    def complete(messages, *, remaining_seconds):
+        sizes.append(len(json.dumps(messages, ensure_ascii=False).encode()))
+        assert sizes[-1] <= 40000
+        for message in messages:
+            if message['role'] == 'user':
+                value = json.loads(message['content'])
+                if 'retained_review_state' in value:
+                    folded.append(value['retained_review_state'])
+        return json.dumps(next(responses))
+    agent = MemoryVerifierAgent(complete)
+    result = agent.review({'summary': 'tail lesson'}, arms,
+                          lambda digest, **kw: store.read_bytes(digest), max_seconds=60)
+    assert result['decision'] == 'accept' and result['evidence'] == hashes
+    assert folded and hashes[0] in folded[-1]['read_artifacts']
+    assert folded[-1]['arm_host_verified'] == {'control': True, 'treatment': True}
+    pages = [event['observation'] for event in agent.last_trace if event['kind'] == 'read']
+    assert {page['sha256'] for page in pages} == set(hashes)
+    assert all(len(page['text'].encode()) == 8192 and page['next_offset'] == 8192 for page in pages)
+    feedback = [event['observation'] for event in agent.last_trace if event['kind'] == 'feedback']
+    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['decision', 'reason', 'evidence', 'instructions']]
+
+
+def test_parent_stop_after_completed_arm_prevents_peer_and_judge(tmp_path):
+    h = Harness()
+    stopped = [False]
+    original = h.verifier.execute_arm
+    def execute(*args, **kwargs):
+        outcome = original(*args, **kwargs)
+        stopped[0] = True
+        return outcome
+    def check_remaining():
+        if stopped[0]:
+            raise TimeoutError('parent stopped')
+        return 30
+    h.verifier.execute_arm = execute
+    result = h.verifier.evaluate({'summary': 'increment lesson'}, b'old', b'new', tmp_path,
+        remaining_seconds=60, check_remaining=check_remaining)
+    assert result['decision'] == 'inconclusive'
+    assert [row[0] for row in h.calls] == ['control'] and h.requests == []
+    assert result['arms']['control']['host_verified']
+    assert result['validity'] == {'control': True}
+
+
+def test_parent_stop_during_judge_prevents_further_requests_or_acceptance(tmp_path):
+    h = Harness()
+    stopped = [False]
+    original = h.verifier.judge.complete
+    def complete(messages, *, remaining_seconds):
+        result = original(messages, remaining_seconds=remaining_seconds)
+        stopped[0] = True
+        return result
+    def check_remaining():
+        if stopped[0]:
+            raise TimeoutError('parent stopped')
+        return 30
+    h.verifier.judge.complete = complete
+    result = h.verifier.evaluate({'summary': 'increment lesson'}, b'old', b'new', tmp_path,
+        remaining_seconds=60, check_remaining=check_remaining)
+    assert result['decision'] == 'inconclusive'
+    assert len(h.requests) == 1 and len(h.calls) == 2
+    assert not any(event['kind'] == 'read' for event in h.verifier.last_trace)
+
+
+def test_inconclusive_judge_must_inspect_valid_matched_evidence_before_finishing(tmp_path):
+    from benchmarks.ascend.memory_verifier import MemoryVerifierAgent
+    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    digest = store.put_bytes(b'Equal final metrics; ambiguous transfer logs')
+    arms = {name: SubjectOutcome(True, None, {'log:actor': digest}, {}, store.root)
+            for name in ('control', 'treatment')}
+    terminal = dict(decision='inconclusive', reason='The inspected pair does not distinguish benefit.',
+                    evidence=[digest], instructions=None)
+    replies = iter([dict(terminal, evidence=[]), {'read_artifact': {'sha256': digest}}, terminal])
+    agent = MemoryVerifierAgent(lambda *args, **kwargs: json.dumps(next(replies)))
+    result = agent.review({}, arms, lambda value, **kw: store.read_bytes(value), max_seconds=60)
+    assert result == terminal
+    assert len([event for event in agent.last_trace if event['kind'] == 'feedback']) == 1
+    assert [event['observation']['sha256'] for event in agent.last_trace if event['kind'] == 'read'] == [digest]
