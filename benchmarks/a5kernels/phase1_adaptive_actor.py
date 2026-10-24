@@ -62,6 +62,7 @@ class AdaptiveActionContext:
     source: str | None
     latest_execution: ProjectExecutionResult | None
     artifacts: ContentAddressedArtifacts
+    remaining_seconds: float | None = None
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -347,6 +348,7 @@ class _ProjectActions:
     ) -> ActionOutcome:
         result = dependency(payload, AdaptiveActionContext(
             self.request, self.prepared, self.source, self.latest, self.artifacts,
+            max(0, self.deadline - time.monotonic()),
         ))
         if not isinstance(result, AdaptiveActionResult):
             raise TypeError("adaptive action dependency must return AdaptiveActionResult")
