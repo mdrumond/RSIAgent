@@ -43,24 +43,35 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("context", async (event, ctx) => {
     const snapshot = await host("snapshot", {}, ctx.signal);
-    // A host turn is a new authoritative snapshot. Within that turn retain only
-    // the latest complete exchange (e.g. a page read), never orphan tool results.
+    // A host turn is a new authoritative snapshot. Keep the pages read within
+    // that turn together, so reading a later page does not erase an earlier one.
     let boundary = -1;
     for (let i = event.messages.length - 1; i >= 0; i--) {
       if (event.messages[i].role === "user") { boundary = i; break; }
     }
-    let exchange: typeof event.messages = [];
+    const exchanges: (typeof event.messages)[] = [];
+    const pages = new Set<string>();
+    let bytes = Buffer.byteLength(JSON.stringify(snapshot));
     for (let i = event.messages.length - 1; i > boundary; i--) {
       const message = event.messages[i];
       if (message.role !== "assistant" || message.stopReason !== "toolUse") continue;
       const calls = message.content.filter(c => c.type === "toolCall");
-      const results = event.messages.slice(i + 1).filter(m => m.role === "toolResult");
+      const results = event.messages.slice(i + 1).filter(m => m.role === "toolResult"
+        && calls.some(c => c.id === m.toolCallId));
       if (calls.length && calls.every(c => results.some(r => r.role === "toolResult" && r.toolCallId === c.id))) {
-        exchange = [message, ...results];
-        break;
+        const keys = calls.map(c => c.name + JSON.stringify(c.arguments));
+        if (keys.every(key => pages.has(key))) continue;
+        const exchange = [message, ...results];
+        const size = Buffer.byteLength(JSON.stringify(exchange));
+        // Preserve the latest complete exchange as before. Older pages fit in a
+        // bounded window below the provider's separately enforced request cap.
+        if (exchanges.length && bytes + size > 32768) continue;
+        exchanges.push(exchange);
+        bytes += size;
+        keys.forEach(key => pages.add(key));
       }
     }
     return { messages: [{ role: "user" as const, content: JSON.stringify(snapshot),
-      timestamp: Date.now() }, ...exchange] };
+      timestamp: Date.now() }, ...exchanges.reverse().flat()] };
   });
 }
