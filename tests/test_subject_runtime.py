@@ -299,3 +299,112 @@ def test_optimizer_reads_initial_seed_and_published_source_evidence_via_real_too
     assert observed[2]['text'] == seed.decode()
     assert observed[3]['text'] == SOURCE.decode()
     assert observed[4]['text'] == RESULT.decode()
+
+
+def selection_context(messages):
+    for line in messages[1]['content'].splitlines():
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict) and 'next_wave_id' in value:
+            return value
+    raise AssertionError('No frozen selection context received')
+
+
+def test_generation_bounds_rich_memories_and_preserves_initial_seed_identity(tmp_path):
+    import hashlib
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
+    from benchmarks.ascend.agent_context import ContextBudget, request_bytes
+    from benchmarks.ascend.subject_memory import digest
+    from test_a5_phase1_adaptive import _project, _wave
+    requests = []
+    profile = direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value == 'deepseek-flash'))
+    def transport(**options):
+        requests.append(options['request'])
+        payload = selection_context(options['request']['messages'])
+        return DirectCompletion(_wave(json.dumps(payload), [_project('fresh', 'gm-ub-movement')]), 1)
+    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
+        models=[profile.identity.backend_model], transport=transport,
+        context_budgets={'deepseek-flash': ContextBudget(40000, 32768, 49152)})
+    binding = bound(tmp_path)
+    binding.update(provider=provider, profile=profile)
+    seed = b'Configured initial guidance\n' * 5000
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'copies')], initial_memory=seed, compose=lambda *a, **k: binding)
+    code = b'// retained example ' + b'x' * 20000 + b'\n'
+    code_sha = campaign.artifacts.put_bytes(code)
+    campaign.artifacts.put_bytes(RESULT)
+    for index in range(12):
+        learned = dict(memory(), summary='Vector lesson ' + str(index))
+        learned['after'] = dict(sha256=code_sha, start_line=1, end_line=1, text=code.decode())
+        campaign.memory.accept('lesson-' + str(index), learned,
+            {'subject_id': 's' if index % 2 == 0 else 'earlier', 'long_audit': 'z' * 30000})
+    snapshot = campaign.memory.snapshot()
+    items = campaign.select_wave(campaign.scheduler.context(), snapshot, {}, remaining_seconds=60)
+    assert [item['project_id'] for item in items] == ['fresh']
+    assert request_bytes(requests[0]) < 49152
+    payload = selection_context(requests[0]['messages'])
+    header, *synopsis = payload['curriculum_memory']
+    assert header['snapshot_sha256'] == payload['pre_wave_memory_sha256'] == hashlib.sha256(snapshot).hexdigest()
+    assert header['initial_memory']['sha256'] == hashlib.sha256(seed).hexdigest()
+    assert seed.startswith(header['initial_memory']['preview'].encode())
+    assert campaign.artifacts.read_bytes(header['snapshot_sha256']) == snapshot
+    assert campaign.artifacts.read_bytes(header['initial_memory']['sha256']) == seed
+    assert synopsis and synopsis[0]['subject_id'] == 's'
+    records = {record['memory_id']: record for record in campaign.memory.records()}
+    for row in synopsis:
+        original = records[row['memory_id']]
+        assert row['version'] == digest(original)
+        assert row['summary'] == original['proposal']['summary']
+        assert row['preconditions'] == original['proposal']['preconditions']
+        assert row['expectations'] == original['proposal']['expectations']
+
+
+def test_generation_retrieval_pins_snapshot_and_bounds_full_code_results(tmp_path):
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
+    from test_a5_phase1_adaptive import _project, _wave
+    database_path = tmp_path / 'knowledge.sqlite'
+    reference = tmp_path / 'reference.txt'
+    reference.write_text('Vector increment reference\n')
+    embeddings = FakeEmbeddings()
+    with KnowledgeDB(database_path, embeddings) as database:
+        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
+    requests, payloads, versions = [], [], {}
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    def transport(**options):
+        messages = options['request']['messages']
+        requests.append(messages)
+        if len(requests) == 1:
+            payloads.append(selection_context(messages))
+            versions['new'] = campaign.memory.accept('two', dict(learned, operation='append',
+                base_versions=[versions['old']], summary='Vector new accepted replacement'), {})
+            return DirectCompletion(json.dumps({'knowledge_query': {'query': 'vector', 'limit': 5}}), 1)
+        page = json.loads(messages[-1]['content'])['knowledge_query']
+        payloads.append(page)
+        return DirectCompletion(_wave(json.dumps(payloads[0]), [_project('fresh', 'gm-ub-movement')]), 1)
+    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
+        models=[profile.identity.backend_model], transport=transport)
+    binding = bound(tmp_path, kdb=database_path, embeddings=embeddings)
+    binding.update(provider=provider, profile=profile)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run', subjects=[Subject('s', 'vectors')],
+        initial_memory=b'initial guidance', compose=lambda *a, **k: binding)
+    code = b'// retained example ' + b'x' * 20000 + b'\n'
+    campaign.artifacts.put_bytes(RESULT)
+    learned = dict(memory(), summary='Vector original accepted lesson')
+    learned['after'] = dict(sha256=campaign.artifacts.put_bytes(code), start_line=1, end_line=1, text=code.decode())
+    versions['old'] = campaign.memory.accept('one', learned, {})
+    snapshot = campaign.memory.snapshot()
+    campaign.select_wave(campaign.scheduler.context(), snapshot, {}, remaining_seconds=60)
+    page = payloads[1]
+    collections = {row['citation']['collection'] for row in page['results']}
+    old_collection = 'subject-memory-' + versions['old']['version']
+    assert old_collection in collections
+    assert 'subject-memory-' + versions['new']['version'] not in collections
+    position = next(index for index, row in enumerate(page['results']) if row['citation']['collection'] == old_collection)
+    pointer = page['search_details']['artifacts'][position]
+    assert pointer['truncated'] is True
+    full = campaign.artifacts.read_bytes(pointer['sha256'])
+    assert json.loads(full)['proposal']['summary'] == learned['summary']
+    assert len(full) > len(page['results'][position]['text'].encode())
+    assert page['search_details']['snapshot_sha256'] == payloads[0]['pre_wave_memory_sha256']
