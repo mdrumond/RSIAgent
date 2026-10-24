@@ -52,7 +52,7 @@ class SubjectCampaign:
                 provenance = result['provenance']
                 review = result['repair']
                 self.scheduler.add_repair(result['review_id']+'-memory', provenance['subject_id'],
-                    provenance['project_id'], review['reason'], review['evidence'])
+                    provenance['project_id'], review['reason']+' '+json.dumps(review.get('repair')), review['evidence'])
                 self.state['needs_decision'] = True
                 self._save()
             if hasattr(self.memory_gate, 'acknowledge'):
@@ -62,11 +62,15 @@ class SubjectCampaign:
         if record.get('review') is not None:
             return
         outcome = record['outcome']
-        linked = {key: self.state['projects'].get(key) for key in record.get('repairs', [])}
+        obligations = self.scheduler.state()['repairs']
+        linked = {key: self.state['projects'].get(obligations.get(key, {}).get('project_id',key))
+                  for key in record.get('repairs', [])}
         artifacts = dict(outcome['artifacts'])
         for key, original in linked.items():
             if original is not None:
                 artifacts.update({f'repair:{key}:{role}': sha for role, sha in original['outcome']['artifacts'].items()})
+            artifacts.update({f'repair:{key}:evidence:{i}': sha
+                for i,sha in enumerate(obligations.get(key,{}).get('evidence',[]))})
         sibling_evidence = {}
         pending = self.state.get('pending') or {}
         for pid in pending.get('projects', []):
@@ -75,7 +79,8 @@ class SubjectCampaign:
                 sibling_evidence[pid] = sibling['outcome']['observations']
                 artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
         objective = json.dumps(dict(subject=record['objective'], sibling_evidence=sibling_evidence, repairs={
-            key: original['review'] for key, original in linked.items() if original is not None}), sort_keys=True)
+            key: dict(original['review'], obligation=obligations.get(key))
+            for key, original in linked.items() if original is not None}), sort_keys=True)
         request = ProjectReview(project_id=project_id, source_sha256=outcome['source_sha256'],
             host_verified=outcome['host_verified'], artifacts=artifacts,
             host_facts=tuple(outcome['observations'].get('host_facts', ())),

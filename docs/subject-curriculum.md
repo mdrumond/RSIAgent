@@ -67,3 +67,36 @@ Runtime identity includes content hashes of referenced runtime/worker JSON files
 including optimizer worker settings. Editing a physical device or workspace at
 the same filename is rejected before recomposition. Credential environment files
 are excluded from these content identities.
+
+## Memory usefulness admission
+
+New subject campaigns enable memory verification by default. The independent
+memory verifier selects one small transfer project, freezes its host acceptance
+contract, and runs fresh control and treatment Actors. The control sees accepted
+memory; the treatment differs only by the proposed new or replacement memory.
+The verifier reads retained results and Actor/tool logs before judging usefulness.
+Equal scores may still support acceptance when logs demonstrate useful transfer;
+invalid or incomplete runs never establish benefit.
+
+Drafts stay outside accepted memory and ordinary KDB retrieval. Other waves may
+start against the older accepted snapshot while verification runs. Acceptance
+publishes a new immutable version for later waves. Appends and merges replace
+specified accepted versions only after testing; history remains readable. A
+concurrent replacement triggers reconciliation and a new comparison.
+
+Unhelpful drafts return to the project verifier for up to two rewrites, using the
+same frozen transfer task. Rejection after those opportunities leaves existing
+memory untouched. Missing underlying evidence can instead send the original
+project back to curriculum repair. Infrastructure failures remain inconclusive
+and retain elapsed allocations and operation identities for resume.
+
+Optional settings are `memory_verifier_model` (defaults to the campaign model),
+`memory_review_seconds` (3600), `memory_trial_seconds` (1800), and
+`memory_arm_seconds` (600). Limits measure elapsed work and inherit the remaining
+campaign allowance. `memory_verification: false` is available for project-review
+smokes; ordinary campaigns should keep the default admission gate.
+
+The `memory-reviews` directory retains draft versions, paired execution evidence,
+judgments, and rewrite feedback. Accepted memory provenance contains the matched
+evaluation identity and verifier trace hash. Full code and examples remain in
+content-addressed artifact storage; snippets preserve exact source lines.
