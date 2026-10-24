@@ -305,3 +305,24 @@ def test_rich_knowledge_observation_is_bounded_and_new_artifacts_are_pageable():
     assert len(json.dumps(query_event)) < 3000
     assert query_event['memories'][0]['artifact_prefix'] == 'memory:old:v1:'
     assert B in [digest for digest, _ in h.reads]
+
+
+def test_host_extracts_agent_selected_observed_lines_without_json_transcription():
+    proposal = memory()
+    del proposal['after']['text']
+    h = Harness([*prerequisites(), decision(proposal)])
+    result = h.agent.review(request())
+    assert result['memory']['after']['text'] == SOURCE.decode()
+    assert result['memory']['after']['start_line'] == 1
+    assert result['memory']['after']['end_line'] == 2
+
+
+def test_host_extraction_still_requires_observation_of_all_selected_bytes():
+    proposal = memory()
+    del proposal['after']['text']
+    h = Harness([{'read_artifact': {'sha256': S, 'limit': 3}}, read(R), read(L),
+                 {'knowledge_query': {'query': 'increment'}}, decision(proposal),
+                 read(S), decision(proposal)])
+    result = h.agent.review(request())
+    assert result['memory']['after']['text'] == SOURCE.decode()
+    assert len([e for e in h.agent.last_trace if e['kind'] == 'feedback']) == 1
