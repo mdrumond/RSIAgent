@@ -67,3 +67,12 @@ Runtime identity includes content hashes of referenced runtime/worker JSON files
 including optimizer worker settings. Editing a physical device or workspace at
 the same filename is rejected before recomposition. Credential environment files
 are excluded from these content identities.
+
+Wave generation receives a bounded synopsis of the frozen memory snapshot,
+prioritizing the current subject. It includes stable memory IDs/versions and
+lesson summaries, preconditions and expectations, together with initial-guidance
+preview and immutable hashes for the complete seed/snapshot. With KDB enabled,
+the curriculum can retrieve reference and learned-memory evidence from that
+same snapshot. Long result text is previewed; exact full text remains available
+in retained artifacts, referenced by the query's search details. Background
+memory admission cannot change an in-progress selection's memory view.
