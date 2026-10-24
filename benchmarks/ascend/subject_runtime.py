@@ -25,6 +25,32 @@ from .subject_memory import digest as memory_digest
 from .subject_knowledge import SubjectKnowledge, memory_artifacts
 
 
+def generation_memory(snapshot, subject_id, store, *, max_bytes=8192):
+    """Small advisory context; complete immutable records remain in the snapshot."""
+    envelope = json.loads(snapshot)
+    seed = envelope['initial_memory'].encode('utf-8')
+    header = dict(snapshot_sha256=store.put_bytes(snapshot), memory_count=len(envelope['memories']),
+        initial_memory=dict(sha256=store.put_bytes(seed), bytes=len(seed), preview=seed[:1024].decode('utf-8', errors='ignore')))
+    rows = [header]
+    records = list(reversed(envelope['memories']))
+    records.sort(key=lambda record: record['provenance'].get('subject_id') != subject_id)
+    for record in records:
+        proposal = record['proposal']
+        row = dict(memory_id=record['memory_id'], version=memory_digest(record),
+            subject_id=record['provenance'].get('subject_id'),
+            **{key: proposal[key][:384] for key in ('summary', 'preconditions', 'expectations')})
+        if len(canonical([*rows, row])) <= max_bytes:
+            rows.append(row)
+    return tuple(rows)
+
+
+class _SelectionResults(tuple):
+    def __new__(cls, rows, details):
+        value = super().__new__(cls, rows)
+        value.search_details = details
+        return value
+
+
 def referenced_settings(settings):
     """Freeze ignored runtime JSON bytes without persisting their contents."""
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
@@ -275,14 +301,32 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 wire.extend(({'role': 'assistant', 'content': response}, {'role': 'user', 'content':
                     'These project IDs were already executed; author fresh IDs for the same frozen wave context: '
                     + json.dumps(sorted(reused))}))
+        def query_wave(action, *, check_remaining=None):
+            from benchmarks.a5kernels.knowledge_agent import KnowledgeResult, Citation
+            if check_remaining is not None:
+                check_remaining()
+            result = knowledge.query({'query': action.query, 'limit': action.limit}, remaining_seconds=available(),
+                snapshot=snapshot, branch_root=root / 'curriculum-selection' / hashlib.sha256(snapshot).hexdigest())
+            hits = result['hits'][:action.limit]
+            allowance = max(64, 4096 // max(1, len(hits)))
+            rows, pointers = [], []
+            for index, hit in enumerate(hits):
+                data = hit['text'].encode('utf-8')
+                pointers.append(dict(result_index=index, sha256=store.put_bytes(data), bytes=len(data),
+                                     truncated=len(data) > allowance))
+                rows.append(KnowledgeResult(Citation.from_mapping(hit['citation']),
+                    data[:allowance].decode('utf-8', errors='ignore'), hit['score']))
+            available()
+            return _SelectionResults(rows, dict(snapshot_sha256=hashlib.sha256(snapshot).hexdigest(), artifacts=pointers))
         selector = CurriculumAgent(complete_wave, target_policy=policy,
             unavailable_capabilities=bound['coordinator'].curriculum.unavailable_capabilities,
-            query_knowledge=reference_query, require_fresh_project_ids=True)
+            query_knowledge=query_wave if knowledge.database_path is not None or reference_query is not None else None,
+            require_fresh_project_ids=True)
         objective = subject['objective'] + '\nOpen repair obligations: ' + json.dumps(repairs)
         objective += '\nAuthor experiments that satisfy these obligations; project IDs must be new: ' + json.dumps(list(history))
         value = CurriculumContext(objective=objective, wave_index=len(campaign.state['waves']) + 1,
             pre_wave_memory_sha256=hashlib.sha256(snapshot).hexdigest(), pre_wave_coverage=(),
-            prior_outcomes=(), curriculum_memory=tuple(json.loads(snapshot)['memories']),
+            prior_outcomes=(), curriculum_memory=generation_memory(snapshot, subject['subject_id'], store),
             remaining_seconds=remaining_seconds, remaining_projects=project_limit)
         decision, _ = selector.select(value, remaining_projects=project_limit)
         if not isinstance(decision, WaveDecision):
