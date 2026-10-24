@@ -2,11 +2,9 @@
 import argparse
 from copy import copy
 from contextlib import redirect_stdout
-from dataclasses import asdict
 import hashlib
 import io
 import json
-import re
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -24,6 +22,7 @@ from .subject_campaign import SubjectCampaign
 from .subject_execution import SubjectExecutor, optimizer_snapshot
 from .subjects import load_subjects
 from .subject_memory import digest as memory_digest
+from .subject_knowledge import SubjectKnowledge, memory_artifacts
 
 
 def referenced_settings(settings):
@@ -36,17 +35,6 @@ def referenced_settings(settings):
         paths['optimizer_worker'] = settings['optimizer_worker_config']
     return {role: hashlib.sha256(Path(path).read_bytes()).hexdigest()
             for role, path in paths.items() if path is not None}
-
-
-def memory_artifacts(record):
-    proposal, provenance = record['proposal'], record['provenance']
-    result = {proposal['after']['sha256'], *proposal['evidence'],
-              *provenance.get('request', {}).get('artifacts', {}).values()}
-    if proposal['before'] is not None:
-        result.add(proposal['before']['sha256'])
-    if provenance.get('review_sha256'):
-        result.add(provenance['review_sha256'])
-    return result
 
 
 def bounded_completion(provider, profile, messages, remaining_seconds):
@@ -153,76 +141,9 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
 
     curriculum_complete, verifier_complete = role_complete('curriculum'), role_complete('verifier')
     paths, embeddings = bound.get('paths'), bound.get('embeddings')
-    database_path = getattr(paths, 'kdb', None)
-    reference_query = getattr(bound['coordinator'].curriculum, 'query_knowledge', None)
-    if database_path is not None and reference_query is None:
-        from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
-        reference_query, _ = curriculum_knowledge(paths, embeddings)
-
-    def index(version, record):
-        if database_path is None:
-            return
-        from benchmarks.a5kernels.knowledge import KnowledgeDB
-        directory = root / 'memory-index' / version
-        directory.mkdir(parents=True, exist_ok=True)
-        document = directory / 'memory.json'
-        atomic(document, canonical(record))
-        with KnowledgeDB(database_path, embeddings) as database:
-            database.index(directory, [document], collection='subject-memory-' + version, language='memory')
-
-    def knowledge(payload, *, remaining_seconds, memory_snapshot=None, frozen_root=None):
-        from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, validate_knowledge_hit
-        started = time.monotonic()
-        def check_remaining():
-            if time.monotonic() - started >= remaining_seconds:
-                raise TimeoutError('subject knowledge query elapsed allowance exhausted')
-        if memory_snapshot is None:
-            memories = campaign.memory.search(payload['query'])
-            frozen_records = None
-        else:
-            # An in-flight Actor sees its frozen versions even if publication
-            # switches the live catalog while the Actor is executing.
-            words = set(re.findall(r'\w+', payload['query'].casefold()))
-            frozen_records = json.loads(memory_snapshot)['memories']
-            memories = [dict(record, version=memory_digest(record))
-                        for record in frozen_records
-                        if words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
-        for memory in memories:
-            memory.setdefault('artifacts', {}).update({str(i): digest
-                for i, digest in enumerate(sorted(memory_artifacts(memory)))})
-        hits = []
-        if reference_query is not None:
-            hits.extend(reference_query(KnowledgeQuery(payload['query']), check_remaining=check_remaining))
-        if database_path is not None and memories:
-            from benchmarks.a5kernels.knowledge import KnowledgeDB
-            selected_database = database_path
-            if frozen_records is not None:
-                # Pending treatment memory belongs only to this arm. It must
-                # never enter the shared accepted/reference database.
-                snapshot_id = hashlib.sha256(memory_snapshot).hexdigest()
-                directory = Path(frozen_root or root / 'frozen-memory') / snapshot_id
-                directory.mkdir(parents=True, exist_ok=True)
-                selected_database = directory / 'knowledge.sqlite'
-                with KnowledgeDB(selected_database, embeddings) as database:
-                    for record in frozen_records:
-                        check_remaining()
-                        version = memory_digest(record)
-                        source = directory / version / 'memory.json'
-                        source.parent.mkdir(exist_ok=True)
-                        atomic(source, canonical(record))
-                        database.index(source.parent, [source], collection='subject-memory-' + version,
-                                       language='memory')
-            with KnowledgeDB.open_read_only(selected_database, embeddings) as database:
-                for memory in memories:
-                    check_remaining()
-                    collection = 'subject-memory-' + memory['version']
-                    hits.extend(validate_knowledge_hit(database, collection, hit)
-                                for hit in database.query(collection, payload['query'], limit=5))
-        return dict(memories=memories, citations=[asdict(hit.citation) for hit in hits],
-                    hits=[dict(citation=asdict(hit.citation), text=hit.text, score=hit.score) for hit in hits])
-
-    def read(digest, *, remaining_seconds):
-        return store.read_bytes(digest)
+    knowledge = SubjectKnowledge(root, store, lambda: campaign.memory, paths=paths, embeddings=embeddings,
+        reference_query=getattr(bound['coordinator'].curriculum, 'query_knowledge', None))
+    reference_query = knowledge.reference_query
 
     def check(payload, *, remaining_seconds):
         from .execution import process_deadline
@@ -248,7 +169,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             current['request'] = request
             return super().review(request, **options)
 
-    verifier = RuntimeVerifier(verifier_complete, read, query_knowledge=knowledge, request_check=check)
+    verifier = RuntimeVerifier(verifier_complete, knowledge.read_artifact,
+        query_knowledge=knowledge.query, request_check=check)
     optimizer_config = settings.get('optimizer_worker_config')
     if isinstance(optimizer_config, str):
         optimizer_config = json.loads(Path(optimizer_config).read_bytes())
@@ -264,28 +186,13 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         optimizer_factory = None
     executor = SubjectExecutor(actor, optimizer_factory)
 
-    if database_path is not None:
+    if knowledge.database_path is not None:
         def actor_knowledge(payload, context):
-            from core.knowledge_presentation import knowledge_presentation
-            from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, Citation
-            from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
-            action = KnowledgeQuery(**payload)
             from .execution import _deadline
             allowance = _deadline.get() - time.monotonic()
             if hasattr(campaign, 'budget'):
                 allowance = min(allowance, campaign._remaining())
-            result = knowledge({'query': action.query}, remaining_seconds=allowance,
-                               memory_snapshot=context.request.pre_wave_memory,
-                               frozen_root=Path(context.request.branch_root) / 'frozen-memory')
-            admitted = {}
-            def retain(content):
-                digest = context.artifacts.put_bytes(content)
-                admitted[digest] = 'knowledge'
-                return digest
-            observation = knowledge_presentation(action.query, result['hits'][:action.limit], retain)
-            return AdaptiveActionResult(observation,
-                citations=tuple(Citation.from_mapping(hit['citation']) for hit in result['hits'][:action.limit]),
-                admitted_artifacts=admitted)
+            return knowledge.actor_query(payload, context, remaining_seconds=allowance)
         actor.query_knowledge = actor_knowledge
 
     def execute(item, snapshot, directory, *, remaining_seconds):
@@ -408,7 +315,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
 
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
-        max_seconds=max_seconds, index_memory=index)
+        max_seconds=max_seconds, index_memory=knowledge.index)
     campaign.role_complete = role_complete
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)

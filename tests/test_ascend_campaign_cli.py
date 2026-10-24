@@ -64,7 +64,7 @@ def start(tmp_path, *, phase=1, extra=(), screen=lambda *a: "session", seed=b"se
     cli.main(argv, screen=screen)
     job = cli._read(tmp_path / "control" / "job.json")
     if phase == 2:
-        # Retained pre-goal campaigns remain resumable; new Phase 2 starts require goals.
+        # Retain historical Phase 2 fixtures for direct controller and reader coverage.
         job.update(phase=2, phase1_root=str(tmp_path / "old"), review=str(tmp_path / "review.json"))
         write(tmp_path / "control" / "job.json", job)
         public = cli._read(tmp_path / "campaign" / "campaign-run.json")
@@ -1055,6 +1055,43 @@ def test_new_phase2_is_retired_before_files_or_compute(tmp_path, extra):
     assert calls == []
     assert not (tmp_path / 'control').exists()
     assert not (tmp_path / 'campaign').exists()
+
+
+@pytest.mark.parametrize('command,extra', [
+    ('resume', []), ('continue', ['--project-target', '3']), ('sample', []),
+    ('approve', ['--proposal-id', 'old-proposal']),
+    ('reject', ['--proposal-id', 'old-proposal']),
+    ('run-approved', ['--proposal-id', 'old-proposal']), ('_campaign', []),
+])
+def test_retained_phase2_control_cannot_dispatch_new_work(tmp_path, monkeypatch, command, extra):
+    job = start(tmp_path, phase=2)
+    control = Path(job['control'])
+    before = {path: path.read_bytes() for base in (control, Path(job['root']))
+              for path in base.rglob('*') if path.is_file()}
+    def no_dispatch(*args, **kwargs):
+        pytest.fail('retired Phase 2 command reached runtime or Screen')
+    for name in ('build_controller', 'campaign_worker', 'sample_curriculum',
+                 'approve_curriculum', 'reject_curriculum', 'run_approved_curriculum'):
+        monkeypatch.setattr(cli, name, no_dispatch)
+    with pytest.raises(SystemExit) as error:
+        cli.main([command, '--control', str(control), *extra], screen=no_dispatch)
+    assert error.value.code == 2
+    assert before == {path: path.read_bytes() for base in (control, Path(job['root']))
+                      for path in base.rglob('*') if path.is_file()}
+
+
+def test_retained_phase2_control_status_reads_without_runtime_or_screen(tmp_path, monkeypatch, capsys):
+    job = start(tmp_path, phase=2)
+    capsys.readouterr()
+    def no_dispatch(*args, **kwargs):
+        pytest.fail('historical status composed runtime or Screen')
+    monkeypatch.setattr(cli, 'build_controller', no_dispatch)
+    before = Path(job['control'], 'job.json').read_bytes()
+    cli.main(['status', '--control', job['control']], screen=no_dispatch)
+    report = json.loads(capsys.readouterr().out)
+    assert report['phase'] == 2
+    assert report['attempted'] == report['verified'] == report['published'] == 0
+    assert Path(job['control'], 'job.json').read_bytes() == before
 
 
 def test_retained_goal_launches_target_controller_and_checks_runtime(tmp_path, monkeypatch):
