@@ -1,6 +1,7 @@
 """One subject curriculum for learning, qualified targets and optimization."""
 from dataclasses import asdict
 import hashlib
+import fcntl
 import json
 from pathlib import Path
 import time
@@ -150,7 +151,7 @@ class SubjectCampaign:
             self._review(pid, self.state['projects'][pid])
         self._publish_wave(pending)
 
-    def run(self):
+    def _run(self):
         self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
         try:
             while True:
@@ -207,5 +208,13 @@ class SubjectCampaign:
             return self.report()
         finally:
             self.budget.close()
+
+    def run(self):
+        with (self.root / '.campaign.lock').open('a+b') as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise RuntimeError('subject campaign is already active; observe its retained work') from None
+            return self._run()
 
     resume = run

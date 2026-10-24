@@ -166,3 +166,13 @@ def test_local_verifier_timeout_does_not_exhaust_campaign_allocation(tmp_path):
     assert result['terminal']=='REVIEW_PENDING'
     assert result['pending'] is not None
     assert json.loads((tmp_path/'elapsed.json').read_text())['elapsed_seconds']<100
+
+
+def test_second_controller_cannot_start_while_original_work_is_active(tmp_path):
+    import fcntl
+    c=SubjectCampaign(tmp_path,[Subject('s','s')],b'',select_wave=None,execute=None,
+        verifier=None,complete=None)
+    with (tmp_path/'.campaign.lock').open('a+b') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError,match='already active'):c.resume()
+    assert not (tmp_path/'elapsed.json').exists()

@@ -65,6 +65,7 @@ behavior and limitations. Explain why evidence supports the lesson, not just
 that the original project passed. A rewrite feedback request concerns memory:
 rewrite using the retained project evidence; request project repair if the
 underlying evidence is insufficient.
+Return only one action JSON object per reply. Never add API configuration keys such as type or response_format.
 Return one JSON action per reply:
 {"read_artifact":{"sha256":"...","offset":0,"limit":8192}}
 {"knowledge_query":{"query":"..."}}
@@ -201,7 +202,10 @@ class ProjectVerifierAgent:
                 remaining()
                 self._record('tool', {'action': value, 'observation': observation})
             except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-                observation = {'error': str(exc)}
+                observation = {'error': str(exc), 'expected_top_level': [
+                    ['read_artifact'], ['knowledge_query'], ['request_check'],
+                    ['decision', 'reason', 'evidence', 'repair', 'memory']],
+                    'correction': 'Return only one of these exact key sets; remove API metadata and unknown keys.'}
                 self._record('feedback', observation)
             messages.append({'role': 'user', 'content': json.dumps(observation, sort_keys=True)})
 
