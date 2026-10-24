@@ -30,8 +30,15 @@ def test_graph_skips_self_distillation_retains_sources_and_resumes(tmp_path):
     ])
     request = _request(tmp_path, execution.executor)
     shared = ContentAddressedArtifacts(tmp_path / 'shared')
+    branch_store = ContentAddressedArtifacts(request.branch_root / 'artifacts')
+    historical = branch_store.put_bytes(b'unrelated historical memory')
+    prewave = branch_store.put_bytes(request.pre_wave_memory)
     outcome = SubjectExecutor(execution).graph(request, artifacts=shared)
     assert outcome.host_verified and actor.distill_calls == []
+    assert historical not in outcome.artifacts.values()
+    assert prewave not in outcome.artifacts.values()
+    result = json.loads(outcome.read_artifact(outcome.artifacts['result:execution']))
+    assert result['evidence']['classification'] == 'host-verified'
     assert outcome.read_artifact(outcome.source_sha256) == b'fixed source'
     retained = [outcome.read_artifact(h) for h in outcome.artifacts.values()]
     assert b'wrong source' in retained

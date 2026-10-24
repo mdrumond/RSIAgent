@@ -50,19 +50,23 @@ class SubjectOutcome:
         return ContentAddressedArtifacts(self.artifact_root).read_bytes(digest)
 
 
-def _logs(root, artifacts):
-    """Retain full provider ledgers and sealed traces rather than previews."""
+def _logs(root, artifacts, admitted):
+    """Index project admissions and exact provider evidence, not older memory."""
     result = {}
+    digests = set(admitted)
     paths = [root / 'evidence.jsonl', *sorted((root / 'sft-traces').glob('*.jsonl'))]
     for path in paths:
         if path.is_file():
-            result['log:' + path.relative_to(root).as_posix()] = artifacts.put_bytes(path.read_bytes())
-    # Provider request/response bytes live in this same content-addressed store.
-    # Retain their hashes so a verifier can follow full ledger references.
-    for path in sorted(artifacts.objects.glob('*/*')):
-        digest = path.parent.name + path.name
+            data = path.read_bytes()
+            result['log:' + path.relative_to(root).as_posix()] = artifacts.put_bytes(data)
+            if path.name == 'evidence.jsonl':
+                for line in data.splitlines():
+                    digest = json.loads(line)['payload'].get('sha256')
+                    if digest is not None:
+                        digests.add(digest)
+    for digest in sorted(digests):
         artifacts.read_bytes(digest)
-        result.setdefault('retained:' + digest, digest)
+        result['retained:' + digest] = digest
     return result
 
 
@@ -122,17 +126,19 @@ class SubjectExecutor:
             observations = dict(classification=result.evidence.classification.value,
                 summary=result.summary, host_facts=[asdict(f) for f in result.memory.host_facts],
                 actions=list(result.memory.actions), evidence=payload)
+            admitted = result.memory.admitted_artifact_sha256
             source, verified = result.memory.source_revision, result.evidence.verified
         except SemanticProjectFailure as error:
             payload = error.evidence
             observations = dict(classification='actor-unverified', summary=error.summary,
                                 evidence=payload, host_facts=payload.get('host_facts', []))
+            admitted = payload.get('admitted_artifact_sha256', [])
             source, verified = payload.get('source_sha256'), False
-        refs = {'execution': store.put_json(observations)}
+        refs = {'result:execution': store.put_json(observations)}
         if source is not None:
             store.read_bytes(source)
             refs['source'] = source
-        refs.update(_logs(root, store))
+        refs.update(_logs(root, store, [*admitted, *(qualified if target else [])]))
         outcome = SubjectOutcome(verified, source, refs, observations, store.root)
         root.mkdir(parents=True, exist_ok=True)
         atomic(checkpoint, canonical(dict(identity=identity, outcome=outcome.as_dict())))
@@ -173,5 +179,5 @@ class SubjectExecutor:
         refs['log:optimizer-events'] = store.put_json(execution.store.events(execution.job_id))
         observations = dict(classification=result['classification'], summary=result['summary'],
                             evidence=result, baseline=baseline, speedup=result.get('speedup'))
-        refs['execution'] = store.put_json(observations)
+        refs['result:execution'] = store.put_json(observations)
         return SubjectOutcome(result['verified'], source, refs, observations, store.root)

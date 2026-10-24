@@ -238,6 +238,8 @@ class ProjectVerifierAgent:
         bases = memory['base_versions']
         if not isinstance(bases, list) or any(not isinstance(base, dict) or set(base) != {'memory_id', 'version'} for base in bases):
             raise ValueError('memory bases require memory_id/version')
+        if len({base['memory_id'] for base in bases}) != len(bases):
+            raise ValueError('memory bases must identify distinct memories')
         if any((base['memory_id'], base['version']) not in versions for base in bases):
             raise ValueError('memory base was not returned by KDB')
         if (memory['operation'] == 'create' and bases or memory['operation'] == 'append' and len(bases) != 1

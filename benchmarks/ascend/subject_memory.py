@@ -64,6 +64,8 @@ class SubjectMemory:
             if review_id in state['admissions']:
                 return state['admissions'][review_id]
             bases = proposal['base_versions']
+            if len({row['memory_id'] for row in bases}) != len(bases):
+                raise ValueError('memory bases must identify distinct memories')
             if any(state['active'].get(row['memory_id']) != row['version'] for row in bases):
                 raise StaleMemory('memory replacement base changed; reconcile and reevaluate')
             memory_id = bases[0]['memory_id'] if bases else review_id
@@ -86,5 +88,10 @@ class SubjectMemory:
         records = []
         for record in self.records():
             if words & set(re.findall(r'\w+', json.dumps(record).casefold())):
-                records.append(dict(record, version=digest(record)))
+                artifacts = dict(record['provenance'].get('request', {}).get('artifacts', {}))
+                for role in ('before', 'after'):
+                    if record['proposal'].get(role):
+                        artifacts[role] = record['proposal'][role]['sha256']
+                artifacts.update({f'evidence:{i}': sha for i, sha in enumerate(record['proposal']['evidence'])})
+                records.append(dict(record, version=digest(record), artifacts=artifacts))
         return records

@@ -9,7 +9,7 @@ from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .project_verifier import ProjectReview
 from .subjects import SubjectScheduler, SubjectCurriculumAgent
-from .subject_memory import SubjectMemory
+from .subject_memory import SubjectMemory, StaleMemory
 from .time_budget import AttemptTimeBudget
 
 
@@ -52,24 +52,44 @@ class SubjectCampaign:
         if record.get('review') is not None:
             return
         outcome = record['outcome']
+        linked = {key: self.state['projects'].get(key) for key in record.get('repairs', [])}
+        artifacts = dict(outcome['artifacts'])
+        for key, original in linked.items():
+            if original is not None:
+                artifacts.update({f'repair:{key}:{role}': sha for role, sha in original['outcome']['artifacts'].items()})
+        sibling_evidence = {}
+        pending = self.state.get('pending') or {}
+        for pid in pending.get('projects', []):
+            sibling = self.state['projects'].get(pid, {})
+            if pid != project_id and set(record.get('repairs', [])) & set(sibling.get('repairs', [])):
+                sibling_evidence[pid] = sibling['outcome']['observations']
+                artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
+        objective = json.dumps(dict(subject=record['objective'], sibling_evidence=sibling_evidence, repairs={
+            key: original['review'] for key, original in linked.items() if original is not None}), sort_keys=True)
         request = ProjectReview(project_id=project_id, source_sha256=outcome['source_sha256'],
-            host_verified=outcome['host_verified'], artifacts=outcome['artifacts'],
+            host_verified=outcome['host_verified'], artifacts=artifacts,
             host_facts=tuple(outcome['observations'].get('host_facts', ())),
-            objective=record['objective'])
+            objective=objective)
         try:
-            review = self.verifier.review(request, max_seconds=self._remaining())
+            review = self.verifier.review(request, max_seconds=self._remaining(),
+                feedback=record.get('rewrite_feedback'))
         finally:
             record['verifier_trace'] = self.artifacts.put_json(self.verifier.last_trace)
             self._save()
+        record.pop('rewrite_feedback', None)
         record['review'] = review
         record['review_request'] = asdict(request)
         record['review_sha256'] = self.artifacts.put_json(review)
         self._save()
 
     def _publish_wave(self, pending):
-        review_ids = [pid for pid in pending['projects']
+        review_ids = pending.get('review_ids')
+        if review_ids is None:
+            review_ids = [pid for pid in pending['projects']
                       if self.state['projects'][pid]['review']['decision'] == 'accept'
                       and self.state['projects'][pid]['review']['memory'] is not None]
+            pending['review_ids'] = review_ids
+            self._save()
         self.scheduler.complete_wave(pending['wave_id'], review_ids)
         subject = pending['subject']['subject_id']
         for pid in pending['projects']:
@@ -77,21 +97,38 @@ class SubjectCampaign:
             review = record['review']
             evidence = [record['review_sha256']]
             if review['decision'] == 'repair':
+                if pid in review_ids:
+                    self.scheduler.resolve_review(pid, 'rejected')
                 self.scheduler.add_repair(pid, subject, pid, review['reason'], evidence)
                 continue
-            # A repair experiment resolves only obligations explicitly linked by its plan.
-            for repair_id in record.get('repairs', []):
-                self.scheduler.resolve_repair(repair_id, evidence)
             if review['memory'] is None:
+                if pid in review_ids:
+                    self.scheduler.resolve_review(pid, 'accepted')
                 continue
             provenance = dict(project_id=pid, subject_id=subject,
                 review_sha256=record['review_sha256'], request=record['review_request'])
             if self.memory_gate is None:
-                self.memory.accept(pid, review['memory'], provenance)
+                try:
+                    self.memory.accept(pid, review['memory'], provenance)
+                except StaleMemory as error:
+                    record.setdefault('prior_reviews', []).append(review)
+                    record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'],
+                        current_memories=self.memory.records())
+                    record['review'] = None
+                    self._save()
+                    self._review(pid, record)
+                    return self._publish_wave(pending)
                 self.scheduler.resolve_review(pid, 'accepted')
             else:
                 self.memory_gate.submit(pid, review['memory'], provenance,
                     record['review_request'], remaining_seconds=self._remaining())
+        linked_repairs = {}
+        for pid in pending['projects']:
+            for repair_id in self.state['projects'][pid].get('repairs', []):
+                linked_repairs.setdefault(repair_id, []).append(self.state['projects'][pid])
+        for repair_id, records in linked_repairs.items():
+            if all(row['review']['decision'] == 'accept' for row in records):
+                self.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in records])
         if pending['wave_id'] not in self.state['waves']:
             self.state['waves'].append(pending['wave_id'])
         self.state.update(pending=None, needs_decision=True)
@@ -108,7 +145,9 @@ class SubjectCampaign:
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
                     pending['memory_sha256']), directory, remaining_seconds=self._remaining()).as_dict()
                 self._save()
-            self._review(pid, record)
+        # All linked probes and controls must finish before either is reviewed.
+        for pid in pending['projects']:
+            self._review(pid, self.state['projects'][pid])
         self._publish_wave(pending)
 
     def run(self):
@@ -162,7 +201,8 @@ class SubjectCampaign:
                     memory_sha256=memory_sha, items=items, projects=[i['project_id'] for i in items])
                 self._save()
         except TimeoutError:
-            self.state['terminal'] = 'TIME_BUDGET_EXHAUSTED'
+            self.state['terminal'] = ('TIME_BUDGET_EXHAUSTED' if self.clock() >= self.budget.deadline
+                                      else 'REVIEW_PENDING')
             self._save()
             return self.report()
         finally:
