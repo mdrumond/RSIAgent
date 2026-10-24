@@ -118,6 +118,7 @@ class ProjectVerifierAgent:
         if request.source_sha256 is not None:
             known.add(request.source_sha256)
         read = set()
+        observed = {}
         versions, citations = set(), []
         queried = self.query_knowledge is None
         host_ok = request.host_verified
@@ -154,8 +155,9 @@ class ProjectVerifierAgent:
                     if type(offset) is not int or not 0 <= offset <= len(data) or type(limit) is not int or not 1 <= limit <= 65536:
                         raise ValueError('invalid artifact page')
                     page = data[offset:offset + limit]
-                    if page:
+                    if page or not data:
                         read.add(digest)
+                        observed.setdefault(digest, []).append((offset, offset + len(page)))
                     observation = {'sha256': digest, 'offset': offset, 'size': len(data),
                                    'text': page.decode('utf-8', errors='replace'),
                                    'next_offset': offset + limit if offset + limit < len(data) else None}
@@ -192,7 +194,7 @@ class ProjectVerifierAgent:
                         known.add(digest)
                 else:
                     self._validate_decision(value, request, read, required, host_ok,
-                                            queried, versions, citations, remaining)
+                                            queried, versions, citations, remaining, observed)
                     remaining()
                     self._record('decision', value)
                     return value
@@ -204,7 +206,7 @@ class ProjectVerifierAgent:
             messages.append({'role': 'user', 'content': json.dumps(observation, sort_keys=True)})
 
     def _validate_decision(self, value, request, read, required, host_ok, queried,
-                           versions, citations, remaining):
+                           versions, citations, remaining, observed):
         if set(value) != {'decision', 'reason', 'evidence', 'repair', 'memory'} or value['decision'] not in {'accept', 'repair'}:
             raise ValueError('invalid terminal decision')
         _text(value['reason'], 'reason')
@@ -253,8 +255,8 @@ class ProjectVerifierAgent:
         elif memory['before_unavailable_reason'] is not None:
             raise ValueError('before snippet cannot have an unavailable reason')
         else:
-            self._snippet(memory['before'], read, remaining)
-        self._snippet(memory['after'], read, remaining)
+            self._snippet(memory['before'], read, remaining, observed)
+        self._snippet(memory['after'], read, remaining, observed)
         if memory['after']['sha256'] != request.source_sha256:
             raise ValueError('after snippet must reference reviewed current source')
 
@@ -263,7 +265,7 @@ class ProjectVerifierAgent:
         if not isinstance(items, list) or not items or any(not isinstance(item, str) or item not in read for item in items):
             raise ValueError('evidence must cite nonempty actually read artifact references')
 
-    def _snippet(self, snippet, read, remaining):
+    def _snippet(self, snippet, read, remaining, observed):
         if not isinstance(snippet, dict) or set(snippet) != {'sha256', 'start_line', 'end_line', 'text'}:
             raise ValueError('invalid source snippet')
         if snippet['sha256'] not in read:
@@ -277,3 +279,15 @@ class ProjectVerifierAgent:
             raise ValueError('snippet lines are outside source artifact')
         if snippet['text'] != ''.join(lines[start - 1:end]):
             raise ValueError('snippet must match exact retained source lines')
+        # A private full-artifact validation read is not an observation by the
+        # agent. Quoted bytes must have appeared in one or more returned pages.
+        quote_start = len(''.join(lines[:start - 1]).encode('utf-8'))
+        quote_end = quote_start + len(snippet['text'].encode('utf-8'))
+        covered = quote_start
+        for page_start, page_end in sorted(observed.get(snippet['sha256'], [])):
+            if page_start > covered:
+                break
+            covered = max(covered, page_end)
+            if covered >= quote_end:
+                return
+        raise ValueError('read all quoted source bytes before quoting a snippet')
