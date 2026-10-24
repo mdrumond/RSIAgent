@@ -395,7 +395,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 skip = True
             elif not argument.startswith('--worker-config='):
                 filtered.append(argument)
-        arm_settings = dict(settings, phase1_arguments=[*filtered, '--worker-config', str(path)])
+        arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
         if optimizer_config is not None:
             arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
             for key in ('cache_directory', 'compile_cache_directory'):
@@ -416,6 +416,21 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         return child.execute(item, snapshot, directory / 'project', remaining_seconds=remaining_seconds)
 
     campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
+    if settings.get('memory_verification', True):
+        from .memory_admission import MemoryAdmission
+        from .memory_verifier import MemoryVerifier
+        judge = MemoryVerifier(role_complete('memory_verifier'), select_trial, execute_trial_arm,
+            model_identity=campaign.model_identity, runtime_identity=campaign.runtime_identity,
+            max_seconds=settings.get('memory_trial_seconds', 1800),
+            arm_seconds=settings.get('memory_arm_seconds', 600))
+        rewrite_agent = ProjectVerifierAgent(verifier_complete, read, query_knowledge=knowledge)
+        def rewrite(request, *, feedback, max_seconds):
+            try:
+                return rewrite_agent.review(request, feedback=feedback, max_seconds=max_seconds)
+            finally:
+                store.put_json(rewrite_agent.last_trace)
+        campaign.memory_gate = MemoryAdmission(root / 'memory-reviews', campaign.memory, judge, rewrite,
+            max_seconds=settings.get('memory_review_seconds', 3600), parent_remaining=campaign._remaining)
     return campaign
 
 
@@ -439,6 +454,11 @@ def main(argv=None, *, builder=build_subject_campaign):
     campaign = builder(json.loads(args.config.read_bytes()), target=args.target, root=args.root,
         subjects=load_subjects(args.subjects), initial_memory=args.initial_memory.read_bytes(),
         max_seconds=args.max_seconds)
-    result = getattr(campaign, args.action)()
+    try:
+        result = getattr(campaign, args.action)()
+    finally:
+        gate = getattr(campaign, 'memory_gate', None)
+        if gate is not None:
+            gate.close()
     print(json.dumps(result, sort_keys=True))
     return result

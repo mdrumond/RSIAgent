@@ -47,6 +47,15 @@ class SubjectCampaign:
             return
         for result in self.memory_gate.poll(remaining_seconds=self._remaining()):
             self.scheduler.resolve_review(result['review_id'], result['outcome'])
+            if result.get('repair'):
+                provenance = result['provenance']
+                review = result['repair']
+                self.scheduler.add_repair(result['review_id']+'-memory', provenance['subject_id'],
+                    provenance['project_id'], review['reason'], review['evidence'])
+                self.state['needs_decision'] = True
+                self._save()
+            if hasattr(self.memory_gate, 'acknowledge'):
+                self.memory_gate.acknowledge(result['review_id'])
 
     def _review(self, project_id, record):
         if record.get('review') is not None:

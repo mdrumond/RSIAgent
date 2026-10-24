@@ -2,6 +2,7 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import json
+import fcntl
 from pathlib import Path
 import time
 
@@ -32,6 +33,12 @@ class MemoryAdmission:
                  parent_remaining=None, clock=time.monotonic):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self.lease = (self.root / '.admission.lock').open('a+b')
+        try:
+            fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.lease.close()
+            raise RuntimeError('memory verification worker is already active') from None
         self.memory, self.verifier, self.rewrite = memory, verifier, rewrite
         self.seconds, self.parent_remaining, self.clock = max_seconds, parent_remaining, clock
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='memory-verifier')
@@ -58,6 +65,7 @@ class MemoryAdmission:
             job = dict(review_id=review_id, proposal=proposal, provenance=provenance,
                 request=request, baseline=base64.b64encode(self.memory.snapshot()).decode(),
                 status='pending', rewrites=0, revision=0, trial_task=None, evaluations=[],
+                sequence=len(list(self.root.glob('*/job.json'))),
                 allocation=min(self.seconds, remaining_seconds))
             self._save(job)
         self._start()
@@ -101,7 +109,14 @@ class MemoryAdmission:
                 treatment = treatment_snapshot(baseline, job['proposal'], job['provenance'], job['review_id'])
                 result = self.verifier.evaluate(job['proposal'], baseline, treatment,
                     directory / f"revision-{job['revision']}", remaining_seconds=remaining(),
-                    task=job['trial_task'], sequence=job['revision'])
+                    task=job['trial_task'], sequence=job.get('sequence',0)+job['revision'])
+                remaining()
+                from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+                shared = ContentAddressedArtifacts(self.memory.root.parent / 'artifacts')
+                trial_store = ContentAddressedArtifacts(directory / f"revision-{job['revision']}" / 'artifacts')
+                for sha in result.get('artifacts', {}).values():
+                    shared.put_bytes(trial_store.read_bytes(sha))
+                job.setdefault('trace_sha256', []).append(shared.put_json(getattr(self.verifier,'last_trace',[])))
                 job['evaluations'].append(result)
                 job['trial_task'] = result.get('trial_task')
                 self._save(job)
@@ -111,7 +126,12 @@ class MemoryAdmission:
                     return
                 if result['decision'] == 'accept':
                     try:
-                        job['admission'] = self.memory.accept(job['review_id'], job['proposal'], job['provenance'])
+                        job['admission'] = self.memory.accept(job['review_id'], job['proposal'], dict(
+                            job['provenance'], memory_verification=dict(
+                                evaluation_id=result.get('evaluation_id',digest(result)),
+                                decision=result['decision'], evidence=result['evidence'],
+                                trace_sha256=job['trace_sha256'][-1], rewrites=job['rewrites'])),
+                            check_remaining=remaining)
                     except StaleMemory:
                         continue
                     job['status'] = 'accepted'
@@ -169,9 +189,11 @@ class MemoryAdmission:
             if job['status'] in {'accepted', 'rejected'} and job['review_id'] not in self.delivered:
                 result.append(dict(review_id=job['review_id'], outcome=job['status'],
                     repair=job.get('project_repair'), provenance=job['provenance']))
-                self.delivered.add(job['review_id'])
         self._start()
         return result
+
+    def acknowledge(self, review_id):
+        self.delivered.add(review_id)
 
     def wait(self, *, remaining_seconds):
         self._start()
@@ -183,4 +205,6 @@ class MemoryAdmission:
             raise TimeoutError('waiting for memory review exceeded campaign allocation') from None
 
     def close(self):
-        self.pool.shutdown(wait=True)
+        if not self.lease.closed:
+            self.pool.shutdown(wait=True)
+            self.lease.close()

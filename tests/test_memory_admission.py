@@ -96,3 +96,67 @@ def test_inconclusive_does_not_rewrite_or_admit(tmp_path):
         assert job['status']=='inconclusive' and job['rewrites']==0
         assert memory.records()==[]
     finally:gate.close()
+
+
+def test_stale_base_is_reconciled_without_consuming_rewrite_chances(tmp_path):
+    from benchmarks.ascend.subject_memory import digest
+    memory=SubjectMemory(tmp_path/'memory',b'')
+    old=memory.accept('old',draft(),{})
+    started,release=threading.Event(),threading.Event()
+    class Paused(Evaluation):
+        def evaluate(self,*a,**kw):
+            if not self.calls:
+                started.set();assert release.wait(3)
+            return super().evaluate(*a,**kw)
+    evaluation=Paused(['accept','accept'])
+    proposed=dict(draft(),operation='append',base_versions=[old])
+    def rewrite(req,feedback,max_seconds):
+        record=memory.records()[0]
+        return dict(decision='accept',memory=dict(proposed,base_versions=[dict(
+            memory_id=record['memory_id'],version=digest(record))]))
+    gate=MemoryAdmission(tmp_path/'gate',memory,evaluation,rewrite)
+    try:
+        gate.submit('pending',proposed,{},request(),remaining_seconds=100)
+        assert started.wait(3)
+        memory.accept('concurrent',dict(proposed,summary='concurrent accepted change'),{})
+        release.set();gate.wait(remaining_seconds=5)
+        assert gate.poll(remaining_seconds=5)[0]['outcome']=='accepted'
+        job=json.loads(gate._path('pending').read_bytes())
+        assert job['rewrites']==0 and job['revision']==1
+        assert evaluation.calls[0][1]!=evaluation.calls[1][1]
+    finally:release.set();gate.close()
+
+
+def test_other_waves_run_on_stale_memory_while_verification_is_pending(tmp_path):
+    from benchmarks.ascend.subject_campaign import SubjectCampaign
+    from benchmarks.ascend.subjects import Subject
+    from benchmarks.ascend.subject_execution import SubjectOutcome
+    started,release=threading.Event(),threading.Event()
+    class Paused(Evaluation):
+        def evaluate(self,*a,**kw):
+            if not self.calls:
+                started.set();assert release.wait(3)
+            return super().evaluate(*a,**kw)
+    snapshots=[]
+    class Review:
+        last_trace=[]
+        def review(self,req,**kw):return dict(decision='accept',reason='host checked',
+            evidence=[req.source_sha256],repair=None,memory=draft())
+    def execute(item,snapshot,*a,**kw):
+        snapshots.append(snapshot)
+        if len(snapshots)==2:
+            assert started.wait(3);release.set()
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    c=SubjectCampaign(tmp_path,[Subject('one','one',1),Subject('two','two',1)],b'',
+        select_wave=lambda context,*a,**kw:[dict(project_id=context['current_subject']['subject_id'])],
+        execute=execute,verifier=Review(),complete=lambda *a,**kw:json.dumps(dict(
+            action='advance',reason='complete wave',evidence=['retained'])))
+    gate=MemoryAdmission(tmp_path/'gate',c.memory,Paused(['accept','accept']),None,parent_remaining=c._remaining)
+    c.memory_gate=gate
+    try:
+        assert c.run()['terminal']=='COMPLETE'
+        assert snapshots[0]==snapshots[1]
+        assert len(c.memory.records())==2
+        assert all(row['status']=='accepted' for row in c.scheduler.state()['reviews'].values())
+    finally:release.set();gate.close()
