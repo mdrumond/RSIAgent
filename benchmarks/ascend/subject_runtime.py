@@ -365,11 +365,16 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
 
     def select_trial(proposal, *, remaining_seconds):
+        lesson = {key: str(proposal.get(key, ''))[:1024] for key in
+                  ('summary', 'applicability', 'preconditions', 'expectations', 'limitations')}
+        lesson['proposal_sha256'] = store.put_bytes(canonical(proposal))
+        lesson['source_examples'] = {key: {field: value for field, value in proposal[key].items() if field != 'text'}
+                                     for key in ('before', 'after') if proposal.get(key) is not None}
         context = dict(current_subject=dict(subject_id='memory-transfer', task=None, objective=(
             'Author exactly ONE SMALL transfer project that could benefit from this proposed lesson. '
             'Use different inputs/extents from its source project. Freeze ordinary host acceptance. '
             'Do not include lesson advice, code snippets or solution strategy in the task/hypothesis. '
-            'Proposed lesson for selecting the workload only: ' + json.dumps(proposal))), repairs=[])
+            'Proposed lesson for selecting the workload only: ' + json.dumps(lesson))), repairs=[])
         return select_wave(context, campaign.memory.snapshot(), {}, remaining_seconds=remaining_seconds,
                            project_limit=1)[0]
 

@@ -408,3 +408,38 @@ def test_generation_retrieval_pins_snapshot_and_bounds_full_code_results(tmp_pat
     assert json.loads(full)['proposal']['summary'] == learned['summary']
     assert len(full) > len(page['results'][position]['text'].encode())
     assert page['search_details']['snapshot_sha256'] == payloads[0]['pre_wave_memory_sha256']
+
+
+def test_transfer_selection_bounds_rich_proposal_with_readable_exact_identity(tmp_path):
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
+    from benchmarks.ascend.agent_context import ContextBudget, request_bytes
+    from test_a5_phase1_adaptive import _project, _wave
+    from optimizer.jobs import canonical
+    requests, contexts = [], []
+    profile = direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value == 'deepseek-flash'))
+    def transport(**options):
+        requests.append(options['request'])
+        context = selection_context(options['request']['messages'])
+        contexts.append(context)
+        return DirectCompletion(_wave(json.dumps(context), [_project('transfer', 'gm-ub-movement')]), 1)
+    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
+        models=[profile.identity.backend_model], transport=transport,
+        context_budgets={'deepseek-flash': ContextBudget(40000, 32768, 49152)})
+    binding = bound(tmp_path)
+    binding.update(provider=provider, profile=profile)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path/'run',
+        subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: binding)
+    proposed = memory()
+    proposed['after']['text'] = 'kernel source\n' * 10000
+    proposed['before'] = dict(proposed['after'])
+    item = campaign.select_trial(proposed, remaining_seconds=60)
+    assert item['project_id'] == 'transfer'
+    assert request_bytes(requests[0]) < 49152
+    # The model receives workload semantics while full code remains immutable in CAS.
+    objective = contexts[0]['objective']
+    lesson = json.JSONDecoder().raw_decode(objective.split('Proposed lesson for selecting the workload only: ', 1)[1])[0]
+    assert lesson['summary'] == proposed['summary']
+    assert lesson['preconditions'] == proposed['preconditions']
+    assert lesson['applicability'] == proposed['applicability']
+    assert campaign.artifacts.read_bytes(lesson['proposal_sha256']) == canonical(proposed)
+    assert lesson['source_examples']['after']['sha256'] == proposed['after']['sha256']
