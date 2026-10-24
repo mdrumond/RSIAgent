@@ -299,3 +299,57 @@ def test_arm_composition_consumes_allocation_and_late_preflight_never_starts_act
     with pytest.raises(TimeoutError):
         campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'late', remaining_seconds=3)
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize('kind', ['config', 'worker-config', 'optimizer_worker_config'])
+def test_same_path_runtime_json_mutation_is_rejected_before_recomposition(tmp_path, kind):
+    referenced = tmp_path / 'runtime.json'
+    referenced.write_text(json.dumps({'physical_device': 0, 'workspace': '/old'}))
+    settings = ({'optimizer_worker_config': str(referenced)} if kind == 'optimizer_worker_config'
+                else {'phase1_arguments': ['--' + kind, str(referenced)]})
+    calls = []
+    def compose(*args, **options):
+        calls.append(options)
+        return bound(options['root'])
+    options = dict(target='a3', root=tmp_path / 'run', subjects=[Subject('s', 'copies')],
+                   initial_memory=b'', compose=compose)
+    build_subject_campaign(settings, **options)
+    referenced.write_text(json.dumps({'physical_device': 1, 'workspace': '/new'}))
+    with pytest.raises(ValueError, match='settings or target changed'):
+        build_subject_campaign(settings, **options)
+    assert len(calls) == 1
+
+
+def test_optimizer_reads_initial_seed_and_published_source_evidence_via_real_tools(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from optimizer.jobs import JobStore
+    from optimizer.loop import OptimizationLoop
+    observed = []
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def optimizer(self, directory, task, snapshot, **kwargs):
+            jobs = JobStore(directory / 'jobs')
+            job = jobs.create('def f(x): return x', 'f', {'args': []}, snapshot)
+            loop = OptimizationLoop(jobs, job['job_id'], None, None)
+            for action in [dict(action='read-memory', index=0), dict(action='read-memory', index=1),
+                           dict(action='read-artifact', sha256=snapshot['memory_entries'][0]['artifact_sha256'], offset=0),
+                           dict(action='read-artifact', sha256=snapshot['memory_entries'][1]['proposal']['after']['sha256'], offset=0),
+                           dict(action='read-artifact', sha256=snapshot['memory_entries'][1]['proposal']['evidence'][0], offset=0)]:
+                loop._tool(action, snapshot)
+                observed.append(loop.state['history'][-1]['content'])
+            return snapshot
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    seed = b'Initial host guidance\n'
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'optimization')], initial_memory=seed,
+        compose=lambda *args, **options: bound(options['root']))
+    campaign.artifacts.put_bytes(SOURCE); campaign.artifacts.put_bytes(RESULT)
+    campaign.memory.accept('lesson', memory(), {})
+    item = dict(project_id='optimizer', task=dict(kind='optimizer', task={}))
+    snapshot = campaign.execute(item, campaign.memory.snapshot(), tmp_path / 'execution', remaining_seconds=30)
+    assert observed[0]['text'] == seed.decode()
+    assert observed[1]['proposal']['after']['text'] == SOURCE.decode()
+    assert observed[2]['text'] == seed.decode()
+    assert observed[3]['text'] == SOURCE.decode()
+    assert observed[4]['text'] == RESULT.decode()

@@ -57,3 +57,13 @@ workspace while retaining the configured model, runtime and physical device.
 Actor KDB retrieval follows the arm's frozen memory versions, even when the live
 accepted catalog changes. `role_complete`, `model_identity` and `runtime_identity`
 are exposed for the memory verifier composition; admission remains caller-owned.
+
+Optimizer subjects retain the initial seed as a readable memory entry and export
+accepted memory documents plus reachable code/evidence in authenticated optimizer
+snapshot files. The existing `read-memory` and `read-artifact` tools can follow
+the same memory links as graph Actors.
+
+Runtime identity includes content hashes of referenced runtime/worker JSON files,
+including optimizer worker settings. Editing a physical device or workspace at
+the same filename is rejected before recomposition. Credential environment files
+are excluded from these content identities.

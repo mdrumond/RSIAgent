@@ -26,6 +26,29 @@ from .subjects import load_subjects
 from .subject_memory import digest as memory_digest
 
 
+def referenced_settings(settings):
+    """Freeze ignored runtime JSON bytes without persisting their contents."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('--config'); parser.add_argument('--worker-config')
+    options, _ = parser.parse_known_args(settings.get('phase1_arguments', []))
+    paths = dict(config=options.config, worker=options.worker_config)
+    if isinstance(settings.get('optimizer_worker_config'), str):
+        paths['optimizer_worker'] = settings['optimizer_worker_config']
+    return {role: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for role, path in paths.items() if path is not None}
+
+
+def memory_artifacts(record):
+    proposal, provenance = record['proposal'], record['provenance']
+    result = {proposal['after']['sha256'], *proposal['evidence'],
+              *provenance.get('request', {}).get('artifacts', {}).values()}
+    if proposal['before'] is not None:
+        result.add(proposal['before']['sha256'])
+    if provenance.get('review_sha256'):
+        result.add(provenance['review_sha256'])
+    return result
+
+
 def bounded_completion(provider, profile, messages, remaining_seconds):
     """Use a private provider copy and bound both retry and HTTP timeouts."""
     from benchmarks.a5kernels.phase1_provider import openai_compatible_transport, DirectCompletion
@@ -104,7 +127,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest())
+    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest(),
+                    referenced_json_sha256=referenced_settings(settings))
     identity_path = root / 'subject-runtime.json'
     if identity_path.exists() and json.loads(identity_path.read_bytes()) != identity:
         raise ValueError('subject runtime settings or target changed on resume')
@@ -164,11 +188,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                         for record in frozen_records
                         if words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
         for memory in memories:
-            memory.setdefault('artifacts', {}).update({str(i): digest for i, digest in enumerate(
-                memory['proposal']['evidence'] + [memory['proposal']['after']['sha256']])})
-            if memory['proposal']['before'] is not None:
-                memory['artifacts']['before'] = memory['proposal']['before']['sha256']
-            memory['artifacts'].update(memory['provenance'].get('request', {}).get('artifacts', {}))
+            memory.setdefault('artifacts', {}).update({str(i): digest
+                for i, digest in enumerate(sorted(memory_artifacts(memory)))})
         hits = []
         if reference_query is not None:
             hits.extend(reference_query(KnowledgeQuery(payload['query']), check_remaining=check_remaining))
@@ -280,19 +301,22 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         atomic(plans_path, canonical(plans))
         if item.get('task', {}).get('kind') == 'optimizer':
             envelope = json.loads(snapshot)
-            frozen = optimizer_snapshot(envelope['memories'], source_identity={'target': target})
+            seed = envelope['initial_memory'].encode('utf-8')
+            files = {'initial-memory.txt': seed}
+            for record in envelope['memories']:
+                files['memories/' + memory_digest(record) + '.json'] = canonical(record)
+                for digest in memory_artifacts(record):
+                    files['artifacts/' + digest] = store.read_bytes(digest)
+            entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
+                            artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
+            frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
             return executor.optimizer(directory, item['task']['task'], frozen,
                 attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
         for memory in envelope['memories']:
-            proposal = memory['proposal']
-            reachable = set(proposal['evidence']) | {proposal['after']['sha256']}
-            if proposal['before'] is not None:
-                reachable.add(proposal['before']['sha256'])
-            reachable.update(memory['provenance'].get('request', {}).get('artifacts', {}).values())
-            for digest in reachable:
+            for digest in memory_artifacts(memory):
                 branch_artifacts.put_bytes(store.read_bytes(digest))
         inputs = materialize_inputs(spec)
         request = AdaptiveProjectRequest(spec, ordinal, snapshot, directory, inputs,
@@ -406,6 +430,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if seconds <= 0:
                 raise TimeoutError('trial arm elapsed allocation exhausted before execution')
             return seconds
+        if referenced_settings(settings) != identity['referenced_json_sha256']:
+            raise ValueError('referenced runtime settings changed before trial composition')
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         selection = argparse.ArgumentParser(add_help=False)
@@ -449,12 +475,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
         available()
         for record in json.loads(snapshot)['memories']:
-            proposal = record['proposal']
-            digests = {proposal['after']['sha256'], *proposal['evidence'],
-                       *record['provenance'].get('request', {}).get('artifacts', {}).values()}
-            if proposal['before'] is not None:
-                digests.add(proposal['before']['sha256'])
-            for digest in digests:
+            for digest in memory_artifacts(record):
                 child.artifacts.put_bytes(store.read_bytes(digest))
         return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
 
