@@ -32,7 +32,7 @@ def _digest(value):
 @dataclass(frozen=True)
 class ProjectReview:
     project_id: str
-    source_sha256: str
+    source_sha256: str | None
     host_verified: bool
     artifacts: Mapping[str, str]
     host_facts: tuple = ()
@@ -40,9 +40,13 @@ class ProjectReview:
 
     def __post_init__(self):
         _text(self.project_id, 'project_id')
-        _digest(self.source_sha256)
         if type(self.host_verified) is not bool:
             raise ValueError('host_verified must be a host-owned boolean')
+        if self.source_sha256 is None:
+            if self.host_verified:
+                raise ValueError('host-verified projects require retained source')
+        else:
+            _digest(self.source_sha256)
         for role, digest in self.artifacts.items():
             _text(role, 'artifact role')
             _digest(digest)
@@ -110,13 +114,17 @@ class ProjectVerifierAgent:
                 raise TimeoutError('project verifier elapsed allocation exhausted')
             return seconds
 
-        known = {request.source_sha256, *request.artifacts.values()}
+        known = set(request.artifacts.values())
+        if request.source_sha256 is not None:
+            known.add(request.source_sha256)
         read = set()
         versions, citations = set(), []
         queried = self.query_knowledge is None
         host_ok = request.host_verified
-        required = {request.source_sha256, *(digest for role, digest in request.artifacts.items()
-                    if any(part in role.lower() for part in ('result', 'log', 'evidence')))}
+        required = {digest for role, digest in request.artifacts.items()
+                    if any(part in role.lower() for part in ('result', 'log', 'evidence', 'execution'))}
+        if request.source_sha256 is not None:
+            required.add(request.source_sha256)
         context = {'project': asdict(request), 'rewrite_feedback': feedback,
                    'tools': {'knowledge_query': self.query_knowledge is not None,
                              'request_check': self.request_check is not None}}
@@ -202,6 +210,8 @@ class ProjectVerifierAgent:
         _text(value['reason'], 'reason')
         self._evidence(value['evidence'], read)
         if value['decision'] == 'repair':
+            if request.source_sha256 is None and required - read:
+                raise ValueError('read execution result/log evidence for a project without source')
             if value['memory'] is not None or not isinstance(value['repair'], dict) or set(value['repair']) != {'instructions', 'expected_evidence'}:
                 raise ValueError('repair needs instructions/expected_evidence and no memory')
             for key, text in value['repair'].items():
