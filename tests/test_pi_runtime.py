@@ -132,6 +132,70 @@ def test_real_pi_reads_admitted_large_guide_with_complete_exchange(monkeypatch):
         assert pi.completion_tokens == 20
 
 
+def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monkeypatch):
+    instruction = 'Instruction body. ' * 600
+    source = 'kernel source;\n' * 160
+    requests, refs = [], {}
+    def pages(request):
+        return [json.loads(message['content']) for message in request['messages'] if message['role'] == 'tool']
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        index = len(requests)
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        if index == 0:
+            packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+            refs.update({key: packet['context']['host'][key]['record'] for key in ['instruction', 'source']})
+        reads = [(refs.get('instruction'), 0), (refs.get('instruction'), 8192), (refs.get('source'), 0)]
+        if index < 3:
+            record, offset = reads[index]
+            return stream('read_context', dict(record=record, offset=offset, limit=8192), index)
+        if index in (3, 4):
+            retained = pages(request)
+            assert len(retained) == 3
+            assert {(row['record'], row['offset']) for row in retained} == set(reads)
+            assert ''.join(row['text'] for row in sorted(retained, key=lambda row: row['offset'])
+                           if row['record'] == refs['instruction']) == instruction
+            assert next(row['text'] for row in retained if row['record'] == refs['source']) == source
+            calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
+            assert calls == {m['tool_call_id'] for m in request['messages'] if m['role'] == 'tool'}
+            if index == 3:
+                return stream('read_context', dict(limit=8192, offset=0, record=refs['instruction']), index)
+        if index == 5:
+            assert not pages(request)
+        return stream('write', {'source': 'kernel'}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'instruction': instruction, 'source': source}, ['write']) == ('write', {'source': 'kernel'})
+        assert pi.next_action({'task': 'New authoritative task'}, ['write']) == ('write', {'source': 'kernel'})
+    assert len(requests) == 6
+
+
+def test_real_pi_many_context_pages_keep_requests_bounded_and_exchanges_complete(monkeypatch):
+    requests = []
+    guide = 'Guide page contents. ' * 10000
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        index = len(requests)
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+        calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
+        results = [m for m in request['messages'] if m['role'] == 'tool']
+        assert calls == {m['tool_call_id'] for m in results}
+        if index:
+            assert any(json.loads(m['content'])['offset'] == (index-1)*4096 for m in results)
+        if index == 10:
+            assert 1 < len(results) < 10
+            return stream('write', {'source': 'bounded kernel'}, index)
+        return stream('read_context', {'record': packet['context']['host']['guide']['record'],
+                                      'offset': index*4096, 'limit': 4096}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'guide': guide}, ['write']) == ('write', {'source': 'bounded kernel'})
+    assert len(requests) == 11
+
+
 def test_credential_in_context_is_rejected_before_provider(monkeypatch):
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('paid request'))
     with session() as pi:
