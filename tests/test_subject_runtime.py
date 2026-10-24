@@ -146,7 +146,7 @@ def test_actor_retrieval_pins_wave_versions_after_catalog_replacement(tmp_path):
     frozen = campaign.memory.snapshot()
     second = campaign.memory.accept('two', dict(proposal, operation='append', base_versions=[first]), {})
     campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
-    context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=frozen),
+    context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=frozen, branch_root=tmp_path / 'branch'),
                               artifacts=ContentAddressedArtifacts(tmp_path / 'actor-artifacts'))
     result = bindings['actor'].query_knowledge({'query': 'vector increments'}, context)
     collections = {citation.collection for citation in result.citations}
@@ -217,3 +217,85 @@ def test_a5_catlass_optimizer_is_rejected_before_composition(tmp_path):
             initial_memory=b'', compose=lambda *a, **k: calls.append(a))
     assert calls == []
     assert not (tmp_path / 'run').exists()
+
+
+def test_pending_treatment_memory_indexes_only_its_frozen_arm_database(tmp_path):
+    import time
+    from benchmarks.ascend.subject_memory import digest
+    database_path = tmp_path / 'knowledge.sqlite'
+    reference = tmp_path / 'reference.txt'
+    reference.write_text('Vector increment reference\n')
+    embeddings = FakeEmbeddings()
+    with KnowledgeDB(database_path, embeddings) as database:
+        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
+    bindings = bound(tmp_path, kdb=database_path, embeddings=embeddings)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'vectors')], initial_memory=b'', compose=lambda *a, **k: bindings)
+    campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
+    draft = dict(memory_id='pending', proposal=dict(memory(), summary='Vector pendingmemoryvector trick'), provenance={})
+    baseline = campaign.memory.snapshot()
+    treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
+    def query(snapshot, arm):
+        context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=snapshot, branch_root=tmp_path / arm),
+                                  artifacts=ContentAddressedArtifacts(tmp_path / arm / 'artifacts'))
+        return bindings['actor'].query_knowledge({'query': 'pendingmemoryvector'}, context)
+    version = digest(draft)
+    assert 'subject-memory-' + version in {row.collection for row in query(treatment, 'treatment').citations}
+    assert 'subject-memory-' + version not in {row.collection for row in query(baseline, 'baseline').citations}
+    with KnowledgeDB.open_read_only(database_path, embeddings) as database:
+        with pytest.raises(KeyError):
+            database.manifest('subject-memory-' + version)
+    assert campaign.memory.records() == []
+
+
+def test_wave_author_gets_reused_id_feedback_without_changing_frozen_context(tmp_path):
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
+    from test_a5_phase1_adaptive import _project, _wave
+    requests = []
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    def transport(**options):
+        messages = options['request']['messages']
+        requests.append(messages)
+        project_id = 'repeat' if len(requests) == 1 else 'fresh'
+        return DirectCompletion(_wave(messages[1]['content'], [_project(project_id, 'gm-ub-movement')]), 1)
+    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
+        models=[profile.identity.backend_model], transport=transport)
+    binding = bound(tmp_path)
+    binding['provider'] = provider
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
+        subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: binding)
+    items = campaign.select_wave(campaign.scheduler.context(), campaign.memory.snapshot(),
+                                 {'repeat': {}}, remaining_seconds=30)
+    assert [item['project_id'] for item in items] == ['fresh']
+    assert len(requests) == 2
+    assert requests[0][1] == requests[1][1]
+    assert [row['role'] for row in requests[1][-2:]] == ['assistant', 'user']
+
+
+def test_arm_composition_consumes_allocation_and_late_preflight_never_starts_actor(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    now, requests = [0.0], []
+    monkeypatch.setattr(subject_runtime.time, 'monotonic', lambda: now[0])
+    worker = tmp_path / 'worker.json'
+    worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path / 'device'), physical_device=0)))
+    parent = tmp_path / 'parent'
+    def compose(settings, **options):
+        if options['root'] != parent:
+            now[0] += 4
+        return bound(options['root'])
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def graph(self, request, **kwargs):
+            requests.append(request)
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({'phase1_arguments': ['--worker-config', str(worker)]}, target='a3',
+        root=parent, subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
+    item = dict(project_id='transfer', spec=_project('transfer', 'gm-ub-movement'))
+    campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'valid', remaining_seconds=10)
+    assert requests[0].remaining_seconds == 6
+    with pytest.raises(TimeoutError):
+        campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'late', remaining_seconds=3)
+    assert len(requests) == 1

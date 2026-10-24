@@ -146,7 +146,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         with KnowledgeDB(database_path, embeddings) as database:
             database.index(directory, [document], collection='subject-memory-' + version, language='memory')
 
-    def knowledge(payload, *, remaining_seconds, memory_snapshot=None):
+    def knowledge(payload, *, remaining_seconds, memory_snapshot=None, frozen_root=None):
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, validate_knowledge_hit
         started = time.monotonic()
         def check_remaining():
@@ -154,12 +154,14 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 raise TimeoutError('subject knowledge query elapsed allowance exhausted')
         if memory_snapshot is None:
             memories = campaign.memory.search(payload['query'])
+            frozen_records = None
         else:
             # An in-flight Actor sees its frozen versions even if publication
             # switches the live catalog while the Actor is executing.
             words = set(re.findall(r'\w+', payload['query'].casefold()))
+            frozen_records = json.loads(memory_snapshot)['memories']
             memories = [dict(record, version=memory_digest(record))
-                        for record in json.loads(memory_snapshot)['memories']
+                        for record in frozen_records
                         if words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
         for memory in memories:
             memory.setdefault('artifacts', {}).update({str(i): digest for i, digest in enumerate(
@@ -172,7 +174,24 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             hits.extend(reference_query(KnowledgeQuery(payload['query']), check_remaining=check_remaining))
         if database_path is not None and memories:
             from benchmarks.a5kernels.knowledge import KnowledgeDB
-            with KnowledgeDB.open_read_only(database_path, embeddings) as database:
+            selected_database = database_path
+            if frozen_records is not None:
+                # Pending treatment memory belongs only to this arm. It must
+                # never enter the shared accepted/reference database.
+                snapshot_id = hashlib.sha256(memory_snapshot).hexdigest()
+                directory = Path(frozen_root or root / 'frozen-memory') / snapshot_id
+                directory.mkdir(parents=True, exist_ok=True)
+                selected_database = directory / 'knowledge.sqlite'
+                with KnowledgeDB(selected_database, embeddings) as database:
+                    for record in frozen_records:
+                        check_remaining()
+                        version = memory_digest(record)
+                        source = directory / version / 'memory.json'
+                        source.parent.mkdir(exist_ok=True)
+                        atomic(source, canonical(record))
+                        database.index(source.parent, [source], collection='subject-memory-' + version,
+                                       language='memory')
+            with KnowledgeDB.open_read_only(selected_database, embeddings) as database:
                 for memory in memories:
                     check_remaining()
                     collection = 'subject-memory-' + memory['version']
@@ -235,7 +254,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if hasattr(campaign, 'budget'):
                 allowance = min(allowance, campaign._remaining())
             result = knowledge({'query': action.query}, remaining_seconds=allowance,
-                               memory_snapshot=context.request.pre_wave_memory)
+                               memory_snapshot=context.request.pre_wave_memory,
+                               frozen_root=Path(context.request.branch_root) / 'frozen-memory')
             admitted = {}
             def retain(content):
                 digest = context.artifacts.put_bytes(content)
@@ -309,8 +329,22 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             elif task.get('kind') != 'optimizer':
                 raise ValueError('subject task kind must be target or optimizer')
             return [item]
-        selector = CurriculumAgent(lambda messages: curriculum_complete(messages,
-            remaining_seconds=available()), target_policy=policy,
+        def complete_wave(messages):
+            wire = list(messages)
+            while True:
+                response = curriculum_complete(wire, remaining_seconds=available())
+                try:
+                    header, body = response.strip().split('\n', 1)
+                    ids = [row['spec']['project_id'] for row in json.loads(body)['projects']] if header == 'DECISION: WAVE' else []
+                    reused = set(ids) & history.keys()
+                except (ValueError, KeyError, TypeError):
+                    return response  # The ordinary selector supplies structural feedback.
+                if not reused:
+                    return response
+                wire.extend(({'role': 'assistant', 'content': response}, {'role': 'user', 'content':
+                    'These project IDs were already executed; author fresh IDs for the same frozen wave context: '
+                    + json.dumps(sorted(reused))}))
+        selector = CurriculumAgent(complete_wave, target_policy=policy,
             unavailable_capabilities=bound['coordinator'].curriculum.unavailable_capabilities,
             query_knowledge=reference_query, require_fresh_project_ids=True)
         objective = subject['objective'] + '\nOpen repair obligations: ' + json.dumps(repairs)
@@ -366,6 +400,12 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
 
     def execute_trial_arm(item, snapshot, directory, *, remaining_seconds):
         """Fresh production session and isolated compilation workspace per arm."""
+        deadline = time.monotonic() + remaining_seconds
+        def available():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError('trial arm elapsed allocation exhausted before execution')
+            return seconds
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         selection = argparse.ArgumentParser(add_help=False)
@@ -403,8 +443,11 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                     arm_settings['optimizer_worker_config'][key] = str(Path(worker[field]) / key)
         retained = directory / 'runtime' / 'subject-runtime.json'
         allocation = json.loads(retained.read_bytes())['max_seconds'] if retained.exists() else remaining_seconds
-        child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
-            subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
+        from .execution import process_deadline
+        with process_deadline(deadline):
+            child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
+                subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
+        available()
         for record in json.loads(snapshot)['memories']:
             proposal = record['proposal']
             digests = {proposal['after']['sha256'], *proposal['evidence'],
@@ -413,7 +456,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 digests.add(proposal['before']['sha256'])
             for digest in digests:
                 child.artifacts.put_bytes(store.read_bytes(digest))
-        return child.execute(item, snapshot, directory / 'project', remaining_seconds=remaining_seconds)
+        return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
 
     campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
     return campaign
