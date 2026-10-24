@@ -59,7 +59,9 @@ export default function (pi: ExtensionAPI) {
       const results = event.messages.slice(i + 1).filter(m => m.role === "toolResult"
         && calls.some(c => c.id === m.toolCallId));
       if (calls.length && calls.every(c => results.some(r => r.role === "toolResult" && r.toolCallId === c.id))) {
-        const keys = calls.map(c => c.name + JSON.stringify(c.arguments));
+        const keys = calls.map(c => c.name === "read_context"
+          ? JSON.stringify([c.name, c.arguments.record, c.arguments.offset ?? 0, c.arguments.limit ?? 4096])
+          : c.name + JSON.stringify(c.arguments));
         if (keys.every(key => pages.has(key))) continue;
         const exchange = [message, ...results];
         const size = Buffer.byteLength(JSON.stringify(exchange));

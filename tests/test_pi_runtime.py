@@ -160,7 +160,7 @@ def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monke
             calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
             assert calls == {m['tool_call_id'] for m in request['messages'] if m['role'] == 'tool'}
             if index == 3:
-                return stream('read_context', dict(record=refs['instruction'], offset=0, limit=8192), index)
+                return stream('read_context', dict(limit=8192, offset=0, record=refs['instruction']), index)
         if index == 5:
             assert not pages(request)
         return stream('write', {'source': 'kernel'}, index)
