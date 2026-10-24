@@ -129,7 +129,7 @@ def test_missing_cas_and_publication_are_explicit(campaign):
 
 
 @pytest.fixture
-def adaptive_campaign(tmp_path):
+def adaptive_campaign(tmp_path, request):
     from dataclasses import replace
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -141,13 +141,17 @@ def adaptive_campaign(tmp_path):
     root.mkdir()
     (root / "initial-memory.bin").write_bytes(SEED)
     count = 0
+    partial = getattr(request, "param", False)
     def complete(messages):
         nonlocal count
         count += 1
         spec = _project(f"project-{count}", "gm-ub-movement")
         spec["learning_focus"] = ["pipe-mte2" if count == 1 else "pipe-mte3"]
-        return _wave(messages[-1]["content"], [spec])
+        specs = [spec, _project("offline", "simd-vector")] if partial else [spec]
+        return _wave(messages[-1]["content"], specs)
     def execute(request):
+        if request.spec.project_id == "offline":
+            raise OSError("retained remote observation unavailable")
         objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
         source = objects.put_bytes(b"source")
         host = objects.put_bytes(b"host verification")
@@ -158,7 +162,7 @@ def adaptive_campaign(tmp_path):
             lessons=(), no_new_knowledge=True, admitted_artifact_sha256=(annex,),
             artifact_store="artifacts"))
     AdaptivePhase1Coordinator(root, "Learn pipes", SEED, CurriculumAgent(complete),
-                             execute, max_parallel=1, project_target=2).run()
+                             execute, max_parallel=1, project_target=2, allow_partial=partial).run()
     assert inventory_campaign(root)["complete"]
     return root
 
@@ -484,3 +488,20 @@ def test_closed_failure_wave_is_complete_only_with_authenticated_evidence(campai
             package_campaign(campaign, target)
     else:
         assert package_campaign(campaign, target)["package_kind"] == "complete"
+
+
+@pytest.mark.parametrize("adaptive_campaign", [True], indirect=True)
+def test_partial_wave_inventory_and_portable_packaging_preserve_interruption(adaptive_campaign, tmp_path):
+    branch = "waves/wave-001/branches/offline"
+    assert not (adaptive_campaign / branch / "outcome.json").exists()
+    retained = (adaptive_campaign / branch / "interruption.json").read_bytes()
+    assert inventory_campaign(adaptive_campaign)["complete"]
+    package = tmp_path / "partial.tar.gz"
+    assert package_campaign(adaptive_campaign, package)["complete"]
+    with tarfile.open(package) as archive:
+        assert archive.extractfile("campaign/" + branch + "/interruption.json").read() == retained
+        archive.extractall(tmp_path / "reloaded", filter="data")
+    assert inventory_campaign(tmp_path / "reloaded/campaign")["complete"]
+    (adaptive_campaign / branch / "interruption.json").write_text("{}")
+    issues = inventory_campaign(adaptive_campaign)["issues"]
+    assert "invalid-wave-publication" in {issue["kind"] for issue in issues}

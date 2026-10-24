@@ -114,11 +114,22 @@ def _verify_wave(root, *, closed_failure=False):
     wave = WaveSpec.from_mapping(read(root / "plan.json")["wave"])
     publication = read(root / ("closed-failure.json" if closed_failure else "published.json"))
     skipped = publication.get("skipped_projects", [])
+    partial = publication.get("completion") in {"partial", "empty"}
     if closed_failure and len(wave.projects) != 1:
         raise ValueError("closed failure requires a single project")
     outcomes = []
     for assignment in wave.assignments():
         branch = root / "branches" / assignment.project_id
+        if not (branch / "outcome.json").exists():
+            if closed_failure or not partial or assignment.project_id not in skipped:
+                raise ValueError("committed branch outcome is missing")
+            interruption = read(branch / "interruption.json")
+            reason = {k: interruption[k] for k in ("classification", "summary")}
+            if (interruption.get("wave_fingerprint") != wave.fingerprint
+                    or interruption.get("project_id") != assignment.project_id
+                    or publication.get("skipped_reasons", {}).get(assignment.project_id) != reason):
+                raise ValueError("skipped interruption differs from publication")
+            continue
         outcome = read(branch / "outcome.json")
         if (outcome["wave_fingerprint"] != wave.fingerprint
                 or outcome["project_id"] != assignment.project_id
@@ -138,8 +149,11 @@ def _verify_wave(root, *, closed_failure=False):
                 or publication["outcome_sha256"] != _sha((branch / "outcome.json").read_bytes())):
             raise ValueError("closed failure marker differs from retained outcome")
         return
-    consolidation = consolidate_wave(wave, tuple(outcomes), allow_semantic_failures=bool(skipped))
-    if skipped != [outcome.project_id for outcome in outcomes if not outcome.verified]:
+    consolidation = consolidate_wave(wave, tuple(outcomes),
+        allow_semantic_failures=bool(skipped), allow_partial=partial)
+    accepted = {commit.project_id for commit in consolidation.commits}
+    if skipped != [assignment.project_id for assignment in wave.assignments()
+                   if assignment.project_id not in accepted]:
         raise ValueError("skipped projects differ from retained outcomes")
     from dataclasses import asdict
     consolidated = read(root / "consolidated-memory.json")
