@@ -250,3 +250,18 @@ def test_provider_metadata_is_corrected_before_executing_valid_tool():
     assert result['decision']=='accept'
     assert len([event for event in h.agent.last_trace if event['kind']=='feedback'])==1
     assert [sha for sha,_ in h.reads].count(R)==1
+
+
+def test_large_artifact_pages_fit_context_without_losing_admission_state():
+    from dataclasses import replace
+    large=b'x'*50000
+    digest=sha(large)
+    first={'read_artifact':{'sha256':digest,'offset':0,'limit':20000}}
+    second={'read_artifact':{'sha256':digest,'offset':20000,'limit':20000}}
+    pages=[{'read_artifact':{'sha256':digest,'offset':offset,'limit':8192}} for offset in range(0,49152,8192)]
+    h=Harness([*prerequisites(),*pages,read(S),decision(memory())])
+    h.artifacts[digest]=large
+    req=replace(request(),artifacts=dict(request().artifacts,large_log=digest))
+    assert h.agent.review(req)['memory']==memory()
+    assert max(len(json.dumps(messages,ensure_ascii=False).encode()) for messages,_ in h.calls)<=40000
+    assert len([sha for sha,_ in h.reads if sha==digest])==6
