@@ -56,7 +56,7 @@ Every arm receives a fresh production Actor/session and isolated execution/cache
 workspace while retaining the configured model, runtime and physical device.
 Actor KDB retrieval follows the arm's frozen memory versions, even when the live
 accepted catalog changes. `role_complete`, `model_identity` and `runtime_identity`
-are exposed for the memory verifier composition; admission remains caller-owned.
+are used by the default memory verifier and admission composition.
 
 Optimizer subjects retain the initial seed as a readable memory entry and export
 accepted memory documents plus reachable code/evidence in authenticated optimizer
