@@ -176,3 +176,23 @@ def test_second_controller_cannot_start_while_original_work_is_active(tmp_path):
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         with pytest.raises(RuntimeError,match='already active'):c.resume()
     assert not (tmp_path/'elapsed.json').exists()
+
+
+def test_verifier_receives_frozen_individual_contract_for_subject_control(tmp_path):
+    plan=dict(project_id='control',spec=dict(hypothesis='Baseline copy control',operation='copy'))
+    class Review:
+        last_trace=[]
+        def review(self,request,**kw):
+            objective=json.loads(request.objective)
+            contract=c.artifacts.read_json(objective['project']['contract_sha256'])
+            assert contract==plan
+            assert objective['project']['contract_sha256'] in request.artifacts.values()
+            return dict(decision='accept',reason='valid control for arithmetic study',
+                evidence=[request.source_sha256],repair=None,memory=None)
+    def execute(*a,**kw):
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    c=SubjectCampaign(tmp_path,[Subject('add','Learn elementwise addition',1)],b'',
+        select_wave=lambda *a,**kw:[plan],execute=execute,verifier=Review(),
+        complete=lambda *a,**kw:json.dumps(dict(action='advance',reason='control evidence complete',evidence=['control'])))
+    assert c.run()['terminal']=='COMPLETE'
