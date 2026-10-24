@@ -59,8 +59,10 @@ class SubjectKnowledge:
         action = KnowledgeQuery(payload['query'], payload.get('limit', 5))
         started = self.clock()
         def check_remaining():
-            if self.clock() - started >= remaining_seconds:
+            available = remaining_seconds - (self.clock() - started)
+            if available <= 0:
                 raise TimeoutError('subject knowledge query elapsed allowance exhausted')
+            return available
         frozen_records = None if snapshot is None else json.loads(snapshot)['memories']
         records = self.memory_getter().records() if frozen_records is None else frozen_records
         words = set(re.findall(r'\w+', action.query.casefold()))
@@ -121,6 +123,7 @@ class SubjectKnowledge:
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, Citation
         from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
         action = KnowledgeQuery(**payload)
+        started = self.clock()
         result = self.query({'query': action.query, 'limit': action.limit}, remaining_seconds=remaining_seconds,
                             snapshot=context.request.pre_wave_memory, branch_root=context.request.branch_root)
         admitted = {}
@@ -128,7 +131,21 @@ class SubjectKnowledge:
             digest = context.artifacts.put_bytes(content)
             admitted[digest] = 'knowledge'
             return digest
-        observation = knowledge_presentation(action.query, result['hits'][:action.limit], retain)
+        selected = result['hits'][:action.limit]
+        collections = {hit['citation']['collection'] for hit in selected}
+        # A query may run outside the production campaign's eager snapshot copy.
+        # Admit only the records actually presented from this frozen view, never
+        # unrelated accepted or pending lessons from the shared artifact store.
+        for memory in result['memories']:
+            if 'subject-memory-' + memory['version'] in collections:
+                for digest in set(memory['artifacts'].values()):
+                    if self.clock() - started >= remaining_seconds:
+                        raise TimeoutError('Actor knowledge artifact copy elapsed allowance exhausted')
+                    content = self.store.read_bytes(digest)
+                    if hashlib.sha256(content).hexdigest() != digest:
+                        raise ValueError('memory artifact bytes differ from their identity')
+                    retain(content)
+        observation = knowledge_presentation(action.query, selected, retain)
         return AdaptiveActionResult(observation,
-            citations=tuple(Citation.from_mapping(hit['citation']) for hit in result['hits'][:action.limit]),
+            citations=tuple(Citation.from_mapping(hit['citation']) for hit in selected),
             admitted_artifacts=admitted)
