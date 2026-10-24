@@ -24,15 +24,32 @@ from benchmarks.a5kernels.screen_workers import ScreenWorkerPool, run_request
 from benchmarks.a5kernels.phase2_live import Phase2LiveRunner
 
 
-def test_phase2_qualify_command_is_retired_before_model_or_device(tmp_path):
-    calls = []
-    with pytest.raises(SystemExit) as error:
-        run_a5_phase2.main(['qualify', '--root', str(tmp_path / 'phase2'),
-            '--snapshot', 'absent', '--cell-id', 'old-cell'],
-            runtime_factory=lambda args: calls.append(args), sleeper=pytest.fail)
-    assert error.value.code == 2
-    assert calls == []
-    assert not (tmp_path / 'phase2').exists()
+def test_phase2_qualify_command_stops_before_model_or_live_runner(tmp_path, capsys):
+    from tests.test_a5_phase2_cli import _dependencies
+    from tests.test_a5_phase2_memory import _snapshot
+
+    _composition, _source, destination, snapshot = _snapshot(tmp_path)
+    dependencies = _dependencies(snapshot)
+    dependencies = type(dependencies)(
+        dependencies.cell,
+        lambda *_args: pytest.fail("qualification called the model"),
+        dependencies.verify,
+    )
+    qualification = snapshot.root.parent / "qualification.json"
+
+    def factory(_args):
+        qualification.parent.mkdir(parents=True, exist_ok=True)
+        qualification.write_text('{"status":"transport-qualified"}\n')
+        return snapshot, dependencies
+
+    assert run_a5_phase2.main([
+        "qualify", "--root", str(tmp_path / "phase2"),
+        "--snapshot", str(snapshot.root), "--cell-id", destination.cell_id,
+    ], runtime_factory=factory, sleeper=pytest.fail) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "cell_id": destination.cell_id, "status": "transport-qualified"
+    }
+    assert not (qualification.parent / "terminal.json").exists()
 
 
 def test_screen_worker_consumes_exact_argv_and_retains_result(tmp_path):

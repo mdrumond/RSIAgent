@@ -231,22 +231,24 @@ def test_cli_persists_exact_pass_qualification_gate_and_fail_is_nonzero(
         }
         for index, cell in enumerate(qualification_cells(), 1)
     )
-    args = run_a3_phase2._parser().parse_args(['qualify', *common])
-    assert run_a3_phase2._publish_qualification(args, records)['qualified'] is True
-    manifest = json.loads((tmp_path / 'state' / 'qualification.json').read_text())
-    assert manifest['schema'] == 'a3-phase2-qualification-v1'
-    assert [item['verdict'] for item in manifest['cells']] == ['PASS', 'PASS']
-    run_a3_phase2._require_qualification(args)
-    failed = ({**records[0], 'verdict': 'FAIL'}, records[1])
-    assert run_a3_phase2._publish_qualification(args, failed)['qualified'] is False
-    assert not (tmp_path / 'state' / 'qualification.json').exists()
+    monkeypatch.setattr(run_a3_phase2, "_run", lambda _args, _cells: records)
+
+    assert run_a3_phase2.main(["qualify", *common]) == 0
+    manifest = json.loads((tmp_path / "state" / "qualification.json").read_text())
+    assert manifest["schema"] == "a3-phase2-qualification-v1"
+    assert [item["verdict"] for item in manifest["cells"]] == ["PASS", "PASS"]
+
     calls = []
-    monkeypatch.setattr(run_a3_phase2, '_run', lambda *args: calls.append(args))
-    for command in ('run', 'resume', 'qualify'):
-        with pytest.raises(SystemExit) as error:
-            run_a3_phase2.main([command, *common])
-        assert error.value.code == 2
-    assert calls == []
+    monkeypatch.setattr(
+        run_a3_phase2, "_run", lambda _args, cells: calls.append(cells) or (),
+    )
+    assert run_a3_phase2.main(["run", *common]) == 0
+    assert calls == [phase2_cells()]
+
+    failed = ({**records[0], "verdict": "FAIL"}, records[1])
+    monkeypatch.setattr(run_a3_phase2, "_run", lambda _args, _cells: failed)
+    assert run_a3_phase2.main(["qualify", *common]) == 1
+    assert not (tmp_path / "state" / "qualification.json").exists()
 
 
 def test_run_rejects_missing_or_nonexact_qualification_gate(tmp_path, monkeypatch):
@@ -720,7 +722,7 @@ def test_cli_resume_reuses_bound_terminal_without_rerunning_cell(tmp_path, monke
         run_a3_phase2._run(args, (cell,))
 
 
-def test_retained_controller_reconciles_interrupted_evidence_without_abandonment(
+def test_cli_resume_reconciles_interrupted_evidence_without_abandonment(
     tmp_path, monkeypatch, capsys,
 ):
     cell = qualification_cells()[0]
@@ -777,10 +779,6 @@ def test_retained_controller_reconciles_interrupted_evidence_without_abandonment
         "--acknowledge-execution", "I_ACCEPT_A3_PHASE2_EXECUTION",
         "--target-direction", direction, "--cell-id", cell.cell_id,
     ]
-    args = run_a3_phase2._parser().parse_args(argv)
-    run_a3_phase2._require_qualification(args)
-    def resume_retained():
-        return run_a3_phase2._run(args, run_a3_phase2._selected(args.cell_id))
     original_write = Phase2TargetEvidence.write
     interrupted = False
 
@@ -793,11 +791,11 @@ def test_retained_controller_reconciles_interrupted_evidence_without_abandonment
 
     monkeypatch.setattr(Phase2TargetEvidence, "write", crash_after_write)
     with pytest.raises(RuntimeError, match="CLI interrupted"):
-        resume_retained()
+        run_a3_phase2.main(argv)
     assert not (state_root / "cells" / cell.cell_id / "terminal.json").exists()
     executions_after_interrupt = calls.count("execute")
 
-    assert resume_retained()[0]["verdict"] == "PASS"
+    assert run_a3_phase2.main(argv) == 0
     capsys.readouterr()
     root = state_root / "cells" / cell.cell_id
     targets = tuple((root / "targets").iterdir())
