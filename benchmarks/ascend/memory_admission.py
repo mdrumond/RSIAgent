@@ -166,9 +166,26 @@ class MemoryAdmission:
         for name, arm in feedback.get('arms', {}).items():
             if arm is not None:
                 refs.update({f'memory-trial:{name}:{role}': sha for role, sha in arm['artifacts'].items()})
+        from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        shared = ContentAddressedArtifacts(self.memory.root.parent / 'artifacts')
+        proposal_sha = shared.put_bytes(canonical(job['proposal']))
+        feedback_sha = shared.put_bytes(canonical(feedback))
+        refs.update({'memory-rewrite:previous-proposal': proposal_sha,
+                     'memory-rewrite:usefulness-feedback': feedback_sha})
         request['artifacts'] = refs
+        previous = {key: str(job['proposal'].get(key, ''))[:512] for key in
+                    ('summary', 'applicability', 'preconditions', 'expectations', 'limitations')}
+        previous['sha256'] = proposal_sha
+        usefulness = {key: str(feedback.get(key, ''))[:2048] for key in
+                      ('decision', 'reason', 'instructions', 'evaluation_id')}
+        usefulness.update(sha256=feedback_sha, evidence=feedback.get('evidence', [])[:16],
+                          arms={name: dict(host_verified=arm.get('host_verified'),
+                                          source_sha256=arm.get('source_sha256'),
+                                          artifact_count=len(arm.get('artifacts', {})))
+                                for name, arm in feedback.get('arms', {}).items() if arm is not None})
         result = self.rewrite(ProjectReview(**request), feedback=dict(
-            previous_proposal=job['proposal'], usefulness=feedback), max_seconds=seconds)
+            previous_proposal=previous, usefulness=usefulness,
+            note='Full immutable previous proposal and usefulness feedback are admitted artifacts; read pages by SHA for exact examples, trial evidence and detailed judgments.'), max_seconds=seconds)
         return result
 
     def _apply_rewrite(self, job, review):

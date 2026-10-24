@@ -237,3 +237,51 @@ def test_parent_budget_includes_background_drain_before_return(tmp_path):
     assert result['terminal']=='REVIEW_PENDING'
     assert c.memory.records()==[]
     assert json.loads((tmp_path/'elapsed.json').read_text())['elapsed_seconds']==10
+
+
+def test_large_rewrite_uses_bounded_feedback_and_readable_exact_cas_documents(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.ascend.agent_context import ContextBudget, request_bytes
+    from benchmarks.ascend.project_verifier import ProjectVerifierAgent
+    from optimizer.jobs import canonical
+    from test_project_verifier_agent import S, SOURCE, R, RESULT
+    memory = SubjectMemory(tmp_path/'memory', b'')
+    store = ContentAddressedArtifacts(tmp_path/'artifacts')
+    store.put_bytes(SOURCE);store.put_bytes(RESULT)
+    proposed = dict(draft(), summary='retain lesson scope')
+    proposed['after']['text'] = 'large code\n' * 20000
+    feedback = dict(decision='rewrite', reason='Observed limited transfer', instructions='Clarify preconditions',
+                    arms={'treatment': dict(host_verified=True, source_sha256=S,
+                        artifacts={f'retained:{n}': R for n in range(500)},
+                        observations={'actor_logs': 'long trace\n' * 30000})}, evidence=[R])
+    profile = direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value == 'deepseek-flash'))
+    requests, phase = [], [0]
+    def transport(**options):
+        wire = options['request'];requests.append(wire)
+        if phase[0] == 0:
+            context = json.loads(wire['messages'][1]['content'])
+            bounded = context['rewrite_feedback']
+            assert bounded['previous_proposal']['summary'] == proposed['summary']
+            assert bounded['usefulness']['instructions'] == feedback['instructions']
+            assert store.read_bytes(bounded['previous_proposal']['sha256']) == canonical(proposed)
+            assert store.read_bytes(bounded['usefulness']['sha256']) == canonical(feedback)
+            phase[0] += 1
+            return DirectCompletion(json.dumps({'read_artifact': {'sha256': bounded['usefulness']['sha256'], 'limit': 200}}), 1)
+        observation = json.loads(wire['messages'][-1]['content'])
+        assert observation['size'] == len(canonical(feedback))
+        return DirectCompletion(json.dumps(dict(decision='repair', reason='Need stronger project evidence',
+            evidence=[observation['sha256']], repair=dict(instructions='Run a control', expected_evidence='Independent outputs'), memory=None)), 1)
+    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'}, transport=transport,
+        models=[profile.identity.backend_model], context_budgets={'deepseek-flash': ContextBudget(40000,32768,49152)})
+    agent = ProjectVerifierAgent(lambda messages, **kw: provider.complete(profile, messages).text,
+        lambda sha, **kw: store.read_bytes(sha))
+    gate = MemoryAdmission(tmp_path/'gate', memory, Evaluation([]), agent.review)
+    try:
+        result = gate._rewrite(dict(request=dict(project_id='p', source_sha256=S, host_verified=True,
+            artifacts={'source': S, 'result': R}), proposal=proposed), feedback, 60)
+        assert result['decision'] == 'repair'
+        assert all(request_bytes(wire) < 49152 for wire in requests)
+    finally:
+        gate.close()
