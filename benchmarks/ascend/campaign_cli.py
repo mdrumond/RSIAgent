@@ -892,6 +892,8 @@ def main(argv=None, *, screen=start_screen):
                                         env_file=args.env_file)))
         return
     if args.command == "start":
+        if args.phase == 2:
+            parser.error('new Ascend Phase 2 launches are retired; use run_ascend_subjects.py')
         from benchmarks.a5kernels.sft_dataset import SourceManifest
         if args.project_target < 1:
             parser.error("--project-target must be positive")
