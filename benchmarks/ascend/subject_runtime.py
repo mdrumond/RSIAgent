@@ -438,7 +438,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             model_identity=campaign.model_identity, runtime_identity=campaign.runtime_identity,
             max_seconds=settings.get('memory_trial_seconds', 1800),
             arm_seconds=settings.get('memory_arm_seconds', 600))
-        rewrite_agent = ProjectVerifierAgent(verifier_complete, read, query_knowledge=knowledge)
+        rewrite_agent = ProjectVerifierAgent(verifier_complete, knowledge.read_artifact, query_knowledge=knowledge.query)
         def rewrite(request, *, feedback, max_seconds):
             try:
                 return rewrite_agent.review(request, feedback=feedback, max_seconds=max_seconds)
