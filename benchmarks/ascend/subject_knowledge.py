@@ -2,6 +2,7 @@
 from dataclasses import asdict
 import hashlib
 import json
+from itertools import zip_longest
 from pathlib import Path
 import re
 import time
@@ -53,25 +54,28 @@ class SubjectKnowledge:
         return self.store.read_bytes(digest)
 
     def query(self, payload, *, remaining_seconds, snapshot=None, branch_root=None):
-        from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, validate_knowledge_hit
+        from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
+        from benchmarks.a5kernels.knowledge_candidates import build_candidate_pool
+        action = KnowledgeQuery(payload['query'], payload.get('limit', 5))
         started = self.clock()
         def check_remaining():
             if self.clock() - started >= remaining_seconds:
                 raise TimeoutError('subject knowledge query elapsed allowance exhausted')
         if snapshot is None:
-            memories = self.memory_getter().search(payload['query'])
             frozen_records = None
+            memories = (self.memory_getter().search(action.query) if self.database_path is None else
+                        [dict(record, version=memory_digest(record)) for record in self.memory_getter().records()])
         else:
-            words = set(re.findall(r'\w+', payload['query'].casefold()))
+            words = set(re.findall(r'\w+', action.query.casefold()))
             frozen_records = json.loads(snapshot)['memories']
             memories = [dict(record, version=memory_digest(record)) for record in frozen_records
-                        if words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
+                        if self.database_path is not None or words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
         for memory in memories:
             memory.setdefault('artifacts', {}).update({str(i): digest
                 for i, digest in enumerate(sorted(memory_artifacts(memory)))})
-        hits = []
+        reference_hits, memory_hits = [], []
         if self.reference_query is not None:
-            hits.extend(self.reference_query(KnowledgeQuery(payload['query']), check_remaining=check_remaining))
+            reference_hits.extend(self.reference_query(action, check_remaining=check_remaining))
         if self.database_path is not None and memories:
             from benchmarks.a5kernels.knowledge import KnowledgeDB
             selected_database = self.database_path
@@ -90,11 +94,19 @@ class SubjectKnowledge:
                         database.index(source.parent, [source], collection='subject-memory-' + version,
                                        language='memory')
             with KnowledgeDB.open_read_only(selected_database, self.embeddings) as database:
-                for memory in memories:
+                collections = {'subject-memory-' + memory['version']: database for memory in memories}
+                for collection in collections:
                     check_remaining()
-                    collection = 'subject-memory-' + memory['version']
-                    hits.extend(validate_knowledge_hit(database, collection, hit)
-                                for hit in database.query(collection, payload['query'], limit=5))
+                    manifest = database.manifest(collection)
+                    if (manifest.embedding_model, manifest.embedding_revision) != (self.embeddings.model, self.embeddings.revision):
+                        raise ValueError('embedding backend does not match collection manifest')
+                memory_hits = list(build_candidate_pool(collections, action, size=100,
+                    check_remaining=check_remaining).page(limit=action.limit))
+            selected = {hit.citation.collection for hit in memory_hits}
+            memories = [memory for memory in memories if 'subject-memory-' + memory['version'] in selected]
+        # Reference retrieval may be an adaptive opaque callback with its own
+        # pinned identities. Preserve it, but never let its prefix starve memory.
+        hits = [hit for pair in zip_longest(memory_hits, reference_hits) for hit in pair if hit is not None]
         return dict(memories=memories, citations=[asdict(hit.citation) for hit in hits],
                     hits=[dict(citation=asdict(hit.citation), text=hit.text, score=hit.score) for hit in hits])
 
@@ -104,7 +116,7 @@ class SubjectKnowledge:
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, Citation
         from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
         action = KnowledgeQuery(**payload)
-        result = self.query({'query': action.query}, remaining_seconds=remaining_seconds,
+        result = self.query({'query': action.query, 'limit': action.limit}, remaining_seconds=remaining_seconds,
                             snapshot=context.request.pre_wave_memory, branch_root=context.request.branch_root)
         admitted = {}
         def retain(content):
