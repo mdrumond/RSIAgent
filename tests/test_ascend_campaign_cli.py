@@ -1043,43 +1043,22 @@ def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_pa
                for row in manifest["files"]) == 2
 
 
-def test_new_phase2_rejects_approval_mode_before_writes(tmp_path, capsys):
-    argv = ["start", "--control", str(tmp_path / "control"), "--root", str(tmp_path / "campaign"),
-            "--target", "a3", "--phase", "2", "--objective", "fixed copy", "--config", "absent",
-            "--initial-memory", "absent", "--project-target", "1", "--phase1-root", "absent", "--review", "absent"]
-    with pytest.raises(SystemExit):
-        cli.main([*argv, "--approval-mode"])
-    assert "does not support --approval-mode" in capsys.readouterr().err
-    with pytest.raises(SystemExit):
-        cli.main([*argv, "--target-goal", "absent", "--approval-mode"])
-    assert "does not support --approval-mode" in capsys.readouterr().err
-    assert not (tmp_path / "control").exists()
-    assert not (tmp_path / "campaign").exists()
+@pytest.mark.parametrize('extra', [[], ['--approval-mode'], ['--target-goal', 'absent']])
+def test_new_phase2_is_retired_before_files_or_compute(tmp_path, extra):
+    calls = []
+    argv = ['start', '--control', str(tmp_path / 'control'), '--root', str(tmp_path / 'campaign'),
+            '--target', 'a3', '--phase', '2', '--objective', 'fixed copy', '--config', 'absent',
+            '--initial-memory', 'absent', '--project-target', '1', '--phase1-root', 'absent', '--review', 'absent']
+    with pytest.raises(SystemExit) as error:
+        cli.main([*argv, *extra], screen=lambda *args: calls.append(args))
+    assert error.value.code == 2
+    assert calls == []
+    assert not (tmp_path / 'control').exists()
+    assert not (tmp_path / 'campaign').exists()
 
 
-def test_new_phase2_without_contract_persists_autonomous_bootstrap(tmp_path):
-    manifest = write(tmp_path / "sources.json", {"schema": "ascend-sft-sources-v2", "sources": [{
-        "name": "native", "repository": "https://example.invalid/native", "revision": "a" * 40,
-        "license": "Apache-2.0", "include": ["**/*.cpp"]}]})
-    settings = write(tmp_path / "settings.json", {"model": "openai/gpt-5.6-sol",
-        "phase1_arguments": [], "source_manifest": str(manifest)})
-    memory = tmp_path / "seed"
-    memory.write_bytes(b"seed")
-    control, root = tmp_path / "control", tmp_path / "campaign"
-    cli.main(["start", "--control", str(control), "--root", str(root), "--target", "a3",
-        "--phase", "2", "--objective", "new goal", "--config", str(settings),
-        "--initial-memory", str(memory), "--project-target", "1", "--phase1-root", "old",
-        "--review", "review"], screen=lambda *args: "session")
-    job = cli._read(control / "job.json")
-    assert job["autonomous_goal"] is True and "target_goal" not in job
-    assert job["optimizer_goal"] is True
-    assert job["phase2_max_seconds"] == 7200 and job["practice_max_seconds"] == 1800
-    assert cli._read(root / "campaign-run.json")["autonomous_goal"] is True
-    with pytest.raises(SystemExit):
-        cli.main(["continue", "--control", str(control), "--project-target", "2"])
-
-
-def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_path, monkeypatch):
+def test_retained_goal_launches_target_controller_and_checks_runtime(tmp_path, monkeypatch):
+    historical_job = start(tmp_path, phase=2)
     import hashlib
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
@@ -1101,16 +1080,15 @@ def test_goal_start_pins_private_reference_and_launches_target_controller(tmp_pa
     memory = tmp_path / "seed"
     memory.write_bytes(b"seed")
     control, root = tmp_path / "control", tmp_path / "campaign"
-    cli.main(["start", "--control", str(control), "--root", str(root), "--target", "a3", "--phase", "2",
-              "--objective", "fixed copy", "--config", str(config), "--initial-memory", str(memory),
-              "--project-target", "1", "--phase1-root", "old", "--review", "review",
-              "--target-goal", str(contract)], screen=lambda *args: "session")
-    job = cli._read(control / "job.json")
-    assert job["target_goal"] == goal.as_dict()
-    pinned = ContentAddressedArtifacts(Path(job["target_artifact_store"]))
+    job = dict(historical_job, config=str(config), config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
+               project_target=1, target_goal=goal.as_dict(), phase2_max_seconds=7200,
+               practice_max_seconds=1800)
+    pinned = ContentAddressedArtifacts(root / 'historical-reference')
+    shutil.copytree(store.root, pinned.root)
+    job['target_artifact_store'] = str(pinned.root)
+    cli._write(control / 'job.json', job)
     shutil.rmtree(store.root)
     goal.verify(pinned, RUNTIME)
-    assert "private working reference" not in (root / "campaign-run.json").read_text()
     source = dict(target="native", arch="arch", execution_profile="bz-a3-1", guide_sha256="a" * 64,
                   cpl_skills_revision="b" * 40, environment_identity={}, model=model.as_dict(),
                   profiling_mode="without-profiling-guidance")
