@@ -22,7 +22,7 @@ class Verifier:
     last_trace = []
     def __init__(self):
         self.calls = []
-    def review(self, request, *, max_seconds):
+    def review(self, request, *, max_seconds, feedback=None):
         self.calls.append(request)
         repair = len(self.calls) == 1
         return dict(decision='repair' if repair else 'accept', reason='needs control' if repair else 'control passed',
@@ -84,3 +84,49 @@ def test_no_new_knowledge_can_accept_without_publishing(tmp_path):
         complete=lambda *a,**k:json.dumps(dict(action='advance',reason='covered',evidence=['p'])))
     assert c.run()['terminal']=='COMPLETE'
     assert c.memory.records()==[]
+
+
+def test_sibling_appends_reconcile_without_executing_projects_again(tmp_path):
+    executions=[]
+    class Appender:
+        last_trace=[]
+        def review(self, request, *, feedback=None, **kw):
+            base = seed if feedback is None else dict(memory_id=campaign.memory.records()[0]['memory_id'],
+                version=__import__('benchmarks.ascend.subject_memory',fromlist=['digest']).digest(campaign.memory.records()[0]))
+            memory=dict(proposal(request.source_sha256),operation='append',base_versions=[base])
+            return dict(decision='accept',reason='combined evidence',evidence=[request.source_sha256],repair=None,memory=memory)
+    def execute(item, *args, **kwargs):
+        executions.append(item['project_id'])
+        sha=campaign.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},campaign.artifacts.root)
+    campaign=SubjectCampaign(tmp_path,[Subject('s','s',1)],b'',
+        select_wave=lambda *a,**k:[dict(project_id='one'),dict(project_id='two')],
+        execute=execute,verifier=Appender(),complete=lambda *a,**k:json.dumps(
+            dict(action='advance',reason='complete',evidence=['one','two'])))
+    seed=campaign.memory.accept('seed',proposal('a'*64),{})
+    assert campaign.run()['terminal']=='COMPLETE'
+    assert executions==['one','two']
+    assert len(campaign.state['projects']['two']['prior_reviews'])==1
+    assert len(campaign.memory.records())==1
+
+
+def test_probe_control_wave_resolves_shared_repair_once_with_original_requirements(tmp_path):
+    class Inspecting(Verifier):
+        def review(self, request, **kw):
+            if self.calls:
+                original=json.loads(request.objective)['repairs']['failed']
+                assert original['repair']['instructions']=='add control'
+            return super().review(request,**kw)
+    verifier=Inspecting()
+    def select(context, *args, **kwargs):
+        return [dict(project_id='failed')] if not verifier.calls else [
+            dict(project_id='probe',repairs=['failed']),dict(project_id='control',repairs=['failed'])]
+    def execute(item,*args,**kw):
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    actions=iter([dict(action='repair',repair_id='failed'),dict(action='advance')])
+    c=SubjectCampaign(tmp_path,[Subject('s','s',1)],b'',select_wave=select,execute=execute,
+        verifier=verifier,complete=lambda *a,**k:json.dumps(dict(next(actions),reason='evidence',evidence=['source'])))
+    assert c.run()['terminal']=='COMPLETE'
+    repair=c.scheduler.state()['repairs']['failed']
+    assert len(repair['resolution_evidence'])==2

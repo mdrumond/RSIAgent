@@ -86,5 +86,10 @@ class SubjectMemory:
         records = []
         for record in self.records():
             if words & set(re.findall(r'\w+', json.dumps(record).casefold())):
-                records.append(dict(record, version=digest(record)))
+                artifacts = dict(record['provenance'].get('request', {}).get('artifacts', {}))
+                for role in ('before', 'after'):
+                    if record['proposal'].get(role):
+                        artifacts[role] = record['proposal'][role]['sha256']
+                artifacts.update({f'evidence:{i}': sha for i, sha in enumerate(record['proposal']['evidence'])})
+                records.append(dict(record, version=digest(record), artifacts=artifacts))
         return records
