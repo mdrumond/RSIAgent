@@ -125,7 +125,12 @@ or terminal {"decision":"accept"|"repair","reason":"...","evidence":["sha"],
 "evidence":["sha"],"citations":[exact KDB citation objects]}}.
 Read the current source and supplied result/log artifacts before acceptance.
 All snippets must be exact lines from artifacts actually read, including line
-endings. Use a null before plus a reason if no retained before-code exists.
+endings. Prefer omitting the optional snippet text field: select sha256/start_line/
+end_line from source you have read, and the host will extract those exact lines.
+Do not double-escape code or guess line endings. If text is supplied it must
+match exactly. A snippet formatting failure is not a reason to discard an
+otherwise useful lesson; correct its range or omit text. Use a null before plus
+a reason if no retained before-code exists.
 Append/merge bases must be exact versions returned by KDB. An append has one
 base; a merge has one or more. A create has none. For an accepted project, normally compose a reusable memory with the verified
 example, its expected behavior, applicability and preconditions. New means not
@@ -290,7 +295,10 @@ class ProjectVerifierAgent:
                 observation = {'error': str(exc), 'expected_top_level': [
                     ['list_artifacts'], ['read_artifact'], ['knowledge_query'], ['request_check'],
                     ['decision', 'reason', 'evidence', 'repair', 'memory']],
-                    'correction': 'Return only one of these exact key sets; remove API metadata and unknown keys.'}
+                    'correction': ('Correct the reported validation error while preserving your evidence-based judgment. '
+                                   'For snippets select observed sha256/start_line/end_line and omit text to extract exact code. '
+                                   'For unread evidence, read the referenced artifact or remove that unsupported citation. '
+                                   'Use only one permitted top-level key set.')}
                 self._record('feedback', observation)
             messages.append({'role': 'user', 'content': json.dumps(observation, sort_keys=True)})
 
@@ -352,10 +360,12 @@ class ProjectVerifierAgent:
     @staticmethod
     def _evidence(items, read):
         if not isinstance(items, list) or not items or any(not isinstance(item, str) or item not in read for item in items):
-            raise ValueError('evidence must cite nonempty actually read artifact references')
+            raise ValueError('evidence must cite nonempty actually read artifact references; '
+                             f'unread references: {[item for item in items if item not in read] if isinstance(items, list) else items}')
 
     def _snippet(self, snippet, read, remaining, observed):
-        if not isinstance(snippet, dict) or set(snippet) != {'sha256', 'start_line', 'end_line', 'text'}:
+        if not isinstance(snippet, dict) or set(snippet) not in ({'sha256', 'start_line', 'end_line'},
+                                                               {'sha256', 'start_line', 'end_line', 'text'}):
             raise ValueError('invalid source snippet')
         if snippet['sha256'] not in read:
             raise ValueError('read source artifact before quoting a snippet')
@@ -366,17 +376,19 @@ class ProjectVerifierAgent:
         start, end = snippet['start_line'], snippet['end_line']
         if type(start) is not int or type(end) is not int or not 1 <= start <= end <= len(lines):
             raise ValueError('snippet lines are outside source artifact')
-        if snippet['text'] != ''.join(lines[start - 1:end]):
+        exact = ''.join(lines[start - 1:end])
+        if 'text' in snippet and snippet['text'] != exact:
             raise ValueError('snippet must match exact retained source lines')
         # A private full-artifact validation read is not an observation by the
         # agent. Quoted bytes must have appeared in one or more returned pages.
         quote_start = len(''.join(lines[:start - 1]).encode('utf-8'))
-        quote_end = quote_start + len(snippet['text'].encode('utf-8'))
+        quote_end = quote_start + len(exact.encode('utf-8'))
         covered = quote_start
         for page_start, page_end in sorted(observed.get(snippet['sha256'], [])):
             if page_start > covered:
                 break
             covered = max(covered, page_end)
             if covered >= quote_end:
+                snippet['text'] = exact
                 return
         raise ValueError('read all quoted source bytes before quoting a snippet')
