@@ -265,3 +265,43 @@ def test_large_artifact_pages_fit_context_without_losing_admission_state():
     assert h.agent.review(req)['memory']==memory()
     assert max(len(json.dumps(messages,ensure_ascii=False).encode()) for messages,_ in h.calls)<=40000
     assert len([sha for sha,_ in h.reads if sha==digest])==6
+
+
+def test_large_registry_pages_hidden_before_code_and_preserves_exact_snippets():
+    refs = {f'retained:{i:04}': sha(str(i).encode()) for i in range(500)}
+    refs.update({'result': R, 'actor-log': L, 'retained:before-source': B})
+    proposal = memory()
+    proposal.update(before=snippet(B, BEFORE.decode()), before_unavailable_reason=None)
+    h = Harness([{'list_artifacts': {'offset': -1}},
+                 {'list_artifacts': {'prefix': 'retained:before', 'limit': 1}},
+                 *prerequisites(), read(B), decision(proposal)])
+    review = ProjectReview('many-artifacts', S, True, refs)
+    result = h.agent.review(review)
+    assert result['memory']['before']['sha256'] == B
+    initial = json.loads(h.calls[0][0][1]['content'])['project']
+    assert initial['artifact_count'] == 504
+    assert initial['artifacts']['source'] == S
+    assert 'retained:before-source' not in initial['artifacts']
+    assert len(json.dumps(h.calls[0][0]).encode()) < 40000
+    assert any(event['kind'] == 'feedback' for event in h.agent.last_trace)
+    listing = next(event['payload']['observation'] for event in h.agent.last_trace
+                   if event['kind'] == 'tool' and 'list_artifacts' in event['payload']['action'])
+    assert listing == {'artifacts': {'retained:before-source': B}, 'total': 1, 'next_offset': None}
+    assert h.agent.last_trace[0]['payload']['project']['artifacts'] == refs
+
+
+def test_rich_knowledge_observation_is_bounded_and_new_artifacts_are_pageable():
+    base = {'memory_id': 'old', 'version': 'v1'}
+    proposal = memory('append', [base])
+    proposal.update(before=snippet(B, BEFORE.decode()), before_unavailable_reason=None)
+    h = Harness([*prerequisites(),
+                 {'list_artifacts': {'prefix': 'memory:old:v1:'}}, read(B), decision(proposal)],
+                knowledge={'memories': [{**base, 'proposal': {'summary': 'x' * 80000},
+                            'artifacts': {'before-source': B}}], 'citations': [],
+                           'hits': [{'text': 'y' * 80000, 'citation': {'path': 'old'}}]})
+    assert h.agent.review(request())['memory']['base_versions'] == [base]
+    query_event = next(e['payload']['observation'] for e in h.agent.last_trace
+                       if e['kind'] == 'tool' and 'knowledge_query' in e['payload']['action'])
+    assert len(json.dumps(query_event)) < 3000
+    assert query_event['memories'][0]['artifact_prefix'] == 'memory:old:v1:'
+    assert B in [digest for digest, _ in h.reads]
