@@ -172,3 +172,16 @@ def test_librarian_provider_is_deepseek_and_cancels_at_total_elapsed_deadline(mo
     assert observed[0]['max_retries'] == 0 and observed[0]['timeout'] == .01
     assert observed[1]['model'] == 'deepseek-flash'
     assert observed[-2:] == ['cancelled', 'closed']
+
+
+def test_gz_binding_records_selected_transport_runtime_without_substitution(tmp_path):
+    from benchmarks.ascend.production import native_target_runtime
+    cfg = replace(config(tmp_path), execution_profile='gz-a3', compiler_version='observed-compiler',
+                  environment_identity={'cann_version':'observed-cann'})
+    transport = SimpleNamespace(profile='gz-a3', _device=2, runtime='registered-runtime')
+    assert native_target_runtime(cfg, transport)['runtime'] == 'registered-runtime'
+    del transport.runtime
+    transport.runtime_identity = {'runtime':'another-registered-runtime'}
+    assert native_target_runtime(cfg, transport)['runtime'] == 'another-registered-runtime'
+    transport.runtime_identity = {}
+    assert native_target_runtime(cfg, transport) is None
