@@ -50,6 +50,55 @@ def test_graph_skips_self_distillation_retains_sources_and_resumes(tmp_path):
         SubjectExecutor(execution).graph(replace(request, pre_wave_memory=b'changed'), artifacts=shared)
 
 
+@pytest.mark.parametrize('changed', ['inputs', 'input-storage', 'oracle'])
+def test_cached_graph_checks_complete_inputs_and_oracle(tmp_path, changed):
+    execution, actor = graph_actor(tmp_path, [
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+    ])
+    adapter = SubjectExecutor(execution)
+    request = _request(tmp_path, execution.executor)
+    passed = adapter.graph(request)
+    assert passed.host_verified
+    if changed == 'inputs':
+        invalid = replace(request, inputs=())
+    elif changed == 'input-storage':
+        tensor = request.inputs[0]
+        invalid = replace(request, inputs=(replace(tensor,
+            storage=(tensor.storage[0] + 1, *tensor.storage[1:])), *request.inputs[1:]))
+    else:
+        invalid = replace(request, oracle=replace(request.oracle,
+            values=tuple(value + 1 for value in request.oracle.values),
+            storage=tuple(value + 1 for value in request.oracle.storage)))
+    with pytest.raises(ValueError, match='rematerialized project'):
+        adapter.graph(invalid)
+    assert len(actor.observations) == 3
+    assert adapter.graph(request).as_dict() == passed.as_dict()
+    assert len(actor.observations) == 3
+
+
+def test_sourceless_failed_actor_retains_trace_validation_evidence_in_shared_store(tmp_path):
+    from benchmarks.ascend.training_traces import recorder_factory
+    from test_a5_phase1_adaptive_actor import TracedScriptedActor
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / 'events.jsonl'))
+    actor = TracedScriptedActor([])
+    driver = AdaptiveActorProjectExecutor(executor, actor, object(),
+        trace_recorder_factory=recorder_factory(phase='phase1', round_id='fixture',
+            model='fixture', source_manifest_sha256='a' * 64))
+    shared = ContentAddressedArtifacts(tmp_path / 'shared')
+    outcome = SubjectExecutor(driver).graph(_request(tmp_path, executor), artifacts=shared)
+    assert not outcome.host_verified and outcome.source_sha256 is None
+    trace = next(digest for role, digest in outcome.artifacts.items() if role.startswith('log:sft-traces/'))
+    rows = [json.loads(line) for line in outcome.read_artifact(trace).splitlines()]
+    terminal = next(row['payload'] for row in rows
+                    if row['kind'] == 'validation' and row['payload']['validator'] == 'actor-terminal')
+    evidence = outcome.read_artifact(terminal['evidence_sha256'])
+    assert json.loads(evidence)['status'] == 'turn-budget-exhausted'
+    assert shared.read_bytes(terminal['evidence_sha256']) == evidence
+    assert terminal['candidate_sha256'] not in outcome.artifacts.values()
+    assert rows[0]['payload']['source_manifest_sha256'] not in outcome.artifacts.values()
+
+
 def test_graph_retains_semantic_failure_without_publishing_memory(tmp_path):
     execution, actor = graph_actor(tmp_path, [
         '{"write":{"slot":"kernel","content":"wrong source"}}', '{"run":{}}',

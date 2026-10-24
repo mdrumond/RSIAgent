@@ -127,3 +127,229 @@ def test_real_direct_provider_role_callback_uses_private_elapsed_and_http_bounds
         models=[profile.identity.backend_model], clock=lambda: 0)
     assert bounded_completion(default_provider, profile, (), 7) == '{}'
     assert timeouts == [(7, 0)]
+
+
+def test_actor_retrieval_pins_wave_versions_after_catalog_replacement(tmp_path):
+    import time
+    database_path = tmp_path / 'knowledge.sqlite'
+    reference = tmp_path / 'reference.txt'
+    reference.write_text('Vector increment reference\n')
+    embeddings = FakeEmbeddings()
+    with KnowledgeDB(database_path, embeddings) as database:
+        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
+    bindings = bound(tmp_path, kdb=database_path, embeddings=embeddings)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'vectors')], initial_memory=b'', compose=lambda *a, **k: bindings)
+    campaign.artifacts.put_bytes(SOURCE); campaign.artifacts.put_bytes(RESULT)
+    proposal = dict(memory(), summary='Vector increments preserve shape')
+    first = campaign.memory.accept('one', proposal, {})
+    frozen = campaign.memory.snapshot()
+    second = campaign.memory.accept('two', dict(proposal, operation='append', base_versions=[first]), {})
+    campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
+    context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=frozen, branch_root=tmp_path / 'branch'),
+                              artifacts=ContentAddressedArtifacts(tmp_path / 'actor-artifacts'))
+    result = bindings['actor'].query_knowledge({'query': 'vector increments'}, context)
+    collections = {citation.collection for citation in result.citations}
+    assert 'subject-memory-' + first['version'] in collections
+    assert 'subject-memory-' + second['version'] not in collections
+
+
+def test_project_plan_ordinal_survives_other_projects_and_rejects_plan_change(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    requests = []
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def graph(self, request, **kwargs):
+            requests.append(request)
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
+        subjects=[Subject('s', 'copies')], initial_memory=b'',
+        compose=lambda *a, **k: bound(tmp_path))
+    first = dict(project_id='first', spec=_project('first', 'gm-ub-movement'))
+    second = dict(project_id='second', spec=_project('second', 'gm-ub-movement'))
+    for item in (first, second, first):
+        campaign.execute(item, campaign.memory.snapshot(), tmp_path / item['project_id'], remaining_seconds=30)
+    assert [request.authored_ordinal for request in requests] == [1, 2, 1]
+    with pytest.raises(ValueError, match='plan changed'):
+        campaign.execute(dict(first, repairs=['different']), campaign.memory.snapshot(),
+                         tmp_path / 'first', remaining_seconds=30)
+
+
+def test_trial_arms_get_fresh_bindings_and_isolated_worker_workspaces(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    worker = tmp_path / 'worker.json'
+    worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path / 'device'), physical_device=0)))
+    composed = []
+    def compose(settings, **options):
+        composed.append((settings, options))
+        return bound(options['root'])
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def graph(self, request, **kwargs):
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({'phase1_arguments': ['--worker-config', str(worker)]}, target='a3',
+        root=tmp_path / 'campaign', subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
+    item = dict(project_id='transfer', spec=_project('transfer', 'gm-ub-movement'))
+    snapshot = campaign.memory.snapshot()
+    a = campaign.execute_trial_arm(item, snapshot, tmp_path / 'a', remaining_seconds=60)
+    b = campaign.execute_trial_arm(item, snapshot, tmp_path / 'b', remaining_seconds=60)
+    replay = campaign.execute_trial_arm(item, snapshot, tmp_path / 'a', remaining_seconds=30)
+    assert len(composed) == 4
+    assert a.branch_root != b.branch_root and replay.branch_root == a.branch_root
+    workers = [json.loads((tmp_path / arm / 'worker.json').read_bytes()) for arm in ('a', 'b')]
+    assert workers[0]['workspace'] != workers[1]['workspace']
+    assert workers[0]['physical_device'] == workers[1]['physical_device'] == 0
+    assert a.pre_wave_memory == b.pre_wave_memory == snapshot
+    assert composed[-1][1]['max_seconds'] == 60  # resume keeps the admitted allocation identity
+
+
+def test_a5_catlass_optimizer_is_rejected_before_composition(tmp_path):
+    calls = []
+    with pytest.raises(ValueError, match='A5 Catlass optimizer subjects are unsupported'):
+        build_subject_campaign({}, target='a5', root=tmp_path / 'run',
+            subjects=[Subject('opt', 'optimize', task={'kind': 'optimizer', 'task': {}})],
+            initial_memory=b'', compose=lambda *a, **k: calls.append(a))
+    assert calls == []
+    assert not (tmp_path / 'run').exists()
+
+
+def test_pending_treatment_memory_indexes_only_its_frozen_arm_database(tmp_path):
+    import time
+    from benchmarks.ascend.subject_memory import digest
+    database_path = tmp_path / 'knowledge.sqlite'
+    reference = tmp_path / 'reference.txt'
+    reference.write_text('Vector increment reference\n')
+    embeddings = FakeEmbeddings()
+    with KnowledgeDB(database_path, embeddings) as database:
+        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
+    bindings = bound(tmp_path, kdb=database_path, embeddings=embeddings)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'vectors')], initial_memory=b'', compose=lambda *a, **k: bindings)
+    campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
+    draft = dict(memory_id='pending', proposal=dict(memory(), summary='Vector pendingmemoryvector trick'), provenance={})
+    baseline = campaign.memory.snapshot()
+    treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
+    def query(snapshot, arm):
+        context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=snapshot, branch_root=tmp_path / arm),
+                                  artifacts=ContentAddressedArtifacts(tmp_path / arm / 'artifacts'))
+        return bindings['actor'].query_knowledge({'query': 'pendingmemoryvector'}, context)
+    version = digest(draft)
+    assert 'subject-memory-' + version in {row.collection for row in query(treatment, 'treatment').citations}
+    assert 'subject-memory-' + version not in {row.collection for row in query(baseline, 'baseline').citations}
+    with KnowledgeDB.open_read_only(database_path, embeddings) as database:
+        with pytest.raises(KeyError):
+            database.manifest('subject-memory-' + version)
+    assert campaign.memory.records() == []
+
+
+def test_wave_author_gets_reused_id_feedback_without_changing_frozen_context(tmp_path):
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
+    from test_a5_phase1_adaptive import _project, _wave
+    requests = []
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    def transport(**options):
+        messages = options['request']['messages']
+        requests.append(messages)
+        project_id = 'repeat' if len(requests) == 1 else 'fresh'
+        return DirectCompletion(_wave(messages[1]['content'], [_project(project_id, 'gm-ub-movement')]), 1)
+    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
+        models=[profile.identity.backend_model], transport=transport)
+    binding = bound(tmp_path)
+    binding['provider'] = provider
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
+        subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: binding)
+    items = campaign.select_wave(campaign.scheduler.context(), campaign.memory.snapshot(),
+                                 {'repeat': {}}, remaining_seconds=30)
+    assert [item['project_id'] for item in items] == ['fresh']
+    assert len(requests) == 2
+    assert requests[0][1] == requests[1][1]
+    assert [row['role'] for row in requests[1][-2:]] == ['assistant', 'user']
+
+
+def test_arm_composition_consumes_allocation_and_late_preflight_never_starts_actor(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    now, requests = [0.0], []
+    monkeypatch.setattr(subject_runtime.time, 'monotonic', lambda: now[0])
+    worker = tmp_path / 'worker.json'
+    worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path / 'device'), physical_device=0)))
+    parent = tmp_path / 'parent'
+    def compose(settings, **options):
+        if options['root'] != parent:
+            now[0] += 4
+        return bound(options['root'])
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def graph(self, request, **kwargs):
+            requests.append(request)
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({'phase1_arguments': ['--worker-config', str(worker)]}, target='a3',
+        root=parent, subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
+    item = dict(project_id='transfer', spec=_project('transfer', 'gm-ub-movement'))
+    campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'valid', remaining_seconds=10)
+    assert requests[0].remaining_seconds == 6
+    with pytest.raises(TimeoutError):
+        campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'late', remaining_seconds=3)
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize('kind', ['config', 'worker-config', 'optimizer_worker_config'])
+def test_same_path_runtime_json_mutation_is_rejected_before_recomposition(tmp_path, kind):
+    referenced = tmp_path / 'runtime.json'
+    referenced.write_text(json.dumps({'physical_device': 0, 'workspace': '/old'}))
+    settings = ({'optimizer_worker_config': str(referenced)} if kind == 'optimizer_worker_config'
+                else {'phase1_arguments': ['--' + kind, str(referenced)]})
+    calls = []
+    def compose(*args, **options):
+        calls.append(options)
+        return bound(options['root'])
+    options = dict(target='a3', root=tmp_path / 'run', subjects=[Subject('s', 'copies')],
+                   initial_memory=b'', compose=compose)
+    build_subject_campaign(settings, **options)
+    referenced.write_text(json.dumps({'physical_device': 1, 'workspace': '/new'}))
+    with pytest.raises(ValueError, match='settings or target changed'):
+        build_subject_campaign(settings, **options)
+    assert len(calls) == 1
+
+
+def test_optimizer_reads_initial_seed_and_published_source_evidence_via_real_tools(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from optimizer.jobs import JobStore
+    from optimizer.loop import OptimizationLoop
+    observed = []
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def optimizer(self, directory, task, snapshot, **kwargs):
+            jobs = JobStore(directory / 'jobs')
+            job = jobs.create('def f(x): return x', 'f', {'args': []}, snapshot)
+            loop = OptimizationLoop(jobs, job['job_id'], None, None)
+            for action in [dict(action='read-memory', index=0), dict(action='read-memory', index=1),
+                           dict(action='read-artifact', sha256=snapshot['memory_entries'][0]['artifact_sha256'], offset=0),
+                           dict(action='read-artifact', sha256=snapshot['memory_entries'][1]['proposal']['after']['sha256'], offset=0),
+                           dict(action='read-artifact', sha256=snapshot['memory_entries'][1]['proposal']['evidence'][0], offset=0)]:
+                loop._tool(action, snapshot)
+                observed.append(loop.state['history'][-1]['content'])
+            return snapshot
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    seed = b'Initial host guidance\n'
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'optimization')], initial_memory=seed,
+        compose=lambda *args, **options: bound(options['root']))
+    campaign.artifacts.put_bytes(SOURCE); campaign.artifacts.put_bytes(RESULT)
+    campaign.memory.accept('lesson', memory(), {})
+    item = dict(project_id='optimizer', task=dict(kind='optimizer', task={}))
+    snapshot = campaign.execute(item, campaign.memory.snapshot(), tmp_path / 'execution', remaining_seconds=30)
+    assert observed[0]['text'] == seed.decode()
+    assert observed[1]['proposal']['after']['text'] == SOURCE.decode()
+    assert observed[2]['text'] == seed.decode()
+    assert observed[3]['text'] == SOURCE.decode()
+    assert observed[4]['text'] == RESULT.decode()
