@@ -12,6 +12,16 @@ from .adapters import A5_SCHEMAS
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_preflight
 
 
+def _typed_contract(contract):
+    # The same task contract serves the legacy JSON driver and this typed driver.
+    return contract.replace(
+        "Respond with exactly one JSON object:",
+        "Call the corresponding declared typed tool. The following objects illustrate "
+        "action arguments; do not print them as JSON responses:",
+        1,
+    )
+
+
 class PiActorDriver(DirectActorDriver):
     session_factory = PiCodingSession
 
@@ -19,6 +29,7 @@ class PiActorDriver(DirectActorDriver):
         runtime_preflight()
         kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
         super().__init__(*args, max_seconds=max_seconds, **kwargs)
+        self.system_prompt = _typed_contract(self.system_prompt)
 
     def with_trace(self, trace_event):
         return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
@@ -67,6 +78,7 @@ class PiActorDriver(DirectActorDriver):
             while self.clock() < deadline:
                 turn += 1
                 before = session.completion_tokens
+                action_error = None
                 def record(kind, payload):
                     self._trace("tool", {"name": kind, "turn": turn, **payload})
                     if recorder.enabled:
@@ -85,14 +97,18 @@ class PiActorDriver(DirectActorDriver):
                 except PiDeadlineError:
                     tokens += session.completion_tokens-before
                     break
-                except ActionError:
+                except ActionError as exc:
+                    action_error = str(exc)[:500]
                     text = "{}"
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
                 self._trace("message", {"role": "assistant", "content": text})
                 action = turn_parser(text)
                 if action is None:
-                    latest = json.dumps({"host": {"event": "invalid-action"}})
+                    host = {"event": "invalid-action"}
+                    if action_error:
+                        host["error"] = action_error
+                    latest = json.dumps({"host": host})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation
