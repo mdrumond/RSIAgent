@@ -26,6 +26,29 @@ from .subjects import load_subjects
 from .subject_memory import digest as memory_digest
 
 
+def referenced_settings(settings):
+    """Freeze ignored runtime JSON bytes without persisting their contents."""
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('--config'); parser.add_argument('--worker-config')
+    options, _ = parser.parse_known_args(settings.get('phase1_arguments', []))
+    paths = dict(config=options.config, worker=options.worker_config)
+    if isinstance(settings.get('optimizer_worker_config'), str):
+        paths['optimizer_worker'] = settings['optimizer_worker_config']
+    return {role: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for role, path in paths.items() if path is not None}
+
+
+def memory_artifacts(record):
+    proposal, provenance = record['proposal'], record['provenance']
+    result = {proposal['after']['sha256'], *proposal['evidence'],
+              *provenance.get('request', {}).get('artifacts', {}).values()}
+    if proposal['before'] is not None:
+        result.add(proposal['before']['sha256'])
+    if provenance.get('review_sha256'):
+        result.add(provenance['review_sha256'])
+    return result
+
+
 def bounded_completion(provider, profile, messages, remaining_seconds):
     """Use a private provider copy and bound both retry and HTTP timeouts."""
     from benchmarks.a5kernels.phase1_provider import openai_compatible_transport, DirectCompletion
@@ -104,7 +127,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest())
+    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest(),
+                    referenced_json_sha256=referenced_settings(settings))
     identity_path = root / 'subject-runtime.json'
     if identity_path.exists() and json.loads(identity_path.read_bytes()) != identity:
         raise ValueError('subject runtime settings or target changed on resume')
@@ -146,7 +170,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         with KnowledgeDB(database_path, embeddings) as database:
             database.index(directory, [document], collection='subject-memory-' + version, language='memory')
 
-    def knowledge(payload, *, remaining_seconds, memory_snapshot=None):
+    def knowledge(payload, *, remaining_seconds, memory_snapshot=None, frozen_root=None):
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, validate_knowledge_hit
         started = time.monotonic()
         def check_remaining():
@@ -154,25 +178,41 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 raise TimeoutError('subject knowledge query elapsed allowance exhausted')
         if memory_snapshot is None:
             memories = campaign.memory.search(payload['query'])
+            frozen_records = None
         else:
             # An in-flight Actor sees its frozen versions even if publication
             # switches the live catalog while the Actor is executing.
             words = set(re.findall(r'\w+', payload['query'].casefold()))
+            frozen_records = json.loads(memory_snapshot)['memories']
             memories = [dict(record, version=memory_digest(record))
-                        for record in json.loads(memory_snapshot)['memories']
+                        for record in frozen_records
                         if words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
         for memory in memories:
-            memory.setdefault('artifacts', {}).update({str(i): digest for i, digest in enumerate(
-                memory['proposal']['evidence'] + [memory['proposal']['after']['sha256']])})
-            if memory['proposal']['before'] is not None:
-                memory['artifacts']['before'] = memory['proposal']['before']['sha256']
-            memory['artifacts'].update(memory['provenance'].get('request', {}).get('artifacts', {}))
+            memory.setdefault('artifacts', {}).update({str(i): digest
+                for i, digest in enumerate(sorted(memory_artifacts(memory)))})
         hits = []
         if reference_query is not None:
             hits.extend(reference_query(KnowledgeQuery(payload['query']), check_remaining=check_remaining))
         if database_path is not None and memories:
             from benchmarks.a5kernels.knowledge import KnowledgeDB
-            with KnowledgeDB.open_read_only(database_path, embeddings) as database:
+            selected_database = database_path
+            if frozen_records is not None:
+                # Pending treatment memory belongs only to this arm. It must
+                # never enter the shared accepted/reference database.
+                snapshot_id = hashlib.sha256(memory_snapshot).hexdigest()
+                directory = Path(frozen_root or root / 'frozen-memory') / snapshot_id
+                directory.mkdir(parents=True, exist_ok=True)
+                selected_database = directory / 'knowledge.sqlite'
+                with KnowledgeDB(selected_database, embeddings) as database:
+                    for record in frozen_records:
+                        check_remaining()
+                        version = memory_digest(record)
+                        source = directory / version / 'memory.json'
+                        source.parent.mkdir(exist_ok=True)
+                        atomic(source, canonical(record))
+                        database.index(source.parent, [source], collection='subject-memory-' + version,
+                                       language='memory')
+            with KnowledgeDB.open_read_only(selected_database, embeddings) as database:
                 for memory in memories:
                     check_remaining()
                     collection = 'subject-memory-' + memory['version']
@@ -235,7 +275,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if hasattr(campaign, 'budget'):
                 allowance = min(allowance, campaign._remaining())
             result = knowledge({'query': action.query}, remaining_seconds=allowance,
-                               memory_snapshot=context.request.pre_wave_memory)
+                               memory_snapshot=context.request.pre_wave_memory,
+                               frozen_root=Path(context.request.branch_root) / 'frozen-memory')
             admitted = {}
             def retain(content):
                 digest = context.artifacts.put_bytes(content)
@@ -260,19 +301,22 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         atomic(plans_path, canonical(plans))
         if item.get('task', {}).get('kind') == 'optimizer':
             envelope = json.loads(snapshot)
-            frozen = optimizer_snapshot(envelope['memories'], source_identity={'target': target})
+            seed = envelope['initial_memory'].encode('utf-8')
+            files = {'initial-memory.txt': seed}
+            for record in envelope['memories']:
+                files['memories/' + memory_digest(record) + '.json'] = canonical(record)
+                for digest in memory_artifacts(record):
+                    files['artifacts/' + digest] = store.read_bytes(digest)
+            entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
+                            artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
+            frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
             return executor.optimizer(directory, item['task']['task'], frozen,
                 attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
         for memory in envelope['memories']:
-            proposal = memory['proposal']
-            reachable = set(proposal['evidence']) | {proposal['after']['sha256']}
-            if proposal['before'] is not None:
-                reachable.add(proposal['before']['sha256'])
-            reachable.update(memory['provenance'].get('request', {}).get('artifacts', {}).values())
-            for digest in reachable:
+            for digest in memory_artifacts(memory):
                 branch_artifacts.put_bytes(store.read_bytes(digest))
         inputs = materialize_inputs(spec)
         request = AdaptiveProjectRequest(spec, ordinal, snapshot, directory, inputs,
@@ -309,8 +353,22 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             elif task.get('kind') != 'optimizer':
                 raise ValueError('subject task kind must be target or optimizer')
             return [item]
-        selector = CurriculumAgent(lambda messages: curriculum_complete(messages,
-            remaining_seconds=available()), target_policy=policy,
+        def complete_wave(messages):
+            wire = list(messages)
+            while True:
+                response = curriculum_complete(wire, remaining_seconds=available())
+                try:
+                    header, body = response.strip().split('\n', 1)
+                    ids = [row['spec']['project_id'] for row in json.loads(body)['projects']] if header == 'DECISION: WAVE' else []
+                    reused = set(ids) & history.keys()
+                except (ValueError, KeyError, TypeError):
+                    return response  # The ordinary selector supplies structural feedback.
+                if not reused:
+                    return response
+                wire.extend(({'role': 'assistant', 'content': response}, {'role': 'user', 'content':
+                    'These project IDs were already executed; author fresh IDs for the same frozen wave context: '
+                    + json.dumps(sorted(reused))}))
+        selector = CurriculumAgent(complete_wave, target_policy=policy,
             unavailable_capabilities=bound['coordinator'].curriculum.unavailable_capabilities,
             query_knowledge=reference_query, require_fresh_project_ids=True)
         objective = subject['objective'] + '\nOpen repair obligations: ' + json.dumps(repairs)
@@ -366,6 +424,14 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
 
     def execute_trial_arm(item, snapshot, directory, *, remaining_seconds):
         """Fresh production session and isolated compilation workspace per arm."""
+        deadline = time.monotonic() + remaining_seconds
+        def available():
+            seconds = deadline - time.monotonic()
+            if seconds <= 0:
+                raise TimeoutError('trial arm elapsed allocation exhausted before execution')
+            return seconds
+        if referenced_settings(settings) != identity['referenced_json_sha256']:
+            raise ValueError('referenced runtime settings changed before trial composition')
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         selection = argparse.ArgumentParser(add_help=False)
@@ -403,17 +469,15 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                     arm_settings['optimizer_worker_config'][key] = str(Path(worker[field]) / key)
         retained = directory / 'runtime' / 'subject-runtime.json'
         allocation = json.loads(retained.read_bytes())['max_seconds'] if retained.exists() else remaining_seconds
-        child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
-            subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
+        from .execution import process_deadline
+        with process_deadline(deadline):
+            child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
+                subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
+        available()
         for record in json.loads(snapshot)['memories']:
-            proposal = record['proposal']
-            digests = {proposal['after']['sha256'], *proposal['evidence'],
-                       *record['provenance'].get('request', {}).get('artifacts', {}).values()}
-            if proposal['before'] is not None:
-                digests.add(proposal['before']['sha256'])
-            for digest in digests:
+            for digest in memory_artifacts(record):
                 child.artifacts.put_bytes(store.read_bytes(digest))
-        return child.execute(item, snapshot, directory / 'project', remaining_seconds=remaining_seconds)
+        return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
 
     campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
     if settings.get('memory_verification', True):
