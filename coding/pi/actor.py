@@ -29,6 +29,7 @@ class PiActorDriver(DirectActorDriver):
         runtime_preflight()
         kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
         super().__init__(*args, max_seconds=max_seconds, **kwargs)
+        self.system_prompt = _typed_contract(self.system_prompt)
 
     def with_trace(self, trace_event):
         return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
@@ -85,7 +86,7 @@ class PiActorDriver(DirectActorDriver):
                         recorder._append(kind, digest, turn=turn)
                 try:
                     name, args = session.next_action({
-                        "instruction": instruction, "contract": _typed_contract(self.system_prompt),
+                        "instruction": instruction, "contract": self.system_prompt,
                         "latest_host_observation": latest, "source": source,
                         "recent_host_observations": history[-6:],
                         "remaining_seconds": max(0, deadline-self.clock()),
