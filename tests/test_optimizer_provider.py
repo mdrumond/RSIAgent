@@ -75,7 +75,7 @@ def test_stop_kills_provider_descendants(tmp_path):
         stat = Path(f'/proc/{pid}/stat')
         try:
             state = stat.read_text().split()[2]
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             continue  # The killed descendant was reaped between observations.
         assert state == 'Z'
     assert agent.process is None
