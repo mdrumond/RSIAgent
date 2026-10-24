@@ -87,6 +87,24 @@ memory when no new reusable knowledge exists. Repair must have null memory.
 Evidence must reference actually read artifacts; no unsupported causal claims.'''
 
 
+def bounded_review_messages(messages, state, max_bytes=40000):
+    """Keep instructions and exact review state while paging older raw outputs."""
+    def size(rows):
+        return len(json.dumps(rows, ensure_ascii=False).encode('utf-8'))
+    if size(messages) <= max_bytes:
+        return messages
+    pinned = messages[:2] + [{'role': 'user', 'content': json.dumps(dict(
+        retained_review_state=state,
+        note='Older raw pages were folded to fit context. Read artifacts again when exact contents are needed.'), sort_keys=True)}]
+    tail = []
+    for end in range(len(messages), 2, -2):
+        pair = messages[max(2,end-2):end]
+        if size(pinned + pair + tail) > max_bytes:
+            break
+        tail = pair + tail
+    return pinned + tail
+
+
 class ProjectVerifierAgent:
     def __init__(self, complete, read_artifact, *, query_knowledge=None,
                  request_check=None, clock=time.monotonic, trace=None):
@@ -134,7 +152,10 @@ class ProjectVerifierAgent:
                     {'role': 'user', 'content': json.dumps(context, sort_keys=True)}]
         self._record('request', context)
         while True:
-            response = self.complete(tuple(messages), remaining_seconds=remaining())
+            working = bounded_review_messages(messages, dict(read_artifacts=sorted(read),
+                observed_versions=sorted(versions), citations=citations, host_checks_passed=host_ok,
+                knowledge_queried=queried))
+            response = self.complete(tuple(working), remaining_seconds=remaining())
             remaining()
             self._record('response', response)
             messages.append({'role': 'assistant', 'content': response})
