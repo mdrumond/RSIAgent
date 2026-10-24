@@ -14,6 +14,7 @@ dispatching device execution:
 | `run_ascend_campaign.py` | `start --phase 2` |
 | `run_a3_phase2.py` | `qualify`, `run`, `resume` |
 | `run_a5_phase2.py` | `qualify`, `run` |
+| `python -m benchmarks.ascend.phase2_cli --target a3` | `admit`, `run` |
 
 For a new campaign, create an ordered subject configuration and reuse your
 ignored provider/runtime settings with the subject launcher. Use a new campaign
@@ -28,6 +29,7 @@ Historical reports do not need provider credentials or device execution:
 
 ```bash
 python run_a3_phase2.py report --state-root /local/old-a3-campaign
+python -m benchmarks.ascend.phase2_cli --target a3 report --root /local/old-native-handoff
 python run_a5_phase2.py report --root /local/old-a5-campaign
 python run_ascend_campaign.py status --control /local/old-campaign-control
 ```
