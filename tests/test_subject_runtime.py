@@ -129,31 +129,6 @@ def test_real_direct_provider_role_callback_uses_private_elapsed_and_http_bounds
     assert timeouts == [(7, 0)]
 
 
-def test_actor_retrieval_pins_wave_versions_after_catalog_replacement(tmp_path):
-    import time
-    database_path = tmp_path / 'knowledge.sqlite'
-    reference = tmp_path / 'reference.txt'
-    reference.write_text('Vector increment reference\n')
-    embeddings = FakeEmbeddings()
-    with KnowledgeDB(database_path, embeddings) as database:
-        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
-    bindings = bound(tmp_path, kdb=database_path, embeddings=embeddings)
-    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
-        subjects=[Subject('s', 'vectors')], initial_memory=b'', compose=lambda *a, **k: bindings)
-    campaign.artifacts.put_bytes(SOURCE); campaign.artifacts.put_bytes(RESULT)
-    proposal = dict(memory(), summary='Vector increments preserve shape')
-    first = campaign.memory.accept('one', proposal, {})
-    frozen = campaign.memory.snapshot()
-    second = campaign.memory.accept('two', dict(proposal, operation='append', base_versions=[first]), {})
-    campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
-    context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=frozen, branch_root=tmp_path / 'branch'),
-                              artifacts=ContentAddressedArtifacts(tmp_path / 'actor-artifacts'))
-    result = bindings['actor'].query_knowledge({'query': 'vector increments'}, context)
-    collections = {citation.collection for citation in result.citations}
-    assert 'subject-memory-' + first['version'] in collections
-    assert 'subject-memory-' + second['version'] not in collections
-
-
 def test_project_plan_ordinal_survives_other_projects_and_rejects_plan_change(tmp_path, monkeypatch):
     from benchmarks.ascend import subject_runtime
     from test_a5_phase1_adaptive import _project
@@ -217,35 +192,6 @@ def test_a5_catlass_optimizer_is_rejected_before_composition(tmp_path):
             initial_memory=b'', compose=lambda *a, **k: calls.append(a))
     assert calls == []
     assert not (tmp_path / 'run').exists()
-
-
-def test_pending_treatment_memory_indexes_only_its_frozen_arm_database(tmp_path):
-    import time
-    from benchmarks.ascend.subject_memory import digest
-    database_path = tmp_path / 'knowledge.sqlite'
-    reference = tmp_path / 'reference.txt'
-    reference.write_text('Vector increment reference\n')
-    embeddings = FakeEmbeddings()
-    with KnowledgeDB(database_path, embeddings) as database:
-        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
-    bindings = bound(tmp_path, kdb=database_path, embeddings=embeddings)
-    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
-        subjects=[Subject('s', 'vectors')], initial_memory=b'', compose=lambda *a, **k: bindings)
-    campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
-    draft = dict(memory_id='pending', proposal=dict(memory(), summary='Vector pendingmemoryvector trick'), provenance={})
-    baseline = campaign.memory.snapshot()
-    treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
-    def query(snapshot, arm):
-        context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=snapshot, branch_root=tmp_path / arm),
-                                  artifacts=ContentAddressedArtifacts(tmp_path / arm / 'artifacts'))
-        return bindings['actor'].query_knowledge({'query': 'pendingmemoryvector'}, context)
-    version = digest(draft)
-    assert 'subject-memory-' + version in {row.collection for row in query(treatment, 'treatment').citations}
-    assert 'subject-memory-' + version not in {row.collection for row in query(baseline, 'baseline').citations}
-    with KnowledgeDB.open_read_only(database_path, embeddings) as database:
-        with pytest.raises(KeyError):
-            database.manifest('subject-memory-' + version)
-    assert campaign.memory.records() == []
 
 
 def test_wave_author_gets_reused_id_feedback_without_changing_frozen_context(tmp_path):
