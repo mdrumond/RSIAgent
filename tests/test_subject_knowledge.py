@@ -116,8 +116,12 @@ def test_kdb_off_preserves_reachable_code_and_evidence_without_embedding(tmp_pat
     memory.accept('one', learned, provenance)
     result = service.query({'query': 'vector increments'}, remaining_seconds=60)
     reachable = set(result['memories'][0]['artifacts'].values())
-    assert reachable == {learned['after']['sha256'], learned['evidence'][0], before, log, review}
-    assert memory_artifacts(memory.records()[0]) == reachable
+    record = memory.records()[0]
+    document = result['memories'][0]['artifacts']['memory-document']
+    assert document == digest(record)
+    assert json.loads(service.read_artifact(document, remaining_seconds=60)) == record
+    assert reachable == {learned['after']['sha256'], learned['evidence'][0], before, log, review, document}
+    assert memory_artifacts(record) == reachable - {document}
     assert result['hits'] == result['citations'] == []
     assert not database.exists()
 
@@ -193,3 +197,31 @@ def test_reference_prefix_cannot_starve_memory_with_actor_limit_five(tmp_path):
     assert len(result.citations) == 5
     assert any(citation.collection == 'subject-memory-' + accepted['version'] for citation in result.citations)
     assert any(citation.collection.startswith('ref-') for citation in result.citations)
+
+
+@pytest.mark.parametrize('frozen', [False, True])
+def test_large_memory_document_pointer_preserves_exact_original_record(tmp_path, frozen):
+    from optimizer.jobs import canonical
+    service, memory, store, _ = setup(tmp_path, enabled=False)
+    learned = proposal(store, 'largevector relocation lesson')
+    long_source = b'def kernel(x):\n' + b'    x = x + 1\n' * 1200 + b'    return x\n'
+    source = store.put_bytes(long_source)
+    learned['after'] = dict(sha256=source, start_line=1, end_line=1202, text=long_source.decode())
+    log = store.put_bytes(b'full retained Actor trajectory')
+    provenance = dict(request=dict(artifacts={'actor-log': log}),
+                      notes='Retained independent evidence and applicability. ' * 400)
+    admitted = memory.accept('large', learned, provenance)
+    original = memory.read(admitted['version'])
+    options = dict(snapshot=memory.snapshot(), branch_root=tmp_path / 'actor') if frozen else {}
+    result = service.query({'query': 'largevector'}, remaining_seconds=60, **options)
+    selected = result['memories'][0]
+    document = selected['artifacts']['memory-document']
+    exact = service.read_artifact(document, remaining_seconds=60)
+    assert document == selected['version'] == admitted['version']
+    assert exact == canonical(original)
+    assert len(exact) > 10000
+    assert json.loads(exact)['proposal']['after']['text'] == long_source.decode()
+    assert json.loads(exact)['provenance'] == provenance
+    assert 'version' not in json.loads(exact) and 'artifacts' not in json.loads(exact)
+    assert memory_artifacts(original) <= set(selected['artifacts'].values())
+    assert service.read_artifact(selected['proposal']['after']['sha256'], remaining_seconds=60) == long_source

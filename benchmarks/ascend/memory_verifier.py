@@ -18,7 +18,7 @@ import time
 from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .subject_execution import SubjectOutcome
-from .project_verifier import bounded_review_messages
+from .project_verifier import bounded_review_messages, artifact_preview, artifact_page
 from .time_budget import AttemptTimeBudget
 
 
@@ -36,6 +36,28 @@ def _inconclusive(reason):
     return dict(decision='inconclusive', reason=reason, evidence=[], instructions=None)
 
 
+def _preview(value, depth=0):
+    """Bound initial metadata; full immutable data stays available by hash."""
+    if isinstance(value, str):
+        return value.encode('utf-8')[:1024].decode('utf-8', errors='ignore')
+    if isinstance(value, dict):
+        return {str(key)[:128]: _preview(item, depth + 1) for key, item in list(value.items())[:16]} if depth < 2 else {'items': len(value)}
+    if isinstance(value, (list, tuple)):
+        return [_preview(item, depth + 1) for item in value[:8]] if depth < 2 else {'items': len(value)}
+    return value
+
+
+def _proposal_preview(proposal):
+    result = {key: _preview(proposal[key]) for key in ('operation', 'base_versions', 'summary',
+        'applicability', 'preconditions', 'expectations', 'limitations', 'before_unavailable_reason') if key in proposal}
+    for role in ('before', 'after'):
+        snippet = proposal.get(role)
+        if isinstance(snippet, dict):
+            result[role] = {key: snippet.get(key) for key in ('sha256', 'start_line', 'end_line')}
+            result[role]['text_preview'] = str(snippet.get('text', '')).encode('utf-8')[:512].decode('utf-8', errors='ignore')
+    return result
+
+
 class MemoryVerifierAgent:
     """The judge can inspect actual logs; a numeric tie does not force rejection."""
     def __init__(self, complete, *, clock=time.monotonic):
@@ -44,12 +66,22 @@ class MemoryVerifierAgent:
     def review(self, proposal, arms, read_artifact, *, max_seconds, check_remaining=None):
         deadline = self.clock() + _seconds(max_seconds)
         self.last_trace = []
-        known, required = set(), set()
-        for arm in arms.values():
+        proposal_bytes = canonical(proposal)
+        proposal_sha = _hash(proposal_bytes)
+        registry = {'proposal': proposal_sha}
+        known, required = {proposal_sha}, set()
+        arm_context = {}
+        for name, arm in arms.items():
             for role, digest in arm.artifacts.items():
+                registry[name + ':' + role] = digest
                 known.add(digest)
                 if any(word in role.lower() for word in ('log', 'result', 'execution')):
                     required.add(digest)
+            arm_context[name] = dict(host_verified=arm.host_verified, source_sha256=arm.source_sha256,
+                artifacts=artifact_preview(arm.artifacts), artifact_count=len(arm.artifacts),
+                observations={key: _preview(value) for key, value in arm.observations.items() if key in
+                    {'classification', 'summary', 'action_counts', 'metrics', 'speedup', 'elapsed_seconds',
+                     'tokens', 'iterations', 'acceptance_score', 'compile_count', 'run_count'}})
         read = set()
         messages = [{'role': 'system', 'content': (
             'You are an independent memory usefulness verifier. Inspect matched transfer '
@@ -67,14 +99,17 @@ class MemoryVerifierAgent:
             'are valid evidence of process quality; final failed, incomplete or mismatched '
             'arms are inconclusive. Weak or counterproductive advice can warrant rewrite '
             'or rejection even if the final repaired treatment is fast. Host correctness is '
-            'authoritative: never accept a failed treatment. Never add API metadata such as type or response_format. Return one JSON action: '
+            'authoritative: never accept a failed treatment. Initial artifacts and proposal are previews. '
+            'Inspect the full candidate with read_artifact using proposal_sha256 when needed. '
+            'List admitted artifacts with {"list_artifacts":{"offset":0,"limit":20,"prefix":"control:"}}; '
+            'prefix may be omitted or treatment:. Never add API metadata such as type or response_format. Return one JSON action: '
             '{"read_artifact":{"sha256":"...","offset":0,"limit":8192}} or '
             '{"decision":"accept|rewrite|reject|inconclusive","reason":"...",'
             '"evidence":["actually read artifact hashes"],"instructions":null|"concrete rewriting guidance"}. '
             'Inspect supplied result/log artifacts before any terminal judgment, including inconclusive. '
             'A rewrite requires concrete instructions; other decisions have null instructions.')},
-            {'role': 'user', 'content': json.dumps(dict(proposal=proposal,
-                arms={key: value.as_dict() for key, value in arms.items()}), sort_keys=True)}]
+            {'role': 'user', 'content': json.dumps(dict(proposal=_proposal_preview(proposal),
+                proposal_sha256=proposal_sha, artifact_count=len(registry), arms=arm_context), sort_keys=True)}]
 
         def remaining():
             available = deadline - self.clock()
@@ -100,14 +135,17 @@ class MemoryVerifierAgent:
                 value = json.loads(raw)
                 if not isinstance(value, dict):
                     raise ValueError('judge action must be an object')
-                if set(value) == {'read_artifact'}:
+                if set(value) == {'list_artifacts'}:
+                    observation = artifact_page(registry, value['list_artifacts'])
+                    self.last_trace.append(dict(kind='artifact-list', request=value['list_artifacts'], observation=observation))
+                elif set(value) == {'read_artifact'}:
                     request = value['read_artifact']
                     if not isinstance(request, dict) or set(request) - {'sha256', 'offset', 'limit'}:
                         raise ValueError('invalid artifact read')
                     digest = request['sha256']
                     if digest not in known:
                         raise ValueError('artifact is not retained by the matched trial')
-                    data = read_artifact(digest, remaining_seconds=remaining())
+                    data = proposal_bytes if digest == proposal_sha else read_artifact(digest, remaining_seconds=remaining())
                     if not isinstance(data, bytes) or _hash(data) != digest:
                         raise ValueError('artifact bytes do not match identity')
                     offset, limit = request.get('offset', 0), request.get('limit', 8192)
@@ -145,7 +183,7 @@ class MemoryVerifierAgent:
                     return value
                 remaining()
             except (ValueError, KeyError, TypeError) as error:
-                observation = dict(error=str(error), expected_top_level=[['read_artifact'],
+                observation = dict(error=str(error), expected_top_level=[['read_artifact'], ['list_artifacts'],
                     ['decision', 'reason', 'evidence', 'instructions']],
                     correction='Return only one exact key set; remove API metadata and unknown keys.')
                 self.last_trace.append(dict(kind='feedback', observation=observation))
@@ -193,6 +231,7 @@ class MemoryVerifier:
             # Persist allocation/identity before any budget interval or callback.
             atomic(path, canonical(state))
             store = ContentAddressedArtifacts(directory / 'artifacts')
+            store.put_bytes(canonical(proposal))
             for role, data in (('control', baseline_bytes), ('treatment', treatment_bytes)):
                 store.put_bytes(data)
             budget = AttemptTimeBudget(directory / 'elapsed.json', state['allocation'],
@@ -285,6 +324,7 @@ class MemoryVerifier:
                     arms={name: row['outcome'] for name, row in state['arms'].items()},
                     artifacts={name + ':' + role: digest for name, row in state['arms'].items()
                                for role, digest in (row['outcome'] or {}).get('artifacts', {}).items()})
+                decision['artifacts']['proposal'] = identity['proposal_sha256']
                 state['decision'] = decision
                 save()
                 return decision
@@ -296,6 +336,7 @@ class MemoryVerifier:
                                 arms={name: row['outcome'] for name, row in state['arms'].items()},
                                 artifacts={name + ':' + role: digest for name, row in state['arms'].items()
                                            for role, digest in (row['outcome'] or {}).get('artifacts', {}).items()})
+                decision['artifacts']['proposal'] = identity['proposal_sha256']
                 state['decision'] = decision
                 save()
                 return decision

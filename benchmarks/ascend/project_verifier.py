@@ -29,6 +29,47 @@ def _digest(value):
     return value
 
 
+def artifact_preview(registry, limit=16):
+    """Prioritize core review evidence without hiding the paged registry."""
+    def priority(role):
+        parts = role.lower().split(':')
+        core = ('source', 'result', 'execution', 'log', 'evidence', 'contract')
+        if role == 'source':
+            return (-1, role)
+        return (next((i for i, word in enumerate(core)
+                      if any(word in part for part in parts)), len(core)), role)
+    return dict(sorted(registry.items(), key=lambda item: priority(item[0]))[:limit])
+
+
+def artifact_page(registry, payload):
+    """List stable role names; newly observed tools may extend the registry."""
+    if not isinstance(payload, dict) or set(payload) - {'offset', 'limit', 'prefix'}:
+        raise ValueError('invalid artifact listing')
+    offset, limit, prefix = payload.get('offset', 0), payload.get('limit', 20), payload.get('prefix', '')
+    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 50 or not isinstance(prefix, str):
+        raise ValueError('artifact listing needs offset >= 0, limit 1..50 and text prefix')
+    rows = sorted((role, digest) for role, digest in registry.items() if role.startswith(prefix))
+    end = offset + limit
+    return dict(artifacts=dict(rows[offset:end]), total=len(rows),
+                next_offset=end if end < len(rows) else None)
+
+
+def knowledge_preview(observation, registry):
+    """Retain exact version/citation identities while paging rich documents."""
+    memories = []
+    for memory in observation.get('memories', []):
+        prefix = 'memory:' + memory['memory_id'] + ':' + memory['version'] + ':'
+        registry.update({prefix + role: digest for role, digest in memory.get('artifacts', {}).items()})
+        proposal = memory.get('proposal', memory)
+        memories.append(dict(memory_id=memory['memory_id'], version=memory['version'],
+            **{key: str(proposal.get(key, ''))[:512] for key in ('summary', 'preconditions', 'expectations')},
+            artifacts=artifact_preview(memory.get('artifacts', {}), 4),
+            artifact_count=len(memory.get('artifacts', {})), artifact_prefix=prefix))
+    hits = [dict(citation=hit.get('citation'), score=hit.get('score'),
+                 text=str(hit.get('text', ''))[:1024]) for hit in observation.get('hits', [])[:5]]
+    return dict(memories=memories, citations=observation.get('citations', []), hits=hits)
+
+
 @dataclass(frozen=True)
 class ProjectReview:
     project_id: str
@@ -70,6 +111,7 @@ rewrite using the retained project evidence; request project repair if the
 underlying evidence is insufficient.
 Return only one action JSON object per reply. Never add API configuration keys such as type or response_format.
 Return one JSON action per reply:
+{"list_artifacts":{"offset":0,"limit":20,"prefix":"optional role prefix"}}
 {"read_artifact":{"sha256":"...","offset":0,"limit":8192}}
 {"knowledge_query":{"query":"..."}}
 {"request_check":{"hypothesis":"...","check":{...}}}
@@ -143,7 +185,10 @@ class ProjectVerifierAgent:
                 raise TimeoutError('project verifier elapsed allocation exhausted')
             return seconds
 
-        known = set(request.artifacts.values())
+        registry = dict(request.artifacts)
+        if request.source_sha256 is not None:
+            registry['source'] = request.source_sha256
+        known = set(registry.values())
         if request.source_sha256 is not None:
             known.add(request.source_sha256)
         read = set()
@@ -155,12 +200,14 @@ class ProjectVerifierAgent:
                     if any(part in role.lower() for part in ('result', 'log', 'evidence', 'execution'))}
         if request.source_sha256 is not None:
             required.add(request.source_sha256)
-        context = {'project': asdict(request), 'rewrite_feedback': feedback,
+        project = asdict(request)
+        project.update(artifacts=artifact_preview(registry), artifact_count=len(registry))
+        context = {'project': project, 'rewrite_feedback': feedback,
                    'tools': {'knowledge_query': self.query_knowledge is not None,
                              'request_check': self.request_check is not None}}
         messages = [{'role': 'system', 'content': SYSTEM},
                     {'role': 'user', 'content': json.dumps(context, sort_keys=True)}]
-        self._record('request', context)
+        self._record('request', dict(context, project=asdict(request)))
         while True:
             working = bounded_review_messages(messages, dict(read_artifacts=sorted(read),
                 observed_versions=sorted(versions), citations=citations, host_checks_passed=host_ok,
@@ -173,7 +220,9 @@ class ProjectVerifierAgent:
                 value = json.loads(response)
                 if not isinstance(value, dict):
                     raise ValueError('reply must be a JSON object')
-                if set(value) == {'read_artifact'}:
+                if set(value) == {'list_artifacts'}:
+                    observation = artifact_page(registry, value['list_artifacts'])
+                elif set(value) == {'read_artifact'}:
                     payload = value['read_artifact']
                     if not isinstance(payload, dict) or set(payload) - {'sha256', 'offset', 'limit'}:
                         raise ValueError('invalid artifact read')
@@ -209,6 +258,7 @@ class ProjectVerifierAgent:
                         for digest in memory.get('artifacts', {}).values():
                             known.add(_digest(digest))
                     citations.extend(observation.get('citations', []))
+                    observation = knowledge_preview(observation, registry)
                     queried = True
                 elif set(value) == {'request_check'}:
                     if self.request_check is None:
@@ -221,9 +271,13 @@ class ProjectVerifierAgent:
                     if not isinstance(observation, Mapping) or type(observation.get('host_verified')) is not bool:
                         raise ValueError('check must return host_verified and artifact references')
                     host_ok = host_ok and observation['host_verified']
+                    registry.update({'check:' + str(len(registry)) + ':' + role: digest
+                                     for role, digest in observation.get('artifacts', {}).items()})
                     for digest in observation.get('artifacts', {}).values():
                         required.add(_digest(digest))
                         known.add(digest)
+                    observation = dict(host_verified=observation['host_verified'],
+                                       artifacts=artifact_preview(registry), artifact_count=len(registry))
                 else:
                     self._validate_decision(value, request, read, required, host_ok,
                                             queried, versions, citations, remaining, observed)
@@ -234,7 +288,7 @@ class ProjectVerifierAgent:
                 self._record('tool', {'action': value, 'observation': observation})
             except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
                 observation = {'error': str(exc), 'expected_top_level': [
-                    ['read_artifact'], ['knowledge_query'], ['request_check'],
+                    ['list_artifacts'], ['read_artifact'], ['knowledge_query'], ['request_check'],
                     ['decision', 'reason', 'evidence', 'repair', 'memory']],
                     'correction': 'Return only one of these exact key sets; remove API metadata and unknown keys.'}
                 self._record('feedback', observation)

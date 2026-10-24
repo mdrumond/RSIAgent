@@ -131,7 +131,10 @@ def test_invalid_status_cannot_support_benefit_even_if_host_flag_is_true(tmp_pat
     assert result['decision'] == 'inconclusive'
     assert not any(result['validity'].values())
     assert h.requests == []
-    assert len(result['artifacts']) == 6
+    expected = {digest for arm in result['arms'].values() for digest in arm['artifacts'].values()}
+    assert expected <= set(result['artifacts'].values())
+    retained = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    assert json.loads(retained.read_bytes(result['artifacts']['proposal'])) == {'summary': 'increment lesson'}
 
 
 def test_late_arm_is_inconclusive_and_does_not_replenish_total_allocation(tmp_path):
@@ -219,7 +222,7 @@ def test_large_judge_pages_fold_context_and_preserve_observed_evidence(tmp_path)
     assert {page['sha256'] for page in pages} == set(hashes)
     assert all(len(page['text'].encode()) == 8192 and page['next_offset'] == 8192 for page in pages)
     feedback = [event['observation'] for event in agent.last_trace if event['kind'] == 'feedback']
-    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['decision', 'reason', 'evidence', 'instructions']]
+    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['list_artifacts'], ['decision', 'reason', 'evidence', 'instructions']]
 
 
 def test_parent_stop_after_completed_arm_prevents_peer_and_judge(tmp_path):
@@ -277,3 +280,60 @@ def test_inconclusive_judge_must_inspect_valid_matched_evidence_before_finishing
     assert result == terminal
     assert len([event for event in agent.last_trace if event['kind'] == 'feedback']) == 1
     assert [event['observation']['sha256'] for event in agent.last_trace if event['kind'] == 'read'] == [digest]
+
+
+def test_large_native_arm_registries_and_proposal_stay_paged_and_readable(tmp_path):
+    from benchmarks.ascend.memory_verifier import MemoryVerifierAgent
+    from optimizer.jobs import canonical
+    store = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    arms, registries = {}, {}
+    for name in ('control', 'treatment'):
+        registry = {f'source:prior-{index:04d}': store.put_bytes(f'{name} source candidate {index}'.encode())
+                    for index in range(500)}
+        registry['source'] = registry['source:prior-0000']
+        registry['log:actor'] = store.put_json({'arm': name, 'mistakes': 3 if name == 'control' else 0})
+        registry['result:execution'] = store.put_json({'passed': True, 'score': 100})
+        registries[name] = registry
+        arms[name] = SubjectOutcome(True, registry['source'], registry,
+            {'classification': 'host-verified', 'speedup': 1.0, 'metrics': {'score': 100},
+             'host_facts': [{'raw': 'x' * 2000}] * 500}, store.root)
+    proposal = {'summary': 'Transfer tail safety', 'preconditions': 'Logical extent is known',
+                'before': {'sha256': 'a' * 64, 'start_line': 1, 'end_line': 20000, 'text': 'before\n' * 20000},
+                'after': {'sha256': 'b' * 64, 'start_line': 1, 'end_line': 20000, 'text': 'after\n' * 20000}}
+    proposal_bytes = canonical(proposal)
+    proposal_sha = __import__('hashlib').sha256(proposal_bytes).hexdigest()
+    commands = []
+    for name in ('control', 'treatment'):
+        for role in ('log:actor', 'result:execution'):
+            commands += [{'list_artifacts': {'prefix': name + ':' + role}},
+                         {'read_artifact': {'sha256': registries[name][role]}}]
+    hidden = registries['control']['source:prior-0499']
+    commands += [{'list_artifacts': {'prefix': 'control:source:prior-', 'offset': 499, 'limit': 20}},
+                 {'read_artifact': {'sha256': hidden}}, {'read_artifact': {'sha256': proposal_sha}}]
+    evidence = [registries[name][role] for name in ('control', 'treatment')
+                for role in ('log:actor', 'result:execution')] + [hidden, proposal_sha]
+    replies = iter([*commands, dict(decision='accept', reason='Read actual matched logs and full-proposal page.',
+                                   evidence=evidence, instructions=None)])
+    contexts = []
+    def complete(messages, *, remaining_seconds):
+        assert len(json.dumps(messages, ensure_ascii=False).encode()) <= 40000
+        context = json.loads(messages[1]['content'])
+        contexts.append(context)
+        assert context['proposal_sha256'] == proposal_sha
+        for name in arms:
+            arm = context['arms'][name]
+            assert len(arm['artifacts']) <= 16 and arm['artifact_count'] == len(registries[name])
+            assert arm['observations']['metrics'] == {'score': 100}
+            assert arm['observations']['speedup'] == 1.0
+            assert 'host_facts' not in arm['observations']
+            assert registries[name]['log:actor'] not in arm['artifacts'].values()
+        return json.dumps(next(replies))
+    agent = MemoryVerifierAgent(complete)
+    result = agent.review(proposal, arms, lambda digest, **kw: store.read_bytes(digest), max_seconds=60)
+    assert result['evidence'] == evidence
+    pages = [event['observation'] for event in agent.last_trace if event['kind'] == 'artifact-list']
+    assert pages[-1] == {'artifacts': {'control:source:prior-0499': hidden}, 'total': 500, 'next_offset': None}
+    read = {event['observation']['sha256']: event['observation'] for event in agent.last_trace if event['kind'] == 'read'}
+    assert read[hidden]['text'] == store.read_bytes(hidden).decode()
+    assert read[proposal_sha]['text'] == proposal_bytes[:8192].decode()
+    assert read[proposal_sha]['next_offset'] == 8192
