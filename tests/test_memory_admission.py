@@ -160,3 +160,80 @@ def test_other_waves_run_on_stale_memory_while_verification_is_pending(tmp_path)
         assert len(c.memory.records())==2
         assert all(row['status']=='accepted' for row in c.scheduler.state()['reviews'].values())
     finally:release.set();gate.close()
+
+
+def test_rewrite_to_newly_accepted_merge_target_refreshes_control_memory(tmp_path):
+    memory=SubjectMemory(tmp_path/'memory',b'')
+    started,release=threading.Event(),threading.Event()
+    class Paused(Evaluation):
+        def evaluate(self,*args,**kw):
+            if not self.calls:
+                started.set();assert release.wait(3)
+            return super().evaluate(*args,**kw)
+    evaluator=Paused(['rewrite','accept'])
+    target={}
+    def rewrite(*a,**kw):
+        return dict(decision='accept',memory=dict(draft(),operation='append',base_versions=[target['base']]))
+    gate=MemoryAdmission(tmp_path/'gate',memory,evaluator,rewrite)
+    try:
+        gate.submit('p',draft(),{},request(),remaining_seconds=100)
+        assert started.wait(3)
+        target['base']=memory.accept('other',dict(draft(),summary='related accepted memory'),{})
+        release.set();gate.wait(remaining_seconds=5)
+        assert gate.poll(remaining_seconds=5)[0]['outcome']=='accepted'
+        assert json.loads(evaluator.calls[0][1])['memories']==[]
+        assert json.loads(evaluator.calls[1][1])['memories'][0]['memory_id']=='other'
+    finally:release.set();gate.close()
+
+
+def test_reopen_worker_preserves_elapsed_allocation(tmp_path):
+    now=[0.0]
+    class Timed(Evaluation):
+        def evaluate(self,*a,**kw):
+            now[0]+=3
+            return super().evaluate(*a,**kw)
+    memory=SubjectMemory(tmp_path/'memory',b'')
+    gate=MemoryAdmission(tmp_path/'gate',memory,Timed(['inconclusive','accept']),None,clock=lambda:now[0])
+    try:
+        gate.submit('p',draft(),{},request(),remaining_seconds=100)
+        gate.wait(remaining_seconds=5);gate.poll(remaining_seconds=5);gate.close()
+        elapsed=gate._path('p').parent/'elapsed.json'
+        assert json.loads(elapsed.read_text())['elapsed_seconds']==3
+        gate.start_session();gate.poll(remaining_seconds=5);gate.wait(remaining_seconds=5)
+        assert gate.poll(remaining_seconds=5)[0]['outcome']=='accepted'
+        assert json.loads(elapsed.read_text())['elapsed_seconds']==6
+    finally:gate.close()
+
+
+def test_parent_budget_includes_background_drain_before_return(tmp_path):
+    from benchmarks.ascend.subject_campaign import SubjectCampaign
+    from benchmarks.ascend.subjects import Subject
+    from benchmarks.ascend.subject_execution import SubjectOutcome
+    now=[0.0];started=threading.Event()
+    class Pending(Evaluation):
+        def evaluate(self,*a,**kw):
+            started.set();assert gate.stop_requested.wait(3)
+            now[0]+=10
+            return dict(decision='inconclusive',reason='paused',instructions=None,evidence=[],arms={})
+    class Review:
+        last_trace=[]
+        calls=0
+        def review(self,req,**kw):
+            self.calls+=1
+            if self.calls==2:
+                assert started.wait(3)
+                raise TimeoutError('main provider request timed out')
+            return dict(decision='accept',reason='verified',evidence=[req.source_sha256],repair=None,memory=draft())
+    def execute(*a,**kw):
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    c=SubjectCampaign(tmp_path,[Subject('one','one',1),Subject('two','two',1)],b'',
+        select_wave=lambda context,*a,**kw:[dict(project_id=context['current_subject']['subject_id'])],
+        execute=execute,verifier=Review(),complete=lambda *a,**kw:json.dumps(dict(
+            action='advance',reason='complete',evidence=['retained'])),max_seconds=100,clock=lambda:now[0])
+    gate=MemoryAdmission(tmp_path/'gate',c.memory,Pending([]),None,parent_remaining=c._remaining,clock=lambda:now[0])
+    c.memory_gate=gate
+    result=c.run()
+    assert result['terminal']=='REVIEW_PENDING'
+    assert c.memory.records()==[]
+    assert json.loads((tmp_path/'elapsed.json').read_text())['elapsed_seconds']==10

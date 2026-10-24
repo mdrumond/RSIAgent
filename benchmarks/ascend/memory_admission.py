@@ -5,6 +5,7 @@ import json
 import fcntl
 from pathlib import Path
 import time
+from threading import Event
 
 from optimizer.jobs import atomic, canonical
 from .project_verifier import ProjectReview
@@ -42,6 +43,7 @@ class MemoryAdmission:
         self.memory, self.verifier, self.rewrite = memory, verifier, rewrite
         self.seconds, self.parent_remaining, self.clock = max_seconds, parent_remaining, clock
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='memory-verifier')
+        self.stop_requested = Event()
         self.future, self.active = None, None
         self.delivered = set()
         # A new process resumes inconclusive jobs with their original elapsed files.
@@ -71,6 +73,8 @@ class MemoryAdmission:
         self._start()
 
     def _start(self):
+        if self.stop_requested.is_set():
+            return
         if self.future is not None:
             return
         for path in sorted(self.root.glob('*/job.json')):
@@ -84,6 +88,8 @@ class MemoryAdmission:
         directory = self._path(job['review_id']).parent
         budget = AttemptTimeBudget(directory / 'elapsed.json', job['allocation'], clock=self.clock)
         def remaining():
+            if self.stop_requested.is_set():
+                raise TimeoutError('memory worker paused; resume retained evaluation')
             seconds = budget.deadline - self.clock()
             if self.parent_remaining is not None:
                 seconds = min(seconds, self.parent_remaining())
@@ -109,7 +115,8 @@ class MemoryAdmission:
                 treatment = treatment_snapshot(baseline, job['proposal'], job['provenance'], job['review_id'])
                 result = self.verifier.evaluate(job['proposal'], baseline, treatment,
                     directory / f"revision-{job['revision']}", remaining_seconds=remaining(),
-                    task=job['trial_task'], sequence=job.get('sequence',0)+job['revision'])
+                    task=job['trial_task'], sequence=job.get('sequence',0)+job['revision'],
+                    check_remaining=remaining)
                 remaining()
                 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
                 shared = ContentAddressedArtifacts(self.memory.root.parent / 'artifacts')
@@ -175,6 +182,8 @@ class MemoryAdmission:
             self._save(job)
             return False
         job['proposal'] = review['memory']
+        # A rewrite may select a different currently accepted merge target.
+        job['baseline'] = base64.b64encode(self.memory.snapshot()).decode()
         job['revision'] += 1
         self._save(job)
         return True
@@ -187,8 +196,10 @@ class MemoryAdmission:
         for path in sorted(self.root.glob('*/job.json')):
             job = json.loads(path.read_bytes())
             if job['status'] in {'accepted', 'rejected'} and job['review_id'] not in self.delivered:
+                judgment = job['evaluations'][-1] if job['evaluations'] else {}
                 result.append(dict(review_id=job['review_id'], outcome=job['status'],
-                    repair=job.get('project_repair'), provenance=job['provenance']))
+                    judgment={key:judgment.get(key) for key in ('decision','reason','evidence','instructions','evaluation_id')},
+                    rewrites=job['rewrites'], repair=job.get('project_repair'), provenance=job['provenance']))
         self._start()
         return result
 
@@ -204,7 +215,25 @@ class MemoryAdmission:
         except FutureTimeout:
             raise TimeoutError('waiting for memory review exceeded campaign allocation') from None
 
+    def start_session(self):
+        if self.lease.closed:
+            self.lease = (self.root / '.admission.lock').open('a+b')
+            try:
+                fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                self.lease.close()
+                raise RuntimeError('memory verification worker is already active') from None
+            self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='memory-verifier')
+            self.future, self.active = None, None
+        self.stop_requested.clear()
+        for path in self.root.glob('*/job.json'):
+            job=json.loads(path.read_bytes())
+            if job['status'] in {'evaluating','inconclusive'}:
+                job['status']='pending'
+                self._save(job)
+
     def close(self):
         if not self.lease.closed:
+            self.stop_requested.set()
             self.pool.shutdown(wait=True)
             self.lease.close()

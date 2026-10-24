@@ -176,3 +176,34 @@ def test_second_controller_cannot_start_while_original_work_is_active(tmp_path):
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         with pytest.raises(RuntimeError,match='already active'):c.resume()
     assert not (tmp_path/'elapsed.json').exists()
+
+
+def test_late_memory_rejection_reaches_curriculum_before_completion(tmp_path):
+    class Review:
+        last_trace=[]
+        def review(self,req,**kw):return dict(decision='accept',reason='verified',
+            evidence=[req.source_sha256],repair=None,memory=proposal(req.source_sha256))
+    class LateGate:
+        pending=[]
+        def submit(self,review_id,*a,**kw):self.pending.append(review_id)
+        def poll(self,**kw):
+            if c.scheduler.context()['current_subject'] is not None or not self.pending:return []
+            pid=self.pending.pop(0)
+            return [dict(review_id=pid,outcome='rejected' if pid=='first' else 'accepted',
+                judgment=dict(reason='memory ignored'),rewrites=2,provenance=dict(subject_id='s'))]
+        def wait(self,**kw):pass
+        def close(self):pass
+    actions=iter([dict(action='advance'),dict(action='revisit',subject_id='s'),dict(action='advance')])
+    contexts=[]
+    def decide(messages,**kw):
+        contexts.append(json.loads(messages[1]['content']))
+        return json.dumps(dict(next(actions),reason='review coverage',evidence=['retained']))
+    def execute(*a,**kw):
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    c=SubjectCampaign(tmp_path,[Subject('s','s',1)],b'',
+        select_wave=lambda *a,**kw:[dict(project_id='first' if not c.state['waves'] else 'revisit')],
+        execute=execute,verifier=Review(),complete=decide,memory_gate=LateGate())
+    assert c.run()['terminal']=='COMPLETE'
+    assert len(c.state['waves'])==2
+    assert contexts[1]['memory']['memory_reviews']['first']['judgment']['reason']=='memory ignored'

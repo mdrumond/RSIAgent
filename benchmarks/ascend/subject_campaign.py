@@ -46,8 +46,15 @@ class SubjectCampaign:
     def _settle_reviews(self):
         if self.memory_gate is None:
             return
-        for result in self.memory_gate.poll(remaining_seconds=self._remaining()):
+        remaining = max(0, self.budget.deadline-self.clock())
+        for result in self.memory_gate.poll(remaining_seconds=remaining):
             self.scheduler.resolve_review(result['review_id'], result['outcome'])
+            self.state.setdefault('memory_reviews',{})[result['review_id']] = dict(
+                outcome=result['outcome'], judgment=result.get('judgment'), rewrites=result.get('rewrites'),
+                subject_id=result['provenance'].get('subject_id'))
+            if result['outcome']=='rejected':
+                self.state['needs_decision']=True
+            self._save()
             if result.get('repair'):
                 provenance = result['provenance']
                 review = result['repair']
@@ -166,12 +173,14 @@ class SubjectCampaign:
         self._publish_wave(pending)
 
     def _run(self):
+        if self.memory_gate is not None and hasattr(self.memory_gate,'start_session'):
+            self.memory_gate.start_session()
         self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
         try:
             while True:
                 self._remaining()
                 self._settle_reviews()
-                if self.scheduler.is_complete():
+                if self.scheduler.is_complete() and not self.state['needs_decision']:
                     self.state['terminal'] = 'COMPLETE'
                     self._save()
                     return self.report()
@@ -185,6 +194,7 @@ class SubjectCampaign:
                     try:
                         self.policy.decide(self.scheduler, memory_context=dict(
                             accepted=self.memory.records(), decision_error=self.state.get('decision_error'),
+                            memory_reviews=self.state.get('memory_reviews',{}),
                             projects={key: {field: record.get(field) for field in ('objective', 'review', 'review_sha256')}
                                       for key, record in list(self.state['projects'].items())[-8:]}),
                             remaining_seconds=self._remaining())
@@ -221,7 +231,12 @@ class SubjectCampaign:
             self._save()
             return self.report()
         finally:
-            self.budget.close()
+            try:
+                if self.memory_gate is not None:
+                    self.memory_gate.close()
+                    self._settle_reviews()
+            finally:
+                self.budget.close()
 
     def run(self):
         with (self.root / '.campaign.lock').open('a+b') as lock:
@@ -229,6 +244,7 @@ class SubjectCampaign:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError('subject campaign is already active; observe its retained work') from None
-            return self._run()
+            self._run()
+            return self.report()
 
     resume = run
