@@ -81,7 +81,10 @@ def test_tied_metrics_allow_log_supported_acceptance_and_completed_arms_do_not_r
     assert [row[:2] for row in h.calls] == [('control', b'old'), ('treatment', b'new')]
     assert [row[3] for row in h.calls] == [10, 10]
     assert h.calls[0][2] != h.calls[1][2] and h.calls[0][4] == h.calls[1][4]
-    assert len([event for event in h.verifier.last_trace if event['kind'] == 'read']) == 4
+    expected_reads = {digest for arm in result['arms'].values()
+                      for role, digest in arm['artifacts'].items() if role != 'source'}
+    assert {event['observation']['sha256'] for event in h.verifier.last_trace
+            if event['kind'] == 'read'} == expected_reads
     assert set(result['artifacts'].values()) >= set(result['evidence'])
     assert evaluate(h, tmp_path) == result
     assert len(h.calls) == 2 and len(h.selections) == 1

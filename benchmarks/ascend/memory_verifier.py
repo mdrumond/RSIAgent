@@ -3,6 +3,9 @@
 Execution callbacks must use fresh Actors, disable learning publication, and
 observe retained external operations when re-entering the same arm directory.
 The evaluator never admits memories or controls rewrite counts.
+Completed invalid/late outcomes remain inconclusive on resume and are never
+executed again. Missing outcomes may recover only through the same arm's
+retained operation; a new completed trial requires an explicitly new directory.
 """
 from contextlib import contextmanager
 import fcntl
