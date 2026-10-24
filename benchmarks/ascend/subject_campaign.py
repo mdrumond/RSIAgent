@@ -109,6 +109,16 @@ class SubjectCampaign:
         linked = {key: self.state['projects'].get(obligations.get(key, {}).get('project_id',key))
                   for key in record.get('repairs', [])}
         artifacts = dict(outcome['artifacts'])
+        plan = record.get('plan')
+        if plan is None:
+            plan = next((item for item in (self.state.get('pending') or {}).get('items',[])
+                         if item['project_id']==project_id), None)
+        project = None
+        if plan is not None:
+            contract = self.artifacts.put_json(plan)
+            artifacts['evidence:project-contract'] = contract
+            project = dict(project_id=project_id, contract_sha256=contract,
+                hypothesis=plan.get('spec',{}).get('hypothesis'), kind=plan.get('kind','graph'))
         for key, original in linked.items():
             if original is not None:
                 artifacts.update({f'repair:{key}:{role}': sha for role, sha in original['outcome']['artifacts'].items()})
@@ -121,7 +131,7 @@ class SubjectCampaign:
             if pid != project_id and set(record.get('repairs', [])) & set(sibling.get('repairs', [])):
                 sibling_evidence[pid] = sibling['outcome']['observations']
                 artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
-        objective = json.dumps(dict(subject=record['objective'], sibling_evidence=sibling_evidence, repairs={
+        objective = json.dumps(dict(subject=record['objective'], project=project, sibling_evidence=sibling_evidence, repairs={
             key: dict(original['review'], obligation=obligations.get(key))
             for key, original in linked.items() if original is not None}), sort_keys=True)
         request = ProjectReview(project_id=project_id, source_sha256=outcome['source_sha256'],
@@ -198,7 +208,7 @@ class SubjectCampaign:
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
                 objective=pending['subject']['objective'], repairs=item.get('repairs', []),
-                wave_index=len(self.state['waves'])+1))
+                wave_index=len(self.state['waves'])+1, plan=json.loads(canonical(item))))
             if 'outcome' not in record:
                 directory = self.root / 'waves' / pending['wave_id'] / pid
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(

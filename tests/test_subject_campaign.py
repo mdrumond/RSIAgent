@@ -221,3 +221,23 @@ def test_progression_context_preserves_coverage_without_repeating_large_sources(
     assert context['accepted'][0]['summary']=='lesson 29'
     assert context['initial_memory']=='prior accepted guidance'
     assert len(json.dumps(context).encode())<10000
+
+
+def test_verifier_receives_frozen_individual_contract_for_subject_control(tmp_path):
+    plan=dict(project_id='control',spec=dict(hypothesis='Baseline copy control',operation='copy'))
+    class Review:
+        last_trace=[]
+        def review(self,request,**kw):
+            objective=json.loads(request.objective)
+            contract=c.artifacts.read_json(objective['project']['contract_sha256'])
+            assert contract==plan
+            assert objective['project']['contract_sha256'] in request.artifacts.values()
+            return dict(decision='accept',reason='valid control for arithmetic study',
+                evidence=[request.source_sha256],repair=None,memory=None)
+    def execute(*a,**kw):
+        sha=c.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
+    c=SubjectCampaign(tmp_path,[Subject('add','Learn elementwise addition',1)],b'',
+        select_wave=lambda *a,**kw:[plan],execute=execute,verifier=Review(),
+        complete=lambda *a,**kw:json.dumps(dict(action='advance',reason='control evidence complete',evidence=['control'])))
+    assert c.run()['terminal']=='COMPLETE'
