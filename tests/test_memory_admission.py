@@ -285,3 +285,28 @@ def test_large_rewrite_uses_bounded_feedback_and_readable_exact_cas_documents(tm
         assert all(request_bytes(wire) < 49152 for wire in requests)
     finally:
         gate.close()
+
+
+def test_rewrite_provider_outage_retains_inconclusive_job_for_resume(tmp_path):
+    from benchmarks.a5kernels.phase1_live import InfrastructureFailure
+    memory = SubjectMemory(tmp_path/'memory', b'initial')
+    def unavailable(*args, **kwargs):
+        raise InfrastructureFailure('temporary provider outage')
+    gate = MemoryAdmission(tmp_path/'gate', memory, Evaluation(['rewrite']), unavailable)
+    try:
+        gate.submit('p', draft(), {}, request(), remaining_seconds=100)
+        gate.wait(remaining_seconds=5)
+        assert gate.poll(remaining_seconds=5) == []
+        retained = json.loads(gate._path('p').read_bytes())
+        assert retained['status'] == 'inconclusive'
+        assert retained['error_type'] == 'InfrastructureFailure'
+        assert retained['rewrites'] == 0 and memory.records() == []
+    finally:
+        gate.close()
+    resumed = MemoryAdmission(tmp_path/'gate', memory, Evaluation(['accept']), unavailable)
+    try:
+        resumed.wait(remaining_seconds=5)
+        assert resumed.poll(remaining_seconds=5)[0]['outcome'] == 'accepted'
+        assert len(memory.records()) == 1
+    finally:
+        resumed.close()

@@ -8,6 +8,7 @@ import time
 from threading import Event
 
 from optimizer.jobs import atomic, canonical
+from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from .project_verifier import ProjectReview
 from .subject_memory import StaleMemory, digest
 from .time_budget import AttemptTimeBudget
@@ -154,7 +155,7 @@ class MemoryAdmission:
                     return
                 job['rewrites'] += 1
                 self._save(job)
-        except (TimeoutError, OSError) as error:
+        except (TimeoutError, OSError, InfrastructureFailure) as error:
             job.update(status='inconclusive', error_type=type(error).__name__)
             self._save(job)
         finally:
