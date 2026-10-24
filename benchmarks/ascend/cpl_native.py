@@ -30,7 +30,7 @@ class CplNativeCandidateBackend:
     build_bundle = GZA3RemoteCandidateBackend.build_bundle
 
     def __init__(self, *, cpl_remote, target, runtime, remote_workspace, physical_device,
-                 state_directory, profile='bz-a3-1', timeout=600, remaining_seconds=None,
+                 state_directory, profile='bz-a3-1', timeout=600, remaining_seconds=None, registry_workspace=None,
                  process_runner=subprocess.run, clock=time.monotonic):
         workspace = PurePosixPath(remote_workspace)
         if not workspace.is_absolute() or '..' in workspace.parts:
@@ -41,6 +41,11 @@ class CplNativeCandidateBackend:
             raise ValueError('explicit registry target and runtime are required')
         self._cpl, self.target, self.runtime = str(cpl_remote), target, runtime
         self._workspace, self._device, self.profile = workspace, physical_device, profile
+        self.registry_workspace = PurePosixPath(registry_workspace) if registry_workspace is not None else None
+        if self.registry_workspace is not None:
+            if not self.registry_workspace.is_absolute() or '..' in self.registry_workspace.parts:
+                raise ValueError('registry_workspace must be an absolute configured base')
+            workspace.relative_to(self.registry_workspace)
         self.root, self.timeout = Path(state_directory), timeout
         self.remaining_seconds, self._run, self.clock = remaining_seconds, process_runner, clock
         self.runtime_identity = dict(target=target, runtime=runtime, profile=profile,
@@ -119,6 +124,10 @@ class CplNativeCandidateBackend:
         _save(path, record)
         return result
 
+    def _wire_path(self, path):
+        selected = PurePosixPath(path)
+        return str(selected.relative_to(self.registry_workspace)) if self.registry_workspace is not None else str(selected)
+
     def remote_candidate_directory(self, plan):
         return self._workspace / 'candidates' / plan.execution_id
 
@@ -134,7 +143,7 @@ class CplNativeCandidateBackend:
         if not script.exists():
             script.write_text(body)
         arguments = ('run', self.target, '--runtime', self.runtime,
-                     '--cwd', str(cwd or self._workspace), '--file', str(script.resolve()))
+                     '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
         value = self._operation(key, arguments, kind='job')
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
         result.job_handle = value['handle']
@@ -149,7 +158,7 @@ class CplNativeCandidateBackend:
         key = plan.execution_id
         bundle = self.build_bundle(plan, Path(local_directory) / (key+'.tar'))
         archive = self._workspace / (key+'.tar')
-        self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), str(archive)), kind='transfer')
+        self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')
         result = self.run_remote(('bash', '-c', _COMPILE_SCRIPT, 'rsi-native', str(archive),
             str(self.remote_candidate_directory(plan)), bundle.sha256, key, plan.source_fingerprint), key=key+'/compile')
         if result.returncode:

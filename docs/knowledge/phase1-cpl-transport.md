@@ -13,8 +13,10 @@ Configure the skill-owned `cpl_remote` executable, registry `target`, named
 it does not select a transport route. Pass a `remaining_seconds` callable to cap
 nested work by the campaign's remaining elapsed allocation. The selected named
 runtime supplies compiler/CANN/Python activation; no environment activation paths
-or SSH routes belong in campaign source. This binding currently uses absolute
-upload paths and working directories supported by SSH registry targets.
+or SSH routes belong in campaign source. For remote-agent targets, additionally
+set the configured absolute `registry_workspace`: upload destinations and CPL
+working directories are then relative to that base, while script file paths stay
+absolute. SSH targets may omit this field and retain absolute path behavior.
 
 The caller must preflight capabilities, discover actual product/tool versions,
 and select a healthy device through CPL before NPU work. Ordinary execution

@@ -138,3 +138,15 @@ def test_parent_elapsed_exhaustion_does_not_submit(tmp_path):
         backend(tmp_path, remote, remaining_seconds=lambda: 0).compile(
             smoke_plan(target='discovered-a3', arch='discovered-arch'), tmp_path/'bundle')
     assert remote.calls == []
+
+
+def test_remote_agent_uses_relative_transfer_and_cwd_with_absolute_payloads(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote, registry_workspace='/owned')
+    compilation = candidate.compile(smoke_plan(target='discovered-a3', arch='discovered-arch'), tmp_path/'bundle')
+    assert compilation.library_sha256 == 'b'*64
+    upload = next(call for call in remote.calls if call[2] == 'upload')
+    assert upload[-1].startswith('task/')
+    submit = next(call for call in remote.calls if call[2] == 'run')
+    assert submit[submit.index('--cwd')+1] == 'task'
+    assert '/owned/task/candidates/' in Path(submit[submit.index('--file')+1]).read_text()
