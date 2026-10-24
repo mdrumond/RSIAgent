@@ -12,6 +12,16 @@ from .adapters import A5_SCHEMAS
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_preflight
 
 
+def _typed_contract(contract):
+    # The same task contract serves the legacy JSON driver and this typed driver.
+    return contract.replace(
+        "Respond with exactly one JSON object:",
+        "Call the corresponding declared typed tool. The following objects illustrate "
+        "action arguments; do not print them as JSON responses:",
+        1,
+    )
+
+
 class PiActorDriver(DirectActorDriver):
     session_factory = PiCodingSession
 
@@ -67,6 +77,7 @@ class PiActorDriver(DirectActorDriver):
             while self.clock() < deadline:
                 turn += 1
                 before = session.completion_tokens
+                action_error = None
                 def record(kind, payload):
                     self._trace("tool", {"name": kind, "turn": turn, **payload})
                     if recorder.enabled:
@@ -74,7 +85,7 @@ class PiActorDriver(DirectActorDriver):
                         recorder._append(kind, digest, turn=turn)
                 try:
                     name, args = session.next_action({
-                        "instruction": instruction, "contract": self.system_prompt,
+                        "instruction": instruction, "contract": _typed_contract(self.system_prompt),
                         "latest_host_observation": latest, "source": source,
                         "recent_host_observations": history[-6:],
                         "remaining_seconds": max(0, deadline-self.clock()),
@@ -85,14 +96,18 @@ class PiActorDriver(DirectActorDriver):
                 except PiDeadlineError:
                     tokens += session.completion_tokens-before
                     break
-                except ActionError:
+                except ActionError as exc:
+                    action_error = str(exc)[:500]
                     text = "{}"
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
                 self._trace("message", {"role": "assistant", "content": text})
                 action = turn_parser(text)
                 if action is None:
-                    latest = json.dumps({"host": {"event": "invalid-action"}})
+                    host = {"event": "invalid-action"}
+                    if action_error:
+                        host["error"] = action_error
+                    latest = json.dumps({"host": host})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation
