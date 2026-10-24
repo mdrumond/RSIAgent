@@ -188,3 +188,12 @@ def test_elapsed_budget_forwarded_and_late_provider_decision_rejected():
     with pytest.raises(TimeoutError):
         h.agent.review(request(), max_seconds=10)
     assert not any(event['kind'] == 'decision' for event in h.agent.last_trace)
+
+
+def test_duplicate_merge_bases_receive_feedback_before_publication():
+    base=dict(memory_id='increment',version='v1')
+    h=Harness([*prerequisites(),decision(memory('merge',[base,base])),
+               decision(memory('merge',[base]))],knowledge={'memories':[base],'citations':[]})
+    result=h.agent.review(request())
+    assert result['memory']['base_versions']==[base]
+    assert any(e['kind']=='feedback' for e in h.agent.last_trace)
