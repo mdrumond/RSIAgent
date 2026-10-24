@@ -51,18 +51,24 @@ class SubjectCampaign:
             subject = record['provenance'].get('subject_id', 'seed')
             counts[subject] = counts.get(subject, 0) + 1
             proposal = record['proposal']
+            wave = record['provenance'].get('wave_index',0)
+            if subject in accepted and accepted[subject]['wave_index'] > wave:
+                continue
             accepted[subject] = dict(memory_id=record['memory_id'], version=digest(record),
-                subject_id=subject, **{key:str(proposal[key])[:256] for key in
+                subject_id=subject, wave_index=wave, **{key:str(proposal[key])[:256] for key in
                     ('summary','applicability','preconditions','expectations','limitations')})
         reviews, rejected = {}, {}
         for key, row in self.state.get('memory_reviews', {}).items():
             subject = row.get('subject_id', 'seed')
             if row['outcome']=='rejected': rejected[subject]=rejected.get(subject,0)+1
             judgment = row.get('judgment') or {}
+            if subject in reviews and reviews[subject][1].get('sequence',0) > row.get('sequence',0):
+                continue
             reviews[subject] = (key, dict(row, judgment={field:(str(value)[:1024] if isinstance(value,str) else value)
                 for field,value in judgment.items()}))
         projects = {}
-        for key, row in list(self.state['projects'].items())[-4:]:
+        recent=sorted(self.state['projects'].items(),key=lambda pair:(pair[1].get('wave_index',0),pair[0]))[-4:]
+        for key, row in recent:
             review = row.get('review') or {}
             projects[key] = dict(objective=row['objective'][:1024], review_sha256=row.get('review_sha256'),
                 review={field:review.get(field) for field in ('decision','reason','evidence','repair')})
@@ -78,18 +84,19 @@ class SubjectCampaign:
         remaining = max(0, self.budget.deadline-self.clock())
         for result in self.memory_gate.poll(remaining_seconds=remaining):
             self.scheduler.resolve_review(result['review_id'], result['outcome'])
-            self.state.setdefault('memory_reviews',{})[result['review_id']] = dict(
-                outcome=result['outcome'], judgment=result.get('judgment'), rewrites=result.get('rewrites'),
-                subject_id=result['provenance'].get('subject_id'))
-            if result['outcome']=='rejected':
-                self.state['needs_decision']=True
-            self._save()
-            if result.get('repair'):
-                provenance = result['provenance']
-                review = result['repair']
-                self.scheduler.add_repair(result['review_id']+'-memory', provenance['subject_id'],
-                    provenance['project_id'], review['reason']+' '+json.dumps(review.get('repair')), review['evidence'])
-                self.state['needs_decision'] = True
+            rows=self.state.setdefault('memory_reviews',{})
+            if result['review_id'] not in rows:
+                rows[result['review_id']] = dict(outcome=result['outcome'], judgment=result.get('judgment'),
+                    rewrites=result.get('rewrites'), subject_id=result['provenance'].get('subject_id'),
+                    sequence=max((row.get('sequence',0) for row in rows.values()),default=0)+1)
+                if result['outcome']=='rejected':
+                    self.state['needs_decision']=True
+                if result.get('repair'):
+                    provenance = result['provenance']
+                    review = result['repair']
+                    self.scheduler.add_repair(result['review_id']+'-memory', provenance['subject_id'],
+                        provenance['project_id'], review['reason']+' '+json.dumps(review.get('repair'),sort_keys=True), review['evidence'])
+                    self.state['needs_decision'] = True
                 self._save()
             if hasattr(self.memory_gate, 'acknowledge'):
                 self.memory_gate.acknowledge(result['review_id'])
@@ -156,7 +163,7 @@ class SubjectCampaign:
                 if pid in review_ids:
                     self.scheduler.resolve_review(pid, 'accepted')
                 continue
-            provenance = dict(project_id=pid, subject_id=subject,
+            provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
                 review_sha256=record['review_sha256'], request=record['review_request'])
             if self.memory_gate is None:
                 try:
@@ -190,7 +197,8 @@ class SubjectCampaign:
             self._remaining()
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
-                objective=pending['subject']['objective'], repairs=item.get('repairs', [])))
+                objective=pending['subject']['objective'], repairs=item.get('repairs', []),
+                wave_index=len(self.state['waves'])+1))
             if 'outcome' not in record:
                 directory = self.root / 'waves' / pending['wave_id'] / pid
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(

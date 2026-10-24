@@ -215,7 +215,7 @@ def test_progression_context_preserves_coverage_without_repeating_large_sources(
     for i in range(30):
         learned=dict(proposal('a'*64),summary='lesson '+str(i),
             after=dict(sha256='a'*64,start_line=1,end_line=2000,text='long source\n'*2000))
-        c.memory.accept('p'+str(i),learned,dict(subject_id='s'))
+        c.memory.accept('p'+str(i),learned,dict(subject_id='s',wave_index=i))
     context=c._decision_context()
     assert context['accepted_counts']=={'s':30}
     assert context['accepted'][0]['summary']=='lesson 29'
