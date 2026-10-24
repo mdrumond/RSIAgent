@@ -1,6 +1,6 @@
 """Target bindings for the shared adaptive controller and host verifier."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from coding.pi.actor import PiActorDriver
 from coding.pi import ENGINE_IDENTITY
@@ -93,8 +93,23 @@ class NativeProductionConfig:
     profiling_mode: str | None = None
     compiler_version: str | None = None
     curriculum_kdb: bool = False
+    adaptive_kdb: bool = False
+    librarian_seconds: float = 90
+    memory_kdb: Path | None = None
+    memory_collection: str | None = None
+    memory_snapshot: Path | None = None
 
     def __post_init__(self):
+        import math
+        if type(self.adaptive_kdb) is not bool:
+            raise TypeError("adaptive_kdb must be boolean")
+        if type(self.librarian_seconds) not in (int, float) or not math.isfinite(self.librarian_seconds) or self.librarian_seconds <= 0:
+            raise ValueError("librarian_seconds must be positive finite seconds")
+        memory = (self.memory_kdb, self.memory_collection, self.memory_snapshot)
+        if any(item is not None for item in memory) and (not all(item is not None for item in memory) or not self.adaptive_kdb):
+            raise ValueError("indexed memory requires adaptive KDB, database, collection and snapshot")
+        if self.adaptive_kdb and (self.kdb is None or not self.collection):
+            raise ValueError("adaptive KDB requires a configured KDB and collection")
         if type(self.curriculum_kdb) is not bool:
             raise TypeError("curriculum_kdb must be boolean")
         if self.curriculum_kdb and (self.kdb is None or not self.collection):
@@ -155,7 +170,7 @@ def build_native_adaptive_phase1(
     max_projects=None, max_seconds=7200, request_profile=None, request_timing=None,
     profiling_guidance=None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
-    project_workers=(),
+    project_workers=(), librarian_complete=None,
 ):
     """Compose native A3 learning without a Catlass checkout requirement.
 
@@ -222,19 +237,39 @@ def build_native_adaptive_phase1(
             identity["kdb_manifest"] = (manifests[0].fingerprint if isinstance(config.collection, str)
                                         else {manifest.collection: manifest.fingerprint
                                               for manifest in manifests})
-        query = _knowledge_action(config, embeddings)
+        adaptive = None
+        if config.adaptive_kdb:
+            from benchmarks.ascend.phase1_knowledge import NativeAdaptiveKnowledge, deepseek_librarian
+            adaptive = NativeAdaptiveKnowledge(config, embeddings,
+                librarian_complete or deepseek_librarian(environment))
+            identity["adaptive_kdb"] = adaptive.identity
+        query = adaptive.actor_query if adaptive is not None else _knowledge_action(config, embeddings)
         # The pinned local embedding model is shared; its tokenizer/model need
         # not support overlapping calls. SQLite readers/journals remain local.
         query_action, query_lock = query, Lock()
         def query(payload, context):
-            with query_lock:
-                return query_action(payload, context)
+            if not config.adaptive_kdb or context.remaining_seconds is None:
+                with query_lock:
+                    return query_action(payload, context)
+            import time
+            deadline = time.monotonic() + context.remaining_seconds
+            if not query_lock.acquire(timeout=max(0, context.remaining_seconds)):
+                raise TimeoutError('actor knowledge lock elapsed allocation exhausted')
+            try:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('actor knowledge lock elapsed allocation exhausted')
+                return query_action(payload, replace(context, remaining_seconds=remaining))
+            finally:
+                query_lock.release()
     elif config.collection is not None or embeddings is not None:
         raise ValueError("KDB-off native treatment cannot receive KDB dependencies")
     curriculum_query = None
     if config.curriculum_kdb:
         from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
         callback, identity["curriculum_kdb"] = curriculum_knowledge(config, embeddings)
+        if config.adaptive_kdb:
+            callback = adaptive.curriculum_query
         def curriculum_query(action, *, check_remaining=None):
             if check_remaining is None:
                 with query_lock:
@@ -247,6 +282,8 @@ def build_native_adaptive_phase1(
                 return callback(action, check_remaining=check_remaining)
             finally:
                 query_lock.release()
+        if config.adaptive_kdb:
+            curriculum_query.begin_selection = adaptive.begin_selection
     root = Path(config.root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / "campaign-identity.json"
