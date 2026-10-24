@@ -171,3 +171,14 @@ def test_late_judge_cannot_publish_acceptance_and_changed_memories_cannot_resume
     with pytest.raises(ValueError, match='identity changed'):
         h.verifier.evaluate({'summary': 'increment lesson'}, b'changed', b'new', tmp_path, remaining_seconds=60)
     assert len(h.calls) == 2
+
+
+def test_invalid_trial_proposal_does_not_leave_half_frozen_resume_state(tmp_path):
+    h = Harness()
+    h.verifier.select_trial = lambda *args, **kwargs: []
+    first = evaluate(h, tmp_path)
+    assert first['decision'] == 'inconclusive' and first['trial_task'] is None
+    assert h.calls == []
+    h.verifier.select_trial = h.select
+    assert evaluate(h, tmp_path)['decision'] == 'accept'
+    assert len(h.selections) == 1

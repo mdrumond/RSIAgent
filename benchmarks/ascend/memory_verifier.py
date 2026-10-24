@@ -185,12 +185,13 @@ class MemoryVerifier:
 
             try:
                 if state['task'] is None:
-                    state['task'] = task if task is not None else self.select_trial(proposal, remaining_seconds=remaining())
+                    selected = task if task is not None else self.select_trial(proposal, remaining_seconds=remaining())
                     remaining()
-                    if not isinstance(state['task'], dict) or not state['task']:
+                    if not isinstance(selected, dict) or not selected:
                         raise ValueError('select exactly one nonempty transfer task')
-                    state['task'] = json.loads(canonical(state['task']))
-                    state['arm_allocation'] = min(self.arm_seconds, remaining() / 3)
+                    frozen = json.loads(canonical(selected))
+                    allocation = min(self.arm_seconds, remaining() / 3)
+                    state['task'], state['arm_allocation'] = frozen, allocation
                     state['order'] = ['control', 'treatment'] if sequence % 2 == 0 else ['treatment', 'control']
                     state['trace'].append(dict(kind='task-frozen', task=state['task'],
                         arm_seconds=state['arm_allocation'], order=state['order']))
