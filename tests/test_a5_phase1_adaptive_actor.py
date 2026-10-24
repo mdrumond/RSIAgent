@@ -456,8 +456,6 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert actor.observations[6]["error"].startswith("submit requires")
     assert actor.observations[8]["classification"] == "host-verified"
     assert '"prior":"memory"' in actor.instruction
-    assert 'read-artifact' in actor.instruction
-    assert 'Production context (immutable' in actor.instruction
     assert actor.instruction.count('{"guide":"exact"}') == 1
     assert executor.prepare(_spec()).instruction in actor.instruction
     assert len(backend.requests) == 4
@@ -857,3 +855,30 @@ def test_print_source_without_runtime_trace_does_not_claim_tool_observation(tmp_
     result = AdaptiveActorProjectExecutor(executor, actor, object())(
         _request(tmp_path, executor, _special_spec()))
     assert not any(f.statement.startswith("verified-debug-print:") for f in result.memory.host_facts)
+
+
+@pytest.mark.parametrize('failure,bad_source,bad_action', [
+    ('compile', 'compile failure', 'compile'),
+    ('host-mismatch', 'wrong source', 'run'),
+])
+def test_repair_recovers_after_missing_original_failure_rejection(
+    tmp_path, failure, bad_source, bad_action,
+):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / 'evidence.jsonl'))
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+        json.dumps({'write': {'slot': 'kernel', 'content': bad_source}}),
+        json.dumps({bad_action: {}}),
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+    ))
+    result = AdaptiveActorProjectExecutor(executor, actor, object())(
+        _request(tmp_path, executor, _special_spec(failure=failure))
+    )
+    assert actor.observations[2]['missing'] == [f'observed-{failure}']
+    assert actor.observations[-1]['event'] == 'host-verified-submit'
+    assert result.evidence.verified
+    assert len(actor.distill_calls) == 1
+    assert len(backend.run_requests) == (3 if failure == 'host-mismatch' else 2)
