@@ -1081,7 +1081,8 @@ def test_retained_goal_launches_target_controller_and_checks_runtime(tmp_path, m
     memory.write_bytes(b"seed")
     control, root = tmp_path / "control", tmp_path / "campaign"
     job = dict(historical_job, config=str(config), config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
-               project_target=1, target_goal=goal.as_dict())
+               project_target=1, target_goal=goal.as_dict(), phase2_max_seconds=7200,
+               practice_max_seconds=1800)
     pinned = ContentAddressedArtifacts(root / 'historical-reference')
     shutil.copytree(store.root, pinned.root)
     job['target_artifact_store'] = str(pinned.root)
