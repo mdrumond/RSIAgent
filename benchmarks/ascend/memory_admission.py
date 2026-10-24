@@ -1,0 +1,186 @@
+"""Background usefulness review, bounded rewriting and accepted-only publication."""
+import base64
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import json
+from pathlib import Path
+import time
+
+from optimizer.jobs import atomic, canonical
+from .project_verifier import ProjectReview
+from .subject_memory import StaleMemory, digest
+from .time_budget import AttemptTimeBudget
+
+
+def treatment_snapshot(baseline, proposal, provenance, memory_id):
+    """Replace only proposed bases; unrelated accepted memory stays identical."""
+    value = json.loads(baseline)
+    removed = {row['memory_id'] for row in proposal['base_versions']}
+    value['memories'] = [row for row in value['memories'] if row['memory_id'] not in removed]
+    if proposal['base_versions']:
+        memory_id = proposal['base_versions'][0]['memory_id']
+    value['memories'].append(dict(memory_id=memory_id, proposal=proposal, provenance=provenance))
+    return canonical(value)
+
+
+class MemoryAdmission:
+    """One verification worker; callers may keep launching waves on old memory.
+
+    Job files and evaluator directories survive restart. A completed arm is never
+    blindly rerun; the evaluator/adapter observes its original retained operation.
+    """
+    def __init__(self, root, memory, verifier, rewrite, *, max_seconds=3600,
+                 parent_remaining=None, clock=time.monotonic):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.memory, self.verifier, self.rewrite = memory, verifier, rewrite
+        self.seconds, self.parent_remaining, self.clock = max_seconds, parent_remaining, clock
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='memory-verifier')
+        self.future, self.active = None, None
+        self.delivered = set()
+        # A new process resumes inconclusive jobs with their original elapsed files.
+        for path in self.root.glob('*/job.json'):
+            job = json.loads(path.read_bytes())
+            if job['status'] in {'evaluating', 'inconclusive'}:
+                job['status'] = 'pending'
+                atomic(path, canonical(job))
+
+    def _path(self, review_id):
+        return self.root / digest(review_id) / 'job.json'
+
+    def _save(self, job):
+        path = self._path(job['review_id'])
+        path.parent.mkdir(exist_ok=True)
+        atomic(path, canonical(job))
+
+    def submit(self, review_id, proposal, provenance, request, *, remaining_seconds):
+        path = self._path(review_id)
+        if not path.exists():
+            job = dict(review_id=review_id, proposal=proposal, provenance=provenance,
+                request=request, baseline=base64.b64encode(self.memory.snapshot()).decode(),
+                status='pending', rewrites=0, revision=0, trial_task=None, evaluations=[],
+                allocation=min(self.seconds, remaining_seconds))
+            self._save(job)
+        self._start()
+
+    def _start(self):
+        if self.future is not None:
+            return
+        for path in sorted(self.root.glob('*/job.json')):
+            job = json.loads(path.read_bytes())
+            if job['status'] == 'pending':
+                self.active = job['review_id']
+                self.future = self.pool.submit(self._work, job)
+                return
+
+    def _work(self, job):
+        directory = self._path(job['review_id']).parent
+        budget = AttemptTimeBudget(directory / 'elapsed.json', job['allocation'], clock=self.clock)
+        def remaining():
+            seconds = budget.deadline - self.clock()
+            if self.parent_remaining is not None:
+                seconds = min(seconds, self.parent_remaining())
+            if seconds <= 0:
+                raise TimeoutError('memory admission elapsed allocation exhausted')
+            return seconds
+        try:
+            while True:
+                remaining()
+                job['status'] = 'evaluating'
+                self._save(job)
+                # Reconcile a concurrent accepted replacement before testing this draft.
+                if not self.memory.bases_current(job['proposal']):
+                    rewritten = self._rewrite(job, dict(reason='Accepted base version changed',
+                        instructions='Reconcile against current accepted memories; preserve useful prior content.',
+                        current_memories=self.memory.records()), remaining())
+                    if not self._apply_rewrite(job, rewritten):
+                        return
+                    job['baseline'] = base64.b64encode(self.memory.snapshot()).decode()
+                    job['trial_task'] = None
+                    self._save(job)
+                baseline = base64.b64decode(job['baseline'], validate=True)
+                treatment = treatment_snapshot(baseline, job['proposal'], job['provenance'], job['review_id'])
+                result = self.verifier.evaluate(job['proposal'], baseline, treatment,
+                    directory / f"revision-{job['revision']}", remaining_seconds=remaining(),
+                    task=job['trial_task'], sequence=job['revision'])
+                job['evaluations'].append(result)
+                job['trial_task'] = result.get('trial_task')
+                self._save(job)
+                if result['decision'] == 'inconclusive':
+                    job['status'] = 'inconclusive'
+                    self._save(job)
+                    return
+                if result['decision'] == 'accept':
+                    try:
+                        job['admission'] = self.memory.accept(job['review_id'], job['proposal'], job['provenance'])
+                    except StaleMemory:
+                        continue
+                    job['status'] = 'accepted'
+                    self._save(job)
+                    return
+                # Both reject and rewrite first receive the requested two rewrite opportunities.
+                if job['rewrites'] == 2:
+                    job['status'] = 'rejected'
+                    self._save(job)
+                    return
+                rewritten = self._rewrite(job, result, remaining())
+                if not self._apply_rewrite(job, rewritten):
+                    return
+                job['rewrites'] += 1
+                self._save(job)
+        except (TimeoutError, OSError) as error:
+            job.update(status='inconclusive', error_type=type(error).__name__)
+            self._save(job)
+        finally:
+            budget.close()
+
+    def _rewrite(self, job, feedback, seconds):
+        request = dict(job['request'])
+        refs = dict(request['artifacts'])
+        for name, arm in feedback.get('arms', {}).items():
+            if arm is not None:
+                refs.update({f'memory-trial:{name}:{role}': sha for role, sha in arm['artifacts'].items()})
+        request['artifacts'] = refs
+        result = self.rewrite(ProjectReview(**request), feedback=dict(
+            previous_proposal=job['proposal'], usefulness=feedback), max_seconds=seconds)
+        return result
+
+    def _apply_rewrite(self, job, review):
+        job.setdefault('rewrite_reviews', []).append(review)
+        if review['decision'] == 'repair':
+            job.update(status='rejected', project_repair=review)
+            self._save(job)
+            return False
+        if review['memory'] is None:
+            job.update(status='rejected')
+            self._save(job)
+            return False
+        job['proposal'] = review['memory']
+        job['revision'] += 1
+        self._save(job)
+        return True
+
+    def poll(self, *, remaining_seconds):
+        if self.future is not None and self.future.done():
+            self.future.result()
+            self.future, self.active = None, None
+        result = []
+        for path in sorted(self.root.glob('*/job.json')):
+            job = json.loads(path.read_bytes())
+            if job['status'] in {'accepted', 'rejected'} and job['review_id'] not in self.delivered:
+                result.append(dict(review_id=job['review_id'], outcome=job['status'],
+                    repair=job.get('project_repair'), provenance=job['provenance']))
+                self.delivered.add(job['review_id'])
+        self._start()
+        return result
+
+    def wait(self, *, remaining_seconds):
+        self._start()
+        if self.future is None:
+            raise TimeoutError('memory review remains inconclusive; retained work needs resuming')
+        try:
+            self.future.result(timeout=remaining_seconds)
+        except FutureTimeout:
+            raise TimeoutError('waiting for memory review exceeded campaign allocation') from None
+
+    def close(self):
+        self.pool.shutdown(wait=True)
