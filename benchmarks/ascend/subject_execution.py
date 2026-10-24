@@ -173,7 +173,16 @@ class SubjectExecutor:
             raise ValueError('subject remaining seconds must be finite and positive')
         verify_snapshot(memory_snapshot)
         started = self.clock()
-        execution = self.optimizer_factory(Path(directory), task, memory_snapshot)
+        directory = Path(directory)
+        initial_path = directory / 'subject-optimizer-initial-memory.json'
+        initial = json.loads(initial_path.read_bytes()) if initial_path.exists() else memory_snapshot
+        verify_snapshot(initial)
+        # JobStore creation is immutable, while each attempt independently pins
+        # the currently accepted learning. Reconstruct with the creation snapshot
+        # so task/config/reference compatibility checks still run in the factory.
+        execution = self.optimizer_factory(directory, task, initial)
+        if not initial_path.exists():
+            atomic(initial_path, canonical(initial))
         def bind():
             remaining = remaining_seconds - (self.clock() - started)
             if remaining <= 0:
