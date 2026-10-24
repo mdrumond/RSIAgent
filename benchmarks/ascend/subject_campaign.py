@@ -65,10 +65,11 @@ class SubjectCampaign:
             objective=objective)
         try:
             review = self.verifier.review(request, max_seconds=min(600, self._remaining()),
-                feedback=record.pop('rewrite_feedback', None))
+                feedback=record.get('rewrite_feedback'))
         finally:
             record['verifier_trace'] = self.artifacts.put_json(self.verifier.last_trace)
             self._save()
+        record.pop('rewrite_feedback', None)
         record['review'] = review
         record['review_request'] = asdict(request)
         record['review_sha256'] = self.artifacts.put_json(review)
