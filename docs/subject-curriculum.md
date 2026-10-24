@@ -45,3 +45,15 @@ accepted memory code/evidence references in their frozen snapshots. Resume
 preserves cached project execution and rejects changed subject/runtime settings.
 A3 evidence establishes shared orchestration and Ascend C behavior; it does not
 establish A5 Catlass execution behavior.
+
+The existing optimizer task backend emits Ascend C, so `kind: optimizer` is
+supported with the A3 Ascend C binding. An A5 Catlass optimizer subject is rejected
+before composition; no Catlass optimizer backend is implied. A5 qualified graph
+and graph performance subjects continue through their existing Catlass binding.
+
+Memory evaluation can use `campaign.select_trial` and `campaign.execute_trial_arm`.
+Every arm receives a fresh production Actor/session and isolated execution/cache
+workspace while retaining the configured model, runtime and physical device.
+Actor KDB retrieval follows the arm's frozen memory versions, even when the live
+accepted catalog changes. `role_complete`, `model_identity` and `runtime_identity`
+are exposed for the memory verifier composition; admission remains caller-owned.

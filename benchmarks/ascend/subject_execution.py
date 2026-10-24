@@ -64,6 +64,13 @@ def _logs(root, artifacts, admitted):
                     digest = json.loads(line)['payload'].get('sha256')
                     if digest is not None:
                         digests.add(digest)
+            else:
+                # Trace-chain and candidate IDs are not necessarily CAS objects.
+                # Only validation's explicit evidence reference admits bytes.
+                for line in data.splitlines():
+                    row = json.loads(line)
+                    if row['kind'] == 'validation':
+                        digests.add(row['payload']['evidence_sha256'])
     for digest in sorted(digests):
         artifacts.read_bytes(digest)
         result['retained:' + digest] = digest
@@ -118,6 +125,18 @@ class SubjectExecutor:
             recorded = json.loads(checkpoint.read_bytes())
             if recorded['identity'] != identity:
                 raise ValueError('subject execution request changed; use its original frozen inputs')
+            # Cached results must preserve the Actor's host-input/oracle gate.
+            # Preparing is host-only: no compilation or device operation occurs.
+            executor = getattr(self.graph_actor, 'executor', None)
+            if executor is not None:
+                prepared = executor.prepare(request.spec)
+                inputs, oracle = prepared.inputs, prepared.expected
+            else:
+                from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
+                inputs = materialize_inputs(request.spec)
+                oracle = evaluate_reference(request.spec, inputs)
+            if request.inputs != inputs or request.oracle != oracle:
+                raise ValueError('request inputs or oracle differ from rematerialized project')
             value = recorded['outcome']
             return portable(value)
         try:

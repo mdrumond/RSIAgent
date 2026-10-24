@@ -127,3 +127,93 @@ def test_real_direct_provider_role_callback_uses_private_elapsed_and_http_bounds
         models=[profile.identity.backend_model], clock=lambda: 0)
     assert bounded_completion(default_provider, profile, (), 7) == '{}'
     assert timeouts == [(7, 0)]
+
+
+def test_actor_retrieval_pins_wave_versions_after_catalog_replacement(tmp_path):
+    import time
+    database_path = tmp_path / 'knowledge.sqlite'
+    reference = tmp_path / 'reference.txt'
+    reference.write_text('Vector increment reference\n')
+    embeddings = FakeEmbeddings()
+    with KnowledgeDB(database_path, embeddings) as database:
+        database.index(tmp_path, [reference], collection='reference', language='ascend-c')
+    bindings = bound(tmp_path, kdb=database_path, embeddings=embeddings)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'run',
+        subjects=[Subject('s', 'vectors')], initial_memory=b'', compose=lambda *a, **k: bindings)
+    campaign.artifacts.put_bytes(SOURCE); campaign.artifacts.put_bytes(RESULT)
+    proposal = dict(memory(), summary='Vector increments preserve shape')
+    first = campaign.memory.accept('one', proposal, {})
+    frozen = campaign.memory.snapshot()
+    second = campaign.memory.accept('two', dict(proposal, operation='append', base_versions=[first]), {})
+    campaign.budget = SimpleNamespace(deadline=time.monotonic() + 60)
+    context = SimpleNamespace(request=SimpleNamespace(pre_wave_memory=frozen),
+                              artifacts=ContentAddressedArtifacts(tmp_path / 'actor-artifacts'))
+    result = bindings['actor'].query_knowledge({'query': 'vector increments'}, context)
+    collections = {citation.collection for citation in result.citations}
+    assert 'subject-memory-' + first['version'] in collections
+    assert 'subject-memory-' + second['version'] not in collections
+
+
+def test_project_plan_ordinal_survives_other_projects_and_rejects_plan_change(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    requests = []
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def graph(self, request, **kwargs):
+            requests.append(request)
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
+        subjects=[Subject('s', 'copies')], initial_memory=b'',
+        compose=lambda *a, **k: bound(tmp_path))
+    first = dict(project_id='first', spec=_project('first', 'gm-ub-movement'))
+    second = dict(project_id='second', spec=_project('second', 'gm-ub-movement'))
+    for item in (first, second, first):
+        campaign.execute(item, campaign.memory.snapshot(), tmp_path / item['project_id'], remaining_seconds=30)
+    assert [request.authored_ordinal for request in requests] == [1, 2, 1]
+    with pytest.raises(ValueError, match='plan changed'):
+        campaign.execute(dict(first, repairs=['different']), campaign.memory.snapshot(),
+                         tmp_path / 'first', remaining_seconds=30)
+
+
+def test_trial_arms_get_fresh_bindings_and_isolated_worker_workspaces(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    worker = tmp_path / 'worker.json'
+    worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path / 'device'), physical_device=0)))
+    composed = []
+    def compose(settings, **options):
+        composed.append((settings, options))
+        return bound(options['root'])
+    class Execution:
+        def __init__(self, *args):
+            pass
+        def graph(self, request, **kwargs):
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({'phase1_arguments': ['--worker-config', str(worker)]}, target='a3',
+        root=tmp_path / 'campaign', subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
+    item = dict(project_id='transfer', spec=_project('transfer', 'gm-ub-movement'))
+    snapshot = campaign.memory.snapshot()
+    a = campaign.execute_trial_arm(item, snapshot, tmp_path / 'a', remaining_seconds=60)
+    b = campaign.execute_trial_arm(item, snapshot, tmp_path / 'b', remaining_seconds=60)
+    replay = campaign.execute_trial_arm(item, snapshot, tmp_path / 'a', remaining_seconds=30)
+    assert len(composed) == 4
+    assert a.branch_root != b.branch_root and replay.branch_root == a.branch_root
+    workers = [json.loads((tmp_path / arm / 'worker.json').read_bytes()) for arm in ('a', 'b')]
+    assert workers[0]['workspace'] != workers[1]['workspace']
+    assert workers[0]['physical_device'] == workers[1]['physical_device'] == 0
+    assert a.pre_wave_memory == b.pre_wave_memory == snapshot
+    assert composed[-1][1]['max_seconds'] == 60  # resume keeps the admitted allocation identity
+
+
+def test_a5_catlass_optimizer_is_rejected_before_composition(tmp_path):
+    calls = []
+    with pytest.raises(ValueError, match='A5 Catlass optimizer subjects are unsupported'):
+        build_subject_campaign({}, target='a5', root=tmp_path / 'run',
+            subjects=[Subject('opt', 'optimize', task={'kind': 'optimizer', 'task': {}})],
+            initial_memory=b'', compose=lambda *a, **k: calls.append(a))
+    assert calls == []
+    assert not (tmp_path / 'run').exists()

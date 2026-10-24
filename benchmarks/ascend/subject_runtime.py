@@ -6,6 +6,7 @@ from dataclasses import asdict
 import hashlib
 import io
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -22,6 +23,7 @@ from .project_verifier import ProjectVerifierAgent
 from .subject_campaign import SubjectCampaign
 from .subject_execution import SubjectExecutor, optimizer_snapshot
 from .subjects import load_subjects
+from .subject_memory import digest as memory_digest
 
 
 def bounded_completion(provider, profile, messages, remaining_seconds):
@@ -96,6 +98,10 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds):
 
 def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                            max_seconds=7200, compose=compose_production):
+    subjects = tuple(subjects)
+    if target == 'a5' and any((getattr(subject, 'task', None) or {}).get('kind') == 'optimizer'
+                              for subject in subjects):
+        raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest())
@@ -140,18 +146,27 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         with KnowledgeDB(database_path, embeddings) as database:
             database.index(directory, [document], collection='subject-memory-' + version, language='memory')
 
-    def knowledge(payload, *, remaining_seconds):
+    def knowledge(payload, *, remaining_seconds, memory_snapshot=None):
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, validate_knowledge_hit
         started = time.monotonic()
         def check_remaining():
             if time.monotonic() - started >= remaining_seconds:
                 raise TimeoutError('subject knowledge query elapsed allowance exhausted')
-        memories = campaign.memory.search(payload['query'])
+        if memory_snapshot is None:
+            memories = campaign.memory.search(payload['query'])
+        else:
+            # An in-flight Actor sees its frozen versions even if publication
+            # switches the live catalog while the Actor is executing.
+            words = set(re.findall(r'\w+', payload['query'].casefold()))
+            memories = [dict(record, version=memory_digest(record))
+                        for record in json.loads(memory_snapshot)['memories']
+                        if words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
         for memory in memories:
             memory.setdefault('artifacts', {}).update({str(i): digest for i, digest in enumerate(
                 memory['proposal']['evidence'] + [memory['proposal']['after']['sha256']])})
             if memory['proposal']['before'] is not None:
                 memory['artifacts']['before'] = memory['proposal']['before']['sha256']
+            memory['artifacts'].update(memory['provenance'].get('request', {}).get('artifacts', {}))
         hits = []
         if reference_query is not None:
             hits.extend(reference_query(KnowledgeQuery(payload['query']), check_remaining=check_remaining))
@@ -215,7 +230,12 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, Citation
             from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
             action = KnowledgeQuery(**payload)
-            result = knowledge({'query': action.query}, remaining_seconds=campaign._remaining())
+            from .execution import _deadline
+            allowance = _deadline.get() - time.monotonic()
+            if hasattr(campaign, 'budget'):
+                allowance = min(allowance, campaign._remaining())
+            result = knowledge({'query': action.query}, remaining_seconds=allowance,
+                               memory_snapshot=context.request.pre_wave_memory)
             admitted = {}
             def retain(content):
                 digest = context.artifacts.put_bytes(content)
@@ -228,7 +248,15 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         actor.query_knowledge = actor_knowledge
 
     def execute(item, snapshot, directory, *, remaining_seconds):
-        plans[item['project_id']] = item
+        previous = plans.get(item['project_id'])
+        if previous is not None and {key: value for key, value in previous.items() if key != '_ordinal'} != item:
+            raise ValueError('retained project plan changed')
+        checkpoint = Path(directory) / 'subject-execution.json'
+        ordinal = (previous or {}).get('_ordinal')
+        if ordinal is None:
+            ordinal = (json.loads(checkpoint.read_bytes())['identity']['ordinal'] if checkpoint.exists()
+                       else max((row.get('_ordinal', 0) for row in plans.values()), default=0) + 1)
+        plans[item['project_id']] = dict(item, _ordinal=ordinal)
         atomic(plans_path, canonical(plans))
         if item.get('task', {}).get('kind') == 'optimizer':
             envelope = json.loads(snapshot)
@@ -247,7 +275,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             for digest in reachable:
                 branch_artifacts.put_bytes(store.read_bytes(digest))
         inputs = materialize_inputs(spec)
-        request = AdaptiveProjectRequest(spec, len(plans), snapshot, directory, inputs,
+        request = AdaptiveProjectRequest(spec, ordinal, snapshot, directory, inputs,
             evaluate_reference(spec, inputs), memory_root=root, remaining_seconds=remaining_seconds,
             publish_learning=False)
         contract = item.get('task', {}).get('contract')
@@ -263,7 +291,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             target_contract = None
         return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
 
-    def select_wave(context, snapshot, history, *, remaining_seconds):
+    def select_wave(context, snapshot, history, *, remaining_seconds, project_limit=64):
         deadline = time.monotonic() + remaining_seconds
         def available():
             seconds = deadline - time.monotonic()
@@ -290,8 +318,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         value = CurriculumContext(objective=objective, wave_index=len(campaign.state['waves']) + 1,
             pre_wave_memory_sha256=hashlib.sha256(snapshot).hexdigest(), pre_wave_coverage=(),
             prior_outcomes=(), curriculum_memory=tuple(json.loads(snapshot)['memories']),
-            remaining_seconds=remaining_seconds)
-        decision, _ = selector.select(value)
+            remaining_seconds=remaining_seconds, remaining_projects=project_limit)
+        decision, _ = selector.select(value, remaining_projects=project_limit)
         if not isinstance(decision, WaveDecision):
             raise ValueError('subject curriculum must author a wave before progression review')
         items = [dict(project_id=project.spec.project_id, spec=project.spec.as_dict(), repairs=[])
@@ -323,6 +351,71 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
         max_seconds=max_seconds, index_memory=index)
+    campaign.role_complete = role_complete
+    campaign.model_identity = profile.identity.as_dict()
+    campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
+
+    def select_trial(proposal, *, remaining_seconds):
+        context = dict(current_subject=dict(subject_id='memory-transfer', task=None, objective=(
+            'Author exactly ONE SMALL transfer project that could benefit from this proposed lesson. '
+            'Use different inputs/extents from its source project. Freeze ordinary host acceptance. '
+            'Do not include lesson advice, code snippets or solution strategy in the task/hypothesis. '
+            'Proposed lesson for selecting the workload only: ' + json.dumps(proposal))), repairs=[])
+        return select_wave(context, campaign.memory.snapshot(), {}, remaining_seconds=remaining_seconds,
+                           project_limit=1)[0]
+
+    def execute_trial_arm(item, snapshot, directory, *, remaining_seconds):
+        """Fresh production session and isolated compilation workspace per arm."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        selection = argparse.ArgumentParser(add_help=False)
+        selection.add_argument('--worker-config'); selection.add_argument('--config')
+        arguments = list(settings.get('phase1_arguments', []))
+        options, _ = selection.parse_known_args(arguments)
+        base = options.worker_config or (options.config if target == 'a3' else None)
+        worker = json.loads(Path(base).read_bytes()) if base else {}
+        field = 'workspace' if worker.get('execution') == 'local' else 'remote_workspace'
+        if not worker.get(field):
+            raise ValueError('trial arms require a configured execution workspace')
+        arm_id = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()
+        worker[field] = str(Path(worker[field]) / 'subject-trials' / arm_id)
+        worker.pop('physical_devices', None)
+        if campaign.runtime_identity is not None:
+            worker['physical_device'] = int(campaign.runtime_identity['device'])
+        for key in ('cache_directory', 'compile_cache_directory'):
+            if key in worker:
+                worker[key] = str(Path(worker[field]) / key)
+        path = directory / 'worker.json'
+        atomic(path, canonical(worker)); path.chmod(0o600)
+        filtered, skip = [], False
+        for argument in arguments:
+            if skip:
+                skip = False
+            elif argument == '--worker-config':
+                skip = True
+            elif not argument.startswith('--worker-config='):
+                filtered.append(argument)
+        arm_settings = dict(settings, phase1_arguments=[*filtered, '--worker-config', str(path)])
+        if optimizer_config is not None:
+            arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
+            for key in ('cache_directory', 'compile_cache_directory'):
+                if key in arm_settings['optimizer_worker_config']:
+                    arm_settings['optimizer_worker_config'][key] = str(Path(worker[field]) / key)
+        retained = directory / 'runtime' / 'subject-runtime.json'
+        allocation = json.loads(retained.read_bytes())['max_seconds'] if retained.exists() else remaining_seconds
+        child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
+            subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
+        for record in json.loads(snapshot)['memories']:
+            proposal = record['proposal']
+            digests = {proposal['after']['sha256'], *proposal['evidence'],
+                       *record['provenance'].get('request', {}).get('artifacts', {}).values()}
+            if proposal['before'] is not None:
+                digests.add(proposal['before']['sha256'])
+            for digest in digests:
+                child.artifacts.put_bytes(store.read_bytes(digest))
+        return child.execute(item, snapshot, directory / 'project', remaining_seconds=remaining_seconds)
+
+    campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
     return campaign
 
 
