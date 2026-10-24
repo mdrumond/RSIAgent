@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from optimizer.jobs import canonical, sha
+
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
@@ -189,3 +191,30 @@ def test_optimizer_memory_and_elapsed_allocation_checked_before_attempt(tmp_path
     broken['memory_entries'] = ['changed']
     with pytest.raises(ValueError, match='snapshot digest'):
         execution.optimizer(tmp_path / 'other', task, broken, attempt_id='once', remaining_seconds=60)
+
+
+def test_optimizer_reconstruction_uses_new_attempt_memory_without_recreating_job(tmp_path):
+    execution, task, backend, actor = optimizer(tmp_path)
+    initial = optimizer_snapshot([{'claim': 'old learning'}])
+    current = optimizer_snapshot([{'claim': 'repair the padded tail'}])
+    directory = tmp_path / 'task'
+    options = dict(directory=directory, task=task, remaining_seconds=60)
+    first = execution.optimizer(**options, memory_snapshot=initial, attempt_id='first')
+    assert not first.host_verified
+    reconstructed = SubjectExecutor(optimizer_factory=execution.optimizer_factory)
+    second = reconstructed.optimizer(**options, memory_snapshot=current, attempt_id='second')
+    assert second.host_verified
+    assert backend.prepares == 1
+    assert [source for source, _ in backend.evaluations] == ['bad', 'good']
+    assert actor.contexts[-1][1]['memory_summary'] == [
+        {'index': 0, 'summary': str(current['memory_entries'][0])}]
+    assert json.loads((directory / 'subject-optimizer-initial-memory.json').read_bytes()) == initial
+    events = json.loads(second.read_artifact(second.artifacts['log:optimizer-events']))
+    requests = [row['payload'] for row in events if row['kind'] == 'phase2-attempt-request']
+    assert requests[-1]['memory_snapshot']['sha256'] == sha(canonical(current))
+    assert reconstructed.optimizer(**options, memory_snapshot=current, attempt_id='second').as_dict() == second.as_dict()
+    with pytest.raises(ValueError, match='original memory'):
+        reconstructed.optimizer(**options, memory_snapshot=initial, attempt_id='second')
+    changed_task = {**task, 'rationale': 'different frozen task'}
+    with pytest.raises(ValueError, match='frozen task'):
+        reconstructed.optimizer(**{**options, 'task': changed_task}, memory_snapshot=current, attempt_id='third')
