@@ -150,3 +150,46 @@ def test_indexing_the_same_version_reuses_existing_embeddings(tmp_path):
     count = embeddings.calls
     service.index(accepted['version'], memory.records()[0])
     assert embeddings.calls == count
+
+
+@pytest.mark.parametrize('frozen', [False, True])
+def test_semantic_memory_candidate_is_selected_without_query_token_overlap(tmp_path, frozen):
+    class Semantic(FakeEmbeddings):
+        def embed(self, texts):
+            return [[1., 0.] if text == 'prismatic' or 'Stateful relocation' in text else [0., 1.]
+                    for text in texts]
+    service, memory, store, _ = setup(tmp_path, embeddings=Semantic())
+    for index in range(6):
+        memory.accept('noise-' + str(index), proposal(store, 'Distractor ' + str(index)), {})
+    selected = memory.accept('target', proposal(store, 'Stateful relocation'), {})
+    record = memory.read(selected['version'])
+    assert 'prismatic' not in json.dumps(record).casefold()
+    result = service.query({'query': 'prismatic', 'limit': 1}, remaining_seconds=60,
+        **({'snapshot': memory.snapshot(), 'branch_root': tmp_path / 'actor'} if frozen else {}))
+    assert [row['memory_id'] for row in result['memories']] == ['target']
+    assert result['hits'][0]['citation']['collection'] == 'subject-memory-' + selected['version']
+
+
+def test_reference_prefix_cannot_starve_memory_with_actor_limit_five(tmp_path):
+    from benchmarks.a5kernels.knowledge_agent import validate_knowledge_hit
+    def reference(action, *, check_remaining):
+        hits = []
+        with KnowledgeDB.open_read_only(database_path, FakeEmbeddings()) as database:
+            for index in range(6):
+                check_remaining()
+                collection = 'ref-' + str(index)
+                hits.extend(validate_knowledge_hit(database, collection, hit)
+                    for hit in database.query(collection, action.query, limit=1))
+        return hits
+    service, memory, store, database_path = setup(tmp_path, reference_query=reference)
+    with KnowledgeDB(database_path, FakeEmbeddings()) as database:
+        for index in range(6):
+            document = tmp_path / ('reference-' + str(index) + '.txt')
+            document.write_text('Vector reference topic ' + str(index))
+            database.index(tmp_path, [document], collection='ref-' + str(index), language='ascend-c')
+    accepted = memory.accept('learned', proposal(store), {})
+    result = service.actor_query({'query': 'vector', 'limit': 5}, context(tmp_path / 'actor', memory.snapshot()),
+                                 remaining_seconds=60)
+    assert len(result.citations) == 5
+    assert any(citation.collection == 'subject-memory-' + accepted['version'] for citation in result.citations)
+    assert any(citation.collection.startswith('ref-') for citation in result.citations)
