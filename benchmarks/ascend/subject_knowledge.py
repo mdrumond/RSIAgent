@@ -61,18 +61,21 @@ class SubjectKnowledge:
         def check_remaining():
             if self.clock() - started >= remaining_seconds:
                 raise TimeoutError('subject knowledge query elapsed allowance exhausted')
-        if snapshot is None:
-            frozen_records = None
-            memories = (self.memory_getter().search(action.query) if self.database_path is None else
-                        [dict(record, version=memory_digest(record)) for record in self.memory_getter().records()])
-        else:
-            words = set(re.findall(r'\w+', action.query.casefold()))
-            frozen_records = json.loads(snapshot)['memories']
-            memories = [dict(record, version=memory_digest(record)) for record in frozen_records
-                        if self.database_path is not None or words & set(re.findall(r'\w+', json.dumps(record).casefold()))]
-        for memory in memories:
-            memory.setdefault('artifacts', {}).update({str(i): digest
-                for i, digest in enumerate(sorted(memory_artifacts(memory)))})
+        frozen_records = None if snapshot is None else json.loads(snapshot)['memories']
+        records = self.memory_getter().records() if frozen_records is None else frozen_records
+        words = set(re.findall(r'\w+', action.query.casefold()))
+        memories, documents = [], {}
+        for record in records:
+            if self.database_path is None and not words & set(re.findall(r'\w+', json.dumps(record).casefold())):
+                continue
+            # Freeze the original record before adding query-only version and
+            # artifact fields. Its full document is exactly the versioned bytes.
+            version = memory_digest(record)
+            documents[version] = canonical(record)
+            memory = dict(record, version=version, artifacts=dict(record.get('artifacts', {})))
+            memory['artifacts'].update({str(i): digest
+                for i, digest in enumerate(sorted(memory_artifacts(record)))})
+            memories.append(memory)
         reference_hits, memory_hits = [], []
         if self.reference_query is not None:
             reference_hits.extend(self.reference_query(action, check_remaining=check_remaining))
@@ -104,6 +107,8 @@ class SubjectKnowledge:
                     check_remaining=check_remaining).page(limit=action.limit))
             selected = {hit.citation.collection for hit in memory_hits}
             memories = [memory for memory in memories if 'subject-memory-' + memory['version'] in selected]
+        for memory in memories:
+            memory['artifacts']['memory-document'] = self.store.put_bytes(documents[memory['version']])
         # Reference retrieval may be an adaptive opaque callback with its own
         # pinned identities. Preserve it, but never let its prefix starve memory.
         hits = [hit for pair in zip_longest(memory_hits, reference_hits) for hit in pair if hit is not None]
