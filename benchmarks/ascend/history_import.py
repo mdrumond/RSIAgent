@@ -30,16 +30,20 @@ def _binding(root):
     path = root / 'campaign-identity.json'
     if not path.exists():
         # Unknown bindings cannot lend verification to another producer.
-        return dict(unknown_producer=root.name)
+        return dict(unknown_producer=_digest(str(root.resolve()).encode()))
     identity = _read(path)
+    if not isinstance(identity, dict):
+        raise ValueError('campaign identity must be an object')
     binding = {key: identity[key] for key in
         ('target', 'arch', 'language', 'execution_profile', 'compiler_version') if key in identity}
     environment = identity.get('environment_identity', {})
+    if not isinstance(environment, dict):
+        raise ValueError('environment identity must be an object')
     binding['environment_identity'] = {key: environment[key] for key in
         ('cann_version', 'compiler_version', 'soc_version', 'torch', 'torch_npu',
          'python_version', 'driver_version', 'firmware_version') if key in environment}
     if not binding.get('target') or not binding.get('arch'):
-        binding['unknown_producer'] = root.name
+        binding['unknown_producer'] = _digest(str(root.resolve()).encode())
     return binding
 
 
@@ -189,9 +193,18 @@ def import_history(roots, store):
     for root in map(Path, roots):
         try:
             state = _read(root / 'state.json')
+            if not isinstance(state, dict):
+                raise ValueError('producer state must be an object')
+            entries = state.get('memory_bytes_base64', [])
+            if not isinstance(entries, list) or any(not isinstance(x, str) for x in entries):
+                raise ValueError('published memory must be an array of base64 strings')
             binding = _binding(root)
-            published = {canonical_bytes(json.loads(base64.b64decode(x, validate=True)))
-                         for x in state.get('memory_bytes_base64', [])}
+            published = set()
+            for entry in entries:
+                memory = json.loads(base64.b64decode(entry, validate=True))
+                if not isinstance(memory, dict):
+                    raise ValueError('published memory payload must be an object')
+                published.add(canonical_bytes(memory))
         except (OSError, ValueError) as error:
             exclusions.append(dict(producer=root.name, reason=type(error).__name__))
             continue

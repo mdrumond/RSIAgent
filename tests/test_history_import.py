@@ -207,3 +207,35 @@ def test_verification_never_resolves_another_binding(tmp_path, different):
     binding = store.read_bytes(result['failures'][0]['review_request']['artifacts']['campaign-binding'])
     assert b'do-not-import' not in binding and b'/private/' not in binding
     assert json.loads(binding)['target'] == identity['target']
+
+
+@pytest.mark.parametrize('identity', ['missing', 'target', 'arch'])
+def test_unknown_same_basename_producers_cannot_resolve_each_other(tmp_path, identity):
+    good, failed = tmp_path / 'a/run', tmp_path / 'b/run'
+    producer(good);producer(failed, terminal='interrupted')
+    for root in (good, failed):
+        path = root / 'campaign-identity.json'
+        if identity == 'missing':
+            path.unlink()
+        else:
+            value = json.loads(path.read_bytes());value.pop(identity);write(path, value)
+    store = ContentAddressedArtifacts(tmp_path / 'consumer')
+    result = import_history([good, failed], store)
+    assert len(result['memories']) == 1 and len(result['failures']) == 1
+    assert result['counts']['resolved_contracts'] == 0
+    binding = store.read_bytes(result['failures'][0]['review_request']['artifacts']['campaign-binding'])
+    assert str(tmp_path).encode() not in binding
+    assert import_history([failed], store)['failures'][0]['id'] == result['failures'][0]['id']
+
+
+@pytest.mark.parametrize('bad_state', [None, [], {'memory_bytes_base64': None},
+    {'memory_bytes_base64': [None]}, {'memory_bytes_base64': [123]},
+    {'memory_bytes_base64': base64.b64encode(b'{}').decode()},
+    {'memory_bytes_base64': [base64.b64encode(b'null').decode()]}])
+def test_malformed_state_excludes_only_its_producer(tmp_path, bad_state):
+    bad, good = tmp_path / 'bad', tmp_path / 'good'
+    producer(bad);producer(good)
+    write(bad / 'state.json', bad_state)
+    result = import_history([bad, good], ContentAddressedArtifacts(tmp_path / 'consumer'))
+    assert len(result['memories']) == 1 and result['failures'] == []
+    assert result['exclusions'] == [{'producer': 'bad', 'reason': 'ValueError'}]

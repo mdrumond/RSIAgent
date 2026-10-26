@@ -20,7 +20,9 @@ attempts. Contract identity includes sanitized target, architecture and toolchai
 omits only `project_id` from the spec: hypotheses remain significant
 because they describe distinct original repair bugs. A verified attempt removes
 that same-binding contract from recovery, even if publication was interrupted.
-Unknown bindings remain isolated to their producer. Sanitized campaign binding
+Unknown bindings remain isolated by an opaque fingerprint of the canonical
+producer location; the raw machine path is never retained. Known target/toolchain
+bindings still deduplicate after relocation. Sanitized campaign binding
 facts are retained as an artifact; provider/model settings and machine paths are
 not included. Exact copied
 attempts do not create additional recovery tasks. Unverified and interrupted
