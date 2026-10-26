@@ -69,7 +69,9 @@ class _CheckedActor:
                 raise _allocation_error('native project elapsed allocation exhausted during environment check', self._remaining)
             try:
                 result = self._wrapped(replace(request, remaining_seconds=remaining))
-            except Exception:
+            except Exception as error:
+                if self._remaining.stop_requested() and not getattr(error, 'interruption_reason', None):
+                    error.interruption_reason = 'operator-stop'
                 self._check.invalidate()
                 raise
             if _runtime_failed(result):
@@ -122,7 +124,7 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     check = NativeWaveEnvironmentCheck(bound['paths'], transports)
     cache = settings.get('environment_check_cache') or ((stop.parent if stop else Path(root)) / 'environment-check-cache')
     admission = EnvironmentAdmission(check, transports, bound['paths'].root, cache=cache,
-        dependencies={key: native.get(key) for key in ('target','arch','compiler_version','environment_identity')})
+        dependencies={key: native.get(key) for key in ('target','arch','compiler_version','environment_identity','allowed_devices')})
     def ensure_environment(*, force=False):
         if remaining() <= 0:
             raise _allocation_error('native environment allocation exhausted or campaign stopped', remaining)

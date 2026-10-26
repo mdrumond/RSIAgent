@@ -20,8 +20,9 @@ def request(tmp_path, seconds=30):
 
 def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
     calls = []
-    native = dict(target='a3-product', arch='dav-2201', execution_profile='gz-a3',
-                  transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned')
+    native = dict(target='a3_product', arch='dav-2201', execution_profile='gz-a3',
+                  transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned',
+                  compiler_version='pinned', environment_identity={'torch':'torch-v','torch_npu':'npu-v','cann_version':'runtime: cann-v','soc_version':255})
     monkeypatch.setattr(runtime, 'load_native_config', lambda *a: native)
     class Transport:
         def __init__(self, **options):
@@ -32,8 +33,8 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
             return SimpleNamespace(returncode=0, job_handle='remote:registry-target:job:health', stdout=json.dumps({
                 'queries':{kind:{'exit':0, 'text':text} for kind,text in {
                     'health':'Health Status : OK', 'ecc':'Errors : 0', 'memory':'HBM',
-                    'usages':'HBM Usage Rate(%) : 0', 'proc-mem':'No process in device', 'board':'Product : test'}.items()},
-                'compiler':'pinned', 'versions':{'torch-npu':'pinned'}, 'toolkit':'pinned'}))
+                    'usages':'HBM Usage Rate(%) : 0', 'proc-mem':'No process in device', 'board':'Chip Name : a3\nNPU Name : product'}.items()},
+                'compiler':'pinned', 'versions':{'torch':'torch-v','torch-npu':'npu-v'}, 'toolkit':'runtime: cann-v','soc_version':255,'arch':'dav-2201'}))
         def compile(self, plan, root):
             calls.append('probe-compile')
             if now is not None:
