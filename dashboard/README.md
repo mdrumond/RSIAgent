@@ -166,3 +166,10 @@ from the beginning without duplicating displayed records. Downloads include
 complete retained records at download time. Partial trailing records appear
 only after their writer finishes the line. Interrupted writers are shown as
 stopped when the campaign execution lock is no longer held.
+
+Live-log cursors report resets per stream, preserving unaffected entries when
+one writer rotates or truncates its ledger. Complete records larger than 1 MiB
+are replaced by an explicit preview-limit entry; the cursor advances so later
+messages continue to arrive, and the full record remains in the log download.
+Unfinished trailing records retain their start even when larger than the preview
+limit and are consumed only after the writer appends their newline.
