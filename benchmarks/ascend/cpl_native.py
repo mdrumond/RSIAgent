@@ -75,12 +75,17 @@ class CplNativeCandidateBackend:
         return remaining
 
     def _call(self, arguments, *, seconds):
+        completed = None
         try:
             completed = self._run((self._cpl, '--json', *arguments), text=True,
                                  capture_output=True, check=False, timeout=max(.001, seconds))
             value = json.loads(completed.stdout)
         except (subprocess.TimeoutExpired, OSError, ValueError) as error:
-            raise self._pending('CPL command outcome unavailable; inspect retained state before retry') from error
+            pending = self._pending('CPL command outcome unavailable; inspect retained state before retry')
+            if completed is not None:
+                pending.transport_diagnostic = dict(returncode=completed.returncode,
+                    stdout=completed.stdout[-8192:], stderr=completed.stderr[-8192:])
+            raise pending from error
         if not isinstance(value, dict):
             raise ProjectInfrastructureError('CPL response must be an object')
         return value
@@ -89,8 +94,18 @@ class CplNativeCandidateBackend:
         stage = key.rsplit('/', 1)[-1]
         if stage not in {'upload', 'compile', 'execute'}:
             stage = 'transport'
-        return self._timed(stage, lambda: self._operation_inner(key, arguments,
-            kind=kind, expires_at=expires_at), key=key)
+        try:
+            return self._timed(stage, lambda: self._operation_inner(key, arguments,
+                kind=kind, expires_at=expires_at), key=key)
+        except _PendingObservation as error:
+            path = self.root / key / 'operation.json'
+            diagnostic = getattr(error, 'transport_diagnostic', None)
+            if diagnostic is not None and path.exists():
+                record = json.loads(path.read_text())
+                record['observation_failure'] = diagnostic
+                _save(path, record)
+            # CLI failure is diagnostic evidence, not proof of remote termination.
+            raise
 
     def _operation_inner(self, key, arguments, *, kind, expires_at=None):
         """Never submit again after an uncertain submission or observable handle."""

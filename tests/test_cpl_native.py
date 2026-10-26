@@ -357,3 +357,23 @@ def test_cpl_stop_metadata_distinguishes_operator_stop_from_deadline(tmp_path):
     with pytest.raises(_PendingObservation) as caught:
         candidate.run_remote(('true',), key='compile')
     assert caught.value.interruption_reason == 'deadline-exhausted'
+
+
+def test_non_json_cli_failure_retains_bounded_diagnostics_without_replay(tmp_path):
+    calls = []
+    def rejected(argv, **options):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 2, '', 'x'*9000+'HTTP400 cwd validation failed')
+    candidate = backend(tmp_path, rejected)
+    with pytest.raises(_PendingObservation) as caught:
+        candidate.run_remote(('true',), key='health')
+    diagnostic = caught.value.transport_diagnostic
+    assert diagnostic['returncode']==2 and len(diagnostic['stderr'])==8192
+    assert diagnostic['stderr'].endswith('HTTP400 cwd validation failed')
+    record = json.loads((candidate.root/'health/operation.json').read_text())
+    assert record['observation_failure']==diagnostic
+    assert record['state']=='submitting' and not record.get('handle')
+    assert caught.value.interruption_reason=='transport-unresolved'
+    with pytest.raises(_PendingObservation, match='ambiguous'):
+        backend(tmp_path, rejected).run_remote(('true',), key='health')
+    assert len(calls)==1
