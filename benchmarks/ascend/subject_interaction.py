@@ -37,7 +37,7 @@ def binding(config_path, campaign_id):
     return row, Path(row['root'])
 
 
-def _project(root, project_id):
+def _project(root, project_id, request_id=None):
     state = _read(root / 'subject-campaign.json')
     active = _read(root / 'memory/active.json', {})
     published = project_id in active.get('admissions', {})
@@ -51,6 +51,8 @@ def _project(root, project_id):
     if record is None:
         item = next(item for item in pending.get('items', []) if item['project_id'] == project_id)
         record = dict(plan=item, objective=pending['subject']['objective'])
+    if record.get('superseded_by') and record.get('cancellation', {}).get('request_id') != request_id:
+        raise ValueError('project was superseded; continue ' + record['superseded_by'])
     if record.get('directory'):
         wave = None
     elif project_id in pending.get('projects', []):
@@ -71,14 +73,6 @@ def _inbox(directory, record):
     return ActorControl(directory / 'actor')
 
 
-def _running(root):
-    try:
-        with _lock(root / '.campaign.lock', wait=False):
-            return False
-    except BlockingIOError:
-        return True
-
-
 def _seconds(value):
     if type(value) not in (float, int) or not math.isfinite(value) or value <= 0:
         raise ValueError('provide a finite positive additional elapsed allowance')
@@ -92,6 +86,15 @@ def _launch(config_path, campaign_id, request):
             str(Path(config_path).resolve()), '--campaign', campaign_id, '--request', request['id']],
             cwd=Path(__file__).resolve().parents[2], stdin=subprocess.DEVNULL,
             stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _unsettled(directory, project_id, exclude):
+    for path in directory.glob('*.json'):
+        previous = _read(path)
+        replacement = previous.get('proposal', {}).get('after', {}).get('item', {}).get('project_id')
+        if (previous['id'] != exclude and project_id in {previous['project_id'], replacement}
+                and previous['status'] in {'running', 'observation-required'}):
+            return previous['id']
 
 
 def _request(config_path, campaign_id, payload, key, launcher=None):
@@ -108,6 +111,9 @@ def _request(config_path, campaign_id, payload, key, launcher=None):
     path = directory / (identifier + '.json')
     fingerprint = hashlib.sha256(canonical(payload)).hexdigest()
     with _lock(directory / '.lock'):
+        previous_work = _unsettled(directory, payload['project_id'], identifier)
+        if previous_work is not None:
+            raise ValueError('observe and settle prior manual request ' + previous_work + ' before starting more work')
         previous = _read(path)
         if previous is not None:
             if previous['fingerprint'] != fingerprint:
@@ -125,7 +131,10 @@ def _request(config_path, campaign_id, payload, key, launcher=None):
         (launcher or _launch)(config_path, campaign_id, request)
     except Exception:
         request.update(status='failed', error='manual worker could not be launched')
-        atomic(path, canonical(request))
+        with _lock(directory / '.lock'):
+            atomic(path, canonical(request))
+            if _read(root / 'manual-pause.json', {}).get('request') == identifier:
+                (root / 'manual-pause.json').unlink(missing_ok=True)
         raise
     return request
 
@@ -146,7 +155,7 @@ def submit_feedback(config_path, campaign_id, project_id, text, key,
         if existing is None:
             return dict(message=previous, request=None)
     # A completed outcome needs reopening even while another campaign actor runs.
-    live = _running(root) and 'outcome' not in record and directory.exists()
+    live = inbox.live()
     if not live:
         _seconds(additional_seconds)
         request = _request(config_path, campaign_id, dict(kind='continue', project_id=project_id,
@@ -163,7 +172,8 @@ def request_restart(config_path, campaign_id, proposal, additional_seconds, key,
     _, root = binding(config_path, campaign_id)
     if _read(root / 'curriculum-edits' / (proposal['id'] + '.json')) != proposal:
         raise ValueError('restart proposal differs from retained curriculum approval')
-    _, record, directory = _project(root, proposal['project'])
+    identifier = hashlib.sha256(key.encode()).hexdigest()[:32] if isinstance(key, str) else None
+    _, record, directory = _project(root, proposal['project'], identifier)
     value = _request(config_path, campaign_id, dict(kind='restart', project_id=proposal['project'],
         proposal=proposal, additional_seconds=additional_seconds), key, launcher)
     _inbox(directory, record).stop()
@@ -208,11 +218,16 @@ def run_request(config_path, campaign_id, identifier, *, builder=build_campaign)
             request.update(status='observation-required', error='Prior worker interrupted; observe retained operations before continuing')
             atomic(path, canonical(request))
             return request
+        previous_work = _unsettled(path.parent, request['project_id'], identifier)
+        if previous_work is not None:
+            request.update(status='observation-required', error='Prior manual request ' + previous_work + ' needs settlement')
+            atomic(path, canonical(request))
+            return request
         request.update(status='running', started=time.time(), worker_pid=os.getpid())
         atomic(path, canonical(request))
         budget, campaign = None, None
         try:
-            _, original, directory = _project(root, request['project_id'])
+            _, original, directory = _project(root, request['project_id'], identifier)
             from .time_budget import AttemptTimeBudget
             elapsed = root / 'elapsed.json'
             identity = _read(root / 'subject-runtime.json', {})
@@ -237,18 +252,32 @@ def run_request(config_path, campaign_id, identifier, *, builder=build_campaign)
                 campaign.memory_gate.close()
             if budget is not None:
                 budget.close()
-            pause = _read(root / 'manual-pause.json', {})
-            if pause.get('request') == identifier:
-                (root / 'manual-pause.json').unlink(missing_ok=True)
+            with _lock(path.parent / '.lock'):
+                pause = _read(root / 'manual-pause.json', {})
+                if pause.get('request') == identifier:
+                    (root / 'manual-pause.json').unlink(missing_ok=True)
             atomic(path, canonical(request))
         return request
 
 
 def _execute(campaign, request, original, directory, request_path):
     root, pid = campaign.root, request['project_id']
+    subject_state = campaign.scheduler.state()
+    pending = campaign.state.get('pending') or {}
+    ordinal = original.get('wave_index', 0)
+    original_wave = original.get('origin_wave_id') or (campaign.state['waves'][ordinal - 1]
+        if 0 < ordinal <= len(campaign.state['waves']) else None)
+    if request['project_id'] in pending.get('projects', []):
+        original_wave = pending['wave_id']
+    subject_id = original.get('subject_id') or subject_state['waves'].get(original_wave, {}).get('subject_id')
+    if subject_id is None and request['project_id'] in pending.get('projects', []):
+        subject_id = pending.get('subject', {}).get('subject_id')
+    repairs = list(dict.fromkeys([*original.get('repairs', []),
+        *original['plan'].get('repairs', []),
+        *(key for key, row in subject_state['repairs'].items()
+          if row['status'] == 'open' and row['project_id'] == request['project_id'])]))
     checkpoint = _read(directory / 'subject-execution.json', {})
     snapshot_id = request.get('snapshot_sha256') or checkpoint.get('identity', {}).get('memory_sha256')
-    pending = campaign.state.get('pending') or {}
     if snapshot_id is None:
         ordinal = original.get('wave_index', 0)
         wave_id = campaign.state['waves'][ordinal - 1] if 0 < ordinal <= len(campaign.state['waves']) else pending.get('wave_id')
@@ -267,9 +296,15 @@ def _execute(campaign, request, original, directory, request_path):
         existing = campaign.state['projects'].get(pid)
         if existing and existing.get('manual_request') != request['id']:
             raise ValueError('restart project ID was already used')
+        if request['project_id'] in pending.get('projects', []):
+            campaign.state['projects'][request['project_id']] = dict(original,
+                wave_index=original.get('wave_index', len(campaign.state['waves'])+1),
+                superseded_by=pid, cancellation=dict(request_id=request['id'], reason='reviewed-restart'))
         directory = root / 'manual-attempts' / request['id'] / pid
         original = dict(objective=original['objective'], plan=item,
-            wave_index=original.get('wave_index', 0), restart_of=request['project_id'])
+            wave_index=original.get('wave_index', 0), restart_of=request['project_id'],
+            subject_id=subject_id, supersedes=[request['project_id'], *original.get('supersedes', [])],
+            repairs=list(dict.fromkeys([*repairs, *item.get('repairs', [])])))
         ActorControl(directory / 'actor').send(request['id'], request['proposal']['after']['instruction'])
     else:
         # Retain the old immutable result and review before reopening its cache.
@@ -296,23 +331,34 @@ def _execute(campaign, request, original, directory, request_path):
     for job_path in (root / 'memory-reviews').glob('*/job.json'):
         job = _read(job_path)
         if job.get('provenance', {}).get('project_id') == request['project_id'] and job['status'] != 'accepted':
+            job.setdefault('original_status', job['status'])
             job.update(status='superseded', superseded_by=request['id'])
             atomic(job_path, canonical(job))
+            campaign.scheduler.supersede_review(job['review_id'], dict(request_id=request['id'],
+                project_id=request['project_id'], admission_job=str(job_path.relative_to(root))))
     directory.mkdir(parents=True, exist_ok=True)
-    atomic(directory / 'manual-execution.json', canonical(dict(attempt_id=pid+'-manual-'+request['id'])))
+    attempt_id = pid+'-manual-'+request['id']
+    if item.get('task', {}).get('kind') == 'optimizer':
+        from optimizer.jobs import JobStore
+        for manifest in (directory / 'jobs').glob('*/manifest.json'):
+            events = JobStore(manifest.parent.parent).events(manifest.parent.name)
+            completed = {row['payload']['attempt_id'] for row in events if row['kind'] == 'phase2-attempt-result'}
+            unfinished = [row['payload']['attempt_id'] for row in events
+                          if row['kind'] == 'phase2-attempt-request' and row['payload']['attempt_id'] not in completed]
+            if unfinished:
+                attempt_id = unfinished[-1]
+    atomic(directory / 'manual-execution.json', canonical(dict(attempt_id=attempt_id)))
     existing = campaign.state['projects'].get(pid, {})
     if existing.get('manual_request') != request['id']:
+        prior_project = campaign.artifacts.put_json(original)
         campaign.state['projects'][pid] = dict(original, plan=item, directory=str(directory.relative_to(root)),
-            manual_request=request['id'])
+            manual_request=request['id'], prior_project_sha256=prior_project,
+            repairs=list(dict.fromkeys([*repairs, *original.get('repairs', [])])))
         campaign.state['projects'][pid].pop('outcome', None)
         campaign.state['projects'][pid].pop('review', None)
     record = campaign.state['projects'][pid]
-    subject_state = campaign.scheduler.state()
-    ordinal = original.get('wave_index', 0)
-    old_wave_id = campaign.state['waves'][ordinal - 1] if 0 < ordinal <= len(campaign.state['waves']) else None
-    old_wave = subject_state['waves'].get(old_wave_id, {})
-    subject_id = original.get('subject_id') or pending.get('subject', {}).get('subject_id') or old_wave.get('subject_id')
     record['subject_id'] = subject_id
+    record['origin_wave_id'] = original_wave
     campaign._save()
     if 'outcome' not in record:
         request['phase'] = 'executing'
@@ -322,12 +368,14 @@ def _execute(campaign, request, original, directory, request_path):
     request['phase'] = 'reviewing'
     atomic(request_path, canonical(request))
     campaign._save()
+    _finish_linked_siblings(campaign, record, snapshot)
     if not record.get('review'):
         campaign._review(pid, record)
     # A distinct review identity preserves earlier A/B decisions and receipts.
     review_id = pid + '-manual-' + request['id']
     record['manual_review_id'] = review_id
     review = record['review']
+    _settle_manual_repairs(campaign, pid, record, review_id, request['project_id'])
     if review.get('memory') is not None and review['decision'] == 'accept':
         campaign.scheduler.register_manual_review(review_id, subject_id)
         provenance = dict(project_id=pid,
@@ -344,6 +392,72 @@ def _execute(campaign, request, original, directory, request_path):
                 time.sleep(.1)
     campaign._save()
     return dict(project_id=pid, review_id=review_id, directory=str(directory.relative_to(root)))
+
+
+def _settle_manual_repairs(campaign, pid, record, review_id, source_pid):
+    """Mirror publication's project repair decisions, including paired probes."""
+    review = record['review']
+    if review['decision'] == 'repair':
+        campaign.scheduler.add_repair(review_id, record['subject_id'], pid,
+            review['reason'], [record['review_sha256']])
+        return
+    if review['decision'] != 'accept':
+        return
+    excluded, parent = set(), source_pid
+    while parent != pid and parent not in excluded:
+        excluded.add(parent)
+        parent = campaign.state['projects'].get(parent, {}).get('restart_of')
+        if parent is None:
+            break
+    pending = campaign.state.get('pending') or {}
+    siblings = {pid: record}
+    for key, row in campaign.state['projects'].items():
+        ordinal = row.get('wave_index', 0)
+        wave = row.get('origin_wave_id') or (campaign.state['waves'][ordinal - 1]
+            if 0 < ordinal <= len(campaign.state['waves']) else None)
+        if key in pending.get('projects', []):
+            wave = pending['wave_id']
+        if key not in excluded and wave == record['origin_wave_id']:
+            siblings[key] = row
+    if pending.get('wave_id') == record['origin_wave_id']:
+        for item in pending.get('items', []):
+            if item['project_id'] not in excluded:
+                siblings.setdefault(item['project_id'], dict(repairs=item.get('repairs', [])))
+    obligations = campaign.scheduler.state()['repairs']
+    for repair_id in record.get('repairs', []):
+        if obligations.get(repair_id, {}).get('status') != 'open':
+            continue
+        linked = [row for row in siblings.values()
+                  if repair_id in row.get('repairs', row.get('plan', {}).get('repairs', []))]
+        if linked and all((row.get('review') or {}).get('decision') == 'accept' for row in linked):
+            campaign.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in linked])
+
+
+def _finish_linked_siblings(campaign, record, snapshot):
+    """Keep the ordinary paired-probe barrier before manual project review."""
+    pending = campaign.state.get('pending') or {}
+    if pending.get('wave_id') != record['origin_wave_id']:
+        return
+    linked = []
+    for item in pending.get('items', []):
+        pid = item['project_id']
+        if (pid == record['plan']['project_id'] or pid in record.get('supersedes', [])
+                or not set(item.get('repairs', [])) & set(record.get('repairs', []))):
+            continue
+        row = campaign.state['projects'].setdefault(pid, dict(plan=item,
+            objective=pending['subject']['objective'], repairs=item.get('repairs', []),
+            wave_index=len(campaign.state['waves'])+1))
+        linked.append((pid, row))
+        if 'outcome' not in row:
+            directory = campaign.root / 'waves' / pending['wave_id'] / pid
+            row['outcome'] = campaign.execute(item, snapshot, directory,
+                remaining_seconds=campaign._remaining()).as_dict()
+            campaign._save()
+    for pid, row in linked:
+        campaign._review(pid, row)
+        if row['review']['decision'] == 'repair':
+            campaign.scheduler.add_repair(pid, record['subject_id'], pid,
+                row['review']['reason'], [row['review_sha256']])
 
 
 def main():

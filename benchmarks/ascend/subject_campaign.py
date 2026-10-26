@@ -114,6 +114,9 @@ class SubjectCampaign:
         obligations = self.scheduler.state()['repairs']
         linked = {key: self.state['projects'].get(obligations.get(key, {}).get('project_id',key))
                   for key in record.get('repairs', [])}
+        for key, original in linked.items():
+            if original is record and record.get('prior_project_sha256'):
+                linked[key] = self.artifacts.read_json(record['prior_project_sha256'])
         artifacts = dict(outcome['artifacts'])
         plan = record.get('plan')
         if plan is None:
@@ -134,7 +137,8 @@ class SubjectCampaign:
         pending = self.state.get('pending') or {}
         for pid in pending.get('projects', []):
             sibling = self.state['projects'].get(pid, {})
-            if pid != project_id and set(record.get('repairs', [])) & set(sibling.get('repairs', [])):
+            if (pid != project_id and pid not in record.get('supersedes', [])
+                    and set(record.get('repairs', [])) & set(sibling.get('repairs', []))):
                 sibling_evidence[pid] = sibling['outcome']['observations']
                 artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
         objective = json.dumps(dict(subject=record['objective'], project=project, sibling_evidence=sibling_evidence, repairs={
@@ -160,7 +164,8 @@ class SubjectCampaign:
         review_ids = pending.get('review_ids')
         if review_ids is None:
             review_ids = [pid for pid in pending['projects']
-                      if self.state['projects'][pid]['review']['decision'] == 'accept'
+                      if not self.state['projects'][pid].get('superseded_by')
+                      and self.state['projects'][pid]['review']['decision'] == 'accept'
                       and not self.state['projects'][pid].get('manual_review_id')
                       and self.state['projects'][pid]['review']['memory'] is not None]
             pending['review_ids'] = review_ids
@@ -169,6 +174,8 @@ class SubjectCampaign:
         subject = pending['subject']['subject_id']
         for pid in pending['projects']:
             record = self.state['projects'][pid]
+            if record.get('superseded_by'):
+                continue
             review = record['review']
             if record.get('manual_review_id'):
                 if pid in review_ids and self.scheduler.state()['reviews'][pid]['status'] == 'pending':
@@ -203,10 +210,14 @@ class SubjectCampaign:
                     record['review_request'], remaining_seconds=self._remaining())
         linked_repairs = {}
         for pid in pending['projects']:
-            for repair_id in self.state['projects'][pid].get('repairs', []):
-                linked_repairs.setdefault(repair_id, []).append(self.state['projects'][pid])
+            record = self.state['projects'][pid]
+            record = self.state['projects'].get(record.get('superseded_by'), record)
+            for repair_id in record.get('repairs', []):
+                linked_repairs.setdefault(repair_id, []).append(record)
+        obligations = self.scheduler.state()['repairs']
         for repair_id, records in linked_repairs.items():
-            if all(row['review']['decision'] == 'accept' for row in records):
+            if (obligations[repair_id]['status'] == 'open'
+                    and all(row['review']['decision'] == 'accept' for row in records)):
                 self.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in records])
         if pending['wave_id'] not in self.state['waves']:
             self.state['waves'].append(pending['wave_id'])
@@ -222,6 +233,8 @@ class SubjectCampaign:
             record = self.state['projects'].setdefault(pid, dict(
                 objective=pending['subject']['objective'], repairs=item.get('repairs', []),
                 wave_index=len(self.state['waves'])+1, plan=json.loads(canonical(item))))
+            if record.get('superseded_by'):
+                continue
             if 'outcome' not in record:
                 directory = self.root / 'waves' / pending['wave_id'] / pid
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
@@ -231,7 +244,8 @@ class SubjectCampaign:
         for pid in pending['projects']:
             if (self.root / 'manual-pause.json').exists():
                 raise TimeoutError('manual interaction queued at campaign checkpoint')
-            self._review(pid, self.state['projects'][pid])
+            if not self.state['projects'][pid].get('superseded_by'):
+                self._review(pid, self.state['projects'][pid])
         self._publish_wave(pending)
 
     def _run(self):

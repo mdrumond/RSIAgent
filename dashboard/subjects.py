@@ -59,7 +59,7 @@ class SubjectViews:
             published = pid in active.get('admissions', {}) or review_id in active.get('admissions', {}) or pid in published_projects
             directory = root / row['directory'] if row.get('directory') else root / 'waves' / str(wave) / pid
             started = directory.is_dir() and _inside(root, directory)
-            execution = ('verified' if outcome.get('host_verified') else 'failed') if outcome else (
+            execution = 'superseded' if row.get('superseded_by') else ('verified' if outcome.get('host_verified') else 'failed') if outcome else (
                 'running' if started and running else 'stopped' if started else 'pending')
             projects.append(dict(id=pid, project_id=pid, attempt_id=_json(directory / "manual-execution.json", {}).get("attempt_id", pid), wave_id=wave,
                 subject_id=row.get('subject_id') or waves.get(wave, {}).get('subject_id', pending.get('subject', {}).get('subject_id')),
@@ -69,7 +69,7 @@ class SubjectViews:
                 memory_admission=('manually-accepted' if review_id in active.get('manual_overrides', {})
                                   else jobs.get(review_id, {}).get('status', 'not-submitted')),
                 publication='published' if published else 'unpublished', merged=published,
-                directory=row.get('directory'), restart_of=row.get('restart_of'),
+                directory=row.get('directory'), restart_of=row.get('restart_of'), superseded_by=row.get('superseded_by'),
                 plan=plan, review=review, outcome=outcome,
                 memory=review.get('memory'), source=_source(root, outcome.get('source_sha256')) or ''))
         return dict(id=key, name=config.get('name', key), target=config.get('target'),

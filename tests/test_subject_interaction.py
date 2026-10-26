@@ -90,8 +90,7 @@ def test_live_feedback_bypasses_worker_and_requires_no_new_allocation(tmp_path):
     state = json.loads((root/'subject-campaign.json').read_text())
     state['projects']['one'].pop('outcome')
     atomic(root/'subject-campaign.json', canonical(state))
-    with (root/'.campaign.lock').open('a+b') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with ActorControl(directory/'actor').lease():
         result = interaction.submit_feedback(config, 'campaign', 'one', 'redirect now', 'live',
             launcher=lambda *args: pytest.fail('live feedback must not launch'))
     assert result['request'] is None

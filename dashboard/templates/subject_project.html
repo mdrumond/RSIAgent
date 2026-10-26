@@ -9,7 +9,8 @@
 {% if admission.eligible %}<form data-force-memory="{{ url_for('force_memory', campaign_id=campaign.id, project_id=project.id) }}" data-project="{{ project.id }}" data-csrf="{{ memory_csrf }}"><label>Reason <textarea name="reason" required></textarea></label><button>Force merge</button><p data-force-status></p></form>
 {% else %}<p>Use project feedback or a reviewed restart to obtain the required evidence and project review.</p>{% endif %}</section>{% endif %}
 <script src="{{ url_for('static', filename='memory_controls.js') }}"></script>
-{% if not project.merged and actor_controls_enabled %}
+{% if project.superseded_by %}<p>This attempt was superseded by <a href="{{ url_for('subject_project_page', campaign_id=campaign.id, project_id=project.superseded_by) }}">{{ project.superseded_by }}</a>.</p>{% endif %}
+{% if not project.merged and not project.superseded_by and actor_controls_enabled %}
 <section data-actor-feedback="{{ url_for('subject_actor_feedback', campaign_id=campaign.id, project_id=project.id) }}"><h2>Redirect actor</h2>
 <form><label>Feedback or instructions<textarea name="text" required rows="4"></textarea></label>
 <label>Additional elapsed seconds for a stopped actor<input name="additional_seconds" type="number" min="1" step="1" value="1800" required></label>

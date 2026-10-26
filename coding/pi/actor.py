@@ -10,6 +10,7 @@ from benchmarks.ascend.agent_context import WorkingContext
 from .rpc import PiDeadlineError
 from .adapters import A5_SCHEMAS
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_preflight
+from benchmarks.ascend.actor_control import actor_lease
 
 
 class PiActorDriver(DirectActorDriver):
@@ -28,6 +29,7 @@ class PiActorDriver(DirectActorDriver):
         return self.session_factory(model=profile.identity.backend_model.value, schemas=A5_SCHEMAS,
             environ=self.provider.coding_environment(), deadline=self.clock() + self.max_seconds)
 
+    @actor_lease
     def __call__(self, instruction, *, profile, workspace, context, turn_parser, action_executor):
         # The legacy pilot uses a closed OpenRouter profile. It must be migrated
         # explicitly by its composition, rather than silently changing provider.

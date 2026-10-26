@@ -249,6 +249,16 @@ class SubjectScheduler:
             state['reviews'].setdefault(review_id, dict(wave_id='manual-' + review_id,
                 subject_id=subject_id, status='pending'))
 
+    def supersede_review(self, review_id, receipt):
+        """Settle abandoned admission work without replacing a prior verdict."""
+        with self._transaction() as state:
+            row = state['reviews'].get(review_id)
+            if row is not None:
+                row.setdefault('original_status', row['status'])
+                row['supersession'] = receipt
+                if row['status'] == 'pending':
+                    row['status'] = 'rejected'
+
     def add_repair(self, repair_id, subject_id, project_id, reason, evidence):
         if subject_id not in self.index:
             raise ValueError('unknown repair subject')
