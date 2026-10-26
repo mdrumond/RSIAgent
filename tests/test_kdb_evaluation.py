@@ -319,3 +319,276 @@ def test_invalid_local_time_allocations_rejected(tmp_path, field, invalid):
     with pytest.raises(ValueError):
         Pilot(None, None, '', budget, **{field: invalid})
     budget.close()
+
+
+def test_six_arm_gate_context_and_direct_memory_isolation(tmp_path):
+    contexts, observed, selected = [], [], []
+    class Gate:
+        def configure_context(self, **context):
+            contexts.append(context)
+        def query(self, request, seconds):
+            selected.append(request.query)
+            return ()
+    def complete(messages, seconds):
+        if len(messages) == 2:
+            observed.append(messages[-1]['content'])
+            if len(observed) > 1:
+                return dict(text='{"knowledge_query":{"query":"task source"}}', tokens=1)
+        return dict(text='{"answer":"source analysis","citations":[]}', tokens=1)
+    budget = Budget(tmp_path/'state.json', 'six')
+    pilot = Pilot(complete, lambda arm: Gate(), 'full direct bundle', budget, adaptive=True)
+    case = Case('six', 'writer', 'copy', 'Find code for target A3', {'secret': 'hidden answer'},
+                context={'target': 'A3'})
+    results = [pilot.run_arm(case, arm) for arm in pilot.arms]
+    assert [r['status'] for r in results] == ['complete'] * 6
+    assert [text.endswith('full direct bundle') for text in observed] == [False, False, True, False, False, False]
+    assert contexts == [dict(task=case.prompt, role='writer', context=case.context)] * 5
+    assert selected == ['task source'] * 5
+    budget.close()
+
+
+def _independent_answer(score=3):
+    return dict(text=json.dumps(dict(scores={'0': dict.fromkeys(
+        ['relevance', 'support', 'applicability', 'uncertainty', 'next_actions'], score)},
+        reasons={'0': 'Supported by source evidence'})), tokens=9)
+
+
+def test_independent_judging_keeps_valid_pairs_and_raw_failures(tmp_path):
+    clock, seen = Clock(), []
+    budget = Budget(tmp_path/'state.json', 'six', clock=clock)
+    for arm in 'ABCDEF':
+        budget.state['runs']['one:'+arm] = dict(status='complete', output='answer '+arm,
+                                                retrieved=[{'text': 'source '+arm}], checks={})
+    budget.state['runs']['one:C']['status'] = 'invalid'
+    def complete(messages, seconds):
+        seen.append(messages)
+        payload = json.loads(messages[-1]['content'])
+        assert payload['shared_memory'] == 'complete snapshot'
+        assert payload['rubric'] == {'support': 'Use actual evidence'}
+        assert list(payload['candidates']) == ['0']
+        candidate = payload['candidates']['0']
+        clock.value += 2
+        if candidate['output'] == 'answer A':
+            return dict(text='malformed JSON', tokens=2)
+        return _independent_answer(4 if candidate['output'] == 'answer F' else 3)
+    pilot = Pilot(complete, None, 'complete snapshot', budget, adaptive=True, judge_seconds=60)
+    case = Case('one', 'writer', 'copy', 'task', {'support': 'Use actual evidence'})
+    pilot.judge(case)
+    grades = budget.state['judgments']['one']['grades']
+    assert grades['A']['response']['text'] == 'malformed JSON'
+    assert grades['A']['error_type'] == 'JSONDecodeError'
+    assert grades['C']['reason'] == 'arm-incomplete'
+    assert grades['F']['status'] == 'complete'
+    assert len(seen) == 5
+    pilot.judge(case)
+    assert len(seen) == 5  # Completed and invalid individual grades are not retried.
+    report = pilot.report([case])['roles']['writer']
+    assert report['matched'] == 0
+    assert report['comparisons']['E-B'] == dict(cases=['one'], matched=1, deltas=[0], wins=0, ties=1, losses=0)
+    assert report['comparisons']['F-D']['deltas'] == [5]
+    assert report['comparisons']['D-C']['matched'] == 0
+    assert report['scores']['one'] == {'B': 15, 'D': 15, 'E': 15, 'F': 20}
+    budget.close()
+
+
+def test_independent_judge_shared_deadline_and_partial_resume(tmp_path):
+    clock = Clock()
+    budget = Budget(tmp_path/'state.json', 'six', seconds=100, clock=clock)
+    for arm in 'ABCDEF':
+        budget.state['runs']['one:'+arm] = dict(status='complete', output='answer', retrieved=[], checks={})
+    calls = []
+    def complete(messages, seconds):
+        calls.append(seconds)
+        clock.value += 4
+        return _independent_answer()
+    pilot = Pilot(complete, None, '', budget, adaptive=True, judge_seconds=10)
+    pilot.judge(Case('one', 'writer', 'copy', 'task', {}))
+    assert calls == [10, 6, 2]
+    grades = budget.state['judgments']['one']['grades']
+    assert sum(g['status'] == 'complete' for g in grades.values()) == 2
+    assert sum(g.get('error_type') == 'TimeoutError' for g in grades.values()) == 1
+    resumed = Budget(budget.path, 'six', seconds=100, clock=clock)
+    Pilot(complete, None, '', resumed, adaptive=True, judge_seconds=10).judge(Case('one', 'writer', 'copy', 'task', {}))
+    assert calls == [10, 6, 2]
+    resumed.close()
+
+
+def test_independent_judgment_resume_charges_active_interruption(tmp_path):
+    clock = Clock()
+    budget = Budget(tmp_path/'state.json', 'six', seconds=100, clock=clock)
+    for arm in 'ABCDEF':
+        budget.state['runs']['one:'+arm] = dict(status='complete', output='answer', retrieved=[], checks={})
+    budget.state['judgments']['one'] = dict(status='incomplete', elapsed=4, active_since=clock.value,
+                                          grades={'A': {'status': 'running', 'request': [{'role': 'user', 'content': 'blinded'}]}})
+    budget.checkpoint()
+    clock.value += 6
+    resumed = Budget(budget.path, 'six', seconds=100, clock=clock)
+    def forbidden(*args):
+        pytest.fail('An interrupted case cannot get a fresh judging allocation')
+    Pilot(forbidden, None, '', resumed, adaptive=True, judge_seconds=10).judge(Case('one', 'writer', 'copy', 'task', {}))
+    assert resumed.state['judgments']['one']['elapsed'] == 10
+    assert resumed.state['judgments']['one']['grades']['A']['error_type'] == 'Interrupted'
+    resumed.close()
+
+
+def test_six_arm_run_rotates_all_arms_and_preserves_fresh_workload(tmp_path):
+    events = []
+    class Recorder(Pilot):
+        def run_arm(self, case, arm):
+            events.append((case.case_id, arm))
+            return {'status': 'invalid'}
+    budget = Budget(tmp_path/'state.json', 'six')
+    cases = [Case(f'{role}-{i}', role, str(i), 'task', {})
+             for role in ('curriculum', 'writer', 'analyzer') for i in range(6)]
+    Recorder(None, None, '', budget, adaptive=True).run(cases)
+    assert len(events) == 108
+    from collections import Counter
+    starts = {role: [] for role in ('curriculum', 'writer', 'analyzer')}
+    for index in range(6):
+        group_starts = []
+        for role in starts:
+            arms = [arm for case, arm in events if case == f'{role}-{index}']
+            assert sorted(arms) == list('ABCDEF')
+            starts[role].append(arms[0])
+            group_starts.append(arms[0])
+        assert len(set(group_starts)) == 3
+    assert all(Counter(arms) == dict.fromkeys('ABCDEF', 1) for arms in starts.values())
+    resumed = Budget(budget.path, 'six')
+    Recorder(None, None, '', resumed, adaptive=True).run(cases)
+    assert len(events) == 108
+
+
+@pytest.mark.parametrize('role', ['writer', 'curriculum'])
+def test_librarian_qualifications_and_tokens_reach_consumer_and_report(tmp_path, role):
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.knowledge_agent import Citation
+    citation = Citation('reference', 'cube.cpp', 1, 2, 'a'*64)
+    excerpt = SimpleNamespace(citation=citation, text='Original target-specific excerpt', score=0.8)
+    class Gate:
+        librarian_tokens = 0
+        search_details = None
+        def query(self, request, seconds):
+            self.librarian_tokens += 7 if self.librarian_tokens == 0 else 11
+            self.search_details = dict(status='partial', gaps=['Target runtime unverified'],
+                selection_reasons=[dict(citation=citation.as_dict(), reason=request.query)])
+            return (excerpt,)
+    gate, calls = Gate(), []
+    def complete(messages, seconds):
+        calls.append(messages[:])
+        if len(calls) > 1:
+            observation = json.loads(messages[-1]['content'])
+            if role == 'curriculum':
+                observation = observation['knowledge_query']
+            assert observation['results'][0]['text'] == excerpt.text
+            assert observation['results'][0]['citation'] == citation.as_dict()
+            assert observation['search_details']['status'] == 'partial'
+            assert observation['search_details']['gaps'] == ['Target runtime unverified']
+            expected_query = 'First layout evidence' if len(calls) == 2 else 'Follow-up compatibility'
+            assert observation['search_details']['selection_reasons'] == [dict(
+                citation=citation.as_dict(), reason=expected_query)]
+        if len(calls) < 3:
+            query = 'First layout evidence' if len(calls) == 1 else 'Follow-up compatibility'
+            return dict(text=json.dumps({'knowledge_query': {'query': query}}), tokens=len(calls)+1)
+        text = ('DECISION: STALLED\n{"reason":"Need target-runtime verification"}' if role == 'curriculum'
+                else json.dumps(dict(answer='Use as a layout idea; target runtime remains unverified',
+                                     citations=[citation.as_dict()], numerical_claims=[])))
+        return dict(text=text, tokens=5)
+    context = dict(objective='Study movement', wave_index=1,
+                   pre_wave_memory_sha256='0'*64, pre_wave_coverage=[], prior_outcomes=[],
+                   phase2_feedback=({'observed_attempt': 'Prior target run unavailable'},))
+    budget = Budget(tmp_path/'state.json', 'qualifications')
+    pilot = Pilot(complete, lambda arm: gate, '', budget, adaptive=True)
+    case = Case('qualified', role, 'cube', 'Find target-compatible evidence', {}, context=context)
+    result = pilot.run_arm(case, 'F')
+    assert result['status'] == 'complete'
+    assert result['consumer_tokens'] == 10
+    assert result['librarian_tokens'] == 18
+    assert result['tokens'] == 28
+    assert [row['search_details']['selection_reasons'][0]['reason'] for row in result['queries']] == [
+        'First layout evidence', 'Follow-up compatibility']
+    assert all(row['text'] == excerpt.text for row in result['retrieved'])
+    budget.state['runs']['qualified:F'] = result
+    telemetry = pilot.report([case])['roles'][role]['telemetry']['F'][0]
+    assert {key: telemetry[key] for key in ('consumer_tokens', 'librarian_tokens', 'tokens')} == dict(
+        consumer_tokens=10, librarian_tokens=18, tokens=28)
+    budget.close()
+
+
+def test_legacy_gate_keeps_ordinary_observation_and_consumer_token_total(tmp_path):
+    seen = []
+    class Gate:
+        def query(self, request, seconds):
+            return ()
+    def complete(messages, seconds):
+        if not seen:
+            seen.append(True)
+            return dict(text='{"knowledge_query":{"query":"copy"}}', tokens=3)
+        assert json.loads(messages[-1]['content']) == []
+        return dict(text='{"answer":"No source evidence"}', tokens=4)
+    budget = Budget(tmp_path/'state.json', 'legacy')
+    result = Pilot(complete, lambda arm: Gate(), '', budget).run_arm(
+        Case('legacy', 'writer', 'copy', 'Find copy evidence', {}), 'B')
+    assert result['status'] == 'complete'
+    assert (result['consumer_tokens'], result['librarian_tokens'], result['tokens']) == (7, 0, 7)
+    assert result['queries'] == [{'query': 'copy', 'limit': 5}]
+    budget.close()
+
+
+@pytest.mark.parametrize('extra', [
+    {'knowledge_query': {'query': 'cube source'}},
+    {'read_artifact': {'collection': 'memory', 'digest': 'a'*64}},
+    {'explanation': 'Unsupported extra field'},
+])
+def test_mixed_tool_or_unknown_answer_fields_are_invalid_and_not_judged(tmp_path, extra):
+    calls = []
+    class Gate:
+        def query(self, *args):
+            pytest.fail('A mixed action must not execute a search')
+        def read_artifact(self, **kwargs):
+            pytest.fail('A mixed action must not read an artifact')
+    def complete(messages, seconds):
+        calls.append(messages[:])
+        if len(calls) > 1:
+            pytest.fail('Invalid output must not become a completed judged answer')
+        return dict(text=json.dumps(dict(answer='Claiming a source without a valid tool turn', **extra)), tokens=4)
+    budget = Budget(tmp_path/'state.json', 'mixed')
+    pilot = Pilot(complete, lambda arm: Gate(), '', budget)
+    case = Case('mixed', 'writer', 'cube', 'Find source evidence', {})
+    result = pilot.run_arm(case, 'B')
+    assert result['status'] == 'invalid'
+    assert result['checks']['error_type'] == 'ValueError'
+    assert result['queries'] == []
+    for arm in 'ABCD':
+        budget.state['runs']['mixed:'+arm] = dict(status='complete', output='answer')
+    budget.state['runs']['mixed:B'] = result
+    pilot.judge(case)
+    assert budget.state['judgments']['mixed']['reason'] == 'arm-incomplete'
+    assert len(calls) == 1
+    budget.close()
+
+
+@pytest.mark.parametrize('optional', [{}, {'citations': []}, {'citations': [], 'numerical_claims': []}])
+def test_final_answer_preserves_optional_evidence_field_compatibility(tmp_path, optional):
+    def complete(messages, seconds):
+        return dict(text=json.dumps(dict(answer='An honest analysis without source claims', **optional)), tokens=2)
+    budget = Budget(tmp_path/'state.json', 'answer')
+    result = Pilot(complete, None, '', budget).run_arm(Case('answer', 'analyzer', 'copy', 'task', {}), 'A')
+    assert result['status'] == 'complete'
+    assert result['checks']['citation_count'] == 0
+    assert result['checks']['numerical_claim_count'] == 0
+    budget.close()
+
+
+def test_four_arm_schedule_balances_starting_positions_across_roles(tmp_path):
+    from collections import Counter
+    events = []
+    class Recorder(Pilot):
+        def run_arm(self, case, arm):
+            events.append((case.case_id, arm))
+            return {'status': 'invalid'}
+    budget = Budget(tmp_path/'state.json', 'balanced-four')
+    cases = [Case(f'{role}-{i}', role, str(i), 'task', {})
+             for role in ('curriculum', 'writer', 'analyzer') for i in range(6)]
+    Recorder(None, None, '', budget).run(cases)
+    first = [next(arm for case_id, arm in events if case_id == case.case_id) for case in cases]
+    assert Counter(first) == {'A': 5, 'B': 5, 'C': 4, 'D': 4}

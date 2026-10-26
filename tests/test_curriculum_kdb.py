@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumSession
+from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumSession, CurriculumSelectionError
 from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge, _bind_campaign_identity
 from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery, ProgressiveMemoryJournal
 from benchmarks.ascend.production import NativeProductionConfig
@@ -127,3 +127,79 @@ def test_gate_failures_propagate_without_another_provider_decision(error_type):
         CurriculumAgent(complete, query_knowledge=broken_gate).select(context())
     assert observed.value is error
     assert len(calls) == 1
+
+
+def test_curriculum_passes_live_deadline_to_supporting_callback():
+    clock = SimpleNamespace(value=1000)
+    calls, allowances = [], []
+    def query(action, *, check_remaining):
+        allowances.append(check_remaining())
+        clock.value += 2
+        allowances.append(check_remaining())
+        return ()
+    def complete(messages):
+        calls.append(messages)
+        return ('{"knowledge_query":{"query":"vector"}}' if len(calls) == 1
+                else wave([project('bounded-selection')]))
+    decision, _ = CurriculumAgent(complete, query_knowledge=query, clock=lambda: clock.value).select(
+        context(remaining_seconds=10))
+    assert allowances == [10, 8]
+    assert decision.wave.projects[0].spec.project_id == 'bounded-selection'
+
+
+def test_curriculum_rejects_legacy_query_that_returns_after_deadline():
+    clock, calls = SimpleNamespace(value=1000), []
+    def query(action):
+        clock.value += 11
+        return ()
+    def complete(messages):
+        calls.append(messages)
+        return '{"knowledge_query":{"query":"vector"}}'
+    with pytest.raises(CurriculumSelectionError, match="time budget exhausted"):
+        CurriculumAgent(complete, query_knowledge=query, clock=lambda: clock.value).select(
+            context(remaining_seconds=10))
+    assert len(calls) == 1
+
+
+def test_curriculum_deadline_interrupts_production_candidate_scan(tmp_path, monkeypatch):
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    query, _ = gate(tmp_path)
+    clock, scans, calls = SimpleNamespace(value=1000), [], []
+    original = KnowledgeDB.ranked_candidates
+    def delayed_scan(self, *args, check_remaining=None, **kwargs):
+        scans.append(True)
+        assert check_remaining is not None
+        clock.value += 3
+        check_remaining()
+        return original(self, *args, check_remaining=check_remaining, **kwargs)
+    monkeypatch.setattr(KnowledgeDB, 'ranked_candidates', delayed_scan)
+    def complete(messages):
+        calls.append(messages)
+        return '{"knowledge_query":{"query":"vector"}}'
+    with pytest.raises(CurriculumSelectionError, match="time budget exhausted"):
+        CurriculumAgent(complete, query_knowledge=query, clock=lambda: clock.value).select(
+            context(remaining_seconds=2))
+    assert scans == [True]
+    assert len(calls) == 1
+
+
+def test_supported_callback_internal_type_error_is_not_retried_as_legacy():
+    error, calls = TypeError('query implementation failed'), []
+    def query(action, *, check_remaining):
+        calls.append(check_remaining())
+        raise error
+    with pytest.raises(TypeError) as observed:
+        CurriculumAgent(lambda _: '{"knowledge_query":{"query":"vector"}}', query_knowledge=query).select(context())
+    assert observed.value is error
+    assert len(calls) == 1
+
+
+def test_curriculum_late_valid_decision_keeps_public_exhaustion_contract():
+    clock = SimpleNamespace(value=1000)
+    proposal = wave([project('late-selection')])
+    def complete(messages):
+        clock.value += 11
+        return proposal
+    with pytest.raises(CurriculumSelectionError, match='time budget exhausted') as observed:
+        CurriculumAgent(complete, clock=lambda: clock.value).select(context(remaining_seconds=10))
+    assert observed.value.messages[-1] == {'role': 'assistant', 'content': proposal}

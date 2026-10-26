@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import inspect
 import math
 import time
 import re
@@ -469,6 +470,17 @@ class CurriculumAgent:
         if query_knowledge is not None and not callable(query_knowledge):
             raise TypeError("query_knowledge must be callable")
         self.query_knowledge = query_knowledge
+        self._query_accepts_remaining = False
+        if query_knowledge is not None:
+            try:
+                parameters = inspect.signature(query_knowledge).parameters.values()
+                self._query_accepts_remaining = any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    or (parameter.name == 'check_remaining' and parameter.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY))
+                    for parameter in parameters)
+            except (ValueError, TypeError):
+                pass  # Some built-in legacy callables expose no signature.
         self._complete = complete
         self.clock = clock or time.monotonic
         self.failure_feedback = None
@@ -524,6 +536,13 @@ class CurriculumAgent:
                 + history[-1]["content"]
             )
         deadline = self.clock() + context.remaining_seconds
+        def check_remaining():
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise CurriculumSelectionError(
+                    f'curriculum selection time budget exhausted: {diagnostic}',
+                    history[selection_start:])
+            return remaining
         attempt = 0
         diagnostic = "no proposal admitted"
         while self.clock() < deadline:
@@ -581,13 +600,20 @@ class CurriculumAgent:
             if action is not None:
                 # Model request errors are repairable; gate/identity failures are
                 # infrastructure failures and must stop selection unchanged.
-                results = self.query_knowledge(action)
+                check_remaining()
+                results = (self.query_knowledge(action, check_remaining=check_remaining)
+                           if self._query_accepts_remaining else self.query_knowledge(action))
+                check_remaining()
                 page = {"knowledge_query": {"available": True, "results": [
                     {"citation": item.citation.as_dict(), "text": item.text,
                      "score": item.score} for item in results
                 ]}}
+                details = getattr(results, 'search_details', None)
+                if details is not None:
+                    page["knowledge_query"]["search_details"] = details
                 history.append({"role": "user", "content": json.dumps(page, sort_keys=True)})
                 continue
+            check_remaining()
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise CurriculumSelectionError(
             f"curriculum selection time budget exhausted: {diagnostic}",
