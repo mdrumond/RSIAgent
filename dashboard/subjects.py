@@ -68,7 +68,8 @@ class SubjectViews:
                 memory=review.get('memory'), source=_source(root, outcome.get('source_sha256')) or ''))
         return dict(id=key, name=config.get('name', key), target=config.get('target'),
                     terminal=state.get('terminal'), subjects=subjects.get('subjects', []),
-                    projects=projects, pending=pending, stats=dict(projects=len(projects),
+                    projects=projects, pending=pending, project_queue=subjects.get('project_queue', []),
+                    stats=dict(projects=len(projects),
                     verified=sum(p['execution'] == 'verified' for p in projects),
                     published=sum(p['merged'] for p in projects)))
 

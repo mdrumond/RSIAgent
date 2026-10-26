@@ -58,6 +58,7 @@ class ControlManager:
     def __init__(self, config_path, database, runner=subprocess.run):
         self.config_path, self.database = Path(config_path), Path(database)
         self.runner = runner
+        self.handlers = {}
         config = _read(self.config_path, {}) or {}
         self.settings = config.get("controls", {})
         from .feedback import FeedbackView
@@ -134,6 +135,8 @@ class ControlManager:
     def _validate(self, action, payload):
         if not self.enabled:
             raise PermissionError("dashboard controls are disabled")
+        if action in self.handlers:
+            return self.handlers[action][0](payload)
         if action not in self.ACTIONS:
             raise ControlError("command is not allowlisted")
         if action in {"import-feedback", "investigate", "retry-feedback"}:
@@ -355,6 +358,12 @@ class ControlManager:
                     "schema": "ascend-dashboard-extension-intent-v1",
                     "project_target": payload["_validated_project_target"],
                     "operation_id": operation_id, "created": time.time()})
+            if action in self.handlers:
+                result = self.handlers[action][1](payload)
+                with self._db() as db:
+                    db.execute("UPDATE operations SET status='succeeded', result=?, finished=? WHERE id=?",
+                               (json.dumps(result), time.time(), operation_id))
+                return
             completed = self.runner(self._argv(action, payload), capture_output=True, text=True,
                                     check=False, shell=False)
             if completed.returncode:

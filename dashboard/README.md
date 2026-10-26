@@ -166,3 +166,14 @@ from the beginning without duplicating displayed records. Downloads include
 complete retained records at download time. Partial trailing records appear
 only after their writer finishes the line. Interrupted writers are shown as
 stopped when the campaign execution lock is no longer held.
+
+Enable curriculum assistance with `controls.enabled: true` and add server-owned
+`config` (subject runtime settings JSON) and `initial_memory` paths to each
+subject campaign entry. The retained runtime/settings fingerprints must match.
+Formatting runs asynchronously under the explicit elapsed allowance entered in
+the form. The curriculum returns an executable contract and a diff; only approval
+changes future subjects or the unreserved project queue. Reserved wave contracts
+stay frozen. Project restarts additionally require a fresh execution allowance
+and dispatch the approved prompt through the durable actor-control service.
+Role bindings are isolated from live campaign/admission workers. Existing
+operation polling, CSRF checks, and idempotency apply to previews and approvals.

@@ -1,0 +1,152 @@
+"""Curriculum-authored previews and explicit approval through retained operations."""
+import json
+import math
+from pathlib import Path
+import re
+import time
+
+from flask import abort, jsonify
+
+from .control import ControlError
+from .subject_services import bind_subject, configured_subject, subject_editor
+
+
+class CurriculumControls:
+    def __init__(self, config_path, controls, *, binder=bind_subject, restart=None):
+        self.config_path, self.controls = Path(config_path), controls
+        self.binder, self.restart = binder, restart
+        controls.handlers['curriculum-preview'] = self.validate_preview, self.preview
+        controls.handlers['curriculum-approve'] = self.validate_approval, self.approve
+
+    @property
+    def enabled(self):
+        return self.controls.enabled
+
+    def available(self, campaign_id):
+        try:
+            entry, _ = configured_subject(self.config_path, campaign_id)
+            return self.enabled and bool(entry.get('config') and entry.get('initial_memory'))
+        except (ValueError, OSError):
+            return False
+
+    @staticmethod
+    def seconds(payload, field):
+        seconds = payload.get(field)
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds <= 0:
+            raise ControlError('an explicit positive elapsed allowance is required')
+        return seconds
+
+    def entry(self, payload):
+        try:
+            entry, root = configured_subject(self.config_path, payload.get('campaign_id'))
+        except (ValueError, OSError) as error:
+            raise ControlError(str(error)) from error
+        if not self.available(entry['id']):
+            raise ControlError('configure subject runtime config and initial_memory before editing')
+        return entry, root
+
+    def proposal(self, root, identifier):
+        if not isinstance(identifier, str) or not re.fullmatch(r'[0-9a-f]{32}', identifier):
+            raise ControlError('invalid curriculum proposal ID')
+        try:
+            return json.loads((root / 'curriculum-edits' / (identifier + '.json')).read_bytes())
+        except (OSError, ValueError) as error:
+            raise ControlError('curriculum proposal is unavailable') from error
+
+    def proposals(self, campaign_id):
+        if not self.available(campaign_id):
+            return []
+        _, root = configured_subject(self.config_path, campaign_id)
+        return [json.loads(path.read_bytes()) for path in sorted(
+            (root / 'curriculum-edits').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[:20]]
+
+    @staticmethod
+    def unmerged(root, project):
+        state = json.loads((root / 'subject-campaign.json').read_bytes())
+        if project not in state['projects']:
+            raise ControlError('unknown restart project')
+        active = json.loads((root / 'memory/active.json').read_bytes())
+        if project in active.get('admissions', {}):
+            raise ControlError('project has already been merged into memory')
+
+    def validate_preview(self, payload):
+        entry, root = self.entry(payload)
+        if payload.get('confirmation') != 'curriculum-preview:' + entry['id']:
+            raise ControlError('confirmation does not match the requested preview')
+        if payload.get('kind') not in {'subjects', 'projects', 'request-project', 'restart'}:
+            raise ControlError('unknown curriculum edit')
+        if not isinstance(payload.get('instructions'), str) or not payload['instructions'].strip():
+            raise ControlError('describe the requested change')
+        self.seconds(payload, 'format_seconds')
+        if payload['kind'] == 'restart':
+            self.unmerged(root, payload.get('project_id'))
+        return 'subject:' + entry['id']
+
+    def validate_approval(self, payload):
+        entry, root = self.entry(payload)
+        if payload.get('confirmation') != 'curriculum-approve:' + str(payload.get('proposal_id')):
+            raise ControlError('confirmation does not match the requested proposal')
+        proposal = self.proposal(root, payload.get('proposal_id'))
+        if proposal['kind'] == 'restart':
+            self.unmerged(root, proposal['project'])
+            self.seconds(payload, 'additional_seconds')
+        return 'subject:' + entry['id']
+
+    def preview(self, payload):
+        started = time.monotonic()
+        allowance = self.seconds(payload, 'format_seconds')
+        with self.binder(self.config_path, payload['campaign_id'], max_seconds=allowance) as service:
+            remaining = allowance - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError('curriculum composition exhausted formatting allowance')
+            from benchmarks.ascend.subject_editing import validate_project
+            from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+            def validate(item):
+                validate_project(item)
+                if item.get('task', {}).get('kind') == 'optimizer':
+                    if service.entry['target'] == 'a5':
+                        raise ValueError('A5 optimizer projects are unsupported')
+                else:
+                    service.policy.admit(ProjectSpec.from_mapping(item['spec']))
+                return item
+            editor = subject_editor(service.root, lambda messages, **options:
+                service.complete('curriculum', messages, **options), validate_item=validate, policy=service.policy)
+            instructions = payload['instructions']
+            if payload['kind'] == 'request-project':
+                instructions = 'Add the requested project to the pending queue; preserve existing entries.\n' + instructions
+            return editor.preview('projects' if payload['kind'] == 'request-project' else payload['kind'],
+                instructions, remaining_seconds=remaining, project=payload.get('project_id'))
+
+    def approve(self, payload):
+        _, root = self.entry(payload)
+        proposal = subject_editor(root).approve(payload['proposal_id'])
+        if proposal['kind'] == 'restart':
+            self.unmerged(root, proposal['project'])
+            restart = self.restart
+            if restart is None:
+                from benchmarks.ascend.subject_interaction import request_restart
+                restart = request_restart
+            request = restart(self.config_path, payload['campaign_id'], proposal,
+                self.seconds(payload, 'additional_seconds'), 'curriculum-restart:' + proposal['id'])
+            return dict(proposal=proposal, restart=request)
+        return dict(proposal=proposal)
+
+
+def register_curriculum_controls(app, config_path, controls, csrf_token, *, binder=None, restart=None):
+    options = {} if binder is None else dict(binder=binder)
+    service = CurriculumControls(config_path, controls, restart=restart, **options)
+    app.extensions['dashboard_curriculum_controls'] = service
+
+    @app.context_processor
+    def curriculum_context():
+        return dict(curriculum_controls=service, csrf_token=csrf_token)
+
+    @app.get('/api/curriculum/<campaign_id>/proposals')
+    def curriculum_proposals(campaign_id):
+        if not service.enabled:
+            abort(403)
+        try:
+            configured_subject(config_path, campaign_id)
+            return jsonify(proposals=service.proposals(campaign_id))
+        except ValueError:
+            abort(404)

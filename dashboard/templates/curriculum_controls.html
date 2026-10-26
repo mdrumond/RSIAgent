@@ -1,0 +1,18 @@
+{% if curriculum_controls.available(campaign.id) %}
+<section class="control-panel" data-curriculum="{{ campaign.id }}"><h2>Curriculum assistance</h2>
+{% if project is not defined or not project.merged %}
+<form data-curriculum-preview>
+{% if project is defined %}<input type="hidden" name="kind" value="restart"><input type="hidden" name="project_id" value="{{ project.id }}"><p>Describe the revised prompt. The curriculum will format a fresh project contract for review.</p>
+{% else %}<label>Change <select name="kind"><option value="request-project">Request a new project</option><option value="subjects">Edit future subjects</option><option value="projects">Edit pending project queue</option></select></label>{% endif %}
+<label>Requested change <textarea name="instructions" required rows="4"></textarea></label>
+<label>Formatting allowance (seconds) <input name="format_seconds" type="number" min="1" step="1" required></label>
+<button type="submit">Review curriculum proposal</button></form>
+{% endif %}
+<p data-curriculum-status role="status"></p>
+<div data-curriculum-proposals>{% for proposal in curriculum_controls.proposals(campaign.id) %}{% if project is not defined or proposal.project == project.id %}
+<article data-curriculum-proposal="{{ proposal.id }}"><h3>{{ proposal.kind }}{% if proposal.project %} · {{ proposal.project }}{% endif %} · {{ proposal.status }}</h3><p>{{ proposal.instructions }}</p><pre>{{ proposal.diff }}</pre>
+{% if proposal.kind == 'restart' %}<h4>Reviewed actor prompt</h4><pre>{{ proposal.after.instruction }}</pre>{% endif %}
+{% if proposal.status == 'proposed' and (project is not defined or not project.merged) %}{% if proposal.kind == 'restart' %}<label>Restart allowance (seconds) <input data-restart-seconds type="number" min="1" step="1" required></label>{% endif %}<button type="button" data-curriculum-approve="{{ proposal.id }}" data-restart="{{ 'yes' if proposal.kind == 'restart' else 'no' }}">Approve{% if proposal.kind == 'restart' %} and restart{% endif %}</button>{% endif %}</article>
+{% endif %}{% endfor %}</div></section>
+<script src="{{ url_for('static', filename='curriculum_controls.js') }}"></script>
+{% endif %}
