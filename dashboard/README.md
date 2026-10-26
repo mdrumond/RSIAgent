@@ -207,6 +207,13 @@ finishes. Completed requests and uncertain executions requiring observation
 cannot be retried from that action. The editable future-work queue excludes
 projects already reserved into a wave, even if they have not started.
 
+Live-log cursors report resets per stream, preserving unaffected entries when
+one writer rotates or truncates its ledger. Complete records larger than 1 MiB
+are replaced by an explicit preview-limit entry; the cursor advances so later
+messages continue to arrive, and the full record remains in the log download.
+Unfinished trailing records retain their start even when larger than the preview
+limit and are consumed only after the writer appends their newline.
+
 ### Manual memory admission
 
 Unpublished subject projects offer **Force merge** when host verification and an
@@ -220,7 +227,10 @@ project review, original project identity, and actual review identity. Publicati
 indexes the proposal before atomically updating accepted pointers. A later
 background evaluation cannot undo the manual decision; its evidence remains
 retained, and the campaign owner reconciles scheduler status. Replaying the same
-request does not publish twice. An ineligible project displays its missing gate;
+request does not publish twice. An uncertain network outcome retains the original
+key and reason; retry reconciles that request or its known operation. Once a
+failure is definitive, the reason can be edited and a fresh request submitted.
+An ineligible project displays its missing gate;
 use actor feedback or a curriculum-reviewed restart to obtain the required
 evidence and project review. This control requires configured subject runtime
 settings and initial memory; it does not establish a successful usefulness trial.
