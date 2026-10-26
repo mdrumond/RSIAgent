@@ -138,8 +138,8 @@ class CurriculumControls:
                     raise ValueError('qualified target requires the observed composed runtime')
                 validate_project(item, runtime=runtime, policy=service.policy)
                 if task.get('kind') == 'optimizer':
-                    if service.entry['target'] == 'a5':
-                        raise ValueError('A5 optimizer projects are unsupported')
+                    if service.entry['target'] == 'a5' or service.settings.get('optimizer_worker_config') is None:
+                        raise ValueError('optimizer projects are unavailable for this campaign runtime')
                 else:
                     service.policy.admit(ProjectSpec.from_mapping(item['spec']))
                 return item
