@@ -111,16 +111,14 @@ def test_failed_treatment_cannot_be_accepted_and_weaker_logs_request_rewrite(tmp
     assert evaluate(other, tmp_path / 'unhelpful')['decision'] == 'rewrite'
 
 
-def test_transport_failure_is_inconclusive_and_resume_reenters_same_arm_only(tmp_path):
+def test_transport_failure_is_cached_and_resume_never_reenters_unknown_arm(tmp_path):
     h = Harness(failure='treatment')
     first = evaluate(h, tmp_path)
     assert first['decision'] == 'inconclusive' and h.requests == []
     assert first['arms']['control'] is not None and first['arms']['treatment'] is None
     second = evaluate(h, tmp_path, task=first['trial_task'])
-    assert second['decision'] == 'accept'
-    assert [row[0] for row in h.calls] == ['control', 'treatment', 'treatment']
-    assert h.calls[1][2] == h.calls[2][2]
-    assert h.calls[2][3] == 9  # Interrupted work does not regain its elapsed allowance.
+    assert second == first
+    assert [row[0] for row in h.calls] == ['control', 'treatment']
     assert len(h.selections) == 1
 
 
@@ -186,7 +184,8 @@ def test_invalid_trial_proposal_does_not_leave_half_frozen_resume_state(tmp_path
     assert first['decision'] == 'inconclusive' and first['trial_task'] is None
     assert h.calls == []
     h.verifier.select_trial = h.select
-    assert evaluate(h, tmp_path)['decision'] == 'accept'
+    assert evaluate(h, tmp_path) == first
+    assert evaluate(h, tmp_path / 'new-trial')['decision'] == 'accept'
     assert len(h.selections) == 1
 
 
@@ -222,7 +221,7 @@ def test_large_judge_pages_fold_context_and_preserve_observed_evidence(tmp_path)
     assert {page['sha256'] for page in pages} == set(hashes)
     assert all(len(page['text'].encode()) == 8192 and page['next_offset'] == 8192 for page in pages)
     feedback = [event['observation'] for event in agent.last_trace if event['kind'] == 'feedback']
-    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['list_artifacts'], ['decision', 'reason', 'evidence', 'instructions']]
+    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['list_artifacts'], ['decision', 'reason', 'evidence', 'instructions'], ['decision', 'reason', 'evidence', 'instructions', 'next_probe']]
 
 
 def test_parent_stop_after_completed_arm_prevents_peer_and_judge(tmp_path):
@@ -337,3 +336,34 @@ def test_large_native_arm_registries_and_proposal_stay_paged_and_readable(tmp_pa
     assert read[hidden]['text'] == store.read_bytes(hidden).decode()
     assert read[proposal_sha]['text'] == proposal_bytes[:8192].decode()
     assert read[proposal_sha]['next_offset'] == 8192
+
+
+def test_first_transport_failure_holds_peer_and_retains_partial_evidence(tmp_path):
+    h = Harness(failure='control')
+    result = evaluate(h, tmp_path)
+    assert result['decision'] == 'inconclusive'
+    assert result['validity'] == {'control': False}
+    assert result['arms'] == {'control': None}
+    assert [row[0] for row in h.calls] == ['control'] and not h.requests
+    assert not (tmp_path / 'treatment').exists()
+    assert ContentAddressedArtifacts(tmp_path / 'artifacts').read_bytes(result['artifacts']['proposal'])
+    assert evaluate(h, tmp_path) == result and len(h.calls) == 1
+
+
+def test_abrupt_first_callback_stop_survives_resume_without_peer_dispatch(tmp_path):
+    h = Harness()
+    execute = h.verifier.execute_arm
+    def interrupted(*args, **kwargs):
+        execute(*args, **kwargs)
+        raise SystemExit('process stopped after external operation could have started')
+    h.verifier.execute_arm = interrupted
+    with pytest.raises(SystemExit):
+        evaluate(h, tmp_path)
+    saved = json.loads((tmp_path / 'evaluation.json').read_text())
+    assert saved['arms']['control']['error_type'] == 'InterruptedArm'
+    assert 'decision' not in saved
+    h.verifier.execute_arm = lambda *a, **kw: pytest.fail('unsettled comparison dispatched work')
+    result = evaluate(h, tmp_path)
+    assert result['decision'] == 'inconclusive' and result['validity'] == {'control': False}
+    assert result['arms'] == {'control': None}
+    assert len(h.calls) == 1 and not h.requests and not (tmp_path / 'treatment').exists()

@@ -3,9 +3,9 @@
 Execution callbacks must use fresh Actors, disable learning publication, and
 observe retained external operations when re-entering the same arm directory.
 The evaluator never admits memories or controls rewrite counts.
-Completed invalid/late outcomes remain inconclusive on resume and are never
-executed again. Missing outcomes may recover only through the same arm's
-retained operation; a new completed trial requires an explicitly new directory.
+Completed judgments, including inconclusive, are immutable on resume. An arm
+whose callback was interrupted is held; retrying requires a fresh directory
+and external certification that its original operations have settled.
 """
 from contextlib import contextmanager
 import fcntl
@@ -58,16 +58,27 @@ def _proposal_preview(proposal):
     return result
 
 
+def _task_contract(task):
+    """IDs and narrative alone do not make a fresh comparison workload."""
+    if isinstance(task, dict):
+        return {key: _task_contract(value) for key, value in task.items()
+                if key not in {'project_id', 'hypothesis', 'repairs'}}
+    if isinstance(task, list):
+        return [_task_contract(value) for value in task]
+    return task
+
+
 class MemoryVerifierAgent:
     """The judge can inspect actual logs; a numeric tie does not force rejection."""
     def __init__(self, complete, *, clock=time.monotonic):
         self.complete, self.clock, self.last_trace = complete, clock, []
 
-    def review(self, proposal, arms, read_artifact, *, max_seconds, check_remaining=None):
+    def review(self, proposal, arms, read_artifact, *, max_seconds, check_remaining=None, history=()):
         deadline = self.clock() + _seconds(max_seconds)
         self.last_trace = []
         proposal_bytes = canonical(proposal)
         proposal_sha = _hash(proposal_bytes)
+        local_bytes = {proposal_sha: proposal_bytes}
         registry = {'proposal': proposal_sha}
         known, required = {proposal_sha}, set()
         arm_context = {}
@@ -82,6 +93,19 @@ class MemoryVerifierAgent:
                 observations={key: _preview(value) for key, value in arm.observations.items() if key in
                     {'classification', 'summary', 'action_counts', 'metrics', 'speedup', 'elapsed_seconds',
                      'tokens', 'iterations', 'acceptance_score', 'compile_count', 'run_count'}})
+        for index, prior in enumerate(history):
+            prior_bytes = canonical(prior)
+            prior_sha = _hash(prior_bytes)
+            local_bytes[prior_sha] = prior_bytes
+            registry[f'history:{index}:evaluation'] = prior_sha
+            required.add(prior_sha)
+            for role, digest in prior.get('artifacts', {}).items():
+                if role.startswith('history:'):
+                    continue
+                registry[f'history:{index}:{role}'] = digest
+                if any(word in role.lower() for word in ('log', 'result', 'execution')):
+                    required.add(digest)
+        known.update(registry.values())
         read = set()
         messages = [{'role': 'system', 'content': (
             'You are an independent memory usefulness verifier. Inspect matched transfer '
@@ -110,6 +134,25 @@ class MemoryVerifierAgent:
             'A rewrite requires concrete instructions; other decisions have null instructions.')},
             {'role': 'user', 'content': json.dumps(dict(proposal=_proposal_preview(proposal),
                 proposal_sha256=proposal_sha, artifact_count=len(registry), arms=arm_context), sort_keys=True)}]
+        messages[0]['content'] += (
+            ' Retain unfavorable prior trials in your cumulative assessment. History includes prior '
+            'candidate revisions; distinguish their proposal hashes from the current candidate. '
+            'Invalid historical pairs do not establish benefit or a memory quality failure. '
+            'Host-passing arms do not establish harmlessness or preclude rejection. If a VALID pair '
+            'remains inconclusive after inspecting its evidence and prior results/logs, you may request '
+            'a discriminating additional experiment by adding exactly '
+            '"next_probe":{"question":"specific unresolved uncertainty and needed contrast"} '
+            'to the inconclusive decision. Do not include code, an algorithm or implementation advice '
+            'in that question; a separate curriculum selector will author the neutral host contract. '
+            'A different project ID alone is not a new workload. Otherwise omit next_probe. '
+            'No fixed number of probes is required; use existing evidence before requesting more.')
+        context = json.loads(messages[1]['content'])
+        context.update(history_count=len(history), history=[dict(index=i,
+            evaluation_sha256=_hash(canonical(prior)), decision=prior.get('decision'),
+            reason=_preview(prior.get('reason', '')), validity=prior.get('validity'),
+            evaluation_id=prior.get('evaluation_id'))
+            for i, prior in list(enumerate(history))[-8:]])
+        messages[1]['content'] = json.dumps(context, sort_keys=True)
 
         def remaining():
             available = deadline - self.clock()
@@ -145,7 +188,7 @@ class MemoryVerifierAgent:
                     digest = request['sha256']
                     if digest not in known:
                         raise ValueError('artifact is not retained by the matched trial')
-                    data = proposal_bytes if digest == proposal_sha else read_artifact(digest, remaining_seconds=remaining())
+                    data = local_bytes[digest] if digest in local_bytes else read_artifact(digest, remaining_seconds=remaining())
                     if not isinstance(data, bytes) or _hash(data) != digest:
                         raise ValueError('artifact bytes do not match identity')
                     offset, limit = request.get('offset', 0), request.get('limit', 8192)
@@ -160,7 +203,8 @@ class MemoryVerifierAgent:
                         next_offset=offset + limit if offset + limit < len(data) else None)
                     self.last_trace.append(dict(kind='read', request=request, observation=observation))
                 else:
-                    if set(value) != {'decision', 'reason', 'evidence', 'instructions'} or value['decision'] not in {'accept', 'rewrite', 'reject', 'inconclusive'}:
+                    keys = {'decision', 'reason', 'evidence', 'instructions'}
+                    if set(value) not in (keys, keys | {'next_probe'}) or value['decision'] not in {'accept', 'rewrite', 'reject', 'inconclusive'}:
                         raise ValueError('invalid memory judgment')
                     if not isinstance(value['reason'], str) or not value['reason'].strip():
                         raise ValueError('judgment requires an evidence-based reason')
@@ -168,7 +212,7 @@ class MemoryVerifierAgent:
                     if not isinstance(evidence, list) or any(item not in read for item in evidence):
                         raise ValueError('judgment cites evidence not actually read')
                     if required - read:
-                        raise ValueError('inspect both arms result/log artifacts before any terminal judgment')
+                        raise ValueError('inspect missing required current and historical evidence before judgment')
                     if value['decision'] != 'inconclusive' and not evidence:
                         raise ValueError('substantive judgment requires actually read evidence references')
                     if value['decision'] == 'accept' and not arms['treatment'].host_verified:
@@ -178,14 +222,30 @@ class MemoryVerifierAgent:
                             raise ValueError('rewrite requires concrete instructions')
                     elif value['instructions'] is not None:
                         raise ValueError('only rewrites carry instructions')
+                    if 'next_probe' in value:
+                        probe = value['next_probe']
+                        if (value['decision'] != 'inconclusive' or not isinstance(probe, dict)
+                                or set(probe) != {'question'} or not isinstance(probe['question'], str)
+                                or not probe['question'].strip() or len(probe['question']) > 2048):
+                            raise ValueError('next_probe requires an inconclusive decision and one concrete question')
                     remaining()
                     self.last_trace.append(dict(kind='decision', value=value))
                     return value
                 remaining()
             except (ValueError, KeyError, TypeError) as error:
                 observation = dict(error=str(error), expected_top_level=[['read_artifact'], ['list_artifacts'],
-                    ['decision', 'reason', 'evidence', 'instructions']],
+                    ['decision', 'reason', 'evidence', 'instructions'],
+                    ['decision', 'reason', 'evidence', 'instructions', 'next_probe']],
                     correction='Return only one exact key set; remove API metadata and unknown keys.')
+                missing = required - read
+                if missing:
+                    observation.update(missing_required_count=len(missing),
+                        missing_required=[dict(sha256=sha,
+                            roles=[role[:160] for role, digest in sorted(registry.items()) if digest == sha][:4])
+                            for sha in sorted(missing)[:16]],
+                        correction='Read the listed missing hashes. Current and historical result/log evidence is required; preserve your observations already read.')
+                    if any(role.startswith('history:') and sha in missing for role, sha in registry.items()):
+                        observation['discovery'] = dict(list_artifacts=dict(prefix='history:', offset=0, limit=20))
                 self.last_trace.append(dict(kind='feedback', observation=observation))
             messages.append(dict(role='user', content=json.dumps(observation, sort_keys=True)))
 
@@ -207,7 +267,8 @@ class MemoryVerifier:
             yield
 
     def evaluate(self, proposal, baseline_bytes, treatment_bytes, directory, *,
-                 remaining_seconds, task=None, sequence=0, check_remaining=None):
+                 remaining_seconds, task=None, sequence=0, check_remaining=None,
+                 history=(), probe_request=None, prior_task=None, read_history_artifact=None):
         parent_deadline = self.clock() + _seconds(remaining_seconds)
         if not isinstance(baseline_bytes, bytes) or not isinstance(treatment_bytes, bytes):
             raise TypeError('paired memories must be immutable bytes')
@@ -219,19 +280,34 @@ class MemoryVerifier:
             treatment_sha256=_hash(treatment_bytes), model=self.model, runtime=self.runtime,
             max_seconds=self.seconds, arm_seconds=self.arm_seconds, sequence=sequence)
         identity = json.loads(canonical(identity))
+        if history or probe_request is not None:
+            identity.update(history_sha256=[_hash(canonical(row)) for row in history],
+                            probe_request=probe_request, prior_task=prior_task)
         path = directory / 'evaluation.json'
         with self._lock(directory):
             state = json.loads(path.read_bytes()) if path.exists() else dict(
                 identity=identity, allocation=min(self.seconds, remaining_seconds), arms={}, trace=[], task=None)
             if state['identity'] != identity or task is not None and state['task'] is not None and state['task'] != task:
                 raise ValueError('matched trial identity changed')
-            if state.get('decision', {}).get('decision') in {'accept', 'rewrite', 'reject'}:
+            if state.get('decision') is not None:
                 self.last_trace = state['trace']
                 return state['decision']
             # Persist allocation/identity before any budget interval or callback.
             atomic(path, canonical(state))
             store = ContentAddressedArtifacts(directory / 'artifacts')
             store.put_bytes(canonical(proposal))
+            history_refs = {}
+            for index, prior in enumerate(history):
+                history_refs[f'history:{index}:evaluation'] = store.put_bytes(canonical(prior))
+                refs = {role: digest for role, digest in prior.get('artifacts', {}).items()
+                        if not role.startswith('history:')}
+                history_refs.update({f'history:{index}:{role}': digest for role, digest in refs.items()})
+                for digest in set(refs.values()):
+                    if read_history_artifact is not None:
+                        if store.put_bytes(read_history_artifact(digest)) != digest:
+                            raise ValueError('prior trial artifact identity changed')
+                    else:
+                        store.read_bytes(digest)
             for role, data in (('control', baseline_bytes), ('treatment', treatment_bytes)):
                 store.put_bytes(data)
             budget = AttemptTimeBudget(directory / 'elapsed.json', state['allocation'],
@@ -253,11 +329,16 @@ class MemoryVerifier:
 
             try:
                 if state['task'] is None:
-                    selected = task if task is not None else self.select_trial(proposal, remaining_seconds=remaining())
+                    options = dict(remaining_seconds=remaining())
+                    if probe_request is not None:
+                        options.update(probe_request=probe_request, prior_task=prior_task, history=history)
+                    selected = task if task is not None else self.select_trial(proposal, **options)
                     remaining()
                     if not isinstance(selected, dict) or not selected:
                         raise ValueError('select exactly one nonempty transfer task')
                     frozen = json.loads(canonical(selected))
+                    if probe_request is not None and any(_task_contract(frozen) == _task_contract(row.get('trial_task')) for row in history):
+                        raise ValueError('follow-up selector repeated a prior workload contract')
                     allocation = min(self.arm_seconds, remaining() / 3)
                     state['task'], state['arm_allocation'] = frozen, allocation
                     state['order'] = ['control', 'treatment'] if sequence % 2 == 0 else ['treatment', 'control']
@@ -265,7 +346,12 @@ class MemoryVerifier:
                         arm_seconds=state['arm_allocation'], order=state['order']))
                     save()
                 for name in state['order']:
-                    if state['arms'].get(name, {}).get('outcome') is not None:
+                    # An invalid/interrupted arm may still own external work.
+                    # Hold the entire pair, including its unstarted peer.
+                    if any(not row.get('valid') or row.get('outcome') is None
+                           for row in state['arms'].values()):
+                        break
+                    if name in state['arms']:
                         continue
                     arm_dir = directory / name
                     arm_dir.mkdir(exist_ok=True)
@@ -278,6 +364,9 @@ class MemoryVerifier:
                         state['trace'].append(dict(kind='arm-started', arm=name,
                             memory_sha256=_hash(treatment_bytes if name == 'treatment' else baseline_bytes),
                             remaining_seconds=allowance))
+                        # An interrupted callback may already own external work.
+                        # Resume must hold, not dispatch it again without settlement.
+                        state['arms'][name] = dict(outcome=None, valid=False, error_type='InterruptedArm')
                         save()
                         outcome = self.execute_arm(json.loads(canonical(state['task'])), treatment_bytes if name == 'treatment' else baseline_bytes,
                                                    arm_dir, remaining_seconds=allowance)
@@ -306,6 +395,8 @@ class MemoryVerifier:
                     # Preserve completed evidence before honoring a parent stop;
                     # never start its peer or a judge after cancellation.
                     remaining()
+                    if not state['arms'][name]['valid']:
+                        break
                 validity = {key: value.get('valid', False) for key, value in state['arms'].items()}
                 if set(validity) != {'control', 'treatment'} or not all(validity.values()):
                     decision = _inconclusive('Incomplete, late or infrastructure-failed arms cannot establish memory benefit.')
@@ -316,7 +407,7 @@ class MemoryVerifier:
                     try:
                         decision = self.judge.review(proposal, arms,
                             lambda digest, **kw: store.read_bytes(digest), max_seconds=remaining(),
-                            check_remaining=remaining)
+                            check_remaining=remaining, history=history)
                     finally:
                         state['trace'].extend(self.judge.last_trace)
                 remaining()
@@ -325,6 +416,7 @@ class MemoryVerifier:
                     artifacts={name + ':' + role: digest for name, row in state['arms'].items()
                                for role, digest in (row['outcome'] or {}).get('artifacts', {}).items()})
                 decision['artifacts']['proposal'] = identity['proposal_sha256']
+                decision['artifacts'].update(history_refs)
                 state['decision'] = decision
                 save()
                 return decision
@@ -337,6 +429,7 @@ class MemoryVerifier:
                                 artifacts={name + ':' + role: digest for name, row in state['arms'].items()
                                            for role, digest in (row['outcome'] or {}).get('artifacts', {}).items()})
                 decision['artifacts']['proposal'] = identity['proposal_sha256']
+                decision['artifacts'].update(history_refs)
                 state['decision'] = decision
                 save()
                 return decision

@@ -443,3 +443,31 @@ def test_transfer_selection_bounds_rich_proposal_with_readable_exact_identity(tm
     assert lesson['applicability'] == proposed['applicability']
     assert campaign.artifacts.read_bytes(lesson['proposal_sha256']) == canonical(proposed)
     assert lesson['source_examples']['after']['sha256'] == proposed['after']['sha256']
+
+
+def test_followup_selector_reads_retained_history_and_authors_neutral_contract(tmp_path):
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
+    from test_a5_phase1_adaptive import _project, _wave
+    profile=direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value=='deepseek-flash'))
+    observed=[]
+    def transport(**options):
+        messages=options['request']['messages'];context=selection_context(messages)
+        details=json.JSONDecoder().raw_decode(context['objective'].split('different workload contract: ',1)[1])[0]
+        reads=[json.loads(m['content'])for m in messages[2:]if m['role']=='user'and m['content'].startswith('{')]
+        if not reads:
+            return DirectCompletion(json.dumps({'read_artifact':{'sha256':details['history_sha256']}}),1)
+        retained=json.loads(reads[0]['text']);observed.append(retained)
+        if len(reads)==1:
+            return DirectCompletion(json.dumps({'read_artifact':{'sha256':retained[0]['artifacts']['log:actor']}}),1)
+        assert reads[-1]['text']=='earlier unfavorable Actor evidence'
+        return DirectCompletion(_wave(json.dumps(context),[_project('fresh-transfer','gm-ub-movement')]),1)
+    provider=DirectCompletionProvider({profile.identity.credential_env:'fixture-only'},
+        models=[profile.identity.backend_model],transport=transport)
+    binding=bound(tmp_path);binding.update(provider=provider,profile=profile)
+    campaign=build_subject_campaign({},target='a3',root=tmp_path/'run',subjects=[Subject('s','copies')],
+        initial_memory=b'',compose=lambda *a,**k:binding)
+    log=campaign.artifacts.put_bytes(b'earlier unfavorable Actor evidence')
+    history=[dict(decision='inconclusive',reason='tail untested',trial_task={'inputs':[32]},artifacts={'log:actor':log})]
+    item=campaign.select_trial(memory(),remaining_seconds=60,
+        probe_request={'question':'Does an odd extent change the evidence?'},prior_task={'inputs':[32]},history=history)
+    assert item['project_id']=='fresh-transfer'and observed[-1]==history

@@ -191,9 +191,11 @@ def test_reopen_worker_preserves_elapsed_allocation(tmp_path):
     class Timed(Evaluation):
         def evaluate(self,*a,**kw):
             now[0]+=3
+            if now[0]==3:
+                raise TimeoutError('paused before a judgment was completed')
             return super().evaluate(*a,**kw)
     memory=SubjectMemory(tmp_path/'memory',b'')
-    gate=MemoryAdmission(tmp_path/'gate',memory,Timed(['inconclusive','accept']),None,clock=lambda:now[0])
+    gate=MemoryAdmission(tmp_path/'gate',memory,Timed(['accept']),None,clock=lambda:now[0])
     try:
         gate.submit('p',draft(),{},request(),remaining_seconds=100)
         gate.wait(remaining_seconds=5);gate.poll(remaining_seconds=5);gate.close()
