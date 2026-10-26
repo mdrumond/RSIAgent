@@ -1,4 +1,5 @@
 import json
+import hashlib
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +32,12 @@ def real_builder(root, scheduler, artifacts, *, decision='accept', reviewed=None
             if reviewed is not None:
                 reviewed(request)
             return dict(decision=decision, reason='observed result', evidence=['a'*64], memory=None)
+        def complete(*args, **kwargs):
+            action = 'advance' if scheduler.context()['current_subject'] is not None else 'complete'
+            return json.dumps(dict(action=action, reason='settled', evidence=['retained']))
         return SubjectCampaign(root, scheduler.subjects, b'', select_wave=None,
             execute=execution or execute, verifier=SimpleNamespace(review=review, last_trace=[]),
-            complete=lambda *args, **kwargs: json.dumps(dict(action='complete', reason='settled', evidence=['retained'])))
+            complete=complete)
     return build
 
 
@@ -198,3 +202,75 @@ def test_successful_probe_keeps_repair_open_until_linked_control_accepts(tmp_pat
     assert interaction.run_request(config, 'campaign', first['id'],
         builder=real_builder(root, scheduler, artifacts))['status'] == 'succeeded'
     assert scheduler.state()['repairs']['paired']['status'] == 'open'
+
+
+def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repairs(tmp_path):
+    config, root, _, scheduler, artifacts = setup(tmp_path)
+    snapshot = scheduler.state()['waves']['wave-1']['memory_snapshot_sha256']
+    scheduler.start_wave('wave-2', snapshot)
+    scheduler.complete_wave('wave-2')
+    scheduler.start_wave('reserved', snapshot)
+    scheduler.add_repair('obligation', 'study', 'failed-origin', 'repair failure', ['a'*64])
+    item = {'project_id': 'one', 'repairs': ['obligation'], 'spec': {'project_id': 'one'}}
+    state = json.loads((root/'subject-campaign.json').read_bytes())
+    state['projects'] = {'failed-origin': dict(objective='original failure', wave_index=1,
+        outcome={'host_verified': False, 'artifacts': {}, 'observations': {}},
+        review={'decision': 'repair', 'reason': 'old failure'})}
+    state['waves'] = ['wave-1', 'wave-2']
+    state['pending'] = dict(wave_id='reserved', subject={'subject_id': 'study', 'objective': 'Study'},
+        memory_sha256=snapshot, projects=['one'], items=[item])
+    atomic(root/'subject-campaign.json', canonical(state))
+    proposal = dict(id='f'*32, kind='restart', status='approved', project='one', after=dict(
+        item={'project_id': 'replacement', 'repairs': ['obligation'], 'spec': {'project_id': 'replacement'}},
+        instruction='reviewed repair'))
+    (root/'curriculum-edits').mkdir()
+    atomic(root/'curriculum-edits'/(proposal['id']+'.json'), canonical(proposal))
+    operation = interaction.request_restart(config, 'campaign', proposal, 15, 'reserved-restart', launcher=lambda *args: None)
+    executed = []
+    def execute(plan, frozen, directory, **options):
+        executed.append(plan['project_id'])
+        assert plan['project_id'] != 'one'
+        source = artifacts.put_bytes(b'repaired source')
+        return SubjectOutcome(True, source, {'source': source}, {}, artifacts.root)
+    builder = real_builder(root, scheduler, artifacts, execution=execute)
+    result = interaction.run_request(config, 'campaign', operation['id'], builder=builder)
+    assert result['status'] == 'succeeded'
+    state = json.loads((root/'subject-campaign.json').read_bytes())
+    assert state['projects']['one']['superseded_by'] == 'replacement'
+    assert 'outcome' not in state['projects']['one']
+    assert state['pending']['items'] == [item]
+    assert state['projects']['replacement']['subject_id'] == 'study'
+    assert scheduler.state()['repairs']['obligation']['status'] == 'resolved'
+    assert builder().run()['terminal'] == 'COMPLETE'
+    assert executed == ['replacement']
+
+
+def test_default_curriculum_status_reports_orphaned_actor_worker(tmp_path, monkeypatch):
+    from dashboard.app import create_app
+    config, root, *_ = setup(tmp_path)
+    identifier = 'd'*32
+    (root/'curriculum-edits').mkdir()
+    atomic(root/'curriculum-edits'/(identifier+'.json'), canonical(dict(id=identifier, kind='restart', status='approved')))
+    request_id = hashlib.sha256(('curriculum-restart:'+identifier).encode()).hexdigest()[:32]
+    (root/'dashboard-requests').mkdir()
+    path = root/'dashboard-requests'/(request_id+'.json')
+    atomic(path, canonical(dict(id=request_id, status='running', project_id='one', additional_seconds=15)))
+    monkeypatch.setattr(interaction, '_launch', lambda *args: pytest.fail('status must not relaunch work'))
+    app = create_app(config, tmp_path/'cache.db')
+    response = app.test_client().get('/api/curriculum/campaign/proposals/'+identifier+'/restart')
+    assert response.status_code == 200
+    assert response.json['request']['status'] == 'observation-required'
+    assert json.loads(path.read_bytes())['status'] == 'observation-required'
+
+
+def test_new_feedback_key_cannot_bypass_unsettled_request(tmp_path):
+    config, root, *_ = setup(tmp_path)
+    first = request(config)
+    path = root/'dashboard-requests'/(first['id']+'.json')
+    first['status'] = 'running'
+    atomic(path, canonical(first))
+    assert interaction.request_status(config, 'campaign', first['id'])['status'] == 'observation-required'
+    with pytest.raises(ValueError, match='settle prior'):
+        interaction.submit_feedback(config, 'campaign', 'one', 'new instructions', 'different-key', 30,
+            launcher=lambda *args: pytest.fail('unsettled execution cannot launch again'))
+    assert len(list((root/'dashboard-requests').glob('*.json'))) == 1

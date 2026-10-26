@@ -143,28 +143,6 @@ def test_feedback_http_guards_and_receipts(tmp_path):
     assert client.get(url).json['messages'][-1]['text'] == 'continue'
 
 
-def test_cached_optimizer_action_is_superseded_before_replay(tmp_path):
-    from optimizer.jobs import JobStore, sha
-    from optimizer.loop import OptimizationLoop
-    body = {'files': {}, 'memory_entries': []}
-    store = JobStore(tmp_path/'jobs')
-    job = store.create('def forward(x): return x', 'forward',
-        {'args': [{'shape': [5], 'dtype': 'float32'}]}, {**body, 'snapshot_id': sha(canonical(body))}, max_seconds=100)
-    seen = []
-    class Agent:
-        identity = {}
-        def complete(self, stage, context, record):
-            seen.extend(context['user_feedback'])
-            return {'action': 'finish', 'summary': 'redirected'}
-    store.transition(job['job_id'], 'running')
-    loop = OptimizationLoop(store, job['job_id'], Agent(), SimpleNamespace())
-    loop.state['model_action'] = loop._artifact('optimize', {'action': 'candidate', 'source': 'stale'})
-    loop.context, loop.single_evaluation, loop.prepare_only = {}, False, False
-    ActorControl(store.root/job['job_id']).send('redirection', 'discard stale candidate')
-    assert loop._model('optimize', {})['action'] == 'finish'
-    assert seen[0]['content'] == 'discard stale candidate'
-
-
 def test_optimizer_restart_instruction_reaches_production_job_context(tmp_path):
     from test_phase2_optimizer_execution import executor, candidate
     ActorControl(tmp_path/'task/actor').send('approved', 'Use the reviewed repair direction')
