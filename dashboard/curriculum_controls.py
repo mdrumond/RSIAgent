@@ -1,5 +1,6 @@
 """Curriculum-authored previews and explicit approval through retained operations."""
 import json
+import hashlib
 import math
 from pathlib import Path
 import re
@@ -59,6 +60,19 @@ class CurriculumControls:
         _, root = configured_subject(self.config_path, campaign_id)
         return [json.loads(path.read_bytes()) for path in sorted(
             (root / 'curriculum-edits').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[:20]]
+
+    def restart_request(self, campaign_id, identifier):
+        _, root = configured_subject(self.config_path, campaign_id)
+        proposal = self.proposal(root, identifier)
+        if proposal['kind'] != 'restart':
+            raise ControlError('proposal is not a restart')
+        request_id = hashlib.sha256(('curriculum-restart:' + identifier).encode()).hexdigest()[:32]
+        path = root / 'dashboard-requests' / (request_id + '.json')
+        if not path.exists():
+            return None
+        request = json.loads(path.read_bytes())
+        return {field: request[field] for field in ('id', 'status', 'error', 'additional_seconds',
+                'project_id', 'result') if field in request}
 
     @staticmethod
     def unmerged(root, project):
@@ -149,4 +163,13 @@ def register_curriculum_controls(app, config_path, controls, csrf_token, *, bind
             configured_subject(config_path, campaign_id)
             return jsonify(proposals=service.proposals(campaign_id))
         except ValueError:
+            abort(404)
+
+    @app.get('/api/curriculum/<campaign_id>/proposals/<identifier>/restart')
+    def curriculum_restart_status(campaign_id, identifier):
+        if not service.enabled:
+            abort(403)
+        try:
+            return jsonify(request=service.restart_request(campaign_id, identifier))
+        except (ControlError, ValueError, OSError):
             abort(404)

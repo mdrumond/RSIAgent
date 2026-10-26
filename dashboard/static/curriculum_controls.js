@@ -40,3 +40,25 @@ document.querySelectorAll('[data-curriculum]').forEach(section => {
     catch (error) { status.textContent = error.message; button.disabled = false; }
   }));
 });
+
+// Restart workers outlive their dashboard operation; follow their retained status.
+document.querySelectorAll('[data-restart-status-url]').forEach(output => {
+  let terminal = false;
+  async function refresh() {
+    if (terminal) return;
+    try {
+      const response = await fetch(output.dataset.restartStatusUrl);
+      if (!response.ok) throw new Error('Restart status unavailable; reload to reconcile');
+      const {request} = await response.json();
+      output.textContent = request ? `Restart: ${request.status}${request.error ? ` · ${request.error}` : ''}` : 'Restart: not dispatched; use Resume/reconcile';
+      if (request?.status === 'observation-required') output.textContent += ' · Observe the prior execution before resubmitting.';
+      if (request && ['succeeded', 'observation-required'].includes(request.status)) {
+        const retry = output.closest('article').querySelector('[data-curriculum-approve]');
+        if (retry) retry.hidden = true;
+      }
+      terminal = request && ['succeeded', 'failed', 'observation-required'].includes(request.status);
+    } catch (error) { output.textContent = error.message; }
+  }
+  refresh();
+  setInterval(refresh, 2000);
+});

@@ -169,3 +169,76 @@ def test_role_binding_uses_frozen_runtime_without_campaign_or_admission_builder(
         with bind_subject(config, 'research', max_seconds=5, compose=compose):
             pass
     assert len(calls) == 1
+
+
+def test_approved_restart_reconciles_failed_launch_and_keeps_durable_request_status(setup):
+    config, root, _ = setup
+    reviewed = dict(item=item('retry'), instruction='Inspect physical padding.')
+    calls = []
+    def restart(config_path, campaign_id, proposal, seconds, key):
+        calls.append((proposal['status'], seconds, key))
+        identifier = hashlib.sha256(key.encode()).hexdigest()[:32]
+        path = root / 'dashboard-requests' / (identifier + '.json')
+        path.parent.mkdir(exist_ok=True)
+        if len(calls) == 1:
+            path.write_bytes(canonical(dict(id=identifier, status='failed', additional_seconds=seconds,
+                project_id='original', error='launch failed', proposal=proposal)))
+            raise RuntimeError('launch failed')
+        request = dict(id=identifier, status='queued', additional_seconds=seconds,
+                       project_id='original', proposal=proposal)
+        path.write_bytes(canonical(request))
+        return request
+    app, formatted = application(setup, [reviewed], restart)
+    client = app.test_client()
+    try:
+        proposal = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='restart', project_id='original', instructions='Fix prompt', format_seconds=10), 'p'))['result']
+        body = dict(campaign_id='research', proposal_id=proposal['id'], additional_seconds=60)
+        assert settled(app, submit(client, 'curriculum-approve', body, 'a'))['status'] == 'failed'
+        service = app.extensions['dashboard_curriculum_controls']
+        assert service.proposal(root, proposal['id'])['status'] == 'approved'
+        url = '/api/curriculum/research/proposals/' + proposal['id'] + '/restart'
+        retained = client.get(url).get_json()['request']
+        assert retained['status'] == 'failed' and retained['additional_seconds'] == 60
+        assert 'proposal' not in retained
+        assert client.get('/campaign/research/project/original').status_code == 200
+        result = settled(app, submit(client, 'curriculum-approve', body, 'retry'))
+        assert result['status'] == 'succeeded'
+        assert client.get(url).get_json()['request']['status'] == 'queued'
+        assert calls[0] == calls[1] and len(formatted) == 1
+        app.extensions['dashboard_controls'].enabled = False
+        assert client.get(url).status_code == 403
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_restart_reconcile_affordance_follows_retained_execution_state(setup):
+    from html.parser import HTMLParser
+    class Actions(HTMLParser):
+        def __init__(self, html):
+            super().__init__()
+            self.approvals = []
+            self.feed(html)
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'button' and 'data-curriculum-approve' in attrs:
+                self.approvals.append(attrs['data-curriculum-approve'])
+    config, root, _ = setup
+    reviewed = dict(item=item('retry'), instruction='Inspect physical padding.')
+    app, _ = application(setup, [reviewed], lambda *args: dict(status='queued'))
+    client = app.test_client()
+    try:
+        proposal = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='restart', project_id='original', instructions='Fix prompt', format_seconds=10), 'p'))['result']
+        settled(app, submit(client, 'curriculum-approve', dict(campaign_id='research',
+            proposal_id=proposal['id'], additional_seconds=60), 'a'))
+        page = '/campaign/research/project/original'
+        assert Actions(client.get(page).get_data(as_text=True)).approvals == [proposal['id']]
+        identifier = hashlib.sha256(('curriculum-restart:' + proposal['id']).encode()).hexdigest()[:32]
+        path = root / 'dashboard-requests' / (identifier + '.json')
+        path.parent.mkdir(exist_ok=True)
+        for status in ('succeeded', 'observation-required'):
+            path.write_bytes(canonical(dict(id=identifier, status=status, additional_seconds=60)))
+            assert Actions(client.get(page).get_data(as_text=True)).approvals == []
+    finally:
+        app.extensions['dashboard_controls'].close()

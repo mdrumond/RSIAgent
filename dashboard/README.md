@@ -177,3 +177,11 @@ stay frozen. Project restarts additionally require a fresh execution allowance
 and dispatch the approved prompt through the durable actor-control service.
 Role bindings are isolated from live campaign/admission workers. Existing
 operation polling, CSRF checks, and idempotency apply to previews and approvals.
+
+Approved restart proposals retain a Resume/reconcile action after a launch
+failure or dashboard interruption. The request uses the same durable identity
+and original elapsed allocation; queued/running requests are observed rather
+than launched again. Status continues polling after the dashboard operation
+finishes. Completed requests and uncertain executions requiring observation
+cannot be retried from that action. The editable future-work queue excludes
+projects already reserved into a wave, even if they have not started.
