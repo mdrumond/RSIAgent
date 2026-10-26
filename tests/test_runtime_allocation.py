@@ -54,7 +54,9 @@ def test_subject_campaign_recomposes_after_permitted_device_only_migration(tmp_p
     settings={'phase1_arguments':['--config',str(path)]};root=tmp_path/'campaign'
     kwargs=dict(target='a3',root=root,subjects=[Subject('s','copies')],initial_memory=b'',
                 compose=lambda settings,**options:bound(options['root']))
-    build_subject_campaign(settings,**kwargs)
+    first = build_subject_campaign(settings,**kwargs)
+    first.memory_gate.close()
     path.write_bytes(raw(1))
-    build_subject_campaign(settings,**kwargs)
+    second = build_subject_campaign(settings,**kwargs)
+    second.memory_gate.close()
     assert json.loads((root/'execution-allocations.json').read_bytes())[-1]['allocation']['config']['physical_device']==1
