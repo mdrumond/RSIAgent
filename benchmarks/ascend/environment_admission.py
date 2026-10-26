@@ -46,7 +46,8 @@ def fresh_health(transport, root, *, allowed_devices=None):
     if not permitted_devices([device], allowed_devices):
         raise ProjectInfrastructureError('physical device is outside campaign permissions')
     result = transport.run_remote(['python', '-c', _HEALTH, str(device)],
-                                  key='health/' + uuid.uuid4().hex)
+                                  key='health/' + uuid.uuid4().hex,
+                                  cwd=getattr(transport, 'registry_workspace', None) or '.')
     if result.returncode:
         raise ProjectInfrastructureError('bounded device health query failed')
     report = json.loads(result.stdout)
