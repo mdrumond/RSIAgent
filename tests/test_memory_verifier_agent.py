@@ -115,7 +115,9 @@ def test_transport_failure_is_cached_and_resume_never_reenters_unknown_arm(tmp_p
     h = Harness(failure='treatment')
     first = evaluate(h, tmp_path)
     assert first['decision'] == 'inconclusive' and h.requests == []
-    assert first['arms']['control'] is not None and first['arms']['treatment'] is None
+    assert first['arms']['control'] is not None
+    assert first['arms']['treatment']['observations']['interruption_reason'] == 'transport-unresolved'
+    assert not first['arms']['treatment']['host_verified']
     second = evaluate(h, tmp_path, task=first['trial_task'])
     assert second == first
     assert [row[0] for row in h.calls] == ['control', 'treatment']
@@ -343,7 +345,7 @@ def test_first_transport_failure_holds_peer_and_retains_partial_evidence(tmp_pat
     result = evaluate(h, tmp_path)
     assert result['decision'] == 'inconclusive'
     assert result['validity'] == {'control': False}
-    assert result['arms'] == {'control': None}
+    assert result['arms']['control']['observations']['classification'] == 'interrupted'
     assert [row[0] for row in h.calls] == ['control'] and not h.requests
     assert not (tmp_path / 'treatment').exists()
     assert ContentAddressedArtifacts(tmp_path / 'artifacts').read_bytes(result['artifacts']['proposal'])

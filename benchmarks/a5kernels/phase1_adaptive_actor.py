@@ -599,6 +599,14 @@ class AdaptiveActorProjectExecutor:
                 turn_parser=parse_trial_action, action_executor=execute_action,
             )
         except Exception as exc:
+            # Keep host-owned partial state when an execution boundary interrupts
+            # the Actor before its ordinary terminal result can be constructed.
+            exc.partial_evidence = dict(source_sha256=actions.source_sha256,
+                actions=list(actions.actions),
+                admitted_artifact_sha256=list(actions.admitted),
+                latest_evidence=(None if actions.latest is None else
+                    dict(classification=actions.latest.evidence.classification.value,
+                         detail=actions.latest.evidence.detail)))
             if recorder is not None:
                 from benchmarks.ascend.agent_context import ContextBudgetError
                 from benchmarks.a5kernels.phase1_provider import ProviderRejectionError

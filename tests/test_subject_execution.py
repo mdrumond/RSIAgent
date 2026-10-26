@@ -218,3 +218,20 @@ def test_optimizer_reconstruction_uses_new_attempt_memory_without_recreating_job
     changed_task = {**task, 'rationale': 'different frozen task'}
     with pytest.raises(ValueError, match='frozen task'):
         reconstructed.optimizer(**{**options, 'task': changed_task}, memory_snapshot=current, attempt_id='third')
+
+
+def test_actor_interruption_exposes_host_partial_state_for_arm_collection(tmp_path):
+    from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+    execution, actor = graph_actor(tmp_path, [
+        '{"write":{"slot":"kernel","content":"fixed source"}}', '{"compile":{}}'])
+    def interrupted(_request):raise ProjectInfrastructureError('observe retained compile')
+    execution.executor._backend.compile = interrupted
+    request = _request(tmp_path, execution.executor)
+    outcome = SubjectExecutor(execution).graph(request)
+    assert not outcome.host_verified
+    assert outcome.observations['interruption_reason'] == 'transport-unresolved'
+    partial = outcome.observations['evidence']
+    assert SubjectExecutor(execution).graph(request).as_dict() == outcome.as_dict()
+    assert partial['source_sha256'] == sha(b'fixed source')
+    assert partial['actions'] == ['write', 'compile']
+    assert partial['source_sha256'] in partial['admitted_artifact_sha256']

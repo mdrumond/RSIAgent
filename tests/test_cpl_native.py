@@ -328,3 +328,32 @@ def test_deadline_exit_is_infrastructure_interruption_not_candidate_failure(tmp_
     assert len(submits) == (2 if stage == 'execute' else 1)
     operation = candidate.root/plan.execution_id/stage/'operation.json'
     assert json.loads(operation.read_text())['result']['returncode'] == 124
+
+
+def test_cpl_records_stage_and_nested_cleanup_timing_without_resubmission(tmp_path):
+    remote = Remote()
+    now = [100.]
+    def runner(argv, **kwargs):
+        now[0] += 1
+        return remote(argv, **kwargs)
+    candidate = backend(tmp_path, runner, clock=lambda:now[0], wall_clock=lambda:now[0])
+    candidate.compile(smoke_plan(target='discovered-a3', arch='discovered-arch'), tmp_path/'bundle')
+    spans = [json.loads(line) for line in (candidate.root/'timing.jsonl').read_text().splitlines()]
+    assert {row['stage'] for row in spans} == {'upload', 'compile', 'cleanup'}
+    assert all(row['ended_epoch']-row['started_epoch'] == row['elapsed_seconds'] for row in spans)
+    compile_span = next(row for row in spans if row['stage']=='compile')
+    assert compile_span['elapsed_seconds'] == 4
+    assert len([c for c in remote.calls if c[2]=='run']) == 1
+
+
+def test_cpl_stop_metadata_distinguishes_operator_stop_from_deadline(tmp_path):
+    def remaining():return 0
+    remaining.stop_requested=lambda:True
+    candidate = backend(tmp_path, Remote(), remaining_seconds=remaining)
+    with pytest.raises(_PendingObservation) as caught:
+        candidate.run_remote(('true',), key='compile')
+    assert caught.value.interruption_reason == 'operator-stop'
+    remaining.stop_requested=lambda:False
+    with pytest.raises(_PendingObservation) as caught:
+        candidate.run_remote(('true',), key='compile')
+    assert caught.value.interruption_reason == 'deadline-exhausted'
