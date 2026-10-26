@@ -374,6 +374,10 @@ def build_native_adaptive_phase1(
             (Capability.PROFILING, request_profile), (Capability.TIMING_SWEEP, request_timing),
         ) if action is None),
     )
+    if reviewed_snapshot is None:
+        from benchmarks.ascend.wave_environment import NativeWaveEnvironmentCheck
+        coordinator.environment_check = NativeWaveEnvironmentCheck(config,
+            tuple(worker.transport for worker in project_workers) or (native_transport,))
     return coordinator
 
 

@@ -176,6 +176,8 @@ class AdaptivePhase1Coordinator:
         self.max_seconds, self.clock = max_seconds, clock
         self.failure_feedback = None
         self.allow_partial = allow_partial
+        self.environment_check = None
+        self._checked_environment = None
 
     @staticmethod
     def root_state_target(root):
@@ -213,6 +215,7 @@ class AdaptivePhase1Coordinator:
             return operation()
 
     def _run_allocation(self, operation):
+        self._checked_environment = None
         state = self._load_state()
         if state.get("allocation_active"):
             # Exclusive ownership proves the previous interval has no owner.
@@ -316,6 +319,9 @@ class AdaptivePhase1Coordinator:
             wave = WaveSpec.from_mapping(pending["wave"])
             if self.failure_feedback is not None:
                 self.failure_feedback.record(pending.get('failure_investigations', []), state)
+            if self._time_exhausted(state):
+                return self._deadline_report(state)
+            self._check_environment(state)
             if self._time_exhausted(state):
                 return self._deadline_report(state)
             coordinator = LiveWaveCoordinator(
@@ -649,7 +655,14 @@ class AdaptivePhase1Coordinator:
             "summary": _validated_summary(value["summary"]),
         }
 
+    def _check_environment(self, state):
+        token = (state["wave_index"], getattr(self, "_deadline", None))
+        if self.environment_check is not None and self._checked_environment != token:
+            self.environment_check(state["wave_index"], self._remaining_seconds)
+            self._checked_environment = token
+
     def _select(self, *args, **kwargs):
+        self._check_environment(self._load_state())
         try:
             return self.curriculum.select(*args, **kwargs)
         except CurriculumSelectionError as error:
