@@ -282,3 +282,33 @@ def test_pending_project_can_receive_reviewed_restart_without_execution(tmp_path
     assert service.approve(proposal['id'])['after'] == replacement
     assert path.read_bytes() == original and not (tmp_path / 'waves').exists()
     assert len(calls) == 1
+
+
+def test_qualified_target_restart_uses_fresh_scheduling_id_without_requalification(tmp_path):
+    from copy import deepcopy
+    from test_ascend_phase2_targets import qualified, RUNTIME
+    from benchmarks.ascend.targets import a3_curriculum_policy
+    target, artifacts, backend = qualified(tmp_path / 'qualification')
+    original = dict(project_id='original-attempt', spec=target.spec.as_dict(), repairs=[],
+        task=dict(kind='target', contract=target.as_dict(), artifact_root=str(artifacts.root)))
+    restarted = dict(deepcopy(original), project_id='fresh-attempt')
+    root = tmp_path / 'campaign'
+    scheduler = SubjectScheduler(root, [Subject('current', 'Current')])
+    path = root / 'subject-campaign.json'
+    path.write_text(json.dumps(dict(projects={'original-attempt': dict(plan=original)}, pending=None)))
+    original_campaign = path.read_bytes()
+    qualification = {p.relative_to(artifacts.root): p.read_bytes() for p in artifacts.root.rglob('*') if p.is_file()}
+    calls = len(backend.compile_requests), len(backend.run_requests)
+    replacement = dict(item=restarted, instruction='Inspect the retained target contract and improve execution.')
+    service = SubjectEdits(root, scheduler, lambda *a, **k: json.dumps(replacement),
+        validate_item=lambda plan: validate_project(plan, runtime=RUNTIME, policy=a3_curriculum_policy()))
+    preview = service.preview('restart', 'Review this qualified-target prompt',
+                              project='original-attempt', remaining_seconds=10)
+    approved = service.approve(preview['id'])
+    assert approved['after']['item']['project_id'] == 'fresh-attempt'
+    assert approved['after']['item']['spec'] == target.spec.as_dict()
+    assert approved['after']['item']['task']['contract'] == target.as_dict()
+    assert path.read_bytes() == original_campaign
+    assert {p.relative_to(artifacts.root): p.read_bytes() for p in artifacts.root.rglob('*') if p.is_file()} == qualification
+    assert (len(backend.compile_requests), len(backend.run_requests)) == calls
+    target.verify(artifacts, RUNTIME, a3_curriculum_policy())
