@@ -201,7 +201,10 @@ project review, original project identity, and actual review identity. Publicati
 indexes the proposal before atomically updating accepted pointers. A later
 background evaluation cannot undo the manual decision; its evidence remains
 retained, and the campaign owner reconciles scheduler status. Replaying the same
-request does not publish twice. An ineligible project displays its missing gate;
+request does not publish twice. An uncertain network outcome retains the original
+key and reason; retry reconciles that request or its known operation. Once a
+failure is definitive, the reason can be edited and a fresh request submitted.
+An ineligible project displays its missing gate;
 use actor feedback or a curriculum-reviewed restart to obtain the required
 evidence and project review. This control requires configured subject runtime
 settings and initial memory; it does not establish a successful usefulness trial.
