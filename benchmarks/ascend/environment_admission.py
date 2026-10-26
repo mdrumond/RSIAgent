@@ -40,14 +40,25 @@ print(json.dumps({'queries':rows,'compiler':r.stdout if r and r.returncode==0 el
 '''
 
 
-def fresh_health(transport, root, *, allowed_devices=None):
+def fresh_health(transport, root, *, allowed_devices=None, health_workspace=None):
+    if (not isinstance(health_workspace, str) or not Path(health_workspace).is_absolute()
+            or '..' in Path(health_workspace).parts):
+        raise ProjectInfrastructureError('configure an existing absolute health_workspace for readonly device checks')
+    registry_root = getattr(transport, 'registry_workspace', None)
+    if registry_root is not None:
+        try:
+            relative = Path(health_workspace).relative_to(registry_root)
+        except ValueError:
+            raise ProjectInfrastructureError('health_workspace must be beneath the registered workspace') from None
+        if relative == Path('.') or '..' in relative.parts:
+            raise ProjectInfrastructureError('health_workspace must be an existing subdirectory, not the registry root')
     identity = transport.runtime_identity
     device = identity['physical_device']
     if not permitted_devices([device], allowed_devices):
         raise ProjectInfrastructureError('physical device is outside campaign permissions')
     result = transport.run_remote(['python', '-c', _HEALTH, str(device)],
                                   key='health/' + uuid.uuid4().hex,
-                                  cwd=getattr(transport, 'registry_workspace', None) or '.')
+                                  cwd=health_workspace)
     if result.returncode:
         raise ProjectInfrastructureError('bounded device health query failed')
     report = json.loads(result.stdout)
@@ -127,7 +138,8 @@ class EnvironmentAdmission:
             for transport in self.transports:
                 # Fresh health runs even on a known-good probe cache hit.
                 health, path = fresh_health(transport, self.root,
-                    allowed_devices=self.dependencies.get('allowed_devices'))
+                    allowed_devices=self.dependencies.get('allowed_devices'),
+                    health_workspace=self.dependencies.get('health_workspace'))
                 verify_dependencies(health, self.dependencies)
                 health_paths.append(path)
                 identities.append(dict(runtime=transport.runtime_identity, health=health))
