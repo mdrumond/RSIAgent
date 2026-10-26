@@ -87,6 +87,17 @@ The verifier reads retained results and Actor/tool logs before judging usefulnes
 Equal scores may still support acceptance when logs demonstrate useful transfer;
 invalid or incomplete runs never establish benefit.
 
+A valid but inconclusive comparison can request a targeted follow-up with
+`next_probe: {"question": "specific uncertainty and needed contrast"}`. The
+curriculum selector authors a different neutral host contract; it does not put
+the lesson's implementation advice into either Actor's task. Each probe has a
+persisted ordinal, fresh arm directories and counterbalanced order. The judge
+can read all earlier results and artifacts, including unfavorable evidence and
+prior candidate revisions. Passing host checks does not preclude rejection.
+Probes share the original admission elapsed allocation; there is no probe-count
+stopping limit. A completed inconclusive result is cached and does not repeat
+Actor or provider work when reopened.
+
 Drafts stay outside accepted memory and ordinary KDB retrieval. Other waves may
 start against the older accepted snapshot while verification runs. Acceptance
 publishes a new immutable version for later waves. Appends and merges replace
@@ -97,7 +108,14 @@ Unhelpful drafts return to the project verifier for up to two rewrites, using th
 same frozen transfer task. Rejection after those opportunities leaves existing
 memory untouched. Missing underlying evidence can instead send the original
 project back to curriculum repair. Infrastructure failures remain inconclusive
-and retain elapsed allocations and operation identities for resume.
+and retain elapsed allocations and operation identities. An invalid trial is
+held unpublished by default, including missing receipts and interrupted Actors.
+Programmatic adapters can inject `MemoryAdmission(..., retry_ready=callback)`;
+only a literal `True` certifying that all owned operations have settled and a
+fresh trial is eligible permits a new isolated comparison. The callback receives
+`(result, trial_directory, remaining_seconds=...)`. Default campaign composition
+does not supply this certification, so it never blindly retries native work.
+An unchanged completed uncertainty without a requested probe also stays held.
 
 Optional settings are `memory_verifier_model` (defaults to the campaign model),
 `memory_review_seconds` (3600), `memory_trial_seconds` (1800), and

@@ -17,7 +17,7 @@ from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, Cur
 from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
 from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
 from benchmarks.a5kernels.phase1_provider import direct_profile
-from .project_verifier import ProjectVerifierAgent
+from .project_verifier import ProjectVerifierAgent, bounded_review_messages
 from .subject_campaign import SubjectCampaign
 from .subject_execution import SubjectExecutor, optimizer_snapshot
 from .subjects import load_subjects
@@ -289,7 +289,30 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         def complete_wave(messages):
             wire = list(messages)
             while True:
-                response = curriculum_complete(wire, remaining_seconds=available())
+                working = bounded_review_messages(wire, {'history_sha256':context['selection_artifacts']['history']}) if context.get('selection_artifacts') else wire
+                response = curriculum_complete(working, remaining_seconds=available())
+                if context.get('selection_artifacts'):
+                    try:
+                        action = json.loads(response)
+                        if set(action) == {'read_artifact'}:
+                            request = action['read_artifact']
+                            sha = request['sha256']
+                            if sha not in context['selection_artifacts'].values():
+                                raise ValueError('artifact is not admitted to transfer selection')
+                            data = store.read_bytes(sha)
+                            offset = request.get('offset', 0)
+                            if type(offset) is not int or not 0 <= offset <= len(data):
+                                raise ValueError('invalid artifact offset')
+                            observation = dict(sha256=sha, text=data[offset:offset+8192].decode(errors='replace'),
+                                next_offset=offset+8192 if offset+8192<len(data) else None)
+                            wire.extend((dict(role='assistant', content=response),
+                                         dict(role='user', content=json.dumps(observation))))
+                            continue
+                    except (ValueError, TypeError, KeyError) as error:
+                        if response.lstrip().startswith('{'):
+                            wire.extend((dict(role='assistant', content=response),
+                                         dict(role='user', content=str(error))))
+                            continue
                 try:
                     header, body = response.strip().split('\n', 1)
                     ids = [row['spec']['project_id'] for row in json.loads(body)['projects']] if header == 'DECISION: WAVE' else []
@@ -364,17 +387,31 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
 
-    def select_trial(proposal, *, remaining_seconds):
+    def select_trial(proposal, *, remaining_seconds, probe_request=None, prior_task=None, history=()):
         lesson = {key: str(proposal.get(key, ''))[:1024] for key in
                   ('summary', 'applicability', 'preconditions', 'expectations', 'limitations')}
         lesson['proposal_sha256'] = store.put_bytes(canonical(proposal))
         lesson['source_examples'] = {key: {field: value for field, value in proposal[key].items() if field != 'text'}
                                      for key in ('before', 'after') if proposal.get(key) is not None}
+        followup = ''
+        selection_artifacts = {}
+        if probe_request is not None:
+            selection_artifacts['history'] = store.put_bytes(canonical(history))
+            for index, row in enumerate(history):
+                selection_artifacts.update({f'history:{index}:{role}':sha for role,sha in row.get('artifacts',{}).items()})
+            followup = '\nDiscriminate this unresolved evidence question using a different workload contract: ' + json.dumps(dict(
+                request=probe_request, prior_task=prior_task,
+                history_sha256=selection_artifacts['history'], history_count=len(history),
+                history=[dict(decision=row.get('decision'), reason=str(row.get('reason', ''))[:1024],
+                              task=row.get('trial_task')) for row in history[-8:]]))
+            followup += '\nUse the question only to choose inputs/operations/preconditions. Keep all implementation advice out of both arms task/hypothesis.'
+            followup += '\nRead full history with JSON {"read_artifact":{"sha256":"...","offset":0}} before authoring the ordinary DECISION: WAVE response. History contains hashes of admitted prior artifacts, which may also be read.'
         context = dict(current_subject=dict(subject_id='memory-transfer', task=None, objective=(
             'Author exactly ONE SMALL transfer project that could benefit from this proposed lesson. '
             'Use different inputs/extents from its source project. Freeze ordinary host acceptance. '
             'Do not include lesson advice, code snippets or solution strategy in the task/hypothesis. '
-            'Proposed lesson for selecting the workload only: ' + json.dumps(lesson))), repairs=[])
+            'Proposed lesson for selecting the workload only: ' + json.dumps(lesson) + followup)), repairs=[])
+        context['selection_artifacts'] = selection_artifacts
         return select_wave(context, campaign.memory.snapshot(), {}, remaining_seconds=remaining_seconds,
                            project_limit=1)[0]
 

@@ -111,16 +111,14 @@ def test_failed_treatment_cannot_be_accepted_and_weaker_logs_request_rewrite(tmp
     assert evaluate(other, tmp_path / 'unhelpful')['decision'] == 'rewrite'
 
 
-def test_transport_failure_is_inconclusive_and_resume_reenters_same_arm_only(tmp_path):
+def test_transport_failure_is_cached_and_resume_never_reenters_unknown_arm(tmp_path):
     h = Harness(failure='treatment')
     first = evaluate(h, tmp_path)
     assert first['decision'] == 'inconclusive' and h.requests == []
     assert first['arms']['control'] is not None and first['arms']['treatment'] is None
     second = evaluate(h, tmp_path, task=first['trial_task'])
-    assert second['decision'] == 'accept'
-    assert [row[0] for row in h.calls] == ['control', 'treatment', 'treatment']
-    assert h.calls[1][2] == h.calls[2][2]
-    assert h.calls[2][3] == 9  # Interrupted work does not regain its elapsed allowance.
+    assert second == first
+    assert [row[0] for row in h.calls] == ['control', 'treatment']
     assert len(h.selections) == 1
 
 
@@ -186,7 +184,8 @@ def test_invalid_trial_proposal_does_not_leave_half_frozen_resume_state(tmp_path
     assert first['decision'] == 'inconclusive' and first['trial_task'] is None
     assert h.calls == []
     h.verifier.select_trial = h.select
-    assert evaluate(h, tmp_path)['decision'] == 'accept'
+    assert evaluate(h, tmp_path) == first
+    assert evaluate(h, tmp_path / 'new-trial')['decision'] == 'accept'
     assert len(h.selections) == 1
 
 
@@ -222,7 +221,7 @@ def test_large_judge_pages_fold_context_and_preserve_observed_evidence(tmp_path)
     assert {page['sha256'] for page in pages} == set(hashes)
     assert all(len(page['text'].encode()) == 8192 and page['next_offset'] == 8192 for page in pages)
     feedback = [event['observation'] for event in agent.last_trace if event['kind'] == 'feedback']
-    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['list_artifacts'], ['decision', 'reason', 'evidence', 'instructions']]
+    assert feedback[0]['expected_top_level'] == [['read_artifact'], ['list_artifacts'], ['decision', 'reason', 'evidence', 'instructions'], ['decision', 'reason', 'evidence', 'instructions', 'next_probe']]
 
 
 def test_parent_stop_after_completed_arm_prevents_peer_and_judge(tmp_path):
