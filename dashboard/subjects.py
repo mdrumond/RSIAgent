@@ -62,7 +62,8 @@ class SubjectViews:
                 kind=plan.get('task', {}).get('kind', plan.get('kind', 'graph')),
                 objective=row.get('objective', plan.get('spec', {}).get('hypothesis', '')),
                 execution=execution, project_review=review.get('decision', 'pending'),
-                memory_admission=jobs.get(pid, {}).get('status', 'not-submitted'),
+                memory_admission=('manually-accepted' if pid in active.get('manual_overrides', {})
+                                  else jobs.get(pid, {}).get('status', 'not-submitted')),
                 publication='published' if published else 'unpublished', merged=published,
                 plan=plan, review=review, outcome=outcome,
                 memory=review.get('memory'), source=_source(root, outcome.get('source_sha256')) or ''))

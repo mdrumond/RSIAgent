@@ -31,6 +31,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     register_feedback(app, controls, csrf_token)
     from .subjects import register_subjects
     register_subjects(app, config_path)
+    from .memory_controls import register_memory_controls
+    register_memory_controls(app, config_path, csrf_token)
     last = [0.0]
 
     def view():
