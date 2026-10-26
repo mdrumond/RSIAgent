@@ -156,3 +156,13 @@ python run_ascend_campaign.py adopt \
   --profiling without-profiling-guidance \
   --legacy-revision 0123456789abcdef0123456789abcdef01234567
 ```
+
+Subject campaigns can be configured alongside historical campaigns with
+`subject_campaigns: [{"id": "research", "name": "Research", "target": "a3", "root": "/path/to/subject-campaign"}]`.
+Their project pages separate execution, project review, memory admission, and
+publication. Actor logs follow retained trace, provider-evidence, and optimizer
+ledgers every two seconds. Pause stops polling; loading earlier entries reads
+from the beginning without duplicating displayed records. Downloads include
+complete retained records at download time. Partial trailing records appear
+only after their writer finishes the line. Interrupted writers are shown as
+stopped when the campaign execution lock is no longer held.
