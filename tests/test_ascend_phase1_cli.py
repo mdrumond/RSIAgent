@@ -36,10 +36,13 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
         def __init__(self, **kwargs):
             assert kwargs["profile"] == "bz-a3-1"
         def compile(self, plan, directory):
-            events.append("compile")
+            events.append("probe-compile" if plan.project_id == "sum-three" else "compile")
             self.plan = plan
             return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
         def execute_receipt(self, compiled):
+            if compiled.plan.project_id == "sum-three":
+                events.append("probe-run")
+                return ExecutionReceipt(0, tuple(sum(xs) for xs in zip(*(t.values for t in compiled.plan.inputs))), "synchronized")
             events.append("run")
             return ExecutionReceipt(0, compiled.plan.inputs[0].values, "synchronized")
         def remote_candidate_directory(self, plan):
@@ -88,6 +91,7 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
           "--project-target", "1", "--max-seconds", "300"],
          transport_factory=Transport, provider_transport=provider, measurement_factory=Measurements,
          environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
+    assert events.index("probe-run") < events.index("run")
     assert "profile" in events
     assert events.index("run") < events.index("profile")
     if sync_performance:
