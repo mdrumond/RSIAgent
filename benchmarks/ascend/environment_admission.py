@@ -12,6 +12,10 @@ from .runtime_allocation import permitted_devices, unsettled_operations
 
 _HEALTH = r'''
 import importlib.metadata,json,os,pathlib,shutil,subprocess,sys
+soc_query=subprocess.run([sys.executable,'-c','import torch_npu; print(torch_npu.npu.get_soc_version())'],capture_output=True,text=True,timeout=15)
+soc=int(soc_query.stdout.strip()) if soc_query.returncode==0 and soc_query.stdout.strip().isdigit() else None
+# This adapter's native host driver implements the dav2201 runtime binding.
+arch='dav-2201' if soc==255 else None
 rows={}
 for kind in ['health','ecc','memory','usages','proc-mem','board']:
  try:
@@ -25,15 +29,21 @@ for name in ['torch','torch-npu']:
  try: versions[name]=importlib.metadata.version(name)
  except importlib.metadata.PackageNotFoundError: versions[name]=None
 home=os.environ.get('ASCEND_HOME_PATH')
-cfg=pathlib.Path(home)/'version.cfg' if home else None
-print(json.dumps({'queries':rows,'compiler':r.stdout if r and r.returncode==0 else None,'versions':versions,'toolkit':cfg.read_text() if cfg and cfg.exists() else None}))
+candidates=[]
+for value in [compiler,home,os.environ.get('ASCEND_TOOLKIT_HOME')]:
+ if value:
+  path=pathlib.Path(value).resolve()
+  candidates.extend([path,*path.parents])
+query=next((p/'query_pkg_version.sh' for p in candidates if (p/'query_pkg_version.sh').is_file()),None)
+packages=subprocess.run(['bash',str(query)],capture_output=True,text=True,timeout=8) if query else None
+print(json.dumps({'queries':rows,'compiler':r.stdout if r and r.returncode==0 else None,'versions':versions,'toolkit':packages.stdout if packages and packages.returncode==0 else None,'soc_version':soc,'arch':arch}))
 '''
 
 
-def fresh_health(transport, root):
+def fresh_health(transport, root, *, allowed_devices=None):
     identity = transport.runtime_identity
     device = identity['physical_device']
-    if not permitted_devices(identity['target'], [device]):
+    if not permitted_devices([device], allowed_devices):
         raise ProjectInfrastructureError('physical device is outside campaign permissions')
     result = transport.run_remote(['python', '-c', _HEALTH, str(device)],
                                   key='health/' + uuid.uuid4().hex)
@@ -56,8 +66,40 @@ def fresh_health(transport, root):
     hbm = re.search(r'HBM Usage Rate\(%\)\s*:\s*(\d+)', q['usages']['text'])
     if not hbm or int(hbm.group(1)) >= 50 or not report.get('compiler'):
         raise ProjectInfrastructureError('device memory or compiler health unavailable')
-    return dict({key: report[key] for key in ('compiler', 'versions', 'toolkit')},
-                board=q['board']['text']), str(path.resolve())
+    board=q['board']['text']
+    chip=re.search(r'Chip Name\s*:\s*(\S+)',board)
+    npu=re.search(r'NPU Name\s*:\s*(\S+)',board)
+    product=chip.group(1)+'_'+npu.group(1) if chip and npu else None
+    return dict({key: report.get(key) for key in ('compiler', 'versions', 'toolkit','soc_version','arch')},
+                board=board, product=product), str(path.resolve())
+
+
+def verify_dependencies(actual, pinned):
+    """Fail closed on unavailable or changed pinned runtime/toolchain facts."""
+    environment=pinned.get('environment_identity') or {}
+    expected={key:pinned.get(key) for key in ('target','arch','compiler_version')}
+    expected.update({key:environment.get(key) for key in ('torch','torch_npu','cann_version','soc_version')})
+    if any(value is None or value=='' for value in expected.values()):
+        raise ProjectInfrastructureError('environment admission requires pinned product/architecture/compiler/CANN/torch/torch_npu/SoC identities')
+    def packages(text):
+        return {key.strip():value.strip() for key,value in
+                (line.split(':',1) for line in text.strip().splitlines() if ':' in line)}
+    versions=actual.get('versions') or {}
+    mismatches=[]
+    for field,current,wanted in [('product',actual.get('product'),expected['target']),
+            ('architecture',actual.get('arch'),expected['arch']),
+            ('torch',versions.get('torch'),expected['torch']),
+            ('torch_npu',versions.get('torch-npu'),expected['torch_npu']),
+            ('SoC',actual.get('soc_version'),expected['soc_version'])]:
+        if current != wanted:mismatches.append(field)
+    if not actual.get('compiler') or not actual['compiler'].startswith(expected['compiler_version']):
+        mismatches.append('compiler')
+    toolkit=actual.get('toolkit')
+    if not toolkit or (packages(toolkit) != packages(expected['cann_version'])
+            if packages(expected['cann_version']) else toolkit.strip()!=expected['cann_version'].strip()):
+        mismatches.append('CANN')
+    if mismatches:
+        raise ProjectInfrastructureError('discovered environment differs from pinned '+', '.join(mismatches))
 
 
 class EnvironmentAdmission:
@@ -83,7 +125,9 @@ class EnvironmentAdmission:
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
             for transport in self.transports:
                 # Fresh health runs even on a known-good probe cache hit.
-                health, path = fresh_health(transport, self.root)
+                health, path = fresh_health(transport, self.root,
+                    allowed_devices=self.dependencies.get('allowed_devices'))
+                verify_dependencies(health, self.dependencies)
                 health_paths.append(path)
                 identities.append(dict(runtime=transport.runtime_identity, health=health))
             probe = smoke_plan(target=self.check.config.target, arch=self.check.config.arch,

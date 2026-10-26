@@ -73,6 +73,9 @@ def admit_identity(root, identity, referenced, *, previous=None):
     return new
 
 
-def permitted_devices(target, eligible):
-    """Campaign allocation policy; eligibility must come from fresh device checks."""
-    return [device for device in eligible if target != 'gz-a3' or device in (0, 1, 2)]
+def permitted_devices(eligible, allowed_devices=None):
+    """Apply the caller's ignored campaign policy to freshly checked devices."""
+    if allowed_devices is not None and (not isinstance(allowed_devices, list)
+            or any(type(device) is not int or device < 0 for device in allowed_devices)):
+        raise ValueError('allowed_devices must be a list of nonnegative physical IDs')
+    return [device for device in eligible if allowed_devices is None or device in allowed_devices]

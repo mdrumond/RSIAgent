@@ -11,14 +11,18 @@ def setup(tmp_path, monkeypatch, *, device=1, cache=None, clock=None):
     root=tmp_path;root.mkdir(parents=True, exist_ok=True)
     transport=SimpleNamespace(runtime_identity={'target':'gz-a3-2','runtime':'named','physical_device':device})
     health=[];probes=[]
-    def fresh(t, r):health.append(t.runtime_identity['physical_device']);return {'compiler':'pinned','versions':{}}, 'health.json'
+    def fresh(t, r, **kwargs):
+        health.append(t.runtime_identity['physical_device'])
+        return {'compiler':'pinned','versions':{'torch':'torch-v','torch-npu':'npu-v'},'toolkit':'runtime: cann-v',
+                'product':'Ascend910_9362','arch':'dav-2201','soc_version':255}, 'health.json'
     monkeypatch.setattr(module,'fresh_health',fresh)
     class Probe:
         config=SimpleNamespace(target='Ascend910_9362', arch='dav-2201', execution_profile='gz-a3')
         last_report=root/'probe.json'
         def __call__(self, *args):
             probes.append('probe');self.last_report.write_text(json.dumps({'status':'passed'}))
-    admission=module.EnvironmentAdmission(Probe(),[transport],root,cache=cache or root/'cache',dependencies={'compiler':'pinned'},clock=clock or (lambda:1000))
+    admission=module.EnvironmentAdmission(Probe(),[transport],root,cache=cache or root/'cache',dependencies={'target':'Ascend910_9362','arch':'dav-2201','compiler_version':'pinned',
+        'environment_identity':{'torch':'torch-v','torch_npu':'npu-v','cann_version':'runtime: cann-v','soc_version':255}},clock=clock or (lambda:1000))
     return admission,health,probes,transport
 
 
@@ -38,14 +42,14 @@ def test_expiry_force_device_and_dependency_changes_require_probe(tmp_path,monke
     admission,health,probes,transport=setup(tmp_path,monkeypatch,clock=lambda:now[0])
     admission(lambda:100);now[0]+=900;admission(lambda:100);admission(lambda:100,force=True)
     transport.runtime_identity['physical_device']=2;admission(lambda:100)
-    admission.dependencies={'compiler':'changed'};admission(lambda:100)
+    admission.dependencies['extra_dependency']='changed';admission(lambda:100)
     assert len(probes)==5 and len(health)==5
 
 
 def test_health_failure_and_pending_work_invalidate_cache(tmp_path,monkeypatch):
     admission,_,probes,_=setup(tmp_path,monkeypatch)
     admission(lambda:100)
-    def failed(*args):raise ProjectInfrastructureError('unhealthy')
+    def failed(*args,**kwargs):raise ProjectInfrastructureError('unhealthy')
     monkeypatch.setattr(module,'fresh_health',failed)
     with pytest.raises(ProjectInfrastructureError):admission(lambda:100)
     assert not list((tmp_path/'cache').glob('*.json'))
@@ -60,11 +64,11 @@ def test_fresh_health_uses_physical_device_and_rejects_busy_or_forbidden(tmp_pat
     def run(argv,**kwargs):
         calls.append(argv);return SimpleNamespace(returncode=0,stdout=json.dumps({'queries':q,'compiler':'pinned','versions':{},'toolkit':None}),job_handle='remote:t:job:health')
     t=SimpleNamespace(runtime_identity={'target':'gz-a3','physical_device':2},run_remote=run)
-    module.fresh_health(t,tmp_path);assert calls[-1][-1]=='2'
+    module.fresh_health(t,tmp_path,allowed_devices=[0,1,2]);assert calls[-1][-1]=='2'
     q['proc-mem']['text']='PID:123'
-    with pytest.raises(ProjectInfrastructureError,match='idle'):module.fresh_health(t,tmp_path)
+    with pytest.raises(ProjectInfrastructureError,match='idle'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2])
     t.runtime_identity['physical_device']=3
-    with pytest.raises(ProjectInfrastructureError,match='permissions'):module.fresh_health(t,tmp_path)
+    with pytest.raises(ProjectInfrastructureError,match='permissions'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2])
     assert len(calls)==2
 
 
@@ -74,3 +78,29 @@ def test_missing_probe_evidence_forces_fresh_probe(tmp_path,monkeypatch):
     (tmp_path/'probe.json').unlink()
     admission(lambda:100)
     assert len(probes)==2 and len(health)==2
+
+
+@pytest.mark.parametrize('field', ['compiler','toolkit','torch','torch_npu','product','arch','soc_version','missing'])
+def test_discovered_mismatch_blocks_probe_and_invalidates_cached_admission(tmp_path,monkeypatch,field):
+    admission,_,probes,_=setup(tmp_path,monkeypatch)
+    admission(lambda:100)
+    original=module.fresh_health
+    def changed(*args,**kwargs):
+        actual,path=original(*args,**kwargs)
+        if field=='torch':actual['versions']['torch']='changed'
+        elif field=='torch_npu':actual['versions']['torch-npu']='changed'
+        elif field=='missing':actual.pop('compiler')
+        else:actual[field]='changed'
+        return actual,path
+    monkeypatch.setattr(module,'fresh_health',changed)
+    with pytest.raises(ProjectInfrastructureError,match='differs from pinned'):
+        admission(lambda:100)
+    assert len(probes)==1 and not list((tmp_path/'cache').glob('*.json'))
+
+
+def test_unpinned_dependency_blocks_probe(tmp_path,monkeypatch):
+    admission,_,probes,_=setup(tmp_path,monkeypatch)
+    admission.dependencies['environment_identity'].pop('torch')
+    with pytest.raises(ProjectInfrastructureError,match='requires pinned'):
+        admission(lambda:100)
+    assert not probes

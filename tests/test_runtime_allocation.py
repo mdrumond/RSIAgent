@@ -42,8 +42,8 @@ def test_unresolved_allocation_cannot_move_until_terminal_observation(tmp_path):
 
 
 def test_campaign_permissions():
-    assert permitted_devices('gz-a3', [0, 2, 3, 7]) == [0, 2]
-    assert permitted_devices('gz-a3-2', [0, 2, 3, 7]) == [0, 2, 3, 7]
+    assert permitted_devices([0, 2, 3, 7], [0, 1, 2]) == [0, 2]
+    assert permitted_devices([0, 2, 3, 7]) == [0, 2, 3, 7]
 
 
 def test_subject_campaign_recomposes_after_permitted_device_only_migration(tmp_path):
