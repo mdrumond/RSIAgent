@@ -1,5 +1,8 @@
 {
   "feedback_root": "/path/to/phase2-feedback",
+  "subject_campaigns": [
+    {"id": "subjects", "target": "a3", "name": "Subject research", "root": "/path/to/subject-campaign"}
+  ],
   "campaigns": [
     {"id": "phase1", "target": "a3", "phase": 1, "name": "A3 Phase 1", "root": "/path/to/phase1/campaign", "control": "/path/to/phase1/control"},
     {"id": "phase2", "target": "a3", "phase": 2, "name": "A3 Phase 2", "root": "/path/to/phase2/campaign", "control": "/path/to/phase2/control"}
