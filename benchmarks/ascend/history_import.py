@@ -192,12 +192,9 @@ def import_history(roots, store):
                     exclusions.append(dict(producer=root.name, project_id=assignment.project_id,
                                            reason=str(error)))
                     continue
-                if verified and raw in published:
-                    found.add(raw)
-                if row['id'] in seen:
-                    continue
-                seen.add(row['id']); attempt_count += 1
                 contract = row['contract_sha256']
+                # Publication belongs to each producer; an unpublished copied
+                # attempt must not hide a later published copy of the same run.
                 if verified:
                     successful.add(contract)
                     if raw in published:
@@ -206,6 +203,10 @@ def import_history(roots, store):
                         candidate = memories.setdefault(key, dict(row, id=key, memory=memory.as_dict()))
                         if row['producer'] not in candidate['attempts']:
                             candidate['attempts'].append(row['producer'])
+                if row['id'] in seen:
+                    continue
+                seen.add(row['id']); attempt_count += 1
+                if verified:
                     continue
                 group = failures.setdefault(contract, dict(row, id=contract))
                 if row['producer'] not in group['attempts']:

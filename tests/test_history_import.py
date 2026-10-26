@@ -172,3 +172,15 @@ def test_published_candidate_needs_retained_actor_log(tmp_path, journal):
         path.write_bytes(b'')
     result = import_history([root], ContentAddressedArtifacts(tmp_path / 'consumer'))
     assert result['memories'] == [] and result['exclusions']
+
+
+@pytest.mark.parametrize('published_first', [False, True])
+def test_unpublished_copy_cannot_hide_published_attempt(tmp_path, published_first):
+    one, copy = tmp_path / 'published', tmp_path / 'unpublished'
+    producer(one);shutil.copytree(one, copy)
+    write(copy / 'state.json', dict(memory_bytes_base64=[]))
+    roots = [one, copy] if published_first else [copy, one]
+    result = import_history(roots, ContentAddressedArtifacts(tmp_path / 'consumer'))
+    assert len(result['memories']) == 1 and result['exclusions'] == []
+    assert result['counts']['attempts'] == 1
+    assert result['memories'][0]['producer']['root'] == 'published'
