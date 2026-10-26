@@ -380,7 +380,8 @@ class MemoryVerifier:
                         status = dict(outcome.observations, timing=timing_summary(spans, arm_epoch,
                             max(0, self.clock()-arm_started), provider_seconds))
                         outcome = SubjectOutcome(outcome.host_verified, outcome.source_sha256,
-                            {**outcome.artifacts, **retained}, status, store.root)
+                            {**outcome.artifacts, **retained, 'result:execution': store.put_json(status)},
+                            status, store.root)
                         evidence = status.get('evidence', {})
                         statuses = [status.get('classification'), status.get('status'), status.get('actor_status')]
                         if isinstance(evidence, dict):

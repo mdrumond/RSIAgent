@@ -369,3 +369,28 @@ def test_abrupt_first_callback_stop_survives_resume_without_peer_dispatch(tmp_pa
     assert result['decision'] == 'inconclusive' and result['validity'] == {'control': False}
     assert result['arms'] == {'control': None}
     assert len(h.calls) == 1 and not h.requests and not (tmp_path / 'treatment').exists()
+
+
+def test_judge_reads_enriched_execution_artifact_with_actual_arm_timing(tmp_path):
+    h = Harness()
+    original = h.verifier.judge.complete
+    inspected = set()
+    def complete(messages, *, remaining_seconds):
+        context = json.loads(messages[1]['content'])
+        read = {row['sha256']:row['text'] for message in messages[2:]
+                if message['role']=='user' and 'sha256' in (row:=json.loads(message['content']))}
+        for name, arm in context['arms'].items():
+            digest = arm['artifacts']['result:execution']
+            if digest not in read:
+                continue
+            result = json.loads(read[digest])
+            assert result['classification']=='host-verified'
+            assert result['timing']['wall_seconds']==1
+            assert result['timing']['unattributed_seconds']==1
+            inspected.add(name)
+        return original(messages, remaining_seconds=remaining_seconds)
+    h.verifier.judge.complete = complete
+    result = evaluate(h, tmp_path)
+    assert result['decision']=='accept' and inspected=={'control','treatment'}
+    assert all(result['arms'][name]['artifacts']['result:execution'] in result['evidence']
+               for name in inspected)
