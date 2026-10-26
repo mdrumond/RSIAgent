@@ -18,7 +18,7 @@ from .control import ControlError, ControlManager
 
 
 def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None,
-               optimizer_launcher=None, curriculum_binder=None, curriculum_restart=None):
+               optimizer_launcher=None, curriculum_binder=None, curriculum_restart=None, curriculum_status=None):
     app = Flask(__name__)
     store = DashboardStore(config_path, cache_path)
     controls = ControlManager(config_path, cache_path, **(
@@ -33,7 +33,7 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     register_subjects(app, config_path)
     from .curriculum_controls import register_curriculum_controls
     register_curriculum_controls(app, config_path, controls, csrf_token,
-                                 binder=curriculum_binder, restart=curriculum_restart)
+                                 binder=curriculum_binder, restart=curriculum_restart, status=curriculum_status)
     from .memory_controls import register_memory_controls
     register_memory_controls(app, config_path, csrf_token)
     last = [0.0]

@@ -10,6 +10,21 @@ from flask import abort, jsonify, render_template, request, Response
 from .store import _json, _source
 
 
+_MAX_LOG_RECORD = 1048576
+
+
+def _line_start(handle, position):
+    """Find the start of the row crossing a tail boundary, including partial rows."""
+    while position:
+        start = max(0, position - 65536)
+        handle.seek(start)
+        boundary = handle.read(position - start).rfind(b'\n')
+        if boundary >= 0:
+            return start + boundary + 1
+        position = start
+    return 0
+
+
 def _inside(root, path):
     return path.resolve().is_relative_to(root.resolve())
 
@@ -128,7 +143,7 @@ class SubjectViews:
         if not isinstance(positions, dict):
             raise ValueError('invalid log cursor')
         root, streams = self.streams(key, pid)
-        events, reset, earlier = [], False, False
+        events, reset_streams, earlier = [], [], False
         for name, path in streams.items():
             with path.open('rb') as handle:
                 size = path.stat().st_size
@@ -140,31 +155,46 @@ class SubjectViews:
                     handle.seek(max(0, offset - 64))
                     actual = hashlib.sha256(handle.read(min(offset, 64))).hexdigest()
                     if offset > size or actual != anchor:
-                        offset, reset = 0, True
+                        offset = 0
+                        reset_streams.append(name)
                 elif cursor is None and size > 65536:
-                    handle.seek(size - 65536)
-                    handle.readline()
-                    offset, earlier = handle.tell(), True
+                    offset = _line_start(handle, size - 65536)
+                    earlier = earlier or offset > 0
                 else:
                     offset = 0
                 handle.seek(offset)
                 while len(events) < limit:
                     start = handle.tell()
-                    line = handle.readline(1048577)
-                    if not line.endswith(b'\n'):
+                    line = handle.readline(_MAX_LOG_RECORD + 1)
+                    complete, length = line.endswith(b'\n'), len(line)
+                    if length > _MAX_LOG_RECORD:
+                        # Skip a complete oversized row in bounded chunks. An
+                        # unfinished row retains its start for the next poll.
+                        while not complete:
+                            chunk = handle.readline(65536)
+                            if not chunk:
+                                break
+                            length += len(chunk)
+                            complete = chunk.endswith(b'\n')
+                    if not complete:
                         handle.seek(start)
                         break
-                    try:
-                        row = json.loads(line)
-                    except (ValueError, UnicodeDecodeError):
-                        row = dict(kind='unreadable', payload='Invalid log record')
+                    if length > _MAX_LOG_RECORD:
+                        row = dict(kind='oversized', payload=dict(bytes=length,
+                            detail='Log record exceeds preview limit; use Download log for full content.'))
+                    else:
+                        try:
+                            row = json.loads(line)
+                        except (ValueError, UnicodeDecodeError):
+                            row = dict(kind='unreadable', payload='Invalid log record')
                     events.append(dict(id=f'{name}:{start}', stream=name, offset=start,
                                        event=self._payload(root, name, row)))
                 offset = handle.tell()
                 handle.seek(max(0, offset - 64))
                 positions[name] = [offset, hashlib.sha256(handle.read(min(offset, 64))).hexdigest()]
         token = base64.urlsafe_b64encode(json.dumps(positions, separators=(',', ':')).encode()).decode()
-        return dict(events=events, cursor=token, reset=reset, earlier=earlier)
+        return dict(events=events, cursor=token, reset=bool(reset_streams),
+                    reset_streams=reset_streams, earlier=earlier)
 
 
 def register_subjects(app, config_path):

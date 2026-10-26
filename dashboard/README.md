@@ -188,6 +188,13 @@ finishes. Completed requests and uncertain executions requiring observation
 cannot be retried from that action. The editable future-work queue excludes
 projects already reserved into a wave, even if they have not started.
 
+Live-log cursors report resets per stream, preserving unaffected entries when
+one writer rotates or truncates its ledger. Complete records larger than 1 MiB
+are replaced by an explicit preview-limit entry; the cursor advances so later
+messages continue to arrive, and the full record remains in the log download.
+Unfinished trailing records retain their start even when larger than the preview
+limit and are consumed only after the writer appends their newline.
+
 ### Manual memory admission
 
 Unpublished subject projects offer **Force merge** when host verification and an

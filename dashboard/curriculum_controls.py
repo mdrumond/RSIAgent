@@ -13,9 +13,9 @@ from .subject_services import bind_subject, configured_subject, subject_editor
 
 
 class CurriculumControls:
-    def __init__(self, config_path, controls, *, binder=bind_subject, restart=None):
+    def __init__(self, config_path, controls, *, binder=bind_subject, restart=None, status=None):
         self.config_path, self.controls = Path(config_path), controls
-        self.binder, self.restart = binder, restart
+        self.binder, self.restart, self.status = binder, restart, status
         controls.handlers['curriculum-preview'] = self.validate_preview, self.preview
         controls.handlers['curriculum-approve'] = self.validate_approval, self.approve
 
@@ -70,18 +70,31 @@ class CurriculumControls:
         path = root / 'dashboard-requests' / (request_id + '.json')
         if not path.exists():
             return None
-        request = json.loads(path.read_bytes())
+        accessor = self.status
+        if accessor is None:
+            from benchmarks.ascend.subject_interaction import request_status
+            accessor = request_status
+        request = accessor(self.config_path, campaign_id, request_id)
+        if request is None:
+            return None
         return {field: request[field] for field in ('id', 'status', 'error', 'additional_seconds',
                 'project_id', 'result') if field in request}
 
     @staticmethod
     def unmerged(root, project):
         state = json.loads((root / 'subject-campaign.json').read_bytes())
-        if project not in state['projects']:
+        pending = (state.get('pending') or {}).get('items', [])
+        record = state['projects'].get(project)
+        if record is None and not any(item['project_id'] == project for item in pending):
             raise ControlError('unknown restart project')
         active = json.loads((root / 'memory/active.json').read_bytes())
-        if project in active.get('admissions', {}):
+        admitted = {project, (record or {}).get('manual_review_id', project)}
+        if admitted & active.get('admissions', {}).keys():
             raise ControlError('project has already been merged into memory')
+        for version in active.get('active', {}).values():
+            memory = json.loads((root / 'memory/versions' / (version + '.json')).read_bytes())
+            if memory.get('provenance', {}).get('project_id') == project:
+                raise ControlError('project has already been merged into memory')
 
     def validate_preview(self, payload):
         entry, root = self.entry(payload)
@@ -116,10 +129,17 @@ class CurriculumControls:
             from benchmarks.ascend.subject_editing import validate_project
             from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
             def validate(item):
-                validate_project(item)
-                if item.get('task', {}).get('kind') == 'optimizer':
-                    if service.entry['target'] == 'a5':
-                        raise ValueError('A5 optimizer projects are unsupported')
+                if not isinstance(item, dict):
+                    raise ValueError('project must be an object')
+                actor = service.bound.get('actor')
+                runtime = getattr(getattr(actor, 'executor', None), 'runtime_identity', None)
+                task = item.get('task') or {}
+                if isinstance(task, dict) and task.get('kind') == 'target' and runtime is None:
+                    raise ValueError('qualified target requires the observed composed runtime')
+                validate_project(item, runtime=runtime, policy=service.policy)
+                if task.get('kind') == 'optimizer':
+                    if service.entry['target'] == 'a5' or service.settings.get('optimizer_worker_config') is None:
+                        raise ValueError('optimizer projects are unavailable for this campaign runtime')
                 else:
                     service.policy.admit(ProjectSpec.from_mapping(item['spec']))
                 return item
@@ -146,9 +166,9 @@ class CurriculumControls:
         return dict(proposal=proposal)
 
 
-def register_curriculum_controls(app, config_path, controls, csrf_token, *, binder=None, restart=None):
+def register_curriculum_controls(app, config_path, controls, csrf_token, *, binder=None, restart=None, status=None):
     options = {} if binder is None else dict(binder=binder)
-    service = CurriculumControls(config_path, controls, restart=restart, **options)
+    service = CurriculumControls(config_path, controls, restart=restart, status=status, **options)
     app.extensions['dashboard_curriculum_controls'] = service
 
     @app.context_processor

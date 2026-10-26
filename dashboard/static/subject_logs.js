@@ -1,3 +1,9 @@
+function updateActorLogEntries(entries, page) {
+  const resetStreams = new Set(page.reset_streams || []);
+  for (const [id, row] of entries) if (resetStreams.has(row.stream)) entries.delete(id);
+  page.events.forEach(row => entries.set(row.id, row));
+}
+
 document.querySelectorAll('[data-live-logs]').forEach(section => {
   const output = section.querySelector('[data-log-output]');
   const status = section.querySelector('[data-log-status]');
@@ -14,8 +20,7 @@ document.querySelectorAll('[data-live-logs]').forEach(section => {
       const response = await fetch(section.dataset.liveLogs + query);
       if (!response.ok) throw new Error(`Log unavailable (${response.status}); retrying`);
       const page = await response.json();
-      if (page.reset) entries.clear();
-      page.events.forEach(row => entries.set(row.id, row));
+      updateActorLogEntries(entries, page);
       if (old) history = page.cursor; else cursor = page.cursor;
       output.textContent = [...entries.values()].sort((a, b) => a.stream.localeCompare(b.stream) || a.offset - b.offset)
         .map(row => `${row.stream}\n${JSON.stringify(row.event, null, 2)}`).join('\n\n');
