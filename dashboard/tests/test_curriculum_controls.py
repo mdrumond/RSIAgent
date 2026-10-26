@@ -47,10 +47,13 @@ def application(setup, responses, restart=None):
         def complete(role, messages, **limits):
             calls.append((role, messages, limits))
             return json.dumps(next(values))
-        yield SimpleNamespace(root=root, entry=dict(target='a3'), complete=complete,
+        yield SimpleNamespace(root=root, entry=dict(target='a3'), complete=complete, bound={},
                               policy=SimpleNamespace(admit=lambda _: None, grammar=lambda grammar: grammar))
+    def status(config_path, campaign_id, identifier):
+        path = root / 'dashboard-requests' / (identifier + '.json')
+        return json.loads(path.read_bytes()) if path.exists() else None
     return create_app(config, root.parent / 'cache.sqlite', curriculum_binder=binder,
-                      curriculum_restart=restart), calls
+                      curriculum_restart=restart, curriculum_status=status), calls
 
 
 def submit(client, action, payload, key):
@@ -240,5 +243,96 @@ def test_restart_reconcile_affordance_follows_retained_execution_state(setup):
         for status in ('succeeded', 'observation-required'):
             path.write_bytes(canonical(dict(id=identifier, status=status, additional_seconds=60)))
             assert Actions(client.get(page).get_data(as_text=True)).approvals == []
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_reserved_unstarted_project_reaches_curriculum_restart_preview(setup):
+    config, root, scheduler = setup
+    pending = item('reserved')
+    state = dict(projects={}, waves=[], pending=dict(wave_id='wave-reserved',
+        subject=Subject('current', 'Current').as_dict(), projects=['reserved'], items=[pending],
+        memory_sha256='a' * 64))
+    (root / 'subject-campaign.json').write_bytes(canonical(state))
+    scheduler.start_wave('wave-reserved', 'a' * 64)
+    reviewed = dict(item=item('fresh'), instruction='Inspect the physical tail.')
+    app, calls = application(setup, [reviewed])
+    client = app.test_client()
+    try:
+        assert client.get('/campaign/research/project/reserved').status_code == 200
+        response = submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='restart', project_id='reserved', instructions='Review the prompt', format_seconds=10), 'pending')
+        result = settled(app, response)
+        assert result['status'] == 'succeeded', result
+        assert result['result']['project'] == 'reserved'
+        assert result['result']['before']['plan'] == pending
+        assert len(calls) == 1
+        assert json.loads((root / 'subject-campaign.json').read_bytes()) == state
+        active = json.loads((root / 'memory/active.json').read_bytes())
+        active['admissions']['reserved'] = dict(version='b' * 64)
+        (root / 'memory/active.json').write_bytes(canonical(active))
+        assert submit(client, 'curriculum-preview', dict(campaign_id='research', kind='restart',
+            project_id='reserved', instructions='Do not rerun merged work', format_seconds=10), 'merged').status_code == 409
+        assert len(calls) == 1
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_restart_status_uses_authoritative_accessor_without_dispatch(setup):
+    config, root, _ = setup
+    app, _ = application(setup, [dict(item=item('retry'), instruction='Inspect padding.')])
+    client = app.test_client()
+    try:
+        proposal = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='restart', project_id='original', instructions='Fix prompt', format_seconds=10), 'p'))['result']
+        from dashboard.subject_services import subject_editor
+        subject_editor(root).approve(proposal['id'])
+        identifier = hashlib.sha256(('curriculum-restart:' + proposal['id']).encode()).hexdigest()[:32]
+        path = root / 'dashboard-requests' / (identifier + '.json')
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(canonical(dict(id=identifier, status='running', additional_seconds=60)))
+        calls = []
+        def authoritative(config_path, campaign_id, request_id):
+            calls.append((config_path, campaign_id, request_id))
+            return dict(id=request_id, status='observation-required', additional_seconds=60)
+        service = app.extensions['dashboard_curriculum_controls']
+        service.status = authoritative
+        service.restart = lambda *args: pytest.fail('status read must never dispatch a restart')
+        result = client.get('/api/curriculum/research/proposals/' + proposal['id'] + '/restart')
+        assert result.get_json()['request']['status'] == 'observation-required'
+        assert calls == [(config, 'research', identifier)]
+        assert app.extensions['dashboard_controls'].recent()[0]['action'] == 'curriculum-preview'
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_target_preview_checks_observed_runtime_before_accepting_qualification(setup, monkeypatch):
+    from test_ascend_phase2_targets import qualified, RUNTIME
+    from benchmarks.ascend.targets import a3_curriculum_policy
+    from copy import deepcopy
+    config, root, _ = setup
+    target, artifacts, _ = qualified(root.parent / 'qualification')
+    plan = dict(project_id=target.spec.project_id, spec=target.spec.as_dict(), repairs=[],
+        task=dict(kind='target', contract=target.as_dict(), artifact_root=str(artifacts.root)))
+    changed = deepcopy(plan)
+    changed['task']['contract']['runtime']['device'] = 'wrong-device'
+    responses, calls = iter([changed, plan]), []
+    @contextmanager
+    def binder(*args, **kwargs):
+        def complete(role, messages, **options):
+            calls.append(messages)
+            return json.dumps([dict(subject_id='current', item=next(responses))])
+        yield SimpleNamespace(root=root, entry=dict(target='a3'), complete=complete,
+            bound=dict(actor=SimpleNamespace(executor=SimpleNamespace(runtime_identity=dict(RUNTIME)))),
+            policy=a3_curriculum_policy())
+    app = create_app(config, root.parent / 'target-cache.sqlite', curriculum_binder=binder)
+    client = app.test_client()
+    try:
+        result = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='projects', instructions='Use the qualified reference', format_seconds=10), 'target'))
+        assert result['status'] == 'succeeded', result
+        assert len(calls) == 2
+        assert result['result']['after'][0]['item'] == plan
+        assert app.extensions['dashboard_subjects'].campaign('research')['project_queue'] == []
     finally:
         app.extensions['dashboard_controls'].close()
