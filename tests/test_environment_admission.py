@@ -104,3 +104,30 @@ def test_unpinned_dependency_blocks_probe(tmp_path,monkeypatch):
     with pytest.raises(ProjectInfrastructureError,match='requires pinned'):
         admission(lambda:100)
     assert not probes
+
+
+@pytest.mark.parametrize('registry_root', [None, '/owned'])
+def test_first_health_uses_existing_registry_root_before_any_bundle_upload(tmp_path,registry_root):
+    import subprocess
+    from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
+    queries={kind:{'exit':0,'text':text} for kind,text in {'health':'Health Status : OK',
+        'ecc':'Errors : 0','memory':'HBM','usages':'HBM Usage Rate(%) : 0',
+        'proc-mem':'No process in device','board':'Chip Name : Ascend910\nNPU Name : 9362'}.items()}
+    report={'queries':queries,'compiler':'pinned','versions':{},'toolkit':None}
+    calls=[]
+    def cpl(argv,**kwargs):
+        calls.append(argv)
+        action=argv[2]
+        if action=='run':
+            assert argv[argv.index('--cwd')+1]=='.'
+            value={'state':'completed','handle':'remote:fixture:job:health','exit':0}
+        else:
+            assert action=='logs'
+            value={'handle':'remote:fixture:job:health','content':json.dumps(report) if argv[argv.index('--stream')+1]=='stdout' else ''}
+        return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
+    transport=CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
+        remote_workspace='/owned/not-created-yet',registry_workspace=registry_root,
+        physical_device=0,state_directory=tmp_path/'transport',process_runner=cpl)
+    actual,_=module.fresh_health(transport,tmp_path)
+    assert actual['product']=='Ascend910_9362'
+    assert [argv[2] for argv in calls]==['run','logs','logs']
