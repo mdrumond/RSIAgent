@@ -164,3 +164,18 @@ def test_full_native_worker_arm_copies_keep_registered_route_and_isolation(tmp_p
     assert [row['target'] for row in routes] == ['a3-product']*3
     assert routes[1]['remote_workspace'] != routes[2]['remote_workspace']
     assert routes[1]['runtime'] == routes[2]['runtime'] == 'py312-torch'
+
+
+@pytest.mark.parametrize('error_name, expected', [('PiCancelled','operator-stop'),('PiDeadlineError','operator-stop'),('PiProviderError',None)])
+def test_actual_stop_marks_cancellation_but_preserves_provider_failure(tmp_path,monkeypatch,error_name,expected):
+    from coding.pi import rpc
+    bound,_=compose(tmp_path,monkeypatch)
+    actor=bound['actor']
+    error=getattr(rpc,error_name)('retained error')
+    def fail(self,request):
+        (tmp_path/'STOP').touch()
+        raise error
+    monkeypatch.setattr(type(actor._wrapped),'__call__',fail)
+    with pytest.raises(type(error)):
+        actor(request(tmp_path))
+    assert getattr(error,'interruption_reason',None)==expected
