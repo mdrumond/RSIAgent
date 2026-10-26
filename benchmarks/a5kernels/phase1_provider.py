@@ -496,11 +496,17 @@ class DirectActorDriver:
         for message in messages:
             self._trace("message", message)
         working = WorkingContext(messages)
+        from benchmarks.ascend.actor_control import ActorConversation, ActorStopped
+        conversation = ActorConversation(workspace, instruction, working, action_executor)
         tokens = 0
-        turn = 0
+        turn = conversation.turn
         ordinary_turns = 0
         deadline = self.clock() + self.max_seconds
         while self.clock() < deadline:
+            try:
+                conversation.boundary()
+            except ActorStopped:
+                return ActorOutcome('user-stopped', turn, tokens)
             turn += 1
             messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
             tokens += summary_tokens
@@ -515,6 +521,11 @@ class DirectActorDriver:
             messages.append({"role": "assistant", "content": completion.text})
             working.append(messages[-1])
             self._trace("message", messages[-1])
+            if conversation.control.pending():
+                working.append({'role': 'user', 'content':
+                    'The preceding proposed action was not executed because user input arrived.'})
+                conversation.save(turn)
+                continue
             action = turn_parser(completion.text)
             if action is None:
                 observation = json.dumps({
@@ -544,6 +555,7 @@ class DirectActorDriver:
                     messages.append({"role": "user", "content": observation})
                     working.append(messages[-1])
                     self._trace("message", messages[-1])
+                    conversation.save(turn)
                     self._trace("terminal", {
                         "status": outcome.status,
                         "admitted_artifacts": dict(outcome.admitted_artifacts),
@@ -558,6 +570,7 @@ class DirectActorDriver:
             messages.append({"role": "user", "content": observation})
             working.append(messages[-1])
             self._trace("message", messages[-1])
+            conversation.save(turn)
             if action is None:
                 ordinary_turns += 1
         self._trace("terminal", {"status": "time-budget-exhausted"})

@@ -85,11 +85,12 @@ class SubjectScheduler:
         self.subjects = _subjects(subjects)
         self.identities = [row.as_dict() for row in self.subjects]
         self.index = {row.subject_id: i for i, row in enumerate(self.subjects)}
+        requested = self.identities
         with self._transaction() as state:
             if not state:
                 state.update(schema='ascend-subjects-v1', subjects=self.identities,
                              frontier=0, current=0, waves={}, repairs={}, reviews={}, decisions=[])
-            elif state.get('schema') != 'ascend-subjects-v1' or state.get('subjects') != self.identities:
+            elif state.get('schema') != 'ascend-subjects-v1' or requested not in (state.get('subjects'), state.get('original_subjects')):
                 raise ValueError('retained subject configuration changed')
 
     @contextmanager
@@ -97,8 +98,68 @@ class SubjectScheduler:
         with (self.root / '.subjects.lock').open('a+b') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = json.loads(self.path.read_bytes()) if self.path.exists() else {}
+            if state.get('subjects'):
+                self._bind(state['subjects'])
             yield state
             atomic(self.path, canonical(state))
+            if state.get('subjects'):
+                self._bind(state['subjects'])
+
+    def _bind(self, rows):
+        self.subjects = _subjects(rows)
+        self.identities = [row.as_dict() for row in self.subjects]
+        self.index = {row.subject_id: i for i, row in enumerate(self.subjects)}
+
+    def edit(self, kind, value, *, expected, proposal_id):
+        """Apply an approved edit without changing reached subjects or reserved waves."""
+        from .subject_memory import digest
+        with self._transaction() as state:
+            if proposal_id in state.get('edits', {}):
+                return state['edits'][proposal_id]
+            if digest(state) != expected:
+                raise ValueError('curriculum proposal is stale; preview again')
+            if kind == 'subjects':
+                rows = [row.as_dict() for row in _subjects(value)]
+                protected = min(len(self.subjects), state['frontier'] + 1)
+                if rows[:protected] != state['subjects'][:protected]:
+                    raise ValueError('active and reached subjects cannot be edited')
+                ids = {row['subject_id'] for row in rows}
+                if any(row['subject_id'] not in ids for row in state.get('project_queue', [])):
+                    raise ValueError('remove queued projects before removing their subject')
+                state.setdefault('original_subjects', state['subjects'])
+                state['subjects'] = rows
+                if state['current'] is None and state['frontier'] < len(rows):
+                    state['current'] = state['frontier']
+            elif kind == 'projects':
+                if any(row['subject_id'] not in self.index for row in value):
+                    raise ValueError('queued project names an unknown subject')
+                reserved = {row['item']['project_id'] for rows in state.get('claimed_projects', {}).values()
+                            for row in rows}
+                if any(row['item']['project_id'] in reserved for row in value):
+                    raise ValueError('project is already reserved for execution')
+                state['project_queue'] = value
+            else:
+                raise ValueError('unknown curriculum edit')
+            receipt = dict(proposal_id=proposal_id, revision=state.get('revision', 0) + 1)
+            state['revision'] = receipt['revision']
+            state.setdefault('edits', {})[proposal_id] = receipt
+            return receipt
+
+    def claim_projects(self, wave_id):
+        """Reserve a queued wave once; repeat after interruption returns the same plans."""
+        with self._transaction() as state:
+            claimed = state.setdefault('claimed_projects', {})
+            if wave_id in claimed:
+                return [row['item'] for row in claimed[wave_id]]
+            if state['current'] is None:
+                return []
+            subject_id = self.subjects[state['current']].subject_id
+            rows = [row for row in state.get('project_queue', []) if row['subject_id'] == subject_id]
+            if not rows:
+                return []
+            claimed[wave_id] = rows
+            state['project_queue'] = [row for row in state['project_queue'] if row['subject_id'] != subject_id]
+            return [row['item'] for row in rows]
 
     def state(self):
         with self._transaction() as state:

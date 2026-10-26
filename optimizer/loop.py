@@ -334,6 +334,18 @@ class OptimizationLoop:
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        from benchmarks.ascend.actor_control import ActorControl, ActorStopped
+        control = ActorControl(self.directory.parent)
+        checkpoint = control.status()['checkpoint'] or {}
+        feedback = checkpoint.get('feedback', self.state.get('user_feedback', []))
+        self.state['user_feedback'] = feedback
+        try:
+            control.boundary({'turn': self.state['turn'], 'feedback': feedback}, feedback)
+        except ActorStopped:
+            self.store.stop(self.key)
+            return None
+        self._save()
+        context['user_feedback'] = feedback
         # History can be paged as a whole by the coding context layer. Keep the
         # latest bounded knowledge response readable independently of that list.
         for entry in reversed(self.state['history']):
@@ -385,7 +397,14 @@ class OptimizationLoop:
                 if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
                     record = self._artifact('context-' + key, context[key])
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
-        return self._action(stage, lambda: self.agent.complete(stage, context, self._record))
+        value = self._action(stage, lambda: self.agent.complete(stage, context, self._record))
+        if value is not None and control.pending():
+            # A redirection arriving in flight supersedes this unexecuted action.
+            self.state.pop('model_action', None)
+            self.state.pop('action_result', None)
+            self._save()
+            return self._model(stage, context)
+        return value
 
     def _tool(self, action, snapshot):
         # Model request mistakes are feedback, not evidence/transport failures.
