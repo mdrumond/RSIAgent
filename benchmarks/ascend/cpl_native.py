@@ -219,6 +219,8 @@ class CplNativeCandidateBackend:
         arguments = ('run', self.target, '--runtime', self.runtime,
                      '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
         value = self._operation(key, arguments, kind='job', expires_at=payload['expires_at'])
+        if value['returncode'] == 124:
+            raise _PendingObservation('CPL command execution allocation expired; retained handle '+value['handle'])
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
         result.job_handle = value['handle']
         return result

@@ -309,3 +309,22 @@ def test_terminal_collection_uses_one_bounded_read_only_allocation(tmp_path):
         candidate.run_remote(('true',), key='compile')
     assert len([c for c in remote.calls if c[2] == 'logs']) == 1
     assert not any(c[2] == 'cancel' for c in remote.calls)
+
+
+@pytest.mark.parametrize('stage', ['compile', 'execute'])
+def test_deadline_exit_is_infrastructure_interruption_not_candidate_failure(tmp_path, stage):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    compilation = candidate.compile(plan, tmp_path/'bundle') if stage == 'execute' else None
+    remote.exit_code = 124
+    for _ in range(2):
+        with pytest.raises(_PendingObservation, match='execution allocation expired'):
+            if stage == 'compile':
+                candidate.compile(plan, tmp_path/'bundle')
+            else:
+                candidate.execute_receipt(compilation)
+    submits = [call for call in remote.calls if call[2] == 'run']
+    assert len(submits) == (2 if stage == 'execute' else 1)
+    operation = candidate.root/plan.execution_id/stage/'operation.json'
+    assert json.loads(operation.read_text())['result']['returncode'] == 124
