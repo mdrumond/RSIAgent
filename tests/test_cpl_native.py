@@ -159,7 +159,8 @@ def test_queue_expiry_cancels_owned_handle_without_resubmitting(tmp_path):
     def delayed(argv, **options):
         if argv[2] == 'observe':
             remote.calls.append(argv)
-            now[0] += 11
+            if '--wait' in argv:
+                now[0] += 11
             return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='queued', handle=argv[3])), '')
         if argv[2] == 'cancel':
             remote.calls.append(argv)
@@ -216,3 +217,95 @@ def test_compile_from_two_directories_then_measurement_reuses_canonical_bundle(t
     assert result['summary']['median_us'] == 11
     assert len([call for call in remote.calls if call[2] == 'upload']) == 1
     assert len([call for call in remote.calls if call[2] == 'run']) == 3
+
+
+def test_compile_error_returned_when_terminal_poll_crosses_deadline(tmp_path):
+    now = [1000.]
+    remote = Remote()
+    remote.exit_code = 1
+    def compiler_error(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'observe':
+            now[0] += 11
+        if argv[2] == 'logs':
+            stream = argv[argv.index('--stream')+1]
+            result.stdout = json.dumps(dict(handle=argv[3], content=(
+                'A3CANDIDATE_COMPILE_FAILED=1' if stream == 'stdout' else
+                "candidate.cpp: error: no matching function for call to 'Mul'")))
+        return result
+    candidate = backend(tmp_path, compiler_error, timeout=10,
+                        clock=lambda: now[0], wall_clock=lambda: now[0])
+    result = candidate.compile(smoke_plan(target='discovered-a3', arch='discovered-arch'), tmp_path/'bundle')
+    assert result.error_type == 'NativeCompileError'
+    assert "no matching function for call to 'Mul'" in result.detail
+    assert not any(call[2] == 'cancel' for call in remote.calls)
+    assert len([call for call in remote.calls if call[2] == 'run']) == 1
+
+
+def test_expired_retained_job_is_observed_before_cancellation(tmp_path):
+    now = [1000.]
+    remote = Remote()
+    remote.unavailable = True
+    candidate = backend(tmp_path, remote, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(('false',), key='compile')
+    now[0] += 20
+    remote.exit_code = 1
+    result = candidate.run_remote(('false',), key='compile')
+    assert result.returncode == 1
+    assert len([call for call in remote.calls if call[2] == 'run']) == 1
+    assert not any(call[2] == 'cancel' for call in remote.calls)
+    assert result.job_handle == 'remote:fixture:job:1'
+
+
+def test_terminal_streams_resume_after_elapsed_parent_and_log_disconnect(tmp_path):
+    remaining = [100.]
+    remote = Remote()
+    failed = [False]
+    def disconnected_stderr(argv, **options):
+        if argv[2] == 'logs' and argv[argv.index('--stream')+1] == 'stderr' and not failed[0]:
+            failed[0] = True
+            remaining[0] = 0
+            raise subprocess.TimeoutExpired(argv, 1)
+        return remote(argv, **options)
+    candidate = backend(tmp_path, disconnected_stderr, remaining_seconds=lambda: remaining[0])
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(('true',), key='compile')
+    record = json.loads((candidate.root/'compile/operation.json').read_text())
+    assert record['terminal_result']['returncode'] == 0
+    assert 'stdout' in record['terminal_result']
+    result = candidate.run_remote(('true',), key='compile')
+    assert result.returncode == 0
+    assert len([c for c in remote.calls if c[2] == 'run']) == 1
+    assert len([c for c in remote.calls if c[2] == 'logs' and c[c.index('--stream')+1] == 'stdout']) == 1
+
+
+def test_expiry_observation_rejects_foreign_handle_without_cancelling(tmp_path):
+    now = [1000.]
+    remote = Remote()
+    remote.unavailable = True
+    candidate = backend(tmp_path, remote, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(('true',), key='compile')
+    now[0] += 20
+    def foreign(argv, **options):
+        return subprocess.CompletedProcess(argv, 0, json.dumps(dict(handle='remote:other:job:1', state='failed', exit=1)), '')
+    candidate._run = foreign
+    with pytest.raises(ProjectInfrastructureError, match='foreign'):
+        candidate.run_remote(('true',), key='compile')
+    assert not any(c[2] == 'cancel' for c in remote.calls)
+
+
+def test_terminal_collection_uses_one_bounded_read_only_allocation(tmp_path):
+    now = [1000.]
+    remote = Remote()
+    def slow_logs(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'logs':
+            now[0] += 11
+        return result
+    candidate = backend(tmp_path, slow_logs, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
+    with pytest.raises(_PendingObservation, match='terminal result collection pending'):
+        candidate.run_remote(('true',), key='compile')
+    assert len([c for c in remote.calls if c[2] == 'logs']) == 1
+    assert not any(c[2] == 'cancel' for c in remote.calls)

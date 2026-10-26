@@ -81,20 +81,45 @@ class CplNativeCandidateBackend:
             if record['state'] != 'new':
                 raise ProjectInfrastructureError('retained operation lacks frozen elapsed expiry; inspect its handle')
             record['expires_at'] = expires_at if expires_at is not None else self.wall_clock()+self._allowance()
-        def check_expiry():
-            expired = self.wall_clock() >= record['expires_at']
-            expired |= self.remaining_seconds is not None and self.remaining_seconds() <= 0
-            if not expired:
-                return
-            if kind == 'job' and record.get('handle') and record['state'] not in ('completed', 'failed', 'cancelled'):
-                cancelled = self._call(('cancel', record['handle']), seconds=min(30, self.timeout))
-                if cancelled.get('handle') != record['handle']:
-                    raise ProjectInfrastructureError('CPL cancellation returned a foreign handle')
-                record.update(state=cancelled.get('state'), cancel_requested=True)
+        terminal = ('completed', 'failed', 'cancelled')
+
+        def expired():
+            return (self.wall_clock() >= record['expires_at'] or
+                    self.remaining_seconds is not None and self.remaining_seconds() <= 0)
+
+        def recover_expiry():
+            # Execution stops at expiry; allow only bounded observation/cleanup.
+            # A failed compiler may already have exited before the final poll.
+            cleanup_deadline = self.clock() + min(30, self.timeout)
+            def cleanup_call(arguments):
+                seconds = cleanup_deadline-self.clock()
+                if seconds <= 0:
+                    raise _PendingObservation('CPL expiry observation unavailable; retained handle '+str(record.get('handle')))
+                return self._call(arguments, seconds=seconds)
+            if kind == 'job' and record.get('handle') and record['state'] not in terminal:
+                observed = cleanup_call(('observe', record['handle']))
+                if observed.get('handle') != record['handle']:
+                    raise ProjectInfrastructureError('CPL observation returned a foreign handle')
+                record['state'] = observed.get('state')
+                _save(path, record)
+                if record['state'] in ('completed', 'failed'):
+                    return self._finish_operation(path, record, observed, kind)
+                if record['state'] != 'cancelled':
+                    cancelled = cleanup_call(('cancel', record['handle']))
+                    if cancelled.get('handle') != record['handle']:
+                        raise ProjectInfrastructureError('CPL cancellation returned a foreign handle')
+                    record.update(state=cancelled.get('state'), cancel_requested=True)
+                    _save(path, record)
+                    if record['state'] in ('completed', 'failed'):
+                        return self._finish_operation(path, record, cancelled, kind)
+            elif record['state'] in ('completed', 'failed'):
+                return self._finish_operation(path, record, dict(state=record['state'], handle=record.get('handle')), kind)
             record['expired'] = True
             _save(path, record)
             raise _PendingObservation('CPL elapsed allocation expired; retained handle '+str(record.get('handle')))
-        check_expiry()
+
+        if expired():
+            return recover_expiry()
         deadline = self.clock() + min(self._allowance(), record['expires_at']-self.wall_clock())
         if not record.get('handle'):
             if record['state'] != 'new':
@@ -111,8 +136,9 @@ class CplNativeCandidateBackend:
             _save(path, record)
         else:
             value = dict(state=record['state'], handle=record['handle'])
-        while value.get('state') not in ('completed', 'failed', 'cancelled'):
-            check_expiry()
+        while value.get('state') not in terminal:
+            if expired():
+                return recover_expiry()
             if not record.get('handle') or self.clock() >= deadline:
                 raise _PendingObservation('CPL operation pending; retain and observe '+str(record.get('handle')))
             try:
@@ -120,30 +146,47 @@ class CplNativeCandidateBackend:
                                     str(max(1, min(30, int(deadline-self.clock()))))),
                                    seconds=max(.001, deadline-self.clock()))
             except _PendingObservation:
-                check_expiry()
+                if expired():
+                    return recover_expiry()
                 raise
             if value.get('handle') != record['handle']:
                 raise ProjectInfrastructureError('CPL observation returned a foreign handle')
             record['state'] = value.get('state')
             _save(path, record)
-        check_expiry()
+        return self._finish_operation(path, record, value, kind)
+
+    def _finish_operation(self, path, record, value, kind):
+        # Result collection cannot dispatch work or extend its frozen expiry.
+        # Checkpoint each stream so a disconnect never loses compiler feedback.
+        deadline = self.clock() + min(30, self.timeout)
+        def collect(arguments):
+            seconds = deadline-self.clock()
+            if seconds <= 0:
+                raise _PendingObservation('CPL terminal result collection pending; retained handle '+str(record.get('handle')))
+            return self._call(arguments, seconds=seconds)
         if kind == 'transfer':
             if value.get('state') != 'completed':
                 raise ProjectInfrastructureError('CPL upload did not complete')
             result = value
         else:
-            if not record.get('handle') or type(value.get('exit')) is not int:
-                # A resumed terminal handle needs its final exit status fetched.
-                value = self._call(('result', record['handle']), seconds=self._allowance())
-            if value.get('handle') != record.get('handle') or type(value.get('exit')) is not int:
-                raise ProjectInfrastructureError('CPL terminal result lacks its authenticated exit status')
-            result = dict(handle=record['handle'], returncode=value['exit'])
+            if value.get('state') == 'cancelled':
+                raise _PendingObservation('CPL elapsed allocation expired; retained cancelled handle '+str(record.get('handle')))
+            result = record.setdefault('terminal_result', dict(handle=record.get('handle')))
+            if 'returncode' not in result:
+                if type(value.get('exit')) is not int:
+                    value = collect(('result', record['handle']))
+                if value.get('handle') != record.get('handle') or type(value.get('exit')) is not int:
+                    raise ProjectInfrastructureError('CPL terminal result lacks its authenticated exit status')
+                result['returncode'] = value['exit']
+                _save(path, record)
             for stream in ('stdout', 'stderr'):
-                logs = self._call(('logs', record['handle'], '--stream', stream, '--tail', '1000000'),
-                                  seconds=self._allowance())
+                if stream in result:
+                    continue
+                logs = collect(('logs', record['handle'], '--stream', stream, '--tail', '1000000'))
                 if logs.get('handle') != record['handle'] or not isinstance(logs.get('content'), str):
                     raise ProjectInfrastructureError('CPL logs returned a foreign or invalid result')
                 result[stream] = logs['content']
+                _save(path, record)
         record['result'] = result
         _save(path, record)
         return result
