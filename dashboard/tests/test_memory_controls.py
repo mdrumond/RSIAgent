@@ -48,14 +48,25 @@ def retained(tmp_path):
     return services, record, proposal, scheduler
 
 
-def test_manual_override_preserves_verification_and_original_verdict_and_replays(retained):
+@pytest.mark.parametrize('review_id', ['p', 'p-manual-request'])
+def test_manual_override_preserves_verification_and_original_verdict_and_replays(retained, review_id):
     services, record, proposal, scheduler = retained
-    job = dict(review_id='p', status='rejected', evaluations=[dict(decision='reject', reason='No transfer gain')])
-    write(services.root / 'memory-reviews' / digest('p') / 'job.json', job)
+    if review_id != 'p':
+        record['manual_review_id'] = review_id
+        state = json.loads((services.root / 'subject-campaign.json').read_bytes())
+        state['projects']['p'] = record
+        write(services.root / 'subject-campaign.json', state)
+        scheduler.start_wave('manual-wave', 'b' * 64)
+        scheduler.complete_wave('manual-wave', [review_id])
+        scheduler.resolve_review(review_id, 'rejected')
+    job = dict(review_id=review_id, status='rejected', evaluations=[dict(decision='reject', reason='No transfer gain')])
+    write(services.root / 'memory-reviews' / digest(review_id) / 'job.json', job)
     receipt = force_merge(services, 'p', 'Useful for a future teaching example', 'manual-1')
     memory = services.knowledge.memory_getter()
     accepted = memory.records()[0]
     assert accepted['proposal'] == proposal
+    assert accepted['provenance']['project_id'] == 'p'
+    assert accepted['provenance']['review_id'] == review_id
     assert accepted['provenance']['manual_override']['original_admission_status'] == 'rejected'
     assert accepted['provenance']['manual_override']['original_evaluations'] == job['evaluations']
     assert force_merge(services, 'p', 'Useful for a future teaching example', 'manual-1') == receipt
@@ -63,11 +74,16 @@ def test_manual_override_preserves_verification_and_original_verdict_and_replays
     with pytest.raises(ValueError, match='different feedback'):
         force_merge(services, 'p', 'Changed reason', 'manual-1')
     with memory.transaction() as state:
-        override = state['manual_overrides']['p']
-    scheduler.override_review('p', override)
-    assert scheduler.state()['reviews']['p']['original_status'] == 'rejected'
-    assert scheduler.state()['reviews']['p']['status'] == 'accepted'
+        override = state['manual_overrides'][review_id]
+    scheduler.override_review(review_id, override)
+    assert scheduler.state()['reviews'][review_id]['original_status'] == 'rejected'
+    assert scheduler.state()['reviews'][review_id]['status'] == 'accepted'
     assert record['outcome']['host_verified'] is True
+    from dashboard.subjects import SubjectViews
+    config = services.root / 'projection.json'
+    write(config, dict(subject_campaigns=[dict(id='research', target='a3', root=str(services.root))]))
+    _, projected = SubjectViews(config).project('research', 'p')
+    assert projected['merged'] is True and projected['memory_admission'] == 'manually-accepted'
 
 
 def test_force_merge_refuses_failed_host_stale_bases_and_missing_evidence(retained):
@@ -95,8 +111,17 @@ def test_force_merge_refuses_failed_host_stale_bases_and_missing_evidence(retain
         reviewed_record(root, 'p')
 
 
-def test_late_background_rejection_cannot_undo_manual_publication(retained):
-    services, record, proposal, _ = retained
+@pytest.mark.parametrize('review_id', ['p', 'p-manual-request'])
+def test_late_background_rejection_cannot_undo_manual_publication(retained, review_id):
+    services, record, proposal, scheduler = retained
+    if review_id != 'p':
+        record['manual_review_id'] = review_id
+        state = json.loads((services.root / 'subject-campaign.json').read_bytes())
+        state['projects']['p'] = record
+        write(services.root / 'subject-campaign.json', state)
+        scheduler.start_wave('manual-wave', 'b' * 64)
+        scheduler.complete_wave('manual-wave', [review_id])
+        scheduler.resolve_review(review_id, 'rejected')
     started, release = threading.Event(), threading.Event()
     class Evaluation:
         def evaluate(self, *args, **options):
@@ -107,25 +132,25 @@ def test_late_background_rejection_cannot_undo_manual_publication(retained):
         raise AssertionError('manual override must prevent new rewrite work')
     gate = MemoryAdmission(services.root / 'memory-reviews', services.knowledge.memory_getter(), Evaluation(), forbidden)
     try:
-        gate.submit('p', proposal, {}, record['review_request'], remaining_seconds=30)
+        gate.submit(review_id, proposal, {}, record['review_request'], remaining_seconds=30)
         assert started.wait(5)
         receipt = force_merge(services, 'p', 'Retain independently useful example', 'late')
         release.set()
         gate.wait(remaining_seconds=5)
         settled = gate.poll(remaining_seconds=5)[0]
         assert settled['outcome'] == 'accepted' and settled['manual_override']['admission'] == receipt
-        job = json.loads(gate._path('p').read_bytes())
+        job = json.loads(gate._path(review_id).read_bytes())
         assert job['evaluations'][0]['decision'] == 'reject' and job['status'] == 'accepted'
         assert services.knowledge.memory_getter().records()[0]['proposal'] == proposal
         from benchmarks.ascend.subject_campaign import SubjectCampaign
         campaign = SubjectCampaign(services.root, [Subject('movement', 'Copies', 1)], b'initial',
             select_wave=None, execute=None, verifier=None, complete=None, memory_gate=gate)
-        campaign.state['memory_reviews'] = {'p': dict(outcome='rejected', subject_id='movement', sequence=1)}
+        campaign.state['memory_reviews'] = {review_id: dict(outcome='rejected', subject_id='movement', sequence=1)}
         campaign.budget = SimpleNamespace(deadline=time.monotonic() + 30)
         campaign._settle_reviews()
-        settled_review = campaign.state['memory_reviews']['p']
+        settled_review = campaign.state['memory_reviews'][review_id]
         assert settled_review['outcome'] == 'accepted' and settled_review['original_review']['outcome'] == 'rejected'
-        assert campaign.scheduler.state()['reviews']['p']['status'] == 'accepted'
+        assert campaign.scheduler.state()['reviews'][review_id]['status'] == 'accepted'
     finally:
         release.set()
         gate.close()

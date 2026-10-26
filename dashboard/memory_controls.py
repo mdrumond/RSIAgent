@@ -32,7 +32,7 @@ def reviewed_record(root, project_id):
     request = ProjectReview(**record['review_request'])
     if not request.host_verified or request.source_sha256 != outcome['source_sha256']:
         raise ValueError('Project review differs from the host-verified outcome.')
-    path = root / 'memory-reviews' / digest(project_id) / 'job.json'
+    path = root / 'memory-reviews' / digest(record.get('manual_review_id', project_id)) / 'job.json'
     job = json.loads(path.read_bytes()) if path.exists() else {}
     if job.get('project_repair'):
         raise ValueError('Project repair requires another project review before publication.')
@@ -56,20 +56,23 @@ def force_merge(services, project_id, reason, key):
     if not isinstance(key, str) or not key.strip() or len(key) > 200:
         raise ValueError('Idempotency-Key is required.')
     memory = services.knowledge.memory_getter()
-    fingerprint = digest(dict(project_id=project_id, reason=reason))
+    state = json.loads((services.root / 'subject-campaign.json').read_bytes())
+    record = state['projects'].get(project_id) or {}
+    review_id = record.get('manual_review_id', project_id)
+    fingerprint = digest(dict(project_id=project_id, review_id=review_id, reason=reason))
     with memory.transaction() as state:
-        old = state.get('manual_overrides', {}).get(project_id)
+        old = state.get('manual_overrides', {}).get(review_id)
         if old is not None and old['key'] == key:
             if old['fingerprint'] != fingerprint:
                 raise ValueError('Idempotency key was used for different feedback.')
             return old['admission']
-        if project_id in state['admissions']:
+        if project_id in state['admissions'] or review_id in state['admissions']:
             raise ValueError('Project has already been merged into memory.')
     record, reviewed, job = reviewed_record(services.root, project_id)
     manual = dict(reason=reason.strip(), key=key, fingerprint=fingerprint, created=time.time(),
         original_admission_status=job.get('status', 'not-submitted'),
         original_evaluations=job.get('evaluations', []), review_sha256=record['review_sha256'])
-    provenance = dict(project_id=project_id,
+    provenance = dict(project_id=project_id, review_id=review_id,
         subject_id=record.get('subject_id'), wave_index=record.get('wave_index'),
         review_sha256=record['review_sha256'], request=asdict(reviewed), manual_override=manual)
     if provenance['subject_id'] is None:
@@ -80,7 +83,7 @@ def force_merge(services, project_id, reason, key):
             waves[record['wave_index'] - 1] if record.get('wave_index', 0) <= len(waves) else None)
         provenance['subject_id'] = subjects.get('waves', {}).get(wave, {}).get('subject_id')
     memory.index = services.knowledge.index
-    return memory.accept(project_id, record['review']['memory'], provenance, manual=manual)
+    return memory.accept(review_id, record['review']['memory'], provenance, manual=manual)
 
 
 def register_memory_controls(app, config_path, csrf_token):

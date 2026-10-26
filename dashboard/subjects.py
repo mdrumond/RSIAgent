@@ -52,7 +52,8 @@ class SubjectViews:
                 wave = pending['wave_id']
             outcome = row.get('outcome') or {}
             review = row.get('review') or {}
-            published = pid in active.get('admissions', {})
+            review_id = row.get('manual_review_id', pid)
+            published = pid in active.get('admissions', {}) or review_id in active.get('admissions', {})
             directory = root / 'waves' / str(wave) / pid
             started = directory.is_dir() and _inside(root, directory)
             execution = ('verified' if outcome.get('host_verified') else 'failed') if outcome else (
@@ -62,8 +63,8 @@ class SubjectViews:
                 kind=plan.get('task', {}).get('kind', plan.get('kind', 'graph')),
                 objective=row.get('objective', plan.get('spec', {}).get('hypothesis', '')),
                 execution=execution, project_review=review.get('decision', 'pending'),
-                memory_admission=('manually-accepted' if pid in active.get('manual_overrides', {})
-                                  else jobs.get(pid, {}).get('status', 'not-submitted')),
+                memory_admission=('manually-accepted' if review_id in active.get('manual_overrides', {})
+                                  else jobs.get(review_id, {}).get('status', 'not-submitted')),
                 publication='published' if published else 'unpublished', merged=published,
                 plan=plan, review=review, outcome=outcome,
                 memory=review.get('memory'), source=_source(root, outcome.get('source_sha256')) or ''))
