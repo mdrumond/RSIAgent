@@ -16,10 +16,11 @@ PAGE_BYTES = 8192
 class MemoryArtifactReader:
     """Read only memory-reachable historical objects; never admit host facts."""
 
-    def __init__(self, request, current):
+    def __init__(self, request, current, *, withheld=(), admitted=None):
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
         from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
         self.current, self.sources = current, {}
+        self.withheld, self.admitted = set(withheld), admitted if admitted is not None else {}
         try:
             envelope = json.loads(request.pre_wave_memory)
         except (ValueError, UnicodeDecodeError):
@@ -60,6 +61,8 @@ class MemoryArtifactReader:
                 self.sources.setdefault(digest, []).extend(stores)
 
     def read_bytes(self, digest):
+        if digest in self.withheld and digest not in self.admitted:
+            raise FileNotFoundError("memory artifact is not admitted by KDB retrieval")
         try:
             return self.current.read_bytes(digest)
         except FileNotFoundError:

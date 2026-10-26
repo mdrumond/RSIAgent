@@ -119,6 +119,8 @@ class SubjectExecutor:
             memory_sha256=hashlib.sha256(request.pre_wave_memory).hexdigest(),
             target_id=target.target_id if target else None,
             runtime=dict(composed) if composed is not None else None)
+        if request.actor_memory_delivery != 'indexed':
+            identity['actor_memory_delivery'] = request.actor_memory_delivery
         destination = artifacts or store
         def portable(value):
             for digest in value['artifacts'].values():

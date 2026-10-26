@@ -96,6 +96,7 @@ class AdaptiveProjectRequest:
     memory_root: Path | None = None
     remaining_seconds: float | None = None
     publish_learning: bool = True
+    actor_memory_delivery: str = "indexed"
 
 
 @dataclass(frozen=True)

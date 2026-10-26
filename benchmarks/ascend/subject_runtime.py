@@ -136,6 +136,11 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds, n
 def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                            max_seconds=7200, compose=compose_production, previous_runtime_configs=None):
     subjects = tuple(subjects)
+    memory_delivery = settings.get('actor_memory_delivery', 'indexed')
+    if memory_delivery not in {'indexed', 'kdb-only'}:
+        raise ValueError('actor_memory_delivery must be indexed or kdb-only')
+    if memory_delivery == 'kdb-only' and any((subject.task or {}).get('kind') == 'optimizer' for subject in subjects):
+        raise ValueError('kdb-only Actor memory delivery currently requires graph subjects')
     if target == 'a5' and any((getattr(subject, 'task', None) or {}).get('kind') == 'optimizer'
                               for subject in subjects):
         raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
@@ -167,6 +172,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     paths, embeddings = bound.get('paths'), bound.get('embeddings')
     knowledge = SubjectKnowledge(root, store, lambda: campaign.memory, paths=paths, embeddings=embeddings,
         reference_query=getattr(bound['coordinator'].curriculum, 'query_knowledge', None))
+    if memory_delivery == 'kdb-only' and knowledge.database_path is None:
+        raise ValueError('kdb-only Actor memory delivery requires enabled KDB retrieval')
     reference_query = knowledge.reference_query
 
     def check(payload, *, remaining_seconds):
@@ -246,13 +253,14 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
-        for memory in envelope['memories']:
-            for digest in memory_artifacts(memory):
-                branch_artifacts.put_bytes(store.read_bytes(digest))
+        if memory_delivery == 'indexed':
+            for memory in envelope['memories']:
+                for digest in memory_artifacts(memory):
+                    branch_artifacts.put_bytes(store.read_bytes(digest))
         inputs = materialize_inputs(spec)
         request = AdaptiveProjectRequest(spec, ordinal, snapshot, directory, inputs,
             evaluate_reference(spec, inputs), memory_root=root, remaining_seconds=remaining_seconds,
-            publish_learning=False)
+            publish_learning=False, actor_memory_delivery=memory_delivery)
         contract = item.get('task', {}).get('contract')
         if contract is not None:
             from .phase2_targets import TargetContract
