@@ -49,10 +49,14 @@ def _artifacts(branch, store, *, strict):
             warnings.append(dict(artifact_sha256=digest, reason=type(error).__name__))
     journal = branch / 'evidence.jsonl'
     source = None
+    if strict and not journal.exists():
+        raise ValueError('verified branch has no retained Actor journal')
     if journal.exists():
         artifacts['actor-log'] = store.put_bytes(journal.read_bytes())
         try:
             ledger = EvidenceLedger(journal)
+            if strict and not ledger.entries:
+                raise ValueError('verified branch has an empty Actor journal')
             for entry in ledger.entries:
                 payload = entry.payload
                 if entry.kind != 'artifact' or 'sha256' not in payload:

@@ -160,3 +160,15 @@ def test_corrupted_failure_journal_retains_contract_without_claiming_verificatio
     failure, = result['failures']
     assert failure['warnings'] and not failure['review_request']['host_verified']
     assert failure['spec'] == project('copy-project').as_dict()
+
+
+@pytest.mark.parametrize('journal', ['missing', 'empty'])
+def test_published_candidate_needs_retained_actor_log(tmp_path, journal):
+    root = tmp_path / 'producer';branch, _ = producer(root)
+    path = branch / 'evidence.jsonl'
+    if journal == 'missing':
+        path.unlink()
+    else:
+        path.write_bytes(b'')
+    result = import_history([root], ContentAddressedArtifacts(tmp_path / 'consumer'))
+    assert result['memories'] == [] and result['exclusions']
