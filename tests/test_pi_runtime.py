@@ -192,6 +192,46 @@ def test_compiler_errors_are_visible_and_full_diagnostic_is_readable():
     assert records.read(ref['record'], 0, 8192)['text'] == diagnostic
 
 
+
+def test_actor_provider_receives_layout_contract_without_context_reads(monkeypatch, tmp_path):
+    try: runtime_preflight()
+    except RuntimeError: pytest.skip('Pi runtime unavailable')
+    from types import SimpleNamespace
+    from coding.pi.actor import PiActorDriver
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_project_executor import ProjectKernelABI
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    seen = []
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data']); seen.append(request)
+        snapshot = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+        contract = snapshot['context']['host']['task_contract']
+        assert contract['shape'] == [2, 23] and contract['dtype'] == 'float32'
+        assert contract['block_count'] == 1 and contract['padding_multiple'] == 32
+        assert contract['abi']['input_arguments'] == ['gm_input0']
+        assert contract['inputs'] == [{'argument': 'gm_input0', 'logical_shape': [2, 23], 'physical_shape': [2, 32]}]
+        assert contract['output']['logical_shape'] == [2, 23]
+        assert contract['output']['physical_shape'] == [2, 32]
+        return stream('write', {'slot': 'kernel', 'content': 'candidate'})
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    def execute(action):
+        assert action.kind == 'write'
+        return ActionOutcome('{}', terminal=True)
+    execute.prepared = SimpleNamespace(
+        spec=SimpleNamespace(shape=(2, 23), dtype=SimpleNamespace(value='float32'),
+            padding_multiple=32, block_count=1, graph=SimpleNamespace(as_dict=lambda: {'output': 'y'})),
+        abi=ProjectKernelABI('project_kernel', ('gm_input0',), 'gm_output'),
+        inputs=(SimpleNamespace(shape=(2, 23), physical_shape=(2, 32), storage='private inputs'),),
+        expected=SimpleNamespace(shape=(2, 23), physical_shape=(2, 32), dtype='float32', values='private oracle'))
+    model = next(item for item in MODEL_IDENTITIES if item.backend_model.value == 'deepseek-flash')
+    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY': 'fake-provider-secret', 'OPENAI_API_KEY': 'fake-openai-secret'}), max_seconds=10)
+    driver('Implement the supplied layout.', profile=direct_profile(model), workspace=tmp_path,
+           context=None, turn_parser=parse_trial_action, action_executor=execute)
+    assert len(seen) == 1
+    assert 'private inputs' not in json.dumps(seen) and 'private oracle' not in json.dumps(seen)
+
+
 def test_context_read_telemetry_and_actionable_validation():
     records = []
     with session() as pi:

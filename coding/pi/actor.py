@@ -23,6 +23,28 @@ def observation_context(value):
     return value
 
 
+
+def task_contract(executor):
+    """Expose layout and ABI metadata without oracle values or tensor storage."""
+    prepared = getattr(executor, "prepared", None)
+    if prepared is None:
+        return None
+    spec, abi = prepared.spec, prepared.abi
+    return {
+        "shape": list(spec.shape), "dtype": spec.dtype.value,
+        "padding_multiple": spec.padding_multiple, "block_count": spec.block_count,
+        "abi": {"kernel_name": abi.kernel_name, "input_arguments": list(abi.input_arguments),
+                "output_argument": abi.output_argument},
+        "graph": spec.graph.as_dict(),
+        "inputs": [{"argument": name, "logical_shape": list(tensor.shape),
+                    "physical_shape": list(tensor.physical_shape)}
+                   for name, tensor in zip(abi.input_arguments, prepared.inputs, strict=True)],
+        "output": {"argument": abi.output_argument, "logical_shape": list(prepared.expected.shape),
+                   "physical_shape": list(prepared.expected.physical_shape),
+                   "dtype": prepared.expected.dtype},
+    }
+
+
 def typed_contract(prompt):
     """Replace the registered JSON wire protocol without changing legacy callers."""
     return re.sub(r"Respond with exactly one JSON object:.*?(?=You cannot choose paths)",
@@ -60,6 +82,7 @@ class PiActorDriver(DirectActorDriver):
         turn = 0
         deadline = min(self.clock() + self.max_seconds,
                        getattr(action_executor, "deadline", float("inf")))
+        contract = task_contract(action_executor)
         latest = None
         history = []
         source = None
@@ -94,6 +117,7 @@ class PiActorDriver(DirectActorDriver):
                 try:
                     name, args = session.next_action({
                         "instruction": instruction, "contract": typed_contract(self.system_prompt),
+                        "task_contract": contract,
                         "latest_host_observation": observation_context(latest), "source": source,
                         "recent_host_observations": history[-6:],
                         "remaining_seconds": max(0, deadline-self.clock()),
