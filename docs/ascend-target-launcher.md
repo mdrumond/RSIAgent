@@ -112,3 +112,20 @@ that conflicts with retained state is rejected; use the continuation method.
 The optional trace hook receives a deterministic event ID, verification flag,
 summary and retained attempt directory after publication; exporters can also
 inspect those retained directories after interrupted notification.
+
+
+## Optional adaptive curriculum retrieval
+
+The shared Phase 1/Phase 2 adaptive curriculum defaults to no direct KDB access.
+For native A3, set `"curriculum_kdb": true` in the ignored native runtime config;
+for the A5 adaptive CLI, pass `--curriculum-kdb`. Both require the existing
+with-KDB treatment, configured collections, and pinned embeddings. Changing
+curriculum access or its collection fingerprints requires a fresh campaign root;
+historical default-off identities remain unchanged.
+
+An enabled curriculum may issue `{"knowledge_query":{"query":"...","limit":5}}`
+repeatedly before returning its normal decision. Retrieval is optional. The same
+read-only citation gate used by actors validates excerpts. Selection session
+history retains requests, excerpts and citations; `curriculum-knowledge.jsonl`
+records queries and collection manifests. Retrieved examples are references,
+not verification that a newly proposed experiment works.

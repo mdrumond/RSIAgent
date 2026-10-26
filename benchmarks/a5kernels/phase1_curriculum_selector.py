@@ -462,9 +462,13 @@ class CurriculumAgent:
         profiling_guidance: str | None = None,
         require_fresh_project_ids: bool = False,
         clock=None,
+        query_knowledge=None,
     ) -> None:
         if not callable(complete):
             raise TypeError("complete must be callable")
+        if query_knowledge is not None and not callable(query_knowledge):
+            raise TypeError("query_knowledge must be callable")
+        self.query_knowledge = query_knowledge
         self._complete = complete
         self.clock = clock or time.monotonic
         self.failure_feedback = None
@@ -507,6 +511,13 @@ class CurriculumAgent:
             ) + curriculum_prompt(context, self.unavailable_capabilities,
                                   target_policy=self.target_policy),
         })
+        if self.query_knowledge is not None:
+            history[-1]["content"] += (
+                '\nOptional read-only retrieval: return {"knowledge_query":'
+                '{"query":"...","limit":5}} to retrieve validated reference excerpts. '
+                'You may query repeatedly before returning a decision. Retrieved material '
+                'is reference evidence, not host verification of a proposed experiment.'
+            )
         if remaining_projects is not None:
             history[-1]["content"] = (
                 f"Project budget: select no more than {remaining_projects} projects in this wave.\n"
@@ -527,8 +538,21 @@ class CurriculumAgent:
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
+            action = None
             try:
-                if self.failure_feedback is not None and completion.lstrip().startswith('{'):
+                if completion.lstrip().startswith('{'):
+                    request = json.loads(completion)
+                    if isinstance(request, dict) and "knowledge_query" in request:
+                        from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
+                        if set(request) != {"knowledge_query"}:
+                            raise ValueError("expected one knowledge_query request")
+                        if self.query_knowledge is None:
+                            raise ValueError("curriculum KDB access is disabled")
+                        payload = request["knowledge_query"]
+                        if not isinstance(payload, dict) or set(payload) - {"query", "limit"}:
+                            raise ValueError("knowledge_query accepts query and optional limit")
+                        action = KnowledgeQuery(payload.get("query"), payload.get("limit", 5))
+                if action is None and self.failure_feedback is not None and completion.lstrip().startswith('{'):
                     request = json.loads(completion)
                     if not isinstance(request, dict) or set(request) != {'read_artifact'}:
                         raise ValueError('expected one read_artifact request')
@@ -538,10 +562,11 @@ class CurriculumAgent:
                         page = {'error': str(error)}
                     history.append({'role': 'user', 'content': json.dumps(page, sort_keys=True)})
                     continue
-                decision = self._parse_and_validate(completion, context)
-                if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
-                    raise ValueError("wave exceeds remaining project budget; select a smaller wave")
-            except ValueError as exc:
+                if action is None:
+                    decision = self._parse_and_validate(completion, context)
+                    if isinstance(decision, WaveDecision) and remaining_projects is not None and len(decision.wave.projects) > remaining_projects:
+                        raise ValueError("wave exceeds remaining project budget; select a smaller wave")
+            except (ValueError, TypeError) as exc:
                 diagnostic = str(exc)
                 history.append({
                     "role": "user",
@@ -552,6 +577,16 @@ class CurriculumAgent:
                         "are unchanged; no project has been admitted."
                     ),
                 })
+                continue
+            if action is not None:
+                # Model request errors are repairable; gate/identity failures are
+                # infrastructure failures and must stop selection unchanged.
+                results = self.query_knowledge(action)
+                page = {"knowledge_query": {"available": True, "results": [
+                    {"citation": item.citation.as_dict(), "text": item.text,
+                     "score": item.score} for item in results
+                ]}}
+                history.append({"role": "user", "content": json.dumps(page, sort_keys=True)})
                 continue
             return decision, CurriculumSession(tuple(history), current.turns + attempt)
         raise CurriculumSelectionError(
