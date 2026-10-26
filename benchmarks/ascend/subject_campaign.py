@@ -258,6 +258,9 @@ class SubjectCampaign:
                 if (self.root / 'manual-pause.json').exists():
                     raise TimeoutError('manual interaction queued at campaign checkpoint')
                 self._settle_reviews()
+                if self.state['pending'] is None and self.scheduler.prioritize_projects():
+                    self.state.update(needs_decision=False, terminal=None)
+                    self._save()
                 if self.scheduler.is_complete() and not self.state['needs_decision']:
                     self.state['terminal'] = 'COMPLETE'
                     self._save()

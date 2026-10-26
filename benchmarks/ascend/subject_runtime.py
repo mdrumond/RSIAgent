@@ -387,7 +387,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         max_seconds=max_seconds, index_memory=knowledge.index)
     from .subject_editing import SubjectEdits, validate_project
     def admit_edit(item):
-        validate_project(item)
+        observed_runtime = getattr(actor.executor, 'runtime_identity', None)
+        if item.get('task', {}).get('kind') == 'target' and observed_runtime is None:
+            raise ValueError('target approval requires an observed composed runtime')
+        validate_project(item, runtime=observed_runtime, policy=policy)
         if item.get('task', {}).get('kind') == 'optimizer':
             if target == 'a5' or optimizer_factory is None:
                 raise ValueError('optimizer projects are unavailable for this campaign runtime')

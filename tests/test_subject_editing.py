@@ -138,3 +138,147 @@ def test_campaign_executes_approved_queue_before_automatic_generation(tmp_path):
     assert campaign.run()['terminal'] == 'COMPLETE'
     assert calls == [item('one')]
     assert campaign.scheduler.state()['project_queue'] == []
+
+
+def test_approved_queue_blocks_advance_and_completion_and_is_visible_to_policy(tmp_path):
+    from benchmarks.ascend.subject_memory import digest
+    scheduler = SubjectScheduler(tmp_path, [Subject('current', 'Current', 1)])
+    scheduler.start_wave('first', 'a' * 64)
+    scheduler.complete_wave('first')
+    queue = [dict(subject_id='current', item=item('requested'))]
+    scheduler.edit('projects', queue, expected=digest(scheduler.state()), proposal_id='edit')
+    assert scheduler.context()['queued_projects'] == [dict(subject_id='current', project_id='requested')]
+    decision = dict(action='advance', reason='Minimum reached', evidence=['first'])
+    with pytest.raises(ValueError, match='queued projects'):
+        scheduler.decide(decision)
+    with pytest.raises(ValueError):
+        scheduler.decide(dict(decision, action='complete'))
+    assert not scheduler.is_complete()
+    assert scheduler.context()['current_subject']['subject_id'] == 'current'
+
+
+@pytest.mark.parametrize('when', ['last-wave', 'earlier-subject', 'completed'])
+def test_campaign_services_approved_work_at_boundary_and_preserves_frontier(tmp_path, when):
+    from benchmarks.ascend.subject_campaign import SubjectCampaign
+    from benchmarks.ascend.subject_execution import SubjectOutcome
+    subjects = [Subject('current', 'Current', 1)]
+    if when == 'earlier-subject':
+        subjects.append(Subject('later', 'Later', 1))
+    executed, before = [], {}
+    def approve():
+        before.update(campaign.scheduler.state())
+        service = SubjectEdits(tmp_path, campaign.scheduler, lambda *a, **k: json.dumps([
+            dict(subject_id='current', item=item('requested'))]))
+        service.approve(service.preview('projects', 'One more current-subject project', remaining_seconds=10)['id'])
+    def execute(plan, snapshot, directory, **options):
+        executed.append(plan['project_id'])
+        if ((when == 'last-wave' and plan['project_id'] == 'auto-current')
+                or (when == 'earlier-subject' and plan['project_id'] == 'auto-later')):
+            approve()  # A running wave remains frozen until the next boundary.
+            assert campaign.scheduler.context()['current_subject']['subject_id'] == (
+                'later' if when == 'earlier-subject' else 'current')
+        source = campaign.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True, source, {'source': source}, {}, campaign.artifacts.root)
+    class NoMemory:
+        last_trace = []
+        def review(self, request, **options):
+            return dict(decision='accept', reason='Known result', evidence=[request.source_sha256],
+                        repair=None, memory=None)
+    def decide(messages, **options):
+        context = json.loads(messages[1]['content'])
+        return json.dumps(dict(action='complete' if context['current_subject'] is None else 'advance',
+                               reason='Minimum complete', evidence=['retained-wave']))
+    campaign = SubjectCampaign(tmp_path, subjects, b'initial', execute=execute, verifier=NoMemory(),
+        select_wave=lambda context, *a, **k: [item('auto-' + context['current_subject']['subject_id'])],
+        complete=decide)
+    if when == 'completed':
+        assert campaign.run()['terminal'] == 'COMPLETE'
+        approve()
+    result = campaign.run()
+    assert result['terminal'] == 'COMPLETE'
+    assert executed == (['auto-current', 'auto-later', 'requested'] if when == 'earlier-subject'
+                        else ['auto-current', 'requested'])
+    final = campaign.scheduler.state()
+    assert final['frontier'] == len(subjects) and final['current'] is None
+    assert final['project_queue'] == []
+    assert final['subjects'] == before['subjects']
+    for wave_id, record in before['waves'].items():
+        assert final['waves'][wave_id]['memory_snapshot_sha256'] == record['memory_snapshot_sha256']
+
+
+def test_target_preview_rejects_missing_or_corrupt_qualification_before_mutation(tmp_path):
+    from copy import deepcopy
+    from test_ascend_phase2_targets import qualified, RUNTIME
+    from benchmarks.ascend.targets import a3_curriculum_policy
+    target, artifacts, backend = qualified(tmp_path / 'qualification')
+    good = dict(project_id=target.spec.project_id, spec=target.spec.as_dict(), repairs=[],
+                task=dict(kind='target', contract=target.as_dict(), artifact_root=str(artifacts.root)))
+    bad = []
+    missing = deepcopy(good)
+    missing['task'].pop('artifact_root')
+    bad.append(missing)
+    unavailable = deepcopy(good)
+    unavailable['task']['artifact_root'] = str(tmp_path / 'unavailable')
+    bad.append(unavailable)
+    corrupt = deepcopy(good)
+    corrupt['task']['contract']['reference_sha256'] = artifacts.put_json(dict(schema='invalid'))
+    bad.append(corrupt)
+    scheduler = SubjectScheduler(tmp_path / 'campaign', [Subject('current', 'Current')])
+    before = scheduler.state()
+    calls, responses = [], iter(bad + [good])
+    def complete(messages, **options):
+        calls.append(messages.copy())
+        return json.dumps([dict(subject_id='current', item=next(responses))])
+    service = SubjectEdits(tmp_path / 'campaign', scheduler, complete,
+        validate_item=lambda plan: validate_project(plan, runtime=RUNTIME, policy=a3_curriculum_policy()))
+    counts = len(backend.compile_requests), len(backend.run_requests)
+    proposal = service.preview('projects', 'Use the qualified target', remaining_seconds=10)
+    assert len(calls) == 4 and scheduler.state() == before
+    assert (len(backend.compile_requests), len(backend.run_requests)) == counts
+    service.approve(proposal['id'])
+    assert scheduler.state()['project_queue'][0]['item'] == good
+    with pytest.raises(ValueError, match='runtime changed'):
+        validate_project(good, runtime=dict(RUNTIME, device='other'), policy=a3_curriculum_policy())
+
+
+def test_production_editor_checks_actual_runtime_and_rechecks_qualification_on_approval(tmp_path):
+    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_subject_runtime import bound
+    from benchmarks.ascend.subject_runtime import build_subject_campaign
+    from benchmarks.ascend.targets import a3_curriculum_policy
+    target, artifacts, _ = qualified(tmp_path / 'qualification')
+    plan = dict(project_id=target.spec.project_id, spec=target.spec.as_dict(), repairs=[],
+                task=dict(kind='target', contract=target.as_dict(), artifact_root=str(artifacts.root)))
+    composed = bound(tmp_path)
+    composed['actor'].executor.runtime_identity = dict(RUNTIME)
+    composed['coordinator'].curriculum.target_policy = a3_curriculum_policy()
+    campaign = build_subject_campaign(dict(memory_verification=False), target='a3', root=tmp_path / 'campaign',
+        subjects=[Subject('current', 'Current')], initial_memory=b'', compose=lambda *a, **k: composed)
+    editor = campaign.curriculum_edits
+    editor.complete = lambda *a, **k: json.dumps([dict(subject_id='current', item=plan)])
+    proposal = editor.preview('projects', 'Qualified target', remaining_seconds=10)
+    composed['actor'].executor.runtime_identity = dict(RUNTIME, device='other')
+    with pytest.raises(ValueError, match='runtime changed'):
+        editor.approve(proposal['id'])
+    assert campaign.scheduler.state().get('project_queue', []) == []
+    composed['actor'].executor.runtime_identity = dict(RUNTIME)
+    reference = target.reference_sha256
+    (artifacts.objects / reference[:2] / reference[2:]).unlink()
+    with pytest.raises(ValueError, match='qualification evidence'):
+        editor.approve(proposal['id'])
+    assert campaign.scheduler.state().get('project_queue', []) == []
+
+
+def test_pending_project_can_receive_reviewed_restart_without_execution(tmp_path):
+    replacement = dict(item=item('fresh'), instruction='Review physical tail handling.')
+    scheduler, service, calls, _ = setup(tmp_path, [replacement])
+    pending = dict(wave_id='queued-wave', subject=dict(subject_id='current', objective='Queued work'),
+                   projects=['queued'], items=[item('queued')])
+    path = tmp_path / 'subject-campaign.json'
+    path.write_text(json.dumps(dict(projects={}, pending=pending)))
+    original = path.read_bytes()
+    proposal = service.preview('restart', 'Revise this pending project', project='queued', remaining_seconds=10)
+    assert proposal['before']['plan'] == item('queued')
+    assert service.approve(proposal['id'])['after'] == replacement
+    assert path.read_bytes() == original and not (tmp_path / 'waves').exists()
+    assert len(calls) == 1
