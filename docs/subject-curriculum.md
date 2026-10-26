@@ -110,6 +110,7 @@ memory untouched. Missing underlying evidence can instead send the original
 project back to curriculum repair. Infrastructure failures remain inconclusive
 and retain elapsed allocations and operation identities. An invalid trial is
 held unpublished by default, including missing receipts and interrupted Actors.
+An invalid or interrupted first arm also holds its unstarted peer.
 Programmatic adapters can inject `MemoryAdmission(..., retry_ready=callback)`;
 only a literal `True` certifying that all owned operations have settled and a
 fresh trial is eligible permits a new isolated comparison. The callback receives

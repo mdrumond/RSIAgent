@@ -124,14 +124,14 @@ def test_invalid_retry_requires_explicit_settlement_and_uses_new_directories(tmp
         gate.submit('p',draft(),{},request(),remaining_seconds=60);gate.wait(remaining_seconds=5)
         result=gate.poll(remaining_seconds=5)
         assert len(certifications)==1
-        assert len(h.executions)==(4 if certified else 2)
+        assert len(h.executions)==(3 if certified else 1)
         if certified:
             assert result[0]['outcome']=='accepted'
-            assert h.executions[0][0]!=h.executions[3][0]
+            assert h.executions[0][0]!=h.executions[2][0]
         else:
             assert not result and not memory.records()
             gate.close();gate.start_session();gate.poll(remaining_seconds=5);gate.wait(remaining_seconds=5)
-            assert len(h.executions)==2
+            assert len(h.executions)==1
     finally:gate.close()
 
 

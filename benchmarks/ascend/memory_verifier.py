@@ -346,6 +346,11 @@ class MemoryVerifier:
                         arm_seconds=state['arm_allocation'], order=state['order']))
                     save()
                 for name in state['order']:
+                    # An invalid/interrupted arm may still own external work.
+                    # Hold the entire pair, including its unstarted peer.
+                    if any(not row.get('valid') or row.get('outcome') is None
+                           for row in state['arms'].values()):
+                        break
                     if name in state['arms']:
                         continue
                     arm_dir = directory / name
@@ -390,6 +395,8 @@ class MemoryVerifier:
                     # Preserve completed evidence before honoring a parent stop;
                     # never start its peer or a judge after cancellation.
                     remaining()
+                    if not state['arms'][name]['valid']:
+                        break
                 validity = {key: value.get('valid', False) for key, value in state['arms'].items()}
                 if set(validity) != {'control', 'treatment'} or not all(validity.values()):
                     decision = _inconclusive('Incomplete, late or infrastructure-failed arms cannot establish memory benefit.')

@@ -336,3 +336,34 @@ def test_large_native_arm_registries_and_proposal_stay_paged_and_readable(tmp_pa
     assert read[hidden]['text'] == store.read_bytes(hidden).decode()
     assert read[proposal_sha]['text'] == proposal_bytes[:8192].decode()
     assert read[proposal_sha]['next_offset'] == 8192
+
+
+def test_first_transport_failure_holds_peer_and_retains_partial_evidence(tmp_path):
+    h = Harness(failure='control')
+    result = evaluate(h, tmp_path)
+    assert result['decision'] == 'inconclusive'
+    assert result['validity'] == {'control': False}
+    assert result['arms'] == {'control': None}
+    assert [row[0] for row in h.calls] == ['control'] and not h.requests
+    assert not (tmp_path / 'treatment').exists()
+    assert ContentAddressedArtifacts(tmp_path / 'artifacts').read_bytes(result['artifacts']['proposal'])
+    assert evaluate(h, tmp_path) == result and len(h.calls) == 1
+
+
+def test_abrupt_first_callback_stop_survives_resume_without_peer_dispatch(tmp_path):
+    h = Harness()
+    execute = h.verifier.execute_arm
+    def interrupted(*args, **kwargs):
+        execute(*args, **kwargs)
+        raise SystemExit('process stopped after external operation could have started')
+    h.verifier.execute_arm = interrupted
+    with pytest.raises(SystemExit):
+        evaluate(h, tmp_path)
+    saved = json.loads((tmp_path / 'evaluation.json').read_text())
+    assert saved['arms']['control']['error_type'] == 'InterruptedArm'
+    assert 'decision' not in saved
+    h.verifier.execute_arm = lambda *a, **kw: pytest.fail('unsettled comparison dispatched work')
+    result = evaluate(h, tmp_path)
+    assert result['decision'] == 'inconclusive' and result['validity'] == {'control': False}
+    assert result['arms'] == {'control': None}
+    assert len(h.calls) == 1 and not h.requests and not (tmp_path / 'treatment').exists()
