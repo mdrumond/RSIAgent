@@ -157,3 +157,20 @@ def test_legacy_remote_calls_and_poll_waits_share_remaining_allocation(tmp_path)
     assert [row[1] for row in seen] == [8, 5, 2]
     assert [row[0][-1] for row in seen[:2]] == ['8', '5']
     assert transport._call == old_call and transport._timeout == old_timeout and transport._sleep == old_sleep
+
+
+def test_curriculum_receives_only_time_remaining_after_environment_probe(tmp_path):
+    now = [0];budgets = []
+    def select(messages):
+        context = json.loads(messages[-1]['content'].rsplit('\n', 1)[-1])
+        budgets.append(context['remaining_seconds'])
+        return _wave(messages[-1]['content'], [_project('copy', 'gm-ub-movement')])
+    c = AdaptivePhase1Coordinator(tmp_path, 'learn', SEED, CurriculumAgent(select),
+        lambda request: None, max_parallel=1, project_target=1, max_seconds=100, clock=lambda: now[0])
+    def check(index, remaining):
+        assert remaining() == 100
+        now[0] += 80
+    c.environment_check = check
+    c.propose_wave()
+    assert budgets == [20]
+    assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 80

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import json
@@ -659,10 +659,11 @@ class AdaptivePhase1Coordinator:
             self.environment_check(state["wave_index"], self._remaining_seconds)
             self._checked_environment = token
 
-    def _select(self, *args, **kwargs):
+    def _select(self, context, *args, **kwargs):
         self._check_environment(self._load_state())
+        context = replace(context, remaining_seconds=min(context.remaining_seconds, self._remaining_seconds()))
         try:
-            return self.curriculum.select(*args, **kwargs)
+            return self.curriculum.select(context, *args, **kwargs)
         except CurriculumSelectionError as error:
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 
