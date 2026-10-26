@@ -9,6 +9,19 @@ from .execution import _deadline, process_deadline
 from .phase1_cli import load_native_config
 from .subject_runtime import compose_production
 from .wave_environment import NativeWaveEnvironmentCheck
+from .environment_admission import EnvironmentAdmission
+
+
+def _runtime_failed(result):
+    evidence = getattr(result, 'evidence', None)
+    classification = getattr(evidence, 'classification', None)
+    return getattr(classification, 'value', classification) == 'runtime-failure'
+
+
+def _allocation_error(message, remaining):
+    error = TimeoutError(message)
+    error.interruption_reason = 'operator-stop' if getattr(remaining, 'stop_requested', lambda: False)() else 'deadline-exhausted'
+    return error
 
 
 class _CheckedExecutor:
@@ -20,7 +33,14 @@ class _CheckedExecutor:
 
     def execute(self, *args, **kwargs):
         self._check()
-        return self._executor.execute(*args, **kwargs)
+        try:
+            result = self._executor.execute(*args, **kwargs)
+            if _runtime_failed(result):
+                self._check.invalidate()
+            return result
+        except Exception:
+            self._check.invalidate()
+            raise
 
 
 class _CheckedActor:
@@ -40,14 +60,21 @@ class _CheckedActor:
         if request.remaining_seconds is not None:
             seconds = min(seconds, request.remaining_seconds)
         if seconds <= 0:
-            raise TimeoutError('native project elapsed allocation exhausted before dispatch')
+            raise _allocation_error('native project elapsed allocation exhausted before dispatch', self._remaining)
         deadline = time.monotonic() + seconds
         with process_deadline(deadline):
             self._check()
             remaining = min(self._remaining(), deadline - time.monotonic())
             if remaining <= 0:
-                raise TimeoutError('native project elapsed allocation exhausted during environment check')
-            return self._wrapped(replace(request, remaining_seconds=remaining))
+                raise _allocation_error('native project elapsed allocation exhausted during environment check', self._remaining)
+            try:
+                result = self._wrapped(replace(request, remaining_seconds=remaining))
+            except Exception:
+                self._check.invalidate()
+                raise
+            if _runtime_failed(result):
+                self._check.invalidate()
+            return result
 
 
 def compose_cpl_production(settings, *, target, root, initial_memory, max_seconds):
@@ -77,6 +104,7 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
         if stop is not None and stop.exists():
             return 0
         return max(0, min(deadline, _deadline.get()) - time.monotonic())
+    remaining.stop_requested = lambda: stop is not None and stop.exists()
     def transport_factory(**kwargs):
         kwargs.pop('validation_wrapper', None)
         transport = CplNativeCandidateBackend(**kwargs, target=native['transport_target'],
@@ -92,16 +120,17 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
         initial_memory=initial_memory, max_seconds=max_seconds,
         native_options={'transport_factory': transport_factory, 'measurement_factory': measurement_factory})
     check = NativeWaveEnvironmentCheck(bound['paths'], transports)
-    passed = False
+    cache = settings.get('environment_check_cache') or ((stop.parent if stop else Path(root)) / 'environment-check-cache')
+    admission = EnvironmentAdmission(check, transports, bound['paths'].root, cache=cache,
+        dependencies={key: native.get(key) for key in ('target','arch','compiler_version','environment_identity')})
     def ensure_environment(*, force=False):
-        nonlocal passed
         if remaining() <= 0:
-            raise TimeoutError('native environment allocation exhausted or campaign stopped')
-        if not passed or force:
-            check(1, remaining)
-            passed = True
+            raise _allocation_error('native environment allocation exhausted or campaign stopped', remaining)
+        admission(remaining, force=force)
+    ensure_environment.invalidate = admission.invalidate
     actor = bound['actor']
     actor.executor = _CheckedExecutor(actor.executor, ensure_environment)
     bound['actor'] = _CheckedActor(actor, ensure_environment, remaining)
-    bound.update(check_environment=ensure_environment, transports=tuple(transports))
+    bound.update(check_environment=ensure_environment, transports=tuple(transports),
+                 environment_check_cache=str(Path(cache).resolve()))
     return bound

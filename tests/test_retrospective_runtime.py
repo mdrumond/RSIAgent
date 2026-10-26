@@ -27,7 +27,13 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
         def __init__(self, **options):
             self.options = options
             self.remaining_seconds = options['remaining_seconds']
-            self.runtime_identity = {'runtime': options['runtime']}
+            self.runtime_identity = dict(target=options['target'], runtime=options['runtime'], physical_device=options['physical_device'])
+        def run_remote(self, *args, **kwargs):
+            return SimpleNamespace(returncode=0, job_handle='remote:registry-target:job:health', stdout=json.dumps({
+                'queries':{kind:{'exit':0, 'text':text} for kind,text in {
+                    'health':'Health Status : OK', 'ecc':'Errors : 0', 'memory':'HBM',
+                    'usages':'HBM Usage Rate(%) : 0', 'proc-mem':'No process in device', 'board':'Product : test'}.items()},
+                'compiler':'pinned', 'versions':{'torch-npu':'pinned'}, 'toolkit':'pinned'}))
         def compile(self, plan, root):
             calls.append('probe-compile')
             if now is not None:
@@ -141,7 +147,9 @@ def test_full_native_worker_arm_copies_keep_registered_route_and_isolation(tmp_p
         arguments, _ = parser.parse_known_args(settings['phase1_arguments'])
         merged = runtime.load_native_config(arguments.config, arguments.worker_config)
         routes.append(merged)
-        return bound(options['root'])
+        if len(routes) > 1:
+            assert settings['environment_check_cache'] == str(tmp_path/'shared-probes')
+        return dict(bound(options['root']), environment_check_cache=str(tmp_path/'shared-probes'))
     class Execution:
         def __init__(self, *args): pass
         def graph(self, request, **kwargs): return request

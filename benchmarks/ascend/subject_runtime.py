@@ -51,7 +51,7 @@ class _SelectionResults(tuple):
         return value
 
 
-def referenced_settings(settings):
+def referenced_settings(settings, *, contents=False):
     """Freeze ignored runtime JSON bytes without persisting their contents."""
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument('--config'); parser.add_argument('--worker-config')
@@ -59,8 +59,8 @@ def referenced_settings(settings):
     paths = dict(config=options.config, worker=options.worker_config)
     if isinstance(settings.get('optimizer_worker_config'), str):
         paths['optimizer_worker'] = settings['optimizer_worker_config']
-    return {role: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-            for role, path in paths.items() if path is not None}
+    raw = {role: Path(path).read_bytes() for role, path in paths.items() if path is not None}
+    return raw if contents else {role: hashlib.sha256(value).hexdigest() for role, value in raw.items()}
 
 
 def bounded_completion(provider, profile, messages, remaining_seconds):
@@ -134,19 +134,17 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds, n
 
 
 def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
-                           max_seconds=7200, compose=compose_production):
+                           max_seconds=7200, compose=compose_production, previous_runtime_configs=None):
     subjects = tuple(subjects)
     if target == 'a5' and any((getattr(subject, 'task', None) or {}).get('kind') == 'optimizer'
                               for subject in subjects):
         raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest(),
-                    referenced_json_sha256=referenced_settings(settings))
-    identity_path = root / 'subject-runtime.json'
-    if identity_path.exists() and json.loads(identity_path.read_bytes()) != identity:
-        raise ValueError('subject runtime settings or target changed on resume')
-    atomic(identity_path, canonical(identity))
+    from .runtime_allocation import admit_identity
+    identity = admit_identity(root, dict(target=target, max_seconds=max_seconds,
+        settings_sha256=hashlib.sha256(canonical(settings)).hexdigest()),
+        referenced_settings(settings, contents=True), previous=previous_runtime_configs)
     bound = compose(settings, target=target, root=root, initial_memory=initial_memory,
                     max_seconds=max_seconds)
     actor, provider, profile = bound['actor'], bound['provider'], bound['profile']
@@ -455,7 +453,9 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if seconds <= 0:
                 raise TimeoutError('trial arm elapsed allocation exhausted before execution')
             return seconds
-        if referenced_settings(settings) != identity['referenced_json_sha256']:
+        from .runtime_allocation import configuration
+        current_semantics = {role: configuration(raw)[0] for role, raw in referenced_settings(settings, contents=True).items()}
+        if current_semantics != identity['referenced_semantic_sha256']:
             raise ValueError('referenced runtime settings changed before trial composition')
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
@@ -487,6 +487,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             elif not argument.startswith('--worker-config='):
                 filtered.append(argument)
         arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
+        if bound.get('environment_check_cache'):
+            arm_settings['environment_check_cache'] = bound['environment_check_cache']
         if optimizer_config is not None:
             arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
             for key in ('cache_directory', 'compile_cache_directory'):
