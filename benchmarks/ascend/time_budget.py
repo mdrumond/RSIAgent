@@ -26,12 +26,15 @@ class AttemptTimeBudget:
         state = json.loads(self.path.read_text()) if self.path.exists() else {
             "max_seconds": seconds, "elapsed_seconds": 0,
         }
-        if state['max_seconds'] != seconds:
+        granted = sum(state.get('grants', {}).values())
+        if state['max_seconds'] not in (seconds, seconds + granted):
             raise ValueError("attempt time allocation changed")
+        seconds = state['max_seconds']
         elapsed = state['elapsed_seconds']
         if state.get('active_since') is not None:
             elapsed += max(0, self.wall_clock()-state['active_since'])
         self.elapsed = elapsed
+        self.grants = state.get('grants', {})
         self.started = self.clock()
         self.deadline = self.started + max(0, seconds-elapsed)
         self.seconds = seconds
@@ -43,6 +46,7 @@ class AttemptTimeBudget:
         self._atomic(self.path, self._canonical({
             'max_seconds': self.seconds, 'elapsed_seconds': self.elapsed,
             'active_since': active_since,
+            **({'grants': self.grants} if self.grants else {}),
         }))
 
     def close(self):
