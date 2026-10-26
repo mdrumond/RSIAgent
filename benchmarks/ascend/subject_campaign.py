@@ -81,14 +81,33 @@ class SubjectCampaign:
     def _settle_reviews(self):
         if self.memory_gate is None:
             return
-        for result in self.memory_gate.poll(remaining_seconds=self._remaining()):
+        remaining = max(0, self.budget.deadline-self.clock())
+        for result in self.memory_gate.poll(remaining_seconds=remaining):
             self.scheduler.resolve_review(result['review_id'], result['outcome'])
+            rows=self.state.setdefault('memory_reviews',{})
+            if result['review_id'] not in rows:
+                rows[result['review_id']] = dict(outcome=result['outcome'], judgment=result.get('judgment'),
+                    rewrites=result.get('rewrites'), subject_id=result['provenance'].get('subject_id'),
+                    sequence=max((row.get('sequence',0) for row in rows.values()),default=0)+1)
+                if result['outcome']=='rejected':
+                    self.state['needs_decision']=True
+                if result.get('repair'):
+                    provenance = result['provenance']
+                    review = result['repair']
+                    self.scheduler.add_repair(result['review_id']+'-memory', provenance['subject_id'],
+                        provenance['project_id'], review['reason']+' '+json.dumps(review.get('repair'),sort_keys=True), review['evidence'])
+                    self.state['needs_decision'] = True
+                self._save()
+            if hasattr(self.memory_gate, 'acknowledge'):
+                self.memory_gate.acknowledge(result['review_id'])
 
     def _review(self, project_id, record):
         if record.get('review') is not None:
             return
         outcome = record['outcome']
-        linked = {key: self.state['projects'].get(key) for key in record.get('repairs', [])}
+        obligations = self.scheduler.state()['repairs']
+        linked = {key: self.state['projects'].get(obligations.get(key, {}).get('project_id',key))
+                  for key in record.get('repairs', [])}
         artifacts = dict(outcome['artifacts'])
         plan = record.get('plan')
         if plan is None:
@@ -103,6 +122,8 @@ class SubjectCampaign:
         for key, original in linked.items():
             if original is not None:
                 artifacts.update({f'repair:{key}:{role}': sha for role, sha in original['outcome']['artifacts'].items()})
+            artifacts.update({f'repair:{key}:evidence:{i}': sha
+                for i,sha in enumerate(obligations.get(key,{}).get('evidence',[]))})
         sibling_evidence = {}
         pending = self.state.get('pending') or {}
         for pid in pending.get('projects', []):
@@ -111,7 +132,8 @@ class SubjectCampaign:
                 sibling_evidence[pid] = sibling['outcome']['observations']
                 artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
         objective = json.dumps(dict(subject=record['objective'], project=project, sibling_evidence=sibling_evidence, repairs={
-            key: original['review'] for key, original in linked.items() if original is not None}), sort_keys=True)
+            key: dict(original['review'], obligation=obligations.get(key))
+            for key, original in linked.items() if original is not None}), sort_keys=True)
         request = ProjectReview(project_id=project_id, source_sha256=outcome['source_sha256'],
             host_verified=outcome['host_verified'], artifacts=artifacts,
             host_facts=tuple(outcome['observations'].get('host_facts', ())),
@@ -186,7 +208,7 @@ class SubjectCampaign:
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
                 objective=pending['subject']['objective'], repairs=item.get('repairs', []),
-                plan=json.loads(canonical(item)), wave_index=len(self.state['waves'])+1))
+                wave_index=len(self.state['waves'])+1, plan=json.loads(canonical(item))))
             if 'outcome' not in record:
                 directory = self.root / 'waves' / pending['wave_id'] / pid
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
@@ -198,12 +220,14 @@ class SubjectCampaign:
         self._publish_wave(pending)
 
     def _run(self):
+        if self.memory_gate is not None and hasattr(self.memory_gate,'start_session'):
+            self.memory_gate.start_session()
         self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
         try:
             while True:
                 self._remaining()
                 self._settle_reviews()
-                if self.scheduler.is_complete():
+                if self.scheduler.is_complete() and not self.state['needs_decision']:
                     self.state['terminal'] = 'COMPLETE'
                     self._save()
                     return self.report()
@@ -250,7 +274,12 @@ class SubjectCampaign:
             self._save()
             return self.report()
         finally:
-            self.budget.close()
+            try:
+                if self.memory_gate is not None:
+                    self.memory_gate.close()
+                    self._settle_reviews()
+            finally:
+                self.budget.close()
 
     def run(self):
         with (self.root / '.campaign.lock').open('a+b') as lock:
@@ -258,6 +287,7 @@ class SubjectCampaign:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError('subject campaign is already active; observe its retained work') from None
-            return self._run()
+            self._run()
+            return self.report()
 
     resume = run

@@ -58,7 +58,7 @@ class SubjectMemory:
             return all(state['active'].get(row['memory_id']) == row['version']
                        for row in proposal['base_versions'])
 
-    def accept(self, review_id, proposal, provenance):
+    def accept(self, review_id, proposal, provenance, *, check_remaining=None):
         """Index first, then switch accepted pointers in one locked publication."""
         with self.transaction() as state:
             if review_id in state['admissions']:
@@ -76,6 +76,8 @@ class SubjectMemory:
             atomic(directory / (version + '.json'), canonical(record))
             if self.index is not None:
                 self.index(version, record)
+            if check_remaining is not None:
+                check_remaining()
             for row in bases:
                 state['active'].pop(row['memory_id'])
             state['active'][memory_id] = version
