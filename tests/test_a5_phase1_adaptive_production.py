@@ -456,11 +456,13 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path,
     source = tmp_path / "sources"
     source.mkdir()
     guide = source / "guide.md"
-    guide.write_text("movement uses a host verified copy\n", encoding="utf-8")
+    guide.write_text("movement uses a host verified Catlass copy\n", encoding="utf-8")
+    native_guide = source / "native-guide.md"
+    native_guide.write_text("movement uses an Ascend C DataCopy example\n", encoding="utf-8")
     kdb = tmp_path / "knowledge.sqlite"
     with KnowledgeDB(kdb, FakeEmbeddings()) as database:
         database.index(source, [guide], collection="catlass", language="catlass-dsl")
-        database.index(source, [guide], collection="native", language="mixed",
+        database.index(source, [native_guide], collection="native", language="mixed",
                        kernel_languages=("ascend-c",))
     campaign = _build(
         tmp_path,
@@ -483,16 +485,22 @@ def test_kdb_treatment_uses_read_only_agent_and_retains_exact_citation(tmp_path,
     assert result.observation["event"] == "knowledge-query"
     assert result.observation["available"] is True
     assert len(result.citations) == (1 if isinstance(selector, str) else 2)
-    retained = result.observation["results"][0]
-    assert retained["citation"]["path"].endswith("guide.md")
-    digest = retained["artifact_sha256"]
-    assert context.artifacts.read_bytes(digest) == guide.read_bytes()
+    expected = {"catlass": guide.read_bytes(), "native": native_guide.read_bytes()}
     from dataclasses import asdict
     index_digest = result.observation["results_index_sha256"]
     index = context.artifacts.read_json(index_digest)
-    assert [row["citation"] for row in index["results"]] == [
-        asdict(citation) for citation in result.citations]
-    assert result.admitted_artifacts == {digest: "knowledge", index_digest: "knowledge"}
+    retained = index["results"]
+    selected = {selector} if isinstance(selector, str) else set(selector)
+    assert {row["citation"]["collection"] for row in retained} == selected
+    assert [row["citation"] for row in retained] == [asdict(citation) for citation in result.citations]
+    for row in retained:
+        digest = row["artifact_sha256"]
+        assert context.artifacts.read_bytes(digest) == expected[row["citation"]["collection"]]
+    assert result.admitted_artifacts == {
+        **{row["artifact_sha256"]: "knowledge" for row in retained},
+        index_digest: "knowledge",
+    }
+
 
 
 def test_kdb_manifest_must_match_supplied_embedding_backend(tmp_path):
