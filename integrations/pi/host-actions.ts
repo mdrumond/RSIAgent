@@ -27,8 +27,8 @@ export default function (pi: ExtensionAPI) {
           const result = await host(name, args, signal);
           return { content: [{ type: "text" as const, text: JSON.stringify(result) }],
             details: undefined, terminate: name !== "read_context" };
-        } catch {
-          return { content: [{ type: "text" as const, text: "Host rejected invalid, stale or disallowed arguments." }],
+        } catch (error) {
+          return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : "Host tool request failed." }],
             details: undefined, isError: true, terminate: true };
         }
       },
@@ -43,21 +43,26 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("context", async (event, ctx) => {
     const snapshot = await host("snapshot", {}, ctx.signal);
-    // A host turn is a new authoritative snapshot. Within that turn retain only
-    // the latest complete exchange (e.g. a page read), never orphan tool results.
+    // Pi owns the tool loop. Refresh host state at the user boundary, while
+    // preserving every complete exchange selected during this host turn.
     let boundary = -1;
     for (let i = event.messages.length - 1; i >= 0; i--) {
       if (event.messages[i].role === "user") { boundary = i; break; }
     }
-    let exchange: typeof event.messages = [];
-    for (let i = event.messages.length - 1; i > boundary; i--) {
+    const exchange: typeof event.messages = [];
+    for (let i = boundary + 1; i < event.messages.length; i++) {
       const message = event.messages[i];
-      if (message.role !== "assistant" || message.stopReason !== "toolUse") continue;
+      if (message.role !== "assistant") continue;
       const calls = message.content.filter(c => c.type === "toolCall");
-      const results = event.messages.slice(i + 1).filter(m => m.role === "toolResult");
-      if (calls.length && calls.every(c => results.some(r => r.role === "toolResult" && r.toolCallId === c.id))) {
-        exchange = [message, ...results];
-        break;
+      if (!calls.length) { exchange.push(message); continue; }
+      const results = [];
+      for (let j = i + 1; j < event.messages.length; j++) {
+        const candidate = event.messages[j];
+        if (candidate.role !== "toolResult") break;
+        if (calls.some(c => c.id === candidate.toolCallId)) results.push(candidate);
+      }
+      if (calls.every(c => results.some(r => r.toolCallId === c.id))) {
+        exchange.push(message, ...results);
       }
     }
     return { messages: [{ role: "user" as const, content: JSON.stringify(snapshot),

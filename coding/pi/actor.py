@@ -1,6 +1,7 @@
 """Pi action driver, retaining the existing noncoding terminal distillation."""
 import json
 import hashlib
+import re
 
 from benchmarks.a5kernels.phase1_provider import (
     DirectActorDriver, _ActorContinuation, _ProviderEvidenceRecorder,
@@ -10,6 +11,24 @@ from benchmarks.ascend.agent_context import WorkingContext
 from .rpc import PiDeadlineError
 from .adapters import A5_SCHEMAS
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_preflight
+
+
+
+def observation_context(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            pass
+    return value
+
+
+def typed_contract(prompt):
+    """Replace the registered JSON wire protocol without changing legacy callers."""
+    return re.sub(r"Respond with exactly one JSON object:.*?(?=You cannot choose paths)",
+        "Select one declared typed host tool. Read artifacts with read-artifact using its "
+        "sha256 and returned next_offset; pages are UTF-8 text, at most 8192 bytes. "
+        "Diagnostic observations never establish correctness or timing.\n", prompt, flags=re.S)
 
 
 class PiActorDriver(DirectActorDriver):
@@ -74,8 +93,8 @@ class PiActorDriver(DirectActorDriver):
                         recorder._append(kind, digest, turn=turn)
                 try:
                     name, args = session.next_action({
-                        "instruction": instruction, "contract": self.system_prompt,
-                        "latest_host_observation": latest, "source": source,
+                        "instruction": instruction, "contract": typed_contract(self.system_prompt),
+                        "latest_host_observation": observation_context(latest), "source": source,
                         "recent_host_observations": history[-6:],
                         "remaining_seconds": max(0, deadline-self.clock()),
                         "coding": ENGINE_IDENTITY,
@@ -85,14 +104,19 @@ class PiActorDriver(DirectActorDriver):
                 except PiDeadlineError:
                     tokens += session.completion_tokens-before
                     break
-                except ActionError:
+                except ActionError as error:
                     text = "{}"
+                    latest = json.dumps({"host": {"event": "invalid-action", "reason": str(error),
+                        "allowed_actions": sorted(allowed)}})
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
                 self._trace("message", {"role": "assistant", "content": text})
                 action = turn_parser(text)
                 if action is None:
-                    latest = json.dumps({"host": {"event": "invalid-action"}})
+                    if text != "{}" or latest is None:
+                        latest = json.dumps({"host": {"event": "invalid-action",
+                            "reason": "Selected action does not match the host protocol",
+                            "allowed_actions": sorted(allowed)}})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation

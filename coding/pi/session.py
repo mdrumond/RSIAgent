@@ -20,7 +20,7 @@ from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_IDENTITY = {"coding_engine": "pi", "pi_version": "1.3.0",
-                   "adapter_version": 2, "context_policy": "host-records-v1",
+                   "adapter_version": 3, "context_policy": "host-turn-history-v2",
                    "budget_policy": "elapsed-time-v1"}
 SYSTEM = (
     "You are the coding engine inside a host-controlled kernel attempt. "
@@ -119,6 +119,7 @@ class PiCodingSession:
         self.record = lambda *_: None
         self.gateway.on_record = lambda kind, payload: self.record(kind, payload)
         self.closed = False
+        self.context_reads = {}
 
     def _operation(self, name, args):
         with self.lock:
@@ -128,7 +129,12 @@ class PiCodingSession:
                 raise ValueError("tool is not allowed in the current host state")
             validate(args, self.schemas[name])
             if name == "read_context":
-                return self.context.read(args["record"], args.get("offset", 0), args.get("limit", 4096))
+                page = self.context.read(args["record"], args.get("offset", 0), args.get("limit", 4096))
+                key = (args["record"], page["offset"], args.get("limit", 4096))
+                self.context_reads[key] = self.context_reads.get(key, 0) + 1
+                self.record("pi-context-read", {"record": args["record"], "offset": page["offset"],
+                    "bytes": len(page["text"].encode()), "repeat": self.context_reads[key] > 1})
+                return page
             self.mutations += 1
             if self.mutations != 1:
                 self.pending = None
@@ -180,8 +186,12 @@ class PiCodingSession:
                     body = json.loads(self.rfile.read(size))
                     result = owner._operation(body["name"], body.get("arguments", {}))
                     status = 200
-                except (ValueError, KeyError, TypeError):
-                    status, result = 400, {"error": "invalid, stale, or disallowed host tool"}
+                except (ValueError, KeyError, TypeError) as error:
+                    # Validation errors describe schema/state, never provider credentials.
+                    reason = str(error)[:500]
+                    result = {"error": reason, "allowed": sorted(owner.allowed)}
+                    owner.record("pi-action-rejected", result)
+                    status = 400
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -229,6 +239,7 @@ class PiCodingSession:
             self.allowed.add("edit_source")
         self.pending, self.mutations = None, 0
         self.context = ContextRecords()
+        self.context_reads = {}
         self.snapshot = self.context.snapshot({
             "host": context,
             "remaining_seconds": max(0, self.deadline - time.monotonic()),
@@ -241,6 +252,8 @@ class PiCodingSession:
             try:
                 self.rpc.prompt("Select the next allowed action using the authoritative host snapshot.")
             except PiError:
+                if self.gateway.stop_reason == "context-limit":
+                    raise PiError("Pi request context exceeds the configured byte limit; no action accepted") from None
                 if any(e.get("message", {}).get("stopReason") == "length" for e in self.rpc.events[start:]):
                     raise ActionError("truncated Pi tool call; no action accepted") from None
                 raise
@@ -263,9 +276,11 @@ class PiCodingSession:
                             if part["name"] not in self.allowed:
                                 raise ValueError("disallowed original tool call")
                             validate(part["arguments"], self.schemas[part["name"]])
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError) as error:
                 self.pending = None
-                raise ActionError("invalid original Pi tool arguments") from None
+                reason = "invalid original Pi tool arguments: " + str(error)
+                self.record("pi-action-rejected", {"error": reason, "allowed": sorted(self.allowed)})
+                raise ActionError(reason) from None
             if self.mutations != 1 or self.pending is None:
                 raise ActionError("Pi must select exactly one valid host action")
             if time.monotonic() >= self.deadline:

@@ -94,6 +94,19 @@ def test_invalid_or_wrong_stage_tools_have_no_host_effect(monkeypatch, tool, arg
         assert pi.gateway.calls >= 1
 
 
+
+def test_original_tool_validation_explains_rejection(monkeypatch):
+    from coding.pi.session import ActionError
+    recorded = []
+    monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: stream('write', {'source': 123}))
+    with session() as pi:
+        with pytest.raises(ActionError, match=r'arguments.source: expected string'):
+            pi.next_action({'task': 'TEST'}, ['write'], record=lambda *args: recorded.append(args))
+        assert pi.pending is None
+        rejected = [payload for kind, payload in recorded if kind == 'pi-action-rejected']
+        assert rejected and rejected[-1]['allowed'] == ['read_context', 'write']
+
+
 def test_truncation_has_no_effect_and_same_process_can_repair(monkeypatch):
     from coding.pi.session import ActionError
     calls = []
@@ -132,6 +145,67 @@ def test_real_pi_reads_admitted_large_guide_with_complete_exchange(monkeypatch):
         assert pi.completion_tokens == 20
 
 
+
+def test_real_pi_accumulates_three_pages_then_refreshes_host_turn(monkeypatch):
+    calls, records = [], []
+    guide = "a" * 2048 + "b" * 2048 + "c" * 1000
+    reference = None
+    def provider(*_, **kwargs):
+        nonlocal reference
+        request = json.loads(kwargs['data']); calls.append(request)
+        messages = request['messages']
+        snapshot = json.loads(next(m['content'] for m in messages if m['role'] == 'user'))
+        pages = [json.loads(m['content']) for m in messages if m['role'] == 'tool']
+        index = len(calls) - 1
+        if index < 3:
+            reference = snapshot['context']['host']['guide']['record']
+            assert ''.join(page['text'] for page in pages) == guide[:index * 2048]
+            return stream('read_context', {'record': reference, 'offset': index * 2048,
+                                          'limit': 2048}, index)
+        if index == 3:
+            assert ''.join(page['text'] for page in pages) == guide
+            return stream('write', {'source': ''.join(page['text'][0] for page in pages)}, index)
+        assert index == 4  # A queued host action must not trigger another provider request.
+        assert snapshot['context']['host'] == {'task': 'NEW', 'feedback': 'current'}
+        assert not pages and not any(m.get('tool_calls') for m in messages)
+        return stream('write', {'source': 'new'}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'task': 'OLD', 'guide': guide}, ['write'],
+                              record=lambda *args: records.append(args)) == ('write', {'source': 'abc'})
+        assert len(calls) == 4
+        assert pi.next_action({'task': 'NEW', 'feedback': 'current'}, ['write']) == ('write', {'source': 'new'})
+        assert len(calls) == 5
+    reads = [payload for kind, payload in records if kind == 'pi-context-read']
+    assert [row['offset'] for row in reads] == [0, 2048, 4096]
+    assert not any(row['repeat'] for row in reads)
+
+
+
+def test_compiler_errors_are_visible_and_full_diagnostic_is_readable():
+    records = ContextRecords()
+    diagnostic = ('warning: header warning\n' * 300 +
+                  'candidate.cpp:17:4: error: undeclared identifier x\n')
+    snapshot = records.snapshot({'diagnostic': diagnostic})
+    assert snapshot['diagnostic']['errors'].splitlines() == ['candidate.cpp:17:4: error: undeclared identifier x']
+    ref = snapshot['diagnostic']['full']
+    assert records.read(ref['record'], 0, 8192)['text'] == diagnostic
+
+
+def test_context_read_telemetry_and_actionable_validation():
+    records = []
+    with session() as pi:
+        pi.record = lambda *args: records.append(args)
+        ref = pi.context.admit('data')
+        pi.allowed = {'write', 'read_context'}
+        pi._operation('read_context', {'record': ref['record']})
+        pi._operation('read_context', {'record': ref['record']})
+        assert [payload['repeat'] for _, payload in records] == [False, True]
+        with pytest.raises(ValueError, match=r'arguments.source: expected string'):
+            pi._operation('write', {'source': 1})
+        assert pi.pending is None and pi.mutations == 0
+
+
 def test_credential_in_context_is_rejected_before_provider(monkeypatch):
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('paid request'))
     with session() as pi:
@@ -145,7 +219,7 @@ def test_gateway_refuses_full_oversized_request_even_if_pi_hook_accepts(monkeypa
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('upstream HTTP'))
     with session() as pi:
         pi.gateway.hard_bytes = 100
-        with pytest.raises(PiError):
+        with pytest.raises(PiError, match='context exceeds'):
             pi.next_action({'task':'TEST'}, ['write'])
         assert pi.gateway.calls == 0
 
