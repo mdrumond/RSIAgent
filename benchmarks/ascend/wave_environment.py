@@ -15,17 +15,51 @@ from benchmarks.ascend.execution import process_deadline
 
 @contextmanager
 def _transport_allocation(transport, remaining_seconds):
-    # CPL also freezes queue-inclusive wall expiry; bound it to this wave.
-    if not hasattr(transport, "remaining_seconds"):
+    # CPL freezes queue-inclusive wall expiry using this callback. Local native
+    # workers consume process_deadline; older remote adapters bind each call.
+    if hasattr(transport, "remaining_seconds"):
+        previous = transport.remaining_seconds
+        transport.remaining_seconds = lambda: min(remaining_seconds(),
+            previous() if previous is not None else float("inf"))
+        try:
+            yield
+        finally:
+            transport.remaining_seconds = previous
+    elif hasattr(transport, "_timeout") and hasattr(transport, "_call"):
+        previous_call, previous_timeout = transport._call, transport._timeout
+        previous_sleep = getattr(transport, "_sleep", None)
+        def allowance():
+            seconds = min(previous_timeout, remaining_seconds())
+            if seconds <= 0:
+                raise TimeoutError("wave elapsed allocation exhausted during environment check")
+            return seconds
+        def call(argv):
+            seconds = allowance()
+            argv = list(argv)
+            if "--timeout" in argv:
+                # Legacy wrapper CLIs accept integer seconds. Refuse dispatch
+                # rather than round a subsecond remainder beyond the deadline.
+                if seconds < 1:
+                    raise TimeoutError("insufficient wave time for remote dispatch")
+                argv[argv.index("--timeout") + 1] = str(int(seconds))
+            transport._timeout = seconds
+            try:
+                return previous_call(tuple(argv))
+            finally:
+                transport._timeout = previous_timeout
+        def sleep(seconds):
+            previous_sleep(min(seconds, allowance()))
+        transport._call = call
+        if previous_sleep is not None:
+            transport._sleep = sleep
+        try:
+            yield
+        finally:
+            transport._call, transport._timeout = previous_call, previous_timeout
+            if previous_sleep is not None:
+                transport._sleep = previous_sleep
+    else:
         yield
-        return
-    previous = transport.remaining_seconds
-    transport.remaining_seconds = lambda: min(remaining_seconds(),
-        previous() if previous is not None else float("inf"))
-    try:
-        yield
-    finally:
-        transport.remaining_seconds = previous
 
 
 class NativeWaveEnvironmentCheck:

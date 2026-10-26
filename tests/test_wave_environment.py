@@ -108,3 +108,52 @@ def test_one_check_per_wave_in_automatic_run(tmp_path):
     c.environment_check = lambda index, remaining: events.append('check')
     c.run()
     assert events == ['check', 'select', 'execute']
+
+
+@pytest.mark.parametrize('retain_publication', [True, False])
+def test_terminal_branch_recovery_does_not_require_live_environment(tmp_path, retain_publication):
+    events = [];c = coordinator(tmp_path, events)
+    c.environment_check = lambda index, remaining: events.append('check')
+    proposal = c.propose_wave()
+    c.approve_wave(proposal, ['copy'])
+    finish = c._finish_wave
+    def interrupted_publication(*args):
+        raise OSError('supervisor interrupted after durable branch results')
+    c._finish_wave = interrupted_publication
+    with pytest.raises(OSError):c.run_approved_wave()
+    c._finish_wave = finish
+    if not retain_publication:
+        (tmp_path/'waves/wave-001/published.json').unlink()
+    def unavailable(index, remaining):
+        raise ProjectInfrastructureError('device no longer available')
+    c.environment_check = unavailable
+    result = c.run_approved_wave()
+    assert result['successful_projects'] == 1
+    assert not (tmp_path/'pending.json').exists()
+    assert events == ['check', 'select', 'check', 'execute']
+
+
+def test_legacy_remote_calls_and_poll_waits_share_remaining_allocation(tmp_path):
+    from subprocess import CompletedProcess
+    from benchmarks.a3kernels.remote_candidate_bz import BZA3RemoteCandidateBackend
+    from benchmarks.ascend.wave_environment import _transport_allocation
+    now = [0];seen = []
+    def runner(argv, **options):
+        seen.append((argv, options['timeout']))
+        now[0] += 3
+        return CompletedProcess(argv, 0, '', '')
+    def sleeper(seconds):
+        seen.append(('sleep', seconds));now[0] += seconds
+    transport = BZA3RemoteCandidateBackend(cpl_remote='/tools/cpl-remote',
+        validation_wrapper='/tools/catlass-validation.sh', profile='bz-a3-1', remote_workspace='/owned',
+        physical_device=0, state_directory=tmp_path, process_runner=runner)
+    transport._sleep = sleeper
+    old_call, old_timeout, old_sleep = transport._call, transport._timeout, transport._sleep
+    with _transport_allocation(transport, lambda: 8-now[0]):
+        transport._call(('/tools/catlass-validation.sh', '--timeout', '1200'))
+        transport._call(('/tools/catlass-validation.sh', '--timeout', '1200'))
+        transport._sleep(30)
+        with pytest.raises(TimeoutError):transport._call(('/tools/catlass-validation.sh',))
+    assert [row[1] for row in seen] == [8, 5, 2]
+    assert [row[0][-1] for row in seen[:2]] == ['8', '5']
+    assert transport._call == old_call and transport._timeout == old_timeout and transport._sleep == old_sleep

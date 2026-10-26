@@ -321,9 +321,6 @@ class AdaptivePhase1Coordinator:
                 self.failure_feedback.record(pending.get('failure_investigations', []), state)
             if self._time_exhausted(state):
                 return self._deadline_report(state)
-            self._check_environment(state)
-            if self._time_exhausted(state):
-                return self._deadline_report(state)
             coordinator = LiveWaveCoordinator(
                 self.root / "waves" / wave.wave_id,
                 wave,
@@ -332,6 +329,7 @@ class AdaptivePhase1Coordinator:
                 self.max_parallel,
                 allow_semantic_failures=True, allow_partial=self.allow_partial,
                 remaining_seconds=self._remaining_seconds if self.allow_partial else None,
+                before_execute=lambda: self._check_environment(state),
             )
             consolidation = coordinator.resume()
             state = self._finish_wave(state, wave, pending, consolidation,
