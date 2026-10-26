@@ -31,6 +31,9 @@ class SubjectViews:
         for plan in pending.get('items', []):
             rows.setdefault(plan['project_id'], dict(plan=plan))
         active = _json(root / 'memory/active.json', {})
+        published_projects = {memory.get('provenance', {}).get('project_id')
+            for version in active.get('active', {}).values()
+            if (memory := _json(root / 'memory/versions' / (version + '.json'), {}))}
         jobs = {_json(path, {}).get('review_id'): _json(path, {})
                 for path in (root / 'memory-reviews').glob('*/job.json')}
         waves = subjects.get('waves', {})
@@ -52,8 +55,8 @@ class SubjectViews:
                 wave = pending['wave_id']
             outcome = row.get('outcome') or {}
             review = row.get('review') or {}
-            published = pid in active.get('admissions', {})
-            directory = root / 'waves' / str(wave) / pid
+            published = pid in active.get('admissions', {}) or pid in published_projects
+            directory = root / row['directory'] if row.get('directory') else root / 'waves' / str(wave) / pid
             started = directory.is_dir() and _inside(root, directory)
             execution = ('verified' if outcome.get('host_verified') else 'failed') if outcome else (
                 'running' if started and running else 'stopped' if started else 'pending')
@@ -62,8 +65,9 @@ class SubjectViews:
                 kind=plan.get('task', {}).get('kind', plan.get('kind', 'graph')),
                 objective=row.get('objective', plan.get('spec', {}).get('hypothesis', '')),
                 execution=execution, project_review=review.get('decision', 'pending'),
-                memory_admission=jobs.get(pid, {}).get('status', 'not-submitted'),
+                memory_admission=jobs.get(row.get('manual_review_id', pid), {}).get('status', 'not-submitted'),
                 publication='published' if published else 'unpublished', merged=published,
+                directory=row.get('directory'), restart_of=row.get('restart_of'),
                 plan=plan, review=review, outcome=outcome,
                 memory=review.get('memory'), source=_source(root, outcome.get('source_sha256')) or ''))
         return dict(id=key, name=config.get('name', key), target=config.get('target'),
@@ -88,7 +92,7 @@ class SubjectViews:
     def streams(self, key, pid):
         _, project = self.project(key, pid)
         root = Path(self.campaigns[key]['root'])
-        directory = root / 'waves' / str(project['wave_id']) / pid
+        directory = root / project['directory'] if project.get('directory') else root / 'waves' / str(project['wave_id']) / pid
         paths = [*directory.glob('**/sft-traces/*.jsonl'), *directory.glob('**/evidence.jsonl'),
                  *directory.glob('**/jobs/*/events.jsonl')]
         return root, {p.relative_to(root).as_posix(): p for p in sorted(paths)

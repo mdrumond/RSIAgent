@@ -501,7 +501,8 @@ class DirectActorDriver:
         tokens = 0
         turn = conversation.turn
         ordinary_turns = 0
-        deadline = self.clock() + self.max_seconds
+        deadline = min(self.clock() + self.max_seconds,
+                       getattr(action_executor, 'deadline', float('inf')))
         while self.clock() < deadline:
             try:
                 conversation.boundary()

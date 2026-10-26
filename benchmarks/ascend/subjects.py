@@ -235,6 +235,14 @@ class SubjectScheduler:
                 raise ValueError('review already has a different outcome')
             row['status'] = outcome
 
+    def register_manual_review(self, review_id, subject_id):
+        """Link a continuation review without rewriting completed wave receipts."""
+        if subject_id not in self.index:
+            raise ValueError('unknown subject for manual review')
+        with self._transaction() as state:
+            state['reviews'].setdefault(review_id, dict(wave_id='manual-' + review_id,
+                subject_id=subject_id, status='pending'))
+
     def add_repair(self, repair_id, subject_id, project_id, reason, evidence):
         if subject_id not in self.index:
             raise ValueError('unknown repair subject')

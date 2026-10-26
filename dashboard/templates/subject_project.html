@@ -3,6 +3,13 @@
 <p>{{ project.objective }}</p><p>Attempt {{ project.attempt_id }} · Wave {{ project.wave_id }}</p>
 <dl><dt>Execution</dt><dd>{{ project.execution }}</dd><dt>Project review</dt><dd>{{ project.project_review }}</dd><dt>Memory admission</dt><dd>{{ project.memory_admission }}</dd><dt>Publication</dt><dd>{{ project.publication }}</dd></dl>
 {% if project.review.reason %}<aside>{{ project.review.reason }}</aside>{% endif %}
+{% if not project.merged and actor_controls_enabled %}
+<section data-actor-feedback="{{ url_for('subject_actor_feedback', campaign_id=campaign.id, project_id=project.id) }}"><h2>Redirect actor</h2>
+<form><label>Feedback or instructions<textarea name="text" required rows="4"></textarea></label>
+<label>Additional elapsed seconds for a stopped actor<input name="additional_seconds" type="number" min="1" step="1" value="1800" required></label>
+<button>Send feedback and continue</button></form><p data-feedback-status></p><ul data-feedback-receipts></ul></section>
+<script src="{{ url_for('static', filename='actor_controls.js') }}"></script>
+{% endif %}
 <section data-live-logs="{{ url_for('subject_logs', campaign_id=campaign.id, project_id=project.id) }}"><h2>Actor log</h2><button type="button" data-log-follow>Pause</button> <button type="button" data-log-earlier>Load earlier entries</button> <a href="{{ url_for('subject_log_download', campaign_id=campaign.id, project_id=project.id) }}">Download log</a><p data-log-status>Loading…</p><pre data-log-output style="max-height:36rem;overflow:auto"></pre></section>
 <details><summary>Project contract</summary><pre>{{ project.plan|tojson(indent=2) }}</pre></details>
 <details><summary>Source</summary><pre>{{ project.source or 'Source unavailable' }}</pre></details>

@@ -243,8 +243,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
                             artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
             frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
+            manual = Path(directory) / 'manual-execution.json'
+            attempt_id = json.loads(manual.read_bytes())['attempt_id'] if manual.exists() else item['project_id']
             return executor.optimizer(directory, item['task']['task'], frozen,
-                attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
+                attempt_id=attempt_id, remaining_seconds=remaining_seconds, artifacts=store)
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')

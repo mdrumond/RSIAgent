@@ -155,6 +155,7 @@ class SubjectCampaign:
         if review_ids is None:
             review_ids = [pid for pid in pending['projects']
                       if self.state['projects'][pid]['review']['decision'] == 'accept'
+                      and not self.state['projects'][pid].get('manual_review_id')
                       and self.state['projects'][pid]['review']['memory'] is not None]
             pending['review_ids'] = review_ids
             self._save()
@@ -163,6 +164,10 @@ class SubjectCampaign:
         for pid in pending['projects']:
             record = self.state['projects'][pid]
             review = record['review']
+            if record.get('manual_review_id'):
+                if pid in review_ids and self.scheduler.state()['reviews'][pid]['status'] == 'pending':
+                    self.scheduler.resolve_review(pid, 'rejected')
+                continue
             evidence = [record['review_sha256']]
             if review['decision'] == 'repair':
                 if pid in review_ids:
@@ -204,6 +209,8 @@ class SubjectCampaign:
 
     def _run_wave(self, pending):
         for item in pending['items']:
+            if (self.root / 'manual-pause.json').exists():
+                raise TimeoutError('manual interaction queued at campaign checkpoint')
             self._remaining()
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
@@ -216,6 +223,8 @@ class SubjectCampaign:
                 self._save()
         # All linked probes and controls must finish before either is reviewed.
         for pid in pending['projects']:
+            if (self.root / 'manual-pause.json').exists():
+                raise TimeoutError('manual interaction queued at campaign checkpoint')
             self._review(pid, self.state['projects'][pid])
         self._publish_wave(pending)
 
@@ -226,6 +235,8 @@ class SubjectCampaign:
         try:
             while True:
                 self._remaining()
+                if (self.root / 'manual-pause.json').exists():
+                    raise TimeoutError('manual interaction queued at campaign checkpoint')
                 self._settle_reviews()
                 if self.scheduler.is_complete() and not self.state['needs_decision']:
                     self.state['terminal'] = 'COMPLETE'

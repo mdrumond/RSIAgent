@@ -159,6 +159,25 @@ python run_ascend_campaign.py adopt \
 
 Subject campaigns can be configured alongside historical campaigns with
 `subject_campaigns: [{"id": "research", "name": "Research", "target": "a3", "root": "/path/to/subject-campaign"}]`.
+
+With controls enabled, subject entries additionally declare server-side `config`
+(the original subject runtime settings JSON) and `initial_memory` paths to resume
+stopped experiments. The worker uses retained subjects and original runtime
+identity; browser requests cannot select settings files or execution commands.
+Feedback reaches a live actor inbox immediately, independently of long dashboard
+operations. Stopped actors require an explicit additional elapsed allowance and
+run in a detached, leased worker. Completed results, traces, and actor checkpoints
+are archived before a continuation reopens its cache. Reviewed restarts use fresh
+linked project workspaces and deliver the curriculum-approved instruction through
+the same actor inbox, including optimizer jobs.
+
+Manual requests persist under the campaign's `dashboard-requests/` directory.
+Repeated keys return the original request. A failed launch or pre-execution failure
+can be retried with the same key. Interrupted execution reports
+`observation-required`: retained device operations must be observed before further
+execution is authorized; the dashboard does not blindly replay ambiguous work.
+Normal campaign scheduling yields at project checkpoints while manual work waits
+for its campaign lease. A manual continuation executes its selected project only.
 Their project pages separate execution, project review, memory admission, and
 publication. Actor logs follow retained trace, provider-evidence, and optimizer
 ledgers every two seconds. Pause stops polling; loading earlier entries reads
