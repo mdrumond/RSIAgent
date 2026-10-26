@@ -96,3 +96,68 @@ def test_interrupted_arm_holds_peer_and_caches_portable_partial_result(tmp_path,
     assert evaluate(h, tmp_path) == first and calls == [stage]
     store = ContentAddressedArtifacts(tmp_path/'artifacts')
     assert all(store.read_bytes(h) for h in first['artifacts'].values())
+
+
+@pytest.mark.parametrize('wrapped', [False, True])
+@pytest.mark.parametrize('kind', ['pi-provider', 'provider-rejection', 'cancelled'])
+def test_actual_pi_and_provider_exception_types_survive_cause_wrapping(kind, wrapped):
+    from coding.pi.rpc import PiProviderError, PiCancelled
+    from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
+    error = {'pi-provider':lambda:PiProviderError('provider rejected'),
+        'provider-rejection':lambda:ProviderRejectionError(code='rate_limit', status_code=429, request_id='fixture'),
+        'cancelled':lambda:PiCancelled('generic aborted provider turn')}[kind]()
+    expected = 'cancelled' if kind=='cancelled' else 'provider-failure'
+    if wrapped:
+        wrapper = ProjectInfrastructureError('wrapped boundary')
+        wrapper.__cause__ = error
+        error = wrapper
+    assert interruption_reason(error) == expected
+
+
+def test_actual_environment_report_contributes_timestamped_span(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from benchmarks.ascend import wave_environment
+    arm = tmp_path/'arm'
+    binding = arm/'runtime/binding'
+    now = [0.]
+    monkeypatch.setattr(wave_environment.time, 'monotonic', lambda:now[0])
+    monkeypatch.setattr(wave_environment.time, 'time', lambda:100+now[0])
+    class Transport:
+        runtime_identity = {'physical_device':0}
+        def compile(self, plan, root):
+            now[0] += 2
+            return SimpleNamespace(plan=plan, library_sha256='b'*64, stdout='', stderr='')
+        def execute_receipt(self, compilation):
+            now[0] += 3
+            return SimpleNamespace(exit_code=0, job_handle='remote:fixture:job:probe',
+                output=tuple(sum(xs) for xs in zip(*(t.values for t in compilation.plan.inputs))))
+    check = wave_environment.NativeWaveEnvironmentCheck(SimpleNamespace(root=binding,
+        target='fixture', arch='fixture', execution_profile='gz-a3'), [Transport()])
+    check(1, lambda:10-now[0])
+    outcome = interrupted_outcome(arm, TimeoutError('deadline'),
+        ContentAddressedArtifacts(tmp_path/'destination'), started_epoch=100, elapsed_seconds=10)
+    timing = outcome.observations['timing']
+    assert timing['by_stage_seconds']['environment'] == 5
+    assert timing['attributed_seconds'] == 5 and timing['unattributed_seconds'] == 5
+    report_ref = next(v for k,v in outcome.artifacts.items() if k.startswith('environment:'))
+    report = json.loads(outcome.read_artifact(report_ref))
+    assert report['status']=='passed' and report['started_epoch']==100 and report['ended_epoch']==105
+
+
+@pytest.mark.parametrize('kind', ['provider', 'cancelled', 'operator-stop'])
+def test_actual_pi_error_arm_is_invalid_and_never_starts_peer(tmp_path, kind):
+    from coding.pi.rpc import PiProviderError, PiCancelled
+    h = Harness()
+    calls = []
+    def execute(task, memory, directory, **kwargs):
+        calls.append(directory.name)
+        error = PiProviderError('provider failed') if kind=='provider' else PiCancelled('aborted')
+        if kind=='operator-stop':error.interruption_reason='operator-stop'
+        raise error
+    h.verifier.execute_arm=execute
+    result = evaluate(h, tmp_path)
+    assert result['decision']=='inconclusive' and result['validity']=={'control':False}
+    expected = 'provider-failure' if kind=='provider' else kind
+    assert result['arms']['control']['observations']['interruption_reason']==expected
+    assert evaluate(h, tmp_path)==result and calls==['control']
+    assert not h.requests and not (tmp_path/'treatment').exists()

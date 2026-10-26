@@ -8,21 +8,30 @@ import re
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .subject_execution import SubjectOutcome
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
+from coding.pi.rpc import PiCancelled, PiProviderError
 
 
 def interruption_reason(error):
     """Prefer structural transport/stop metadata, including wrapped causes."""
+    chain = []
     current = error
     while current is not None:
+        chain.append(current)
+        current = current.__cause__
+    # A wrapping exception must not erase the authoritative stop provenance.
+    for current in chain:
         reason = getattr(current, 'interruption_reason', None)
         if reason:
             return reason
-        if isinstance(current, TimeoutError):
-            return 'deadline-exhausted'
-        current = current.__cause__
-    if type(error).__name__ == 'ProviderRejectionError':
+    if any(isinstance(current, PiCancelled) for current in chain):
+        return 'cancelled'
+    if any(isinstance(current, (PiProviderError, ProviderRejectionError)) for current in chain):
         return 'provider-failure'
-    return 'transport-unresolved' if isinstance(error, (OSError, ProjectInfrastructureError)) else 'harness-error'
+    if any(isinstance(current, TimeoutError) for current in chain):
+        return 'deadline-exhausted'
+    return ('transport-unresolved' if any(isinstance(current, (OSError, ProjectInfrastructureError))
+            for current in chain) else 'harness-error')
 
 
 def arm_evidence(directory, store, *, project_root=None):
