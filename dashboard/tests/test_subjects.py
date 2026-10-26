@@ -126,3 +126,87 @@ def test_trace_messages_are_visible_before_finish_and_final_seal_remains_valid(t
                         evidence_sha256='b' * 64, candidate_sha256='c' * 64)
     recorder.finish()
     assert _read_trace(path)[-1]['kind'] == 'terminal'
+
+
+def test_log_reset_identifies_only_the_replaced_stream(campaign):
+    config, _, live = campaign
+    first = live / 'evidence.jsonl'
+    other = live / 'sft-traces/other.jsonl'
+    other.parent.mkdir()
+    first.write_text(json.dumps(dict(kind='message', payload='old actor entry')) + '\n')
+    other.write_text(json.dumps(dict(kind='tool', payload='retained host observation')) + '\n')
+    views = SubjectViews(config)
+    initial = views.logs('research', 'live', 'start')
+    assert len(initial['events']) == 2
+    first.write_text(json.dumps(dict(kind='message', payload='replacement')) + '\n')
+    page = views.logs('research', 'live', initial['cursor'])
+    stream = first.relative_to(live.parents[2]).as_posix()
+    assert page['reset_streams'] == [stream]
+    assert len(page['events']) == 1 and page['events'][0]['event']['payload'] == 'replacement'
+    retained = {row['id']: row for row in initial['events'] if row['stream'] not in page['reset_streams']}
+    retained.update((row['id'], row) for row in page['events'])
+    assert {row['event']['payload'] for row in retained.values()} == {'replacement', 'retained host observation'}
+    assert views.logs('research', 'live', page['cursor'])['events'] == []
+
+
+def test_live_log_client_retains_other_streams_when_one_rotates():
+    import shutil
+    import subprocess
+    from pathlib import Path
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node is required to execute the dashboard client behavior')
+    script = """
+const assert = require('assert');
+const vm = require('vm');
+const fs = require('fs');
+const context = {document: {querySelectorAll: () => []}};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+const entries = new Map();
+context.updateActorLogEntries(entries, {events: [
+  {id: 'actor:0', stream: 'actor', event: {content: 'old'}},
+  {id: 'host:0', stream: 'host', event: {content: 'retained'}}], reset_streams: []});
+context.updateActorLogEntries(entries, {events: [
+  {id: 'actor:0', stream: 'actor', event: {content: 'replacement'}}], reset_streams: ['actor']});
+assert.strictEqual(entries.size, 2);
+assert.strictEqual(entries.get('host:0').event.content, 'retained');
+assert.strictEqual(entries.get('actor:0').event.content, 'replacement');
+"""
+    subprocess.run([node, '-e', script, str(Path(__file__).parents[1] / 'static/subject_logs.js')], check=True)
+
+
+def test_oversized_complete_record_advances_to_following_events(campaign):
+    config, _, live = campaign
+    oversized = json.dumps(dict(kind='message', payload='x' * (1048576 + 100))).encode() + b'\n'
+    following = dict(kind='tool', payload='next action')
+    (live / 'evidence.jsonl').write_bytes(oversized + json.dumps(following).encode() + b'\n')
+    views = SubjectViews(config)
+    first = views.logs('research', 'live', 'start', limit=1)
+    assert first['events'][0]['event']['kind'] == 'oversized'
+    assert first['events'][0]['event']['payload']['bytes'] == len(oversized)
+    next_page = views.logs('research', 'live', first['cursor'])
+    assert [row['event'] for row in next_page['events']] == [following]
+    assert views.logs('research', 'live', next_page['cursor'])['events'] == []
+
+
+def test_large_partial_tail_is_retained_until_newline_then_following_rows_flow(campaign):
+    config, _, live = campaign
+    path = live / 'evidence.jsonl'
+    prefix = json.dumps(dict(kind='message', payload='older event')).encode() + b'\n'
+    partial = json.dumps(dict(kind='message', payload='x' * (1048576 + 100))).encode()
+    path.write_bytes(prefix + partial)
+    views = SubjectViews(config)
+    # A fresh tail poll lands inside the long unfinished row. It must retain
+    # that row's start rather than bookmarking its temporary EOF.
+    initial = views.logs('research', 'live')
+    assert initial['events'] == []
+    assert views.logs('research', 'live', initial['cursor'])['events'] == []
+    following = dict(kind='tool', payload='after completed long record')
+    with path.open('ab') as stream:
+        stream.write(b'\n' + json.dumps(following).encode() + b'\n')
+    complete = views.logs('research', 'live', initial['cursor'])
+    assert [row['event']['kind'] for row in complete['events']] == ['oversized', 'tool']
+    assert complete['events'][0]['event']['payload']['bytes'] == len(partial) + 1
+    assert complete['events'][1]['event'] == following
+    assert complete['reset_streams'] == []

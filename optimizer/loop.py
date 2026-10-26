@@ -326,23 +326,28 @@ class OptimizationLoop:
             self._save()
 
     def _model(self, stage, context):
+        from benchmarks.ascend.actor_control import ActorControl, ActorStopped
+        control = ActorControl(self.directory.parent)
         retained = self.state.get('model_action', self.state.get('action_result'))
-        if retained and retained.get('name') == stage:
+        if retained and retained.get('name') == stage and not control.pending():
             # The caller removes this result in the same checkpoint that applies
             # it. A crash in between must not issue another billable request.
             return self._read(retained)
+        if retained and retained.get('name') == stage:
+            self.state.pop('model_action', None)
+            self.state.pop('action_result', None)
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
-        from benchmarks.ascend.actor_control import ActorControl, ActorStopped
-        control = ActorControl(self.directory.parent)
         checkpoint = control.status()['checkpoint'] or {}
         feedback = checkpoint.get('feedback', self.state.get('user_feedback', []))
         self.state['user_feedback'] = feedback
         try:
             control.boundary({'turn': self.state['turn'], 'feedback': feedback}, feedback)
         except ActorStopped:
-            self.store.stop(self.key)
+            row = self.store.stop(self.key)
+            if row['status'] == 'running':
+                self.store.transition(self.key, 'stopped')
             return None
         self._save()
         context['user_feedback'] = feedback

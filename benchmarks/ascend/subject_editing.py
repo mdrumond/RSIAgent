@@ -35,7 +35,7 @@ def validate_project(item, *, runtime=None, policy=None):
         validate_submission(task['task']['submission'])
     else:
         spec = ProjectSpec.from_mapping(item['spec'])
-        if spec.project_id != identifier:
+        if spec.project_id != identifier and task.get('kind') != 'target':
             raise ValueError('project and spec identifiers differ')
         if task:
             from .phase2_targets import TargetContract
