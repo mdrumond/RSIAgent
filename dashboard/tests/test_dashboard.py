@@ -1201,17 +1201,17 @@ def test_a5_campaign_and_preset_are_rejected_before_invocation(tmp_path):
 
 
 def test_start_is_async_allowlisted_and_idempotent(tmp_path):
-    config, _, _ = controlled_config(tmp_path, phase=2)
+    config, _, _ = controlled_config(tmp_path, phase=1)
     calls = []
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         return subprocess.CompletedProcess(argv, 0, '{"session":"test"}\n', "")
     app = create_app(config, tmp_path / "cache.sqlite3", refresh_seconds=0, command_runner=run)
     client = app.test_client()
-    assert b"Start phase 2" in client.get("/").data
+    assert b"Start phase 1" in client.get("/").data
     csrf = client.get("/api/csrf").get_json()["token"]
     headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "start-once"}
-    body = {"preset_id": "phase2", "confirmation": "start:phase2"}
+    body = {"preset_id": "phase1", "confirmation": "start:phase1"}
     first = client.post("/api/control/start", json=body, headers=headers)
     second = client.post("/api/control/start", json=body, headers=headers)
     assert first.status_code == second.status_code == 202
@@ -1221,7 +1221,7 @@ def test_start_is_async_allowlisted_and_idempotent(tmp_path):
     argv, kwargs = calls[0]
     assert argv[:3] == [pytest.importorskip("sys").executable, "/repo/run_ascend_campaign.py", "start"]
     assert "--target" in argv and argv[argv.index("--target") + 1] == "a3"
-    assert "--approval-mode" not in argv and "--phase1-root" in argv and "--review" in argv
+    assert "--approval-mode" in argv and "--phase1-root" not in argv and "--review" not in argv
     assert kwargs["shell"] is False
     conflict = client.post("/api/control/start", json={**body, "confirmation": "wrong"}, headers=headers)
     assert conflict.status_code == 409
@@ -1330,11 +1330,11 @@ def test_running_approval_retry_and_reconciliation_are_idempotent(tmp_path, alre
     assert len(calls) == 2
 
 
-def test_selection_staleness_phase2_cardinality_failures_and_restart(tmp_path):
-    config, root, control = controlled_config(tmp_path, phase=2)
+def test_stale_selection_and_interrupted_operations_recover_after_restart(tmp_path):
+    config, root, control = controlled_config(tmp_path, phase=1)
     root.mkdir()
     write(root / "state.json", {"coverage": [], "prior_outcomes": [], "wave_index": 2})
-    write(control / "curriculum-approval.json", {"status": "proposed", "phase": 2,
+    write(control / "curriculum-approval.json", {"status": "proposed", "phase": 1,
           "proposal_id": "p2", "proposal": {"base_wave_index": 1,
           "base_memory_sha256": "a" * 64, "wave": {"projects": [
               {"spec": {"project_id": "one", "hypothesis": "One", "capabilities": []}},
@@ -1344,7 +1344,7 @@ def test_selection_staleness_phase2_cardinality_failures_and_restart(tmp_path):
     client = app.test_client()
     csrf = client.get("/api/csrf").get_json()["token"]
     headers = {"X-CSRF-Token": csrf, "Idempotency-Key": "approval"}
-    body = {"campaign_id": "phase2", "proposal_id": "p2", "project_ids": ["one", "two"],
+    body = {"campaign_id": "phase1", "proposal_id": "p2", "project_ids": ["one", "two"],
             "confirmation": "approve:p2"}
     assert client.post("/api/control/approve", json=body, headers=headers).status_code == 409
     body["project_ids"] = ["one"]
@@ -1352,8 +1352,8 @@ def test_selection_staleness_phase2_cardinality_failures_and_restart(tmp_path):
         headers={**headers, "Idempotency-Key": "stale"}).status_code == 409
 
     manager = app.extensions["dashboard_controls"]
-    running = manager._insert_for_test("sample", "phase2", "running")
-    queued = manager._insert_for_test("sample", "phase2", "queued")
+    running = manager._insert_for_test("sample", "phase1", "running")
+    queued = manager._insert_for_test("sample", "phase1", "queued")
     manager.close()
     restarted = create_app(config, cache, refresh_seconds=0, command_runner=lambda *a, **k: None)
     client = restarted.test_client()
@@ -1431,3 +1431,38 @@ def test_background_failure_is_sanitized_and_visible(tmp_path):
     assert operation["status"] == "failed"
     assert "provider unavailable" in operation["error"]
     assert "SECRET_TOKEN" not in operation["error"]
+
+
+@pytest.mark.parametrize('action', ['start', 'sample', 'approve', 'reject', 'run-approved', 'extend'])
+def test_retired_phase2_mutations_refuse_before_runner_or_campaign_changes(tmp_path, action):
+    from html.parser import HTMLParser
+    config, root, control = controlled_config(tmp_path, phase=2)
+    write(root / 'state.json', dict(wave_index=1, coverage=[], prior_outcomes=[]))
+    write(control / 'curriculum-approval.json', dict(status='approved', proposal_id='historical',
+        proposal=dict(base_wave_index=1, wave=dict(projects=[]))))
+    before = {path: path.read_bytes() for directory in (root, control) for path in directory.rglob('*') if path.is_file()}
+    calls = []
+    app = create_app(config, tmp_path / 'retired.sqlite', command_runner=lambda *a, **k: calls.append(a))
+    client = app.test_client()
+    try:
+        subject = 'phase2' if action in {'start', 'sample', 'extend'} else 'historical'
+        payload = dict(campaign_id='phase2', preset_id='phase2', proposal_id='historical',
+                       project_ids=[], confirmation=action + ':' + subject)
+        response = client.post('/api/control/' + action, json=payload, headers={
+            'X-CSRF-Token': client.get('/api/csrf').get_json()['token'], 'Idempotency-Key': action})
+        assert response.status_code == 409 and calls == []
+        assert {path: path.read_bytes() for directory in (root, control) for path in directory.rglob('*') if path.is_file()} == before
+        assert app.extensions['dashboard_controls'].recent() == []
+        assert client.get('/api/status').get_json()['controls']['proposals'][0]['controls_available'] is False
+        class Buttons(HTMLParser):
+            def __init__(self, html):
+                super().__init__()
+                self.actions = []
+                self.feed(html)
+            def handle_starttag(self, tag, attrs):
+                values = dict(attrs)
+                if tag == 'button':
+                    self.actions.extend(values[key] for key in ('data-action', 'data-proposal-action') if key in values)
+        assert Buttons(client.get('/').get_data(as_text=True)).actions == []
+    finally:
+        app.extensions['dashboard_controls'].close()

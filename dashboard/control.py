@@ -126,7 +126,8 @@ class ControlManager:
         return {"campaign_id": campaign_id, "phase": campaign["phase"],
                 "proposal_id": record.get("proposal_id"), "status": record.get("status"),
                 "selected_project_ids": record.get("selected_project_ids", []),
-                "projects": projects, "terminal": safe_terminal}
+                "projects": projects, "terminal": safe_terminal,
+                "controls_available": campaign["phase"] == 1}
 
     def proposals(self):
         return [proposal for campaign_id in self.campaigns
@@ -154,8 +155,12 @@ class ControlManager:
                 raise ControlError("unknown start preset") from error
             if preset.get("target") != "a3" or preset.get("phase") not in (1, 2):
                 raise ControlError("only A3 Phase 1 and Phase 2 presets are allowed")
+            if preset["phase"] == 2:
+                raise ControlError("new Phase 2 launches are retired; use subject campaigns")
             return identifier
         campaign = self._campaign(identifier)
+        if campaign["phase"] == 2:
+            raise ControlError("Phase 2 execution is retired; historical evidence remains readable")
         if action == "extend":
             step = self.settings.get("extension_step")
             if type(step) is not int or step != 8:
@@ -229,6 +234,8 @@ class ControlManager:
         return identifier
 
     def _validate_feedback(self, action, payload):
+        if action == 'retry-feedback':
+            raise ControlError('Phase 2 retries are retired; request a project from the subject curriculum')
         if self.feedback.root is None:
             raise ControlError("configure feedback_root first")
         subject = 'phase2' if action == 'import-feedback' else payload.get('preset_id')
