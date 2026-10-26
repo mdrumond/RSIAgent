@@ -37,7 +37,7 @@ def setup(tmp_path):
     return config, root, scheduler
 
 
-def application(setup, responses, restart=None):
+def application(setup, responses, restart=None, *, settings=None, target='a3'):
     config, root, _ = setup
     calls = []
     values = iter(responses)
@@ -47,7 +47,8 @@ def application(setup, responses, restart=None):
         def complete(role, messages, **limits):
             calls.append((role, messages, limits))
             return json.dumps(next(values))
-        yield SimpleNamespace(root=root, entry=dict(target='a3'), complete=complete, bound={},
+        yield SimpleNamespace(root=root, entry=dict(target=target), complete=complete, bound={},
+                              settings=settings or {},
                               policy=SimpleNamespace(admit=lambda _: None, grammar=lambda grammar: grammar))
     def status(config_path, campaign_id, identifier):
         path = root / 'dashboard-requests' / (identifier + '.json')
@@ -322,7 +323,7 @@ def test_target_preview_checks_observed_runtime_before_accepting_qualification(s
         def complete(role, messages, **options):
             calls.append(messages)
             return json.dumps([dict(subject_id='current', item=next(responses))])
-        yield SimpleNamespace(root=root, entry=dict(target='a3'), complete=complete,
+        yield SimpleNamespace(root=root, entry=dict(target='a3'), complete=complete, settings={},
             bound=dict(actor=SimpleNamespace(executor=SimpleNamespace(runtime_identity=dict(RUNTIME)))),
             policy=a3_curriculum_policy())
     app = create_app(config, root.parent / 'target-cache.sqlite', curriculum_binder=binder)
@@ -334,5 +335,43 @@ def test_target_preview_checks_observed_runtime_before_accepting_qualification(s
         assert len(calls) == 2
         assert result['result']['after'][0]['item'] == plan
         assert app.extensions['dashboard_subjects'].campaign('research')['project_queue'] == []
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def optimizer_item():
+    return dict(project_id='optimizer-copy', repairs=[], task=dict(kind='optimizer', task=dict(
+        task_id='torch-copy', submission=dict(source='def copy(x): return x', entrypoint='copy',
+        signatures=[dict(args=[dict(shape=[8], dtype='float32')])]))))
+
+
+@pytest.mark.parametrize('settings,target', [({}, 'a3'), ({'optimizer_worker_config': {}}, 'a5')])
+def test_curriculum_repairs_optimizer_request_unavailable_in_campaign(setup, settings, target):
+    graph = dict(subject_id='current', item=item('graph-copy'))
+    app, calls = application(setup, [[dict(subject_id='current', item=optimizer_item())], [graph]],
+                             settings=settings, target=target)
+    client = app.test_client()
+    try:
+        result = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='request-project', instructions='Request a useful copy experiment', format_seconds=10), 'optimizer'))
+        assert result['status'] == 'succeeded', result
+        assert len(calls) == 2 and result['result']['after'] == [graph]
+        assert setup[2].state().get('project_queue', []) == []
+        assert not list(setup[1].glob('**/jobs'))
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_configured_a3_optimizer_can_be_previewed_without_execution(setup):
+    queued = [dict(subject_id='current', item=optimizer_item())]
+    app, calls = application(setup, [queued], settings={'optimizer_worker_config': {}}, target='a3')
+    client = app.test_client()
+    try:
+        result = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='projects', instructions='Use the configured optimizer', format_seconds=10), 'supported'))
+        assert result['status'] == 'succeeded', result
+        assert len(calls) == 1 and result['result']['after'] == queued
+        assert setup[2].state().get('project_queue', []) == []
+        assert not list(setup[1].glob('**/jobs'))
     finally:
         app.extensions['dashboard_controls'].close()
