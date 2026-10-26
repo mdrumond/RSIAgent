@@ -368,7 +368,7 @@ def _execute(campaign, request, original, directory, request_path):
     request['phase'] = 'reviewing'
     atomic(request_path, canonical(request))
     campaign._save()
-    _finish_linked_siblings(campaign, record, snapshot)
+    _finish_linked_siblings(campaign, record, snapshot, request, request_path)
     if not record.get('review'):
         campaign._review(pid, record)
     # A distinct review identity preserves earlier A/B decisions and receipts.
@@ -433,7 +433,7 @@ def _settle_manual_repairs(campaign, pid, record, review_id, source_pid):
             campaign.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in linked])
 
 
-def _finish_linked_siblings(campaign, record, snapshot):
+def _finish_linked_siblings(campaign, record, snapshot, request, request_path):
     """Keep the ordinary paired-probe barrier before manual project review."""
     pending = campaign.state.get('pending') or {}
     if pending.get('wave_id') != record['origin_wave_id']:
@@ -449,10 +449,14 @@ def _finish_linked_siblings(campaign, record, snapshot):
             wave_index=len(campaign.state['waves'])+1))
         linked.append((pid, row))
         if 'outcome' not in row:
+            request['phase'] = 'executing'
+            atomic(request_path, canonical(request))
             directory = campaign.root / 'waves' / pending['wave_id'] / pid
             row['outcome'] = campaign.execute(item, snapshot, directory,
                 remaining_seconds=campaign._remaining()).as_dict()
             campaign._save()
+    request['phase'] = 'reviewing'
+    atomic(request_path, canonical(request))
     for pid, row in linked:
         campaign._review(pid, row)
         if row['review']['decision'] == 'repair':

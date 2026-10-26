@@ -37,7 +37,7 @@ def real_builder(root, scheduler, artifacts, *, decision='accept', reviewed=None
             return json.dumps(dict(action=action, reason='settled', evidence=['retained']))
         return SubjectCampaign(root, scheduler.subjects, b'', select_wave=None,
             execute=execution or execute, verifier=SimpleNamespace(review=review, last_trace=[]),
-            complete=complete)
+            complete=complete, max_seconds=20)
     return build
 
 
@@ -130,7 +130,8 @@ def test_stopped_project_queues_even_when_another_actor_is_live(tmp_path):
     assert not ActorControl(directory/'actor').live()
 
 
-def test_manual_review_waits_for_linked_sibling_execution_and_preserves_obligation(tmp_path):
+@pytest.mark.parametrize('sibling_interrupted', [False, True])
+def test_manual_review_waits_for_linked_sibling_execution_and_preserves_obligation(tmp_path, sibling_interrupted):
     config, root, _, scheduler, artifacts = setup(tmp_path)
     scheduler.add_repair('paired', 'study', 'one', 'compare both probes', ['a'*64])
     state = json.loads((root/'subject-campaign.json').read_bytes())
@@ -151,8 +152,19 @@ def test_manual_review_waits_for_linked_sibling_execution_and_preserves_obligati
         observed = json.loads((root/'subject-campaign.json').read_bytes())
         assert all('outcome' in observed['projects'][pid] for pid in ('one', 'control'))
     operation = request(config)
+    def execute(item, snapshot, directory, **options):
+        from optimizer.control import ObservationUnavailable
+        if item['project_id'] == 'control':
+            raise ObservationUnavailable('retained sibling operation requires observation')
+        source = artifacts.put_bytes(b'selected source')
+        return SubjectOutcome(True, source, {'source': source}, {}, artifacts.root)
     result = interaction.run_request(config, 'campaign', operation['id'],
-        builder=real_builder(root, scheduler, artifacts, reviewed=verify))
+        builder=real_builder(root, scheduler, artifacts, reviewed=verify,
+                             execution=execute if sibling_interrupted else None))
+    if sibling_interrupted:
+        assert result['status'] == 'observation-required'
+        assert scheduler.state()['repairs']['paired']['status'] == 'open'
+        return
     assert result['status'] == 'succeeded'
     assert scheduler.state()['repairs']['paired']['status'] == 'resolved'
 
@@ -204,7 +216,8 @@ def test_successful_probe_keeps_repair_open_until_linked_control_accepts(tmp_pat
     assert scheduler.state()['repairs']['paired']['status'] == 'open'
 
 
-def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repairs(tmp_path):
+@pytest.mark.parametrize('cached_reviews', [False, True])
+def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repairs(tmp_path, cached_reviews):
     config, root, _, scheduler, artifacts = setup(tmp_path)
     snapshot = scheduler.state()['waves']['wave-1']['memory_snapshot_sha256']
     scheduler.start_wave('wave-2', snapshot)
@@ -219,6 +232,8 @@ def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repa
     state['waves'] = ['wave-1', 'wave-2']
     state['pending'] = dict(wave_id='reserved', subject={'subject_id': 'study', 'objective': 'Study'},
         memory_sha256=snapshot, projects=['one'], items=[item])
+    if cached_reviews:
+        state['pending']['review_ids'] = ['one']
     atomic(root/'subject-campaign.json', canonical(state))
     proposal = dict(id='f'*32, kind='restart', status='approved', project='one', after=dict(
         item={'project_id': 'replacement', 'repairs': ['obligation'], 'spec': {'project_id': 'replacement'}},
@@ -243,6 +258,10 @@ def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repa
     assert scheduler.state()['repairs']['obligation']['status'] == 'resolved'
     assert builder().run()['terminal'] == 'COMPLETE'
     assert executed == ['replacement']
+    if cached_reviews:
+        superseded = scheduler.state()['reviews']['one']
+        assert superseded['status'] == 'rejected'
+        assert superseded['supersession']['replacement_project'] == 'replacement'
 
 
 def test_default_curriculum_status_reports_orphaned_actor_worker(tmp_path, monkeypatch):

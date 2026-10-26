@@ -115,8 +115,11 @@ class SubjectCampaign:
         linked = {key: self.state['projects'].get(obligations.get(key, {}).get('project_id',key))
                   for key in record.get('repairs', [])}
         for key, original in linked.items():
-            if original is record and record.get('prior_project_sha256'):
-                linked[key] = self.artifacts.read_json(record['prior_project_sha256'])
+            if original is not None and original.get('prior_project_sha256'):
+                prior = self.artifacts.read_json(original['prior_project_sha256'])
+                if (original is record or not original.get('review')
+                        or prior.get('review_sha256') in obligations[key]['evidence']):
+                    linked[key] = prior
         artifacts = dict(outcome['artifacts'])
         plan = record.get('plan')
         if plan is None:
@@ -175,11 +178,13 @@ class SubjectCampaign:
         for pid in pending['projects']:
             record = self.state['projects'][pid]
             if record.get('superseded_by'):
+                self.scheduler.supersede_review(pid, dict(record['cancellation'],
+                    replacement_project=record['superseded_by']))
                 continue
             review = record['review']
             if record.get('manual_review_id'):
-                if pid in review_ids and self.scheduler.state()['reviews'][pid]['status'] == 'pending':
-                    self.scheduler.resolve_review(pid, 'rejected')
+                self.scheduler.supersede_review(pid, dict(request_id=record['manual_request'],
+                    replacement_review=record['manual_review_id']))
                 continue
             evidence = [record['review_sha256']]
             if review['decision'] == 'repair':
