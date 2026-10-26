@@ -14,7 +14,7 @@ from .subject_memory import digest
 from .subjects import Subject
 
 
-def validate_project(item):
+def validate_project(item, *, runtime=None, policy=None):
     """Validate existing executable contracts without executing model-authored code."""
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
     if not isinstance(item, dict) or set(item) - {'project_id', 'spec', 'task', 'repairs'}:
@@ -41,6 +41,15 @@ def validate_project(item):
             from .phase2_targets import TargetContract
             if task.get('kind') != 'target' or TargetContract.from_mapping(task['contract']).spec != spec:
                 raise ValueError('target contract differs from project spec')
+            if not isinstance(task.get('artifact_root'), str) or not task['artifact_root'].strip():
+                raise ValueError('target requires a retained qualification artifact_root')
+            from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+            contract = TargetContract.from_mapping(task['contract'])
+            try:
+                contract.verify(ContentAddressedArtifacts(Path(task['artifact_root'])),
+                                contract.runtime if runtime is None else runtime, policy)
+            except (OSError, KeyError, TypeError) as error:
+                raise ValueError('target qualification evidence is unavailable or invalid') from error
     return item
 
 
@@ -135,9 +144,14 @@ class SubjectEdits:
         state, campaign, base = self._context()
         before = state['subjects'] if kind == 'subjects' else state.get('project_queue', [])
         if kind == 'restart':
-            if project not in campaign['projects']:
+            before = campaign['projects'].get(project)
+            if before is None:
+                pending = campaign.get('pending') or {}
+                plan = next((row for row in pending.get('items', []) if row['project_id'] == project), None)
+                if plan is not None:
+                    before = dict(plan=plan, objective=pending.get('subject', {}).get('objective', ''))
+            if before is None:
                 raise ValueError('unknown restart project')
-            before = campaign['projects'][project]
         schema = {'subjects': 'a complete subject list using subject_id, objective, min_waves, task',
                   'projects': 'the complete pending queue [{"subject_id":"...","item":{project_id,spec or task,repairs}}]',
                   'restart': '{"item":{project_id,spec or task,repairs},"instruction":"reviewed actor prompt"}'}[kind]
