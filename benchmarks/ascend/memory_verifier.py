@@ -212,7 +212,7 @@ class MemoryVerifierAgent:
                     if not isinstance(evidence, list) or any(item not in read for item in evidence):
                         raise ValueError('judgment cites evidence not actually read')
                     if required - read:
-                        raise ValueError('inspect both arms result/log artifacts before any terminal judgment')
+                        raise ValueError('inspect missing required current and historical evidence before judgment')
                     if value['decision'] != 'inconclusive' and not evidence:
                         raise ValueError('substantive judgment requires actually read evidence references')
                     if value['decision'] == 'accept' and not arms['treatment'].host_verified:
@@ -237,6 +237,15 @@ class MemoryVerifierAgent:
                     ['decision', 'reason', 'evidence', 'instructions'],
                     ['decision', 'reason', 'evidence', 'instructions', 'next_probe']],
                     correction='Return only one exact key set; remove API metadata and unknown keys.')
+                missing = required - read
+                if missing:
+                    observation.update(missing_required_count=len(missing),
+                        missing_required=[dict(sha256=sha,
+                            roles=[role[:160] for role, digest in sorted(registry.items()) if digest == sha][:4])
+                            for sha in sorted(missing)[:16]],
+                        correction='Read the listed missing hashes. Current and historical result/log evidence is required; preserve your observations already read.')
+                    if any(role.startswith('history:') and sha in missing for role, sha in registry.items()):
+                        observation['discovery'] = dict(list_artifacts=dict(prefix='history:', offset=0, limit=20))
                 self.last_trace.append(dict(kind='feedback', observation=observation))
             messages.append(dict(role='user', content=json.dumps(observation, sort_keys=True)))
 

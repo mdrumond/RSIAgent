@@ -185,3 +185,38 @@ def test_restart_before_followup_dispatch_preserves_history_ordinal_and_budget(t
         assert [p.name for p,*_ in h.executions]==['control','treatment','treatment','control']
         assert json.loads((gate._path('p').parent/'elapsed.json').read_text())['elapsed_seconds']>spent
     finally:gate.close()
+
+
+def test_missing_history_feedback_drives_exact_reads_then_finishes(tmp_path):
+    from benchmarks.ascend.memory_verifier import MemoryVerifierAgent
+    store=ContentAddressedArtifacts(tmp_path/'artifacts')
+    current_log=store.put_bytes(b'current Actor log')
+    current_result=store.put_bytes(b'current host result')
+    prior_log=store.put_bytes(b'prior unfavorable Actor evidence')
+    history=[dict(decision='inconclusive',reason='earlier uncertainty',artifacts={'log:actor':prior_log})]
+    arms={name:SubjectOutcome(True,None,{'log:actor':current_log,'result':current_result},{},store.root)
+          for name in ['control','treatment']}
+    corrections=[]
+    def complete(messages,**kwargs):
+        observations=[json.loads(m['content'])for m in messages[2:]if m['role']=='user']
+        read={o['sha256']for o in observations if 'sha256'in o}
+        for sha in [current_log,current_result]:
+            if sha not in read:return json.dumps({'read_artifact':{'sha256':sha}})
+        feedback=[o for o in observations if 'missing_required'in o]
+        if feedback:
+            corrections.extend(feedback[-1:])
+            for entry in feedback[-1]['missing_required']:
+                if entry['sha256']not in read:
+                    return json.dumps({'read_artifact':{'sha256':entry['sha256']}})
+        return json.dumps(dict(decision='inconclusive',reason='Actual current and prior evidence compared',
+                               evidence=sorted(read),instructions=None))
+    judge=MemoryVerifierAgent(complete)
+    result=judge.review(draft(),arms,lambda sha,**kw:store.read_bytes(sha),max_seconds=30,history=history)
+    feedback=[e['observation']for e in judge.last_trace if e['kind']=='feedback']
+    assert len(feedback)==1 and feedback[0]['missing_required_count']==2
+    entries=feedback[0]['missing_required']
+    assert next(e for e in entries if e['sha256']==prior_log)['roles']==['history:0:log:actor']
+    assert any(e['roles']==['history:0:evaluation']for e in entries)
+    assert feedback[0]['discovery']['list_artifacts']['prefix']=='history:'
+    assert prior_log in result['evidence']and result['decision']=='inconclusive'
+    assert {e['observation']['sha256']for e in judge.last_trace if e['kind']=='read'}>=set(result['evidence'])
