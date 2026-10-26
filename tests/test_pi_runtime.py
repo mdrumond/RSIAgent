@@ -232,6 +232,31 @@ def test_actor_provider_receives_layout_contract_without_context_reads(monkeypat
     assert 'private inputs' not in json.dumps(seen) and 'private oracle' not in json.dumps(seen)
 
 
+
+@pytest.mark.parametrize('dtype_name', ['MXFP8_E4M3FN', 'MXFP8_E5M2'])
+def test_task_contract_preserves_real_mxfp8_auxiliary_scale_abi(tmp_path, dtype_name):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from coding.pi.actor import task_contract
+    from benchmarks.a5kernels.phase1_curriculum import DType
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from tests.test_a5_phase1_project_bz import FakeExecutor, _backend
+    from tests.test_a5_phase1_project_executor import _spec
+    project = ProjectExecutor(FakeExecutor([]), EvidenceLedger(tmp_path / 'ledger'))
+    prepared = project.prepare(replace(_spec('cube'), dtype=getattr(DType, dtype_name)))
+    contract = task_contract(SimpleNamespace(prepared=prepared))
+    assert len(contract['inputs']) == len(prepared.inputs) == 2
+    assert [item['argument'] for item in contract['auxiliary_inputs']] == list(prepared.abi.input_arguments[2:])
+    _, files = _backend(tmp_path, FakeExecutor([]))._bundle(project.request(prepared, '# candidate'))
+    manifest = json.loads(next(item.content for item in files if item.relative_path == 'manifest.json'))
+    assert [item['physical_shape'] for item in contract['auxiliary_inputs']] == [item['shape'] for item in manifest['scales']]
+    assert contract['auxiliary_inputs'][0]['logical_shape'] == manifest['scales'][0]['shape']
+    assert contract['auxiliary_inputs'][1]['logical_shape'] == list(reversed(manifest['scales'][1]['shape']))
+    assert all(item['dtype'] == 'E8M0' and item['group_size'] == 32 for item in contract['auxiliary_inputs'])
+    assert not any('storage' in item for item in contract['inputs'] + contract['auxiliary_inputs'])
+
+
 def test_context_read_telemetry_and_actionable_validation():
     records = []
     with session() as pi:
