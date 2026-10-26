@@ -95,7 +95,7 @@ def bounded_completion(provider, profile, messages, remaining_seconds):
         raise
 
 
-def compose_production(settings, *, target, root, initial_memory, max_seconds):
+def compose_production(settings, *, target, root, initial_memory, max_seconds, native_options=None):
     """Capture existing CLI composition without invoking its learning loop."""
     from .phase1_cli import main as native_main
     from .production import build_native_adaptive_phase1
@@ -127,7 +127,7 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds):
             '--objective', 'Subject curriculum production binding', '--initial-memory', str(seed),
             '--max-seconds', str(max_seconds), *arguments]
     with redirect_stdout(io.StringIO()):
-        native_main(argv, native_parallel=False,
+        native_main(argv, native_parallel=False, **(native_options or {}),
             native_builder=lambda **options: capture(build_native_adaptive_phase1, options),
             a5_main=lambda args: a5_main(args, builder=lambda **options: capture(build_adaptive_phase1, options)))
     return captured[0]
@@ -266,7 +266,24 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 store.put_bytes(qualification.read_bytes(digest))
         else:
             target_contract = None
-        return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+        recovery = item.get('recovery')
+        if recovery is None:
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+        if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
+                or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
+            raise ValueError('recovery requires a reason and retained artifact references')
+        for digest in set(recovery['artifacts'].values()):
+            branch_artifacts.put_bytes(store.read_bytes(digest))
+        registry = branch_artifacts.put_bytes(canonical(recovery))
+        from .project_verifier import artifact_preview
+        preview = dict(reason=recovery['reason'][:1024], artifacts=artifact_preview(recovery['artifacts']),
+                       registry_sha256=registry, artifact_count=len(recovery['artifacts']))
+        previous = actor.immutable_context
+        actor.immutable_context = previous + b'\nOriginal failure context (not learned memory; read full registry by SHA): ' + canonical(preview)
+        try:
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+        finally:
+            actor.immutable_context = previous
 
     def select_wave(context, snapshot, history, *, remaining_seconds, project_limit=64):
         deadline = time.monotonic() + remaining_seconds
@@ -383,6 +400,21 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
         max_seconds=max_seconds, index_memory=knowledge.index)
+    def review_retained(item, request, **options):
+        if item.get('project_id') != request.project_id or 'spec' not in item:
+            raise ValueError('retained review requires its original graph project')
+        policy.admit(ProjectSpec.from_mapping(item['spec']))
+        previous = plans.get(request.project_id)
+        if previous is not None and {k: v for k, v in previous.items() if k != '_ordinal'} != item:
+            raise ValueError('retained project plan changed')
+        plans[request.project_id] = dict(item, _ordinal=(previous or {}).get('_ordinal',
+            max((row.get('_ordinal', 0) for row in plans.values()), default=0) + 1))
+        atomic(plans_path, canonical(plans))
+        return verifier.review(request, **options)
+
+    campaign.review_retained = review_retained
+    if 'check_environment' in bound:
+        campaign.check_environment = bound['check_environment']
     campaign.role_complete = role_complete
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)

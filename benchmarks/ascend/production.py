@@ -27,7 +27,7 @@ def native_target_runtime(config, transport):
     if (not compiler or not environment.get("cann_version")
             or not hasattr(transport, "_device") or not hasattr(transport, "profile")):
         return None
-    return {"target": "a3", "runtime": ("local" if transport.profile == "local" else "py311-torch"), "device": str(transport._device),
+    return {"target": "a3", "runtime": ("local" if transport.profile == "local" else getattr(transport, "runtime", "py311-torch")), "device": str(transport._device),
             "toolchain": environment["cann_version"], "compiler": compiler,
             "product": config.target, "architecture": config.arch,
             "execution_profile": transport.profile}
@@ -99,8 +99,8 @@ class NativeProductionConfig:
             raise TypeError("curriculum_kdb must be boolean")
         if self.curriculum_kdb and (self.kdb is None or not self.collection):
             raise ValueError("curriculum KDB requires a configured KDB and collection")
-        if self.execution_profile not in {"bz-a3-1", "bz-a3-2", "local"}:
-            raise ValueError("native production requires a BZ-A3 or local profile")
+        if self.execution_profile not in {"bz-a3-1", "bz-a3-2", "gz-a3", "local"}:
+            raise ValueError("native production requires an A3 native or local profile")
         if not self.target or not self.arch:
             raise ValueError("native production requires discovered target and architecture")
         if re.fullmatch(r"[0-9a-f]{64}", self.guide_sha256) is None:
