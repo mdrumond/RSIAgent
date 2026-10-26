@@ -60,3 +60,11 @@ def test_subject_campaign_recomposes_after_permitted_device_only_migration(tmp_p
     second = build_subject_campaign(settings,**kwargs)
     second.memory_gate.close()
     assert json.loads((root/'execution-allocations.json').read_bytes())[-1]['allocation']['config']['physical_device']==1
+
+
+def test_health_workspace_and_device_permissions_are_recorded_allocation(tmp_path):
+    first=admit_identity(tmp_path,{'target':'a3'},{'config':raw(0)})
+    next_config=raw(0,health_workspace='/owned/incoming',allowed_devices=[0,1,2])
+    assert admit_identity(tmp_path,{'target':'a3'},{'config':next_config})==first
+    allocation=json.loads((tmp_path/'execution-allocations.json').read_bytes())[-1]['allocation']['config']
+    assert allocation['health_workspace']=='/owned/incoming' and allocation['allowed_devices']==[0,1,2]

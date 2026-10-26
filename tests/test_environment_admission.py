@@ -64,11 +64,11 @@ def test_fresh_health_uses_physical_device_and_rejects_busy_or_forbidden(tmp_pat
     def run(argv,**kwargs):
         calls.append(argv);return SimpleNamespace(returncode=0,stdout=json.dumps({'queries':q,'compiler':'pinned','versions':{},'toolkit':None}),job_handle='remote:t:job:health')
     t=SimpleNamespace(runtime_identity={'target':'gz-a3','physical_device':2},run_remote=run)
-    module.fresh_health(t,tmp_path,allowed_devices=[0,1,2]);assert calls[-1][-1]=='2'
+    module.fresh_health(t,tmp_path,allowed_devices=[0,1,2],health_workspace='/owned/incoming');assert calls[-1][-1]=='2'
     q['proc-mem']['text']='PID:123'
-    with pytest.raises(ProjectInfrastructureError,match='idle'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2])
+    with pytest.raises(ProjectInfrastructureError,match='idle'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2],health_workspace='/owned/incoming')
     t.runtime_identity['physical_device']=3
-    with pytest.raises(ProjectInfrastructureError,match='permissions'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2])
+    with pytest.raises(ProjectInfrastructureError,match='permissions'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2],health_workspace='/owned/incoming')
     assert len(calls)==2
 
 
@@ -107,7 +107,7 @@ def test_unpinned_dependency_blocks_probe(tmp_path,monkeypatch):
 
 
 @pytest.mark.parametrize('registry_root', [None, '/owned'])
-def test_first_health_uses_existing_registry_root_before_any_bundle_upload(tmp_path,registry_root):
+def test_first_health_uses_configured_existing_subdirectory_before_any_bundle_upload(tmp_path,registry_root):
     import subprocess
     from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
     queries={kind:{'exit':0,'text':text} for kind,text in {'health':'Health Status : OK',
@@ -119,7 +119,7 @@ def test_first_health_uses_existing_registry_root_before_any_bundle_upload(tmp_p
         calls.append(argv)
         action=argv[2]
         if action=='run':
-            assert argv[argv.index('--cwd')+1]=='.'
+            assert argv[argv.index('--cwd')+1]==('.cpl-remote/incoming' if registry_root else '/owned/.cpl-remote/incoming')
             value={'state':'completed','handle':'remote:fixture:job:health','exit':0}
         else:
             assert action=='logs'
@@ -128,6 +128,12 @@ def test_first_health_uses_existing_registry_root_before_any_bundle_upload(tmp_p
     transport=CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
         remote_workspace='/owned/not-created-yet',registry_workspace=registry_root,
         physical_device=0,state_directory=tmp_path/'transport',process_runner=cpl)
-    actual,_=module.fresh_health(transport,tmp_path)
+    actual,_=module.fresh_health(transport,tmp_path,health_workspace='/owned/.cpl-remote/incoming')
     assert actual['product']=='Ascend910_9362'
     assert [argv[2] for argv in calls]==['run','logs','logs']
+
+
+def test_missing_health_workspace_rejects_before_any_submission(tmp_path):
+    t=SimpleNamespace(runtime_identity={'physical_device':0},run_remote=lambda *a,**k:pytest.fail('remote submission'))
+    with pytest.raises(ProjectInfrastructureError,match='health_workspace'):
+        module.fresh_health(t,tmp_path)

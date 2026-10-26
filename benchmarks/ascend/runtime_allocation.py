@@ -6,7 +6,7 @@ import time
 
 from optimizer.jobs import atomic, canonical
 
-ALLOCATION_FIELDS = {'physical_device', 'physical_devices'}
+ALLOCATION_FIELDS = {'physical_device', 'physical_devices', 'allowed_devices', 'health_workspace'}
 TERMINAL = {'completed', 'failed', 'cancelled'}
 
 

@@ -21,7 +21,7 @@ def request(tmp_path, seconds=30):
 def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
     calls = []
     native = dict(target='a3_product', arch='dav-2201', execution_profile='gz-a3',
-                  transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned',
+                  transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned', health_workspace='/owned/incoming',
                   compiler_version='pinned', environment_identity={'torch':'torch-v','torch_npu':'npu-v','cann_version':'runtime: cann-v','soc_version':255})
     monkeypatch.setattr(runtime, 'load_native_config', lambda *a: native)
     class Transport:
