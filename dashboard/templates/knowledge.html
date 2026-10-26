@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}Knowledge questions · RSI{% endblock %}{% block body %}
+<h1>Ask the knowledge database</h1><p>Ask the librarian about reference sources and accepted memories, independently of actor sessions.</p>
+{% if enabled %}<form id="knowledge-question" data-url="{{ url_for('knowledge_question') }}">
+<label>Campaign <select name="campaign_id">{% for campaign in campaigns %}<option value="{{ campaign.id }}">{{ campaign.name or campaign.id }}</option>{% endfor %}</select></label>
+<label>Question <textarea name="question" required></textarea></label><label>Time allowance (seconds) <input name="max_seconds" type="number" value="60" min="1" required></label><button>Ask librarian</button></form>
+<p id="knowledge-status" role="status"></p><section id="knowledge-answer" hidden><h2>Answer</h2><p data-answer style="white-space:pre-wrap"></p><h2>Sources</h2><div data-sources></div></section>
+{% else %}<p>Enable dashboard controls and configure a subject campaign runtime to ask questions.</p>{% endif %}
+<script src="{{ url_for('static', filename='knowledge.js') }}"></script>{% endblock %}
