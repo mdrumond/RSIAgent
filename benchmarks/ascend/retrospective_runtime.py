@@ -4,6 +4,8 @@ from dataclasses import replace
 from pathlib import Path
 import time
 
+from coding.pi.rpc import PiCancelled
+
 from .cpl_native import CplNativeCandidateBackend, CplNativeMeasurements
 from .execution import _deadline, process_deadline
 from .phase1_cli import load_native_config
@@ -70,7 +72,8 @@ class _CheckedActor:
             try:
                 result = self._wrapped(replace(request, remaining_seconds=remaining))
             except Exception as error:
-                if self._remaining.stop_requested() and not getattr(error, 'interruption_reason', None):
+                if (isinstance(error, (PiCancelled, TimeoutError)) and self._remaining.stop_requested()
+                        and not getattr(error, 'interruption_reason', None)):
                     error.interruption_reason = 'operator-stop'
                 self._check.invalidate()
                 raise
