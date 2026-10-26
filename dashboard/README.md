@@ -187,3 +187,21 @@ than launched again. Status continues polling after the dashboard operation
 finishes. Completed requests and uncertain executions requiring observation
 cannot be retried from that action. The editable future-work queue excludes
 projects already reserved into a wave, even if they have not started.
+
+### Manual memory admission
+
+Unpublished subject projects offer **Force merge** when host verification and an
+independent project review have produced a valid reusable memory proposal. The
+user supplies a reason and confirms publication. This overrides usefulness
+admission only: failed host checks, missing evidence, project repair requirements,
+invalid snippets, and changed replacement bases still prevent publication.
+
+The accepted catalog records the reason, original admission status and evaluations,
+project review, original project identity, and actual review identity. Publication
+indexes the proposal before atomically updating accepted pointers. A later
+background evaluation cannot undo the manual decision; its evidence remains
+retained, and the campaign owner reconciles scheduler status. Replaying the same
+request does not publish twice. An ineligible project displays its missing gate;
+use actor feedback or a curriculum-reviewed restart to obtain the required
+evidence and project review. This control requires configured subject runtime
+settings and initial memory; it does not establish a successful usefulness trial.
