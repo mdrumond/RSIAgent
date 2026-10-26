@@ -139,6 +139,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     memory_delivery = settings.get('actor_memory_delivery', 'indexed')
     if memory_delivery not in {'indexed', 'kdb-only'}:
         raise ValueError('actor_memory_delivery must be indexed or kdb-only')
+    if memory_delivery == 'kdb-only' and initial_memory:
+        raise ValueError('kdb-only Actor memory delivery does not support nonempty initial memory')
     if memory_delivery == 'kdb-only' and any((subject.task or {}).get('kind') == 'optimizer' for subject in subjects):
         raise ValueError('kdb-only Actor memory delivery currently requires graph subjects')
     if target == 'a5' and any((getattr(subject, 'task', None) or {}).get('kind') == 'optimizer'
@@ -227,6 +229,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         actor.query_knowledge = actor_knowledge
 
     def execute(item, snapshot, directory, *, remaining_seconds):
+        if memory_delivery == 'kdb-only' and json.loads(snapshot).get('initial_memory'):
+            raise ValueError('kdb-only Actor memory delivery does not support nonempty initial memory')
         previous = plans.get(item['project_id'])
         if previous is not None and {key: value for key, value in previous.items() if key != '_ordinal'} != item:
             raise ValueError('retained project plan changed')

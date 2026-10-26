@@ -142,3 +142,51 @@ def test_campaign_kdb_only_rejects_disabled_knowledge(tmp_path):
         build_subject_campaign({'actor_memory_delivery':'kdb-only'}, target='a3', root=tmp_path,
             subjects=[Subject('s','copies')], initial_memory=b'',
             compose=lambda settings,**options:bound(options['root']))
+
+
+def test_kdb_only_rejects_campaign_seed_before_composition(tmp_path):
+    with pytest.raises(ValueError, match='nonempty initial memory'):
+        build_subject_campaign({'actor_memory_delivery':'kdb-only'}, target='a3', root=tmp_path,
+            subjects=[Subject('s','copies')], initial_memory=b'prior lessons',
+            compose=lambda *a, **k:pytest.fail('infrastructure composed'))
+    assert not (tmp_path/'runtime-config.json').exists()
+
+
+def test_kdb_only_rejects_external_snapshot_seed_before_execution(tmp_path):
+    runtime, actor = campaign(tmp_path)
+    try:
+        item = dict(project_id=_spec().project_id, spec=_spec().as_dict(), repairs=[])
+        snapshot = json.dumps(dict(schema='subject-memory-snapshot-v1',
+            initial_memory='prior lessons', memories=[])).encode()
+        with pytest.raises(ValueError, match='nonempty initial memory'):
+            runtime.execute(item, snapshot, tmp_path/'branch', remaining_seconds=30)
+        assert actor.calls == []
+        assert not (tmp_path/'branch').exists()
+    finally:
+        runtime.memory_gate.close()
+
+
+def test_direct_delivery_seed_guard_preserves_indexed_default(tmp_path, monkeypatch):
+    from test_subject_execution import graph_actor
+    graph, actor = graph_actor(tmp_path, ['{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}','{"submit":{}}'])
+    graph.query_knowledge = lambda *a, **k:pytest.fail('unexpected retrieval')
+    snapshot = json.dumps(dict(schema='subject-memory-snapshot-v1',
+        initial_memory='prior lessons', memories=[])).encode()
+    request = replace(_request(tmp_path, graph.executor), pre_wave_memory=snapshot)
+    original_prepare = graph.executor.prepare
+    monkeypatch.setattr(graph.executor, 'prepare', lambda *a, **k:pytest.fail('infrastructure prepared'))
+    with pytest.raises(ValueError, match='nonempty initial memory'):
+        graph(replace(request, actor_memory_delivery='kdb-only'))
+    assert actor.observations == []
+    monkeypatch.setattr(graph.executor, 'prepare', original_prepare)
+    # Default indexed delivery still admits the complete seed through its normal context.
+    contexts = []
+    def indexed_actor(instruction, *, context, turn_parser, action_executor, **options):
+        contexts.append(context.read_bytes())
+        for reply in actor.replies:
+            outcome = action_executor(turn_parser(reply))
+        return ActorOutcome(outcome.status, 3, 1, admitted_artifacts=outcome.admitted_artifacts)
+    graph.actor = indexed_actor
+    assert graph(replace(request, publish_learning=False)).evidence.verified
+    assert contexts == [snapshot]

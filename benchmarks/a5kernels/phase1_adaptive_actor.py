@@ -505,6 +505,8 @@ class AdaptiveActorProjectExecutor:
             raise ValueError("actor_memory_delivery must be indexed or kdb-only")
         if request.actor_memory_delivery == "kdb-only" and self.query_knowledge is disabled_knowledge_action:
             raise ValueError("kdb-only Actor memory delivery requires enabled KDB retrieval")
+        if request.actor_memory_delivery == "kdb-only" and json.loads(request.pre_wave_memory).get("initial_memory"):
+            raise ValueError("kdb-only Actor memory delivery does not support nonempty initial memory")
         # The host keeps the retrieval snapshot on request. Only this presentation
         # is admitted into the Actor's context/artifact namespace before a query.
         presented_memory = b"{}" if request.actor_memory_delivery == "kdb-only" else request.pre_wave_memory
