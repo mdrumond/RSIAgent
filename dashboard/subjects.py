@@ -55,24 +55,27 @@ class SubjectViews:
                 wave = pending['wave_id']
             outcome = row.get('outcome') or {}
             review = row.get('review') or {}
-            published = pid in active.get('admissions', {}) or pid in published_projects
+            review_id = row.get('manual_review_id', pid)
+            published = pid in active.get('admissions', {}) or review_id in active.get('admissions', {}) or pid in published_projects
             directory = root / row['directory'] if row.get('directory') else root / 'waves' / str(wave) / pid
             started = directory.is_dir() and _inside(root, directory)
             execution = ('verified' if outcome.get('host_verified') else 'failed') if outcome else (
                 'running' if started and running else 'stopped' if started else 'pending')
-            projects.append(dict(id=pid, project_id=pid, attempt_id=pid, wave_id=wave,
-                subject_id=waves.get(wave, {}).get('subject_id', pending.get('subject', {}).get('subject_id')),
+            projects.append(dict(id=pid, project_id=pid, attempt_id=_json(directory / "manual-execution.json", {}).get("attempt_id", pid), wave_id=wave,
+                subject_id=row.get('subject_id') or waves.get(wave, {}).get('subject_id', pending.get('subject', {}).get('subject_id')),
                 kind=plan.get('task', {}).get('kind', plan.get('kind', 'graph')),
                 objective=row.get('objective', plan.get('spec', {}).get('hypothesis', '')),
                 execution=execution, project_review=review.get('decision', 'pending'),
-                memory_admission=jobs.get(row.get('manual_review_id', pid), {}).get('status', 'not-submitted'),
+                memory_admission=('manually-accepted' if review_id in active.get('manual_overrides', {})
+                                  else jobs.get(review_id, {}).get('status', 'not-submitted')),
                 publication='published' if published else 'unpublished', merged=published,
                 directory=row.get('directory'), restart_of=row.get('restart_of'),
                 plan=plan, review=review, outcome=outcome,
                 memory=review.get('memory'), source=_source(root, outcome.get('source_sha256')) or ''))
         return dict(id=key, name=config.get('name', key), target=config.get('target'),
                     terminal=state.get('terminal'), subjects=subjects.get('subjects', []),
-                    projects=projects, pending=pending, stats=dict(projects=len(projects),
+                    projects=projects, pending=pending, project_queue=subjects.get('project_queue', []),
+                    stats=dict(projects=len(projects),
                     verified=sum(p['execution'] == 'verified' for p in projects),
                     published=sum(p['merged'] for p in projects)))
 

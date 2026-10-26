@@ -71,7 +71,12 @@ class MemoryAdmission:
     def _save(self, job):
         path = self._path(job['review_id'])
         path.parent.mkdir(exist_ok=True)
-        atomic(path, canonical(job))
+        with self.memory.transaction() as state:
+            manual = state.get('manual_overrides', {}).get(job['review_id'])
+            if manual is not None:
+                job.setdefault('status_before_override', job['status'])
+                job.update(status='accepted', manual_override=manual, admission=manual['admission'])
+            atomic(path, canonical(job))
 
     def submit(self, review_id, proposal, provenance, request, *, remaining_seconds):
         path = self._path(review_id)
@@ -112,9 +117,16 @@ class MemoryAdmission:
         try:
             while True:
                 remaining()
+                with self.memory.transaction() as state:
+                    forced = job['review_id'] in state.get('manual_overrides', {})
+                if forced:
+                    self._save(job)
+                    return
                 job['status'] = 'evaluating'
                 job.pop('error_type', None)
                 self._save(job)
+                if job.get('manual_override'):
+                    return
                 # Reconcile a concurrent accepted replacement before testing this draft.
                 if not self.memory.bases_current(job['proposal']):
                     rewritten = self._rewrite(job, dict(reason='Accepted base version changed',
@@ -148,6 +160,8 @@ class MemoryAdmission:
                     job['evaluations'].append(result)
                 job['trial_task'] = result.get('trial_task')
                 self._save(job)
+                if job.get('manual_override'):
+                    return
                 remaining()
                 if result['decision'] == 'inconclusive':
                     valid = result.get('validity') == {'control': True, 'treatment': True}
@@ -256,11 +270,16 @@ class MemoryAdmission:
         result = []
         for path in sorted(self.root.glob('*/job.json')):
             job = json.loads(path.read_bytes())
-            if job['status'] in {'accepted', 'rejected'} and job['review_id'] not in self.delivered:
+            with self.memory.transaction() as state:
+                manual = state.get('manual_overrides', {}).get(job['review_id'])
+            delivery = ('manual:' if manual else '') + job['review_id']
+            if manual is not None:
+                job.update(status='accepted', manual_override=manual)
+            if job['status'] in {'accepted', 'rejected'} and delivery not in self.delivered:
                 judgment = job['evaluations'][-1] if job['evaluations'] else {}
-                result.append(dict(review_id=job['review_id'], outcome=job['status'],
+                result.append(dict(review_id=job['review_id'], delivery_id=delivery, manual_override=manual, outcome=job['status'],
                     judgment={key:judgment.get(key) for key in ('decision','reason','evidence','instructions','evaluation_id')},
-                    rewrites=job['rewrites'], repair=job.get('project_repair'), provenance=job['provenance']))
+                    rewrites=job['rewrites'], repair=None if manual else job.get('project_repair'), provenance=job['provenance']))
         self._start()
         return result
 

@@ -3,6 +3,12 @@
 <p>{{ project.objective }}</p><p>Attempt {{ project.attempt_id }} · Wave {{ project.wave_id }}</p>
 <dl><dt>Execution</dt><dd>{{ project.execution }}</dd><dt>Project review</dt><dd>{{ project.project_review }}</dd><dt>Memory admission</dt><dd>{{ project.memory_admission }}</dd><dt>Publication</dt><dd>{{ project.publication }}</dd></dl>
 {% if project.review.reason %}<aside>{{ project.review.reason }}</aside>{% endif %}
+{% include 'curriculum_controls.html' %}
+{% if not project.merged %}{% set admission = memory_eligibility(campaign.id, project.id) %}
+<section><h2>Merge into memory</h2><p>{{ admission.reason }}</p>
+{% if admission.eligible %}<form data-force-memory="{{ url_for('force_memory', campaign_id=campaign.id, project_id=project.id) }}" data-project="{{ project.id }}" data-csrf="{{ memory_csrf }}"><label>Reason <textarea name="reason" required></textarea></label><button>Force merge</button><p data-force-status></p></form>
+{% else %}<p>Use project feedback or a reviewed restart to obtain the required evidence and project review.</p>{% endif %}</section>{% endif %}
+<script src="{{ url_for('static', filename='memory_controls.js') }}"></script>
 {% if not project.merged and actor_controls_enabled %}
 <section data-actor-feedback="{{ url_for('subject_actor_feedback', campaign_id=campaign.id, project_id=project.id) }}"><h2>Redirect actor</h2>
 <form><label>Feedback or instructions<textarea name="text" required rows="4"></textarea></label>

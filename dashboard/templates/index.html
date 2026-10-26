@@ -5,18 +5,18 @@
 {% if controls.enabled %}<section class="control-panel"><h2>Campaign controls</h2>
 <p>Actions run asynchronously. Confirm each operation before it is queued.</p>
 <div class="control-actions">{% for preset in controls.presets.values() %}
-<button data-action="start" data-subject="{{ preset.id }}" data-preset-id="{{ preset.id }}">Start phase {{ preset.phase }}</button>{% endfor %}
+{% if preset.phase == 1 %}<button data-action="start" data-subject="{{ preset.id }}" data-preset-id="{{ preset.id }}">Start phase {{ preset.phase }}</button>{% endif %}{% endfor %}
 {% for campaign_id, campaign in controls.campaigns.items() %}
 {% if campaign.phase == 1 %}<button data-action="extend" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Extend {{ campaign.name or ('Phase ' ~ campaign.phase) }} by {{ controls.settings.extension_step }}</button>{% endif %}
-<button data-action="sample" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Sample {{ campaign.name or ('Phase ' ~ campaign.phase) }}</button>{% endfor %}</div>
+{% if campaign.phase == 1 %}<button data-action="sample" data-subject="{{ campaign_id }}" data-campaign-id="{{ campaign_id }}">Sample {{ campaign.name or ('Phase ' ~ campaign.phase) }}</button>{% else %}<p>{{ campaign.name or ('Phase ' ~ campaign.phase) }} is historical; execution controls are unavailable. Use subject campaigns for new work.</p>{% endif %}{% endfor %}</div>
 {% for proposal in proposals %}<article class="proposal"><div class="row"><h3>{{ proposal.campaign_id }} proposal</h3><span class="status {{ proposal.status }}">{{ proposal.status }}</span></div>
 <form data-proposal-form data-campaign-id="{{ proposal.campaign_id }}" data-proposal-id="{{ proposal.proposal_id }}">
 {% if proposal.terminal %}<p><b>{{ proposal.terminal.status }}</b> — {{ proposal.terminal.reason }}</p>{% endif %}
-{% for project in proposal.projects %}<label class="proposal-project"><input type="checkbox" name="project_id" value="{{ project.project_id }}">
+{% for project in proposal.projects %}<label class="proposal-project"><input type="checkbox" name="project_id" value="{{ project.project_id }}"{% if not proposal.controls_available %} disabled{% endif %}>
 <span><b>{{ project.project_id }}</b><dl class="description-fields compact">{% for field in project.description_fields %}<dt>{{ field.label }}</dt><dd>{{ field.value }}</dd>{% endfor %}</dl><small>{{ project.novelty_summary }}{% if project.new_coverage %}; new coverage: {{ project.new_coverage|join(', ') }}{% endif %}</small></span></label>{% endfor %}
-{% if proposal.status == 'proposed' %}<button data-proposal-action="approve">Approve selected</button><button data-proposal-action="reject">Reject</button>{% endif %}
-{% if proposal.status == 'approved' %}<button data-proposal-action="run-approved">Run approved</button>{% endif %}
-{% if proposal.status == 'running' %}<button data-proposal-action="run-approved">Resume/reconcile</button>{% endif %}</form></article>{% endfor %}
+{% if proposal.controls_available and proposal.status == 'proposed' %}<button data-proposal-action="approve">Approve selected</button><button data-proposal-action="reject">Reject</button>{% endif %}
+{% if proposal.controls_available and proposal.status == 'approved' %}<button data-proposal-action="run-approved">Run approved</button>{% endif %}
+{% if proposal.controls_available and proposal.status == 'running' %}<button data-proposal-action="run-approved">Resume/reconcile</button>{% endif %}{% if not proposal.controls_available %}<p>Retained proposal; Phase 2 execution is retired.</p>{% endif %}</form></article>{% endfor %}
 <div id="operation-status">{% for operation in operations %}<p class="operation {{ operation.status }}"><b>{{ operation.action }}</b> {{ operation.status }}{% if operation.error %}: {{ operation.error }}{% endif %}</p>{% endfor %}</div>
 </section>{% endif %}
 <section class="grid">{% for campaign in subject_campaigns %}<a class="card" href="{{ url_for('subject_campaign_page', campaign_id=campaign.id) }}"><span class="tag">SUBJECT CAMPAIGN</span><h2>{{ campaign.name }}</h2>{% if campaign.error %}<p>{{ campaign.error }}</p>{% else %}<p>{{ campaign.stats.projects }} projects · {{ campaign.stats.verified }} verified · {{ campaign.stats.published }} published</p>{% endif %}</a>{% endfor %}</section>

@@ -235,6 +235,12 @@ class SubjectScheduler:
                 raise ValueError('review already has a different outcome')
             row['status'] = outcome
 
+    def override_review(self, review_id, receipt):
+        """Record a user's admission override separately from the original outcome."""
+        with self._transaction() as state:
+            row = state['reviews'][review_id]
+            row.setdefault('original_status', row['status'])
+            row.update(status='accepted', manual_override=receipt)
     def register_manual_review(self, review_id, subject_id):
         """Link a continuation review without rewriting completed wave receipts."""
         if subject_id not in self.index:
