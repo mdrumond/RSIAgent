@@ -3,7 +3,7 @@
 `benchmarks.ascend.history_import.import_history(roots, store)` reads explicit
 historical producer roots and copies their content-addressed artifacts into a
 consumer-owned `ContentAddressedArtifacts` store. A producer root contains
-`state.json` and `waves/*/plan.json`. Pass retained retry roots as well as the
+`state.json`, `campaign-identity.json` and `waves/*/plan.json`. Pass retained retry roots as well as the
 original roots. The importer never writes producer files, admits memory, or
 executes projects.
 
@@ -16,9 +16,13 @@ lessons. Its `review_request` reconstructs with `ProjectReview(**request)` for
 independent review; historical correctness is not a usefulness judgment.
 
 Failures retain frozen specs and the readable evidence from all coalesced
-attempts. Contract identity omits only `project_id`: hypotheses remain significant
+attempts. Contract identity includes sanitized target, architecture and toolchain facts and
+omits only `project_id` from the spec: hypotheses remain significant
 because they describe distinct original repair bugs. A verified attempt removes
-that contract from recovery, even if publication was interrupted. Exact copied
+that same-binding contract from recovery, even if publication was interrupted.
+Unknown bindings remain isolated to their producer. Sanitized campaign binding
+facts are retained as an artifact; provider/model settings and machine paths are
+not included. Exact copied
 attempts do not create additional recovery tasks. Unverified and interrupted
 branches never become memory candidates. Malformed failure journals remain
 readable raw artifacts with warnings, not verified host evidence.

@@ -22,6 +22,8 @@ def write(path, value):
 
 def producer(root, *, spec=None, terminal='verified', published=True):
     spec = spec or project('copy-project')
+    write(root / 'campaign-identity.json', dict(target='a3', arch='dav-2201',
+        language='ascend-c', environment_identity=dict(cann_version='9.1.0')))
     wave = WaveSpec('wave-001', hashlib.sha256(b'{}').hexdigest(), (), (WaveProject(spec),))
     wr = root / 'waves/wave-001'
     branch = wr / 'branches' / spec.project_id
@@ -184,3 +186,24 @@ def test_unpublished_copy_cannot_hide_published_attempt(tmp_path, published_firs
     assert len(result['memories']) == 1 and result['exclusions'] == []
     assert result['counts']['attempts'] == 1
     assert result['memories'][0]['producer']['root'] == 'published'
+
+
+@pytest.mark.parametrize('different', ['target', 'toolchain'])
+def test_verification_never_resolves_another_binding(tmp_path, different):
+    good, failed = tmp_path / 'verified', tmp_path / 'failed'
+    producer(good);producer(failed, terminal='interrupted')
+    path = failed / 'campaign-identity.json';identity = json.loads(path.read_bytes())
+    if different == 'target':
+        identity.update(target='a5', arch='dav-3510')
+    else:
+        identity['environment_identity']['cann_version'] = '9.3.0'
+    identity['model'] = {'credential_env': 'PRIVATE', 'secret': 'do-not-import'}
+    identity['workspace'] = '/private/machine/path'
+    write(path, identity)
+    store = ContentAddressedArtifacts(tmp_path / 'consumer')
+    result = import_history([good, failed], store)
+    assert len(result['memories']) == 1 and len(result['failures']) == 1
+    assert result['counts']['resolved_contracts'] == 0
+    binding = store.read_bytes(result['failures'][0]['review_request']['artifacts']['campaign-binding'])
+    assert b'do-not-import' not in binding and b'/private/' not in binding
+    assert json.loads(binding)['target'] == identity['target']

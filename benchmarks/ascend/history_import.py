@@ -26,6 +26,23 @@ def _read(path):
     return json.loads(path.read_bytes())
 
 
+def _binding(root):
+    path = root / 'campaign-identity.json'
+    if not path.exists():
+        # Unknown bindings cannot lend verification to another producer.
+        return dict(unknown_producer=root.name)
+    identity = _read(path)
+    binding = {key: identity[key] for key in
+        ('target', 'arch', 'language', 'execution_profile', 'compiler_version') if key in identity}
+    environment = identity.get('environment_identity', {})
+    binding['environment_identity'] = {key: environment[key] for key in
+        ('cann_version', 'compiler_version', 'soc_version', 'torch', 'torch_npu',
+         'python_version', 'driver_version', 'firmware_version') if key in environment}
+    if not binding.get('target') or not binding.get('arch'):
+        binding['unknown_producer'] = root.name
+    return binding
+
+
 def _bound(record, assignment):
     expected = dict(project_id=assignment.project_id,
         wave_fingerprint=assignment.wave_fingerprint,
@@ -83,10 +100,11 @@ def _artifacts(branch, store, *, strict):
     return artifacts, source, warnings
 
 
-def _attempt(root, plan_path, plan, assignment, store):
+def _attempt(root, plan_path, plan, assignment, binding, store):
     branch = plan_path.parent / 'branches' / assignment.project_id
     spec = assignment.spec.as_dict()
-    contract = _digest(canonical_bytes({k: v for k, v in spec.items() if k != 'project_id'}))
+    contract = _digest(canonical_bytes(dict(spec={k: v for k, v in spec.items() if k != 'project_id'},
+                                          binding=binding)))
     outcome_path, interruption_path = branch / 'outcome.json', branch / 'interruption.json'
     outcome = _read(outcome_path) if outcome_path.exists() else None
     verified = outcome is not None and outcome.get('verified') is True
@@ -94,6 +112,7 @@ def _attempt(root, plan_path, plan, assignment, store):
         _bound(outcome, assignment)
     artifacts, source, warnings = _artifacts(branch, store, strict=verified)
     artifacts['contract'] = store.put_bytes(canonical_bytes(spec))
+    artifacts['campaign-binding'] = store.put_bytes(canonical_bytes(binding))
     artifacts['wave-plan'] = store.put_bytes(plan_path.read_bytes())
     memory, facts, raw = None, [], None
     if outcome is not None:
@@ -146,9 +165,9 @@ def _attempt(root, plan_path, plan, assignment, store):
         artifacts['source'] = source
     producer = dict(root=root.name, wave_id=plan.wave_id,
         wave_fingerprint=plan.fingerprint, project_id=assignment.project_id,
-        authored_ordinal=assignment.authored_ordinal)
+        authored_ordinal=assignment.authored_ordinal, binding=binding)
     identity = _digest(canonical_bytes(dict(wave=plan.fingerprint, project=assignment.project_id,
-        outcome=artifacts.get('outcome'), interruption=artifacts.get('interruption'),
+        binding=binding, outcome=artifacts.get('outcome'), interruption=artifacts.get('interruption'),
         log=artifacts.get('actor-log'))))
     request = ProjectReview(assignment.project_id, source, verified, artifacts,
         tuple(facts), assignment.spec.hypothesis)
@@ -162,7 +181,7 @@ def import_history(roots, store):
 
     No producer files are written. Recoveries are coalesced by complete spec minus
     project_id; hypotheses are retained because they describe distinct repair bugs.
-    A verified later attempt suppresses recovery, even if it was not published.
+    A verified same-binding attempt suppresses recovery, even if unpublished.
     ``ProjectReview(**row['review_request'])`` reconstructs each review request.
     """
     memories, failures, exclusions, successful, seen = {}, {}, [], set(), set()
@@ -170,6 +189,7 @@ def import_history(roots, store):
     for root in map(Path, roots):
         try:
             state = _read(root / 'state.json')
+            binding = _binding(root)
             published = {canonical_bytes(json.loads(base64.b64decode(x, validate=True)))
                          for x in state.get('memory_bytes_base64', [])}
         except (OSError, ValueError) as error:
@@ -187,7 +207,7 @@ def import_history(roots, store):
                 continue
             for assignment in plan.assignments():
                 try:
-                    row, verified, raw, memory = _attempt(root, plan_path, plan, assignment, store)
+                    row, verified, raw, memory = _attempt(root, plan_path, plan, assignment, binding, store)
                 except (OSError, ValueError, KeyError, TypeError) as error:
                     exclusions.append(dict(producer=root.name, project_id=assignment.project_id,
                                            reason=str(error)))
@@ -199,7 +219,7 @@ def import_history(roots, store):
                     successful.add(contract)
                     if raw in published:
                         found.add(raw)
-                        key = _digest(raw)
+                        key = _digest(canonical_bytes(dict(memory_sha256=_digest(raw), binding=binding)))
                         candidate = memories.setdefault(key, dict(row, id=key, memory=memory.as_dict()))
                         if row['producer'] not in candidate['attempts']:
                             candidate['attempts'].append(row['producer'])
