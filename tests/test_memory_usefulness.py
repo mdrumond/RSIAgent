@@ -162,8 +162,12 @@ def test_factory_caps_every_provider_call_by_local_pair_and_parent(tmp_path, ins
     class Provider:
         def complete(self, profile, messages, *, max_seconds):
             calls.append(max_seconds)
-            if 'stage' in json.loads(messages[-1]['content']):
-                stage = json.loads(messages[-1]['content'])['stage']
+            try:
+                payload = json.loads(messages[-1]['content'])
+            except ValueError:
+                payload = {}
+            if 'stage' in payload:
+                stage = payload['stage']
                 now[0] += inspection_seconds if stage == 'inspect' else 0
                 return SimpleNamespace(text=stage)
             now[0] += 2
