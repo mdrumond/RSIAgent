@@ -92,12 +92,14 @@ class CurriculumControls:
                 'project_id', 'result') if field in request}
 
     @staticmethod
-    def unmerged(root, project):
+    def unmerged(root, project, *, reject_superseded=False):
         state = json.loads((root / 'subject-campaign.json').read_bytes())
         pending = (state.get('pending') or {}).get('items', [])
         record = state['projects'].get(project)
         if record is None and not any(item['project_id'] == project for item in pending):
             raise ControlError('unknown restart project')
+        if reject_superseded and (record or {}).get('superseded_by'):
+            raise ControlError('project was superseded; use replacement ' + record['superseded_by'])
         active = json.loads((root / 'memory/active.json').read_bytes())
         admitted = {project, (record or {}).get('manual_review_id', project)}
         if admitted & active.get('admissions', {}).keys():
@@ -118,7 +120,7 @@ class CurriculumControls:
         self.seconds(payload, 'format_seconds')
         if payload['kind'] == 'restart':
             self.require_restart()
-            self.unmerged(root, payload.get('project_id'))
+            self.unmerged(root, payload.get('project_id'), reject_superseded=True)
         return 'subject:' + entry['id']
 
     def validate_approval(self, payload):
@@ -128,13 +130,15 @@ class CurriculumControls:
         proposal = self.proposal(root, payload.get('proposal_id'))
         if proposal['kind'] == 'restart':
             self.require_restart()
-            self.unmerged(root, proposal['project'])
+            self.unmerged(root, proposal['project'], reject_superseded=proposal['status'] != 'approved')
             self.seconds(payload, 'additional_seconds')
         return 'subject:' + entry['id']
 
     def preview(self, payload):
         if payload['kind'] == 'restart':
             self.require_restart()
+            _, root = self.entry(payload)
+            self.unmerged(root, payload.get('project_id'), reject_superseded=True)
         started = time.monotonic()
         allowance = self.seconds(payload, 'format_seconds')
         with self.binder(self.config_path, payload['campaign_id'], max_seconds=allowance) as service:
@@ -171,6 +175,7 @@ class CurriculumControls:
         retained = self.proposal(root, payload['proposal_id'])
         if retained['kind'] == 'restart':
             self.require_restart()
+            self.unmerged(root, retained['project'], reject_superseded=retained['status'] != 'approved')
         proposal = subject_editor(root).approve(payload['proposal_id'])
         if proposal['kind'] == 'restart':
             self.require_restart()
