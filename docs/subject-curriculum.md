@@ -135,7 +135,10 @@ A3 campaigns may pass `compose_cpl_production` from
 `benchmarks.ascend.retrospective_runtime` to `build_subject_campaign(compose=...)`.
 The same ignored Phase1 settings select provider/model, reference KDB, guide and
 workspace. The native JSON additionally requires `transport_target` and a named
-registry `runtime`; `registry_workspace` is optional. This path never invokes the
+registry `runtime`; `registry_workspace` is optional. Configure `health_workspace`
+as an existing absolute subdirectory of the registered workspace for read-only
+checks before uploads. Pin product, architecture, compiler, CANN, Torch,
+Torch-NPU and SoC identities. Optional `allowed_devices` restricts physical IDs. This path never invokes the
 legacy validation wrapper. Each fresh binding checks a known-good compile and
 exact host oracle before Actor work or additional verifier execution. The check
 consumes the current elapsed allocation. Optional `stop_file` belongs to this
@@ -153,3 +156,8 @@ execution. Original project specs and frozen accepted-memory snapshots are uncha
 The CPL adapter and environment probe retain reviewed behavior from PR186
 (`48592246`) and PR200 (`37004d1`), respectively. Terminal result collection is
 bounded read-only recovery: it cannot extend command execution or resubmit jobs.
+
+Transport journals are retained per execution allocation. On admission, bounded
+read-only observation settles owned retained handles before permitting new work;
+ambiguous submissions and still-running operations continue to block admission.
+Changing a permitted device preserves old journals and uses a distinct namespace.

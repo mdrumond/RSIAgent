@@ -133,6 +133,8 @@ class EnvironmentAdmission:
         from benchmarks.a3kernels.native_smoke import smoke_plan
         identities, health_paths = [], []
         try:
+            for transport in self.transports:
+                transport.recover_owned_operations()
             if unsettled_operations(self.root):
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
             for transport in self.transports:

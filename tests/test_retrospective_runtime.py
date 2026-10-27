@@ -18,7 +18,7 @@ def request(tmp_path, seconds=30):
                                   remaining_seconds=seconds)
 
 
-def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
+def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device=3):
     calls = []
     native = dict(target='a3_product', arch='dav-2201', execution_profile='gz-a3',
                   transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned', health_workspace='/owned/incoming',
@@ -29,6 +29,7 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
             self.options = options
             self.remaining_seconds = options['remaining_seconds']
             self.runtime_identity = dict(target=options['target'], runtime=options['runtime'], physical_device=options['physical_device'])
+        def recover_owned_operations(self): pass
         def run_remote(self, *args, **kwargs):
             return SimpleNamespace(returncode=0, job_handle='remote:registry-target:job:health', stdout=json.dumps({
                 'queries':{kind:{'exit':0, 'text':text} for kind,text in {
@@ -53,7 +54,7 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
             return value
     def production(settings, **options):
         transport = options['native_options']['transport_factory'](cpl_remote='/skill/cpl-remote',
-            validation_wrapper='must-not-run', remote_workspace='/owned/arm', physical_device=3,
+            validation_wrapper='must-not-run', remote_workspace='/owned/arm', physical_device=device,
             profile='gz-a3', state_directory=tmp_path/'transport')
         paths = SimpleNamespace(root=tmp_path, **{k: native[k] for k in ('target','arch','execution_profile')})
         return dict(actor=Actor(), paths=paths, transport=transport)
@@ -179,3 +180,16 @@ def test_actual_stop_marks_cancellation_but_preserves_provider_failure(tmp_path,
     with pytest.raises(type(error)):
         actor(request(tmp_path))
     assert getattr(error,'interruption_reason',None)==expected
+
+
+def test_changed_device_has_distinct_retained_namespace_and_preserves_old_records(tmp_path, monkeypatch):
+    first, _ = compose(tmp_path, monkeypatch, device=1)
+    original = first['transport'].options['state_directory']
+    original.mkdir(parents=True)
+    journal = original/'operation.json'
+    journal.write_text('retained original allocation')
+    second, _ = compose(tmp_path, monkeypatch, device=2)
+    assert original != second['transport'].options['state_directory']
+    assert journal.read_text() == 'retained original allocation'
+    same, _ = compose(tmp_path, monkeypatch, device=1)
+    assert same['transport'].options['state_directory'] == original

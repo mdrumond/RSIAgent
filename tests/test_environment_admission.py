@@ -9,7 +9,7 @@ from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 
 def setup(tmp_path, monkeypatch, *, device=1, cache=None, clock=None):
     root=tmp_path;root.mkdir(parents=True, exist_ok=True)
-    transport=SimpleNamespace(runtime_identity={'target':'gz-a3-2','runtime':'named','physical_device':device})
+    transport=SimpleNamespace(recover_owned_operations=lambda:None, runtime_identity={'target':'gz-a3-2','runtime':'named','physical_device':device})
     health=[];probes=[]
     def fresh(t, r, **kwargs):
         health.append(t.runtime_identity['physical_device'])
@@ -137,3 +137,14 @@ def test_missing_health_workspace_rejects_before_any_submission(tmp_path):
     t=SimpleNamespace(runtime_identity={'physical_device':0},run_remote=lambda *a,**k:pytest.fail('remote submission'))
     with pytest.raises(ProjectInfrastructureError,match='health_workspace'):
         module.fresh_health(t,tmp_path)
+
+
+def test_admission_recovers_owned_handle_before_deciding_pending(tmp_path, monkeypatch):
+    admission, health, probes, transport = setup(tmp_path, monkeypatch)
+    operation = tmp_path/'operation.json'
+    operation.write_text(json.dumps({'state':'running','handle':'remote:t:job:owned'}))
+    def recover():
+        operation.write_text(json.dumps({'state':'completed','handle':'remote:t:job:owned'}))
+    transport.recover_owned_operations = recover
+    admission(lambda:100)
+    assert health == [1] and probes == ['probe']

@@ -1,5 +1,7 @@
 """Current subject composition with retained CPL execution and environment admission."""
 import argparse
+import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 import time
@@ -112,9 +114,15 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     remaining.stop_requested = lambda: stop is not None and stop.exists()
     def transport_factory(**kwargs):
         kwargs.pop('validation_wrapper', None)
+        allocation = {key: native.get(key) for key in ('transport_target', 'runtime', 'registry_workspace')}
+        allocation.update({key: str(kwargs.get(key)) for key in ('remote_workspace', 'physical_device', 'profile')})
+        namespace = hashlib.sha256(json.dumps(allocation, sort_keys=True).encode()).hexdigest()
+        recovery_root = Path(kwargs['state_directory'])
+        kwargs['state_directory'] = recovery_root / 'allocations' / namespace
         transport = CplNativeCandidateBackend(**kwargs, target=native['transport_target'],
             runtime=native['runtime'], registry_workspace=native.get('registry_workspace'),
             remaining_seconds=remaining)
+        transport.recovery_root = recovery_root
         transports.append(transport)
         return transport
     def measurement_factory(**kwargs):
