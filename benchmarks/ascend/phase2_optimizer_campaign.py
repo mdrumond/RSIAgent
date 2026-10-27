@@ -138,6 +138,10 @@ class OptimizerPhase2Coordinator:
             'You are the Phase 2 Curriculum Agent. Return JSON {"action":'
             '"ready"|"stalled"|"retry-target"|"practice","reason":"..."}. '
             'Choose focused practice only for an evidenced weakness, not arbitrary busywork. '
+            'The original retry is a fresh repair using current memory, not a replay of the old candidate. '
+            'When an applicable cause and repair lesson are known, retry-target is next unless a concrete '
+            'execution blocker remains. Unrelated operator or layout coverage is not a reason to delay. '
+            'Original retries are exempt from new-project novelty. '
             'A verified practice never establishes target readiness: retry the fixed target. '
             'READY needs the latest attempt to be a host-verified target. '
             'Measurements must be host evidence; do not demand a speedup for correctness readiness.')},

@@ -106,6 +106,18 @@ def _composed_target_runtime(actor, declared):
     return dict(actual)
 
 
+def _validate_remediation_settings(settings, *, phase, target, approval):
+    if phase != 1 or not settings.get('automatic_remediation'):
+        return
+    if approval:
+        raise ValueError('automatic remediation does not support approval mode')
+    external = any(row.get('type') in {'phase2', 'optimizer'} for row in settings.get('feedback_sources', []))
+    if target != 'a3' and (settings.get('optimizer_worker_config') or external):
+        raise ValueError('external automatic remediation requires an A3 campaign')
+    if external and not settings.get('optimizer_worker_config'):
+        raise ValueError('external automatic remediation requires optimizer_worker_config')
+
+
 def build_controller(job):
     """Reuse the existing native/Catlass CLI bindings, replacing only execution."""
     from .phase1_cli import main as target_main
@@ -118,6 +130,12 @@ def build_controller(job):
     if hashlib.sha256(config_bytes).hexdigest() != job["config_sha256"]:
         raise ValueError("runtime settings changed; use a new campaign configuration")
     settings = json.loads(config_bytes)
+    _validate_remediation_settings(settings, phase=job['phase'], target=job['target'],
+                                   approval=job.get('approval_mode', False))
+    if job['phase'] == 1 and settings.get('automatic_remediation') and settings.get('optimizer_worker_config'):
+        worker_bytes = Path(settings['optimizer_worker_config']).read_bytes()
+        if hashlib.sha256(worker_bytes).hexdigest() != job.get('optimizer_worker_config_sha256'):
+            raise ValueError('optimizer worker configuration changed on resume')
     captured = []
 
     def capture(**options):
@@ -162,6 +180,16 @@ def build_controller(job):
             feedback = FailureCurriculum(job['root'], job['feedback_root'], json.loads(data))
             coordinator.failure_feedback = feedback
             coordinator.curriculum.failure_feedback = feedback
+        if job['phase'] == 1 and settings.get('automatic_remediation', False):
+            from .automatic_remediation import AutomaticRemediation, optimizer_retry_adapter
+            from optimizer.worker import load_config
+            automatic = AutomaticRemediation(coordinator, target=job['target'],
+                store=settings.get('feedback_root', job.get('feedback_root')),
+                sources=settings.get('feedback_sources', []),
+                seconds=settings.get('failure_active_seconds', 1800))
+            if job['target'] == 'a3' and settings.get('optimizer_worker_config'):
+                automatic.retry_external = optimizer_retry_adapter(coordinator, automatic.store,
+                    load_config(settings['optimizer_worker_config']))
         if job.get("optimizer_goal"):
             coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
         elif job.get("target_goal") is not None or job.get("autonomous_goal"):
@@ -829,8 +857,10 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    feedback = commands.add_parser('feedback-phase2', help='import retained Phase 2 observations without running agents')
+    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'],
+                                   help='import retained failure observations without running agents')
     feedback.add_argument('--feedback-root', type=Path, required=True)
+    feedback.add_argument('--source-type', choices=('phase1', 'phase2', 'optimizer'), default='phase2')
     sources = feedback.add_mutually_exclusive_group(required=True)
     sources.add_argument('--source-root', type=Path, action='append')
     sources.add_argument('--dashboard-config', type=Path)
@@ -882,14 +912,22 @@ def main(argv=None, *, screen=start_screen):
         if command == "approve":
             sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
-    if args.command == 'feedback-phase2':
+    if args.command in {'feedback', 'feedback-phase2'}:
         from .phase2_feedback import FeedbackStore
         roots = args.source_root
         if args.dashboard_config:
-            roots = [row['root'] for row in _read(args.dashboard_config).get('campaigns', [])
-                     if row.get('phase') in (2, '2')]
+            configuration = _read(args.dashboard_config)
+            if args.source_type == 'optimizer':
+                root = configuration.get('optimizer', {}).get('root')
+                roots = [root] if root else []
+            else:
+                phase = '1' if args.source_type == 'phase1' else '2'
+                roots = [row['root'] for row in configuration.get('campaigns', [])
+                         if str(row.get('phase')) == phase]
         store = FeedbackStore(args.feedback_root)
-        print(json.dumps({'reports': [store.import_campaign(root) for root in roots]}))
+        importer = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
+                    'optimizer': store.import_optimizer}[args.source_type]
+        print(json.dumps({'reports': [importer(root) for root in roots]}))
         return
     control = args.control.resolve()
     if args.command == "adopt":
@@ -931,6 +969,10 @@ def main(argv=None, *, screen=start_screen):
             parser.error("start requires an empty campaign root; use resume")
         config = args.config.resolve()
         settings = _read(config)
+        try:
+            _validate_remediation_settings(settings, phase=args.phase, target=args.target, approval=args.approval_mode)
+        except ValueError as error:
+            parser.error(str(error))
         arguments = settings["phase1_arguments"]
         reserved = {"--root", "--objective", "--initial-memory", "--target", "--project-target", "--max-projects", "--max-seconds"}
         if not isinstance(arguments, list) or any(not isinstance(a, str) for a in arguments):
@@ -992,7 +1034,7 @@ def main(argv=None, *, screen=start_screen):
         if args.worker_config is not None:
             job["worker_config"] = str(args.worker_config.resolve(strict=True))
             job["worker_config_sha256"] = hashlib.sha256(args.worker_config.read_bytes()).hexdigest()
-        if job.get("optimizer_goal") and settings.get("optimizer_worker_config"):
+        if (job.get("optimizer_goal") or args.phase == 1 and settings.get("automatic_remediation")) and settings.get("optimizer_worker_config"):
             job["optimizer_worker_config_sha256"] = hashlib.sha256(
                 Path(settings["optimizer_worker_config"]).read_bytes()).hexdigest()
         if goal is not None:
