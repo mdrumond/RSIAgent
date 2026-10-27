@@ -316,6 +316,35 @@ def test_new_feedback_key_cannot_bypass_unsettled_request(tmp_path):
     assert len(list((root/'dashboard-requests').glob('*.json'))) == 1
 
 
+def test_feedback_refuses_retained_manual_admission_after_later_memory_supersedes_version(tmp_path):
+    from dashboard.app import create_app
+    config, root, _, _, _ = setup(tmp_path)
+    state = json.loads((root/'subject-campaign.json').read_bytes())
+    state['projects']['one']['manual_review_id'] = 'one-manual-accepted'
+    atomic(root/'subject-campaign.json', canonical(state))
+    later = dict(provenance={'project_id': 'another-project'})
+    version = hashlib.sha256(canonical(later)).hexdigest()
+    (root/'memory/versions').mkdir(parents=True)
+    atomic(root/'memory/versions'/(version+'.json'), canonical(later))
+    atomic(root/'memory/active.json', canonical(dict(active={'learning': version}, admissions={
+        'one-manual-accepted': dict(memory_id='learning', version='a'*64)})))
+    launched = []
+    app = create_app(config, tmp_path/'cache.db', actor_launcher=lambda *args: launched.append(args))
+    client = app.test_client()
+    try:
+        before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+        response = client.post('/api/campaigns/campaign/projects/one/feedback',
+            json=dict(text='stale tab feedback', additional_seconds=15), headers={
+                'X-CSRF-Token': client.get('/api/csrf').get_json()['token'],
+                'Idempotency-Key': 'stale-tab'})
+        assert response.status_code == 409
+        assert launched == []
+        assert {path: path.read_bytes() for path in root.rglob('*') if path.is_file()} == before
+        assert not (root/'dashboard-requests').exists()
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
 @pytest.mark.parametrize('sequence', [('control',), ('replacement',), ('replacement', 'control')])
 def test_sequential_paired_restarts_use_current_evidence_and_resume_without_old_execution(tmp_path, sequence):
     config, root, _, scheduler, artifacts = setup(tmp_path)

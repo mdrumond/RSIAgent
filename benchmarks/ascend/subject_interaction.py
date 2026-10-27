@@ -40,15 +40,17 @@ def binding(config_path, campaign_id):
 
 def _project(root, project_id, request_id=None):
     state = _read(root / 'subject-campaign.json')
+    record = state['projects'].get(project_id)
     active = _read(root / 'memory/active.json', {})
-    published = project_id in active.get('admissions', {})
+    admissions = active.get('admissions', {})
+    published = (project_id in admissions
+                 or (record or {}).get('manual_review_id', project_id) in admissions)
     for version in active.get('active', {}).values():
         memory = _read(root / 'memory/versions' / (version + '.json'), {})
         published = published or memory.get('provenance', {}).get('project_id') == project_id
     if published:
         raise ValueError('project is already published into memory')
     pending = state.get('pending') or {}
-    record = state['projects'].get(project_id)
     if record is None:
         item = next(item for item in pending.get('items', []) if item['project_id'] == project_id)
         record = dict(plan=item, objective=pending['subject']['objective'])
