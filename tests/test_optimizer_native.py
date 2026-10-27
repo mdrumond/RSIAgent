@@ -168,3 +168,41 @@ def test_failed_case_retains_exact_inputs_outputs_and_layout(tmp_path, monkeypat
     assert case['metrics']
     assert case['mismatch_samples']
     assert case['mismatch_samples'][0]['expected'] != case['mismatch_samples'][0]['observed']
+
+
+@pytest.mark.parametrize('observed', [1e38, -1e38, float('inf'), -float('inf'), float('nan'), 1.0])
+def test_failed_comparison_metrics_publish_with_exact_reproducer(tmp_path, monkeypatch, observed):
+    import math
+    from optimizer.jobs import sha
+    from optimizer.reference import ReferenceError, compare_outputs
+    from optimizer.remote_worker import publish
+
+    prepared = prepare_reference(dict(source='def forward(x): return torch.zeros_like(x)',
+        entrypoint='forward', signatures=[dict(args=[dict(shape=[2], dtype='float32')])]),
+        max_cases=1)
+    expected = prepared.cases[0]['output']
+    actual = torch.full_like(expected, observed)
+    with pytest.raises(ReferenceError) as error:
+        compare_outputs(expected, actual, inputs=prepared.cases[0]['args'])
+    raw_metrics = error.value.metrics
+    if math.isfinite(observed) and abs(observed) > 1e37:
+        assert math.isinf(raw_metrics['MERE']) and raw_metrics['MERE'] > 0
+    monkeypatch.setattr(native, '_compile_case', lambda *args, **kwargs:
+                        (lambda inputs, states: [actual.clone()], {}))
+    result = native.evaluate(prepared, 'wrong kernel', tmp_path, device='cpu', arch='test')
+    assert result['status'] == 'incorrect'
+    case = result['failure_case']
+    for key, value in raw_metrics.items():
+        assert case['metrics'][key] == (
+            repr(value) if isinstance(value, float) and not math.isfinite(value) else value)
+    raw = lambda tensor: tensor.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    assert bytes.fromhex(case['expected']['bytes_hex']) == raw(expected)
+    assert bytes.fromhex(case['observed']['bytes_hex']) == raw(actual)
+    assert bytes.fromhex(case['inputs']['args']['items'][0]['bytes_hex']) == raw(
+        prepared.cases[0]['args'][0])
+    publish(tmp_path, result)
+    retained = (tmp_path / 'result.json').read_bytes()
+    assert json.loads(retained) == result
+    published = next(row for row in json.loads((tmp_path / 'files.json').read_bytes())
+                     if row['path'] == 'result.json')
+    assert published['sha256'] == sha(retained) and published['size'] == len(retained)
