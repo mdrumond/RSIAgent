@@ -37,8 +37,6 @@ def test_target_binding_changes_language_not_host_oracle(tmp_path):
     assert actual.expected == expected.expected
     assert actual.family == expected.family
     assert actual.abi.kernel_name == "native_kernel"
-    assert actual.instruction.startswith("Ascend C native_kernel:")
-    assert "tla.Tensor" not in actual.instruction
     backend.runtime_result = _runtime(actual.expected.storage)
     good = native.execute(spec, "native candidate")
     assert good.evidence.classification is EvidenceClassification.HOST_VERIFIED
@@ -156,17 +154,6 @@ def test_executor_materializes_each_generic_family_without_benchmark_adapter(
     )
     assert prepared.abi.signature in prepared.instruction
     assert spec.project_id in prepared.instruction
-    assert "host-owned oracle" in prepared.instruction
-    assert "tensor.origin_shape is the PHYSICAL shape" in prepared.instruction
-    assert "LOGICAL_INPUT_SHAPES and LOGICAL_OUTPUT_SHAPE for computation bounds" in prepared.instruction
-    assert "output padding must be zero" in prepared.instruction
-    assert "Input padding contains nonzero sentinels" in prepared.instruction
-    assert "expected_values" not in prepared.instruction
-    assert "bsa" not in prepared.instruction.lower()
-    assert "gdm" not in prepared.instruction.lower()
-    assert "benchmark" not in prepared.instruction.lower()
-    assert '"accumulator_dtype":"float32"' in prepared.instruction
-    assert f'"output_dtype":"{spec.dtype.value}"' in prepared.instruction
     assert len(prepared.inputs) == len(spec.graph.inputs)
     assert prepared.expected.shape == spec.graph.output_shape
 

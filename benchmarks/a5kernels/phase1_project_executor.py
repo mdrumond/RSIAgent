@@ -264,10 +264,20 @@ class ProjectExecutor:
     def supported_tools(self):
         return tuple(getattr(self._binding, "supported_tools", ()))
 
+    def bind_case(self, spec: ProjectSpec, inputs: tuple[HostTensor, ...]):
+        """Create an isolated executor for authenticated remedial inputs and the host oracle."""
+        from copy import copy
+        bound = copy(self)
+        # Recompute the oracle using ordinary host semantics; never accept supplied expected values.
+        evaluate_reference(spec, inputs)
+        bound._bound_case = (spec, inputs)
+        return bound
+
     def prepare(self, spec: ProjectSpec) -> PreparedProject:
         if not isinstance(spec, ProjectSpec):
             raise TypeError("project must be a validated ProjectSpec")
-        inputs = materialize_inputs(spec)
+        frozen = getattr(self, '_bound_case', None)
+        inputs = frozen[1] if frozen is not None and frozen[0] == spec else materialize_inputs(spec)
         expected = evaluate_reference(spec, inputs)
         family_selector = getattr(self._binding, "family", _family)
         family = family_selector(spec)

@@ -236,6 +236,30 @@ class CplNativeCandidateBackend:
         _save(path, record)
         return result
 
+    def recover_owned_operations(self, *, seconds=30, remaining_seconds=None):
+        """Observe this binding's retained handles without submitting device work."""
+        deadline = self.clock() + min(seconds, self.timeout)
+        for path in Path(getattr(self, 'recovery_root', self.root)).rglob('operation.json'):
+            record = json.loads(path.read_text())
+            if ('result' in record or record.get('state') in ('new', 'completed', 'failed', 'cancelled')):
+                continue
+            identity = record.get('identity', {})
+            if identity.get('route') != self.runtime_identity or identity.get('workspace') != str(self._workspace):
+                continue
+            handle = record.get('handle')
+            if not handle:
+                continue  # Ambiguous submissions must remain blocked, never resubmitted.
+            if not any(handle.startswith(f'remote:{self.target}:{kind}:') for kind in ('job', 'transfer')):
+                raise ProjectInfrastructureError('retained CPL operation has a foreign handle')
+            remaining = min(deadline-self.clock(), remaining_seconds() if remaining_seconds else float("inf"))
+            if remaining <= 0:
+                break
+            observed = self._call(('observe', handle), seconds=remaining)
+            if observed.get('handle') != handle:
+                raise ProjectInfrastructureError('CPL observation returned a foreign handle')
+            record['state'] = observed.get('state')
+            _save(path, record)
+
     def _wire_path(self, path):
         selected = PurePosixPath(path)
         return str(selected.relative_to(self.registry_workspace)) if self.registry_workspace is not None else str(selected)
@@ -249,22 +273,41 @@ class CplNativeCandidateBackend:
         script = directory / 'command.sh'
         command = directory / 'command.json'
         payload = json.loads(command.read_text()) if command.exists() else dict(
-            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance())
+            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance(),
+            launcher='process-group-v1')
         if payload['argv'] != [str(arg) for arg in argv]:
             raise ProjectInfrastructureError('retained CPL command changed')
         _save(command, payload)
         body = 'set -eu\nexport ASCEND_RT_VISIBLE_DEVICES='+str(self._device)+'\n'
-        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+"\npython - <<'CPL_PAYLOAD'\n"
-        body += 'import json,os,sys,time\nremaining='+repr(payload['expires_at'])+'-time.time()\n'
+        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+"\nexec python - <<'CPL_PAYLOAD'\n"
+        body += 'import json,os,signal,subprocess,sys,time\nremaining='+repr(payload['expires_at'])+'-time.time()\n'
         body += 'if remaining <= 0: sys.exit(124)\n'
         body += 'command=json.loads('+repr(json.dumps(payload['argv']))+')\n'
-        body += "os.execvp('timeout', ['timeout','--signal=TERM','--kill-after=10s',str(remaining)+'s',*command])\nCPL_PAYLOAD\n"
+        # Own the process group so deadline escalation has an unambiguous exit
+        # contract. GNU timeout returns 137 for both escalation and ordinary kills.
+        body += "child=subprocess.Popen(command,start_new_session=True)\n"
+        body += "def cancelled(signum,frame):\n"
+        body += " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+        body += " try: os.killpg(child.pid,signal.SIGKILL)\n except ProcessLookupError: pass\n"
+        body += " child.wait(timeout=1)\n sys.exit(124)\n"
+        body += "signal.signal(signal.SIGTERM,cancelled)\nsignal.signal(signal.SIGINT,cancelled)\n"
+        body += "try: code=child.wait(timeout=max(0, " + repr(payload['expires_at']) + "-time.time()))\n"
+        body += "except subprocess.TimeoutExpired:\n"
+        body += " try: os.killpg(child.pid,signal.SIGTERM)\n except ProcessLookupError: pass\n"
+        body += " grace=time.monotonic()+10\n while True:\n"
+        body += "  child.poll()\n  try: os.killpg(child.pid,0)\n  except ProcessLookupError: break\n"
+        body += "  if time.monotonic()>=grace:\n"
+        body += "   try: os.killpg(child.pid,signal.SIGKILL)\n   except ProcessLookupError: pass\n   break\n"
+        body += "  time.sleep(min(0.05,max(0,grace-time.monotonic())))\n child.wait()\n"
+        body += " sys.exit(124)\nsys.exit(code if code>=0 else 128-code)\nCPL_PAYLOAD\n"
         if not script.exists():
             script.write_text(body)
         arguments = ('run', self.target, '--runtime', self.runtime,
                      '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
         value = self._operation(key, arguments, kind='job', expires_at=payload['expires_at'])
-        if value['returncode'] == 124:
+        if (value['returncode'] == 124 or
+                value['returncode'] == 137 and payload.get('launcher') != 'process-group-v1'
+                and self.wall_clock() >= payload['expires_at']):
             raise self._pending('CPL command execution allocation expired; retained handle '+value['handle'], 'deadline-exhausted')
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
         result.job_handle = value['handle']
@@ -277,6 +320,7 @@ class CplNativeCandidateBackend:
     def compile(self, plan, local_directory):
         self._require_plan(plan)
         key = plan.execution_id
+        _save(self.root / key / 'candidate.json', dict(project_id=plan.project_id))
         bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
         archive = self._workspace / (key+'.tar')
         self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')
@@ -343,8 +387,8 @@ class CplNativeMeasurements(NativeMeasurementBackend):
             retained = json.loads(record.read_text())
             if retained['request_id'] != request_id:
                 raise ProjectInfrastructureError('native measurement replay identity changed')
-            return retained['result']
-        verification = self._verify()
+            if 'result' in retained:
+                return retained['result']
         directory = backend.remote_candidate_directory(plan)
         argv = ['python', str(directory/'native_measurement_driver.py'), mode, '--candidate-dir', str(directory),
                 '--kernel', plan.kernel_name, '--execution-id', plan.execution_id,
@@ -353,6 +397,23 @@ class CplNativeMeasurements(NativeMeasurementBackend):
         if metric:
             argv += ['--metric', 'ArithmeticUtilization' if metric == 'Basic' else metric]
         replay_key = canonical_digest(dict(request_id=request_id, replay_id=replay))
+        if not record.exists():
+            # Older versions wrote replay receipts only after success. Reconstruct
+            # only the exact retained key/command; an unbound different pending
+            # operation cannot safely be assigned to another replay.
+            bound_keys = {json.loads(path.read_text()).get('operation_key')
+                          for path in self.root.glob('*/measurement.json')}
+            for operation in (backend.root / 'measurements').glob('*/operation.json'):
+                old = json.loads(operation.read_text())
+                key = operation.parent.name
+                if key in bound_keys or 'result' in old:
+                    continue
+                command = operation.parent / 'command.json'
+                if (key != replay_key or not command.exists()
+                        or json.loads(command.read_text()).get('argv') != argv):
+                    raise ProjectInfrastructureError('unbound retained native measurement requires recovery before a new replay')
+            _save(record, dict(request_id=request_id, operation_key=replay_key))
+        verification = self._verify()
         result = backend.run_remote(argv, key='measurements/'+replay_key, cwd=directory)
         if result.returncode:
             raise ProjectInfrastructureError(result.stderr or result.stdout or 'native measurement failed')
@@ -377,7 +438,7 @@ class CplNativeMeasurements(NativeMeasurementBackend):
         raw = dict(stdout=result.stdout, stderr=result.stderr, verification=verification, metadata=meta)
         raw_hash = canonical_digest(raw)
         measured = dict(identity=identity, summary=summary, evidence_sha256=raw_hash, artifact_payloads={raw_hash: raw})
-        _save(record, dict(request_id=request_id, result=measured, evidence=dict(profile=backend.profile,
+        _save(record, dict(request_id=request_id, operation_key=replay_key, result=measured, evidence=dict(profile=backend.profile,
             handle=result.job_handle, status='completed', physical_device=backend._device, logical_device=0,
             remote_report=meta.get('remote_report'))))
         return measured

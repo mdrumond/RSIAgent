@@ -4,6 +4,7 @@
 <div class="eyebrow">A3 / ASCEND C</div><h1>{{ job.name or 'Optimization job' }}</h1>
 <section id="optimizer-job" data-job-id="{{ job.job_id }}"><h2>Progress</h2>
 <p id="optimizer-progress" role="status">{{ job.status }} · {{ job.stage }}</p>
+<div id="optimizer-explanations">{{ explain(job) }}</div>
 <p id="optimizer-budget">{{ job.attempts }} attempts; {{ job.elapsed_seconds }} / {{ job.max_seconds }} seconds</p>
 <pre id="optimizer-handles"></pre>
 <button id="optimizer-stop">Stop</button>

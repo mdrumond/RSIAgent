@@ -61,6 +61,9 @@ def test_local_native_distinguishes_compiler_failure_from_host_failure(tmp_path)
     result = LocalNativeCandidateBackend(config(tmp_path), runner=Runner()).compile(plan(), tmp_path / "evidence")
     assert isinstance(result, FailedEvidence)
     assert result.error_type == "NativeCompileError"
+    assert "exit code 1" in result.detail
+    assert "A3CANDIDATE_COMPILE_FAILED=1" in result.detail
+    assert "bad candidate" in result.detail
 
 
 def test_native_worker_config_replaces_remote_requirements_before_transport(tmp_path, monkeypatch):
@@ -119,3 +122,23 @@ def test_legacy_vectoradd_plan_uses_local_compiler_architecture(tmp_path):
     assert candidate.execution_profile == "local"
     build = next(item for item in candidate.files if item.relative_path == "build.json")
     assert json.loads(build.content)["arch"] == "discovered-arch"
+
+
+def test_failed_native_execution_explains_signal_even_with_correct_looking_stdout(tmp_path):
+    class Runner:
+        def run(self, argv, operation_directory, **options):
+            if "--compile-only" in argv:
+                library = Path(options["cwd"]) / "a3_candidate.so"
+                library.write_bytes(b"compiled-library")
+                digest = hashlib.sha256(library.read_bytes()).hexdigest()
+                return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + digest, "")
+            return subprocess.CompletedProcess(argv, -15, "A3KERNEL_OUTPUT=[1,2]", "termination diagnostic")
+    backend = LocalNativeCandidateBackend(config(tmp_path), runner=Runner())
+    compilation = backend.compile(plan(), tmp_path / "evidence")
+    result = backend.execute_receipt(compilation)
+    assert isinstance(result, FailedEvidence)
+    assert result.error_type == "NativeRuntimeError"
+    assert "exit code -15" in result.detail
+    assert "SIGTERM" in result.detail
+    assert "A3KERNEL_OUTPUT=[1,2]" in result.detail
+    assert "termination diagnostic" in result.detail

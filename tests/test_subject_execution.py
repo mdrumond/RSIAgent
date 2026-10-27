@@ -264,3 +264,72 @@ def test_graph_checkpoints_actual_pi_provider_and_cancel_exceptions(tmp_path, ki
     assert not outcome.host_verified and outcome.source_sha256==sha(b'fixed source')
     assert outcome.observations['evidence']['actions']==['write','compile']
     assert adapter.graph(request).as_dict()==outcome.as_dict()
+
+
+def test_completed_graph_recovers_original_allocation_without_rewriting_checkpoint(tmp_path):
+    execution, actor = graph_actor(tmp_path, [
+        '{"write":{"slot":"kernel","content":"fixed source"}}', '{"run":{}}', '{"submit":{}}'])
+    execution.executor.runtime_identity = dict(RUNTIME, device='0')
+    adapter = SubjectExecutor(execution)
+    request = _request(tmp_path, execution.executor)
+    original = adapter.graph(request)
+    checkpoint = request.branch_root/'subject-execution.json'
+    before = checkpoint.read_bytes()
+    calls = len(actor.observations)
+    execution.executor.runtime_identity = dict(RUNTIME, device='2')
+    assert adapter.graph(request, allow_device_migration=True).as_dict() == original.as_dict()
+    assert checkpoint.read_bytes() == before and len(actor.observations) == calls
+    with pytest.raises(ValueError, match='request changed'):
+        adapter.graph(replace(request, pre_wave_memory=b'changed'), allow_device_migration=True)
+    execution.executor.runtime_identity = dict(RUNTIME, device='2', compiler='different')
+    with pytest.raises(ValueError, match='request changed'):
+        adapter.graph(request, allow_device_migration=True)
+    execution.executor.runtime_identity = dict(RUNTIME, device='2')
+    fresh = replace(request, branch_root=tmp_path/'fresh')
+    adapter.graph(fresh, allow_device_migration=True)
+    assert json.loads((fresh.branch_root/'subject-execution.json').read_bytes())['identity']['runtime']['device'] == '2'
+
+
+@pytest.mark.parametrize('allocation', ['', 'allocations/runtime-namespace'])
+def test_campaign_interruption_retains_only_project_owned_transport_evidence(tmp_path, allocation):
+    from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+    campaign = tmp_path / 'campaign'
+    directory = campaign / 'waves' / 'wave-1' / 'project-1'
+    execution, _ = graph_actor(tmp_path, [])
+    request = replace(_request(tmp_path, execution.executor), branch_root=directory)
+    binding = campaign / 'binding'
+    transport = binding / 'transport-state' / allocation
+    for key, project in [('owned', request.spec.project_id), ('sibling', 'unrelated-project')]:
+        candidate = transport / key
+        operation = candidate / 'compile' / 'operation.json'
+        operation.parent.mkdir(parents=True)
+        (candidate / 'candidate.json').write_text(json.dumps(dict(project_id=project)))
+        operation.write_text(json.dumps(dict(handle='remote:fixture:job:'+key, state='unknown',
+            observation_failure=dict(stderr=key+' compiler diagnostic'))))
+    # A separate runtime can reuse the same execution key for another project.
+    foreign = binding / 'transport-state' / 'allocations' / 'foreign-namespace'
+    operation = foreign / 'owned' / 'compile' / 'operation.json'
+    operation.parent.mkdir(parents=True)
+    (operation.parent.parent / 'candidate.json').write_text(json.dumps(dict(project_id='foreign-project')))
+    operation.write_text(json.dumps(dict(handle='remote:fixture:job:foreign', state='unknown')))
+    import time
+    epoch = time.time()
+    (transport / 'timing.jsonl').write_text(''.join(json.dumps(dict(stage='compile',
+        key=key+'/compile', started_epoch=epoch-1, ended_epoch=epoch+1))+'\n'
+        for key in ['owned', 'sibling']))
+    (foreign / 'timing.jsonl').write_text(json.dumps(dict(stage='foreign-compile',
+        key='owned/compile', started_epoch=epoch-1, ended_epoch=epoch+1))+'\n')
+    def interrupted(request):
+        raise ProjectInfrastructureError('compile observation unavailable')
+    # Keep a real composed executor while replacing only the Actor boundary.
+    class Actor:
+        executor = execution.executor
+        def __call__(self, request):return interrupted(request)
+    outcome = SubjectExecutor(Actor()).graph(request, binding_root=binding)
+    assert [row['handle'] for row in outcome.observations['remote_operations']] == ['remote:fixture:job:owned']
+    assert set(outcome.observations['timing']['by_stage_seconds']) == {'compile'}
+    assert outcome.observations['timing']['by_stage_seconds']['compile'] > 0
+    retained = [outcome.read_artifact(digest) for digest in outcome.artifacts.values()]
+    assert any(b'owned compiler diagnostic' in data for data in retained)
+    assert all(b'sibling' not in data and b'foreign' not in data for data in retained)
+    assert SubjectExecutor(Actor()).graph(request, binding_root=binding).as_dict() == outcome.as_dict()

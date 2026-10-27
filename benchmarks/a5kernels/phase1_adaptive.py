@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import json
@@ -48,6 +49,14 @@ DELTA_SCHEMA = "a5-phase1-adaptive-memory-delta-v1"
 def retained_failure_outcome(root: Path, wave_id: str, project: ProjectSpec) -> dict:
     """Concise selection feedback, backed by the retained branch evidence."""
     branch = root / "waves" / wave_id / "branches" / project.project_id
+    if not (branch / "outcome.json").exists():
+        raw = (branch / "interruption.json").read_bytes()
+        interruption = json.loads(raw)
+        return {"project_id": project.project_id, "spec": project.as_dict(), "verified": False,
+                "summary": interruption["summary"],
+                "evidence": {"path": str(branch.relative_to(root)),
+                             "sha256": hashlib.sha256(raw).hexdigest(),
+                             "classification": interruption["classification"]}}
     try:
         evidence = json.loads((branch / "execution-evidence.bin").read_bytes())
     except (ValueError, UnicodeDecodeError):
@@ -96,6 +105,7 @@ class AdaptiveProjectRequest:
     memory_root: Path | None = None
     remaining_seconds: float | None = None
     publish_learning: bool = True
+    failure_context: Mapping[str, object] | None = None
     actor_memory_delivery: str = "indexed"
 
 
@@ -137,6 +147,7 @@ class AdaptivePhase1Coordinator:
         max_projects: int | None = None,
         max_seconds: float = 7200,
         clock: Callable[[], float] = time.monotonic,
+        allow_partial: bool = False,
     ) -> None:
         if not isinstance(objective, str) or not objective.strip():
             raise ValueError("objective must be non-empty")
@@ -168,6 +179,11 @@ class AdaptivePhase1Coordinator:
             raise ValueError("max_seconds must be positive and finite")
         self.max_seconds, self.clock = max_seconds, clock
         self.failure_feedback = None
+        self.allow_partial = allow_partial
+        self.environment_check = None
+        self._checked_environment = None
+
+        self.automatic_remediation = None
 
     @staticmethod
     def root_state_target(root):
@@ -180,24 +196,39 @@ class AdaptivePhase1Coordinator:
     def _run(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
         pending = self._load_pending(state)
-        if pending is not None and len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects) > self.project_target:
+        if (pending is not None and len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects) > self.project_target
+                and self.automatic_remediation is None):
             raise ValueError("retained wave exceeds configured project target")
         if state.get("project_target", self.project_target) != self.project_target:
             raise ValueError("use continue_campaign to change the retained project target")
-        if state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target:
+        if (self.allow_partial and pending is not None and
+                (state["terminal"] is not None or state["elapsed_seconds"] >= self.max_seconds)):
+            return self.finalize_pending_wave()
+        if (self.automatic_remediation is None and (state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target
+                or (self.allow_partial and pending is None and self._partial_closed(state)))):
+            verifier = getattr(self, 'usefulness_verifier', None)
+            if verifier is not None and verifier.enabled:
+                def reconcile():
+                    self._assess_committed_memory(state)
+                    return self._report(state)
+                return self._with_allocation(reconcile)
             return self._report(state)
         return self._with_allocation(lambda: self._run_allocated(wave_limit=wave_limit, approved_only=approved_only))
 
     def _with_allocation(self, operation):
+        return self._exclusive(lambda: self._run_allocation(operation))
+
+    def _exclusive(self, operation):
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / "allocation.lock").open("a") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise RuntimeError("campaign allocation is already active") from None
-            return self._run_allocation(operation)
+            return operation()
 
     def _run_allocation(self, operation):
+        self._checked_environment = None
         state = self._load_state()
         if state.get("allocation_active"):
             # Exclusive ownership proves the previous interval has no owner.
@@ -239,12 +270,13 @@ class AdaptivePhase1Coordinator:
 
     def _run_allocated(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
+        self._assess_committed_memory(state)
         if self.failure_feedback is not None:
             self.failure_feedback.record(state.get('failure_investigations', []), state)
         pending = self._load_pending(state)
         if pending is not None and (
             len(state["prior_outcomes"]) + len(WaveSpec.from_mapping(pending["wave"]).projects)
-            > self.project_target
+            > self.project_target and self.automatic_remediation is None
         ):
             raise ValueError("retained wave exceeds configured project target")
         if state.get("project_target", self.project_target) != self.project_target:
@@ -253,23 +285,41 @@ class AdaptivePhase1Coordinator:
         self._atomic_json(self.root / "state.json", state)
         executed_waves = 0
         while True:
-            if state["terminal"] is not None:
+            if self._time_exhausted(state):
+                return self._deadline_report(state)
+            remediate = self.automatic_remediation
+            obligations = remediate.refresh(state) if remediate else False
+            if obligations:
+                remediate.retry_ready(state)
+                obligations = remediate.refresh(state)
+            if state["terminal"] is not None and not obligations:
                 return self._report(state)
-            if len(state["prior_outcomes"]) >= self.project_target:
+            if len(state["prior_outcomes"]) >= self.project_target and not obligations:
                 return self._report(state)
             if self._time_exhausted(state):
-                return self._report(state)
+                return self._deadline_report(state)
             snapshot = self._memory_snapshot(state)
             pending = self._load_pending(state)
             if pending is None:
                 if approved_only:
                     raise ValueError("no approved wave is pending")
-                decision, session = self._select(
-                    self._context(state, snapshot), self._session(state),
-                    remaining_projects=self.project_target - len(state["prior_outcomes"]),
-                )
+                try:
+                    with remediate.active() if remediate else nullcontext():
+                        decision, session = self._select(
+                            self._context(state, snapshot), self._session(state),
+                            remaining_projects=max(1, remediate.wave_slots(state) if obligations else
+                                                   self.project_target - len(state["prior_outcomes"])),
+                        )
+                except ValueError:
+                    if remediate and remediate.selection_remaining() <= 0:
+                        continue
+                    raise
                 if self._time_exhausted(state):
-                    return self._report(state)
+                    return self._deadline_report(state)
+                if remediate and remediate.selection_remaining() <= 0:
+                    state = {**state, 'session': self._session_dict(session)}
+                    self._atomic_json(self.root / 'state.json', state)
+                    continue
                 if isinstance(decision, TerminalDecision):
                     state = {
                         **state,
@@ -284,10 +334,17 @@ class AdaptivePhase1Coordinator:
                     self._atomic_json(self.root / "state.json", state)
                     if self.failure_feedback is not None:
                         self.failure_feedback.record(decision.failure_investigations, state)
+                    if remediate and obligations:
+                        remediate.refresh(state)
+                        remediate.retry_ready(state)
+                        if remediate.refresh(state):
+                            state = {**state, 'terminal': None}
+                            self._atomic_json(self.root / 'state.json', state)
+                            continue
                     return self._report(state)
                 assert isinstance(decision, WaveDecision)
                 if self._time_exhausted(state):
-                    return self._report(state)
+                    return self._deadline_report(state)
                 pending = {
                     "schema": PENDING_SCHEMA,
                     "base_wave_index": state["wave_index"],
@@ -301,29 +358,87 @@ class AdaptivePhase1Coordinator:
             wave = WaveSpec.from_mapping(pending["wave"])
             if self.failure_feedback is not None:
                 self.failure_feedback.record(pending.get('failure_investigations', []), state)
+            if remediate:
+                # Preserve the admitted wave, but apply ready repairs first.
+                remediate.refresh(state)
+                remediate.retry_ready(state)
+                remediate.refresh(state)
+                pending = self._load_pending(state)
             if self._time_exhausted(state):
-                return self._report(state)
+                return self._deadline_report(state)
             coordinator = LiveWaveCoordinator(
                 self.root / "waves" / wave.wave_id,
                 wave,
                 snapshot,
                 self._execute,
                 self.max_parallel,
-                allow_semantic_failures=True,
+                allow_semantic_failures=True, allow_partial=self.allow_partial,
+                remaining_seconds=self._remaining_seconds if self.allow_partial else None,
+                before_execute=lambda: self._check_environment(state),
             )
             consolidation = coordinator.resume()
-            committed = {commit.project_id for commit in consolidation.commits}
-            deltas = tuple(self._read_delta(wave.wave_id, project.spec.project_id)
-                           if project.spec.project_id in committed else None
-                           for project in wave.projects)
-            state = self._publish(state, wave, pending, deltas)
-            self._atomic_json(self.root / "state.json", state)
-            (self.root / "pending.json").unlink(missing_ok=True)
-            if self.failure_feedback is not None:
-                self.failure_feedback.sync(state)
+            state = self._finish_wave(state, wave, pending, consolidation,
+                "deadline" if self._remaining_seconds() <= 0 else "settled")
+            self._assess_committed_memory(state)
             executed_waves += 1
+            if self.allow_partial and self._partial_closed(state):
+                # Semantic failures have settled evidence for remediation. An
+                # unfinished branch still requires explicit infrastructure recovery.
+                settled = all((self.root / "waves" / wave.wave_id / "branches" /
+                               project.spec.project_id / "outcome.json").is_file()
+                              for project in wave.projects)
+                if remediate is None or not settled:
+                    return self._report(state)
             if wave_limit is not None and executed_waves >= wave_limit:
                 return self._report(state)
+
+    def _finish_wave(self, state, wave, pending, consolidation, reason):
+        committed = {commit.project_id for commit in consolidation.commits}
+        deltas = tuple(self._read_delta(wave.wave_id, project.spec.project_id)
+                       if project.spec.project_id in committed else None for project in wave.projects)
+        state = self._publish(state, wave, pending, deltas)
+        if self.allow_partial:
+            skipped = [p.spec.project_id for p in wave.projects if p.spec.project_id not in committed]
+            state["wave_results"] = [*state.get("wave_results", []), {
+                "wave_id": wave.wave_id, "status": "complete" if not skipped else "partial" if committed else "empty",
+                "accepted_projects": [c.project_id for c in consolidation.commits],
+                "skipped_projects": skipped, "closure_reason": reason,
+            }]
+        self._atomic_json(self.root / "state.json", state)
+        (self.root / "pending.json").unlink(missing_ok=True)
+        if self.failure_feedback is not None:
+            self.failure_feedback.sync(state)
+        return state
+
+    def finalize_pending_wave(self):
+        """Publish retained finalized results only, without extending an elapsed allocation."""
+        if not self.allow_partial:
+            raise ValueError("retained-only finalization requires partial-wave acceptance")
+        return self._exclusive(self._finalize_pending_wave)
+
+    def _finalize_pending_wave(self):
+        state = self._load_state()
+        if state.get("allocation_active"):
+            state.update(elapsed_seconds=max(self.max_seconds, state["elapsed_seconds"]),
+                         allocation_active=False, allocation_interrupted=True)
+            self._atomic_json(self.root / "state.json", state)
+        pending = self._load_pending(state)
+        if pending is None:
+            return self._report(state)
+        return self._close_retained(state, pending)
+
+    def _deadline_report(self, state):
+        pending = self._load_pending(state) if self.allow_partial else None
+        return self._close_retained(state, pending) if pending is not None else self._report(state)
+
+    def _close_retained(self, state, pending):
+        wave = WaveSpec.from_mapping(pending["wave"])
+        coordinator = LiveWaveCoordinator(self.root / "waves" / wave.wave_id, wave,
+            self._memory_snapshot(state), self._execute, self.max_parallel,
+            allow_semantic_failures=True, allow_partial=True)
+        consolidation = coordinator.finalize_retained()
+        return self._report(self._finish_wave(state, wave, pending, consolidation,
+            "deadline" if state["terminal"] and state["terminal"]["status"] == "TIME_BUDGET_EXHAUSTED" else "recovery"))
 
     def propose_wave(self):
         """Charge curriculum selection to the campaign allocation."""
@@ -480,6 +595,10 @@ class AdaptivePhase1Coordinator:
                         "terminal": terminal,
                         "previous_status": self._report(state)["status"],
                         "successful_projects": len(state["prior_outcomes"])})
+        if self._partial_closed(state):
+            # Acknowledge only this immutable boundary; a later partial wave
+            # must stop again until the user explicitly continues it.
+            state = {**state, "continued_partial_wave": state["wave_results"][-1]["wave_id"]}
         state = {**state, "project_target": project_target, "terminal": None,
                  "continuations": history}
         self._atomic_json(self.root / "state.json", state)
@@ -513,14 +632,30 @@ class AdaptivePhase1Coordinator:
         return reader._report(state)
 
     def _execute(self, request: WaveProjectRequest) -> WaveProjectResult:
+        automatic = self.automatic_remediation
+        with automatic.project_active(request) if automatic else nullcontext():
+            return self._execute_bound(request)
+
+    def _execute_bound(self, request: WaveProjectRequest) -> WaveProjectResult:
+        failure_context = (self.failure_feedback.project_context(request.assignment.project_id)
+                           if self.failure_feedback else None)
+        inputs, oracle = request.inputs, request.oracle
+        if failure_context is not None and request.assignment.spec.failure_mode.value != 'none':
+            from benchmarks.ascend.failure_handoff import FailureContext
+            failure = FailureContext(failure_context, request.assignment.spec)
+            failure.require_repair_evidence(request.assignment.spec)
+            inputs, oracle = failure.inputs, failure.expected
         result = self.execute_project(AdaptiveProjectRequest(
             request.assignment.spec,
             request.assignment.authored_ordinal,
             request.pre_wave_memory,
             request.branch_root,
-            request.inputs,
-            request.oracle,
-            remaining_seconds=self._remaining_seconds(),
+            inputs,
+            oracle,
+            failure_context=failure_context,
+            memory_root=self.root,
+            remaining_seconds=(self.automatic_remediation.project_remaining(request)
+                               if self.automatic_remediation else self._remaining_seconds()),
         ))
         if not isinstance(result, AdaptiveProjectResult):
             raise TypeError("project adapter must return AdaptiveProjectResult")
@@ -568,6 +703,34 @@ class AdaptivePhase1Coordinator:
             **({"failed_outcomes": failures} if failures else {}),
         }
 
+    def _assess_committed_memory(self, state):
+        verifier = getattr(self, "usefulness_verifier", None)
+        if verifier is None or not verifier.enabled:
+            return
+        previous = []
+        for wave_id in state["completed_waves"]:
+            plan = self._read_json(self.root / "waves" / wave_id / "plan.json")
+            wave = WaveSpec.from_mapping(plan["wave"])
+            prior = self._assessment_snapshot(state, wave_id, previous)
+            publication = self._read_json(self.root / "waves" / wave_id / "published.json")
+            committed = {row["project_id"] for row in publication["commits"]}
+            for project in wave.projects:
+                if project.spec.project_id not in committed:
+                    continue
+                path = self.root / "waves" / wave_id / "branches" / project.spec.project_id / "memory-delta.bin"
+                if not path.exists():
+                    continue
+                if not self._read_json(path.parent / "outcome.json")["verified"]:
+                    continue
+                delta = self._read_json(path)
+                raw = base64.b64decode(delta["memory_base64"])
+                memory = Phase1ProjectMemory.from_mapping(json.loads(raw))
+                verifier.assess_memory(memory, prior, f"{wave_id}/{project.spec.project_id}")
+                previous.append(delta["memory_base64"])
+
+    def _assessment_snapshot(self, state, wave_id, previous):
+        return self._memory_snapshot({**state, "memory_bytes_base64": previous})
+
     def _read_delta(self, wave_id: str, project_id: str) -> dict[str, object]:
         path = self.root / "waves" / wave_id / "branches" / project_id / "memory-delta.bin"
         try:
@@ -590,9 +753,18 @@ class AdaptivePhase1Coordinator:
             "summary": _validated_summary(value["summary"]),
         }
 
-    def _select(self, *args, **kwargs):
+    def _check_environment(self, state, *, remaining_seconds=None):
+        token = (state["wave_index"], getattr(self, "_deadline", None))
+        if self.environment_check is not None and self._checked_environment != token:
+            allowance = (lambda: min(self._remaining_seconds(), remaining_seconds())) if remaining_seconds else self._remaining_seconds
+            self.environment_check(state["wave_index"], allowance)
+            self._checked_environment = token
+
+    def _select(self, context, *args, **kwargs):
+        self._check_environment(self._load_state())
+        context = replace(context, remaining_seconds=min(context.remaining_seconds, self._remaining_seconds()))
         try:
-            return self.curriculum.select(*args, **kwargs)
+            return self.curriculum.select(context, *args, **kwargs)
         except CurriculumSelectionError as error:
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 
@@ -635,9 +807,37 @@ class AdaptivePhase1Coordinator:
                     *(base64.b64encode(canonical_bytes(row)).decode("ascii")
                       for row in seed["phase1_memory"]), *state["memory_bytes_base64"]]}
 
+    def _context_files(self, state):
+        from benchmarks.ascend.context_files import ContextFiles
+        files = ContextFiles(self.root / 'curriculum' / 'context')
+        refs = []
+        entries = []
+        if hasattr(self, 'snapshot'):
+            self.snapshot.verify()
+            entries.extend(self.snapshot.memory_entries())
+        entries.extend(json.loads(base64.b64decode(encoded, validate=True))
+                       for encoded in state['memory_bytes_base64'])
+        seen = set()
+        for memory in entries:
+            digest = hashlib.sha256(canonical_bytes(memory)).hexdigest()
+            if digest in seen:
+                continue
+            seen.add(digest)
+            project_id = memory.get('project_spec', {}).get('project_id', memory.get('task_id', digest[:12]))
+            refs.append(files.put('project-memory-' + project_id, memory))
+        for row in state.get('failed_outcomes', []):
+            refs.append(files.put('failed-project-' + row['project_id'], row))
+        if len(refs) > 5:
+            index = files.put('context-file-index', {'files': refs})
+            refs = [index, *refs[-4:]]
+        return tuple(refs), files.read
+
     def _context(self, state, snapshot):
         remaining = max(0, self.project_target - len(state["prior_outcomes"]))
         context_state = self._seed_context_state(state)
+        if self.automatic_remediation and self.automatic_remediation.feedback.ids:
+            remaining = max(remaining, self.automatic_remediation.wave_slots(state))
+        refs, reader = self._context_files(context_state)
         return CurriculumContext(
             self.objective,
             state["wave_index"],
@@ -655,7 +855,9 @@ class AdaptivePhase1Coordinator:
             remaining,
             self._curriculum_feedback(context_state),
             self.failure_feedback.context(state) if self.failure_feedback else (),
-            remaining_seconds=self._remaining_seconds(),
+            remaining_seconds=(self.automatic_remediation.selection_remaining()
+                               if self.automatic_remediation else self._remaining_seconds()),
+            context_files=refs, artifact_reader=reader,
         )
 
     @staticmethod
@@ -736,6 +938,12 @@ class AdaptivePhase1Coordinator:
     def _session_dict(session):
         return {"messages": [dict(item) for item in session.messages], "turns": session.turns}
 
+    @staticmethod
+    def _partial_closed(state):
+        results = state.get("wave_results", [])
+        return bool(results and results[-1]["status"] in {"partial", "empty"}
+                    and state.get("continued_partial_wave") != results[-1]["wave_id"])
+
     def _report(self, state):
         snapshot = self._memory_snapshot(state)
         terminal = state["terminal"]
@@ -748,6 +956,7 @@ class AdaptivePhase1Coordinator:
             "status": (
                 "RECOVERY_REQUIRED" if pending is not None
                 else "TARGET_REACHED" if len(state["prior_outcomes"]) >= self.project_target
+                else "WAVE_CLOSED" if terminal is None and self._partial_closed(state)
                 else "RUNNING" if terminal is None
                 else terminal["status"]
             ),
@@ -756,6 +965,7 @@ class AdaptivePhase1Coordinator:
             "elapsed_seconds": state.get("elapsed_seconds"),
             "remaining_seconds": max(0, state["max_seconds"]-state["elapsed_seconds"]) if "elapsed_seconds" in state else None,
             "wave_index": state["wave_index"],
+            "wave_results": state.get("wave_results", []),
             "project_target": self.project_target,
             "successful_projects": len(state["prior_outcomes"]),
             "completed_attempts": self._completed_attempts(state),

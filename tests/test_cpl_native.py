@@ -62,6 +62,7 @@ def test_cpl_compiles_executes_and_reuses_retained_handle_without_resubmit(tmp_p
     plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
     compilation = candidate.compile(plan, tmp_path/'bundle')
     receipt = candidate.execute_receipt(compilation)
+    assert json.loads((candidate.root / plan.execution_id / 'candidate.json').read_bytes()) == dict(project_id=plan.project_id)
     assert receipt.output == EXPECTED
     assert receipt.job_handle.startswith('remote:fixture:job:')
     assert candidate.compile(plan, tmp_path/'bundle') == compilation
@@ -377,3 +378,213 @@ def test_non_json_cli_failure_retains_bounded_diagnostics_without_replay(tmp_pat
     with pytest.raises(_PendingObservation, match='ambiguous'):
         backend(tmp_path, rejected).run_remote(('true',), key='health')
     assert len(calls)==1
+
+
+def test_readonly_recovery_settles_disconnected_job_without_submission(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    remote.unavailable = True
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(['python', '-c', 'pass'], key='health/interrupted')
+    before = len([call for call in remote.calls if call[2] == 'run'])
+    candidate.recover_owned_operations()
+    record = json.loads((candidate.root/'health/interrupted/operation.json').read_text())
+    assert record['state'] == 'completed'
+    assert len([call for call in remote.calls if call[2] == 'run']) == before == 1
+    assert candidate.run_remote(['python', '-c', 'pass'], key='health/interrupted').returncode == 0
+
+
+def test_readonly_recovery_preserves_ambiguous_and_foreign_allocation_records(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    identity = dict(route=candidate.runtime_identity, workspace='/owned/task', arguments=[])
+    for name, row in {'ambiguous':dict(identity=identity, state='submitting'),
+            'foreign':dict(identity=dict(identity, route=dict(candidate.runtime_identity, physical_device=2)),
+                           state='running', handle='remote:fixture:job:other')}.items():
+        path = candidate.root/name/'operation.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(row))
+    candidate.recover_owned_operations()
+    assert not remote.calls
+    assert json.loads((candidate.root/'ambiguous/operation.json').read_text())['state']=='submitting'
+
+
+@pytest.mark.parametrize('deadline', [False, True])
+def test_real_launcher_distinguishes_deadline_escalation_from_normal_137(tmp_path, deadline):
+    remote = Remote()
+    def launch(argv, **options):
+        if argv[2] != 'run':
+            return remote(argv, **options)
+        remote.calls.append(argv)
+        script = Path(argv[argv.index('--file')+1])
+        result = subprocess.run(('bash', str(script)), capture_output=True, text=True, timeout=15)
+        handle = 'remote:fixture:job:real-launcher'
+        remote.jobs[handle] = result.stdout
+        remote.exit_code = result.returncode
+        return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='completed', handle=handle, exit=result.returncode)), '')
+    candidate = backend(tmp_path, launch, timeout=1 if deadline else 10)
+    marker = tmp_path/'started'
+    command = ('python', '-c',
+        'import signal,time,pathlib,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+        'pathlib.Path(sys.argv[1]).touch(); time.sleep(60)', str(marker)) if deadline else (
+        'python', '-c', 'import sys;sys.exit(137)')
+    if deadline:
+        with pytest.raises(_PendingObservation, match='execution allocation expired'):
+            candidate.run_remote(command, key='real')
+        assert marker.exists()
+        assert remote.exit_code == 124
+    else:
+        assert candidate.run_remote(command, key='real').returncode == 137
+    assert len([call for call in remote.calls if call[2]=='run']) == 1
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_expired_legacy_137_is_held_without_rewriting_or_resubmitting(tmp_path, legacy):
+    now = [1000.0]
+    remote = Remote()
+    remote.exit_code = 137
+    candidate = backend(tmp_path, remote, wall_clock=lambda:now[0])
+    argv = ['python', '-c', 'pass']
+    directory = candidate.root/'retained'
+    if legacy:
+        directory.mkdir(parents=True)
+        (directory/'command.json').write_text(json.dumps(dict(argv=argv, expires_at=1010.0)))
+        (directory/'command.sh').write_text("exec timeout --signal=TERM --kill-after=10s 10s python -c 'pass'\n")
+    assert candidate.run_remote(argv, key='retained').returncode == 137
+    script = (directory/'command.sh').read_bytes()
+    payload = (directory/'command.json').read_bytes()
+    now[0] = 2000.0
+    if legacy:
+        with pytest.raises(_PendingObservation, match='execution allocation expired'):
+            candidate.run_remote(argv, key='retained')
+    else:
+        assert candidate.run_remote(argv, key='retained').returncode == 137
+    assert (directory/'command.sh').read_bytes() == script
+    assert (directory/'command.json').read_bytes() == payload
+    assert len([call for call in remote.calls if call[2]=='run']) == 1
+
+
+def test_real_launcher_kills_surviving_descendant_after_leader_exits(tmp_path):
+    import os
+    import signal
+    import sys
+    remote = Remote()
+    candidate = backend(tmp_path, remote, timeout=2)
+    ready = tmp_path/'descendant.pid'
+    parent = tmp_path/'parent.py'
+    descendant = "import os,pathlib,signal,time,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
+    parent.write_text("import pathlib,subprocess,sys,time\n"
+        + "subprocess.Popen([sys.executable,'-c'," + repr(descendant) + ",sys.argv[1]])\n"
+        + "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
+        + "time.sleep(60)\n")
+    # Generate the actual remote launcher; the fixture transport does not execute it.
+    candidate.run_remote([sys.executable, str(parent), str(ready)], key='tree')
+    script = candidate.root/'tree/command.sh'
+    pid = None
+    try:
+        result = subprocess.run(('bash', str(script)), capture_output=True, text=True, timeout=17)
+        assert ready.exists(), result.stderr
+        pid = int(ready.read_text())
+        assert result.returncode == 124
+        status = Path(f'/proc/{pid}/stat')
+        # An orphan may briefly remain as a zombie until the system reaper runs.
+        settled = time.monotonic() + 1
+        while status.exists():
+            try: state = status.read_text().split(') ',1)[1].split()[0]
+            except FileNotFoundError: break
+            if state in ('X','Z'): break
+            if time.monotonic() >= settled: pytest.fail('deadline descendant remains alive')
+            time.sleep(0.01)
+    finally:
+        if pid is None and ready.exists(): pid = int(ready.read_text())
+        if pid is not None:
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+
+
+@pytest.mark.parametrize('cancel_signal', ['SIGTERM', 'SIGINT'])
+def test_real_launcher_cancellation_kills_isolated_payload_group(tmp_path, cancel_signal):
+    import os
+    import signal
+    import sys
+    ready = tmp_path/'ready.json'
+    descendant = (
+        "import json,os,pathlib,signal,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "signal.signal(signal.SIGINT,signal.SIG_IGN); "
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getppid(),os.getpid()])); "
+        "time.sleep(60)"
+    )
+    parent = tmp_path/'parent.py'
+    parent.write_text("import signal,subprocess,sys,time\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+        + "subprocess.Popen([sys.executable,'-c'," + repr(descendant) + ",sys.argv[1]])\n"
+        + "time.sleep(60)\n")
+    candidate = backend(tmp_path, Remote())
+    candidate.run_remote([sys.executable, str(parent), str(ready)], key='cancelled-tree')
+    process = subprocess.Popen(('bash', str(candidate.root/'cancelled-tree/command.sh')),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    pids = []
+    try:
+        deadline = time.monotonic()+5
+        while not ready.exists() and time.monotonic()<deadline:
+            time.sleep(0.01)
+        assert ready.exists(), 'payload group did not become ready'
+        pids = json.loads(ready.read_text())
+        os.killpg(process.pid, getattr(signal,cancel_signal))
+        assert process.wait(timeout=2) == 124
+        deadline = time.monotonic()+1
+        for pid in pids:
+            status = Path(f'/proc/{pid}/stat')
+            while status.exists():
+                try: state = status.read_text().split(') ',1)[1].split()[0]
+                except FileNotFoundError: break
+                if state in ('X','Z'): break
+                assert time.monotonic()<deadline, 'cancelled payload remained alive'
+                time.sleep(0.01)
+    finally:
+        if not pids and ready.exists(): pids = json.loads(ready.read_text())
+        for pid in pids:
+            try: os.kill(pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+        if process.poll() is None:
+            os.killpg(process.pid,signal.SIGKILL)
+        process.communicate(timeout=3)
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_pending_measurement_binds_replay_before_submission_and_recovers_same_handle(tmp_path, legacy):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    compilation = candidate.compile(plan, tmp_path/'bundle')
+    measurements = CplNativeMeasurements(compilation=compilation, candidate_backend=candidate,
+        expected_output=EXPECTED, evidence_directory=tmp_path/'measurements',
+        environment_identity=dict(cann_version='cann', profiler_version='msprof'))
+    def disconnect(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'run' and 'native_measurement_driver.py' in Path(argv[argv.index('--file')+1]).read_text():
+            remote.unavailable = True
+        return result
+    candidate._run = disconnect
+    with pytest.raises(_PendingObservation):
+        measurements.timing(warm_up=1, launch_count=2, replay_id='pending')
+    receipts = list(measurements.root.glob('*/measurement.json'))
+    assert len(receipts) == 1
+    if legacy:
+        receipts[0].unlink()  # Actual pre-upgrade layout: only transport journals.
+    pending = json.loads(next((candidate.root/'measurements').glob('*/operation.json')).read_text())
+    before = len([call for call in remote.calls if call[2]=='run'])
+    observation_start = len(remote.calls)
+    with pytest.raises(ProjectInfrastructureError):
+        measurements.timing(warm_up=2, launch_count=2, replay_id='pending')
+    assert len([call for call in remote.calls if call[2]=='run']) == before
+    candidate._run = remote
+    result = measurements.timing(warm_up=1, launch_count=2, replay_id='pending')
+    assert result['summary']['median_us'] == 11
+    assert [call[3] for call in remote.calls[observation_start:] if call[2]=='observe'] == [pending['handle']]
+    assert len([call for call in remote.calls if call[2]=='run']) == before
+    measurement_runs = [call for call in remote.calls if call[2]=='run'
+        and 'native_measurement_driver.py' in Path(call[call.index('--file')+1]).read_text()]
+    assert len(measurement_runs) == 1

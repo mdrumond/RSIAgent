@@ -1,13 +1,13 @@
 """Target bindings for the shared adaptive controller and host verifier."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from coding.pi.actor import PiActorDriver
 from coding.pi import ENGINE_IDENTITY
 
 import re
 from queue import Queue
-from threading import Lock
+from threading import Lock, Condition
 
 from benchmarks.ascend.contracts import CompileObservation, RuntimeObservation
 from benchmarks.ascend.targets import a3_curriculum_policy
@@ -27,7 +27,12 @@ def native_target_runtime(config, transport):
     if (not compiler or not environment.get("cann_version")
             or not hasattr(transport, "_device") or not hasattr(transport, "profile")):
         return None
-    return {"target": "a3", "runtime": ("local" if transport.profile == "local" else getattr(transport, "runtime", "py311-torch")), "device": str(transport._device),
+    runtime = getattr(transport, "runtime", None) or getattr(transport, "runtime_identity", {}).get("runtime")
+    if not runtime and transport.profile in {"local", "bz-a3-1", "bz-a3-2"}:
+        runtime = "local" if transport.profile == "local" else "py311-torch"
+    if not runtime:
+        return None
+    return {"target": "a3", "runtime": runtime, "device": str(transport._device),
             "toolchain": environment["cann_version"], "compiler": compiler,
             "product": config.target, "architecture": config.arch,
             "execution_profile": transport.profile}
@@ -41,7 +46,7 @@ def compose_adaptive_controller(
     diagnostic_instructions=None, curriculum_query_knowledge=None,
     unavailable_capabilities=(),
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
-    project_actor=None,
+    project_actor=None, usefulness_enabled=False, usefulness_pair_seconds=600,
 ):
     """One action loop, curriculum and progressive-memory controller for both targets."""
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -66,6 +71,7 @@ def compose_adaptive_controller(
         coordinator = AdaptivePhase1Coordinator(
             root, objective, initial_memory, curriculum, project_actor,
             max_parallel=max_parallel, project_target=project_target, max_projects=max_projects, max_seconds=max_seconds,
+            allow_partial=True,
         )
     else:
         from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
@@ -75,6 +81,14 @@ def compose_adaptive_controller(
             root, objective, reviewed_snapshot, curriculum, project_actor,
             project_target=project_target, trace_hook=trace_hook,
         )
+    from benchmarks.ascend.memory_usefulness import build_usefulness_verifier
+    coordinator.usefulness_verifier = build_usefulness_verifier(
+        root=root, provider=provider, profile=profile, curriculum=curriculum,
+        project_actor=project_actor, enabled=usefulness_enabled,
+        pair_seconds=usefulness_pair_seconds, remaining_seconds=coordinator._remaining_seconds,
+        before_live_work=(lambda remaining: coordinator._check_environment(
+            coordinator._load_state(), remaining_seconds=remaining))
+            if hasattr(coordinator, "_check_environment") else None)
     return project_actor, coordinator
 
 
@@ -93,14 +107,29 @@ class NativeProductionConfig:
     profiling_mode: str | None = None
     compiler_version: str | None = None
     curriculum_kdb: bool = False
+    adaptive_kdb: bool = False
+    librarian_seconds: float = 90
+    memory_kdb: Path | None = None
+    memory_collection: str | None = None
+    memory_snapshot: Path | None = None
 
     def __post_init__(self):
+        import math
+        if type(self.adaptive_kdb) is not bool:
+            raise TypeError("adaptive_kdb must be boolean")
+        if type(self.librarian_seconds) not in (int, float) or not math.isfinite(self.librarian_seconds) or self.librarian_seconds <= 0:
+            raise ValueError("librarian_seconds must be positive finite seconds")
+        memory = (self.memory_kdb, self.memory_collection, self.memory_snapshot)
+        if any(item is not None for item in memory) and (not all(item is not None for item in memory) or not self.adaptive_kdb):
+            raise ValueError("indexed memory requires adaptive KDB, database, collection and snapshot")
+        if self.adaptive_kdb and (self.kdb is None or not self.collection):
+            raise ValueError("adaptive KDB requires a configured KDB and collection")
         if type(self.curriculum_kdb) is not bool:
             raise TypeError("curriculum_kdb must be boolean")
         if self.curriculum_kdb and (self.kdb is None or not self.collection):
             raise ValueError("curriculum KDB requires a configured KDB and collection")
         if self.execution_profile not in {"bz-a3-1", "bz-a3-2", "gz-a3", "local"}:
-            raise ValueError("native production requires an A3 native or local profile")
+            raise ValueError("native production requires an A3 or local profile")
         if not self.target or not self.arch:
             raise ValueError("native production requires discovered target and architecture")
         if re.fullmatch(r"[0-9a-f]{64}", self.guide_sha256) is None:
@@ -121,32 +150,60 @@ class NativeProjectWorker:
 
 
 class NativeProjectPool:
-    """Exclusive slots; stop dispatch after infrastructure/unknown exceptions."""
+    """Exclusive slots; quarantine uncertain workers without poisoning healthy peers."""
 
     def __init__(self, actors):
         self.actors = Queue()
         self.failure = None
         self.lock = Lock()
+        self.condition = Condition(self.lock)
+        self.live = 0
+        self.quarantined = []
         for actor in actors:
             self.actors.put(actor)
+            self.live += 1
 
     def __call__(self, request):
-        from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
-        actor = self.actors.get()
-        try:
-            with self.lock:
-                if self.failure is not None:
+        from benchmarks.a5kernels.phase1_wave_runtime import (
+            ProjectAdmissionTimeout, SemanticProjectFailure,
+        )
+        import time
+        seconds = getattr(request, "remaining_seconds", None)
+        deadline = time.monotonic() + seconds if seconds is not None else float("inf")
+        with self.condition:
+            while self.actors.empty():
+                if not self.live:
                     raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("project allocation exhausted while waiting for a healthy worker")
+                self.condition.wait(timeout=min(remaining, .1))
+            actor = self.actors.get_nowait()
+        reusable = True
+        called = False
+        try:
+            if seconds is not None:
+                remaining = max(0, deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError("project allocation exhausted before dispatch")
+                request = replace(request, remaining_seconds=remaining)
+            called = True
             return actor(request)
-        except SemanticProjectFailure:
+        except (SemanticProjectFailure, ProjectAdmissionTimeout):
             raise
         except Exception as exc:
-            with self.lock:
-                if self.failure is None:
-                    self.failure = exc
+            if called:
+                reusable = False
+                with self.condition:
+                    self.live -= 1
+                    self.quarantined.append(actor)
+                    self.failure = self.failure or exc
             raise
         finally:
-            self.actors.put(actor)
+            with self.condition:
+                if reusable:
+                    self.actors.put(actor)
+                self.condition.notify_all()
 
 
 def build_native_adaptive_phase1(
@@ -155,7 +212,8 @@ def build_native_adaptive_phase1(
     max_projects=None, max_seconds=7200, request_profile=None, request_timing=None,
     profiling_guidance=None,
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
-    project_workers=(),
+    project_workers=(), librarian_complete=None,
+    usefulness_enabled=False, usefulness_pair_seconds=600,
 ):
     """Compose native A3 learning without a Catlass checkout requirement.
 
@@ -222,19 +280,39 @@ def build_native_adaptive_phase1(
             identity["kdb_manifest"] = (manifests[0].fingerprint if isinstance(config.collection, str)
                                         else {manifest.collection: manifest.fingerprint
                                               for manifest in manifests})
-        query = _knowledge_action(config, embeddings)
+        adaptive = None
+        if config.adaptive_kdb:
+            from benchmarks.ascend.phase1_knowledge import NativeAdaptiveKnowledge, deepseek_librarian
+            adaptive = NativeAdaptiveKnowledge(config, embeddings,
+                librarian_complete or deepseek_librarian(environment))
+            identity["adaptive_kdb"] = adaptive.identity
+        query = adaptive.actor_query if adaptive is not None else _knowledge_action(config, embeddings)
         # The pinned local embedding model is shared; its tokenizer/model need
         # not support overlapping calls. SQLite readers/journals remain local.
         query_action, query_lock = query, Lock()
         def query(payload, context):
-            with query_lock:
-                return query_action(payload, context)
+            if not config.adaptive_kdb or context.remaining_seconds is None:
+                with query_lock:
+                    return query_action(payload, context)
+            import time
+            deadline = time.monotonic() + context.remaining_seconds
+            if not query_lock.acquire(timeout=max(0, context.remaining_seconds)):
+                raise TimeoutError('actor knowledge lock elapsed allocation exhausted')
+            try:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError('actor knowledge lock elapsed allocation exhausted')
+                return query_action(payload, replace(context, remaining_seconds=remaining))
+            finally:
+                query_lock.release()
     elif config.collection is not None or embeddings is not None:
         raise ValueError("KDB-off native treatment cannot receive KDB dependencies")
     curriculum_query = None
     if config.curriculum_kdb:
         from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
         callback, identity["curriculum_kdb"] = curriculum_knowledge(config, embeddings)
+        if config.adaptive_kdb:
+            callback = adaptive.curriculum_query
         def curriculum_query(action, *, check_remaining=None):
             if check_remaining is None:
                 with query_lock:
@@ -247,6 +325,8 @@ def build_native_adaptive_phase1(
                 return callback(action, check_remaining=check_remaining)
             finally:
                 query_lock.release()
+        if config.adaptive_kdb:
+            curriculum_query.begin_selection = adaptive.begin_selection
     root = Path(config.root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / "campaign-identity.json"
@@ -304,7 +384,12 @@ def build_native_adaptive_phase1(
         unavailable_capabilities=tuple(capability for capability, action in (
             (Capability.PROFILING, request_profile), (Capability.TIMING_SWEEP, request_timing),
         ) if action is None),
+        usefulness_enabled=usefulness_enabled, usefulness_pair_seconds=usefulness_pair_seconds,
     )
+    if reviewed_snapshot is None:
+        from benchmarks.ascend.wave_environment import NativeWaveEnvironmentCheck
+        coordinator.environment_check = NativeWaveEnvironmentCheck(config,
+            tuple(worker.transport for worker in project_workers) or (native_transport,))
     return coordinator
 
 

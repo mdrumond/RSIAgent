@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 from pathlib import Path
 import sys
 import time
@@ -138,8 +139,8 @@ def main(
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command == 'report':
-        print(json.dumps({'records': [json.loads(path.read_bytes()) for path in
-            sorted(args.root.rglob('terminal.json'))]}, sort_keys=True))
+        print(json.dumps(describe_statuses({'records': [json.loads(path.read_bytes()) for path in
+            sorted(args.root.rglob('terminal.json'))]}), sort_keys=True))
         return 0
     parser.error('Ascend Phase 2 execution is retired; use run_ascend_subjects.py; historical report remains available')
 

@@ -17,7 +17,7 @@ import time
 
 from core.knowledge_presentation import compact_knowledge_result
 
-from .cases import validate_submission
+from .cases import validate_submission, normalize_job_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
 from .control import ObservationUnavailable, WorkerStopped
@@ -97,21 +97,14 @@ class OptimizationLoop:
             self._save()
 
     def _spec(self, submission):
-        signature = submission['signature']
-        if isinstance(signature, dict) and 'signatures' in signature:
-            if set(signature) != {'signatures'}:
-                raise ValueError('signature envelope contains unexpected fields')
-            signatures = signature['signatures']
-        else:
-            # Preserve jobs created by the original CLI's list/single-case API.
-            signatures = signature if isinstance(signature, list) else [signature]
-        return validate_submission({k: submission[k] for k in ('source', 'entrypoint', 'init_args', 'init_kwargs')}
-                                   | {'signatures': signatures})
+        return normalize_job_submission(submission)
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         try:
-            return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
-                             memory_snapshot=memory_snapshot, context=context)
+            from benchmarks.ascend.actor_control import ActorControl
+            with ActorControl(self.directory.parent).lease():
+                return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
+                                 memory_snapshot=memory_snapshot, context=context)
         finally:
             close = getattr(self.agent, "close", None)
             if close is not None:
@@ -269,6 +262,7 @@ class OptimizationLoop:
             result = self._read(pending['evaluation'])
             value = score(baseline, result)
             history = {'candidate_sha256': pending['sha256'], 'result': pending['evaluation'],
+                       'source': self.state['candidate'],
                        'configuration_sha256': pending.get('configuration_sha256', pending['sha256']),
                        'block_count': pending['block_count'],
                        'content': result, 'speedup': value, 'summary': pending['summary']}
@@ -326,14 +320,32 @@ class OptimizationLoop:
             self._save()
 
     def _model(self, stage, context):
+        original_context = context
+        from benchmarks.ascend.actor_control import ActorControl, ActorStopped
+        control = ActorControl(self.directory.parent)
         retained = self.state.get('model_action', self.state.get('action_result'))
-        if retained and retained.get('name') == stage:
+        if retained and retained.get('name') == stage and not control.pending():
             # The caller removes this result in the same checkpoint that applies
             # it. A crash in between must not issue another billable request.
             return self._read(retained)
+        if retained and retained.get('name') == stage:
+            self.state.pop('model_action', None)
+            self.state.pop('action_result', None)
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        checkpoint = control.status()['checkpoint'] or {}
+        feedback = checkpoint.get('feedback', self.state.get('user_feedback', []))
+        self.state['user_feedback'] = feedback
+        try:
+            control.boundary({'turn': self.state['turn'], 'feedback': feedback}, feedback)
+        except ActorStopped:
+            row = self.store.stop(self.key)
+            if row['status'] == 'running':
+                self.store.transition(self.key, 'stopped')
+            return None
+        self._save()
+        context['user_feedback'] = feedback
         # History can be paged as a whole by the coding context layer. Keep the
         # latest bounded knowledge response readable independently of that list.
         for entry in reversed(self.state['history']):
@@ -349,7 +361,8 @@ class OptimizationLoop:
         context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
         if self.agent.identity.get('coding_engine') == 'pi':
             context['knowledge_available'] = self.knowledge is not None
-        if self.single_evaluation or self.prepare_only:
+        if (self.single_evaluation or self.prepare_only or
+                any(item.get('content', {}).get('failure_case') for item in context.get('history', []))):
             # Keep every lesson addressable, but don't replay hundreds of full
             # entries or accumulated compiler/profiler logs on every turn.
             rows = context.get('memory_summary', [])
@@ -385,7 +398,16 @@ class OptimizationLoop:
                 if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
                     record = self._artifact('context-' + key, context[key])
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
-        return self._action(stage, lambda: self.agent.complete(stage, context, self._record))
+        from benchmarks.ascend.status_descriptions import describe_statuses
+        presentation = describe_statuses(context)
+        value = self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
+        if value is not None and control.pending():
+            # A redirection arriving in flight supersedes this unexecuted action.
+            self.state.pop('model_action', None)
+            self.state.pop('action_result', None)
+            self._save()
+            return self._model(stage, original_context)
+        return value
 
     def _tool(self, action, snapshot):
         # Model request mistakes are feedback, not evidence/transport failures.

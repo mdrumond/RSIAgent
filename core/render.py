@@ -2,9 +2,9 @@
 
 CONTRACT: this module must contain NO model-facing prompt literals — every string
 here is either a shell command template or a filename pattern. It is therefore not
-an audited prompt surface (tests/test_no_leakage.py SURFACES); anything that goes
-into model context (questions, evidence framing) lives in core/verifier.py and IS
-audited. Keep it that way: if you add a prompt string here, move it to verifier.py.
+a model-facing prompt surface; anything that goes into model context (questions,
+evidence framing) lives in core/verifier.py and must remain task-independent.
+Keep it that way: if you add a prompt string here, move it to verifier.py.
 
 Path discovery is provenance-only: candidates come from the run's file-change
 ledger, the task instruction, and the inspector's own probe output — never from

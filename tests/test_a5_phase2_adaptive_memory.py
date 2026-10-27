@@ -26,7 +26,7 @@ from tests.test_a5_phase2_source_provider import GUIDE, GUIDE_ID, ENVIRONMENT
 from tests.test_a5_phase2_production import FakeExecutor, CopyVBackend
 
 
-def _source(tmp_path, *, new=False, historical_citation=False):
+def _source(tmp_path, *, new=False, historical_citation=False, partial=False):
     profiling_guide = None
     if new:
         from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
@@ -58,14 +58,22 @@ def _source(tmp_path, *, new=False, historical_citation=False):
     pre_memory = canonical_bytes({
         "schema": MEMORY_SCHEMA, "initial_memory_base64": "", "project_memory_base64": [],
     })
-    wave = WaveSpec("wave-01", hashlib.sha256(pre_memory).hexdigest(), (), (WaveProject(spec),))
-    LiveWaveCoordinator(root / "waves/wave-01", wave, pre_memory, lambda _: WaveProjectResult(
+    projects = (WaveProject(spec),)
+    if partial:
+        projects += (WaveProject(ProjectSpec.from_mapping(_project("offline", "simd-vector"))),)
+    wave = WaveSpec("wave-01", hashlib.sha256(pre_memory).hexdigest(), (), projects)
+    def execute(request):
+        if request.assignment.project_id == "offline":
+            raise OSError("retained remote observation unavailable")
+        return WaveProjectResult(
         canonical_bytes({"schema": DELTA_SCHEMA, "project_id": "copy", "summary": "host verified",
                          "memory_base64": encoded}),
         ExecutionEvidence(EvidenceClassification.HOST_VERIFIED, "test fixture"),
         canonical_bytes({"classification": "host-verified", "source_sha256": source_sha,
                          "artifacts": {"classification": evidence}}),
-    ), 1).run()
+    )
+    LiveWaveCoordinator(root / "waves/wave-01", wave, pre_memory, execute, 1,
+                        allow_partial=partial).run()
     state = {
         "schema": STATE_SCHEMA, "initial_memory_sha256": hashlib.sha256(b"").hexdigest(),
         "terminal": {"status": "SATURATED", "reason": "done"},
@@ -198,3 +206,33 @@ def test_new_guidance_reaches_phase2_and_current_qualification_is_required(tmp_p
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")
+
+
+def test_partial_publication_transfers_verified_memory_and_interruption_only_branch(tmp_path):
+    root, source, review, memory = _source(tmp_path, partial=True)
+    branch = "waves/wave-01/branches/offline"
+    retained = (root / branch / "interruption.json").read_bytes()
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
+    assert snapshot.memory_entries() == (memory,)
+    assert (snapshot.root / branch / "interruption.json").read_bytes() == retained
+    assert not (snapshot.root / branch / "outcome.json").exists()
+    assert not (snapshot.root / branch / "memory-delta.bin").exists()
+    (root / "state.json").unlink()
+    snapshot.verify()
+    (snapshot.root / branch / "interruption.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="bytes changed"):
+        snapshot.verify()
+
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong-wave"])
+def test_partial_snapshot_rejects_missing_or_mismatched_interruption(tmp_path, mutation):
+    root, source, review, _ = _source(tmp_path, partial=True)
+    path = root / "waves/wave-01/branches/offline/interruption.json"
+    if mutation == "missing":
+        path.unlink()
+    else:
+        value = json.loads(path.read_bytes())
+        value["wave_fingerprint"] = "0" * 64
+        path.write_bytes(canonical_bytes(value))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")

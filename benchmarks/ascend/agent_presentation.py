@@ -9,6 +9,7 @@ from pathlib import Path
 from collections.abc import Mapping
 
 from benchmarks.a5kernels.evidence import canonical_bytes
+from .status_descriptions import describe_statuses
 
 PAGE_BYTES = 8192
 
@@ -109,8 +110,9 @@ def compact_observation(payload, artifacts):
     This view never replaces the host result used by verification or publication.
     """
     digest = artifacts.put_json(payload)
-    if len(canonical_bytes(payload)) <= 12 * 1024:
-        return dict(payload)
+    presentation = describe_statuses(payload)
+    if len(canonical_bytes(presentation)) <= 12 * 1024:
+        return presentation
     preview = _preview(payload)
     artifact = preview.get("artifact")
     if isinstance(artifact, dict) and isinstance(artifact.get("payload"), dict):
@@ -134,7 +136,16 @@ def compact_observation(payload, artifacts):
         ) if key in payload}
     preview["full_observation_sha256"] = digest
     preview["presentation_only"] = True
-    return preview
+    view = describe_statuses(preview)
+    # Preserve actionable requirements even when large logs force the fallback.
+    if "missing" in payload:
+        view["missing"] = _preview(payload["missing"])
+        view = describe_statuses(view)
+    if len(canonical_bytes(view)) > 12 * 1024:
+        view = {key: value for key, value in view.items() if key in {
+            "event", "classification", "status", "source_sha256", "error", "missing",
+            "status_explanations", "full_observation_sha256", "presentation_only"}}
+    return view
 
 
 def mismatch_summary(expected, observed):
@@ -226,12 +237,27 @@ def memory_presentation(raw, artifacts):
     """Index every original memory; show readable bounded lessons, not base64."""
     digest = artifacts.put_bytes(raw)
     result = {"sha256": digest, "bytes": len(raw), "projects": [],
-              "note": "Presentation only. Full immutable memories available via read-artifact."}
+              "note": "Presentation only. Full immutable memories available via read-artifact.",
+              "file_reader": {"action": "read_artifact", "hash_field": "sha256", "offset": 0, "limit": 8192}}
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
         result["preview"] = raw[:2048].decode("utf-8", errors="replace")
         return result
+    if isinstance(value, dict) and "usefulness_lesson" in value:
+        result["usefulness_lesson"] = value["usefulness_lesson"]
+    if isinstance(value, dict) and isinstance(value.get("memory_entries"), list):
+        result["memory_entries"] = []
+        remaining = 8192
+        for entry in value["memory_entries"]:
+            content = canonical_bytes(entry)
+            row = dict(sha256=artifacts.put_bytes(content))
+            lesson = _preview(entry)
+            size = len(canonical_bytes(lesson))
+            if size <= remaining:
+                row["lesson"] = lesson
+                remaining -= size
+            result["memory_entries"].append(row)
     if isinstance(value, dict) and value.get("schema") == "subject-memory-snapshot-v1":
         return _subject_memory_index(value, result, artifacts)
     if not isinstance(value, dict) or "project_memory_base64" not in value:
@@ -259,7 +285,9 @@ def memory_presentation(raw, artifacts):
     optimizer_remaining = 8192
     for content, origin in entries:
         project = json.loads(content)
-        row = {"sha256": artifacts.put_bytes(content),
+        digest = artifacts.put_bytes(content)
+        row = {"sha256": digest, "size_bytes": len(content),
+               "filename": "project-memory-" + str(project.get("project_spec", {}).get("project_id", project.get("task_id", digest[:12]))) + ".json",
                "origin": origin,
                "project_id": project.get("project_spec", {}).get("project_id", project.get("task_id"))}
         if project.get("task_id"):
