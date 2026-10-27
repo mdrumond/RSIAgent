@@ -119,6 +119,10 @@ class NativeAdaptiveKnowledge:
             audit_root.mkdir(exist_ok=True)
             def retain(audit):
                 (audit_root / (uuid.uuid4().hex + '.json')).write_bytes(canonical_bytes(audit))
+            seconds = min(budget.deadline-time.monotonic(), remaining())
+            if seconds <= 0:
+                gate.close()
+                return (), dict(status='insufficient', gaps=['Shared librarian elapsed allowance exhausted.'])
             agent = AdaptiveKnowledgeAgent(gate, self.complete, seconds=seconds, audit=retain)
             agent.configure_context(task=task, role=role, context=context)
             try:
