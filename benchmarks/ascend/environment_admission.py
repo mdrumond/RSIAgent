@@ -1,5 +1,8 @@
 """Fresh device health plus short-lived, identity-scoped known-good probe reuse."""
 import hashlib
+import fcntl
+from contextlib import contextmanager
+import threading
 import json
 from pathlib import Path
 import re
@@ -9,6 +12,43 @@ import uuid
 from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from .runtime_allocation import permitted_devices, unsettled_operations
+
+_RESERVATIONS = {}
+_RESERVATIONS_LOCK = threading.Lock()
+
+
+@contextmanager
+def native_reservation(root, remaining):
+    """Serialize admission through settled dispatch, across threads and processes."""
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with _RESERVATIONS_LOCK:
+        lock, state = _RESERVATIONS.setdefault(str(root), (threading.RLock(), threading.local()))
+    if not lock.acquire(timeout=max(0, remaining())):
+        raise TimeoutError('native admission reservation allocation exhausted')
+    try:
+        if getattr(state, 'active', False):
+            yield
+            return
+        with (root / '.native-admission.lock').open('a') as stream:
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    seconds = remaining()
+                    if seconds <= 0:
+                        raise TimeoutError('native admission reservation allocation exhausted')
+                    time.sleep(min(.05, seconds))
+            state.active = True
+            try:
+                yield
+            finally:
+                state.active = False
+                fcntl.flock(stream, fcntl.LOCK_UN)
+    finally:
+        lock.release()
+
 
 _HEALTH = r'''
 import importlib.metadata,json,os,pathlib,shutil,subprocess,sys

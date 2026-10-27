@@ -48,6 +48,8 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device
     class Actor:
         immutable_context = b'original'
         query_knowledge = None
+        request_timing = staticmethod(lambda *a, **k: calls.append('timing') or {'receipt':'timing'})
+        request_profile = staticmethod(lambda *a, **k: calls.append('profile') or {'receipt':'profile'})
         executor = SimpleNamespace(execute=lambda *a, **k: calls.append('extra-check'))
         def __call__(self, value):
             calls.append(('actor', value.remaining_seconds))
@@ -212,3 +214,58 @@ def test_background_trial_pending_operation_blocks_foreground_until_settled(tmp_
     bound['actor'](request(binding))
     assert calls[:2] == ['probe-compile','probe-execute'] and calls[-1][0] == 'actor'
     assert bound['native_operation_root'] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize('name', ['request_timing','request_profile'])
+def test_measurement_callbacks_readmit_after_last_correctness_run(tmp_path, monkeypatch, name):
+    bound, calls = compose(tmp_path/'foreground', monkeypatch, operation_root=tmp_path)
+    bound['actor'].executor.execute('correctness')
+    before = list(calls)
+    pending = tmp_path/'memory-reviews/trial/runtime/operation.json'
+    pending.parent.mkdir(parents=True)
+    pending.write_text(json.dumps(dict(state='queued',handle='remote:registry-target:job:trial')))
+    callback = getattr(bound['actor'],name)
+    with pytest.raises(ProjectInfrastructureError, match='unsettled'):
+        callback({'replay_id':'same'},None)
+    assert calls == before
+    pending.write_text(json.dumps(dict(state='completed',handle='remote:registry-target:job:trial')))
+    first = callback({'replay_id':'same'},None)
+    assert callback({'replay_id':'same'},None) == first
+    assert calls.count(name.removeprefix('request_')) == 2
+
+
+def test_campaign_reservation_serializes_parent_and_trial_admission_through_dispatch(tmp_path, monkeypatch):
+    import threading
+    from contextlib import contextmanager
+    parent, parent_calls = compose(tmp_path/'parent',monkeypatch,operation_root=tmp_path)
+    trial, trial_calls = compose(tmp_path/'trial/runtime',monkeypatch,operation_root=tmp_path)
+    entered, release, attempted = threading.Event(), threading.Event(), threading.Event()
+    errors = []
+    def execute(*args):
+        entered.set()
+        assert release.wait(5)
+        parent_calls.append('device-settled')
+    parent['actor'].executor._executor.execute = execute
+    reserve = trial['actor'].executor._check.reserve
+    @contextmanager
+    def observed_reserve():
+        attempted.set()
+        with reserve(): yield
+    trial['actor'].executor._check.reserve = observed_reserve
+    def run(bound):
+        try: bound['actor'].executor.execute('candidate')
+        except BaseException as error: errors.append(error)
+    first, second = threading.Thread(target=run,args=(parent,)), threading.Thread(target=run,args=(trial,))
+    first.start()
+    try:
+        assert entered.wait(5)
+        second.start()
+        assert attempted.wait(5)
+        assert not trial_calls  # Neither probe nor candidate dispatch raced the parent.
+    finally:
+        release.set()
+        first.join(5)
+        if second.ident is not None: second.join(5)
+    assert not first.is_alive() and not second.is_alive() and not errors
+    assert parent_calls[-1] == 'device-settled'
+    assert trial_calls == ['probe-compile','probe-execute','extra-check']

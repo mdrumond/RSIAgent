@@ -13,7 +13,7 @@ from .execution import _deadline, process_deadline
 from .phase1_cli import load_native_config
 from .subject_runtime import compose_production
 from .wave_environment import NativeWaveEnvironmentCheck
-from .environment_admission import EnvironmentAdmission
+from .environment_admission import EnvironmentAdmission, native_reservation
 
 
 def _runtime_failed(result):
@@ -35,16 +35,23 @@ class _CheckedExecutor:
     def __getattr__(self, name):
         return getattr(self._executor, name)
 
-    def execute(self, *args, **kwargs):
-        self._check()
-        try:
-            result = self._executor.execute(*args, **kwargs)
-            if _runtime_failed(result):
+    def _call(self, name, *args, **kwargs):
+        with self._check.reserve():
+            self._check()
+            try:
+                result = getattr(self._executor, name)(*args, **kwargs)
+                if _runtime_failed(result):
+                    self._check.invalidate()
+                return result
+            except Exception:
                 self._check.invalidate()
-            return result
-        except Exception:
-            self._check.invalidate()
-            raise
+                raise
+
+    def execute(self, *args, **kwargs):
+        return self._call('execute', *args, **kwargs)
+
+    def compile(self, *args, **kwargs):
+        return self._call('compile', *args, **kwargs)
 
 
 class _CheckedActor:
@@ -140,10 +147,26 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     def ensure_environment(*, force=False):
         if remaining() <= 0:
             raise _allocation_error('native environment allocation exhausted or campaign stopped', remaining)
-        admission(remaining, force=force)
+        with native_reservation(operation_root, remaining):
+            admission(remaining, force=force)
     ensure_environment.invalidate = admission.invalidate
+    ensure_environment.reserve = lambda: native_reservation(operation_root, remaining)
     actor = bound['actor']
     actor.executor = _CheckedExecutor(actor.executor, ensure_environment)
+    def checked_measurement(callback):
+        def measure(*args, **kwargs):
+            with ensure_environment.reserve():
+                ensure_environment()
+                try:
+                    return callback(*args, **kwargs)
+                except Exception:
+                    admission.invalidate()
+                    raise
+        return measure
+    for name in ('request_timing', 'request_profile'):
+        callback = getattr(actor, name, None)
+        if callback is not None:
+            setattr(actor, name, checked_measurement(callback))
     bound['actor'] = _CheckedActor(actor, ensure_environment, remaining)
     bound.update(check_environment=ensure_environment, transports=tuple(transports),
                  environment_check_cache=str(Path(cache).resolve()),
