@@ -1,6 +1,6 @@
 {% if curriculum_controls.available(campaign.id) %}
 <section class="control-panel" data-curriculum="{{ campaign.id }}" data-curriculum-project="{{ project.id if project is defined else '' }}"><h2>Curriculum assistance</h2>
-{% if project is not defined or not project.merged %}
+{% if project is not defined or (not project.merged and curriculum_controls.restart_available) %}
 <form data-curriculum-preview>
 {% if project is defined %}<input type="hidden" name="kind" value="restart"><input type="hidden" name="project_id" value="{{ project.id }}"><p>Describe the revised prompt. The curriculum will format a fresh project contract for review.</p>
 {% else %}<label>Change <select name="kind"><option value="request-project">Request a new project</option><option value="subjects">Edit future subjects</option><option value="projects">Edit unreserved project queue</option></select></label>{% endif %}
@@ -8,13 +8,14 @@
 <label>Formatting allowance (seconds) <input name="format_seconds" type="number" min="1" step="1" required></label>
 <button type="submit">Review curriculum proposal</button></form>
 {% endif %}
+{% if project is defined and not project.merged and not curriculum_controls.restart_available %}<p>Reviewed restarts are unavailable until the subject interaction runtime is installed.</p>{% endif %}
 <p data-curriculum-status role="status"></p><button type="button" data-curriculum-reconcile hidden>Reconcile original request</button>
 <div data-curriculum-proposals>{% for proposal in curriculum_controls.proposals(campaign.id) %}{% if project is not defined or proposal.project == project.id %}
 <article data-curriculum-proposal="{{ proposal.id }}"><h3>{{ proposal.kind }}{% if proposal.project %} · {{ proposal.project }}{% endif %} · {{ proposal.status }}</h3><p>{{ proposal.instructions }}</p><pre>{{ proposal.diff }}</pre>
 {% set retained = curriculum_controls.restart_request(campaign.id, proposal.id) if proposal.kind == 'restart' else none %}
 {% if proposal.kind == 'restart' %}<h4>Reviewed actor prompt</h4><pre>{{ proposal.after.instruction }}</pre>
-{% if proposal.status == 'approved' %}<p data-restart-status-url="{{ url_for('curriculum_restart_status', campaign_id=campaign.id, identifier=proposal.id) }}">Restart: {{ retained.status if retained else 'not dispatched' }}{% if retained and retained.error %} · {{ retained.error }}{% endif %}{% if retained and retained.status == 'observation-required' %} · Observe the prior execution before resubmitting.{% endif %}</p>{% endif %}{% endif %}
-{% if (proposal.status == 'proposed' or (proposal.kind == 'restart' and proposal.status == 'approved' and (not retained or retained.status not in ['succeeded', 'observation-required']))) and (project is not defined or not project.merged) %}{% if proposal.kind == 'restart' %}<label>Restart allowance (seconds) <input data-restart-seconds type="number" min="1" step="1"{% if retained %} value="{{ retained.additional_seconds }}" readonly{% endif %} required></label>{% endif %}<button type="button" data-curriculum-approve="{{ proposal.id }}" data-restart="{{ 'yes' if proposal.kind == 'restart' else 'no' }}">{% if proposal.status == 'approved' %}Resume/reconcile restart{% else %}Approve{% if proposal.kind == 'restart' %} and restart{% endif %}{% endif %}</button>{% endif %}</article>
+{% if proposal.status == 'approved' and curriculum_controls.restart_available %}<p data-restart-status-url="{{ url_for('curriculum_restart_status', campaign_id=campaign.id, identifier=proposal.id) }}">Restart: {{ retained.status if retained else 'not dispatched' }}{% if retained and retained.error %} · {{ retained.error }}{% endif %}{% if retained and retained.status == 'observation-required' %} · Observe the prior execution before resubmitting.{% endif %}</p>{% endif %}{% endif %}
+{% if (proposal.kind != 'restart' or curriculum_controls.restart_available) and (proposal.status == 'proposed' or (proposal.kind == 'restart' and proposal.status == 'approved' and (not retained or retained.status not in ['succeeded', 'observation-required']))) and (project is not defined or not project.merged) %}{% if proposal.kind == 'restart' %}<label>Restart allowance (seconds) <input data-restart-seconds type="number" min="1" step="1"{% if retained %} value="{{ retained.additional_seconds }}" readonly{% endif %} required></label>{% endif %}<button type="button" data-curriculum-approve="{{ proposal.id }}" data-restart="{{ 'yes' if proposal.kind == 'restart' else 'no' }}">{% if proposal.status == 'approved' %}Resume/reconcile restart{% else %}Approve{% if proposal.kind == 'restart' %} and restart{% endif %}{% endif %}</button>{% endif %}</article>
 {% endif %}{% endfor %}</div></section>
 <script src="{{ url_for('static', filename='curriculum_controls.js') }}"></script>
 {% endif %}
