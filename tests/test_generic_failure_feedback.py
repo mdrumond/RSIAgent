@@ -623,3 +623,62 @@ def test_retained_campaign_retry_links_standalone_optimizer_without_new_launch(
     assert error.value.code == 2
     assert not (tmp_path / 'new-control').exists() and not (tmp_path / 'new-campaign').exists()
     assert (store.root / (original['feedback_id'] + '.json')).read_bytes() == before
+
+
+@pytest.mark.parametrize('candidate_us, change, fixed', [
+    (5, None, True), (11, None, False), (5, 'source', False),
+    (5, 'policy', False), (5, 'result', False),
+])
+def test_standalone_retry_remeasurement_preserves_original_acceptance(
+        tmp_path, candidate_us, change, fixed):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent, Backend, candidate
+
+    jobs = JobStore(tmp_path / 'jobs')
+    suite = sha(b'frozen-case-suite')
+    snapshot = dict(files={}, memory_entries=[],
+                    source_identity=dict(target='a3', language='ascend-c'))
+    snapshot['snapshot_id'] = sha(canonical(snapshot))
+
+    class MeasuredBackend(Backend):
+        def __init__(self, reference_us, native_us, policy):
+            super().__init__()
+            self.reference_us, self.native_us, self.policy = reference_us, native_us, policy
+
+        def prepare(self, spec, directory):
+            return dict(suite_sha256=suite, manifest=dict(policy=self.policy),
+                profiling=dict(reference_run=self.reference_us), cases=[dict(
+                    case='case-000', contract={},
+                    timing=dict(torch=dict(latency_us=self.reference_us)))])
+
+        def evaluate(self, source, directory, *, block_count):
+            return dict(status='incorrect' if self.native_us is None else 'verified',
+                suite_sha256=suite, cases=[] if self.native_us is None else [dict(
+                    case='case-000', correctness={},
+                    timing=dict(ascendc=dict(latency_us=self.native_us)))])
+
+    keys = []
+    for retry, reference_us, native_us in [(False, 10, None), (True, 12, candidate_us)]:
+        job = jobs.create('changed reference' if retry and change == 'source' else
+            'def forward(x): return x', 'forward',
+            {'args': [{'shape': [5], 'dtype': 'float32'}]}, snapshot)
+        key = job['job_id']
+        keys.append(key)
+        policy = dict(rtol=.1 if retry and change == 'policy' else .01)
+        backend = MeasuredBackend(reference_us, native_us, policy)
+        actions = [dict(action='cases', signatures=[], summary='Frozen input'),
+                   candidate('retry kernel' if retry else 'failed kernel'),
+                   dict(action='finish', summary='Retain measured outcome')]
+        assert OptimizationLoop(jobs, key, Agent(actions), backend).run()['status'] == 'completed'
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['warnings'] == []
+    records = {row['outcome']['attempt_id']: row for row in store.records()}
+    original, retry = (records[key] for key in keys)
+    assert not original['outcome']['verified'] and retry['outcome']['verified']
+    assert retry['outcome']['result']['speedup'] > 1
+    if change == 'result':
+        ref = retry['outcome']['evidence']['evaluation']
+        (jobs.root / ref['job_id'] / 'artifacts' / ref['sha256']).write_bytes(b'changed result')
+    linked = store.link_original_retry(original['feedback_id'], retry['feedback_id'])
+    assert (linked['lifecycle'] == 'fixed') is fixed
+    assert linked['investigation']['retries'] == [retry['feedback_id']]

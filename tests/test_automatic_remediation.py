@@ -137,7 +137,8 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
 
 @pytest.mark.parametrize("standalone", [False, "envelope", "list", "single"])
 @pytest.mark.parametrize("failed_retry", [False, True])
-def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone, failed_retry):
+@pytest.mark.parametrize("retry_latency", [5, 11])
+def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone, failed_retry, retry_latency):
     from types import SimpleNamespace
     from tests.test_a3_reviewed_phase2 import native_source
     from tests.test_phase2_optimizer_execution import Agent, Backend, candidate, snapshot
@@ -152,9 +153,9 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     task = dict(task_id='original', submission=dict(source='def forward(a): return a',
         entrypoint='forward', signatures=[dict(args=[dict(shape=[8], dtype='float32')])]))
     class FrozenBackend(Backend):
-        def __init__(self, latency, failed=False):
+        def __init__(self, latency, failed=False, native_latency=5):
             super().__init__()
-            self.latency, self.failed = latency, failed
+            self.latency, self.failed, self.native_latency = latency, failed, native_latency
         def prepare(self, spec, directory):
             value = super().prepare(spec, directory)
             value.update(suite_sha256='a'*64, manifest=dict(policy=dict(rtol=.001), submission=spec))
@@ -162,6 +163,8 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
             return value
         def evaluate(self, source, directory, **kwargs):
             result = dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
+            for case in result.get('cases', []):
+                case['timing']['ascendc']['latency_us'] = self.native_latency
             if self.failed:
                 result.update(status='incorrect', failure_case=dict(schema='failure-case-v1',
                     classification='host-mismatch', description='retry returned zero',
@@ -196,7 +199,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         received.append(memory)
         assert type(bound['phase2_attempt_seconds']) is int and bound['phase2_attempt_seconds'] == 30
         assert bound['max_cases'] == 2
-        backend = FrozenBackend(12, failed=failed_retry)
+        backend = FrozenBackend(12, failed=failed_retry, native_latency=retry_latency)
         backend.interrupt = not children
         child = OptimizerTaskExecutor(directory, task, memory, bound,
             agent=Agent([candidate('good')]), backend=backend, **kwargs)
@@ -225,7 +228,11 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     assert 0 < children[1].deadline - time.monotonic() <= 18.5
     retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
     linked = store.link_original_retry(row['feedback_id'], retried['feedback_id'])
-    assert linked['lifecycle'] == ('failed' if failed_retry else 'fixed')
+    # Remeasuring the reference at 12us cannot relax original optimizer acceptance at 10us.
+    assert linked['lifecycle'] == ('failed' if failed_retry or standalone and retry_latency > 10 else 'fixed')
+    if standalone and not failed_retry:
+        assert retried['outcome']['result']['speedup'] > 1
+        assert retried['outcome']['evidence']['result_artifact']
     if failed_retry:
         from benchmarks.ascend.failure_curriculum import FailureCurriculum
         from test_curriculum_context_files import read_all
