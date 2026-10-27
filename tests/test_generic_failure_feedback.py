@@ -718,6 +718,9 @@ def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_
     original = next(row for row in store.records() if row['outcome']['attempt_id'] == key)
     original_path = store.root / (original['feedback_id'] + '.json')
     before = original_path.read_bytes()
+    retained = {row['feedback_id']: (store.root / (row['feedback_id'] + '.json')).read_bytes()
+                for row in store.records()}
+    assert len(retained) == 2  # Terminal failure and its failed candidate.
     jobs.resume(key, additional_seconds=60)
     assert OptimizationLoop(jobs, key, Agent([candidate('fast'),
         dict(action='finish', summary='Retained repaired outcome')]), backend).run()['status'] == 'completed'
@@ -727,8 +730,13 @@ def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_
                  and row['feedback_id'] != original['feedback_id'])
     assert retry['outcome']['verified'] and original_path.read_bytes() == before
     assert retry['outcome']['result']['job_id'] == original['outcome']['result']['job_id'] == key
+    assert len(store.records()) == 3
+    assert all((store.root / (feedback_id + '.json')).read_bytes() == data
+               for feedback_id, data in retained.items())
+    # Reimport scans the current terminal snapshot and failed candidate; the
+    # historical terminal record stays retained without being scanned again.
     assert store.import_optimizer(jobs.root) == dict(source_root=str(jobs.root.resolve()),
-        imported=0, existing=3, warnings=[])
+        imported=0, existing=2, warnings=[])
     assert store.link_original_retry(original['feedback_id'], retry['feedback_id'])['lifecycle'] == 'fixed'
 
 
