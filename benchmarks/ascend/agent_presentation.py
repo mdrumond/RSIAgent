@@ -244,8 +244,17 @@ def memory_presentation(raw, artifacts):
     if isinstance(value, dict) and "usefulness_lesson" in value:
         result["usefulness_lesson"] = value["usefulness_lesson"]
     if isinstance(value, dict) and isinstance(value.get("memory_entries"), list):
-        result["memory_entries"] = [dict(sha256=artifacts.put_bytes(canonical_bytes(entry)),
-            lesson=_preview(entry)) for entry in value["memory_entries"]]
+        result["memory_entries"] = []
+        remaining = 8192
+        for entry in value["memory_entries"]:
+            content = canonical_bytes(entry)
+            row = dict(sha256=artifacts.put_bytes(content))
+            lesson = _preview(entry)
+            size = len(canonical_bytes(lesson))
+            if size <= remaining:
+                row["lesson"] = lesson
+                remaining -= size
+            result["memory_entries"].append(row)
     if isinstance(value, dict) and value.get("schema") == "subject-memory-snapshot-v1":
         return _subject_memory_index(value, result, artifacts)
     if not isinstance(value, dict) or "project_memory_base64" not in value:
