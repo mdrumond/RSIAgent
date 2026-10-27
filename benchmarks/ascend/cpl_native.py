@@ -234,13 +234,18 @@ class CplNativeCandidateBackend:
             raise ProjectInfrastructureError('retained CPL command changed')
         _save(command, payload)
         body = 'set -eu\nexport ASCEND_RT_VISIBLE_DEVICES='+str(self._device)+'\n'
-        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+"\npython - <<'CPL_PAYLOAD'\n"
+        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+"\nexec python - <<'CPL_PAYLOAD'\n"
         body += 'import json,os,signal,subprocess,sys,time\nremaining='+repr(payload['expires_at'])+'-time.time()\n'
         body += 'if remaining <= 0: sys.exit(124)\n'
         body += 'command=json.loads('+repr(json.dumps(payload['argv']))+')\n'
         # Own the process group so deadline escalation has an unambiguous exit
         # contract. GNU timeout returns 137 for both escalation and ordinary kills.
         body += "child=subprocess.Popen(command,start_new_session=True)\n"
+        body += "def cancelled(signum,frame):\n"
+        body += " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+        body += " try: os.killpg(child.pid,signal.SIGKILL)\n except ProcessLookupError: pass\n"
+        body += " child.wait(timeout=1)\n sys.exit(124)\n"
+        body += "signal.signal(signal.SIGTERM,cancelled)\nsignal.signal(signal.SIGINT,cancelled)\n"
         body += "try: code=child.wait(timeout=max(0, " + repr(payload['expires_at']) + "-time.time()))\n"
         body += "except subprocess.TimeoutExpired:\n"
         body += " try: os.killpg(child.pid,signal.SIGTERM)\n except ProcessLookupError: pass\n"
