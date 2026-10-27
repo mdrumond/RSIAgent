@@ -341,6 +341,7 @@ class AdaptivePhase1Coordinator:
                 remediate.refresh(state)
                 remediate.retry_ready(state)
                 remediate.refresh(state)
+                pending = self._load_pending(state)
             if self._time_exhausted(state):
                 return self._report(state)
             coordinator = LiveWaveCoordinator(
