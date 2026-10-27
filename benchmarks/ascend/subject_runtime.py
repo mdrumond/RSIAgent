@@ -2,6 +2,7 @@
 import argparse
 from copy import copy
 from contextlib import redirect_stdout
+from dataclasses import asdict
 import hashlib
 import io
 import json
@@ -161,7 +162,6 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     store = ContentAddressedArtifacts(root / 'artifacts')
     plans_path = root / 'project-plans.json'
     plans = json.loads(plans_path.read_bytes()) if plans_path.exists() else {}
-    current = {}
     campaign = None
 
     def role_complete(role):
@@ -198,15 +198,17 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         raise ValueError('project verifier engine or model changed on resume')
     atomic(verifier_identity_path, canonical(verifier_identity))
     paths, embeddings = bound.get('paths'), bound.get('embeddings')
+    contextual_reference = getattr(bound['coordinator'], 'contextual_reference_query', None)
     knowledge = SubjectKnowledge(root, store, lambda: campaign.memory, paths=paths, embeddings=embeddings,
-        reference_query=getattr(bound['coordinator'].curriculum, 'query_knowledge', None))
+        reference_query=(None if contextual_reference is not None else
+                         getattr(bound['coordinator'].curriculum, 'query_knowledge', None)),
+        contextual_reference_query=contextual_reference)
     if memory_delivery == 'kdb-only' and knowledge.database_path is None:
         raise ValueError('kdb-only Actor memory delivery requires enabled KDB retrieval')
     reference_query = knowledge.reference_query
 
-    def check(payload, *, remaining_seconds):
+    def check(request, payload, *, remaining_seconds):
         from .execution import process_deadline
-        request = current['request']
         item = plans[request.project_id]
         if 'spec' not in item:
             raise ValueError('extra graph checks require a graph subject project')
@@ -225,8 +227,23 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
 
     class RuntimeVerifier(ProjectVerifierAgent):
         def review(self, request, **options):
-            current['request'] = request
-            return super().review(request, **options)
+            identity = hashlib.sha256(canonical(asdict(request))).hexdigest()
+            caller = dict(root=root / 'verifier-librarian' / identity, role='verifier',
+                task='Audit retained evidence for ' + request.project_id,
+                context=dict(project_id=request.project_id, source_sha256=request.source_sha256))
+            def query(payload, *, remaining_seconds):
+                return knowledge.query(payload, remaining_seconds=remaining_seconds, reference_context=caller)
+            def request_check(payload, *, remaining_seconds):
+                return check(request, payload, remaining_seconds=remaining_seconds)
+            # Each invocation owns its callbacks; concurrent reviews cannot replace
+            # another caller's task or additional-check request context.
+            reviewer = ProjectVerifierAgent(self.complete, self.read_artifact,
+                query_knowledge=query, request_check=request_check if self.request_check is not None else None,
+                clock=self.clock, trace=self.trace, session_factory=self.session_factory)
+            try:
+                return reviewer.review(request, **options)
+            finally:
+                self.last_trace = reviewer.last_trace
 
     verifier = RuntimeVerifier(verifier_complete, knowledge.read_artifact,
         query_knowledge=knowledge.query, request_check=check, session_factory=verifier_sessions)
@@ -249,6 +266,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         def actor_knowledge(payload, context):
             from .execution import _deadline
             allowance = _deadline.get() - time.monotonic()
+            if context.remaining_seconds is not None:
+                allowance = min(allowance, context.remaining_seconds)
             if hasattr(campaign, 'budget'):
                 allowance = min(allowance, campaign._remaining())
             return knowledge.actor_query(payload, context, remaining_seconds=allowance)
@@ -386,7 +405,11 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if check_remaining is not None:
                 check_remaining()
             result = knowledge.query({'query': action.query, 'limit': action.limit}, remaining_seconds=available(),
-                snapshot=snapshot, branch_root=root / 'curriculum-selection' / hashlib.sha256(snapshot).hexdigest())
+                snapshot=snapshot, branch_root=root / 'curriculum-selection' / hashlib.sha256(snapshot).hexdigest(),
+                reference_context=dict(root=root / 'curriculum-librarian' / hashlib.sha256(canonical(dict(
+                    objective=value.objective, snapshot_sha256=value.pre_wave_memory_sha256,
+                    wave_index=value.wave_index))).hexdigest(), role='curriculum', task=value.objective,
+                    context=dict(subject_id=subject['subject_id'], wave_index=value.wave_index)))
             hits = result['hits'][:action.limit]
             allowance = max(64, 4096 // max(1, len(hits)))
             rows, pointers = [], []
@@ -572,7 +595,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             model_identity=campaign.model_identity, runtime_identity=campaign.runtime_identity,
             max_seconds=settings.get('memory_trial_seconds', 1800),
             arm_seconds=settings.get('memory_arm_seconds', 600))
-        rewrite_agent = ProjectVerifierAgent(verifier_complete, knowledge.read_artifact,
+        rewrite_agent = RuntimeVerifier(verifier_complete, knowledge.read_artifact,
             query_knowledge=knowledge.query, session_factory=verifier_sessions)
         def rewrite(request, *, feedback, max_seconds):
             try:

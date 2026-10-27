@@ -268,7 +268,7 @@ def build_native_adaptive_phase1(
         reviewed_snapshot.verify()
         identity.update(schema="ascend-native-adaptive-phase2-identity-v1",
                         phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
-    query = None
+    query, adaptive = None, None
     if config.kdb is not None:
         if embeddings is None or not config.collection:
             raise ValueError("native KDB requires explicit collection and embeddings")
@@ -280,7 +280,6 @@ def build_native_adaptive_phase1(
             identity["kdb_manifest"] = (manifests[0].fingerprint if isinstance(config.collection, str)
                                         else {manifest.collection: manifest.fingerprint
                                               for manifest in manifests})
-        adaptive = None
         if config.adaptive_kdb:
             from benchmarks.ascend.phase1_knowledge import NativeAdaptiveKnowledge, deepseek_librarian
             adaptive = NativeAdaptiveKnowledge(config, embeddings,
@@ -390,6 +389,16 @@ def build_native_adaptive_phase1(
         from benchmarks.ascend.wave_environment import NativeWaveEnvironmentCheck
         coordinator.environment_check = NativeWaveEnvironmentCheck(config,
             tuple(worker.transport for worker in project_workers) or (native_transport,))
+    if adaptive is not None:
+        def reference_query(action, *, check_remaining, **context):
+            if not query_lock.acquire(timeout=max(0, check_remaining())):
+                raise TimeoutError('reference query lock elapsed allocation exhausted')
+            try:
+                check_remaining()
+                return adaptive.reference_query(action, check_remaining=check_remaining, **context)
+            finally:
+                query_lock.release()
+        coordinator.contextual_reference_query = reference_query
     return coordinator
 
 

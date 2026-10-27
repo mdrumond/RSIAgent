@@ -31,11 +31,12 @@ class SubjectKnowledge:
     inside their branch namespace, never into the accepted/reference database.
     """
     def __init__(self, root, store, memory_getter, *, paths=None, embeddings=None,
-                 reference_query=None, clock=time.monotonic):
+                 reference_query=None, contextual_reference_query=None, clock=time.monotonic):
         self.root, self.store, self.memory_getter = Path(root), store, memory_getter
         self.database_path, self.embeddings = getattr(paths, 'kdb', None), embeddings
         self.reference_query, self.clock = reference_query, clock
-        if self.database_path is not None and self.reference_query is None:
+        self.contextual_reference_query = contextual_reference_query
+        if self.database_path is not None and self.reference_query is None and contextual_reference_query is None:
             from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
             self.reference_query, _ = curriculum_knowledge(paths, embeddings)
 
@@ -53,7 +54,7 @@ class SubjectKnowledge:
     def read_artifact(self, digest, *, remaining_seconds):
         return self.store.read_bytes(digest)
 
-    def query(self, payload, *, remaining_seconds, snapshot=None, branch_root=None):
+    def query(self, payload, *, remaining_seconds, snapshot=None, branch_root=None, reference_context=None):
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
         from benchmarks.a5kernels.knowledge_candidates import build_candidate_pool
         action = KnowledgeQuery(payload['query'], payload.get('limit', 5))
@@ -79,7 +80,12 @@ class SubjectKnowledge:
                 for i, digest in enumerate(sorted(memory_artifacts(record)))})
             memories.append(memory)
         reference_hits, memory_hits = [], []
-        if self.reference_query is not None:
+        if self.contextual_reference_query is not None:
+            caller = reference_context or dict(root=self.root / 'reference-librarian',
+                role='verifier', task=action.query, context={})
+            reference_hits.extend(self.contextual_reference_query(action,
+                check_remaining=check_remaining, **caller))
+        elif self.reference_query is not None:
             reference_hits.extend(self.reference_query(action, check_remaining=check_remaining))
         if self.database_path is not None and memories:
             from benchmarks.a5kernels.knowledge import KnowledgeDB
@@ -124,8 +130,14 @@ class SubjectKnowledge:
         from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionResult
         action = KnowledgeQuery(**payload)
         started = self.clock()
+        reference_context = None
+        if self.contextual_reference_query is not None:
+            reference_context = dict(root=Path(context.request.branch_root) / 'reference-librarian',
+                role='writer', task=context.prepared.instruction,
+                context=dict(project=context.request.spec.as_dict()))
         result = self.query({'query': action.query, 'limit': action.limit}, remaining_seconds=remaining_seconds,
-                            snapshot=context.request.pre_wave_memory, branch_root=context.request.branch_root)
+            snapshot=context.request.pre_wave_memory, branch_root=context.request.branch_root,
+            reference_context=reference_context)
         admitted = {}
         def retain(content):
             digest = context.artifacts.put_bytes(content)
