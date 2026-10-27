@@ -26,6 +26,12 @@ def _read(path):
     return json.loads(path.read_bytes())
 
 
+def _object(value, record):
+    if not isinstance(value, dict):
+        raise ValueError(f'{record} must be an object')
+    return value
+
+
 def _binding(root):
     path = root / 'campaign-identity.json'
     if not path.exists():
@@ -79,7 +85,7 @@ def _artifacts(branch, store, *, strict):
             if strict and not ledger.entries:
                 raise ValueError('verified branch has an empty Actor journal')
             for entry in ledger.entries:
-                payload = entry.payload
+                payload = _object(entry.payload, 'Actor journal payload')
                 if entry.kind != 'artifact' or 'sha256' not in payload:
                     continue
                 digest = payload['sha256']
@@ -91,7 +97,8 @@ def _artifacts(branch, store, *, strict):
                     continue
                 artifacts[f"{payload.get('role', 'artifact')}:{entry.sequence:06}"] = store.put_bytes(content)
                 if payload.get('role') == 'host-observation':
-                    host = json.loads(content).get('host', {})
+                    observation = _object(json.loads(content), 'host observation')
+                    host = _object(observation.get('host', {}), 'host observation body')
                     if host.get('event') == 'candidate-written' and host.get('source_sha256'):
                         candidate = host['source_sha256']
                         store.put_bytes(original.read_bytes(candidate))
@@ -110,7 +117,8 @@ def _attempt(root, plan_path, plan, assignment, binding, store):
     contract = _digest(canonical_bytes(dict(spec={k: v for k, v in spec.items() if k != 'project_id'},
                                           binding=binding)))
     outcome_path, interruption_path = branch / 'outcome.json', branch / 'interruption.json'
-    outcome = _read(outcome_path) if outcome_path.exists() else None
+    outcome = (_object(_read(outcome_path), 'outcome')
+               if outcome_path.exists() else None)
     verified = outcome is not None and outcome.get('verified') is True
     if outcome is not None:
         _bound(outcome, assignment)
@@ -127,7 +135,9 @@ def _attempt(root, plan_path, plan, assignment, binding, store):
             if _digest(data) != outcome.get(field):
                 raise ValueError('terminal artifact does not match outcome digest')
             artifacts[role] = store.put_bytes(data)
-        delta = json.loads(store.read_bytes(artifacts['memory-delta']))
+        delta = _object(json.loads(store.read_bytes(artifacts['memory-delta'])), 'memory delta')
+        execution = _object(json.loads(store.read_bytes(artifacts['execution-result'])), 'execution result')
+        execution_artifacts = _object(execution.get('artifacts', {}), 'execution artifacts')
         if delta.get('schema') == 'a5-phase1-adaptive-memory-delta-v1':
             if delta.get('project_id') != assignment.project_id:
                 raise ValueError('memory delta project does not match assignment')
@@ -146,17 +156,16 @@ def _attempt(root, plan_path, plan, assignment, binding, store):
                 artifacts.setdefault('retained:' + digest, digest)
             artifacts['historical-memory'] = store.put_bytes(raw)
         if verified:
-            execution = json.loads(store.read_bytes(artifacts['execution-result']))
             if (memory is None or execution.get('classification') != 'host-verified'
                     or execution.get('source_sha256') != source
                     or outcome.get('classification') != 'host-verified'):
                 raise ValueError('verified outcome lacks matching source and host evidence')
-            for digest in execution.get('artifacts', {}).values():
+            for digest in execution_artifacts.values():
                 store.put_bytes(ContentAddressedArtifacts(branch / 'artifacts').read_bytes(digest))
                 artifacts.setdefault('host-result:' + digest, digest)
     reason = 'No finalized outcome retained'
     if interruption_path.exists():
-        interruption = _read(interruption_path)
+        interruption = _object(_read(interruption_path), 'interruption')
         if (interruption.get('project_id') != assignment.project_id or
                 interruption.get('wave_fingerprint') != assignment.wave_fingerprint):
             raise ValueError('interruption does not match frozen assignment')
@@ -211,7 +220,7 @@ def import_history(roots, store):
         found = set()
         for plan_path in sorted(root.glob('waves/*/plan.json')):
             try:
-                body = _read(plan_path)
+                body = _object(_read(plan_path), 'wave plan')
                 plan = WaveSpec.from_mapping(body['wave'])
                 if body.get('wave_fingerprint') != plan.fingerprint:
                     raise ValueError('wave plan fingerprint changed')

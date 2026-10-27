@@ -239,3 +239,45 @@ def test_malformed_state_excludes_only_its_producer(tmp_path, bad_state):
     result = import_history([bad, good], ContentAddressedArtifacts(tmp_path / 'consumer'))
     assert len(result['memories']) == 1 and result['failures'] == []
     assert result['exclusions'] == [{'producer': 'bad', 'reason': 'ValueError'}]
+
+
+@pytest.mark.parametrize('bad_record', [None, [], 'invalid'])
+@pytest.mark.parametrize('record', ['outcome', 'delta', 'execution', 'execution-artifacts',
+                                    'interruption', 'observation', 'host', 'journal-payload', 'plan'])
+def test_malformed_branch_record_does_not_abort_other_producers(tmp_path, record, bad_record):
+    bad, good = tmp_path / 'bad', tmp_path / 'good'
+    branch, _ = producer(bad, terminal='interrupted' if record == 'interruption' else 'verified')
+    producer(good)
+    if record in ('outcome', 'interruption'):
+        write(branch / f'{record}.json', bad_record)
+    elif record == 'plan':
+        write(branch.parent.parent / 'plan.json', bad_record)
+    elif record in ('delta', 'execution', 'execution-artifacts'):
+        filename, field = (('memory-delta.bin', 'memory_delta_sha256') if record == 'delta'
+                           else ('execution-evidence.bin', 'evidence_sha256'))
+        value = bad_record
+        if record == 'execution-artifacts':
+            value = json.loads((branch / filename).read_bytes())
+            value['artifacts'] = bad_record
+        data = canonical_bytes(value)
+        (branch / filename).write_bytes(data)
+        outcome = json.loads((branch / 'outcome.json').read_bytes())
+        outcome[field] = hashlib.sha256(data).hexdigest()
+        write(branch / 'outcome.json', outcome)
+    else:
+        journal = branch / 'evidence.jsonl'
+        journal.unlink()
+        if record == 'journal-payload':
+            payload = bad_record
+        else:
+            observation = bad_record if record == 'observation' else {'host': bad_record}
+            digest = ContentAddressedArtifacts(branch / 'artifacts').put_json(observation)
+            payload = dict(role='host-observation', sha256=digest)
+        EvidenceLedger(journal).append('artifact', payload)
+    before = {path.relative_to(bad): path.read_bytes() for path in bad.rglob('*') if path.is_file()}
+    result = import_history([bad, good], ContentAddressedArtifacts(tmp_path / 'consumer'))
+    candidate, = result['memories']
+    assert candidate['producer']['root'] == 'good'
+    assert result['failures'] == []
+    assert result['exclusions'] and all(row['producer'] == 'bad' for row in result['exclusions'])
+    assert {path.relative_to(bad): path.read_bytes() for path in bad.rglob('*') if path.is_file()} == before
