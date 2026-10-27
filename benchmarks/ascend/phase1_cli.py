@@ -170,6 +170,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
     parser.add_argument("--model", choices=[i.backend_model.value for i in MODEL_IDENTITIES])
     parser.add_argument("--knowledge", choices=("with-kdb", "without-kdb"))
     parser.add_argument("--profiling", choices=("new", "without-profiling-guidance"))
+    parser.add_argument("--verify-memory-usefulness", action="store_true")
+    parser.add_argument("--usefulness-pair-seconds", type=float, default=600)
     parser.add_argument("--project-target", type=int)
     parser.add_argument("--max-projects", type=int, help="Deprecated metadata; does not limit execution")
     parser.add_argument("--max-seconds", type=float, default=7200)
@@ -229,6 +231,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             request_timing=first.request_timing, request_profile=first.request_profile,
             **({"project_workers": tuple(workers)} if parallel else {}),
             profiling_guidance=guidance,
+            usefulness_enabled=args.verify_memory_usefulness,
+            usefulness_pair_seconds=args.usefulness_pair_seconds,
         ), args.action)()
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
