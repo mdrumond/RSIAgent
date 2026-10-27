@@ -848,7 +848,8 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'], help='import retained Phase 2 observations without running agents')
+    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'],
+                                   help='import retained failure observations without running agents')
     feedback.add_argument('--feedback-root', type=Path, required=True)
     feedback.add_argument('--source-type', choices=('phase1', 'phase2', 'optimizer'), default='phase2')
     sources = feedback.add_mutually_exclusive_group(required=True)
@@ -906,8 +907,14 @@ def main(argv=None, *, screen=start_screen):
         from .phase2_feedback import FeedbackStore
         roots = args.source_root
         if args.dashboard_config:
-            roots = [row['root'] for row in _read(args.dashboard_config).get('campaigns', [])
-                     if str(row.get('phase')) == ('1' if args.source_type == 'phase1' else '2')]
+            configuration = _read(args.dashboard_config)
+            if args.source_type == 'optimizer':
+                root = configuration.get('optimizer', {}).get('root')
+                roots = [root] if root else []
+            else:
+                phase = '1' if args.source_type == 'phase1' else '2'
+                roots = [row['root'] for row in configuration.get('campaigns', [])
+                         if str(row.get('phase')) == phase]
         store = FeedbackStore(args.feedback_root)
         importer = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
                     'optimizer': store.import_optimizer}[args.source_type]

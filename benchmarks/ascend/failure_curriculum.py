@@ -188,13 +188,9 @@ class FailureCurriculum:
                     text=task[offset:offset+limit].decode(errors='replace'),
                     next_offset=offset+limit if offset+limit < len(task) else None)
             try:
-                data = self.store.failure_artifact_bytes(row['feedback_id'], digest)
-            except (ValueError, FileNotFoundError):
+                return self.store.read_failure_artifact(row['feedback_id'], digest, offset, limit)
+            except FileNotFoundError:
                 pass
-            else:
-                return dict(sha256=digest, offset=offset, size=len(data),
-                    text=data[offset:offset+limit].decode(errors='replace'),
-                    next_offset=offset+limit if offset+limit < len(data) else None)
             for ref in row['outcome']['evidence'].values():
                 if ref['sha256'] == digest:
                     return self.store.read_evidence(digest, offset=offset, limit=limit)

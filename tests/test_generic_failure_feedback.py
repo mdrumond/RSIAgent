@@ -337,3 +337,86 @@ def test_failure_artifact_paging_streams_requested_file_only(tmp_path, monkeypat
         store.read_failure_artifact(feedback_id, digest, offset=123, limit=17)
     with pytest.raises(FileNotFoundError, match='not linked'):
         store.read_failure_artifact(feedback_id, '2' * 64)
+
+
+@pytest.mark.parametrize('source_type', ['phase1', 'phase2', 'optimizer'])
+@pytest.mark.parametrize('configured', [False, True])
+def test_feedback_cli_imports_retained_sources_without_dispatch(tmp_path, capsys, source_type, configured):
+    from benchmarks.ascend.campaign_cli import main
+    root = tmp_path / 'source'
+    if source_type == 'phase1':
+        phase1(root)
+    elif source_type == 'phase2':
+        from test_phase2_feedback import campaign
+        campaign(root)
+    else:
+        jobs = JobStore(root)
+        job = jobs.create('source', 'forward', {}, {})
+        jobs.transition(job['job_id'], 'running')
+        jobs.transition(job['job_id'], 'failed')
+    feedback = tmp_path / 'feedback'
+    arguments = ['feedback', '--feedback-root', str(feedback), '--source-type', source_type]
+    if configured:
+        configuration = tmp_path / 'dashboard.json'
+        write(configuration, dict(campaigns=[dict(root=str(root), phase=1 if source_type == 'phase1' else 2)],
+                                  optimizer=dict(root=str(root))))
+        arguments += ['--dashboard-config', str(configuration)]
+    else:
+        arguments += ['--source-root', str(root)]
+    main(arguments, screen=lambda *args: pytest.fail('imports must not dispatch agents'))
+    report = json.loads(capsys.readouterr().out)
+    assert len(report['reports']) == 1 and report['reports'][0]['imported'] == 1
+    records = FeedbackStore(feedback).records()
+    assert len(records) == 1 and records[0]['outcome']['source_type'] == source_type
+    # The historical command remains a Phase2 import by default.
+    if source_type == 'phase2':
+        main(['feedback-phase2', '--feedback-root', str(feedback), '--source-root', str(root)],
+             screen=lambda *args: pytest.fail('imports must not dispatch agents'))
+        assert json.loads(capsys.readouterr().out)['reports'][0]['existing'] == 1
+
+
+def test_curriculum_discovers_and_pages_only_selected_failure_cases(tmp_path, monkeypatch):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    from test_a5_phase1_wave_runtime import project
+
+    store = FeedbackStore(tmp_path / 'feedback')
+    ids = {}
+    for name, observed in [('selected', [0]), ('unselected', [99])]:
+        root = tmp_path / name
+        spec = project(name)
+        phase1(root, spec=spec.as_dict())
+        artifacts = ContentAddressedArtifacts(root / 'waves/wave-1/branches' / name / 'artifacts')
+        source = artifacts.put_bytes(b'broken source')
+        retain_phase1_failure(artifacts, spec, source, 'host-mismatch', 'observed mismatch',
+            dict(inputs={'tensors': []}, expected={'storage': [3]}, observed={'output': observed}), 'float32')
+        store.import_phase1(root)
+        ids[name] = next(row['feedback_id'] for row in store.records()
+                         if row['outcome']['source_root'] == str(root.resolve()))
+    selected = next(row for row in store.records() if row['feedback_id'] == ids['selected'])
+    curriculum = FailureCurriculum(tmp_path / 'curriculum', store.root,
+                                   dict(selected=[selected], controls=[]))
+    context = curriculum.context({})
+    index = next(row for row in context if row.get('role') == 'selection-index')
+    manifest = index['selected'][0]['failure_cases_file']
+    offset, chunks = 0, []
+    while offset is not None:
+        page = curriculum.read(manifest['sha256'], offset, 73)
+        assert len(page['text'].encode()) <= 73
+        chunks.append(page['text'])
+        offset = page['next_offset']
+    cases = json.loads(''.join(chunks))
+    assert sha(''.join(chunks).encode()) == manifest['sha256']
+    assert cases[0]['availability']['complete']
+    observed = cases[0]['artifacts']['observed']['sha256']
+    monkeypatch.setattr(FeedbackStore, 'failure_artifact_bytes',
+                        lambda *args: pytest.fail('curriculum reads must use bounded pages'))
+    assert curriculum.read(observed, limit=2)['next_offset'] == 2
+    assert json.loads(curriculum.read(observed)['text']) == {'output': [0]}
+    other = store.failure_cases(ids['unselected'])[0]['artifacts']['observed']['sha256']
+    with pytest.raises(ValueError):
+        curriculum.read(other)
+    from pathlib import Path
+    Path(cases[0]['artifacts']['observed']['retained_path']).write_bytes(b'changed')
+    with pytest.raises(ValueError):
+        curriculum.read(observed)
