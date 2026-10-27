@@ -787,3 +787,69 @@ def test_optimizer_case_expansion_retry_uses_authenticated_frozen_submission(tmp
         ref = retry['outcome']['evidence']['evaluation']
         (jobs.root / ref['job_id'] / 'artifacts' / ref['sha256']).write_bytes(b'changed evaluation')
     assert (store.link_original_retry(original['feedback_id'], retry['feedback_id'])['lifecycle'] == 'fixed') is (change is None)
+
+
+@pytest.mark.parametrize('role', ['baseline', 'submission', 'candidate', 'evaluation',
+                                  'failed-source', 'failed-evaluation'])
+@pytest.mark.parametrize('damage', ['missing', 'corrupt'])
+def test_optimizer_import_preserves_observations_when_optional_artifacts_are_unavailable(tmp_path, role, damage):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent, Backend, candidate
+
+    jobs = JobStore(tmp_path/'jobs')
+    snapshot = dict(files={}, memory_entries=[], source_identity=dict(target='a3', language='ascend-c'))
+    snapshot['snapshot_id'] = sha(canonical(snapshot))
+
+    class RetainedBackend(Backend):
+        def prepare(self, spec, directory):
+            return dict(super().prepare(spec, directory), suite_sha256=sha(b'retained-suite'),
+                manifest=dict(submission=spec, policy=dict(exact=True)))
+        def evaluate(self, source, directory, *, block_count):
+            result = dict(super().evaluate(source, directory, block_count=block_count),
+                          suite_sha256=sha(b'retained-suite'))
+            if source == 'bad':
+                result['failure_case'] = dict(schema='failure-case-v1', classification='host-mismatch',
+                    description='Actual zero differs from the original oracle.', inputs=dict(x=[1]),
+                    expected=dict(output=[1]), observed=dict(output=[0]), state={}, policy=dict(exact=True))
+            return result
+
+    keys = []
+    for failed in (True, False):
+        job = jobs.create('def forward(x): return x', 'forward',
+            dict(args=[dict(shape=[1], dtype='float32')]), snapshot)
+        keys.append(job['job_id'])
+        actions = [dict(action='cases', signatures=[], summary='Retained case')]
+        if failed:
+            actions.append(candidate('bad'))
+        actions += [candidate('fast'), dict(action='finish', summary='Retain final outcome')]
+        assert OptimizationLoop(jobs, job['job_id'], Agent(actions), RetainedBackend()).run()['status'] == 'completed'
+    key, healthy_key = keys
+    state = next(event['payload'] for event in reversed(jobs.events(key)) if event['kind'] == 'optimizer-state')
+    failed = next(row for row in state['history'] if row['content']['status'] == 'incorrect')
+    ref = dict(baseline=state['baseline'], submission=state['spec'], candidate=state['best']['source'],
+        evaluation=state['best']['result'], **{'failed-source': failed['source'],
+                                             'failed-evaluation': failed['result']})[role]
+    path = jobs.artifact_path(key, ref['sha256'])
+    if damage == 'missing':
+        path.unlink()
+    else:
+        path.write_bytes(b'corrupt retained artifact')
+
+    store = FeedbackStore(tmp_path/'feedback')
+    report = store.import_optimizer(jobs.root)
+    assert report['imported'] == 3 and report['warnings']
+    records = {row['outcome']['attempt_id']: row for row in store.records()}
+    assert records[key]['outcome']['verified'] and records[healthy_key]['outcome']['verified']
+    observation = next(row for row in records.values() if row['outcome']['attempt_id'].startswith(key+':candidate:'))
+    assert observation['outcome']['result']['result']['status'] == 'incorrect'
+    case, = store.failure_cases(observation['feedback_id'])
+    assert case['availability']['complete'] is (role != 'failed-source')
+    for artifact in ('inputs', 'expected', 'observed'):
+        retained = case['artifacts'][artifact]
+        assert json.loads(store.failure_artifact_bytes(observation['feedback_id'], retained['sha256']))
+    if role != 'failed-source':
+        source = case['artifacts']['source']
+        assert json.loads(store.failure_artifact_bytes(observation['feedback_id'], source['sha256'])) == 'bad'
+    if role in {'baseline', 'evaluation'}:
+        assert store.link_original_retry(observation['feedback_id'], records[key]['feedback_id'])['lifecycle'] == 'failed'
+    assert store.import_optimizer(jobs.root)['existing'] == 3
