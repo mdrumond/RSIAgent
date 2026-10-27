@@ -194,7 +194,7 @@ def test_usefulness_live_work_is_gated_but_retained_assessment_replay_is_probe_f
         requests.append(request)
         return _result(request.spec, True, 'host pass')
     _, runner = compose_adaptive_controller(root=tmp_path, objective='Learn', initial_memory=b'{}',
-        executor=None, actor=None, profile=None, provider=SimpleNamespace(complete=complete),
+        executor=None, actor=None, profile=None, provider=SimpleNamespace(complete=complete), immutable_context=None,
         max_parallel=1, project_target=1, max_seconds=100, project_actor=execute, usefulness_enabled=True)
     runner.clock = lambda: now[0]
     def check(index, remaining):
