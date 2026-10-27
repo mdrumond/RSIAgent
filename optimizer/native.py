@@ -313,9 +313,21 @@ def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, 
         except Exception as exc:
             result['status'] = 'compile-error'
             record['error'] = f'{type(exc).__name__}: {exc}'
+
             if (case_root / 'compile.log').is_file():
                 record['compiler_diagnostics'] = (case_root / 'compile.log').read_text(errors='replace')[-24000:]
     return result
+
+
+def _comparison_metrics(value):
+    """Keep finite metrics numeric; label nonfinite diagnostics for strict JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _comparison_metrics(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_comparison_metrics(item) for item in value]
+    return value
 
 
 def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_count=1,
@@ -351,6 +363,7 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
     for i, row in enumerate(cases):
         record = {'case': row['case']['id'], 'contract': describe_case(prepared, row)}
         result['cases'].append(record)
+        actual = None
         try:
             run, provenance = _compile_case(candidate, record['contract'], root / f'case-{i}', arch=arch, block_count=block_count, cache_directory=cache_directory)
             record['compilation'] = provenance
@@ -373,6 +386,11 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
         except Exception as exc:
             result['status'] = 'incorrect'
             record['error'] = f'{type(exc).__name__}: {exc}'
+            if actual is not None and 'failure_case' not in result:
+                from benchmarks.ascend.failure_cases import optimizer_failure
+                result['failure_case'] = optimizer_failure(prepared, row, actual, result['candidate_sha256'], exc)
+                result['failure_case'].update(block_count=block_count, arch=arch, device=device,
+                    metrics=_comparison_metrics(getattr(exc, 'metrics', {})))
             log = root / f'case-{i}' / 'compile.log'
             if log.is_file():
                 # The complete log remains an artifact; include bounded diagnostics

@@ -10,6 +10,7 @@ import re
 from typing import Callable, Mapping, Protocol
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+from benchmarks.ascend.failure_cases import retain_phase1_failure
 from benchmarks.ascend.agent_presentation import (
     artifact_page_presentation, compact_observation, memory_presentation, mismatch_summary,
 )
@@ -292,6 +293,9 @@ class _ProjectActions:
         self.admitted[digest] = "compile"
         if not result.observation.passed:
             self.observed_failures[FailureMode.COMPILE] = len(self.actions)
+            retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
+                "compile-failure", result.observation.diagnostic, {"diagnostics": result.artifact},
+                self.prepared.expected.dtype)
         return self._observation({
             "event": "host-compile", "source_sha256": self.source_sha256,
             "passed": result.observation.passed,
@@ -324,6 +328,10 @@ class _ProjectActions:
             )
             self.admitted[digest] = role
             retained[name] = {"sha256": digest, "payload": payload}
+        if not result.evidence.verified:
+            retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
+                result.evidence.classification.value, result.evidence.detail, result.artifacts,
+                self.prepared.expected.dtype)
         # Source intent cannot establish that a device print executed. This
         # backend exposes correctness artifacts, but no retained print trace.
         return self._observation({
