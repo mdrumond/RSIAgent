@@ -39,6 +39,10 @@ def setup(tmp_path):
 
 def application(setup, responses, restart=None, *, settings=None, target='a3'):
     config, root, _ = setup
+    # Unit fixtures explicitly supply both interaction callbacks. Production
+    # availability without callbacks is exercised separately below.
+    if restart is None:
+        restart = lambda *args: dict(status='queued')
     calls = []
     values = iter(responses)
     @contextmanager
@@ -410,5 +414,82 @@ def test_old_restart_recovery_remains_visible_after_twenty_other_previews(setup)
         actions = Actions()
         actions.feed(client.get('/campaign/research/project/original').get_data(as_text=True))
         assert actions.ids == [proposal['id']]
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_missing_restart_runtime_refuses_without_approval_or_provider_effects(setup, monkeypatch):
+    from dashboard.subject_services import subject_editor
+    app, calls = application(setup, [dict(item=item('retry'), instruction='Inspect padding.')])
+    client = app.test_client()
+    try:
+        body = dict(campaign_id='research', kind='restart', project_id='original',
+                    instructions='Fix prompt', format_seconds=10)
+        proposal = settled(app, submit(client, 'curriculum-preview', body, 'retained'))['result']
+        service = app.extensions['dashboard_curriculum_controls']
+        service.restart = service.status = None
+        monkeypatch.setattr('dashboard.curriculum_controls.find_spec', lambda _: None)
+        assert not service.restart_available
+        count = len(calls)
+        before = service.proposal(setup[1], proposal['id'])
+        assert submit(client, 'curriculum-preview', body, 'missing-runtime').status_code == 409
+        approval = dict(campaign_id='research', proposal_id=proposal['id'], additional_seconds=60)
+        assert submit(client, 'curriculum-approve', approval, 'approval').status_code == 409
+        with pytest.raises(ValueError):
+            service.approve(approval)
+        assert len(calls) == count and service.proposal(setup[1], proposal['id']) == before
+        # A retained approval/request from a newer installation stays readable.
+        subject_editor(setup[1]).approve(proposal['id'])
+        identifier = hashlib.sha256(('curriculum-restart:' + proposal['id']).encode()).hexdigest()[:32]
+        directory = setup[1] / 'dashboard-requests'
+        directory.mkdir()
+        (directory / (identifier + '.json')).write_bytes(canonical(dict(id=identifier, status='queued')))
+        assert service.restart_request('research', proposal['id']) is None
+        from html.parser import HTMLParser
+        class Actions(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.mutations = []
+            def handle_starttag(self, tag, attrs):
+                attrs = dict(attrs)
+                if 'data-curriculum-preview' in attrs or 'data-curriculum-approve' in attrs:
+                    self.mutations.append(tag)
+        response = client.get('/campaign/research/project/original')
+        assert response.status_code == 200
+        actions = Actions(); actions.feed(response.get_data(as_text=True))
+        assert actions.mutations == []
+        # Installing the real runtime restores production availability without
+        # injecting a restart callback or changing retained proposals.
+        monkeypatch.setattr('dashboard.curriculum_controls.find_spec', lambda _: object())
+        assert service.restart_available
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_installed_restart_runtime_dispatches_through_default_production_callback(setup, monkeypatch):
+    interaction = pytest.importorskip('benchmarks.ascend.subject_interaction')
+    config, root, _ = setup
+    state = json.loads((root / 'subject-campaign.json').read_bytes())
+    state['projects']['original']['directory'] = 'original'
+    (root / 'subject-campaign.json').write_bytes(canonical(state))
+    (root.parent / 'runtime.json').write_text('{}')
+    (root.parent / 'seed').write_bytes(b'initial')
+    launched = []
+    monkeypatch.setattr(interaction, '_launch', lambda *args: launched.append(args))
+    app, _ = application(setup, [dict(item=item('retry'), instruction='Inspect padding.')])
+    service = app.extensions['dashboard_curriculum_controls']
+    service.restart = service.status = None
+    assert service.restart_available
+    client = app.test_client()
+    try:
+        proposal = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='restart', project_id='original', instructions='Fix prompt', format_seconds=10), 'p'))['result']
+        result = settled(app, submit(client, 'curriculum-approve', dict(campaign_id='research',
+            proposal_id=proposal['id'], additional_seconds=60), 'a'))
+        assert result['status'] == 'succeeded', result
+        assert len(launched) == 1 and launched[0][2]['proposal']['after'] == proposal['after']
+        assert launched[0][2]['additional_seconds'] == 60
+        url = '/api/curriculum/research/proposals/' + proposal['id'] + '/restart'
+        assert client.get(url).get_json()['request']['status'] == 'queued'
     finally:
         app.extensions['dashboard_controls'].close()

@@ -177,6 +177,7 @@ the form. The curriculum returns an executable contract and a diff; only approva
 changes future subjects or the unreserved project queue. Reserved wave contracts
 stay frozen. Project restarts additionally require a fresh execution allowance
 and dispatch the approved prompt through the durable actor-control service.
+Restart preview and approval require the subject interaction runtime (provided by the actor-controls change); installations without it retain read-only restart history and reject dispatch before provider work or approval changes.
 Role bindings are isolated from live campaign/admission workers. Existing
 operation polling, CSRF checks, and idempotency apply to previews and approvals.
 
