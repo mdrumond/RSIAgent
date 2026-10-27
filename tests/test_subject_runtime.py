@@ -471,3 +471,54 @@ def test_followup_selector_reads_retained_history_and_authors_neutral_contract(t
     item=campaign.select_trial(memory(),remaining_seconds=60,
         probe_request={'question':'Does an odd extent change the evidence?'},prior_task={'inputs':[32]},history=history)
     assert item['project_id']=='fresh-transfer'and observed[-1]==history
+
+
+def test_retained_review_registers_original_plan_without_actor_execution(tmp_path, monkeypatch):
+    from benchmarks.ascend.project_verifier import ProjectReview
+    from test_a5_phase1_adaptive import _project
+    config = bound(tmp_path)
+    admitted = []
+    config['coordinator'].curriculum.target_policy = SimpleNamespace(admit=lambda spec: admitted.append(spec))
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
+        subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: config)
+    calls = []
+    campaign.verifier.review = lambda request, **options: calls.append((request, options)) or {'decision':'repair'}
+    item = dict(project_id='old', spec=_project('old','gm-ub-movement'))
+    review = ProjectReview('old', None, False, {})
+    assert campaign.review_retained(item, review, max_seconds=10)['decision'] == 'repair'
+    assert calls == [(review, {'max_seconds':10})]
+    assert admitted[0].project_id == 'old'
+    assert json.loads((tmp_path/'project-plans.json').read_text())['old']['spec'] == item['spec']
+    with pytest.raises(ValueError, match='plan changed'):
+        campaign.review_retained(dict(item, repairs=['new']), review, max_seconds=10)
+
+
+def test_recovery_context_is_readable_and_restored_without_changing_memory(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from test_a5_phase1_adaptive import _project
+    config = bound(tmp_path)
+    config['actor'].immutable_context = b'base'
+    seen = []
+    class Execution:
+        def __init__(self, actor, *args): self.actor = actor
+        def graph(self, request, **options):
+            seen.append((request.pre_wave_memory, self.actor.immutable_context,
+                         ContentAddressedArtifacts(request.branch_root/'artifacts').read_bytes(digest)))
+            raise RuntimeError('simulated interruption')
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
+        subjects=[Subject('s','copies')], initial_memory=b'', compose=lambda *a, **k: config)
+    digest = campaign.artifacts.put_bytes(b'original compiler failure')
+    references = {'compile-log':digest, **{f'journal:{i}':digest for i in range(1500)}}
+    item = dict(project_id='retry', spec=_project('retry','gm-ub-movement'),
+                recovery={'reason':'original compile failed','artifacts':references})
+    snapshot = campaign.memory.snapshot()
+    with pytest.raises(RuntimeError, match='simulated interruption'):
+        campaign.execute(item, snapshot, tmp_path/'retry', remaining_seconds=30)
+    assert seen[0][0] == snapshot and seen[0][2] == b'original compiler failure'
+    assert digest.encode() in seen[0][1] and config['actor'].immutable_context == b'base'
+    assert len(seen[0][1]) < 4096
+    preview = json.loads(seen[0][1].split(b'): ', 1)[1])
+    registry = ContentAddressedArtifacts(tmp_path/'retry/artifacts').read_json(preview['registry_sha256'])
+    assert registry['artifacts'] == references
+    assert not campaign.memory.records()

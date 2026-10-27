@@ -21,6 +21,7 @@ def _transport_allocation(transport, remaining_seconds):
         previous = transport.remaining_seconds
         transport.remaining_seconds = lambda: min(remaining_seconds(),
             previous() if previous is not None else float("inf"))
+        transport.remaining_seconds.stop_requested = getattr(previous, 'stop_requested', lambda: False)
         try:
             yield
         finally:
@@ -70,10 +71,12 @@ class NativeWaveEnvironmentCheck:
         attempt = uuid.uuid4().hex
         root = Path(self.config.root) / "environment-checks" / f"wave-{wave_index:03}" / attempt
         root.mkdir(parents=True)
-        report = {"status": "running", "wave_index": wave_index, "workers": []}
+        self.last_report = root / 'report.json'
+        report = {"status": "running", "wave_index": wave_index, "workers": [], "started_epoch": time.time()}
         started = time.monotonic()
         def save():
             report["elapsed_seconds"] = time.monotonic() - started
+            report["ended_epoch"] = time.time()
             temporary = root / "report.tmp"
             temporary.write_text(json.dumps(report, indent=2) + "\n")
             temporary.replace(root / "report.json")
