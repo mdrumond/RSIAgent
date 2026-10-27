@@ -27,6 +27,11 @@ def test_production_defaults_pi_but_injected_transport_stays_compatible(monkeypa
     with create(max_seconds=7):
         pass
     assert made[0]['model'] == 'deepseek-flash'
+    from test_review_context import fixture
+    from coding.pi.context import encoded
+    packed = made[0]['context_factory']().snapshot(fixture(), target=16384)
+    assert len(encoded(packed)) <= 16384
+    assert packed['host']['review_state']['missing_required_artifacts']
     assert before + 7 <= made[0]['deadline'] <= time.monotonic() + 7
     with pytest.raises(ValueError):
         session_factory({'verifier_engine': 'unknown'}, live, completion)
@@ -360,3 +365,51 @@ def test_real_pi_provider_outage_holds_rewrite_and_resume_can_publish(tmp_path, 
         assert accepted.records()[0]['proposal'] == memory()
     finally:
         gate.close()
+
+
+def test_real_pi_pages_aggregate_feedback_then_executes_required_reads(monkeypatch):
+    from benchmarks.ascend.review_context import ReviewContextRecords
+    from test_review_context import fixture
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('Node22 and pinned Pi required')
+    h = Harness([])
+    feedback = fixture()['host']['project']['rewrite_feedback']
+    actions = iter([*prerequisites(), decision(memory())])
+    restored, reference, reading = [], [None], [True]
+    calls = []
+    def provider(*_, **options):
+        body = json.loads(options['data'])
+        calls.append(body)
+        assert len(options['data']) < 49152
+        if reference[0] is None:
+            snapshot = json.loads(next(m['content'] for m in body['messages'] if m['role'] == 'user'))
+            host = snapshot['context']['host']
+            pointer = host['project']['rewrite_feedback']['prior_draft']
+            reference[0] = pointer['record']
+            assert host['review_state']['missing_required_artifacts']
+            assert host['review_state']['host_checks_passed'] is True
+            return stream('read_context', {'record': reference[0], 'offset': 0, 'limit': 4096}, len(calls))
+        if reading[0]:
+            message = next(m for m in reversed(body['messages']) if m['role'] == 'tool')
+            content = message['content']
+            if isinstance(content, list):
+                content = ''.join(p.get('text', '') for p in content)
+            page = json.loads(content)
+            restored.append(page['text'])
+            if page['next_offset'] is not None:
+                return stream('read_context', {'record': reference[0], 'offset': page['next_offset'], 'limit': 4096}, len(calls))
+            reading[0] = False
+        action = next(actions)
+        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
+        return stream(name, args, len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
+        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
+        deadline=time.monotonic()+options['max_seconds'], first_action_only=True,
+        context_factory=ReviewContextRecords)
+    assert h.agent.review(request(), feedback=feedback, max_seconds=30) == decision(memory())
+    assert json.loads(''.join(restored)) == feedback['prior_draft']
+    assert [digest for digest, _ in h.reads[:3]] == [S, R, L]
+    assert len(h.queries) == 1

@@ -82,7 +82,7 @@ class RequestAccounting:
 class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
                  budget=None, own_process_group=True, system_prompt=SYSTEM,
-                 first_action_only=False):
+                 first_action_only=False, context_factory=ContextRecords):
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
         self.system_prompt = system_prompt
@@ -107,7 +107,8 @@ class PiCodingSession:
                                            "limit": {"type": "integer", "minimum": 1, "maximum": 8192}},
                                           ["record"])
         self.schemas["edit_source"] = obj({"sha256": STRING, "old_text": STRING, "new_text": STRING})
-        self.context = ContextRecords()
+        self.context_factory = context_factory
+        self.context = self.context_factory()
         self.token = secrets.token_urlsafe(32)
         self.own_process_group = own_process_group
         self.stack = ExitStack()
@@ -243,7 +244,7 @@ class PiCodingSession:
         if source is not None and write_action is not None:
             self.allowed.add("edit_source")
         self.pending, self.mutations = None, 0
-        self.context = ContextRecords()
+        self.context = self.context_factory()
         self.context_reads = {}
         self.snapshot = self.context.snapshot({
             "host": context,

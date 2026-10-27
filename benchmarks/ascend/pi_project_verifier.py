@@ -5,6 +5,7 @@ import time
 from coding.pi.schema import STRING, INTEGER, obj
 from coding.pi.session import PiCodingSession
 from .project_verifier import REVIEW_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS
+from .review_context import ReviewContextRecords
 
 SYSTEM = REVIEW_INSTRUCTIONS + '''Use the declared typed tools, never print JSON action envelopes.
 Choose one host action per turn. If multiple tools are emitted, only the first
@@ -19,6 +20,11 @@ review_state.allowed_evidence. Put interpretation in reason, never in evidence.
 Memory citations must be exact objects from review_state.citations; use [] when
 that list is empty. Do not invent source-line citations. Snippet line numbers
 are 1-based; omit snippet text to let the host extract the exact observed lines.
+Aggregate drafts, retained lessons, KDB observations, citations or artifact pages
+may be represented by a record/bytes/preview/read_with pointer instead of inline
+contents. Use read_context with that record digest and returned next_offset to
+inspect their exact data; a pointer is not an empty result. Required-read and
+host-check controls remain directly visible and authoritative.
 Use read_context to page context records if previews are insufficient.
 ''' + EVIDENCE_INSTRUCTIONS
 
@@ -80,7 +86,7 @@ def session_factory(settings, provider, complete):
             environment = provider.coding_environment() if hasattr(provider, 'coding_environment') else None
             with PiCodingSession(model=complete.model, schemas=SCHEMAS, environ=environment,
                     deadline=time.monotonic() + max_seconds, system_prompt=SYSTEM,
-                    first_action_only=True) as session:
+                    first_action_only=True, context_factory=ReviewContextRecords) as session:
                 yield session
         except (PiCancelled, PiDeadlineError) as error:
             raise TimeoutError('Pi project review interrupted: ' + type(error).__name__) from None

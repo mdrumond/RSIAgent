@@ -142,6 +142,11 @@ feedback instead of replaying every prior action. Evidence fields contain bare
 SHA256 values from the actually-read set; source snippet lines start at 1 and
 citations must be exact objects returned by KDB (or an empty list). Malformed
 reference formatting is reported separately from a valid but unread artifact.
+Aggregate dictionaries also consume the snapshot budget even when their individual
+fields are short. Verifier-only aggregate paging replaces large prior drafts,
+retained lessons and retrieval details with lossless `read_context` pointers.
+Required-read and host-verification controls, task instructions and known
+counterevidence stay directly visible. Actor snapshot packing is unchanged.
 `verifier_model` continues to select the model, including `deepseek-flash`.
 
 `verifier_engine: "completion"` retains the JSON-completion adapter when needed;

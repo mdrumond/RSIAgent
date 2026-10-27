@@ -183,7 +183,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         engine_origin='legacy-resume' if legacy_default else 'configured' if 'verifier_engine' in settings else 'provider-default',
         model=verifier_complete.model, role='project-verifier',
         runtime=ENGINE_IDENTITY if verifier_sessions is not None else None,
-        context_policy='review-state-v1' if verifier_sessions is not None else 'bounded-messages-v1',
+        context_policy='review-state-aggregate-v1' if verifier_sessions is not None else 'bounded-messages-v1',
         selection_policy='first-host-action-v1' if verifier_sessions is not None else 'json-action-v1')
     if saved_verifier and saved_verifier != verifier_identity:
         raise ValueError('project verifier engine or model changed on resume')
