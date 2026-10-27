@@ -472,3 +472,40 @@ def test_real_launcher_cancellation_kills_isolated_payload_group(tmp_path, cance
         if process.poll() is None:
             os.killpg(process.pid,signal.SIGKILL)
         process.communicate(timeout=3)
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_pending_measurement_binds_replay_before_submission_and_recovers_same_handle(tmp_path, legacy):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    compilation = candidate.compile(plan, tmp_path/'bundle')
+    measurements = CplNativeMeasurements(compilation=compilation, candidate_backend=candidate,
+        expected_output=EXPECTED, evidence_directory=tmp_path/'measurements',
+        environment_identity=dict(cann_version='cann', profiler_version='msprof'))
+    def disconnect(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'run' and 'native_measurement_driver.py' in Path(argv[argv.index('--file')+1]).read_text():
+            remote.unavailable = True
+        return result
+    candidate._run = disconnect
+    with pytest.raises(_PendingObservation):
+        measurements.timing(warm_up=1, launch_count=2, replay_id='pending')
+    receipts = list(measurements.root.glob('*/measurement.json'))
+    assert len(receipts) == 1
+    if legacy:
+        receipts[0].unlink()  # Actual pre-upgrade layout: only transport journals.
+    pending = json.loads(next((candidate.root/'measurements').glob('*/operation.json')).read_text())
+    before = len([call for call in remote.calls if call[2]=='run'])
+    observation_start = len(remote.calls)
+    with pytest.raises(ProjectInfrastructureError):
+        measurements.timing(warm_up=2, launch_count=2, replay_id='pending')
+    assert len([call for call in remote.calls if call[2]=='run']) == before
+    candidate._run = remote
+    result = measurements.timing(warm_up=1, launch_count=2, replay_id='pending')
+    assert result['summary']['median_us'] == 11
+    assert [call[3] for call in remote.calls[observation_start:] if call[2]=='observe'] == [pending['handle']]
+    assert len([call for call in remote.calls if call[2]=='run']) == before
+    measurement_runs = [call for call in remote.calls if call[2]=='run'
+        and 'native_measurement_driver.py' in Path(call[call.index('--file')+1]).read_text()]
+    assert len(measurement_runs) == 1

@@ -317,8 +317,8 @@ class CplNativeMeasurements(NativeMeasurementBackend):
             retained = json.loads(record.read_text())
             if retained['request_id'] != request_id:
                 raise ProjectInfrastructureError('native measurement replay identity changed')
-            return retained['result']
-        verification = self._verify()
+            if 'result' in retained:
+                return retained['result']
         directory = backend.remote_candidate_directory(plan)
         argv = ['python', str(directory/'native_measurement_driver.py'), mode, '--candidate-dir', str(directory),
                 '--kernel', plan.kernel_name, '--execution-id', plan.execution_id,
@@ -327,6 +327,23 @@ class CplNativeMeasurements(NativeMeasurementBackend):
         if metric:
             argv += ['--metric', 'ArithmeticUtilization' if metric == 'Basic' else metric]
         replay_key = canonical_digest(dict(request_id=request_id, replay_id=replay))
+        if not record.exists():
+            # Older versions wrote replay receipts only after success. Reconstruct
+            # only the exact retained key/command; an unbound different pending
+            # operation cannot safely be assigned to another replay.
+            bound_keys = {json.loads(path.read_text()).get('operation_key')
+                          for path in self.root.glob('*/measurement.json')}
+            for operation in (backend.root / 'measurements').glob('*/operation.json'):
+                old = json.loads(operation.read_text())
+                key = operation.parent.name
+                if key in bound_keys or 'result' in old:
+                    continue
+                command = operation.parent / 'command.json'
+                if (key != replay_key or not command.exists()
+                        or json.loads(command.read_text()).get('argv') != argv):
+                    raise ProjectInfrastructureError('unbound retained native measurement requires recovery before a new replay')
+            _save(record, dict(request_id=request_id, operation_key=replay_key))
+        verification = self._verify()
         result = backend.run_remote(argv, key='measurements/'+replay_key, cwd=directory)
         if result.returncode:
             raise ProjectInfrastructureError(result.stderr or result.stdout or 'native measurement failed')
@@ -351,7 +368,7 @@ class CplNativeMeasurements(NativeMeasurementBackend):
         raw = dict(stdout=result.stdout, stderr=result.stderr, verification=verification, metadata=meta)
         raw_hash = canonical_digest(raw)
         measured = dict(identity=identity, summary=summary, evidence_sha256=raw_hash, artifact_payloads={raw_hash: raw})
-        _save(record, dict(request_id=request_id, result=measured, evidence=dict(profile=backend.profile,
+        _save(record, dict(request_id=request_id, operation_key=replay_key, result=measured, evidence=dict(profile=backend.profile,
             handle=result.job_handle, status='completed', physical_device=backend._device, logical_device=0,
             remote_report=meta.get('remote_report'))))
         return measured
