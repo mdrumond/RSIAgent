@@ -95,6 +95,7 @@ class AdaptiveProjectRequest:
     oracle: ReferenceOutput
     memory_root: Path | None = None
     remaining_seconds: float | None = None
+    publish_learning: bool = True
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,12 @@ class AdaptivePhase1Coordinator:
         if state.get("project_target", self.project_target) != self.project_target:
             raise ValueError("use continue_campaign to change the retained project target")
         if state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target:
+            verifier = getattr(self, 'usefulness_verifier', None)
+            if verifier is not None and verifier.enabled:
+                def reconcile():
+                    self._assess_committed_memory(state)
+                    return self._report(state)
+                return self._with_allocation(reconcile)
             return self._report(state)
         return self._with_allocation(lambda: self._run_allocated(wave_limit=wave_limit, approved_only=approved_only))
 
@@ -237,6 +244,7 @@ class AdaptivePhase1Coordinator:
 
     def _run_allocated(self, *, wave_limit=None, approved_only=False) -> dict[str, object]:
         state = self._load_state()
+        self._assess_committed_memory(state)
         if self.failure_feedback is not None:
             self.failure_feedback.record(state.get('failure_investigations', []), state)
         pending = self._load_pending(state)
@@ -319,6 +327,7 @@ class AdaptivePhase1Coordinator:
             (self.root / "pending.json").unlink(missing_ok=True)
             if self.failure_feedback is not None:
                 self.failure_feedback.sync(state)
+            self._assess_committed_memory(state)
             executed_waves += 1
             if wave_limit is not None and executed_waves >= wave_limit:
                 return self._report(state)
@@ -565,6 +574,27 @@ class AdaptivePhase1Coordinator:
                if pending.get('failure_investigations') else {}),
             **({"failed_outcomes": failures} if failures else {}),
         }
+
+    def _assess_committed_memory(self, state):
+        verifier = getattr(self, "usefulness_verifier", None)
+        if verifier is None or not verifier.enabled:
+            return
+        previous = []
+        for wave_id in state["completed_waves"]:
+            plan = self._read_json(self.root / "waves" / wave_id / "plan.json")
+            wave = WaveSpec.from_mapping(plan["wave"])
+            prior = self._memory_snapshot({**state, "memory_bytes_base64": previous})
+            for project in wave.projects:
+                path = self.root / "waves" / wave_id / "branches" / project.spec.project_id / "memory-delta.bin"
+                if not path.exists():
+                    continue
+                if not self._read_json(path.parent / "outcome.json")["verified"]:
+                    continue
+                delta = self._read_json(path)
+                raw = base64.b64decode(delta["memory_base64"])
+                memory = Phase1ProjectMemory.from_mapping(json.loads(raw))
+                verifier.assess_memory(memory, prior, f"{wave_id}/{project.spec.project_id}")
+                previous.append(delta["memory_base64"])
 
     def _read_delta(self, wave_id: str, project_id: str) -> dict[str, object]:
         path = self.root / "waves" / wave_id / "branches" / project_id / "memory-delta.bin"

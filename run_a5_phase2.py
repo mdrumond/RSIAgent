@@ -41,6 +41,8 @@ class _OneCell(argparse.Action):
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    report = commands.add_parser('report')
+    report.add_argument('--root', type=Path, required=True)
     for name in ("qualify", "run"):
         command = commands.add_parser(name)
         command.add_argument("--root", type=Path, required=True)
@@ -133,51 +135,13 @@ def main(
     runtime_factory: RuntimeFactory = _production_factory,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> int:
-    args = _parser().parse_args(argv)
-    failures = 0
-    while True:
-        try:
-            snapshot, dependencies = runtime_factory(args)
-            if not isinstance(snapshot, A5Phase1Snapshot):
-                raise TypeError("runtime factory must return an A5Phase1Snapshot")
-            if not isinstance(dependencies, Phase2Dependencies):
-                raise TypeError("runtime factory must return Phase2Dependencies")
-            if args.snapshot.resolve() != snapshot.root.resolve():
-                raise ValueError("requested snapshot path does not match admitted snapshot")
-            if args.cell_id != snapshot.destination.cell_id:
-                raise ValueError("requested cell does not match admitted snapshot")
-            if dependencies.cell != snapshot.destination:
-                raise ValueError("runtime cell does not match admitted snapshot")
-
-            if args.command == "qualify":
-                path = args.root.resolve() / "cells" / args.cell_id / "qualification.json"
-                try:
-                    qualification = json.loads(path.read_bytes())
-                except (OSError, json.JSONDecodeError) as exc:
-                    raise ValueError("production factory did not retain qualification") from exc
-                if qualification.get("status") != "transport-qualified":
-                    raise ValueError("production factory retained invalid qualification")
-                terminal = {
-                    "cell_id": args.cell_id, "status": "transport-qualified",
-                }
-            else:
-                terminal = Phase2LiveRunner(
-                    phase2_root=args.root,
-                    snapshot=snapshot,
-                    dependencies=dependencies,
-                ).run()
-            break
-        except (
-            InfrastructureFailure,
-            AttentionInfrastructureError,
-            RuntimeUnavailableError,
-        ):
-            if failures >= MAX_INFRASTRUCTURE_RETRIES:
-                raise
-            failures += 1
-            sleeper(BACKOFF_SECONDS)
-    print(json.dumps(terminal, sort_keys=True, separators=(",", ":")))
-    return 0
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.command == 'report':
+        print(json.dumps({'records': [json.loads(path.read_bytes()) for path in
+            sorted(args.root.rglob('terminal.json'))]}, sort_keys=True))
+        return 0
+    parser.error('Ascend Phase 2 execution is retired; use run_ascend_subjects.py; historical report remains available')
 
 
 def _entry() -> int:
