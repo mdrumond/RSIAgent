@@ -78,9 +78,13 @@ def _verified_retry(outcome):
         ref = outcome['evidence']['result_artifact']
         if not Path(ref['job_root']).is_dir():
             return False
+        submission = outcome['task']['submission']
+        if 'signatures' not in submission and 'signature' in submission:
+            from optimizer.cases import normalize_job_submission
+            submission = normalize_job_submission(submission)
         verify_attempt_result(JobStore(ref['job_root']), outcome['result'],
                               attempt_id=outcome['attempt_id'], task_id=outcome['task']['task_id'],
-                              task_submission=outcome['task']['submission'])
+                              task_submission=submission)
         return outcome['result'].get('verified') is True
     except (KeyError, OSError, ValueError, TypeError):
         return False
@@ -134,11 +138,11 @@ class FeedbackStore:
         }.get(record['investigation']['status'], 'failed')
         return record
 
-    def read_evidence(self, digest, offset=0, limit=8192):
+    def read_evidence(self, digest, offset=0, limit=8192, *, records=None):
         """Authenticate a locally retained linked artifact, then return one text page."""
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('evidence page requires nonnegative offset and limit 1..8192')
-        refs = [ref for record in self.records() for ref in record['outcome']['evidence'].values()
+        refs = [ref for record in (self.records() if records is None else records) for ref in record['outcome']['evidence'].values()
                 if ref['sha256'] == digest]
         for ref in refs:
             try:
@@ -489,7 +493,8 @@ class FeedbackStore:
                 outcome = dict(source_type='optimizer', source_root=str(root),
                     attempt_id=job['job_id'], completed=True, kind='optimizer',
                     target=observed_target, language=observed_language, original_spec=original,
-                    task=task, runtime={}, job_incarnation=events[0]['sha256'],
+                    task=task, runtime=next((event['payload'] for event in reversed(events)
+                        if event['kind'] == 'worker-configuration'), {}), job_incarnation=events[0]['sha256'],
                     verified=bool(best), result=result, evidence=evidence,
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
@@ -590,8 +595,19 @@ class FeedbackStore:
                 binding = _baseline_identity(original)
                 if binding is None or _baseline_identity(retry) != binding:
                     return False
-                measured = score(baseline, artifact(retry, 'evaluation'))
+                if retry['evidence'].get('result_artifact'):
+                    if not _verified_retry(retry):
+                        return False
+                    evaluation = retry['result']['result']
+                else:
+                    evaluation = artifact(retry, 'evaluation')
+                measured = score(baseline, evaluation)
                 return measured is not None and measured >= 1.0
+            if original['source_type'] == 'phase2':
+                baseline = _baseline_identity(original)
+                return (baseline is not None and baseline == _baseline_identity(retry)
+                        and _verified_retry(retry)
+                        and _category(original['task'], retry['result']) == 'verified-success')
             plan_ref = retry['evidence']['plan']
             plan_data = Path(plan_ref['retained_path']).read_bytes()
             if sha(plan_data) != plan_ref['sha256']:
@@ -606,6 +622,25 @@ class FeedbackStore:
             outcome = json.loads(data)
             evidence = retry['evidence']['execution-evidence.bin']
             payload = Path(evidence['retained_path']).read_bytes()
+            original_ref = original['evidence'].get('execution-evidence.bin')
+            if original_ref:
+                original_payload = Path(original_ref['retained_path']).read_bytes()
+                if sha(original_payload) != original_ref['sha256']:
+                    return False
+                original_artifacts = json.loads(original_payload).get('artifacts', {})
+                if original_artifacts.get('inputs'):
+                    from benchmarks.a5kernels.evidence import canonical_bytes
+                    planned = plan.get('case_inputs', {}).get(retry['original_spec']['project_id'])
+                    if planned is None or sha(canonical_bytes(planned)) != original_artifacts['inputs']:
+                        return False
+                    actual_artifacts = json.loads(payload).get('artifacts', {})
+                    for role in ('inputs', 'expected'):
+                        digest = original_artifacts[role]
+                        if actual_artifacts.get(role) != digest:
+                            return False
+                        artifact = Path(evidence['retained_path']).parent / 'artifacts' / 'objects' / digest[:2] / digest[2:]
+                        if sha(artifact.read_bytes()) != digest:
+                            return False
             return (outcome.get('verified') is True
                     and outcome.get('wave_fingerprint') == plan['wave_fingerprint']
                     and outcome.get('project_id') == retry['original_spec']['project_id']

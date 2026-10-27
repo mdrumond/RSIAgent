@@ -82,7 +82,8 @@ class SourceBackend:
 
 
 class ScriptedActor:
-    def __init__(self, replies):
+    def __init__(self, replies, *, memory=b'{"prior":"memory"}'):
+        self.expected_memory = memory
         self.replies = tuple(replies)
         self.instruction = None
         self.observations = []
@@ -94,7 +95,7 @@ class ScriptedActor:
     ):
         del profile, workspace
         self.instruction = instruction
-        assert context.read_bytes() == b'{"prior":"memory"}'
+        assert context.read_bytes() == self.expected_memory
         for ordinal, reply in enumerate(self.replies, 1):
             action = turn_parser(reply)
             assert action is not None
