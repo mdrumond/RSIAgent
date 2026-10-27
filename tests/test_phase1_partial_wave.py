@@ -202,3 +202,70 @@ def test_project_admission_timeout_does_not_quarantine_a_healthy_worker():
         pool('expired')
     assert pool('fresh') == 'completed'
     assert pool.quarantined == [] and calls == ['expired', 'fresh']
+
+
+@pytest.mark.parametrize('next_partial', [False, True])
+def test_explicit_continuation_acknowledges_only_current_partial_boundary(tmp_path, next_partial):
+    selected, executed, now = [], [], [0.0]
+    def select(messages):
+        selected.append(messages)
+        names = ['good', 'offline'] if len(selected) == 1 else ['fresh', 'offline-next' if next_partial else 'last']
+        specs = [_project(name, focus) for name, focus in zip(names,
+            ['gm-ub-movement', 'simd-vector'] if len(selected) == 1 else ['padded-tail', 'pipe-mte2'])]
+        return _wave(messages[-1]['content'], specs)
+    def execute(request):
+        executed.append(request.spec.project_id)
+        now[0] += 1
+        if request.spec.project_id.startswith('offline'):
+            raise OSError('unavailable')
+        return _result(request.spec, True, 'host pass')
+    def build(target):
+        return AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
+            max_parallel=1, project_target=target, max_seconds=100, clock=lambda: now[0], allow_partial=True)
+    runner = build(2)
+    first = runner.run()
+    assert first['status'] == 'WAVE_CLOSED' and first['published_projects'] == ['good']
+    wave_root = tmp_path / 'waves/wave-001'
+    retained = {path.relative_to(wave_root): path.read_bytes() for path in wave_root.rglob('*') if path.is_file()}
+    assert runner.resume()['status'] == 'WAVE_CLOSED'
+    assert len(selected) == 1 and executed == ['good', 'offline']
+    elapsed = first['elapsed_seconds']
+    assert runner.continue_campaign(3)['elapsed_seconds'] == elapsed
+    # The acknowledgement survives reconstructing the controller before dispatch.
+    resumed = build(3)
+    result = resumed.resume()
+    assert len(selected) == 2 and executed[:2] == ['good', 'offline']
+    assert result['elapsed_seconds'] == elapsed + 2
+    assert retained == {path.relative_to(wave_root): path.read_bytes() for path in wave_root.rglob('*') if path.is_file()}
+    if next_partial:
+        assert result['status'] == 'WAVE_CLOSED'
+        assert result['published_projects'] == ['good', 'fresh']
+        assert resumed.resume()['status'] == 'WAVE_CLOSED'
+        assert len(selected) == 2 and len(executed) == 4
+    else:
+        assert result['status'] == 'TARGET_REACHED'
+        assert result['published_projects'] == ['good', 'fresh', 'last']
+
+
+def test_explicit_partial_continuation_does_not_renew_exhausted_allocation(tmp_path):
+    selected, executed = [], []
+    def select(messages):
+        selected.append(messages)
+        return _wave(messages[-1]['content'], [_project('good', 'gm-ub-movement'),
+                                              _project('offline', 'simd-vector')])
+    def execute(request):
+        executed.append(request.spec.project_id)
+        if request.spec.project_id == 'offline':
+            raise OSError('unavailable')
+        return _result(request.spec, True, 'host pass')
+    runner = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
+        max_parallel=1, project_target=2, max_seconds=100, clock=lambda: 0, allow_partial=True)
+    assert runner.run()['status'] == 'WAVE_CLOSED'
+    path = tmp_path / 'state.json'
+    state = json.loads(path.read_bytes())
+    state['elapsed_seconds'] = 100
+    path.write_text(json.dumps(state))
+    runner.continue_campaign(3)
+    result = runner.resume()
+    assert result['status'] == 'TIME_BUDGET_EXHAUSTED' and result['remaining_seconds'] == 0
+    assert len(selected) == 1 and executed == ['good', 'offline']

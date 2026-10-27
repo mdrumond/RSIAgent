@@ -583,6 +583,10 @@ class AdaptivePhase1Coordinator:
                         "terminal": terminal,
                         "previous_status": self._report(state)["status"],
                         "successful_projects": len(state["prior_outcomes"])})
+        if self._partial_closed(state):
+            # Acknowledge only this immutable boundary; a later partial wave
+            # must stop again until the user explicitly continues it.
+            state = {**state, "continued_partial_wave": state["wave_results"][-1]["wave_id"]}
         state = {**state, "project_target": project_target, "terminal": None,
                  "continuations": history}
         self._atomic_json(self.root / "state.json", state)
@@ -913,7 +917,8 @@ class AdaptivePhase1Coordinator:
     @staticmethod
     def _partial_closed(state):
         results = state.get("wave_results", [])
-        return bool(results and results[-1]["status"] in {"partial", "empty"})
+        return bool(results and results[-1]["status"] in {"partial", "empty"}
+                    and state.get("continued_partial_wave") != results[-1]["wave_id"])
 
     def _report(self, state):
         snapshot = self._memory_snapshot(state)
