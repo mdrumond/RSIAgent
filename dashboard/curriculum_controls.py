@@ -59,7 +59,7 @@ class CurriculumControls:
             return []
         _, root = configured_subject(self.config_path, campaign_id)
         return [json.loads(path.read_bytes()) for path in sorted(
-            (root / 'curriculum-edits').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)[:20]]
+            (root / 'curriculum-edits').glob('*.json'), key=lambda p: p.stat().st_mtime, reverse=True)]
 
     def restart_request(self, campaign_id, identifier):
         _, root = configured_subject(self.config_path, campaign_id)
