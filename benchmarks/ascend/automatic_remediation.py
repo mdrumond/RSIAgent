@@ -223,9 +223,18 @@ class AutomaticRemediation:
             snapshot = pending_path.read_bytes()
         else:
             pending_path.write_bytes(snapshot)
+        from .failure_handoff import original_retry_inputs
+        inputs = original_retry_inputs(self.store, row['feedback_id'], spec) if row.get('feedback_id') else None
+        retry_runner = copy(self.runner)
+        retry_runner.failure_feedback = None
+        if row.get('feedback_id'):
+            from types import SimpleNamespace
+            context = dict(root=str(self.store.root), feedback_ids=[row['feedback_id']], original_retry=True)
+            retry_runner.failure_feedback = SimpleNamespace(project_context=lambda project_id: context)
         wave = WaveSpec('original-retry', sha(snapshot), (), (WaveProject(spec),))
         live = LiveWaveCoordinator(directory / 'waves' / wave.wave_id, wave, snapshot,
-                                   self.runner._execute, 1, allow_semantic_failures=True)
+                                   retry_runner._execute, 1, allow_semantic_failures=True,
+                                   inputs_by_project={spec.project_id: inputs} if inputs is not None else None)
         result = live.resume()
         pending = dict(session=state['session'])
         blank = dict(state, prior_outcomes=[], failed_outcomes=[], memory_bytes_base64=[],
@@ -278,9 +287,6 @@ def optimizer_retry_adapter(runner, store, config):
             atomic(allocation_path, canonical(dict(seconds=allocation)))
         expected = retry_spec(dict(selected=[row]), 'a3')
         task = expected['task']
-        if row['outcome']['source_type'] == 'optimizer':
-            from optimizer.cases import normalize_job_submission
-            task = dict(task, submission=normalize_job_submission(task['submission']))
         bound = dict(config, phase2_attempt_seconds=allocation, max_cases=expected['max_cases'])
         remaining()
         executor = OptimizerTaskExecutor(directory, task, memory, bound, expected_baseline=expected)
@@ -299,4 +305,10 @@ def optimizer_retry_adapter(runner, store, config):
         from .phase2_feedback import _category
         outcome['category'] = _category(outcome['task'], result)
         store._put(outcome, report['warnings'])
+        refs = {}
+        source = outcome['evidence'].get('candidate')
+        if source:
+            refs['source'] = dict(source, retained_path=str(
+                executor.store.artifact_path(executor.job_id, source['sha256'])))
+        store._retain_failure_cases(outcome, store._optimizer_failure_case(result.get('result', {}), refs))
     return retry

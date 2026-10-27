@@ -423,7 +423,8 @@ def test_curriculum_discovers_and_pages_only_selected_failure_cases(tmp_path, mo
 
 
 
-def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(tmp_path):
+@pytest.mark.parametrize('historical_sources', [False, True])
+def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(tmp_path, historical_sources):
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import Agent, Backend, candidate
     body = dict(files={}, memory_entries=[{'lesson': 'Retained context'}],
@@ -440,6 +441,10 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
             return {'status': 'compile-error', 'stderr': 'Observed compile diagnostic'}
         def evaluate(self, source, directory, *, block_count):
             self.evaluations.append(source)
+            if historical_sources:
+                return dict(status='compile-error', suite_sha256='suite',
+                    candidate_sha256=sha(source.encode()), cases=[dict(case='case-000',
+                        error='compiler rejected candidate', compiler_diagnostics='Actual retained diagnostic')])
             return dict(status='incorrect', suite_sha256='suite', cases=[],
                 candidate_sha256=sha(source.encode()), failure_case=dict(
                     schema='failure-case-v1', classification='host-mismatch',
@@ -455,7 +460,17 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
         candidate('bad-one'), dict(action='query-knowledge', query='Second retrieval'),
         candidate('bad-two'), dict(action='read-memory', index=0),
         dict(action='finish', summary='Retained failed candidates')]
-    result = OptimizationLoop(jobs, key, Agent(actions), backend).run()
+    loop = OptimizationLoop(jobs, key, Agent(actions), backend)
+    if historical_sources:
+        # The old producer retained canonical source artifacts and current
+        # candidate state, but not the additive history.source reference.
+        def save_legacy_state():
+            state = json.loads(canonical(loop.state))
+            for row in state['history']:
+                row.pop('source', None)
+            jobs.add_event(key, 'optimizer-state', state)
+        loop._save = save_legacy_state
+    result = loop.run()
     assert result['status'] == 'completed' and backend.evaluations == ['bad-one', 'bad-two']
     history = OptimizationLoop(jobs, key, Agent([]), backend).state['history']
     assert [row.get('tool', {}).get('action') for row in history if 'tool' in row] == [
@@ -468,6 +483,9 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
     candidates = [row for row in records if ':candidate:' in row['outcome']['attempt_id']]
     assert {row['outcome']['result']['source_sha256'] for row in candidates} == {
         sha(b'bad-one'), sha(b'bad-two')}
+    for row in candidates:
+        source = store.failure_cases(row['feedback_id'])[0]['artifacts']['source']['sha256']
+        assert sha(json.loads(store.failure_artifact_bytes(row['feedback_id'], source)).encode()) == row['outcome']['result']['source_sha256']
     assert all(store.failure_cases(row['feedback_id'])[0]['availability']['complete'] for row in candidates)
     repeated = store.import_optimizer(jobs.root)
     assert repeated['existing'] == 3 and repeated['warnings'] == []
@@ -517,3 +535,255 @@ def test_a5_production_identity_imports_selects_and_authenticates_original_retry
 ])
 def test_identity_normalization_keeps_unknown_schemas_and_existing_aliases(tmp_path, identity, target, language):
     assert FeedbackStore._identity(tmp_path, None, None, identity) == (target, language)
+
+
+@pytest.mark.parametrize('change_contract', [False, True])
+def test_retained_campaign_retry_links_standalone_optimizer_without_new_launch(
+        tmp_path, change_contract):
+    from benchmarks.ascend.campaign_cli import main, campaign_worker
+    from benchmarks.ascend.failure_curriculum import link_retry, retry_spec
+    from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
+    from test_ascend_phase2_optimizer_tasks import seed
+
+    submission = dict(source='def forward(x): return x', entrypoint='forward',
+        signatures=[dict(args=[dict(shape=[5], dtype='float32')])], init_args=[], init_kwargs={})
+    memory = seed()
+    memory['source_identity'] = dict(target='a3', language='ascend-c')
+    memory['snapshot_id'] = sha(canonical({k: v for k, v in memory.items() if k != 'snapshot_id'}))
+    jobs = JobStore(tmp_path / 'original-jobs')
+    original_job = jobs.create(submission['source'], submission['entrypoint'],
+        {'signatures': submission['signatures']}, memory, name='original-task')
+    key = original_job['job_id']
+    frozen = dict(suite_sha256='1' * 64,
+        manifest=dict(policy={'rtol': 1e-5}, submission=submission),
+        cases=[dict(case='case-000', timing={'torch': {'latency_us': 10}})])
+    baseline = jobs.put_artifact(key, 'baseline', canonical(frozen))
+    jobs.transition(key, 'running')
+    jobs.add_event(key, 'optimizer-state', dict(baseline=baseline, history=[]))
+    jobs.transition(key, 'failed')
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['imported'] == 1
+    original = store.records()[0]
+    pinned = retry_spec(dict(selected=[original]), 'a3')
+    assert pinned['task']['submission'] == submission
+    task = json.loads(canonical(pinned['task']))
+    if change_contract:
+        task['submission']['source'] = 'def forward(x): return x + 1'
+    repeated = json.loads(canonical(frozen))
+    repeated['cases'][0]['timing']['torch']['latency_us'] = 12
+
+    class Retried:
+        def __init__(self, directory, selected, memory):
+            self.task = selected
+            spec = selected['submission']
+            self.jobs = JobStore(directory / 'jobs')
+            self.key = self.jobs.create(spec['source'], spec['entrypoint'],
+                {'signatures': spec['signatures']}, memory,
+                init_args=spec.get('init_args'), init_kwargs=spec.get('init_kwargs'))['job_id']
+            self.baseline = self.jobs.put_artifact(self.key, 'baseline', canonical(repeated))
+        def prepare(self):
+            return repeated
+        def attempt(self, attempt_id, **kwargs):
+            source = 'candidate for the retained task'
+            result = dict(attempt_id=attempt_id, task_id=self.task['task_id'], job_id=self.key,
+                verified=True, speedup=2, baseline=self.baseline, source_sha256=sha(source.encode()),
+                candidate=self.jobs.put_artifact(self.key, 'candidate', canonical(source)),
+                result=dict(status='verified', candidate_sha256=sha(source.encode()),
+                    suite_sha256=frozen['suite_sha256'], cases=[dict(case='case-000',
+                        timing={'ascendc': {'latency_us': 5}})]))
+            result['result_artifact'] = self.jobs.put_artifact(self.key, 'result', canonical(result))
+            self.jobs.add_event(self.key, 'phase2-attempt-result', result)
+            return result
+
+    root = tmp_path / 'retained-retry'
+    campaign = OptimizerPhase2Coordinator(root, 'Retained original retry', memory,
+        lambda _: json.dumps(dict(action='ready', reason='Retained host result')), Retried,
+        feedback_root=store.root, fixed_task=task)
+    assert campaign.resume()['status'] == 'READY'
+    # This is retained-result finalization through the existing worker API, not
+    # permission to launch a retired Phase2 campaign from the CLI.
+    control = tmp_path / 'control'
+    control.mkdir()
+    job = dict(root=str(root), control=str(control), feedback_root=str(store.root),
+               retry_feedback_id=original['feedback_id'])
+    assert campaign_worker(job, builder=lambda _: campaign)['status'] == 'READY'
+    updated = next(row for row in store.records() if row['feedback_id'] == original['feedback_id'])
+    assert (updated['investigation']['status'] == 'resolved') is not change_contract
+    assert len(updated['investigation']['retries']) == 1
+    assert json.loads((control / 'worker.json').read_bytes())['status'] == 'complete'
+    link_retry(job)
+    assert next(row for row in store.records() if row['feedback_id'] == original['feedback_id']) == updated
+    before = (store.root / (original['feedback_id'] + '.json')).read_bytes()
+    with pytest.raises(SystemExit) as error:
+        main(['start', '--phase', '2', '--target', 'a3', '--control', str(tmp_path / 'new-control'),
+            '--root', str(tmp_path / 'new-campaign'), '--objective', 'Original retry',
+            '--config', 'absent', '--initial-memory', 'absent', '--project-target', '1',
+            '--retry-feedback-id', original['feedback_id'], '--feedback-root', str(store.root)],
+            screen=lambda *args: pytest.fail('retired retry dispatched an agent'))
+    assert error.value.code == 2
+    assert not (tmp_path / 'new-control').exists() and not (tmp_path / 'new-campaign').exists()
+    assert (store.root / (original['feedback_id'] + '.json')).read_bytes() == before
+
+
+@pytest.mark.parametrize('candidate_us, change, fixed', [
+    (5, None, True), (11, None, False), (5, 'source', False),
+    (5, 'policy', False), (5, 'result', False),
+])
+def test_standalone_retry_remeasurement_preserves_original_acceptance(
+        tmp_path, candidate_us, change, fixed):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent, Backend, candidate
+
+    jobs = JobStore(tmp_path / 'jobs')
+    suite = sha(b'frozen-case-suite')
+    snapshot = dict(files={}, memory_entries=[],
+                    source_identity=dict(target='a3', language='ascend-c'))
+    snapshot['snapshot_id'] = sha(canonical(snapshot))
+
+    class MeasuredBackend(Backend):
+        def __init__(self, reference_us, native_us, policy):
+            super().__init__()
+            self.reference_us, self.native_us, self.policy = reference_us, native_us, policy
+
+        def prepare(self, spec, directory):
+            return dict(suite_sha256=suite, manifest=dict(policy=self.policy),
+                profiling=dict(reference_run=self.reference_us), cases=[dict(
+                    case='case-000', contract={},
+                    timing=dict(torch=dict(latency_us=self.reference_us)))])
+
+        def evaluate(self, source, directory, *, block_count):
+            return dict(status='incorrect' if self.native_us is None else 'verified',
+                suite_sha256=suite, cases=[] if self.native_us is None else [dict(
+                    case='case-000', correctness={},
+                    timing=dict(ascendc=dict(latency_us=self.native_us)))])
+
+    keys = []
+    for retry, reference_us, native_us in [(False, 10, None), (True, 12, candidate_us)]:
+        job = jobs.create('changed reference' if retry and change == 'source' else
+            'def forward(x): return x', 'forward',
+            {'args': [{'shape': [5], 'dtype': 'float32'}]}, snapshot)
+        key = job['job_id']
+        keys.append(key)
+        policy = dict(rtol=.1 if retry and change == 'policy' else .01)
+        backend = MeasuredBackend(reference_us, native_us, policy)
+        actions = [dict(action='cases', signatures=[], summary='Frozen input'),
+                   candidate('retry kernel' if retry else 'failed kernel'),
+                   dict(action='finish', summary='Retain measured outcome')]
+        assert OptimizationLoop(jobs, key, Agent(actions), backend).run()['status'] == 'completed'
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['warnings'] == []
+    records = {row['outcome']['attempt_id']: row for row in store.records()}
+    original, retry = (records[key] for key in keys)
+    assert not original['outcome']['verified'] and retry['outcome']['verified']
+    assert retry['outcome']['result']['speedup'] > 1
+    if change == 'result':
+        ref = retry['outcome']['evidence']['evaluation']
+        (jobs.root / ref['job_id'] / 'artifacts' / ref['sha256']).write_bytes(b'changed result')
+    linked = store.link_original_retry(original['feedback_id'], retry['feedback_id'])
+    assert (linked['lifecycle'] == 'fixed') is fixed
+    assert linked['investigation']['retries'] == [retry['feedback_id']]
+
+
+@pytest.mark.parametrize('terminal', ['stopped', 'budget-exhausted'])
+def test_resumed_optimizer_retains_distinct_immutable_terminal_observations(tmp_path, terminal):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent, Backend, candidate
+
+    jobs = JobStore(tmp_path / 'jobs')
+    snapshot = dict(files={}, memory_entries=[], source_identity=dict(target='a3', language='ascend-c'))
+    snapshot['snapshot_id'] = sha(canonical(snapshot))
+    job = jobs.create('def forward(x): return x', 'forward',
+        dict(args=[dict(shape=[5], dtype='float32')]), snapshot)
+    key = job['job_id']
+
+    class FrozenBackend(Backend):
+        def prepare(self, spec, directory):
+            value = super().prepare(spec, directory)
+            value.update(suite_sha256=sha(b'resume-suite'), manifest=dict(submission=spec, policy=dict(rtol=.01)))
+            return value
+        def evaluate(self, *args, **kwargs):
+            return dict(super().evaluate(*args, **kwargs), suite_sha256=sha(b'resume-suite'))
+
+    backend = FrozenBackend()
+    first = OptimizationLoop(jobs, key, Agent([
+        dict(action='cases', signatures=[], summary='Frozen cases'), candidate('bad')]), backend)
+    first.run(single_evaluation=True)
+    if terminal == 'stopped':
+        jobs.stop(key)
+    else:
+        jobs.account_time(key, job['max_seconds'])
+    assert OptimizationLoop(jobs, key, Agent([]), backend).run()['status'] == terminal
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['warnings'] == []
+    original = next(row for row in store.records() if row['outcome']['attempt_id'] == key)
+    original_path = store.root / (original['feedback_id'] + '.json')
+    before = original_path.read_bytes()
+    retained = {row['feedback_id']: (store.root / (row['feedback_id'] + '.json')).read_bytes()
+                for row in store.records()}
+    assert len(retained) == 2  # Terminal failure and its failed candidate.
+    jobs.resume(key, additional_seconds=60)
+    assert OptimizationLoop(jobs, key, Agent([candidate('fast'),
+        dict(action='finish', summary='Retained repaired outcome')]), backend).run()['status'] == 'completed'
+    report = store.import_optimizer(jobs.root)
+    assert report['imported'] == 1 and report['warnings'] == []
+    retry = next(row for row in store.records() if row['outcome']['attempt_id'] == key
+                 and row['feedback_id'] != original['feedback_id'])
+    assert retry['outcome']['verified'] and original_path.read_bytes() == before
+    assert retry['outcome']['result']['job_id'] == original['outcome']['result']['job_id'] == key
+    assert len(store.records()) == 3
+    assert all((store.root / (feedback_id + '.json')).read_bytes() == data
+               for feedback_id, data in retained.items())
+    # Reimport scans the current terminal snapshot and failed candidate; the
+    # historical terminal record stays retained without being scanned again.
+    assert store.import_optimizer(jobs.root) == dict(source_root=str(jobs.root.resolve()),
+        imported=0, existing=2, warnings=[])
+    assert store.link_original_retry(original['feedback_id'], retry['feedback_id'])['lifecycle'] == 'fixed'
+
+
+@pytest.mark.parametrize('change', [None, 'source', 'signatures', 'policy', 'result'])
+def test_optimizer_case_expansion_retry_uses_authenticated_frozen_submission(tmp_path, change):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent, Backend, candidate
+
+    jobs = JobStore(tmp_path / 'jobs')
+    snapshot = dict(files={}, memory_entries=[], source_identity=dict(target='a3', language='ascend-c'))
+    snapshot['snapshot_id'] = sha(canonical(snapshot))
+    initial = dict(args=[dict(shape=[5], dtype='float32')])
+    expanded = dict(args=[dict(shape=[7], dtype='float32')])
+
+    class ExpandedBackend(Backend):
+        def __init__(self, retry):
+            super().__init__()
+            self.retry = retry
+        def prepare(self, spec, directory):
+            self.suite = sha(canonical(spec))
+            self.cases = [dict(case=f'case-{index:03}', contract={},
+                timing=dict(torch=dict(latency_us=10))) for index in range(len(spec['signatures']))]
+            return dict(suite_sha256=self.suite, cases=self.cases, manifest=dict(submission=spec,
+                policy=dict(rtol=.1 if self.retry and change == 'policy' else .01)))
+        def evaluate(self, *args, **kwargs):
+            return dict(status='verified' if self.retry else 'incorrect', suite_sha256=self.suite,
+                cases=[dict(case=row['case'], correctness={}, timing=dict(ascendc=dict(latency_us=5)))
+                       for row in self.cases] if self.retry else [])
+
+    keys = []
+    for retry in [False, True]:
+        signatures = [initial, expanded] if retry else [initial]
+        if retry and change == 'signatures':
+            signatures = [initial]
+        job = jobs.create('def forward(x): return x + 1' if retry and change == 'source' else
+            'def forward(x): return x', 'forward', dict(signatures=signatures), snapshot)
+        keys.append(job['job_id'])
+        actions = [dict(action='cases', signatures=[] if retry else [expanded], summary='Representative cases'),
+                   candidate('fast' if retry else 'bad'), dict(action='finish', summary='Retain outcome')]
+        assert OptimizationLoop(jobs, job['job_id'], Agent(actions), ExpandedBackend(retry)).run()['status'] == 'completed'
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['warnings'] == []
+    records = {row['outcome']['attempt_id']: row for row in store.records()}
+    original, retry = (records[key] for key in keys)
+    if change != 'signatures':
+        assert original['outcome']['original_spec'] != retry['outcome']['original_spec']
+    if change == 'result':
+        ref = retry['outcome']['evidence']['evaluation']
+        (jobs.root / ref['job_id'] / 'artifacts' / ref['sha256']).write_bytes(b'changed evaluation')
+    assert (store.link_original_retry(original['feedback_id'], retry['feedback_id'])['lifecycle'] == 'fixed') is (change is None)

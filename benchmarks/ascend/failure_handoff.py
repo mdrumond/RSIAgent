@@ -19,6 +19,33 @@ def phase1_contract(spec, inputs=None, expected=None):
                 policy='phase1-classify-execution-v1')
 
 
+def original_retry_inputs(store, feedback_id, spec):
+    """Recover the selected observation's host case without campaign lineage."""
+    from benchmarks.a5kernels.phase1_project import HostTensor, materialize_inputs, evaluate_reference
+    from benchmarks.a5kernels.phase1_project_executor import _expected_payload
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    cases = store.failure_cases(feedback_id)
+    retained = [case for case in cases if 'inputs' in case.get('artifacts', {})]
+    if not retained:
+        return None  # Historical observations without a retained host case.
+    layout = [(item.shape, item.physical_shape) for item in materialize_inputs(spec)]
+    for case in retained:
+        refs = case['artifacts']
+        payload = json.loads(store.failure_artifact_bytes(feedback_id, refs['inputs']['sha256']))
+        inputs = tuple(HostTensor(tuple(row['shape']), tuple(row['physical_shape']), tuple(row['storage']))
+                       for row in payload['tensors'])
+        if [(item.shape, item.physical_shape) for item in inputs] != layout:
+            continue
+        expected = evaluate_reference(spec, inputs)
+        contract = phase1_contract(spec, inputs, expected)
+        if (case.get('project_contract') == contract
+                and refs.get('expected', {}).get('sha256') == contract['expected_sha256']
+                and store.failure_artifact_bytes(feedback_id, refs['expected']['sha256']) ==
+                    canonical_bytes(_expected_payload(expected))):
+            return inputs
+    raise ValueError('Original retry has no authenticated compatible retained host case')
+
+
 class FailureContext:
     """Resolve only cases linked by the host to this remedial project."""
     def __init__(self, context, spec, inputs=None, expected=None):

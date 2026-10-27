@@ -102,7 +102,7 @@ class LiveWaveCoordinator:
         pre_wave_memory: bytes,
         execute: WaveProjectExecutor,
         max_parallel: int,
-        *, allow_semantic_failures: bool = False,
+        *, allow_semantic_failures: bool = False, inputs_by_project=None,
     ) -> None:
         if not isinstance(wave, WaveSpec):
             raise TypeError("wave must be a WaveSpec")
@@ -120,6 +120,7 @@ class LiveWaveCoordinator:
         self.execute = execute
         self.max_parallel = max_parallel
         self.allow_semantic_failures = allow_semantic_failures
+        self.inputs_by_project = inputs_by_project or {}
 
     def run(self) -> WaveConsolidation:
         self._ensure_plan()
@@ -174,7 +175,9 @@ class LiveWaveCoordinator:
     def _execute_one(self, assignment: ProjectAssignment) -> ProjectOutcome:
         branch_root = self.root / "branches" / assignment.project_id
         branch_root.mkdir(parents=True, exist_ok=True)
-        inputs = materialize_inputs(assignment.spec)
+        inputs = self.inputs_by_project.get(assignment.project_id)
+        if inputs is None:
+            inputs = materialize_inputs(assignment.spec)
         try:
             result = self.execute(WaveProjectRequest(
                 assignment=assignment,
@@ -271,6 +274,10 @@ class LiveWaveCoordinator:
             "wave": self.wave.as_dict(),
             "wave_fingerprint": self.wave.fingerprint,
         }
+        if self.inputs_by_project:
+            from .phase1_project_executor import _tensor_payload
+            expected["case_inputs"] = {key: {"tensors": [_tensor_payload(x) for x in inputs]}
+                                       for key, inputs in self.inputs_by_project.items()}
         path = self.root / "plan.json"
         if path.exists():
             if self._read_json(path) != expected:

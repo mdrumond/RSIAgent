@@ -34,6 +34,8 @@ def _observation_identity(outcome):
     identity['job_id' if job_id else 'source_root'] = job_id or outcome['source_root']
     if job_id and outcome.get('job_incarnation'):
         identity['job_incarnation'] = outcome['job_incarnation']
+    if outcome.get('terminal_snapshot'):
+        identity['terminal_snapshot'] = outcome['terminal_snapshot']
     return identity
 
 
@@ -468,7 +470,7 @@ class FeedbackStore:
                     classification=job['status'], speedup=best.get('speedup'),
                     result=best.get('content', {}))
                 evidence = {}
-                for role, ref in dict(baseline=state.get('baseline'), candidate=best.get('source'),
+                for role, ref in dict(baseline=state.get('baseline'), submission=state.get('spec'), candidate=best.get('source'),
                                       evaluation=best.get('result')).items():
                     if ref:
                         store.read_artifact(job['job_id'], ref['sha256'])
@@ -490,7 +492,12 @@ class FeedbackStore:
                     verified=bool(best), result=result, evidence=evidence,
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
+                continuation = next((event['sha256'] for event in reversed(events)
+                                     if event['kind'] in {'resumed', 'manual-continuation', 'recovered'}), None)
+                if continuation:
+                    outcome['terminal_snapshot'] = continuation
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+                historical_sources = None
                 for candidate in state.get('history', []):
                     content = candidate.get('content', {})
                     if (candidate.get('tool') or not candidate.get('candidate_sha256')
@@ -498,8 +505,18 @@ class FeedbackStore:
                         continue
                     source = candidate.get('source')
                     if not source:
-                        source = next((event['payload'] for event in events if event['kind'] == 'artifact'
-                            and event['payload'].get('sha256') == candidate.get('candidate_sha256')), None)
+                        if historical_sources is None:
+                            historical_sources = {}
+                            seen = set()
+                            for event in events:
+                                ref = event['payload'].get('candidate') if event['kind'] == 'optimizer-state' else None
+                                if not ref or ref['sha256'] in seen:
+                                    continue
+                                seen.add(ref['sha256'])
+                                retained = json.loads(store.read_artifact(job['job_id'], ref['sha256']))
+                                if isinstance(retained, str):
+                                    historical_sources[sha(retained.encode())] = ref
+                        source = historical_sources.get(candidate['candidate_sha256'])
                     refs = {role: ref for role, ref in evidence.items() if role == 'baseline'}
                     for role, ref in dict(source=source, evaluation=candidate['result']).items():
                         if ref:
@@ -511,6 +528,7 @@ class FeedbackStore:
                         source_sha256=candidate['candidate_sha256'], result=content)
                     failed = dict(outcome, attempt_id=job['job_id'] + ':candidate:' + identity,
                         verified=False, result=failed_result, evidence=refs, category=_category(task, failed_result))
+                    failed.pop('terminal_snapshot', None)
                     report['imported' if self._put(failed, report['warnings']) else 'existing'] += 1
                     self._retain_failure_cases(failed, self._optimizer_failure_case(content, refs))
             except (KeyError, TypeError, ValueError, OSError) as error:
@@ -518,31 +536,69 @@ class FeedbackStore:
         return report
 
     @staticmethod
+    def _optimizer_campaign_retry(original, retry):
+        """Authenticate historical campaign results against a standalone frozen suite."""
+        if (not retry.get('verified') or original['target'] not in {'a3', 'a5'}
+                or original['target'] != retry.get('target')
+                or original['language'] not in {'ascend-c', 'catlass-dsl'}
+                or original['language'] != retry.get('language')):
+            return False
+        try:
+            from optimizer.loop import score
+            ref = original['evidence']['baseline']
+            if not Path(ref['job_root']).is_dir():
+                return False
+            frozen = json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
+            binding = _baseline_identity(original)
+            if (binding is None or retry['task']['task_id'] != original['task']['task_id']
+                    or retry['task']['submission'] != frozen['manifest']['submission']
+                    or not _verified_retry(retry) or _baseline_identity(retry) != binding):
+                return False
+            measured = score(frozen, retry['result']['result'])
+            return measured is not None and measured >= 1.0
+        except (KeyError, ValueError, OSError, TypeError):
+            return False
+
+    @staticmethod
     def _original_retry(original, retry):
+        if original.get('source_type') == 'optimizer' and retry.get('source_type') == 'phase2':
+            return FeedbackStore._optimizer_campaign_retry(original, retry)
         if (not retry.get('verified') or original.get('source_type') != retry.get('source_type')
-                or original.get('original_spec') != retry.get('original_spec')
+                or (original.get('source_type') != 'optimizer'
+                    and original.get('original_spec') != retry.get('original_spec'))
                 or original['target'] not in {'a3', 'a5'}
                 or original['target'] != retry.get('target')
                 or original['language'] != retry.get('language')
                 or original['language'] not in {'ascend-c', 'catlass-dsl'}):
             return False
         try:
-            if original['source_type'] == 'phase2' or retry['evidence'].get('result_artifact'):
+            if original['source_type'] == 'optimizer':
+                from optimizer.loop import score
+                def artifact(outcome, role):
+                    if role == 'submission' and role not in outcome['evidence']:
+                        return artifact(outcome, 'baseline')['manifest']['submission']
+                    ref = outcome['evidence'][role]
+                    return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
+                baseline = artifact(original, 'baseline')
+                frozen = artifact(original, 'submission')
+                if frozen != artifact(retry, 'submission'):
+                    return False
+                binding = _baseline_identity(original)
+                if binding is None or _baseline_identity(retry) != binding:
+                    return False
+                if retry['evidence'].get('result_artifact'):
+                    if not _verified_retry(retry):
+                        return False
+                    evaluation = retry['result']['result']
+                else:
+                    evaluation = artifact(retry, 'evaluation')
+                measured = score(baseline, evaluation)
+                return measured is not None and measured >= 1.0
+            if original['source_type'] == 'phase2':
                 baseline = _baseline_identity(original)
                 return (baseline is not None and baseline == _baseline_identity(retry)
                         and _verified_retry(retry)
                         and _category(original['task'], retry['result']) == 'verified-success')
-            if original['source_type'] == 'optimizer':
-                from optimizer.loop import score
-                def artifact(outcome, role):
-                    ref = outcome['evidence'][role]
-                    return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
-                baseline = artifact(original, 'baseline')
-                retry_baseline = artifact(retry, 'baseline')
-                if _baseline_identity(original) is None or _baseline_identity(original) != _baseline_identity(retry):
-                    return False
-                measured = score(retry_baseline, artifact(retry, 'evaluation'))
-                return measured is not None and measured >= 1.0
             plan_ref = retry['evidence']['plan']
             plan_data = Path(plan_ref['retained_path']).read_bytes()
             if sha(plan_data) != plan_ref['sha256']:
@@ -557,6 +613,25 @@ class FeedbackStore:
             outcome = json.loads(data)
             evidence = retry['evidence']['execution-evidence.bin']
             payload = Path(evidence['retained_path']).read_bytes()
+            original_ref = original['evidence'].get('execution-evidence.bin')
+            if original_ref:
+                original_payload = Path(original_ref['retained_path']).read_bytes()
+                if sha(original_payload) != original_ref['sha256']:
+                    return False
+                original_artifacts = json.loads(original_payload).get('artifacts', {})
+                if original_artifacts.get('inputs'):
+                    from benchmarks.a5kernels.evidence import canonical_bytes
+                    planned = plan.get('case_inputs', {}).get(retry['original_spec']['project_id'])
+                    if planned is None or sha(canonical_bytes(planned)) != original_artifacts['inputs']:
+                        return False
+                    actual_artifacts = json.loads(payload).get('artifacts', {})
+                    for role in ('inputs', 'expected'):
+                        digest = original_artifacts[role]
+                        if actual_artifacts.get(role) != digest:
+                            return False
+                        artifact = Path(evidence['retained_path']).parent / 'artifacts' / 'objects' / digest[:2] / digest[2:]
+                        if sha(artifact.read_bytes()) != digest:
+                            return False
             return (outcome.get('verified') is True
                     and outcome.get('wave_fingerprint') == plan['wave_fingerprint']
                     and outcome.get('project_id') == retry['original_spec']['project_id']
