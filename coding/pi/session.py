@@ -20,7 +20,7 @@ from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_IDENTITY = {"coding_engine": "pi", "pi_version": "1.3.0",
-                   "adapter_version": 2, "context_policy": "host-records-v1",
+                   "adapter_version": 2, "context_policy": "host-records-v2",
                    "budget_policy": "elapsed-time-v1"}
 SYSTEM = (
     "You are the coding engine inside a host-controlled kernel attempt. "
@@ -201,7 +201,8 @@ class PiCodingSession:
                "PI_CODING_AGENT_DIR": str(directory), "PI_OFFLINE": "1",
                "RSI_PI_GATEWAY_TOKEN": self.gateway.token, "RSI_PI_TOOL_TOKEN": self.token,
                "RSI_PI_TOOL_URL": f"http://127.0.0.1:{server.server_port}",
-               "RSI_PI_SCHEMAS": str(directory / "schemas.json")}
+               "RSI_PI_SCHEMAS": str(directory / "schemas.json"),
+               "RSI_PI_REQUEST_BYTES": str(self.gateway.hard_bytes)}
         argv = [str(self.executable), "--mode", "rpc", "--no-session",
                 "--provider", "rsi-host", "--model", spec["model"],
                 "--thinking", "off" if self.gateway.provider == "deepseek" else "high",
