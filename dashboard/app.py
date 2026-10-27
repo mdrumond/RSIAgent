@@ -32,6 +32,10 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     register_optimizer(app, config_path, csrf_token, optimizer_launcher)
     from .feedback import register_feedback
     register_feedback(app, controls, csrf_token)
+    from .usefulness import register_usefulness
+    register_usefulness(app, controls)
+    from .presentation import register_presentation
+    register_presentation(app)
     from .subjects import register_subjects
     register_subjects(app, config_path)
     from .curriculum_controls import register_curriculum_controls

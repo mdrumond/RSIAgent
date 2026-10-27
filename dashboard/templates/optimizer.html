@@ -19,6 +19,6 @@
 <label>Time budget (seconds)<input name="max_seconds" type="number" min="1" value="7200" required></label></div>
 <button id="optimizer-start" disabled>Start optimization</button><p id="optimizer-message" role="status"></p>
 </form></details>
-<section><h2>Jobs</h2><div id="optimizer-jobs">{% for job in jobs %}<a class="card" href="{{ url_for('optimizer_job', job_id=job.job_id) }}"><b>{{ job.name or job.job_id }}</b> — {{ job.status }} / {{ job.stage }}</a>{% else %}<p>No optimization jobs yet.</p>{% endfor %}</div></section>
+<section><h2>Jobs</h2><div id="optimizer-jobs">{% for job in jobs %}<a class="card" href="{{ url_for('optimizer_job', job_id=job.job_id) }}"><b>{{ job.name or job.job_id }}</b> — {{ job.status }} / {{ job.stage }}{{ explain(job) }}</a>{% else %}<p>No optimization jobs yet.</p>{% endfor %}</div></section>
 {% endif %}<script src="{{ url_for('static', filename='optimizer.js') }}" defer></script>
 {% endblock %}

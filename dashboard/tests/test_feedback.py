@@ -1,6 +1,7 @@
 import hashlib
 import io
 import json
+from pathlib import Path
 from contextlib import redirect_stdout
 import subprocess
 import time
@@ -8,11 +9,20 @@ import time
 import pytest
 
 from dashboard.app import create_app
+from benchmarks.ascend.status_descriptions import describe_statuses
 
 
 def write(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value))
+
+
+def raw_fields(value):
+    if isinstance(value, list):
+        return [raw_fields(item) for item in value]
+    if isinstance(value, dict):
+        return {key: raw_fields(item) for key, item in value.items() if key != 'status_explanations'}
+    return value
 
 
 @pytest.fixture
@@ -47,6 +57,11 @@ def feedback(tmp_path):
     app.extensions['dashboard_controls'].close()
 
 
+def presented(row):
+    return describe_statuses({**row, 'lifecycle': 'failed', 'outcome': {
+        **row['outcome'], 'source_type': 'phase2', 'original_spec': row['outcome']['task']}})
+
+
 def submit(client, action, body):
     csrf = client.get('/api/csrf').get_json()['token']
     body['confirmation'] = f"{action}:{body.get('preset_id', 'phase2')}"
@@ -67,11 +82,14 @@ def completed(client, response):
 
 def test_feedback_readonly_separates_correctness_performance_and_investigation(feedback):
     client, app, config, row, calls = feedback
+    retained = config.parent / 'feedback' / (row['feedback_id'] + '.json')
+    original_bytes = retained.read_bytes()
     body = client.get('/feedback').get_data(as_text=True)
     assert 'verified-slow' in body and 'shortfall' in body and 'Host correctness:' in body
     assert 'original attempt attempt-001' in body and 'Investigation:</b> open' in body
-    assert client.get('/api/feedback').get_json() == [row]
+    assert client.get('/api/feedback').get_json() == [presented(row)]
     assert not calls
+    assert retained.read_bytes() == original_bytes
     settings = json.loads(config.read_text())
     settings['controls']['enabled'] = False
     write(config, settings)
@@ -79,7 +97,7 @@ def test_feedback_readonly_separates_correctness_performance_and_investigation(f
     try:
         view = readonly.test_client()
         assert 'data-feedback-action' not in view.get('/feedback').get_data(as_text=True)
-        assert view.get('/api/feedback').get_json() == [row]
+        assert view.get('/api/feedback').get_json() == [presented(row)]
         assert view.post('/api/control/investigate', json={}).status_code == 403
     finally:
         readonly.extensions['dashboard_controls'].close()
@@ -88,7 +106,7 @@ def test_feedback_readonly_separates_correctness_performance_and_investigation(f
 def test_import_and_bounded_phase1_use_existing_async_runner(feedback):
     client, app, config, row, calls = feedback
     completed(client, submit(client, 'import-feedback', {}))
-    assert calls[0][2:] == ['feedback-phase2', '--feedback-root',
+    assert calls[0][2:] == ['feedback', '--source-type', 'all', '--feedback-root',
                            str(config.parent / 'feedback'), '--dashboard-config', str(config)]
     completed(client, submit(client, 'investigate', dict(
         preset_id='phase1', feedback_ids=[row['feedback_id']], project_target=3)))
@@ -107,7 +125,8 @@ def test_retired_retry_is_refused_before_runner_and_preserves_history(feedback):
     assert calls == []
     assert not (config.parent / 'new2').exists()
     assert not (config.parent / 'control2').exists()
-    assert client.get('/api/feedback').get_json() == [row]
+    assert client.get('/api/feedback').get_json() == [presented(row)]
+
 
 
 @pytest.mark.parametrize('status', ['resolved', 'deferred'])
@@ -253,7 +272,7 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
         assert response.status_code == 409
         assert invocations == [] and screens == []
         assert not (root / 'control2').exists() and not (root / 'new2').exists()
-        assert client.get('/api/feedback').get_json() == [row]
+        assert raw_fields(client.get('/api/feedback').get_json()) == [row]
         return
     completed(client, response)
     if phase:
@@ -265,6 +284,57 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
         assert screens == ['collector', 'campaign']  # callbacks only; no processes launched
     else:
         assert not screens
+
+
+def test_phase1_original_missing_native_acceptance_rejected(feedback):
+    client, app, config, row, calls = feedback
+    row['outcome'].update(source_type='phase1', original_spec=None)
+    write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
+    assert submit(client, 'retry-feedback', dict(preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
+    assert not calls
+
+
+def test_failure_case_paging_download_and_legacy_unavailability(feedback):
+    client, app, config, row, calls = feedback
+    identifier = row['feedback_id']
+    base = f'/api/feedback/{identifier}'
+    legacy = client.get(base + '/failure-cases').get_json()[0]
+    assert not legacy['availability']['complete']
+    root = config.parent / 'feedback'
+    source = b'kernel source\n'
+    inputs = b'{"values":[' + b'1,' * 5000 + b'1]}'
+    refs = {}
+    for role, data in dict(source=source, inputs=inputs, expected=b'[2]', observed=b'[0]',
+                           diagnostics=b'index 0: expected 2; observed 0').items():
+        digest = hashlib.sha256(data).hexdigest()
+        path = root / 'retained' / digest
+        path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(data)
+        refs[role] = dict(sha256=digest, retained_path=str(path))
+    write(root / 'failure-cases' / (identifier + '.json'), [dict(schema='failure-case-v1',
+        classification='host-mismatch', description='Addition returned zeros.',
+        policy=dict(atol=1e-5), artifacts=refs)])
+    before = (root / (identifier + '.json')).read_bytes()
+    cases = client.get(base + '/failure-cases').get_json()
+    assert cases[0]['availability']['complete']
+    assert cases[0]['policy'] == dict(atol=1e-5)
+    assert cases[0]['status_explanations'][0]['code'] == cases[0]['classification']
+    url = base + '/failure-artifacts/' + refs['inputs']['sha256']
+    first = client.get(url).get_json()
+    assert first['size'] == len(inputs) and first['has_more']
+    second = client.get(url + '?offset=' + str(first['next_offset'])).get_json()
+    assert (first['text'] + second['text']).encode() == inputs and not second['has_more']
+    download = client.get(url + '/download')
+    assert download.data == inputs
+    assert download.headers['Content-Disposition'].startswith('attachment')
+    assert client.get(url + '?offset=-1').status_code == 409
+    assert client.get(base + '/failure-artifacts/' + 'f' * 64).status_code == 404
+    assert client.get('/feedback').status_code == 200
+    Path(refs['inputs']['retained_path']).write_bytes(b'corrupt')
+    unavailable = client.get(base + '/failure-cases').get_json()[0]
+    assert not unavailable['availability']['complete']
+    assert 'digest mismatch' in unavailable['availability']['reason']
+    assert client.get(url + '/download').status_code == 409
+    assert (root / (identifier + '.json')).read_bytes() == before and not calls
 
 
 def test_feedback_destinations_and_actions_exclude_retired_phase2(feedback):
@@ -312,7 +382,7 @@ def test_legacy_feedback_metadata_is_derived_without_rewriting_history(feedback,
     assert actual['lifecycle'] == lifecycle
     # Every original field remains identical, including investigation state and
     # retained host evidence; the defaults exist only in the public read view.
-    original = json.loads(json.dumps(actual))
+    original = raw_fields(actual)
     original.pop('lifecycle')
     original['outcome'].pop('source_type')
     original['outcome'].pop('original_spec')

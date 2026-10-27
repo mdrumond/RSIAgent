@@ -16,7 +16,7 @@ from optimizer.memory import verify_snapshot
 class OptimizerPhase2Coordinator:
     def __init__(self, root, objective, snapshot, complete, execution_factory, *,
                  query_knowledge=None, max_seconds=7200, max_practice_seconds=1800, clock=time.monotonic,
-                 selector=None, feedback_root=None, fixed_task=None):
+                 selector=None, feedback_root=None, fixed_task=None, usefulness_verifier=None):
         if selector is None:
             from .phase2_optimizer_tasks import select_optimizer_task
             selector = select_optimizer_task
@@ -27,8 +27,11 @@ class OptimizerPhase2Coordinator:
         self.feedback = FeedbackStore(feedback_root or self.root / 'feedback')
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
+        self.usefulness_verifier = usefulness_verifier
         self.fixed_task = fixed_task
         self.time = Phase2TimeBudget(self.root, max_seconds, max_practice_seconds, clock=clock)
+        if self.usefulness_verifier is not None:
+            self.usefulness_verifier.remaining_seconds = lambda: self.time.remaining
         seed_path = self.root / "seed-memory.json"
         if seed_path.exists():
             if json.loads(seed_path.read_bytes()) != snapshot:
@@ -224,11 +227,31 @@ class OptimizerPhase2Coordinator:
     def _directory(task):
         return "tasks/" + task["task_id"] + "-" + sha(canonical(task))[:12]
 
+    def _assess_committed(self, state):
+        if self.usefulness_verifier is None or not getattr(self.usefulness_verifier, 'enabled', True):
+            return
+        with self.time.active():
+            self._assess_committed_active(state)
+
+    def _assess_committed_active(self, state):
+        if self.usefulness_verifier is None or not getattr(self.usefulness_verifier, 'enabled', True):
+            return
+        for lesson in state["memory_entries"]:
+            index = next(i for i, row in enumerate(state["attempts"])
+                         if row["attempt_id"] == lesson["attempt_id"])
+            prior = dict(state, attempts=state["attempts"][:index], memory_entries=[entry
+                for entry in state["memory_entries"] if entry["attempt_id"] in {
+                    row["attempt_id"] for row in state["attempts"][:index]}])
+            self.usefulness_verifier.assess_lesson(lesson, canonical(self._memory(prior)),
+                lesson["attempt_id"], host_facts=[state["attempts"][index]])
+
     def _run(self, limit=None):
         with self.time.active():
             state = self._bootstrap()
         completed = 0
         self.feedback.import_campaign(self.root)
+        # Replay committed lessons after interrupted publication; experiment identities deduplicate.
+        self._assess_committed(state)
         while not state["terminal"]:
             if self.time.remaining <= 0:
                 state["terminal"] = dict(status="BUDGET_EXHAUSTED", reason="Phase 2 elapsed-time budget exhausted")
@@ -248,7 +271,8 @@ class OptimizerPhase2Coordinator:
                     executor.store.add_event(executor.job_id, 'phase2-prepare-request', dict(attempt_id=key))
                 with self.time.active(practice=pending["kind"] == "practice"):
                     executor.prepare()
-                    result = executor.attempt(key, memory_snapshot=self._memory(state),
+                    prior_memory = self._memory(state)
+                    result = executor.attempt(key, memory_snapshot=prior_memory,
                                               feedback=state["attempts"][-2:])
             except Exception:
                 self.feedback.import_campaign(self.root)
@@ -273,6 +297,7 @@ class OptimizerPhase2Coordinator:
             state["next_kind"] = "review"
             self._write("state.json", state)
             self.feedback.import_campaign(self.root)
+            self._assess_committed(state)
             (self.root / "pending.json").unlink()
             completed += 1
             if limit is not None and completed >= limit:

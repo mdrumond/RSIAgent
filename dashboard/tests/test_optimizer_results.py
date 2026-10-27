@@ -115,11 +115,12 @@ for (const status of ['running', 'budget-exhausted']) {
 for (const stage of ['evaluating', 'observation-unavailable']) {
   const nodes = new Map();
   const element = id => {
-    if (!nodes.has(id)) nodes.set(id, {dataset:{jobId:'job'}, addEventListener(){}, parentElement:{addEventListener(){}}});
+    if (!nodes.has(id)) nodes.set(id, {dataset:{jobId:'job'}, addEventListener(){}, replaceChildren(){}, parentElement:{addEventListener(){}}});
     return nodes.get(id);
   };
   vm.runInNewContext(source, {
     document:{querySelector:id=>id==='#optimizer-create'?null:element(id)},
+    window:{renderStatusExplanations(){}},
     crypto:{randomUUID:()=> 'id'}, setInterval(){},
     fetch:async()=>({ok:true,json:async()=>({status,stage,worker_active:active,handles:[],stop_requested:false})})
   });

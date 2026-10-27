@@ -76,6 +76,8 @@
     try {
       const result = await read('/results');
       summary.textContent = result.best ? `Best verified geomean speedup: ${number(result.best.speedup)}× · ${result.best.summary || ''}` : 'No fully verified candidate with complete timings yet.';
+      document.querySelector('#optimizer-results > .status-explanations')?.remove();
+      window.renderStatusExplanations(document.querySelector('#optimizer-results'), result);
       const cases = result.cases.map(row=>({...row,label:row.case}));
       chart('#optimizer-case-plot','CANNBot device latency',cases,
         [{key:'torch_us',label:'Torch reference'},{key:'ascendc_us',label:'Best Ascend C'}], 'Latency (µs)', 'Input case');
