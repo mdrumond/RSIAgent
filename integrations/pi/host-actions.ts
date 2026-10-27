@@ -15,6 +15,7 @@ async function host(name: string, args: unknown, signal?: AbortSignal) {
 
 export default function (pi: ExtensionAPI) {
   const schemas = JSON.parse(readFileSync(process.env.RSI_PI_SCHEMAS!, "utf8"));
+  const requestBytes = Number(process.env.RSI_PI_REQUEST_BYTES ?? 49152);
   for (const [name, parameters] of Object.entries(schemas)) {
     pi.registerTool(defineTool({
       name, label: name,
@@ -78,7 +79,7 @@ export default function (pi: ExtensionAPI) {
         const size = wireBound(exchange);
         // The current snapshot and latest complete exchange stay mandatory.
         // Admit older exchanges only below the gateway's complete request cap.
-        if (exchanges.length && bytes + size > 49152) continue;
+        if (exchanges.length && bytes + size > requestBytes) continue;
         exchanges.push(exchange);
         bytes += size;
         keys.forEach(key => pages.add(key));

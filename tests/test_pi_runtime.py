@@ -29,6 +29,27 @@ def stream(tool, args, index=0, finish='tool_calls'):
     return Response()
 
 
+def responses_stream(tool, args, index=0):
+    class Response:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def iter_lines(self):
+            reasoning = {'type':'reasoning','id':f'rs_{index}','summary':[], 'encrypted_content':'opaque'}
+            call = {'type':'function_call', 'id':f'fc_{index}', 'call_id':f'call_{index}','name':tool,
+                    'arguments':json.dumps(args), 'status':'completed'}
+            events = [{'type':'response.created','response':{'id':f'resp_{index}'}}]
+            for i, item in enumerate([reasoning, call]):
+                events += [{'type':'response.output_item.added','output_index':i,'item':item},
+                           {'type':'response.output_item.done','output_index':i,'item':item}]
+            events.append({'type':'response.completed','response':{'id':f'resp_{index}','status':'completed',
+                'output':[reasoning,call],'usage':{'input_tokens':100,'output_tokens':40,
+                'input_tokens_details':{'cached_tokens':20},'output_tokens_details':{'reasoning_tokens':30}}}})
+            for event in events:
+                yield b'data: '+json.dumps(event).encode(); yield b''
+    return Response()
+
+
 def session(**kwargs):
     try:
         runtime_preflight()
@@ -243,25 +264,8 @@ def test_openai_responses_uses_registered_profile_and_counts_subsets(monkeypatch
     try: runtime_preflight()
     except RuntimeError: pytest.skip('Pi runtime unavailable')
     captured = []
-    class Response:
-        status_code = 200
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def iter_lines(self):
-            reasoning = {'type':'reasoning','id':'rs_0','summary':[], 'encrypted_content':'opaque'}
-            call = {'type':'function_call', 'id':'fc_0', 'call_id':'call_0','name':'write',
-                    'arguments':json.dumps({'source':'kernel'}), 'status':'completed'}
-            events = [{'type':'response.created','response':{'id':'resp_0'}}]
-            for i, item in enumerate([reasoning, call]):
-                events += [{'type':'response.output_item.added','output_index':i,'item':item},
-                           {'type':'response.output_item.done','output_index':i,'item':item}]
-            events.append({'type':'response.completed','response':{'id':'resp_0','status':'completed',
-                'output':[reasoning,call],'usage':{'input_tokens':100,'output_tokens':40,
-                'input_tokens_details':{'cached_tokens':20},'output_tokens_details':{'reasoning_tokens':30}}}})
-            for event in events:
-                yield b'data: '+json.dumps(event).encode(); yield b''
     def provider(*_, **kwargs):
-        captured.append(json.loads(kwargs['data'])); return Response()
+        captured.append(json.loads(kwargs['data'])); return responses_stream('write', {'source':'kernel'})
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with PiCodingSession(model='openai/gpt-5.6-sol', schemas={'write':obj({'source':STRING})},
                          environ={'OPENAI_API_KEY':'fake'}, deadline=time.monotonic()+30) as pi:
@@ -447,4 +451,37 @@ def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(mo
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with session() as pi:
         assert pi.next_action(context, ['write']) == ('write', {'source': 'selected after bounded paging'})
+    assert len(requests) == 3
+
+
+def test_real_pi_openai_large_snapshot_retains_multiple_pages_within_configured_cap(monkeypatch):
+    try: runtime_preflight()
+    except RuntimeError: pytest.skip('Pi runtime unavailable')
+    requests = []
+    context = {'guide': 'paged-content-' * 2000,
+               'fields': {f'field-{index}': 'retained-' * 100 for index in range(64)}}
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        assert len(kwargs['data']) <= 196608
+        user = next(row for row in request['input'] if row.get('role') == 'user')
+        text = user['content'] if isinstance(user['content'], str) else user['content'][0]['text']
+        snapshot = json.loads(text)
+        assert len(text.encode()) > 49152
+        assert snapshot['context']['host']['fields'] == context['fields']
+        index = len(requests) - 1
+        retained = [json.loads(row['output']) for row in request['input']
+                    if row.get('type') == 'function_call_output']
+        assert [row['offset'] for row in retained] == [offset * 4096 for offset in range(index)]
+        calls = {row['call_id'] for row in request['input'] if row.get('type') == 'function_call'}
+        assert calls == {row['call_id'] for row in request['input']
+                         if row.get('type') == 'function_call_output'}
+        if index == 2:
+            return responses_stream('write', {'source': 'selected with both pages'}, index)
+        return responses_stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
+                                offset=index * 4096, limit=4096), index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with PiCodingSession(model='openai/gpt-5.6-sol', schemas={'write': obj({'source': STRING})},
+                         environ={'OPENAI_API_KEY': 'fake-provider-secret'}, deadline=time.monotonic()+30) as pi:
+        assert pi.next_action(context, ['write']) == ('write', {'source': 'selected with both pages'})
     assert len(requests) == 3
