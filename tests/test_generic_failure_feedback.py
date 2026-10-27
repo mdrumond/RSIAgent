@@ -420,3 +420,100 @@ def test_curriculum_discovers_and_pages_only_selected_failure_cases(tmp_path, mo
     Path(cases[0]['artifacts']['observed']['retained_path']).write_bytes(b'changed')
     with pytest.raises(ValueError):
         curriculum.read(observed)
+
+
+
+def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(tmp_path):
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent, Backend, candidate
+    body = dict(files={}, memory_entries=[{'lesson': 'Retained context'}],
+                source_identity=dict(target='a3', language='ascend-c'))
+    jobs = JobStore(tmp_path / 'jobs')
+    job = jobs.create('def forward(x): return x', 'forward',
+        {'args': [{'shape': [5], 'dtype': 'float32'}]},
+        dict(body, snapshot_id=sha(canonical(body))))
+    key = job['job_id']
+    readable = jobs.put_artifact(key, 'retained-context', b'Actual context bytes')
+
+    class FailingBackend(Backend):
+        def compile(self, source, directory, *, block_count):
+            return {'status': 'compile-error', 'stderr': 'Observed compile diagnostic'}
+        def evaluate(self, source, directory, *, block_count):
+            self.evaluations.append(source)
+            return dict(status='incorrect', suite_sha256='suite', cases=[],
+                candidate_sha256=sha(source.encode()), failure_case=dict(
+                    schema='failure-case-v1', classification='host-mismatch',
+                    description='Observed zero differs from expected one',
+                    inputs={'x': [1]}, expected={'output': [1]}, observed={'output': [0]}))
+
+    backend = FailingBackend()
+    actions = [dict(action='cases', signatures=[], summary='Retain frozen input'),
+        dict(action='read-memory', index=0),
+        dict(action='read-artifact', sha256=readable['sha256'], offset=0),
+        dict(action='query-knowledge', query='First retrieval'),
+        dict(action='compile', source='compile probe', block_count=1, summary='Read compiler error'),
+        candidate('bad-one'), dict(action='query-knowledge', query='Second retrieval'),
+        candidate('bad-two'), dict(action='read-memory', index=0),
+        dict(action='finish', summary='Retained failed candidates')]
+    result = OptimizationLoop(jobs, key, Agent(actions), backend).run()
+    assert result['status'] == 'completed' and backend.evaluations == ['bad-one', 'bad-two']
+    history = OptimizationLoop(jobs, key, Agent([]), backend).state['history']
+    assert [row.get('tool', {}).get('action') for row in history if 'tool' in row] == [
+        'read-memory', 'read-artifact', 'query-knowledge', 'compile', 'query-knowledge', 'read-memory']
+    store = FeedbackStore(tmp_path / 'feedback')
+    report = store.import_optimizer(jobs.root)
+    assert report['imported'] == 3 and report['warnings'] == []
+    records = store.records()
+    assert sum(row['outcome']['attempt_id'] == key for row in records) == 1
+    candidates = [row for row in records if ':candidate:' in row['outcome']['attempt_id']]
+    assert {row['outcome']['result']['source_sha256'] for row in candidates} == {
+        sha(b'bad-one'), sha(b'bad-two')}
+    assert all(store.failure_cases(row['feedback_id'])[0]['availability']['complete'] for row in candidates)
+    repeated = store.import_optimizer(jobs.root)
+    assert repeated['existing'] == 3 and repeated['warnings'] == []
+
+
+def test_a5_production_identity_imports_selects_and_authenticates_original_retry(tmp_path, capsys):
+    from benchmarks.a5kernels.phase1_adaptive_production import _bind_campaign_identity
+    from benchmarks.ascend.campaign_cli import main
+    from benchmarks.ascend.failure_curriculum import select_feedback
+    from test_a5_phase1_adaptive_production import _cell
+    from test_a5_phase1_wave_runtime import project
+
+    identity_root = tmp_path / 'producer'
+    _bind_campaign_identity(identity_root, _cell())
+    identity = (identity_root / 'campaign-identity.json').read_bytes()
+    original_spec = project('original').as_dict()
+    roots = dict(original=tmp_path / 'original', changed=tmp_path / 'changed', retry=tmp_path / 'retry')
+    for name, root in roots.items():
+        phase1(root, verified=name != 'original',
+               spec=project('different').as_dict() if name == 'changed' else original_spec)
+        (root / 'campaign-identity.json').write_bytes(identity)
+    feedback_root = tmp_path / 'feedback'
+    main(['feedback', '--source-type', 'phase1', '--feedback-root', str(feedback_root),
+          '--source-root', str(roots['original'])], screen=lambda *args: pytest.fail('import dispatched work'))
+    report = json.loads(capsys.readouterr().out)['reports'][0]
+    assert report['imported'] == 1
+    selection = select_feedback(feedback_root, 'a5')
+    original = selection['selected'][0]
+    assert (original['outcome']['target'], original['outcome']['language']) == ('a5', 'catlass-dsl')
+    assert original['outcome']['original_spec'] == original_spec
+    store = FeedbackStore(feedback_root)
+    ids = {}
+    for name in ('changed', 'retry'):
+        assert store.import_phase1(roots[name])['imported'] == 1
+        ids[name] = next(row['feedback_id'] for row in store.records()
+                         if row['outcome']['source_root'] == str(roots[name].resolve()))
+    assert store.link_original_retry(original['feedback_id'], ids['changed'])['lifecycle'] == 'failed'
+    assert store.link_original_retry(original['feedback_id'], ids['retry'])['lifecycle'] == 'fixed'
+    assert all((root / 'campaign-identity.json').read_bytes() == identity for root in roots.values())
+
+
+@pytest.mark.parametrize('identity,target,language', [
+    ({'schema': 'future-production-v2', 'cell': {'target': 'a5', 'language': 'catlass-dsl'}}, 'unknown', 'unknown'),
+    ({'schema': 'a5-phase1-production-identity-v1', 'cell': {'target': 'a5', 'language': 'other'}}, 'unknown', 'unknown'),
+    ({'target': 'native-a5', 'language': 'catlass-dsl'}, 'a5', 'catlass-dsl'),
+    ({'target': 'native-a3', 'language': 'ascend-c'}, 'a3', 'ascend-c'),
+])
+def test_identity_normalization_keeps_unknown_schemas_and_existing_aliases(tmp_path, identity, target, language):
+    assert FeedbackStore._identity(tmp_path, None, None, identity) == (target, language)
