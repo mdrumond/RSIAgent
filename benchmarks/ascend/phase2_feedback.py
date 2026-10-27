@@ -136,11 +136,11 @@ class FeedbackStore:
         }.get(record['investigation']['status'], 'failed')
         return record
 
-    def read_evidence(self, digest, offset=0, limit=8192):
+    def read_evidence(self, digest, offset=0, limit=8192, *, records=None):
         """Authenticate a locally retained linked artifact, then return one text page."""
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('evidence page requires nonnegative offset and limit 1..8192')
-        refs = [ref for record in self.records() for ref in record['outcome']['evidence'].values()
+        refs = [ref for record in (self.records() if records is None else records) for ref in record['outcome']['evidence'].values()
                 if ref['sha256'] == digest]
         for ref in refs:
             try:
