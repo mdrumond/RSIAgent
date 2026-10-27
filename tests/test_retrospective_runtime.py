@@ -29,7 +29,7 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device
             self.options = options
             self.remaining_seconds = options['remaining_seconds']
             self.runtime_identity = dict(target=options['target'], runtime=options['runtime'], physical_device=options['physical_device'])
-        def recover_owned_operations(self): pass
+        def recover_owned_operations(self, **kwargs): pass
         def run_remote(self, *args, **kwargs):
             return SimpleNamespace(returncode=0, job_handle='remote:registry-target:job:health', stdout=json.dumps({
                 'queries':{kind:{'exit':0, 'text':text} for kind,text in {

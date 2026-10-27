@@ -82,3 +82,11 @@ def test_shared_admission_scope_preserves_existing_experiment_identity(tmp_path)
     resumed = build_subject_campaign({'native_operation_root':str(options['root'])}, **options)
     resumed.memory_gate.close()
     assert (options['root']/'subject-runtime.json').read_bytes() == before
+
+
+@pytest.mark.parametrize('field', ['model','guide','source_revision'])
+def test_allocation_migration_rejects_changed_frozen_semantics(tmp_path, field):
+    original = raw(0, **{field:'original'})
+    admit_identity(tmp_path, {'target':'a3'}, {'config':original})
+    with pytest.raises(ValueError,match='settings or target'):
+        admit_identity(tmp_path, {'target':'a3'}, {'config':raw(2, **{field:'changed'})})
