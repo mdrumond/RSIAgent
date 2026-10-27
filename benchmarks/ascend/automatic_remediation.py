@@ -299,4 +299,10 @@ def optimizer_retry_adapter(runner, store, config):
         from .phase2_feedback import _category
         outcome['category'] = _category(outcome['task'], result)
         store._put(outcome, report['warnings'])
+        refs = {}
+        source = outcome['evidence'].get('candidate')
+        if source:
+            refs['source'] = dict(source, retained_path=str(
+                executor.store.artifact_path(executor.job_id, source['sha256'])))
+        store._retain_failure_cases(outcome, store._optimizer_failure_case(result.get('result', {}), refs))
     return retry

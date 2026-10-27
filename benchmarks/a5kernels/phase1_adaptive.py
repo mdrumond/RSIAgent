@@ -575,6 +575,7 @@ class AdaptivePhase1Coordinator:
             inputs,
             oracle,
             failure_context=failure_context,
+            memory_root=self.root,
             remaining_seconds=(self.automatic_remediation.project_remaining(request)
                                if self.automatic_remediation else self._remaining_seconds()),
         ))
