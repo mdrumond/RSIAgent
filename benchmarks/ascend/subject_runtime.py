@@ -505,6 +505,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
         if bound.get('environment_check_cache'):
             arm_settings['environment_check_cache'] = bound['environment_check_cache']
+        if bound.get('native_operation_root'):
+            arm_settings['native_operation_root'] = bound['native_operation_root']
         if optimizer_config is not None:
             arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
             for key in ('cache_directory', 'compile_cache_directory'):

@@ -148,3 +148,25 @@ def test_admission_recovers_owned_handle_before_deciding_pending(tmp_path, monke
     transport.recover_owned_operations = recover
     admission(lambda:100)
     assert health == [1] and probes == ['probe']
+
+
+def test_shared_scope_keeps_owned_recovery_and_foreign_trial_blocking(tmp_path, monkeypatch):
+    admission, health, probes, transport = setup(tmp_path/'binding', monkeypatch)
+    admission.pending_root = tmp_path
+    own = admission.root/'operation.json'
+    own.write_text(json.dumps(dict(state='running', handle='remote:t:job:owned')))
+    other = tmp_path/'trial/runtime/operation.json'
+    other.parent.mkdir(parents=True)
+    other.write_text(json.dumps(dict(state='running', handle='remote:t:job:trial')))
+    recovered = []
+    def recover():
+        recovered.append('owned')
+        own.write_text(json.dumps(dict(state='completed', handle='remote:t:job:owned')))
+    transport.recover_owned_operations = recover
+    with pytest.raises(ProjectInfrastructureError, match='unsettled'):
+        admission(lambda:100)
+    assert recovered == ['owned'] and not health and not probes
+    assert json.loads(other.read_text())['state'] == 'running'
+    other.write_text(json.dumps(dict(state='cancelled', handle='remote:t:job:trial')))
+    admission(lambda:100)
+    assert recovered == ['owned','owned'] and health == [1] and probes == ['probe']
