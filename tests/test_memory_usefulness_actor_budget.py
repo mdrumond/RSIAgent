@@ -145,3 +145,49 @@ def test_request_binding_cannot_extend_a_shorter_actor_limit():
     actor = DirectActorDriver(provider, max_seconds=3, clock=lambda: 1).with_time_budget(10)
     actor._complete(_ProviderEvidenceRecorder(None), direct_profile(MODEL_IDENTITIES[0]), [], stage='action', turn=1)
     assert calls == [3] and actor.max_seconds == 3
+
+
+@pytest.mark.parametrize('uncertain', [False, True])
+def test_native_pool_reuses_only_host_admission_timeout(tmp_path, monkeypatch, uncertain):
+    import benchmarks.a5kernels.phase1_adaptive_actor as adaptive
+    from benchmarks.ascend.production import NativeProjectPool
+    from benchmarks.a5kernels.phase1_wave_runtime import ProjectAdmissionTimeout
+    now, calls = [0.0], []
+    backend = SourceBackend()
+    actions = [dict(write=dict(slot='kernel', content='fixed source')), dict(run={}), dict(submit={}),
+               dict(distillation=dict(no_new_knowledge=True, lessons=[]))]
+    def transport(**options):
+        calls.append(options)
+        if uncertain:
+            raise TimeoutError('remote response lost after dispatch')
+        return DirectCompletion(json.dumps(actions[len(calls)-1]), 1)
+    provider = DirectCompletionProvider(ENV, transport=transport, clock=lambda: now[0])
+    actor = DirectActorDriver(provider, clock=lambda: now[0])
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path/'events.jsonl'))
+    request = replace(_request(tmp_path, executor), remaining_seconds=1, publish_learning=False)
+    prepare = executor.prepare
+    def setup(spec):
+        prepared = prepare(spec)
+        if not uncertain:
+            now[0] += 2
+        return prepared
+    monkeypatch.setattr(executor, 'prepare', setup)
+    monkeypatch.setattr(adaptive.time, 'monotonic', lambda: now[0])
+    pool = NativeProjectPool([AdaptiveActorProjectExecutor(executor, actor, direct_profile(MODEL_IDENTITIES[0]))])
+    from benchmarks.a5kernels.phase1_live import InfrastructureFailure
+    with pytest.raises(InfrastructureFailure if uncertain else ProjectAdmissionTimeout) as failure:
+        pool(request)
+    main_request = replace(request, publish_learning=True, remaining_seconds=10,
+                           branch_root=tmp_path/'ordinary')
+    if uncertain:
+        assert not isinstance(failure.value, ProjectAdmissionTimeout)
+        with pytest.raises(RuntimeError, match='settle retained operations'):
+            pool(main_request)
+        assert len(calls) == 1 and pool.failure is failure.value
+    else:
+        assert isinstance(failure.value, ProjectAdmissionTimeout)
+        assert calls == [] and backend.requests == [] and backend.run_requests == []
+        assert pool.failure is None
+        result = pool(main_request)
+        assert result.evidence.verified and len(backend.run_requests) == 1
+        assert len(calls) == 4 and pool.failure is None

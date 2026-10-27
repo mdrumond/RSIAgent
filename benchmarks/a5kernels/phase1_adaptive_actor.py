@@ -600,6 +600,9 @@ class AdaptiveActorProjectExecutor:
             execute_action = _ObservedActions(actions, observe_action)
         try:
             if not request.publish_learning:
+                from benchmarks.a5kernels.phase1_wave_runtime import ProjectAdmissionTimeout
+                if time.monotonic() >= actions.deadline:
+                    raise ProjectAdmissionTimeout("record-only project admission time budget exhausted")
                 from benchmarks.a5kernels.phase1_provider import DirectActorDriver
                 if isinstance(actor, DirectActorDriver):
                     actor = actor.with_time_budget(actions.deadline - time.monotonic())
