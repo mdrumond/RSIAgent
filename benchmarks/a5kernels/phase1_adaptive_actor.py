@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import time
 from pathlib import Path
@@ -530,6 +530,15 @@ class AdaptiveActorProjectExecutor:
             raise TypeError("request must be AdaptiveProjectRequest")
         if type(request.publish_learning) is not bool:
             raise TypeError("publish_learning must be boolean")
+        if request.actor_memory_delivery not in {"indexed", "kdb-only"}:
+            raise ValueError("actor_memory_delivery must be indexed or kdb-only")
+        if request.actor_memory_delivery == "kdb-only" and self.query_knowledge is disabled_knowledge_action:
+            raise ValueError("kdb-only Actor memory delivery requires enabled KDB retrieval")
+        if request.actor_memory_delivery == "kdb-only" and json.loads(request.pre_wave_memory).get("initial_memory"):
+            raise ValueError("kdb-only Actor memory delivery does not support nonempty initial memory")
+        # The host keeps the retrieval snapshot on request. Only this presentation
+        # is admitted into the Actor's context/artifact namespace before a query.
+        presented_memory = b"{}" if request.actor_memory_delivery == "kdb-only" else request.pre_wave_memory
         started = time.monotonic()
         remaining = getattr(request, "remaining_seconds", None)
         if remaining is not None and remaining <= 0:
@@ -557,7 +566,7 @@ class AdaptiveActorProjectExecutor:
             raise ValueError("request spec, inputs, or oracle differ from rematerialized project")
         root = Path(request.branch_root)
         artifacts = ContentAddressedArtifacts(root / "artifacts")
-        memory_sha256 = artifacts.put_bytes(request.pre_wave_memory)
+        memory_sha256 = artifacts.put_bytes(presented_memory)
         actions = _ProjectActions(
             executor, request, prepared, artifacts,
             max_actions=self.max_actions, max_seconds=max(0.001, max_seconds-(time.monotonic()-started)), max_source_bytes=self.max_source_bytes,
@@ -568,7 +577,21 @@ class AdaptiveActorProjectExecutor:
         )
         actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
-        actions.read_artifacts = MemoryArtifactReader(request, artifacts)
+        withheld = set()
+        if request.actor_memory_delivery == "kdb-only":
+            import hashlib
+            from benchmarks.ascend.subject_knowledge import memory_artifacts
+            from benchmarks.ascend.subject_memory import digest as memory_digest
+            withheld.add(hashlib.sha256(request.pre_wave_memory).hexdigest())
+            envelope = json.loads(request.pre_wave_memory)
+            if envelope.get('schema') == 'subject-memory-snapshot-v1':
+                withheld.add(hashlib.sha256(envelope['initial_memory'].encode()).hexdigest())
+                for record in envelope['memories']:
+                    withheld.update(memory_artifacts(record))
+                    withheld.add(memory_digest(record))
+                    withheld.add(hashlib.sha256(canonical_bytes(record["proposal"])).hexdigest())
+        actions.read_artifacts = MemoryArtifactReader(replace(request, pre_wave_memory=presented_memory), artifacts,
+            withheld=withheld, admitted=actions.admitted)
         if actions.failure_context is not None:
             from benchmarks.ascend.failure_handoff import FailureArtifactReader
             actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
@@ -603,7 +626,7 @@ class AdaptiveActorProjectExecutor:
                         "requirement; repair it and host-verify your current source. Do not invent "
                         "a new mismatch. Incompatible cases are context only.\n")
         opening += prepared.instruction + "\nPre-wave memory (immutable, readable index): " + json.dumps(
-            memory_presentation(request.pre_wave_memory, artifacts),
+            memory_presentation(presented_memory, artifacts),
             sort_keys=True, separators=(",", ":"))
         opening += ('\nInspect full retained evidence or memory with '
                     '{"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}. '
