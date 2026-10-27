@@ -421,3 +421,30 @@ def test_actor_inherits_executor_deadline_and_preserves_clock_on_clone(monkeypat
         turn_parser=None, action_executor=SimpleNamespace(deadline=9))
     assert outcome.status == 'time-budget-exhausted'
     assert active.deadline == active.gateway.deadline == 9
+
+
+def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
+    requests = []
+    context = {'guide': 'Page contents. ' * 2000,
+               'quoted': {f'field-{index}': '\\"' * 240 for index in range(16)}}
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        snapshot = json.loads(next(row['content'] for row in request['messages'] if row['role'] == 'user'))
+        assert snapshot['context']['host']['quoted'] == context['quoted']
+        index = len(requests) - 1
+        retained = [json.loads(row['content']) for row in request['messages'] if row['role'] == 'tool']
+        if index:
+            assert any(row['offset'] == (index - 1) * 7400 for row in retained)
+        if index == 2:
+            assert [row['offset'] for row in retained] == [7400]
+            calls = {call['id'] for row in request['messages'] for call in row.get('tool_calls', [])}
+            assert calls == {row['tool_call_id'] for row in request['messages'] if row['role'] == 'tool'}
+            return stream('write', {'source': 'selected after bounded paging'}, index)
+        return stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
+                                          offset=index * 7400, limit=7400), index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action(context, ['write']) == ('write', {'source': 'selected after bounded paging'})
+    assert len(requests) == 3
