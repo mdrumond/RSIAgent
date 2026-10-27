@@ -569,6 +569,9 @@ class AdaptiveActorProjectExecutor:
         actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
         actions.read_artifacts = MemoryArtifactReader(request, artifacts)
+        if actions.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureArtifactReader
+            actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
         repair_protocol = ''
         if request.spec.failure_mode is not FailureMode.NONE:
             repair_protocol = (
@@ -584,10 +587,6 @@ class AdaptiveActorProjectExecutor:
                 'failure, repair it, verify again, then submit; do not loop over passing runs '
                 'or repeat submit without supplying the missing evidence.\n'
             )
-
-        if actions.failure_context is not None:
-            from benchmarks.ascend.failure_handoff import FailureArtifactReader
-            actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "
