@@ -383,3 +383,41 @@ def test_expired_legacy_137_is_held_without_rewriting_or_resubmitting(tmp_path, 
     assert (directory/'command.sh').read_bytes() == script
     assert (directory/'command.json').read_bytes() == payload
     assert len([call for call in remote.calls if call[2]=='run']) == 1
+
+
+def test_real_launcher_kills_surviving_descendant_after_leader_exits(tmp_path):
+    import os
+    import signal
+    import sys
+    remote = Remote()
+    candidate = backend(tmp_path, remote, timeout=2)
+    ready = tmp_path/'descendant.pid'
+    parent = tmp_path/'parent.py'
+    descendant = "import os,pathlib,signal,time,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
+    parent.write_text("import pathlib,subprocess,sys,time\n"
+        + "subprocess.Popen([sys.executable,'-c'," + repr(descendant) + ",sys.argv[1]])\n"
+        + "while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.01)\n"
+        + "time.sleep(60)\n")
+    # Generate the actual remote launcher; the fixture transport does not execute it.
+    candidate.run_remote([sys.executable, str(parent), str(ready)], key='tree')
+    script = candidate.root/'tree/command.sh'
+    pid = None
+    try:
+        result = subprocess.run(('bash', str(script)), capture_output=True, text=True, timeout=17)
+        assert ready.exists(), result.stderr
+        pid = int(ready.read_text())
+        assert result.returncode == 124
+        status = Path(f'/proc/{pid}/stat')
+        # An orphan may briefly remain as a zombie until the system reaper runs.
+        settled = time.monotonic() + 1
+        while status.exists():
+            try: state = status.read_text().split(') ',1)[1].split()[0]
+            except FileNotFoundError: break
+            if state in ('X','Z'): break
+            if time.monotonic() >= settled: pytest.fail('deadline descendant remains alive')
+            time.sleep(0.01)
+    finally:
+        if pid is None and ready.exists(): pid = int(ready.read_text())
+        if pid is not None:
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
