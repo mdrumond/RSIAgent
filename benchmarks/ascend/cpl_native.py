@@ -228,7 +228,8 @@ class CplNativeCandidateBackend:
         script = directory / 'command.sh'
         command = directory / 'command.json'
         payload = json.loads(command.read_text()) if command.exists() else dict(
-            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance())
+            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance(),
+            launcher='process-group-v1')
         if payload['argv'] != [str(arg) for arg in argv]:
             raise ProjectInfrastructureError('retained CPL command changed')
         _save(command, payload)
@@ -251,7 +252,9 @@ class CplNativeCandidateBackend:
         arguments = ('run', self.target, '--runtime', self.runtime,
                      '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
         value = self._operation(key, arguments, kind='job', expires_at=payload['expires_at'])
-        if value['returncode'] == 124:
+        if (value['returncode'] == 124 or
+                value['returncode'] == 137 and payload.get('launcher') != 'process-group-v1'
+                and self.wall_clock() >= payload['expires_at']):
             raise _PendingObservation('CPL command execution allocation expired; retained handle '+value['handle'])
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
         result.job_handle = value['handle']

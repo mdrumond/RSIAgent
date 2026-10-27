@@ -386,3 +386,29 @@ def test_real_launcher_distinguishes_deadline_escalation_from_normal_137(tmp_pat
     else:
         assert candidate.run_remote(command, key='real').returncode == 137
     assert len([call for call in remote.calls if call[2]=='run']) == 1
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_expired_legacy_137_is_held_without_rewriting_or_resubmitting(tmp_path, legacy):
+    now = [1000.0]
+    remote = Remote()
+    remote.exit_code = 137
+    candidate = backend(tmp_path, remote, wall_clock=lambda:now[0])
+    argv = ['python', '-c', 'pass']
+    directory = candidate.root/'retained'
+    if legacy:
+        directory.mkdir(parents=True)
+        (directory/'command.json').write_text(json.dumps(dict(argv=argv, expires_at=1010.0)))
+        (directory/'command.sh').write_text("exec timeout --signal=TERM --kill-after=10s 10s python -c 'pass'\n")
+    assert candidate.run_remote(argv, key='retained').returncode == 137
+    script = (directory/'command.sh').read_bytes()
+    payload = (directory/'command.json').read_bytes()
+    now[0] = 2000.0
+    if legacy:
+        with pytest.raises(_PendingObservation, match='execution allocation expired'):
+            candidate.run_remote(argv, key='retained')
+    else:
+        assert candidate.run_remote(argv, key='retained').returncode == 137
+    assert (directory/'command.sh').read_bytes() == script
+    assert (directory/'command.json').read_bytes() == payload
+    assert len([call for call in remote.calls if call[2]=='run']) == 1
