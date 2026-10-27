@@ -43,8 +43,11 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
         CurriculumAgent(complete), execute, max_parallel=1, project_target=1)
     automatic = AutomaticRemediation(runner, target='a3')
     from types import SimpleNamespace
-    assessments = []
+    assessments, ordinary_assessments = [], []
     def assess(memory, prior, source_id):
+        if not source_id.startswith('original-retries/'):
+            ordinary_assessments.append(source_id)
+            return []
         linked = next(row for row in automatic.store.records() if
             row['outcome']['attempt_id'] == 'original' and row['outcome']['source_root'] == str(runner.root.resolve()))
         assert linked['lifecycle'] == 'fixed'
@@ -57,6 +60,7 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
                     r['outcome']['source_root'] == str(runner.root.resolve()) and
                     r['outcome']['attempt_id'] == 'original')
     assert original['lifecycle'] == 'fixed'
+    assert {'wave-002/probe', 'wave-002/control'} <= set(ordinary_assessments)
     assert [r.spec.project_id for r in executions].count('original') == 2
     retries = [r for r in executions if 'original-retries' in str(r.branch_root)]
     assert retries[0].spec == executions[0].spec
