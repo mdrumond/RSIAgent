@@ -263,15 +263,18 @@ def test_usefulness_lessons_have_independent_selection_budgets_and_resume_reuses
     assert len(calls) == 2
 
 
-@pytest.mark.parametrize('spent', [30, 90])
-def test_legacy_selection_layout_preserves_elapsed_allowance_on_resume(tmp_path, spent):
+@pytest.mark.parametrize('spent,interrupted', [(30, False), (90, False), (30, True)])
+def test_legacy_selection_layout_preserves_elapsed_allowance_on_resume(tmp_path, spent, interrupted):
+    import time
     from test_a5_phase1_curriculum_selector import context
     cfg, calls = config(tmp_path), []
     selection = context()
     legacy = (cfg.root / 'curriculum-librarian' /
               f'{selection.wave_index:03}-{selection.pre_wave_memory_sha256}')
     legacy.mkdir(parents=True)
-    old = canonical_bytes(dict(max_seconds=90, elapsed_seconds=spent, active_since=None))
+    active_since = time.time() - 20 if interrupted else None
+    inherited = spent + (20 if interrupted else 0)
+    old = canonical_bytes(dict(max_seconds=90, elapsed_seconds=spent, active_since=active_since))
     (legacy / 'librarian-budget.json').write_bytes(old)
     knowledge = NativeAdaptiveKnowledge(cfg, Embeddings(), completion(calls))
     knowledge.begin_selection(selection)
@@ -281,9 +284,9 @@ def test_legacy_selection_layout_preserves_elapsed_allowance_on_resume(tmp_path,
     assert result.search_details['status'] == ('complete' if spent < 90 else 'insufficient')
     assert len(calls) == (1 if spent < 90 else 0)
     if calls:
-        assert 0 < calls[0][1] <= 90 - spent
+        assert 0 < calls[0][1] <= 90 - inherited
     retained = json.loads((root / 'librarian-budget.json').read_bytes())
-    assert retained['elapsed_seconds'] >= spent and retained['active_since'] is None
+    assert retained['elapsed_seconds'] >= inherited and retained['active_since'] is None
     assert (legacy / 'librarian-budget.json').read_bytes() == old
     # A later begin must keep the new directory's accumulated charge.
     charged = canonical_bytes(dict(max_seconds=90, elapsed_seconds=90, active_since=None))
