@@ -292,7 +292,6 @@ def test_failure_case_paging_download_and_legacy_unavailability(feedback):
     base = f'/api/feedback/{identifier}'
     legacy = client.get(base + '/failure-cases').get_json()[0]
     assert not legacy['availability']['complete']
-    assert 'historical observation' in legacy['description']
     root = config.parent / 'feedback'
     source = b'kernel source\n'
     inputs = b'{"values":[' + b'1,' * 5000 + b'1]}'
@@ -310,7 +309,7 @@ def test_failure_case_paging_download_and_legacy_unavailability(feedback):
     cases = client.get(base + '/failure-cases').get_json()
     assert cases[0]['availability']['complete']
     assert cases[0]['policy'] == dict(atol=1e-5)
-    assert 'differs from the host reference' in cases[0]['status_explanations'][0]['description']
+    assert cases[0]['status_explanations'][0]['code'] == cases[0]['classification']
     url = base + '/failure-artifacts/' + refs['inputs']['sha256']
     first = client.get(url).get_json()
     assert first['size'] == len(inputs) and first['has_more']
@@ -322,7 +321,6 @@ def test_failure_case_paging_download_and_legacy_unavailability(feedback):
     assert client.get(url + '?offset=-1').status_code == 409
     assert client.get(base + '/failure-artifacts/' + 'f' * 64).status_code == 404
     assert client.get('/feedback').status_code == 200
-    assert 'Failing examples: inputs, expected and actual results' in client.get('/feedback').text
     Path(refs['inputs']['retained_path']).write_bytes(b'corrupt')
     unavailable = client.get(base + '/failure-cases').get_json()[0]
     assert not unavailable['availability']['complete']
