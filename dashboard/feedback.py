@@ -1,8 +1,9 @@
 """Small, read-only views of Phase 2 observations and investigation lineage."""
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
-from flask import abort, jsonify, render_template
+from flask import abort, jsonify, render_template, request, send_file
 
 from benchmarks.ascend.phase2_feedback import FeedbackStore
 
@@ -59,3 +60,29 @@ def register_feedback(app, controls, csrf_token):
             abort(404)
         except (ValueError, OSError):
             abort(409)
+
+    @app.get('/api/feedback/<identifier>/failure-cases')
+    def failure_cases(identifier):
+        if controls.feedback.get(identifier) is None:
+            abort(404)
+        return jsonify(FeedbackStore(controls.feedback.root).failure_cases(identifier))
+
+    @app.get('/api/feedback/<identifier>/failure-artifacts/<digest>')
+    @app.get('/api/feedback/<identifier>/failure-artifacts/<digest>/download')
+    def failure_artifact(identifier, digest):
+        if controls.feedback.get(identifier) is None:
+            abort(404)
+        store = FeedbackStore(controls.feedback.root)
+        try:
+            if request.path.endswith('/download'):
+                return send_file(BytesIO(store.failure_artifact_bytes(identifier, digest)),
+                                 mimetype='application/octet-stream', as_attachment=True,
+                                 download_name=f'{digest}.bin')
+            offset = int(request.args.get('offset', 0))
+            if offset < 0:
+                raise ValueError('offset must be nonnegative')
+            return jsonify(store.read_failure_artifact(identifier, digest, offset=offset, limit=8192))
+        except FileNotFoundError:
+            abort(404, description='This failing-example artifact is unavailable or is not linked to this failure.')
+        except (ValueError, OSError):
+            abort(409, description='The retained artifact could not be verified or the requested offset is invalid.')

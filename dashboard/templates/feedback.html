@@ -1,10 +1,11 @@
 {% extends "base.html" %}{% block body %}
-<h1>Phase 2 failure feedback</h1>
+<h1>Failure remediation</h1>
 <p>Observations are not verified reusable knowledge. Original results remain immutable; investigation status and linked retries are separate.</p>
 {% if not controls.feedback.root %}<p>Configure <code>feedback_root</code> to view imported outcomes.</p>{% endif %}
 {% if controls.enabled and controls.feedback.root %}<section class="control-panel">
-<button data-action="import-feedback" data-subject="phase2">Import configured Phase 2 results</button>
+<button data-action="import-feedback" data-subject="phase2">Import configured failures</button>
 <p>Use a fresh Phase 1 destination for an investigation. New Phase 2 launches and retries are retired; request new work through the subject curriculum. Historical results remain available below.</p>
+
 <form data-feedback-form>
 <label>Destination <select name="preset_id">{% for preset in controls.presets.values() %}{% if preset.target == 'a3' and preset.phase == 1 %}<option value="{{ preset.id }}">{{ preset.id }} (Phase {{ preset.phase }})</option>{% endif %}{% endfor %}</select></label>
 <label>Phase 1 project budget <input name="project_target" type="number" min="1" required></label>
@@ -14,16 +15,19 @@
 <article class="card" id="{{ row.feedback_id }}">
 {% if controls.enabled and controls.feedback.root and state.status not in ['resolved', 'deferred'] and outcome.category not in ['interrupted', 'verified-success', 'verified-timing-unknown'] and state.classification not in ['infrastructure', 'provider'] %}<label><input name="feedback_id" type="checkbox" value="{{ row.feedback_id }}"> Select failure</label>{% endif %}
 <h2>{{ outcome.task.task_id or outcome.attempt_id }}</h2>
+<p><b>Lifecycle:</b> {{ row.lifecycle or "successful control" }} · <b>Source:</b> {{ outcome.source_type or "phase2" }}</p>
 <p>{{ outcome.target }} / {{ outcome.language }} · {{ outcome.category }} · original attempt {{ outcome.attempt_id }}{% if not outcome.completed %} (interrupted, not completed){% endif %}</p>
 <p><b>Host correctness:</b> {{ 'verified' if outcome.verified else 'not verified' }}. <b>Performance:</b> {% if outcome.category == 'verified-slow' %}shortfall{% elif outcome.category == 'verified-success' %}goal met{% else %}unknown / not established{% endif %}{% if outcome.result.speedup is defined %} ({{ outcome.result.speedup }}×){% endif %}.</p>
 <p><b>Investigation:</b> {{ state.status }}{% if state.classification %} · {{ state.classification }}{% endif %}{% if state.reason %} — {{ state.reason }}{% endif %}</p>
+{{ explain(row) }}{{ explain(outcome) }}{{ explain(state) }}
 <p>Source: <code>{{ outcome.source_root }}</code></p>
-<details><summary>Original task and runtime</summary><pre>{{ outcome.task|tojson(indent=2) }}</pre><pre>{{ outcome.runtime|tojson(indent=2) }}</pre></details>
+<details class="failure-cases" data-failure-cases-url="{{ url_for('failure_cases', identifier=row.feedback_id) }}" data-artifact-base="/api/feedback/{{ row.feedback_id }}/failure-artifacts/"><summary>Failing examples: inputs, expected and actual results</summary><p class="failure-cases-status">Open to inspect retained failing examples. Missing historical evidence will be identified explicitly.</p><div class="failure-cases-content"></div></details>
+<details><summary>Original project and runtime</summary><pre>{{ outcome.task|tojson(indent=2) }}</pre><pre>{{ outcome.runtime|tojson(indent=2) }}</pre></details>
 {% for role, ref in outcome.evidence.items() %}<details class="trace-event" data-trace-url="{{ url_for('feedback_evidence', identifier=row.feedback_id, role=role) }}"><summary>{{ role }} · {{ ref.sha256 }} (bounded preview)</summary><pre class="trace-payload"></pre></details>{% endfor %}
 {% if state.projects %}<details open><summary>Investigation projects</summary>{% for item in controls.feedback.projects(row, controls.campaigns) %}{% if item.url %}<a href="{{ item.url }}">{{ item.record.project_id }}</a>{% endif %}<pre>{{ item.record|tojson(indent=2) }}</pre>{% endfor %}</details>{% endif %}
 {% if state.evidence %}<details><summary>Investigation evidence</summary><pre>{{ state.evidence|tojson(indent=2) }}</pre></details>{% endif %}
 {% if state.retries %}<p>Retries: {% for identifier in state.retries %}<a href="#{{ identifier }}">{{ identifier }}</a> {% endfor %}</p>{% endif %}
-</article>{% else %}<p>No imported outcomes. Nothing is launched automatically.</p>{% endfor %}
+</article>{% else %}<p>No imported outcomes. Automatic remediation is an optional campaign setting.</p>{% endfor %}
 {% if controls.enabled and controls.feedback.root %}</form></section>{% endif %}
-{% for operation in operations %}<p class="operation {{ operation.status }}">{{ operation.action }}: {{ operation.status }}{% if operation.error %} — {{ operation.error }}{% endif %}</p>{% endfor %}
+{% for operation in operations %}<p class="operation {{ operation.status }}">{{ operation.action }}: {{ operation.status }}{% if operation.error %} — {{ operation.error }}{% endif %}</p>{{ explain(operation) }}{% endfor %}
 {% endblock %}
