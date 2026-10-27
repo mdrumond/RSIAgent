@@ -739,7 +739,7 @@ class AdaptiveActorProjectExecutor:
             distillation = learned.distillation
             artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
         else:
-            # Subject campaigns delegate learning to an independent verifier.
+            # Subject campaigns and usefulness arms delegate learning independently.
             # The factual result is still compatible with legacy wave readers.
             distillation = AgentDistillation(True, (), tuple(sorted(actions.admitted)))
         assert actions.source_sha256 is not None

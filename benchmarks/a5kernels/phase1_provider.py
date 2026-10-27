@@ -172,10 +172,12 @@ def _is_openai_transport_failure(exc: Exception) -> bool:
 def openai_compatible_transport(*, base_url, api_key, request) -> DirectCompletion:
     from openai import OpenAI
 
+    request = dict(request)
+    timeout = request.pop("timeout", _PROVIDER_TIMEOUT_SECONDS)
     response = OpenAI(
         api_key=api_key,
         base_url=base_url,
-        timeout=_PROVIDER_TIMEOUT_SECONDS,
+        timeout=timeout,
         max_retries=0,
     ).chat.completions.create(
         **dict(request)
@@ -252,7 +254,7 @@ class DirectCompletionProvider:
         self,
         profile: DirectModelProfile,
         messages: Sequence[Mapping[str, str]],
-        *, attempt_observer=None,
+        *, attempt_observer=None, max_seconds=None,
     ) -> DirectCompletion:
         if profile != direct_profile(profile.identity):
             raise ValueError("provider profile is not canonical")
@@ -260,17 +262,31 @@ class DirectCompletionProvider:
             raise ValueError("provider credential is not configured for this model")
         if request_bytes(profile.request(messages)) > self.context_budget(profile).hard:
             raise ContextBudgetError("direct provider request exceeds context hard byte budget")
+        if max_seconds is not None:
+            if type(max_seconds) not in (int, float) or not math.isfinite(max_seconds):
+                raise ValueError("provider max_seconds must be finite seconds")
+            if max_seconds <= 0:
+                raise TimeoutError("provider request time allowance exhausted")
         request = profile.request(messages)
-        request_sha256 = canonical_digest(request)
-        deadline = self.clock() + self.retry_max_seconds
+        started = self.clock()
+        request_deadline = started + max_seconds if max_seconds is not None else None
+        retry_seconds = min(self.retry_max_seconds, max_seconds) if max_seconds is not None else self.retry_max_seconds
+        deadline = started + retry_seconds
         attempt = 0
         while True:
+            dispatched = dict(request)
+            if request_deadline is not None:
+                remaining = request_deadline - self.clock()
+                if remaining <= 0:
+                    raise TimeoutError("provider request time allowance exhausted")
+                dispatched["timeout"] = min(_PROVIDER_TIMEOUT_SECONDS, remaining)
+            request_sha256 = canonical_digest(dispatched)
             attempt += 1
             if attempt_observer is not None:
-                attempt_observer("request", {"attempt": attempt, "request": deepcopy(request),
+                attempt_observer("request", {"attempt": attempt, "request": deepcopy(dispatched),
                                              "request_sha256": request_sha256})
             try:
-                return self._complete_once(profile, request)
+                return self._complete_once(profile, dispatched)
             except ProviderRejectionError as exc:
                 retry = self.clock() + self.invalid_prompt_backoff_seconds < deadline
                 delay = self.invalid_prompt_backoff_seconds if retry else 0
