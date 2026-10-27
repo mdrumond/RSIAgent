@@ -173,7 +173,7 @@ def test_shared_scope_keeps_owned_recovery_and_foreign_trial_blocking(tmp_path, 
 
 
 @pytest.mark.parametrize('state', ['running','completed'])
-def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, state):
+def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, monkeypatch, state):
     import subprocess
     from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
     root = tmp_path/'campaign'
@@ -190,7 +190,16 @@ def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, 
     journal.parent.mkdir(parents=True)
     journal.write_text(json.dumps(dict(state='queued',handle='remote:fixture:job:trial',
         identity=dict(route=trial.runtime_identity,workspace=str(trial._workspace),arguments=[]))))
-    module.recover_campaign_operations(root,[foreground])
+    admission, health, probes, _ = setup(root/'foreground',monkeypatch)
+    admission.transports = (foreground,)
+    admission.pending_root = root
+    if state == 'running':
+        with pytest.raises(ProjectInfrastructureError,match='unsettled'):
+            admission(lambda:100)
+        assert not health and not probes
+    else:
+        admission(lambda:100)
+        assert health == [0] and probes == ['probe']
     assert len(calls) == 1 and json.loads(journal.read_text())['state'] == state
     from benchmarks.ascend.runtime_allocation import unsettled_operations
     assert bool(unsettled_operations(root)) == (state == 'running')
