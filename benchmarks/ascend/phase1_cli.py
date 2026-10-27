@@ -201,6 +201,11 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             hashlib.sha256(guide).hexdigest(), config["cpl_skills_revision"],
             tuple(config.get("dtypes", ["float32"])), kdb, collection,
             curriculum_kdb=config.get("curriculum_kdb", False),
+            adaptive_kdb=config.get("adaptive_kdb", False),
+            librarian_seconds=config.get("librarian_seconds", 90),
+            memory_kdb=Path(config["memory_kdb"]) if config.get("memory_kdb") else None,
+            memory_collection=config.get("memory_collection"),
+            memory_snapshot=Path(config["memory_snapshot"]) if config.get("memory_snapshot") else None,
             environment_identity=config["environment_identity"],
             profiling_mode=args.profiling, compiler_version=config.get("compiler_version"),
         )
