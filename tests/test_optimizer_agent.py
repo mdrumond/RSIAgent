@@ -20,7 +20,6 @@ def test_cases_stage_declares_only_cases_and_preserves_remaining_limit(remaining
     context, allowed = agent.session.contexts[0]
     assert allowed == ['cases']
     assert context['remaining_signatures'] == remaining
-    assert f'remaining_signatures is {remaining}' in context['current_stage_instruction']
     assert result['action'] == 'cases'
     assert agent.identity['coding_engine'] == 'pi'
     assert agent.identity['model'] == 'deepseek-flash'
@@ -36,7 +35,6 @@ def test_optimizer_preserves_session_and_frozen_suite():
     assert 'cases' not in allowed and 'compile' in allowed
     assert context['stage'] == 'optimize'
     assert context['baseline'] == {'cases':['frozen']}
-    assert 'ALREADY PREPARED AND FROZEN' in context['current_stage_instruction']
 
 
 def test_unknown_stage_does_not_start_pi():

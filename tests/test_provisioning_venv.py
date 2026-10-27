@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -13,7 +14,11 @@ from explore import provisioning as provision
 
 
 class LocalGuest:
+    def __init__(self, workspace):
+        self.stderr_path = Path(workspace) / 'proj_err'
+
     def run_command(self, command, timeout=None, cap=None):
+        command = command.replace('/tmp/proj_err', shlex.quote(str(self.stderr_path)))
         result = subprocess.run(['bash', '-c', command], capture_output=True,
                                 text=True, timeout=timeout, check=False)
         return result.stdout + result.stderr
@@ -42,7 +47,7 @@ def test_real_venv_round_trip_preserves_absolute_chained_and_directory_links(tmp
         'GUEST_EXPECTED': tmp_path / 'expected', 'GUEST_ACTUAL': tmp_path / 'actual',
     }.items():
         monkeypatch.setattr(provision, name, str(value))
-    vm, snapshot = LocalGuest(), tmp_path / 'snapshot'
+    vm, snapshot = LocalGuest(tmp_path), tmp_path / 'snapshot'
     assert provision.capture_project_materials(
         vm, 'venv', str(snapshot), guest_dirs=['evolution_project'], attempts=1)['ok']
     original_bytes = (snapshot / provision.MATERIALS).read_bytes()

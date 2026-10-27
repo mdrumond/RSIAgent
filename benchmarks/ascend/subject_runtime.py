@@ -141,9 +141,11 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
+    resumed_runtime = (root / 'subject-runtime.json').exists()
     from .runtime_allocation import admit_identity
     identity = admit_identity(root, dict(target=target, max_seconds=max_seconds,
-        settings_sha256=hashlib.sha256(canonical(settings)).hexdigest()),
+        settings_sha256=hashlib.sha256(canonical({key: value for key, value in settings.items()
+            if key != 'native_operation_root'})).hexdigest()),
         referenced_settings(settings, contents=True), previous=previous_runtime_configs)
     bound = compose(settings, target=target, root=root, initial_memory=initial_memory,
                     max_seconds=max_seconds)
@@ -161,9 +163,33 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             item for item in MODEL_IDENTITIES if item.backend_model.value == name))
         def complete(messages, *, remaining_seconds):
             return bounded_completion(provider, selected, messages, remaining_seconds)
+        complete.model = selected.identity.backend_model.value
         return complete
 
     curriculum_complete, verifier_complete = role_complete('curriculum'), role_complete('verifier')
+    from .pi_project_verifier import session_factory
+    verifier_identity_path = root / 'project-verifier-runtime.json'
+    verifier_settings = dict(settings)
+    saved_verifier = (json.loads(verifier_identity_path.read_bytes())
+                      if verifier_identity_path.exists() else {})
+    legacy_default = ('verifier_engine' not in settings and
+        (saved_verifier.get('engine_origin') == 'legacy-resume' or
+         resumed_runtime and not verifier_identity_path.exists()))
+    if legacy_default:
+        # Historical checkpoints retain their completion engine on resume.
+        verifier_settings['verifier_engine'] = 'completion'
+    verifier_sessions = session_factory(verifier_settings, provider, verifier_complete)
+    from coding.pi import ENGINE_IDENTITY
+    verifier_identity = dict(engine='pi' if verifier_sessions is not None else 'completion',
+        engine_origin='legacy-resume' if legacy_default else 'configured' if 'verifier_engine' in settings else 'provider-default',
+        model=verifier_complete.model, role='project-verifier',
+        runtime=dict(ENGINE_IDENTITY, context_policy='native-review-whole-request-v1',
+                     verifier_loop='native-reads-standalone-terminal-v1') if verifier_sessions is not None else None,
+        context_policy='native-review-whole-request-v1' if verifier_sessions is not None else 'bounded-messages-v1',
+        selection_policy='native-read-loop-standalone-terminal-v1' if verifier_sessions is not None else 'json-action-v1')
+    if saved_verifier and saved_verifier != verifier_identity:
+        raise ValueError('project verifier engine or model changed on resume')
+    atomic(verifier_identity_path, canonical(verifier_identity))
     paths, embeddings = bound.get('paths'), bound.get('embeddings')
     knowledge = SubjectKnowledge(root, store, lambda: campaign.memory, paths=paths, embeddings=embeddings,
         reference_query=getattr(bound['coordinator'].curriculum, 'query_knowledge', None))
@@ -194,7 +220,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             return super().review(request, **options)
 
     verifier = RuntimeVerifier(verifier_complete, knowledge.read_artifact,
-        query_knowledge=knowledge.query, request_check=check)
+        query_knowledge=knowledge.query, request_check=check, session_factory=verifier_sessions)
     optimizer_config = settings.get('optimizer_worker_config')
     if isinstance(optimizer_config, str):
         optimizer_config = json.loads(Path(optimizer_config).read_bytes())
@@ -241,8 +267,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
                             artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
             frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
+            manual = Path(directory) / 'manual-execution.json'
+            attempt_id = json.loads(manual.read_bytes())['attempt_id'] if manual.exists() else item['project_id']
             return executor.optimizer(directory, item['task']['task'], frozen,
-                attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
+                attempt_id=attempt_id, remaining_seconds=remaining_seconds, artifacts=store)
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
@@ -266,7 +294,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             target_contract = None
         recovery = item.get('recovery')
         if recovery is None:
-            return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
+                binding_root=root / 'binding')
         if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
                 or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
             raise ValueError('recovery requires a reason and retained artifact references')
@@ -279,7 +308,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         previous = actor.immutable_context
         actor.immutable_context = previous + b'\nOriginal failure context (not learned memory; read full registry by SHA): ' + canonical(preview)
         try:
-            return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
+                binding_root=root / 'binding')
         finally:
             actor.immutable_context = previous
 
@@ -413,6 +443,20 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign.review_retained = review_retained
     if 'check_environment' in bound:
         campaign.check_environment = bound['check_environment']
+    from .subject_editing import SubjectEdits, validate_project
+    def admit_edit(item):
+        observed_runtime = getattr(actor.executor, 'runtime_identity', None)
+        if item.get('task', {}).get('kind') == 'target' and observed_runtime is None:
+            raise ValueError('target approval requires an observed composed runtime')
+        validate_project(item, runtime=observed_runtime, policy=policy)
+        if item.get('task', {}).get('kind') == 'optimizer':
+            if target == 'a5' or optimizer_factory is None:
+                raise ValueError('optimizer projects are unavailable for this campaign runtime')
+        else:
+            policy.admit(ProjectSpec.from_mapping(item['spec']))
+        return item
+    campaign.curriculum_edits = SubjectEdits(root, campaign.scheduler, curriculum_complete,
+                                             validate_item=admit_edit, target_policy=policy)
     campaign.role_complete = role_complete
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
@@ -489,6 +533,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
         if bound.get('environment_check_cache'):
             arm_settings['environment_check_cache'] = bound['environment_check_cache']
+        if bound.get('native_operation_root'):
+            arm_settings['native_operation_root'] = bound['native_operation_root']
         if optimizer_config is not None:
             arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
             for key in ('cache_directory', 'compile_cache_directory'):
@@ -514,7 +560,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             model_identity=campaign.model_identity, runtime_identity=campaign.runtime_identity,
             max_seconds=settings.get('memory_trial_seconds', 1800),
             arm_seconds=settings.get('memory_arm_seconds', 600))
-        rewrite_agent = ProjectVerifierAgent(verifier_complete, knowledge.read_artifact, query_knowledge=knowledge.query)
+        rewrite_agent = ProjectVerifierAgent(verifier_complete, knowledge.read_artifact,
+            query_knowledge=knowledge.query, session_factory=verifier_sessions)
         def rewrite(request, *, feedback, max_seconds):
             try:
                 return rewrite_agent.review(request, feedback=feedback, max_seconds=max_seconds)
@@ -538,7 +585,7 @@ def main(argv=None, *, builder=build_subject_campaign):
     if args.action == 'report':
         from .memory_status import admission_report, review_report
         state = json.loads((args.root / 'subject-campaign.json').read_bytes())
-        state = review_report(state, admission_report(args.root / 'memory-reviews'))
+        state = review_report(state, admission_report(args.root / 'memory-reviews', memory_root=args.root / 'memory'))
         state['subjects'] = json.loads((args.root / 'subjects.json').read_bytes())
         print(json.dumps(state, sort_keys=True))
         return state

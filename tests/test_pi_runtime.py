@@ -29,6 +29,27 @@ def stream(tool, args, index=0, finish='tool_calls'):
     return Response()
 
 
+def responses_stream(tool, args, index=0):
+    class Response:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def iter_lines(self):
+            reasoning = {'type':'reasoning','id':f'rs_{index}','summary':[], 'encrypted_content':'opaque'}
+            call = {'type':'function_call', 'id':f'fc_{index}', 'call_id':f'call_{index}','name':tool,
+                    'arguments':json.dumps(args), 'status':'completed'}
+            events = [{'type':'response.created','response':{'id':f'resp_{index}'}}]
+            for i, item in enumerate([reasoning, call]):
+                events += [{'type':'response.output_item.added','output_index':i,'item':item},
+                           {'type':'response.output_item.done','output_index':i,'item':item}]
+            events.append({'type':'response.completed','response':{'id':f'resp_{index}','status':'completed',
+                'output':[reasoning,call],'usage':{'input_tokens':100,'output_tokens':40,
+                'input_tokens_details':{'cached_tokens':20},'output_tokens_details':{'reasoning_tokens':30}}}})
+            for event in events:
+                yield b'data: '+json.dumps(event).encode(); yield b''
+    return Response()
+
+
 def session(**kwargs):
     try:
         runtime_preflight()
@@ -94,6 +115,19 @@ def test_invalid_or_wrong_stage_tools_have_no_host_effect(monkeypatch, tool, arg
         assert pi.gateway.calls >= 1
 
 
+
+def test_original_tool_validation_explains_rejection(monkeypatch):
+    from coding.pi.session import ActionError
+    recorded = []
+    monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: stream('write', {'source': 123}))
+    with session() as pi:
+        with pytest.raises(ActionError, match=r'arguments.source: expected string'):
+            pi.next_action({'task': 'TEST'}, ['write'], record=lambda *args: recorded.append(args))
+        assert pi.pending is None
+        rejected = [payload for kind, payload in recorded if kind == 'pi-action-rejected']
+        assert rejected and rejected[-1]['allowed'] == ['read_context', 'write']
+
+
 def test_truncation_has_no_effect_and_same_process_can_repair(monkeypatch):
     from coding.pi.session import ActionError
     calls = []
@@ -132,6 +166,196 @@ def test_real_pi_reads_admitted_large_guide_with_complete_exchange(monkeypatch):
         assert pi.completion_tokens == 20
 
 
+
+def test_real_pi_accumulates_three_pages_then_refreshes_host_turn(monkeypatch):
+    calls, records = [], []
+    guide = "a" * 2048 + "b" * 2048 + "c" * 1000
+    reference = None
+    def provider(*_, **kwargs):
+        nonlocal reference
+        request = json.loads(kwargs['data']); calls.append(request)
+        messages = request['messages']
+        snapshot = json.loads(next(m['content'] for m in messages if m['role'] == 'user'))
+        pages = [json.loads(m['content']) for m in messages if m['role'] == 'tool']
+        index = len(calls) - 1
+        if index < 3:
+            reference = snapshot['context']['host']['guide']['record']
+            assert ''.join(page['text'] for page in pages) == guide[:index * 2048]
+            return stream('read_context', {'record': reference, 'offset': index * 2048,
+                                          'limit': 2048}, index)
+        if index == 3:
+            assert ''.join(page['text'] for page in pages) == guide
+            return stream('write', {'source': ''.join(page['text'][0] for page in pages)}, index)
+        assert index == 4  # A queued host action must not trigger another provider request.
+        assert snapshot['context']['host'] == {'task': 'NEW', 'feedback': 'current'}
+        assert not pages and not any(m.get('tool_calls') for m in messages)
+        return stream('write', {'source': 'new'}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'task': 'OLD', 'guide': guide}, ['write'],
+                              record=lambda *args: records.append(args)) == ('write', {'source': 'abc'})
+        assert len(calls) == 4
+        assert pi.next_action({'task': 'NEW', 'feedback': 'current'}, ['write']) == ('write', {'source': 'new'})
+        assert len(calls) == 5
+    reads = [payload for kind, payload in records if kind == 'pi-context-read']
+    assert [row['offset'] for row in reads] == [0, 2048, 4096]
+    assert not any(row['repeat'] for row in reads)
+
+
+
+def test_compiler_errors_are_visible_and_full_diagnostic_is_readable():
+    records = ContextRecords()
+    diagnostic = ('warning: header warning\n' * 300 +
+                  'candidate.cpp:17:4: error: undeclared identifier x\n')
+    snapshot = records.snapshot({'diagnostic': diagnostic})
+    assert snapshot['diagnostic']['errors'].splitlines() == ['candidate.cpp:17:4: error: undeclared identifier x']
+    ref = snapshot['diagnostic']['full']
+    assert records.read(ref['record'], 0, 8192)['text'] == diagnostic
+
+
+
+def test_actor_provider_receives_layout_contract_without_context_reads(monkeypatch, tmp_path):
+    try: runtime_preflight()
+    except RuntimeError: pytest.skip('Pi runtime unavailable')
+    from types import SimpleNamespace
+    from coding.pi.actor import PiActorDriver
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_project_executor import ProjectKernelABI
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    seen = []
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data']); seen.append(request)
+        snapshot = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+        contract = snapshot['context']['host']['task_contract']
+        assert contract['shape'] == [2, 23] and contract['dtype'] == 'float32'
+        assert contract['block_count'] == 1 and contract['padding_multiple'] == 32
+        assert contract['abi']['input_arguments'] == ['gm_input0']
+        assert contract['inputs'] == [{'argument': 'gm_input0', 'logical_shape': [2, 23], 'physical_shape': [2, 32]}]
+        assert contract['output']['logical_shape'] == [2, 23]
+        assert contract['output']['physical_shape'] == [2, 32]
+        return stream('write', {'slot': 'kernel', 'content': 'candidate'})
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    def execute(action):
+        assert action.kind == 'write'
+        return ActionOutcome('{}', terminal=True)
+    execute.prepared = SimpleNamespace(
+        spec=SimpleNamespace(shape=(2, 23), dtype=SimpleNamespace(value='float32'),
+            padding_multiple=32, block_count=1, graph=SimpleNamespace(as_dict=lambda: {'output': 'y'})),
+        abi=ProjectKernelABI('project_kernel', ('gm_input0',), 'gm_output'),
+        inputs=(SimpleNamespace(shape=(2, 23), physical_shape=(2, 32), storage='private inputs'),),
+        expected=SimpleNamespace(shape=(2, 23), physical_shape=(2, 32), dtype='float32', values='private oracle'))
+    model = next(item for item in MODEL_IDENTITIES if item.backend_model.value == 'deepseek-flash')
+    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY': 'fake-provider-secret', 'OPENAI_API_KEY': 'fake-openai-secret'}), max_seconds=10)
+    driver('Implement the supplied layout.', profile=direct_profile(model), workspace=tmp_path,
+           context=None, turn_parser=parse_trial_action, action_executor=execute)
+    assert len(seen) == 1
+    assert 'private inputs' not in json.dumps(seen) and 'private oracle' not in json.dumps(seen)
+
+
+
+@pytest.mark.parametrize('dtype_name', ['MXFP8_E4M3FN', 'MXFP8_E5M2'])
+def test_task_contract_preserves_real_mxfp8_auxiliary_scale_abi(tmp_path, dtype_name):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from coding.pi.actor import task_contract
+    from benchmarks.a5kernels.phase1_curriculum import DType
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from tests.test_a5_phase1_project_bz import FakeExecutor, _backend
+    from tests.test_a5_phase1_project_executor import _spec
+    project = ProjectExecutor(FakeExecutor([]), EvidenceLedger(tmp_path / 'ledger'))
+    prepared = project.prepare(replace(_spec('cube'), dtype=getattr(DType, dtype_name)))
+    contract = task_contract(SimpleNamespace(prepared=prepared))
+    assert len(contract['inputs']) == len(prepared.inputs) == 2
+    assert [item['argument'] for item in contract['auxiliary_inputs']] == list(prepared.abi.input_arguments[2:])
+    _, files = _backend(tmp_path, FakeExecutor([]))._bundle(project.request(prepared, '# candidate'))
+    manifest = json.loads(next(item.content for item in files if item.relative_path == 'manifest.json'))
+    assert [item['physical_shape'] for item in contract['auxiliary_inputs']] == [item['shape'] for item in manifest['scales']]
+    assert contract['auxiliary_inputs'][0]['logical_shape'] == manifest['scales'][0]['shape']
+    assert contract['auxiliary_inputs'][1]['logical_shape'] == list(reversed(manifest['scales'][1]['shape']))
+    assert all(item['dtype'] == 'E8M0' and item['group_size'] == 32 for item in contract['auxiliary_inputs'])
+    assert not any('storage' in item for item in contract['inputs'] + contract['auxiliary_inputs'])
+
+
+def test_context_read_telemetry_and_actionable_validation():
+    records = []
+    with session() as pi:
+        pi.record = lambda *args: records.append(args)
+        ref = pi.context.admit('data')
+        pi.allowed = {'write', 'read_context'}
+        pi._operation('read_context', {'record': ref['record']})
+        pi._operation('read_context', {'record': ref['record']})
+        assert [payload['repeat'] for _, payload in records] == [False, True]
+        with pytest.raises(ValueError, match=r'arguments.source: expected string'):
+            pi._operation('write', {'source': 1})
+        assert pi.pending is None and pi.mutations == 0
+
+
+def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monkeypatch):
+    instruction = 'Instruction body. ' * 600
+    source = 'kernel source;\n' * 160
+    requests, refs = [], {}
+    def pages(request):
+        return [json.loads(message['content']) for message in request['messages'] if message['role'] == 'tool']
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        index = len(requests)
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        if index == 0:
+            packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+            refs.update({key: packet['context']['host'][key]['record'] for key in ['instruction', 'source']})
+        reads = [(refs.get('instruction'), 0), (refs.get('instruction'), 8192), (refs.get('source'), 0)]
+        if index < 3:
+            record, offset = reads[index]
+            return stream('read_context', dict(record=record, offset=offset, limit=8192), index)
+        if index in (3, 4):
+            retained = pages(request)
+            assert len(retained) == 3
+            assert {(row['record'], row['offset']) for row in retained} == set(reads)
+            assert ''.join(row['text'] for row in sorted(retained, key=lambda row: row['offset'])
+                           if row['record'] == refs['instruction']) == instruction
+            assert next(row['text'] for row in retained if row['record'] == refs['source']) == source
+            calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
+            assert calls == {m['tool_call_id'] for m in request['messages'] if m['role'] == 'tool'}
+            if index == 3:
+                return stream('read_context', dict(limit=8192, offset=0, record=refs['instruction']), index)
+        if index == 5:
+            assert not pages(request)
+        return stream('write', {'source': 'kernel'}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'instruction': instruction, 'source': source}, ['write']) == ('write', {'source': 'kernel'})
+        assert pi.next_action({'task': 'New authoritative task'}, ['write']) == ('write', {'source': 'kernel'})
+    assert len(requests) == 6
+
+
+def test_real_pi_many_context_pages_keep_requests_bounded_and_exchanges_complete(monkeypatch):
+    requests = []
+    guide = 'Guide page contents. ' * 10000
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        index = len(requests)
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+        calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
+        results = [m for m in request['messages'] if m['role'] == 'tool']
+        assert calls == {m['tool_call_id'] for m in results}
+        if index:
+            assert any(json.loads(m['content'])['offset'] == (index-1)*4096 for m in results)
+        if index == 10:
+            assert 1 < len(results) < 10
+            return stream('write', {'source': 'bounded kernel'}, index)
+        return stream('read_context', {'record': packet['context']['host']['guide']['record'],
+                                      'offset': index*4096, 'limit': 4096}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'guide': guide}, ['write']) == ('write', {'source': 'bounded kernel'})
+    assert len(requests) == 11
+
+
 def test_credential_in_context_is_rejected_before_provider(monkeypatch):
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('paid request'))
     with session() as pi:
@@ -145,7 +369,7 @@ def test_gateway_refuses_full_oversized_request_even_if_pi_hook_accepts(monkeypa
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('upstream HTTP'))
     with session() as pi:
         pi.gateway.hard_bytes = 100
-        with pytest.raises(PiError):
+        with pytest.raises(PiError, match='context exceeds'):
             pi.next_action({'task':'TEST'}, ['write'])
         assert pi.gateway.calls == 0
 
@@ -179,25 +403,8 @@ def test_openai_responses_uses_registered_profile_and_counts_subsets(monkeypatch
     try: runtime_preflight()
     except RuntimeError: pytest.skip('Pi runtime unavailable')
     captured = []
-    class Response:
-        status_code = 200
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def iter_lines(self):
-            reasoning = {'type':'reasoning','id':'rs_0','summary':[], 'encrypted_content':'opaque'}
-            call = {'type':'function_call', 'id':'fc_0', 'call_id':'call_0','name':'write',
-                    'arguments':json.dumps({'source':'kernel'}), 'status':'completed'}
-            events = [{'type':'response.created','response':{'id':'resp_0'}}]
-            for i, item in enumerate([reasoning, call]):
-                events += [{'type':'response.output_item.added','output_index':i,'item':item},
-                           {'type':'response.output_item.done','output_index':i,'item':item}]
-            events.append({'type':'response.completed','response':{'id':'resp_0','status':'completed',
-                'output':[reasoning,call],'usage':{'input_tokens':100,'output_tokens':40,
-                'input_tokens_details':{'cached_tokens':20},'output_tokens_details':{'reasoning_tokens':30}}}})
-            for event in events:
-                yield b'data: '+json.dumps(event).encode(); yield b''
     def provider(*_, **kwargs):
-        captured.append(json.loads(kwargs['data'])); return Response()
+        captured.append(json.loads(kwargs['data'])); return responses_stream('write', {'source':'kernel'})
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with PiCodingSession(model='openai/gpt-5.6-sol', schemas={'write':obj({'source':STRING})},
                          environ={'OPENAI_API_KEY':'fake'}, deadline=time.monotonic()+30) as pi:
@@ -357,3 +564,173 @@ def test_actor_inherits_executor_deadline_and_preserves_clock_on_clone(monkeypat
         turn_parser=None, action_executor=SimpleNamespace(deadline=9))
     assert outcome.status == 'time-budget-exhausted'
     assert active.deadline == active.gateway.deadline == 9
+
+
+def test_actor_reports_rejected_action_for_next_turn_recovery(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    observations = []
+    class RecoveringSession:
+        completion_tokens = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, context, *args, **kwargs):
+            observations.append(context['latest_host_observation'])
+            if len(observations) == 1:
+                raise actor_module.ActionError('Pi returned no accepted host action')
+            host = context['latest_host_observation']['host']
+            assert host['event'] == 'invalid-action'
+            assert host['error'] == 'Pi returned no accepted host action'
+            return 'submit', {}
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: RecoveringSession())
+    driver = actor_module.PiActorDriver(DirectCompletionProvider({
+        'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
+    executed = []
+    def execute(action):
+        executed.append(action.kind)
+        return ActionOutcome('{}', True, 'host-verified')
+    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
+                     workspace=tmp_path, context=None, turn_parser=parse_trial_action,
+                     action_executor=execute)
+    assert outcome.status == 'host-verified'
+    assert executed == ['submit']
+    assert len(observations) == 2
+
+
+def test_real_pi_actor_waits_for_submit_acceptance(monkeypatch, tmp_path):
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import A5BackendModel, MODEL_IDENTITIES
+    from coding.pi.actor import PiActorDriver
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('npm ci --prefix integrations/pi required')
+    actions = [('run', {}), ('submit', {}), ('request-timing', {}), ('submit', {})]
+    calls = []
+    def provider(*args, **kwargs):
+        calls.append(json.loads(kwargs['data']))
+        name, payload = actions[len(calls)-1]
+        return stream(name, payload, len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    seen = []
+    verified, timed = False, False
+    def execute(action):
+        nonlocal verified, timed
+        seen.append(action.kind)
+        if action.kind == 'run':
+            verified = True
+            host = {'classification': 'host-verified'}
+        elif action.kind == 'request-timing':
+            assert verified
+            timed = True
+            host = {'event': 'performance-study', 'passed': True}
+        else:
+            assert action.kind == 'submit'
+            if verified and timed:
+                return ActionOutcome('{}', True, 'host-verified')
+            host = {'error': 'submit requires retained project evidence', 'missing': ['performance-study']}
+        return ActionOutcome(json.dumps({'host': host}), False, 'continue')
+    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY': 'fake'},
+        models=(A5BackendModel.DEEPSEEK_FLASH,)), max_seconds=30)
+    profile = direct_profile(next(i for i in MODEL_IDENTITIES if i.backend_model is A5BackendModel.DEEPSEEK_FLASH))
+    outcome = driver('Synthetic task requires verified correctness and timing.', profile=profile,
+                     workspace=tmp_path, context=None, turn_parser=parse_trial_action,
+                     action_executor=execute)
+    assert outcome.status == 'host-verified'
+    assert seen == ['run', 'submit', 'request-timing', 'submit']
+    assert len(calls) == 4
+
+
+def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    requests = []
+    class FakeSession:
+        completion_tokens = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, payload, allowed, **kwargs):
+            requests.append((payload, set(allowed)))
+            return ('not-an-action', {}) if len(requests) == 1 else ('submit', {})
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
+    driver = actor_module.PiActorDriver(DirectCompletionProvider(
+        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
+    executed = []
+    def execute(action):
+        executed.append(action.kind)
+        return ActionOutcome('{}', True, 'passed')
+    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
+                     workspace=tmp_path, context=None,
+                     turn_parser=parse_trial_action, action_executor=execute)
+    assert outcome.status == 'passed' and executed == ['submit']
+    feedback = requests[1][0]['latest_host_observation']['host']
+    assert feedback['event'] == 'invalid-action'
+    assert feedback['allowed_actions'] == sorted(requests[1][1])
+    assert 'submit' in feedback['allowed_actions']
+
+
+def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
+    requests = []
+    context = {'guide': 'Page contents. ' * 2000,
+               'quoted': {f'field-{index}': '\\"' * 240 for index in range(16)}}
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        snapshot = json.loads(next(row['content'] for row in request['messages'] if row['role'] == 'user'))
+        assert snapshot['context']['host']['quoted'] == context['quoted']
+        index = len(requests) - 1
+        retained = [json.loads(row['content']) for row in request['messages'] if row['role'] == 'tool']
+        if index:
+            assert any(row['offset'] == (index - 1) * 7400 for row in retained)
+        if index == 2:
+            assert [row['offset'] for row in retained] == [7400]
+            calls = {call['id'] for row in request['messages'] for call in row.get('tool_calls', [])}
+            assert calls == {row['tool_call_id'] for row in request['messages'] if row['role'] == 'tool'}
+            return stream('write', {'source': 'selected after bounded paging'}, index)
+        return stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
+                                          offset=index * 7400, limit=7400), index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action(context, ['write']) == ('write', {'source': 'selected after bounded paging'})
+    assert len(requests) == 3
+
+
+def test_real_pi_openai_large_snapshot_retains_multiple_pages_within_configured_cap(monkeypatch):
+    try: runtime_preflight()
+    except RuntimeError: pytest.skip('Pi runtime unavailable')
+    requests = []
+    context = {'guide': 'paged-content-' * 2000,
+               'fields': {f'field-{index}': 'retained-' * 100 for index in range(64)}}
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        assert len(kwargs['data']) <= 196608
+        user = next(row for row in request['input'] if row.get('role') == 'user')
+        text = user['content'] if isinstance(user['content'], str) else user['content'][0]['text']
+        snapshot = json.loads(text)
+        assert len(text.encode()) > 49152
+        assert snapshot['context']['host']['fields'] == context['fields']
+        index = len(requests) - 1
+        retained = [json.loads(row['output']) for row in request['input']
+                    if row.get('type') == 'function_call_output']
+        assert [row['offset'] for row in retained] == [offset * 4096 for offset in range(index)]
+        calls = {row['call_id'] for row in request['input'] if row.get('type') == 'function_call'}
+        assert calls == {row['call_id'] for row in request['input']
+                         if row.get('type') == 'function_call_output'}
+        if index == 2:
+            return responses_stream('write', {'source': 'selected with both pages'}, index)
+        return responses_stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
+                                offset=index * 4096, limit=4096), index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with PiCodingSession(model='openai/gpt-5.6-sol', schemas={'write': obj({'source': STRING})},
+                         environ={'OPENAI_API_KEY': 'fake-provider-secret'}, deadline=time.monotonic()+30) as pi:
+        assert pi.next_action(context, ['write']) == ('write', {'source': 'selected with both pages'})
+    assert len(requests) == 3

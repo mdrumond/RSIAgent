@@ -241,3 +241,87 @@ def test_verifier_receives_frozen_individual_contract_for_subject_control(tmp_pa
         select_wave=lambda *a,**kw:[plan],execute=execute,verifier=Review(),
         complete=lambda *a,**kw:json.dumps(dict(action='advance',reason='control evidence complete',evidence=['control'])))
     assert c.run()['terminal']=='COMPLETE'
+
+
+@pytest.mark.parametrize('interrupted_at', [0, 1])
+def test_interrupted_execution_holds_automatic_wave_and_resume(tmp_path, interrupted_at):
+    now = [0.0]
+    calls, reviews, gate_calls = [], [], []
+    class Gate:
+        def start_session(self): gate_calls.append('start')
+        def poll(self, **kw): gate_calls.append('poll'); return []
+        def close(self): gate_calls.append('close')
+    class NoReview:
+        def review(self, *args, **kw): reviews.append(args); raise AssertionError('unsettled wave reviewed')
+    def execute(item, memory, directory, **kw):
+        calls.append(item['project_id'])
+        now[0] += 3
+        directory.mkdir(parents=True, exist_ok=True)
+        receipt = tmp_path / 'binding' / 'shared' / 'operation.json'
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        receipt.write_text(json.dumps(dict(handle='remote:target:job:retained')))
+        sha = c.artifacts.put_bytes(b'partial source')
+        interrupted = len(calls) - 1 == interrupted_at
+        return SubjectOutcome(False, sha, {'source': sha},
+            dict(classification='interrupted' if interrupted else 'actor-unverified'), c.artifacts.root)
+    c = SubjectCampaign(tmp_path, [Subject('s', 'subject', 1)], b'initial',
+        select_wave=lambda *a, **kw: [dict(project_id=p) for p in ['one', 'two', 'three']],
+        execute=execute, verifier=NoReview(), complete=lambda *a, **kw: None,
+        memory_gate=Gate(), max_seconds=100, clock=lambda: now[0])
+    first = c.run()
+    assert first['terminal'] == 'OBSERVATION_REQUIRED'
+    assert calls == ['one', 'two'][:interrupted_at + 1]
+    assert not reviews and first['waves'] == [] and first['pending']
+    retained = first['observation_required'][0]
+    assert retained['memory_sha256'] == first['pending']['memory_sha256']
+    assert json.loads(c.artifacts.read_bytes(retained['outcome_sha256'])) == first['projects'][calls[-1]]['outcome']
+    inventory = json.loads(c.artifacts.read_bytes(retained['operations_inventory_sha256']))
+    assert json.loads(c.artifacts.read_bytes(inventory[0]['artifact_sha256']))['handle'] == 'remote:target:job:retained'
+    before = json.loads((tmp_path / 'elapsed.json').read_bytes())
+    gate_calls.clear()
+    assert c.resume()['terminal'] == 'OBSERVATION_REQUIRED'
+    assert gate_calls == ['close']  # No background A/B polling/session or project work on resume.
+    assert calls == ['one', 'two'][:interrupted_at + 1] and not reviews
+    after = json.loads((tmp_path / 'elapsed.json').read_bytes())
+    assert after['max_seconds'] == before['max_seconds'] == 100
+    assert after['elapsed_seconds'] == before['elapsed_seconds'] == now[0]
+    if interrupted_at:
+        assert c.state['projects']['one']['outcome']['observations']['classification'] == 'actor-unverified'
+
+
+def test_pending_interruption_scan_uses_effective_replacement_and_checks_all_entries(tmp_path):
+    c = SubjectCampaign(tmp_path, [Subject('s', 'subject', 1)], b'',
+        select_wave=None, execute=None, verifier=None, complete=None)
+    interrupted = dict(outcome=dict(observations=dict(classification='interrupted')))
+    c.state['projects'] = dict(old=dict(interrupted, superseded_by='replacement'),
+                               replacement=dict(outcome=dict(observations=dict(classification='actor-unverified'))),
+                               later=interrupted)
+    c.state['pending'] = dict(wave_id='w', projects=['unstarted', 'old', 'later'], memory_sha256=c.artifacts.put_bytes(b'frozen'))
+    from benchmarks.ascend.subject_campaign import ObservationRequired
+    with pytest.raises(ObservationRequired):
+        c._require_observed_pending()
+    assert [r['project_id'] for r in c.state['observation_required']] == ['later']
+    # A cached later interruption blocks resume before the unstarted first item.
+    assert c.resume()['terminal'] == 'OBSERVATION_REQUIRED'
+    assert 'unstarted' not in c.state['projects']
+    c.state['projects']['later']['outcome']['observations']['classification'] = 'actor-unverified'
+    c._require_observed_pending()
+    assert 'observation_required' not in c.state
+
+
+def test_interrupted_wave_at_elapsed_deadline_keeps_partial_outcome(tmp_path):
+    now = [0.0]
+    def execute(item, memory, directory, **kw):
+        now[0] = 10.0
+        sha = c.artifacts.put_bytes(b'partial')
+        return SubjectOutcome(False, sha, {'source': sha}, dict(classification='interrupted'), c.artifacts.root)
+    c = SubjectCampaign(tmp_path, [Subject('s', 'subject', 1)], b'', max_seconds=10,
+        clock=lambda: now[0], select_wave=lambda *a, **kw: [dict(project_id='p'), dict(project_id='peer')],
+        execute=execute, verifier=None, complete=None)
+    report = c.run()
+    assert report['terminal'] == 'TIME_BUDGET_EXHAUSTED'
+    assert list(report['projects']) == ['p']
+    assert report['pending']['projects'] == ['p', 'peer']
+    assert report['observation_required'][0]['project_id'] == 'p'
+    assert c.resume()['terminal'] == 'TIME_BUDGET_EXHAUSTED'
+    assert json.loads((tmp_path / 'elapsed.json').read_bytes())['elapsed_seconds'] == 10

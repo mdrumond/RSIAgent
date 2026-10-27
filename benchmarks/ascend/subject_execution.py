@@ -84,7 +84,7 @@ class SubjectExecutor:
     def __init__(self, graph_actor=None, optimizer_factory=None, *, clock=time.monotonic):
         self.graph_actor, self.optimizer_factory, self.clock = graph_actor, optimizer_factory, clock
 
-    def graph(self, request, *, target=None, artifacts=None, runtime=None, policy=None):
+    def graph(self, request, *, target=None, artifacts=None, runtime=None, policy=None, allow_device_migration=False, binding_root=None):
         """Execute AdaptiveProjectRequest without Actor-owned distillation.
 
         When target is supplied, artifacts contains its retained qualification;
@@ -127,7 +127,15 @@ class SubjectExecutor:
         checkpoint = root / 'subject-execution.json'
         if checkpoint.exists():
             recorded = json.loads(checkpoint.read_bytes())
-            if recorded['identity'] != identity:
+            previous = recorded['identity']
+            same = previous == identity
+            if not same and allow_device_migration and previous.get('runtime') and identity.get('runtime'):
+                # The campaign has already authenticated unchanged frozen settings.
+                # Only reuse a completed outcome; never alter its original identity.
+                old_runtime = {key: value for key, value in previous['runtime'].items() if key != 'device'}
+                new_runtime = {key: value for key, value in identity['runtime'].items() if key != 'device'}
+                same = old_runtime == new_runtime and {key: value for key, value in previous.items() if key != 'runtime'} == {key: value for key, value in identity.items() if key != 'runtime'}
+            if not same:
                 raise ValueError('subject execution request changed; use its original frozen inputs')
             # Cached results must preserve the Actor's host-input/oracle gate.
             # Preparing is host-only: no compilation or device operation occurs.
@@ -142,6 +150,8 @@ class SubjectExecutor:
             if request.inputs != inputs or request.oracle != oracle:
                 raise ValueError('request inputs or oracle differ from rematerialized project')
             value = recorded['outcome']
+            if store.read_json(value['artifacts']['result:execution']) != value['observations']:
+                raise ValueError('completed subject execution evidence changed')
             return portable(value)
         try:
             result = self.graph_actor(request)
@@ -160,7 +170,8 @@ class SubjectExecutor:
         except (ProjectInfrastructureError, TimeoutError, PiError, ProviderRejectionError) as error:
             from .arm_evidence import interrupted_outcome
             outcome = interrupted_outcome(root.parent, error, store, started_epoch=epoch,
-                elapsed_seconds=max(0, self.clock()-started), project_root=root)
+                elapsed_seconds=max(0, self.clock()-started), project_root=root,
+                binding_root=binding_root, project_id=request.spec.project_id if binding_root is not None else None)
             root.mkdir(parents=True, exist_ok=True)
             atomic(checkpoint, canonical(dict(identity=identity, outcome=outcome.as_dict())))
             return portable(outcome.as_dict())

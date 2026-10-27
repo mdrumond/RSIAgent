@@ -129,13 +129,50 @@ judgments, and rewrite feedback. Accepted memory provenance contains the matched
 evaluation identity and verifier trace hash. Full code and examples remain in
 content-addressed artifact storage; snippets preserve exact source lines.
 
+Project source audits and memory rewrites use the pinned Pi runtime for standard
+live providers. Verifier reads, artifact listings, KDB queries and context reads
+execute sequentially inside Pi's native conversation and return authoritative
+observations immediately, including when a response requests several reads.
+`submit_review` and `request_check` must each be standalone assistant calls;
+mixed batches reject those operations while permitting their read-only calls.
+Only a host-validated accept/repair decision ends the review. A model ending its
+message without a verdict receives current state and may continue within its
+remaining elapsed allocation; it is never automatically accepted or rejected.
+
+The Python host validates original tool arguments before Pi coercion, artifact
+identity, required evidence, observed snippets, citations and host correctness.
+Read pages are at most 2 KiB with UTF-8 continuation offsets; large listings and
+query results have lossless paged records with previews bounded to 4 KiB.
+Review-wide immutable byte caching allows legitimate rereads and reports their
+roles, coverage, cache hits and repeats. Completed prerequisites guide the model
+toward a decision without relaxing admission gates or introducing request-count
+stopping budgets. Raw proposed calls, dispositions and conversation are retained.
+
+The gateway projects the entire serialized Chat/Responses request, including
+instructions, schemas and current host state, before its existing hard byte
+limit. Older complete tool exchanges become lossless `read_context` records;
+the latest complete batch, host controls and known counterevidence remain visible.
+Actor tool selection, default context packing and gateway behavior are unchanged.
+
+`verifier_model` still selects the model, including `deepseek-flash`.
+`verifier_engine: "completion"` retains the JSON-completion adapter; injected
+transports default to that adapter. Explicit `verifier_engine: "pi"` supports
+custom composition. Effective engine/model and native loop/context identities
+are persisted in `project-verifier-runtime.json`; changed identities fail resume.
+Historical directories without this metadata retain completion delivery, including
+subsequent resumes. New Pi policies require a new runtime directory. Pi does not
+change remote job queues or independent A/B publication gates.
+
 ## Retrospective native runs
 
 A3 campaigns may pass `compose_cpl_production` from
 `benchmarks.ascend.retrospective_runtime` to `build_subject_campaign(compose=...)`.
 The same ignored Phase1 settings select provider/model, reference KDB, guide and
 workspace. The native JSON additionally requires `transport_target` and a named
-registry `runtime`; `registry_workspace` is optional. This path never invokes the
+registry `runtime`; `registry_workspace` is optional. Configure `health_workspace`
+as an existing absolute subdirectory of the registered workspace for read-only
+checks before uploads. Pin product, architecture, compiler, CANN, Torch,
+Torch-NPU and SoC identities. Optional `allowed_devices` restricts physical IDs. This path never invokes the
 legacy validation wrapper. Each fresh binding checks a known-good compile and
 exact host oracle before Actor work or additional verifier execution. The check
 consumes the current elapsed allocation. Optional `stop_file` belongs to this
@@ -153,3 +190,14 @@ execution. Original project specs and frozen accepted-memory snapshots are uncha
 The CPL adapter and environment probe retain reviewed behavior from PR186
 (`48592246`) and PR200 (`37004d1`), respectively. Terminal result collection is
 bounded read-only recovery: it cannot extend command execution or resubmit jobs.
+
+The latest complete batch and mandatory host controls are not silently dropped
+to fit a request. If those inputs plus instructions and schemas alone exceed the
+provider cap, the review is held as infrastructure/context failure before dispatch;
+its raw evidence remains retained. This is a per-request capacity constraint,
+not a request-count or token-based stopping budget.
+
+Transport journals are retained per execution allocation. On admission, bounded
+read-only observation settles owned retained handles before permitting new work;
+ambiguous submissions and still-running operations continue to block admission.
+Changing a permitted device preserves old journals and uses a distinct namespace.

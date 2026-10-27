@@ -77,3 +77,30 @@ def test_source_repair_from_rewrite_is_not_a_quality_rejection(tmp_path):
         assert memory.records() == []
     finally:
         gate.close()
+
+
+def test_manual_override_wins_in_saved_and_offline_assessments_without_changing_judgment(tmp_path):
+    from benchmarks.ascend.memory_status import admission_report
+    memory = SubjectMemory(tmp_path/'memory', b'')
+    gate = MemoryAdmission(tmp_path/'gate', memory, Evaluation([]), None)
+    job = dict(review_id='p', status='rejected', rewrites=2, provenance={},
+               evaluations=[dict(decision='reject', reason='No observed benefit')])
+    try:
+        gate._save(job)
+        memory.accept('p', draft(), {}, manual=dict(reason='Useful independent example'))
+        before = gate._path('p').read_bytes()
+        shown = admission_report(gate.root, memory_root=memory.root)['p']
+        assert shown['status'] == 'accepted'
+        assert shown['assessment']['reason_code'] == 'manual-override'
+        assert shown['reason'] == 'Useful independent example'
+        assert gate._path('p').read_bytes() == before
+        gate._save(job)
+        saved = json.loads(gate._path('p').read_bytes())
+        assert saved['status'] == saved['assessment']['status'] == 'accepted'
+        assert saved['assessment']['reason_code'] == 'manual-override'
+        assert saved['evaluations'][0]['decision'] == 'reject'
+        settled, = gate.poll(remaining_seconds=1)
+        assert settled['delivery_id'] == 'manual:p' and settled['manual_override']
+        assert settled['assessment']['reason_code'] == 'manual-override'
+    finally:
+        gate.close()

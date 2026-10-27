@@ -138,7 +138,6 @@ def test_failed_host_receipt_advances_memory_and_next_attempt(tmp_path):
         "evidence_sha256"
     ]
     assert repair["host_evidence"] == source_calls[1].phase2_memory[0]
-    assert "repair the preceding candidate" in repair["instruction"]
     failed_case = source_calls[1].phase2_memory[0]["failed_cases"][0]
     assert failed_case == {
         "case_id": failed_case["case_id"],

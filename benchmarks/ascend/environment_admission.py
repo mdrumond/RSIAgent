@@ -1,5 +1,8 @@
 """Fresh device health plus short-lived, identity-scoped known-good probe reuse."""
 import hashlib
+import fcntl
+from contextlib import contextmanager
+import threading
 import json
 from pathlib import Path
 import re
@@ -9,6 +12,43 @@ import uuid
 from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from .runtime_allocation import permitted_devices, unsettled_operations
+
+_RESERVATIONS = {}
+_RESERVATIONS_LOCK = threading.Lock()
+
+
+@contextmanager
+def native_reservation(root, remaining):
+    """Serialize admission through settled dispatch, across threads and processes."""
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    with _RESERVATIONS_LOCK:
+        lock, state = _RESERVATIONS.setdefault(str(root), (threading.RLock(), threading.local()))
+    if not lock.acquire(timeout=max(0, remaining())):
+        raise TimeoutError('native admission reservation allocation exhausted')
+    try:
+        if getattr(state, 'active', False):
+            yield
+            return
+        with (root / '.native-admission.lock').open('a') as stream:
+            while True:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    seconds = remaining()
+                    if seconds <= 0:
+                        raise TimeoutError('native admission reservation allocation exhausted')
+                    time.sleep(min(.05, seconds))
+            state.active = True
+            try:
+                yield
+            finally:
+                state.active = False
+                fcntl.flock(stream, fcntl.LOCK_UN)
+    finally:
+        lock.release()
+
 
 _HEALTH = r'''
 import importlib.metadata,json,os,pathlib,shutil,subprocess,sys
@@ -114,10 +154,38 @@ def verify_dependencies(actual, pinned):
         raise ProjectInfrastructureError('discovered environment differs from pinned '+', '.join(mismatches))
 
 
+def recover_campaign_operations(root, transports, *, seconds=30, remaining=lambda: float("inf")):
+    """Reconstruct retained owning bindings for read-only sibling observation."""
+    from .cpl_native import CplNativeCandidateBackend
+    clients = {transport.target: transport for transport in transports
+               if isinstance(transport, CplNativeCandidateBackend)}
+    deadline = time.monotonic() + seconds
+    for path in Path(root).rglob('operation.json'):
+        record = json.loads(path.read_bytes())
+        if 'result' in record or record.get('state') in ('new', 'completed', 'failed', 'cancelled'):
+            continue
+        identity = record.get('identity', {})
+        route = identity.get('route', {})
+        client = clients.get(route.get('target'))
+        if client is None or not record.get('handle'):
+            continue
+        left = min(deadline-time.monotonic(), remaining())
+        if left <= 0:
+            break
+        owner = CplNativeCandidateBackend(cpl_remote=client._cpl, target=route['target'],
+            runtime=route['runtime'], profile=route['profile'], physical_device=route['physical_device'],
+            remote_workspace=identity['workspace'], state_directory=path.parent,
+            process_runner=client._run, timeout=left)
+        if owner.runtime_identity != route:
+            raise ProjectInfrastructureError('retained owning binding identity changed')
+        owner.recover_owned_operations(seconds=left, remaining_seconds=remaining)
+
+
 class EnvironmentAdmission:
-    def __init__(self, check, transports, root, *, cache, dependencies, clock=time.time):
+    def __init__(self, check, transports, root, *, cache, dependencies, clock=time.time, pending_root=None):
         self.check, self.transports, self.root = check, tuple(transports), Path(root)
         self.cache, self.dependencies, self.clock = Path(cache), dependencies, clock
+        self.pending_root = Path(pending_root) if pending_root is not None else self.root
         self.keys = set()
         self.cache.mkdir(parents=True, exist_ok=True)
 
@@ -133,7 +201,18 @@ class EnvironmentAdmission:
         from benchmarks.a3kernels.native_smoke import smoke_plan
         identities, health_paths = [], []
         try:
-            if unsettled_operations(self.root):
+            recovery_deadline = time.monotonic() + min(30, remaining())
+            def recovery_remaining():
+                return max(0, min(remaining(), recovery_deadline-time.monotonic()))
+            for transport in self.transports:
+                if recovery_remaining() <= 0:
+                    raise TimeoutError('native recovery elapsed allocation exhausted')
+                transport.recover_owned_operations(seconds=recovery_remaining(), remaining_seconds=recovery_remaining)
+            recover_campaign_operations(self.pending_root, self.transports,
+                seconds=recovery_remaining(), remaining=recovery_remaining)
+            if remaining() <= 0:
+                raise TimeoutError('native recovery elapsed allocation exhausted')
+            if unsettled_operations(self.pending_root):
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
             for transport in self.transports:
                 # Fresh health runs even on a known-good probe cache hit.

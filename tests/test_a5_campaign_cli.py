@@ -65,34 +65,75 @@ def test_screen_worker_consumes_exact_argv_and_retains_result(tmp_path):
 
 
 def test_screen_worker_start_does_not_wait_for_detached_output_holder(tmp_path):
-    """A detached Screen descendant must not keep start's capture pipes open."""
+    """Start returns while the detached descendant still owns its output."""
+    import threading
 
+    ready, release, exited = (tmp_path / name for name in ('ready', 'release', 'exited'))
+    holder = (
+        "import os,pathlib,sys,time; "
+        "ready,release,exited=map(pathlib.Path,sys.argv[1:]); "
+        "ready.write_text(str(os.getpid())); "
+        "deadline=time.monotonic()+20\n"
+        "while not release.exists() and time.monotonic()<deadline: time.sleep(0.01)\n"
+        "exited.touch()\n"
+    )
+    launcher = (
+        "import pathlib,subprocess,sys,time\n"
+        "subprocess.Popen([sys.executable,'-c',sys.argv[1],*sys.argv[2:]], "
+        "stdout=sys.stdout,stderr=sys.stderr)\n"
+        "deadline=time.monotonic()+5\n"
+        "while not pathlib.Path(sys.argv[2]).exists():\n"
+        " if time.monotonic()>=deadline: raise RuntimeError('holder did not start')\n"
+        " time.sleep(0.01)\n"
+    )
     def screen(_argv, **kwargs):
         return subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import subprocess, sys; "
-                    "subprocess.Popen([sys.executable, '-c', "
-                    "'import time; time.sleep(1)'], "
-                    "stdout=sys.stdout, stderr=sys.stderr)"
-                ),
-            ],
-            timeout=0.25,
-            **kwargs,
-        )
+            [sys.executable, '-c', launcher, holder, str(ready), str(release), str(exited)],
+            timeout=15, **kwargs)
 
     root = tmp_path / "controller"
     worker = root / "workers" / "phase1-run" / "p1-detach"
-    pool = ScreenWorkerPool(
-        root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py")
-    )
-
-    started = time.monotonic()
-    pool.start(Job(JobKind.PHASE1_RUN, "p1-detach"), 2, worker, ("run",))
-
-    assert time.monotonic() - started < 0.25
+    pool = ScreenWorkerPool(root, screen_runner=screen, script=Path("/repo/run_a5_campaign.py"))
+    returned = threading.Event()
+    errors = []
+    def start():
+        try:
+            pool.start(Job(JobKind.PHASE1_RUN, "p1-detach"), 2, worker, ("run",))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            returned.set()
+    thread = threading.Thread(target=start)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), 'detached holder did not become ready'
+        assert returned.wait(5), 'start waited for the detached output holder'
+        assert not errors
+        assert not release.exists() and not exited.exists()
+        os.kill(int(ready.read_text()), 0)
+    finally:
+        release.touch()
+        thread.join(17)
+        deadline = time.monotonic() + 5
+        while ready.exists() and not exited.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if ready.exists() and not exited.exists():
+            try: os.kill(int(ready.read_text()), signal.SIGKILL)
+            except ProcessLookupError: pass
+        assert not thread.is_alive()
+        assert not ready.exists() or exited.exists()
+        if ready.exists():
+            status = Path('/proc') / ready.read_text() / 'stat'
+            deadline = time.monotonic() + 5
+            while status.exists():
+                try: state = status.read_text().split(') ', 1)[1].split()[0]
+                except FileNotFoundError: break
+                if state in ('X', 'Z'): break
+                assert time.monotonic() < deadline, 'detached holder remained alive after release'
+                time.sleep(0.01)
 
 
 def test_screen_worker_start_reports_screen_diagnostics(tmp_path):

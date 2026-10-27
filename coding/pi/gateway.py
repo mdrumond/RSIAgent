@@ -51,11 +51,12 @@ def safe_provider_error(error, api_key, token):
 
 
 class Gateway:
-    def __init__(self, provider, api_key, budget, label, *, max_calls=9, deadline=None, max_output_tokens=None, records_path=None, hard_bytes=49152, on_record=None):
+    def __init__(self, provider, api_key, budget, label, *, max_calls=9, deadline=None, max_output_tokens=None, records_path=None, hard_bytes=49152, on_record=None, request_projector=None):
         self.provider, self.spec = provider, dict(PROVIDERS[provider])
         if max_output_tokens is not None:
             self.spec["max_tokens"] = max_output_tokens
         self.records_path = records_path
+        self.request_projector = request_projector
         self.hard_bytes = hard_bytes
         self.on_record = on_record or (lambda *_: None)
         self.finished = threading.Event()
@@ -92,6 +93,8 @@ class Gateway:
         if request.get("stream") and not responses:
             request["stream_options"] = {"include_usage": True}
         request["parallel_tool_calls"] = False
+        if self.request_projector is not None:
+            request = self.request_projector(request, responses=responses, hard_bytes=self.hard_bytes)
         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > self.hard_bytes:
             raise ValueError("provider request exceeds context hard byte budget")
@@ -114,9 +117,10 @@ class Gateway:
                 if self.path not in ("/v1/chat/completions", "/v1/responses") or self.headers.get("Authorization") != "Bearer " + owner.token:
                     return self.error(403, "gateway access denied")
                 started = time.monotonic()
+                started_epoch = time.time()
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 524288:
+                    if not 0 < size <= (8388608 if owner.request_projector is not None else 524288):
                         return self.error(413, "smoke request size limit")
                     payload = json.loads(self.rfile.read(size))
                     responses = self.path == "/v1/responses"
@@ -131,7 +135,11 @@ class Gateway:
                 except TimeoutError as exc:
                     owner.stop_reason = owner.stop_reason or "deadline"
                     return self.error(408, str(exc))
-                except (ValueError, TypeError, AttributeError):
+                except (ValueError, TypeError, AttributeError) as error:
+                    if "hard byte" in str(error):
+                        owner.stop_reason = "context-limit"
+                        owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes})
+                        return self.error(413, "request context exceeds the configured byte limit")
                     return self.error(400, "invalid smoke request")
                 row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}
                 owner.records.append(row)
@@ -195,6 +203,7 @@ class Gateway:
                         if row["usage"]:
                             owner.budget.settle(rid, row["usage"], owner.spec["rates"])
                         row["seconds"] = round(time.monotonic() - started, 3)
+                        row.update(started_epoch=started_epoch, ended_epoch=time.time())
                         owner.on_record("pi-provider", dict(row))
                         if owner.records_path:
                             owner.records_path.write_text(json.dumps(owner.records, indent=2))

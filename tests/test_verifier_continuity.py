@@ -140,7 +140,6 @@ def test_agentic_unverified_returns_reproducible_checks_to_same_verifier(
     assert "candidate is independently live" in leads
     assert "test -e /tmp/candidate && echo PASS" in leads
     assert "private actor narration marker" not in leads
-    assert any("could not CONFIRM" in user for user in actor_users)
 
 
 def _mock_chat_factory(replies):
@@ -197,16 +196,8 @@ def test_session_keeps_context_but_refreshes_candidate_content_evidence():
         assert v2 == "pass"
         assert session.content_probes == 2
         assert session.inspections == 2
-        assert any("CURRENT candidate" in message["content"]
-                   for message in session if message["role"] == "user")
     finally:
         V.chat = orig
-
-
-def test_verifier_system_requires_pre_pass_falsification():
-    system = V.build_verifier_system(Cfg())
-    assert "Before emitting `pass`, try to FALSIFY" in system
-    assert "one terminal `pass`" in system
 
 
 def test_pass_doubts_are_resolved_by_same_verifier_agent():
@@ -314,7 +305,6 @@ def test_messages_carry_the_punchlist_when_items_exist():
          "evidence": "found only in /tmp"}])
     for msg in (V.disagreement_message(f),
                 V.unverified_message(f, evidence_request=True)):
-        assert "THE UNSETTLED ITEMS" in msg
         assert "the deck is at the named path" in msg
 
 

@@ -20,13 +20,22 @@ from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_IDENTITY = {"coding_engine": "pi", "pi_version": "1.3.0",
-                   "adapter_version": 2, "context_policy": "host-records-v1",
+                   "adapter_version": 4, "context_policy": "bounded-host-turn-history-v3",
                    "budget_policy": "elapsed-time-v1"}
 SYSTEM = (
     "You are the coding engine inside a host-controlled kernel attempt. "
     "Use the declared typed tools; never print a JSON action envelope. "
     "Select exactly one host action. A queued receipt is NOT execution or success. "
     "Only the next authoritative host observation establishes compilation, correctness or timing. "
+    "When submit is offered, a successful run alone does not finish the attempt. "
+    "Once the current source is host-verified and all evidence required by the task is retained, "
+    "call the submit tool as your next action. Do not add optional timing, profiling, source edits, "
+    "or repeated compile/run calls after the task is satisfied. If submit reports missing evidence, "
+    "obtain that evidence and submit again. A pass for an older source does not verify current edits. "
+    "For a failure-repair task, first retain a host observation of the specified original failure, "
+    "then repair, verify the current source, and submit. Skip reproduction when that failure is "
+    "already retained. A missing-original-failure rejection requires that missing reproduction "
+    "and a verified repair, not repeated passing runs or repeated submit calls. "
     "Follow the task ABI, allowed actions, frozen case suite and remaining limits. "
     "Read admitted context records with read_context when their previews are insufficient. "
     "Use edit_source for small corrections with the exact current source hash. "
@@ -81,9 +90,12 @@ class RequestAccounting:
 
 class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
-                 budget=None, own_process_group=True):
+                 budget=None, own_process_group=True, system_prompt=SYSTEM,
+                 first_action_only=False, context_factory=ContextRecords):
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
+        self.system_prompt = system_prompt
+        self.first_action_only = first_action_only
         # Only canonical registered profiles are accepted.
         from benchmarks.a3_experiments import BackendModel
         from benchmarks.a3_model_profiles import load_a3_model_profile
@@ -104,7 +116,8 @@ class PiCodingSession:
                                            "limit": {"type": "integer", "minimum": 1, "maximum": 8192}},
                                           ["record"])
         self.schemas["edit_source"] = obj({"sha256": STRING, "old_text": STRING, "new_text": STRING})
-        self.context = ContextRecords()
+        self.context_factory = context_factory
+        self.context = self.context_factory()
         self.token = secrets.token_urlsafe(32)
         self.own_process_group = own_process_group
         self.stack = ExitStack()
@@ -119,6 +132,7 @@ class PiCodingSession:
         self.record = lambda *_: None
         self.gateway.on_record = lambda kind, payload: self.record(kind, payload)
         self.closed = False
+        self.context_reads = {}
 
     def _operation(self, name, args):
         with self.lock:
@@ -128,9 +142,16 @@ class PiCodingSession:
                 raise ValueError("tool is not allowed in the current host state")
             validate(args, self.schemas[name])
             if name == "read_context":
-                return self.context.read(args["record"], args.get("offset", 0), args.get("limit", 4096))
+                page = self.context.read(args["record"], args.get("offset", 0), args.get("limit", 4096))
+                key = (args["record"], page["offset"], args.get("limit", 4096))
+                self.context_reads[key] = self.context_reads.get(key, 0) + 1
+                self.record("pi-context-read", {"record": args["record"], "offset": page["offset"],
+                    "bytes": len(page["text"].encode()), "repeat": self.context_reads[key] > 1})
+                return page
             self.mutations += 1
             if self.mutations != 1:
+                if self.first_action_only:
+                    raise ValueError("only the first queued host action is selected; this extra call was not executed")
                 self.pending = None
                 raise ValueError("only one host action is allowed per turn")
             if name == "edit_source":
@@ -180,8 +201,12 @@ class PiCodingSession:
                     body = json.loads(self.rfile.read(size))
                     result = owner._operation(body["name"], body.get("arguments", {}))
                     status = 200
-                except (ValueError, KeyError, TypeError):
-                    status, result = 400, {"error": "invalid, stale, or disallowed host tool"}
+                except (ValueError, KeyError, TypeError) as error:
+                    # Validation errors describe schema/state, never provider credentials.
+                    reason = str(error)[:500]
+                    result = {"error": reason, "allowed": sorted(owner.allowed)}
+                    owner.record("pi-action-rejected", result)
+                    status = 400
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -201,14 +226,15 @@ class PiCodingSession:
                "PI_CODING_AGENT_DIR": str(directory), "PI_OFFLINE": "1",
                "RSI_PI_GATEWAY_TOKEN": self.gateway.token, "RSI_PI_TOOL_TOKEN": self.token,
                "RSI_PI_TOOL_URL": f"http://127.0.0.1:{server.server_port}",
-               "RSI_PI_SCHEMAS": str(directory / "schemas.json")}
+               "RSI_PI_SCHEMAS": str(directory / "schemas.json"),
+               "RSI_PI_REQUEST_BYTES": str(self.gateway.hard_bytes)}
         argv = [str(self.executable), "--mode", "rpc", "--no-session",
                 "--provider", "rsi-host", "--model", spec["model"],
                 "--thinking", "off" if self.gateway.provider == "deepseek" else "high",
                 "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "--no-themes", "--no-context-files", "--no-mcp", "--offline", "--no-approve",
-                "--extension", str(ROOT / "integrations/pi/host-actions.ts"),
-                "--system-prompt", SYSTEM]
+                "--extension", str(getattr(self, "extension_file", ROOT / "integrations/pi/host-actions.ts")),
+                "--system-prompt", self.system_prompt]
         self.rpc = self.stack.enter_context(PiRPC(argv, cwd=directory, env=env,
                                                  own_process_group=self.own_process_group))
 
@@ -228,7 +254,8 @@ class PiCodingSession:
         if source is not None and write_action is not None:
             self.allowed.add("edit_source")
         self.pending, self.mutations = None, 0
-        self.context = ContextRecords()
+        self.context = self.context_factory()
+        self.context_reads = {}
         self.snapshot = self.context.snapshot({
             "host": context,
             "remaining_seconds": max(0, self.deadline - time.monotonic()),
@@ -241,6 +268,8 @@ class PiCodingSession:
             try:
                 self.rpc.prompt("Select the next allowed action using the authoritative host snapshot.")
             except PiError:
+                if self.gateway.stop_reason == "context-limit":
+                    raise PiError("Pi request context exceeds the configured byte limit; no action accepted") from None
                 if any(e.get("message", {}).get("stopReason") == "length" for e in self.rpc.events[start:]):
                     raise ActionError("truncated Pi tool call; no action accepted") from None
                 raise
@@ -263,10 +292,12 @@ class PiCodingSession:
                             if part["name"] not in self.allowed:
                                 raise ValueError("disallowed original tool call")
                             validate(part["arguments"], self.schemas[part["name"]])
-            except (ValueError, KeyError, TypeError):
+            except (ValueError, KeyError, TypeError) as error:
                 self.pending = None
-                raise ActionError("invalid original Pi tool arguments") from None
-            if self.mutations != 1 or self.pending is None:
+                reason = "invalid original Pi tool arguments: " + str(error)
+                self.record("pi-action-rejected", {"error": reason, "allowed": sorted(self.allowed)})
+                raise ActionError(reason) from None
+            if self.pending is None or (self.mutations != 1 and not self.first_action_only):
                 raise ActionError("Pi must select exactly one valid host action")
             if time.monotonic() >= self.deadline:
                 self.pending = None
@@ -274,7 +305,7 @@ class PiCodingSession:
             name, args = self.pending
             # Persist intent before returning it to the host that owns side effects.
             self.record("pi-action", {"id": uuid.uuid4().hex, "name": name, "arguments": args,
-                                      **ENGINE_IDENTITY})
+                                      "discarded_actions": self.mutations - 1, **ENGINE_IDENTITY})
             return name, args
         finally:
             # Stream records through the host callback, including on failed or

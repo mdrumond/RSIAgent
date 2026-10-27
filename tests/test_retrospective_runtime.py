@@ -18,7 +18,7 @@ def request(tmp_path, seconds=30):
                                   remaining_seconds=seconds)
 
 
-def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
+def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device=3, operation_root=None):
     calls = []
     native = dict(target='a3_product', arch='dav-2201', execution_profile='gz-a3',
                   transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned', health_workspace='/owned/incoming',
@@ -29,6 +29,7 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
             self.options = options
             self.remaining_seconds = options['remaining_seconds']
             self.runtime_identity = dict(target=options['target'], runtime=options['runtime'], physical_device=options['physical_device'])
+        def recover_owned_operations(self, **kwargs): pass
         def run_remote(self, *args, **kwargs):
             return SimpleNamespace(returncode=0, job_handle='remote:registry-target:job:health', stdout=json.dumps({
                 'queries':{kind:{'exit':0, 'text':text} for kind,text in {
@@ -47,13 +48,15 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
     class Actor:
         immutable_context = b'original'
         query_knowledge = None
+        request_timing = staticmethod(lambda *a, **k: calls.append('timing') or {'receipt':'timing'})
+        request_profile = staticmethod(lambda *a, **k: calls.append('profile') or {'receipt':'profile'})
         executor = SimpleNamespace(execute=lambda *a, **k: calls.append('extra-check'))
         def __call__(self, value):
             calls.append(('actor', value.remaining_seconds))
             return value
     def production(settings, **options):
         transport = options['native_options']['transport_factory'](cpl_remote='/skill/cpl-remote',
-            validation_wrapper='must-not-run', remote_workspace='/owned/arm', physical_device=3,
+            validation_wrapper='must-not-run', remote_workspace='/owned/arm', physical_device=device,
             profile='gz-a3', state_directory=tmp_path/'transport')
         paths = SimpleNamespace(root=tmp_path, **{k: native[k] for k in ('target','arch','execution_profile')})
         return dict(actor=Actor(), paths=paths, transport=transport)
@@ -64,7 +67,8 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False):
     stop = tmp_path/'STOP'
     if stopped:
         stop.touch()
-    bound = runtime.compose_cpl_production({'phase1_arguments':['--config','fixture'], 'stop_file':str(stop)},
+    bound = runtime.compose_cpl_production({'phase1_arguments':['--config','fixture'], 'stop_file':str(stop),
+         'native_operation_root':str(operation_root) if operation_root else None},
         target='a3', root=tmp_path, initial_memory=b'', max_seconds=100)
     return bound, calls
 
@@ -150,7 +154,9 @@ def test_full_native_worker_arm_copies_keep_registered_route_and_isolation(tmp_p
         routes.append(merged)
         if len(routes) > 1:
             assert settings['environment_check_cache'] == str(tmp_path/'shared-probes')
-        return dict(bound(options['root']), environment_check_cache=str(tmp_path/'shared-probes'))
+            assert settings['native_operation_root'] == str(tmp_path/'campaign')
+        return dict(bound(options['root']), environment_check_cache=str(tmp_path/'shared-probes'),
+                    native_operation_root=str(tmp_path/'campaign'))
     class Execution:
         def __init__(self, *args): pass
         def graph(self, request, **kwargs): return request
@@ -179,3 +185,127 @@ def test_actual_stop_marks_cancellation_but_preserves_provider_failure(tmp_path,
     with pytest.raises(type(error)):
         actor(request(tmp_path))
     assert getattr(error,'interruption_reason',None)==expected
+
+
+def test_changed_device_has_distinct_retained_namespace_and_preserves_old_records(tmp_path, monkeypatch):
+    first, _ = compose(tmp_path, monkeypatch, device=1)
+    original = first['transport'].options['state_directory']
+    original.mkdir(parents=True)
+    journal = original/'operation.json'
+    journal.write_text('retained original allocation')
+    second, _ = compose(tmp_path, monkeypatch, device=2)
+    assert original != second['transport'].options['state_directory']
+    assert journal.read_text() == 'retained original allocation'
+    same, _ = compose(tmp_path, monkeypatch, device=1)
+    assert same['transport'].options['state_directory'] == original
+
+
+def test_background_trial_pending_operation_blocks_foreground_until_settled(tmp_path, monkeypatch):
+    binding = tmp_path/'foreground'
+    bound, calls = compose(binding, monkeypatch, operation_root=tmp_path)
+    journal = tmp_path/'memory-reviews/trial/control/runtime/transport/operation.json'
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps(dict(state='queued', handle='remote:registry-target:job:trial')))
+    with pytest.raises(ProjectInfrastructureError, match='unsettled'):
+        bound['actor'](request(binding))
+    assert calls == []
+    assert json.loads(journal.read_text())['state'] == 'queued'
+    journal.write_text(json.dumps(dict(state='completed', handle='remote:registry-target:job:trial')))
+    bound['actor'](request(binding))
+    assert calls[:2] == ['probe-compile','probe-execute'] and calls[-1][0] == 'actor'
+    assert bound['native_operation_root'] == str(tmp_path.resolve())
+
+
+@pytest.mark.parametrize('name', ['request_timing','request_profile'])
+def test_measurement_callbacks_readmit_after_last_correctness_run(tmp_path, monkeypatch, name):
+    bound, calls = compose(tmp_path/'foreground', monkeypatch, operation_root=tmp_path)
+    bound['actor'].executor.execute('correctness')
+    before = list(calls)
+    pending = tmp_path/'memory-reviews/trial/runtime/operation.json'
+    pending.parent.mkdir(parents=True)
+    pending.write_text(json.dumps(dict(state='queued',handle='remote:registry-target:job:trial')))
+    callback = getattr(bound['actor'],name)
+    with pytest.raises(ProjectInfrastructureError, match='unsettled'):
+        callback({'replay_id':'same'},None)
+    assert calls == before
+    pending.write_text(json.dumps(dict(state='completed',handle='remote:registry-target:job:trial')))
+    first = callback({'replay_id':'same'},None)
+    assert callback({'replay_id':'same'},None) == first
+    assert calls.count(name.removeprefix('request_')) == 2
+
+
+@pytest.mark.parametrize('bound_case', [False, True])
+def test_campaign_reservation_serializes_parent_and_trial_admission_through_dispatch(tmp_path, monkeypatch, bound_case):
+    import threading
+    from contextlib import contextmanager
+    parent, parent_calls = compose(tmp_path/'parent',monkeypatch,operation_root=tmp_path)
+    trial, trial_calls = compose(tmp_path/'trial/runtime',monkeypatch,operation_root=tmp_path)
+    entered, release, attempted = threading.Event(), threading.Event(), threading.Event()
+    errors = []
+    def execute(*args):
+        entered.set()
+        assert release.wait(5)
+        parent_calls.append('device-settled')
+    parent['actor'].executor._executor.execute = execute
+    if bound_case:
+        parent['actor'].executor._executor.bind_case = lambda *args: SimpleNamespace(execute=execute)
+        trial_execute = trial['actor'].executor._executor.execute
+        trial['actor'].executor._executor.bind_case = lambda *args: SimpleNamespace(execute=trial_execute)
+        parent['actor'].executor = parent['actor'].executor.bind_case(None, ())
+        trial['actor'].executor = trial['actor'].executor.bind_case(None, ())
+    reserve = trial['actor'].executor._check.reserve
+    @contextmanager
+    def observed_reserve():
+        attempted.set()
+        with reserve(): yield
+    trial['actor'].executor._check.reserve = observed_reserve
+    def run(bound):
+        try: bound['actor'].executor.execute('candidate')
+        except BaseException as error: errors.append(error)
+    first, second = threading.Thread(target=run,args=(parent,)), threading.Thread(target=run,args=(trial,))
+    first.start()
+    try:
+        assert entered.wait(5)
+        second.start()
+        assert attempted.wait(5)
+        assert not trial_calls  # Neither probe nor candidate dispatch raced the parent.
+    finally:
+        release.set()
+        first.join(5)
+        if second.ident is not None: second.join(5)
+    assert not first.is_alive() and not second.is_alive() and not errors
+    assert parent_calls[-1] == 'device-settled'
+    assert trial_calls == ['probe-compile','probe-execute','extra-check']
+
+
+@pytest.mark.parametrize('operation', ['compile','execute'])
+@pytest.mark.parametrize('case_offset', [1,2])
+def test_bound_original_or_remedial_case_keeps_admission_and_exact_inputs(tmp_path, monkeypatch, operation, case_offset):
+    bound, calls = compose(tmp_path/'foreground',monkeypatch,operation_root=tmp_path)
+    spec = request(tmp_path).spec
+    inputs = tuple(materialize_inputs(spec))
+    dispatched = []
+    class Executor:
+        def __init__(self, retained=None): self.retained = retained
+        def bind_case(self, selected, values):
+            assert selected == spec
+            return Executor(values)
+        def compile(self, selected, source):
+            dispatched.append(('compile',self.retained))
+            return self.retained
+        def execute(self, selected, source):
+            dispatched.append(('execute',self.retained))
+            return self.retained
+    bound['actor'].executor._executor = Executor()
+    selected = bound['actor'].executor.bind_case(spec,inputs)
+    if case_offset == 2:
+        selected = selected.bind_case(spec,inputs)
+    pending = tmp_path/'trial/runtime/operation.json'
+    pending.parent.mkdir(parents=True)
+    pending.write_text(json.dumps(dict(state='running',handle='remote:registry-target:job:trial')))
+    with pytest.raises(ProjectInfrastructureError,match='unsettled'):
+        getattr(selected,operation)(spec,'candidate')
+    assert not dispatched and not calls
+    pending.write_text(json.dumps(dict(state='completed',handle='remote:registry-target:job:trial')))
+    assert getattr(selected,operation)(spec,'candidate') == inputs
+    assert dispatched == [(operation,inputs)]

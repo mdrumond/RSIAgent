@@ -36,7 +36,7 @@ def evaluation_assessment(result):
 def admission_assessment(job):
     status = job['status']
     if status == 'accepted':
-        return assessment('accepted', 'publication', 'memory-published')
+        return assessment('accepted', 'publication', 'manual-override' if job.get('manual_override') else 'memory-published')
     if status == 'rejected':
         if job.get('project_repair'):
             return assessment('needs-repair', 'source-audit', 'source-repair-required')
@@ -64,14 +64,21 @@ def project_assessment(record):
     return assessment('eligible', 'source-audit', 'source-audit-passed')
 
 
-def admission_report(root):
+def admission_report(root, *, memory_root=None):
     """Read held and completed jobs without workers, leases or runtime setup."""
+    state_path = Path(memory_root) / 'active.json' if memory_root is not None else None
+    overrides = (json.loads(state_path.read_bytes()).get('manual_overrides', {})
+                 if state_path is not None and state_path.exists() else {})
     result = {}
     for path in sorted(Path(root).glob('*/job.json')):
         job = json.loads(path.read_bytes())
+        manual = overrides.get(job['review_id']) or job.get('manual_override')
+        if manual is not None:
+            job = dict(job, status='accepted', manual_override=manual)
         result[job['review_id']] = dict(status=job['status'],
-            assessment=admission_assessment(job), error_type=job.get('error_type'),
-            reason=job.get('error') or ((job.get('evaluations') or [{}])[-1].get('reason')),
+            assessment=admission_assessment(job), error_type=None if manual is not None else job.get('error_type'),
+            reason=(manual.get('reason') if manual is not None else job.get('error')
+                    or ((job.get('evaluations') or [{}])[-1].get('reason'))),
             rewrites=job['rewrites'])
     return result
 
