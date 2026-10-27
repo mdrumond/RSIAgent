@@ -134,7 +134,8 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
         native_options={'transport_factory': transport_factory, 'measurement_factory': measurement_factory})
     check = NativeWaveEnvironmentCheck(bound['paths'], transports)
     cache = settings.get('environment_check_cache') or ((stop.parent if stop else Path(root)) / 'environment-check-cache')
-    admission = EnvironmentAdmission(check, transports, bound['paths'].root, cache=cache,
+    operation_root = Path(settings.get('native_operation_root') or root).resolve()
+    admission = EnvironmentAdmission(check, transports, bound['paths'].root, cache=cache, pending_root=operation_root,
         dependencies={key: native.get(key) for key in ('target','arch','compiler_version','environment_identity','allowed_devices','health_workspace')})
     def ensure_environment(*, force=False):
         if remaining() <= 0:
@@ -145,5 +146,6 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     actor.executor = _CheckedExecutor(actor.executor, ensure_environment)
     bound['actor'] = _CheckedActor(actor, ensure_environment, remaining)
     bound.update(check_environment=ensure_environment, transports=tuple(transports),
-                 environment_check_cache=str(Path(cache).resolve()))
+                 environment_check_cache=str(Path(cache).resolve()),
+                 native_operation_root=str(operation_root))
     return bound

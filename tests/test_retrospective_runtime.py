@@ -18,7 +18,7 @@ def request(tmp_path, seconds=30):
                                   remaining_seconds=seconds)
 
 
-def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device=3):
+def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device=3, operation_root=None):
     calls = []
     native = dict(target='a3_product', arch='dav-2201', execution_profile='gz-a3',
                   transport_target='registry-target', runtime='named-runtime', registry_workspace='/owned', health_workspace='/owned/incoming',
@@ -65,7 +65,8 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device
     stop = tmp_path/'STOP'
     if stopped:
         stop.touch()
-    bound = runtime.compose_cpl_production({'phase1_arguments':['--config','fixture'], 'stop_file':str(stop)},
+    bound = runtime.compose_cpl_production({'phase1_arguments':['--config','fixture'], 'stop_file':str(stop),
+         'native_operation_root':str(operation_root) if operation_root else None},
         target='a3', root=tmp_path, initial_memory=b'', max_seconds=100)
     return bound, calls
 
@@ -151,7 +152,9 @@ def test_full_native_worker_arm_copies_keep_registered_route_and_isolation(tmp_p
         routes.append(merged)
         if len(routes) > 1:
             assert settings['environment_check_cache'] == str(tmp_path/'shared-probes')
-        return dict(bound(options['root']), environment_check_cache=str(tmp_path/'shared-probes'))
+            assert settings['native_operation_root'] == str(tmp_path/'campaign')
+        return dict(bound(options['root']), environment_check_cache=str(tmp_path/'shared-probes'),
+                    native_operation_root=str(tmp_path/'campaign'))
     class Execution:
         def __init__(self, *args): pass
         def graph(self, request, **kwargs): return request
@@ -193,3 +196,19 @@ def test_changed_device_has_distinct_retained_namespace_and_preserves_old_record
     assert journal.read_text() == 'retained original allocation'
     same, _ = compose(tmp_path, monkeypatch, device=1)
     assert same['transport'].options['state_directory'] == original
+
+
+def test_background_trial_pending_operation_blocks_foreground_until_settled(tmp_path, monkeypatch):
+    binding = tmp_path/'foreground'
+    bound, calls = compose(binding, monkeypatch, operation_root=tmp_path)
+    journal = tmp_path/'memory-reviews/trial/control/runtime/transport/operation.json'
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps(dict(state='queued', handle='remote:registry-target:job:trial')))
+    with pytest.raises(ProjectInfrastructureError, match='unsettled'):
+        bound['actor'](request(binding))
+    assert calls == []
+    assert json.loads(journal.read_text())['state'] == 'queued'
+    journal.write_text(json.dumps(dict(state='completed', handle='remote:registry-target:job:trial')))
+    bound['actor'](request(binding))
+    assert calls[:2] == ['probe-compile','probe-execute'] and calls[-1][0] == 'actor'
+    assert bound['native_operation_root'] == str(tmp_path.resolve())

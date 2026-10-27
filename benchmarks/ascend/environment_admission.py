@@ -115,9 +115,10 @@ def verify_dependencies(actual, pinned):
 
 
 class EnvironmentAdmission:
-    def __init__(self, check, transports, root, *, cache, dependencies, clock=time.time):
+    def __init__(self, check, transports, root, *, cache, dependencies, clock=time.time, pending_root=None):
         self.check, self.transports, self.root = check, tuple(transports), Path(root)
         self.cache, self.dependencies, self.clock = Path(cache), dependencies, clock
+        self.pending_root = Path(pending_root) if pending_root is not None else self.root
         self.keys = set()
         self.cache.mkdir(parents=True, exist_ok=True)
 
@@ -135,7 +136,7 @@ class EnvironmentAdmission:
         try:
             for transport in self.transports:
                 transport.recover_owned_operations()
-            if unsettled_operations(self.root):
+            if unsettled_operations(self.pending_root):
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
             for transport in self.transports:
                 # Fresh health runs even on a known-good probe cache hit.

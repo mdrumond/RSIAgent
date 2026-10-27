@@ -68,3 +68,17 @@ def test_health_workspace_and_device_permissions_are_recorded_allocation(tmp_pat
     assert admit_identity(tmp_path,{'target':'a3'},{'config':next_config})==first
     allocation=json.loads((tmp_path/'execution-allocations.json').read_bytes())[-1]['allocation']['config']
     assert allocation['health_workspace']=='/owned/incoming' and allocation['allowed_devices']==[0,1,2]
+
+
+def test_shared_admission_scope_preserves_existing_experiment_identity(tmp_path):
+    from benchmarks.ascend.subject_runtime import build_subject_campaign
+    from benchmarks.ascend.subjects import Subject
+    from test_subject_runtime import bound
+    options = dict(target='a3', root=tmp_path/'campaign', subjects=[Subject('s','copies')],
+        initial_memory=b'', compose=lambda settings, **kwargs:bound(kwargs['root']))
+    first = build_subject_campaign({}, **options)
+    first.memory_gate.close()
+    before = (options['root']/'subject-runtime.json').read_bytes()
+    resumed = build_subject_campaign({'native_operation_root':str(options['root'])}, **options)
+    resumed.memory_gate.close()
+    assert (options['root']/'subject-runtime.json').read_bytes() == before
