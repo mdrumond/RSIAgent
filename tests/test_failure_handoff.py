@@ -209,3 +209,68 @@ def test_failed_bound_repair_preserves_exact_case_for_next_generation(tmp_path):
     fixed_actor = ScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}', '{"run":{}}', '{"submit":{}}'])
     assert AdaptiveActorProjectExecutor(executor, fixed_actor, object())(final_request).evidence.verified
     assert executor._backend.run_requests[-1].inputs == request.inputs
+
+
+@pytest.mark.parametrize('wrong_execution_case', [False, True])
+def test_foreign_renamed_failure_retry_keeps_authenticated_inputs_and_original_oracle(tmp_path, wrong_execution_case):
+    from benchmarks.a5kernels.phase1_curriculum import FailureMode
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from benchmarks.a5kernels.phase1_project import evaluate_reference
+    from benchmarks.ascend.automatic_remediation import AutomaticRemediation
+    from benchmarks.ascend.failure_handoff import phase1_contract
+    from optimizer.jobs import sha
+    executor, spec, _, _ = observed_failure(tmp_path/'producer')
+    inputs = executor.prepare(spec).inputs
+    renamed = replace(spec, project_id='foreign-renamed-repair', failure_mode=FailureMode.NONE,
+                      capabilities=tuple(item for item in spec.capabilities if item.value != 'failure-repair'))
+    assert inputs != executor.prepare(renamed).inputs
+    foreign = tmp_path/'foreign'
+    phase1(foreign, spec=renamed.as_dict())
+    branch = foreign/'waves/wave-1/branches'/renamed.project_id
+    artifacts = ContentAddressedArtifacts(branch/'artifacts')
+    result = executor.execute(spec, 'broken source')
+    refs = {name: artifacts.put_json(value) for name, value in result.artifacts.items()}
+    source = artifacts.put_bytes(b'broken source')
+    payload = canonical_bytes(dict(classification='host-mismatch', source_sha256=source, artifacts=refs))
+    (branch/'execution-evidence.bin').write_bytes(payload)
+    outcome = json.loads((branch/'outcome.json').read_bytes())
+    outcome['evidence_sha256'] = sha(payload)
+    (branch/'outcome.json').write_bytes(canonical_bytes(outcome))
+    store = FeedbackStore(tmp_path/'feedback')
+    store.import_phase1(foreign, target='a3', language='ascend-c')
+    original, = store.records()
+    original_bytes = (store.root/(original['feedback_id']+'.json')).read_bytes()
+    received = []
+    def execute(request):
+        received.append(request)
+        assert request.inputs == inputs
+        assert request.oracle == evaluate_reference(renamed, inputs)
+        bound = request
+        if wrong_execution_case:
+            wrong = executor.prepare(renamed)
+            bound = replace(request, failure_context=None, inputs=wrong.inputs, oracle=wrong.expected)
+        actor = ScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
+                               '{"run":{}}', '{"submit":{}}'], memory=bound.pre_wave_memory)
+        return AdaptiveActorProjectExecutor(executor, actor, object())(bound)
+    runner = AdaptivePhase1Coordinator(tmp_path/'consumer', 'Retry original case.', b'{}',
+        CurriculumAgent(lambda _: pytest.fail('no new curriculum project')), execute, max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', store=store.root)
+    state = runner._load_state()
+    automatic.refresh(state)
+    directory = runner.root/'original-retries'/original['feedback_id']/'retry-1'
+    automatic._phase1_retry(original, directory, state)
+    assert len(received) == 1
+    plan = json.loads((directory/'waves/original-retry/plan.json').read_bytes())
+    expected_contract = phase1_contract(renamed, inputs)
+    assert sha(canonical_bytes(plan['case_inputs'][renamed.project_id])) == expected_contract['inputs_sha256']
+    retry = next(row for row in store.records() if row['feedback_id'] != original['feedback_id'])
+    assert retry['outcome']['verified']
+    assert (store.root/(original['feedback_id']+'.json')).read_bytes() == original_bytes
+    linked = store.link_original_retry(original['feedback_id'], retry['feedback_id'])
+    assert linked['lifecycle'] == ('failed' if wrong_execution_case else 'fixed')
+    retained = json.loads((directory/'waves/original-retry/branches'/renamed.project_id/'execution-evidence.bin').read_bytes())
+    if not wrong_execution_case:
+        assert retained['artifacts']['inputs'] == expected_contract['inputs_sha256']
+        assert retained['artifacts']['expected'] == expected_contract['expected_sha256']
+        assert executor._backend.run_requests[-1].inputs == inputs
