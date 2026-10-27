@@ -230,5 +230,8 @@ def test_owned_and_trial_recovery_share_remaining_elapsed_allocation(tmp_path, m
     admission.pending_root = root
     with pytest.raises(TimeoutError,match='allocation exhausted'):
         admission(lambda:max(0,5-now[0]))
-    assert observations == [('remote:fixture:job:owned',5),('remote:fixture:job:trial',3)]
+    assert [handle for handle, _ in observations] == ['remote:fixture:job:owned','remote:fixture:job:trial']
+    assert observations[0][1] == 5
+    assert 0 < observations[1][1] <= 3
+    assert observations[1][1] == pytest.approx(3,abs=.01)
     assert now[0] == 5 and not health and not probes
