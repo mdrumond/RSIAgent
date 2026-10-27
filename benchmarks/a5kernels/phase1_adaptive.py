@@ -738,10 +738,11 @@ class AdaptivePhase1Coordinator:
             "summary": _validated_summary(value["summary"]),
         }
 
-    def _check_environment(self, state):
+    def _check_environment(self, state, *, remaining_seconds=None):
         token = (state["wave_index"], getattr(self, "_deadline", None))
         if self.environment_check is not None and self._checked_environment != token:
-            self.environment_check(state["wave_index"], self._remaining_seconds)
+            allowance = (lambda: min(self._remaining_seconds(), remaining_seconds())) if remaining_seconds else self._remaining_seconds
+            self.environment_check(state["wave_index"], allowance)
             self._checked_environment = token
 
     def _select(self, context, *args, **kwargs):

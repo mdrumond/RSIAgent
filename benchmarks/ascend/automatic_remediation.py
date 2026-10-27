@@ -225,7 +225,10 @@ class AutomaticRemediation:
             pending_path.write_bytes(snapshot)
         wave = WaveSpec('original-retry', sha(snapshot), (), (WaveProject(spec),))
         live = LiveWaveCoordinator(directory / 'waves' / wave.wave_id, wave, snapshot,
-                                   self.runner._execute, 1, allow_semantic_failures=True)
+                                   self.runner._execute, 1, allow_semantic_failures=True,
+                                   before_execute=lambda: self.runner._check_environment(state,
+                                       remaining_seconds=lambda: min(self.budgets[row["feedback_id"]].remaining_seconds,
+                                                                     self.runner._remaining_seconds())))
         result = live.resume()
         pending = dict(session=state['session'])
         blank = dict(state, prior_outcomes=[], failed_outcomes=[], memory_bytes_base64=[],

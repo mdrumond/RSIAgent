@@ -174,3 +174,91 @@ def test_curriculum_receives_only_time_remaining_after_environment_probe(tmp_pat
     c.propose_wave()
     assert budgets == [20]
     assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 80
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_usefulness_live_work_is_gated_but_retained_assessment_replay_is_probe_free(tmp_path, failed):
+    from benchmarks.ascend.production import compose_adaptive_controller
+    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+    from tests.test_a5_phase1_adaptive import _memory
+    events, requests, now = [], [], [0.0]
+    def complete(profile, messages, **kwargs):
+        events.append('provider')
+        try:
+            stage = json.loads(messages[-1]['content']).get('stage')
+        except ValueError:
+            stage = None
+        return SimpleNamespace(text=stage or _wave(messages[-1]['content'], [_project('paired', 'gm-ub-movement')]))
+    def execute(request):
+        events.append('actor')
+        requests.append(request)
+        return _result(request.spec, True, 'host pass')
+    _, runner = compose_adaptive_controller(root=tmp_path, objective='Learn', initial_memory=b'{}',
+        executor=None, actor=None, profile=None, provider=SimpleNamespace(complete=complete),
+        max_parallel=1, project_target=1, max_seconds=100, project_actor=execute, usefulness_enabled=True)
+    runner.clock = lambda: now[0]
+    def check(index, remaining):
+        events.append('check')
+        assert remaining() == 100
+        now[0] += 7
+        if failed:
+            raise ProjectInfrastructureError('environment unavailable')
+    runner.environment_check = check
+    memory = _memory(ProjectSpec.from_mapping(_project('source', 'gm-ub-movement')))
+    def assess():
+        return runner.usefulness_verifier.assess_memory(memory, b'{}', 'source')[0]
+    result = runner._with_allocation(assess)
+    assert result['outcome'] == ('inconclusive' if failed else 'both-succeeded')
+    assert events[0] == 'check'
+    if failed:
+        assert events == ['check'] and requests == []
+    else:
+        assert len(requests) == 2 and all(0 < request.remaining_seconds <= 93 for request in requests)
+    before = list(events)
+    runner.environment_check = lambda *args: pytest.fail('retained assessment must not probe')
+    assert runner._with_allocation(assess)['experiment_id'] == result['experiment_id']
+    assert events == before
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_original_retry_live_work_is_gated_but_completed_publication_replay_is_probe_free(tmp_path, failed):
+    from benchmarks.ascend.automatic_remediation import AutomaticRemediation
+    from tests.test_generic_failure_feedback import phase1
+    phase1(tmp_path / 'source', spec=_project('original', 'gm-ub-movement'))
+    events, requests, now = [], [], [0.0]
+    def execute(request):
+        events.append('actor')
+        requests.append(request)
+        return _result(request.spec, True, 'host pass')
+    runner = AdaptivePhase1Coordinator(tmp_path / 'run', 'Repair', b'{}',
+        CurriculumAgent(lambda _: pytest.fail('retry must not select')), execute,
+        max_parallel=1, project_target=1, max_seconds=100, clock=lambda: now[0])
+    automatic = AutomaticRemediation(runner, target='a3', sources=[dict(type='phase1', root=str(tmp_path / 'source'))])
+    state = runner._load_state()
+    automatic.refresh(state)
+    original, = automatic.store.records()
+    automatic.store.update_investigation(original['feedback_id'], status='ready-to-retry', evidence=['retained probe'])
+    automatic.refresh(state)
+    def check(index, remaining):
+        events.append('check')
+        assert remaining() == 100
+        now[0] += 7
+        if failed:
+            raise ProjectInfrastructureError('environment unavailable')
+    runner.environment_check = check
+    def retry():
+        automatic.retry_ready(state)
+        return {}
+    if failed:
+        with pytest.raises(ProjectInfrastructureError):
+            runner._with_allocation(retry)
+        assert events == ['check'] and requests == []
+    else:
+        runner._with_allocation(retry)
+        assert events == ['check', 'actor']
+        assert 0 < requests[0].remaining_seconds <= 93
+        directory = requests[0].branch_root.parents[3]
+        row = automatic.feedback.selection['selected'][0]
+        runner.environment_check = lambda *args: pytest.fail('completed retry must not probe')
+        runner._with_allocation(lambda: (automatic._phase1_retry(row, directory, state) or {}))
+        assert events == ['check', 'actor']

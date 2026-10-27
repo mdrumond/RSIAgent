@@ -85,7 +85,10 @@ def compose_adaptive_controller(
     coordinator.usefulness_verifier = build_usefulness_verifier(
         root=root, provider=provider, profile=profile, curriculum=curriculum,
         project_actor=project_actor, enabled=usefulness_enabled,
-        pair_seconds=usefulness_pair_seconds, remaining_seconds=coordinator._remaining_seconds)
+        pair_seconds=usefulness_pair_seconds, remaining_seconds=coordinator._remaining_seconds,
+        before_live_work=(lambda remaining: coordinator._check_environment(
+            coordinator._load_state(), remaining_seconds=remaining))
+            if hasattr(coordinator, "_check_environment") else None)
     return project_actor, coordinator
 
 
