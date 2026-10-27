@@ -1,0 +1,391 @@
+"""Ordered, resumable subject progress; curriculum agents supply the decisions."""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+import fcntl
+import json
+from pathlib import Path
+import re
+
+from optimizer.jobs import atomic, canonical
+
+
+def _text(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f'{field} must be nonempty text')
+    return value
+
+
+def _evidence(value):
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError('decision requires evidence references')
+    return [_text(item, 'evidence reference') for item in value]
+
+
+@dataclass(frozen=True)
+class Subject:
+    subject_id: str
+    objective: str
+    min_waves: int = 3
+    task: dict | None = None
+
+    def __post_init__(self):
+        if not isinstance(self.subject_id, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', self.subject_id):
+            raise ValueError('subject_id must be a stable identifier')
+        _text(self.objective, 'objective')
+        if type(self.min_waves) is not int or self.min_waves < 1:
+            raise ValueError('min_waves must be a positive integer')
+        if self.task is not None and not isinstance(self.task, dict):
+            raise ValueError('task must be an object or null')
+        if self.task is not None:
+            object.__setattr__(self, 'task', json.loads(canonical(self.task)))
+
+    def as_dict(self):
+        return dict(subject_id=self.subject_id, objective=self.objective,
+                    min_waves=self.min_waves, task=json.loads(canonical(self.task)))
+
+    @classmethod
+    def from_mapping(cls, value):
+        if not isinstance(value, dict) or set(value) - {'subject_id', 'objective', 'min_waves', 'task'}:
+            raise ValueError('invalid subject fields')
+        try:
+            return cls(**value)
+        except TypeError as error:
+            raise ValueError('subject requires subject_id and objective') from error
+
+
+def load_subjects(path):
+    value = json.loads(Path(path).read_bytes())
+    if isinstance(value, dict) and set(value) == {'subjects'}:
+        value = value['subjects']
+    if not isinstance(value, list):
+        raise ValueError('subjects must be a list')
+    return _subjects(value)
+
+
+def _subjects(rows):
+    result = tuple(row if isinstance(row, Subject) else Subject.from_mapping(row) for row in rows)
+    if not result or len({row.subject_id for row in result}) != len(result):
+        raise ValueError('subjects must be nonempty with unique identifiers')
+    return result
+
+
+class SubjectScheduler:
+    """One durable state, locked across memory-review and wave writers.
+
+    ``frontier`` tracks first-pass progression independently of ``current`` so a
+    revisit returns to the outstanding subject rather than restarting the list.
+    Every wave owns immutable memory bytes identified by its snapshot hash.
+    """
+    def __init__(self, root, subjects):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.path = self.root / 'subjects.json'
+        self.subjects = _subjects(subjects)
+        self.identities = [row.as_dict() for row in self.subjects]
+        self.index = {row.subject_id: i for i, row in enumerate(self.subjects)}
+        requested = self.identities
+        with self._transaction() as state:
+            if not state:
+                state.update(schema='ascend-subjects-v1', subjects=self.identities,
+                             frontier=0, current=0, waves={}, repairs={}, reviews={}, decisions=[])
+            elif state.get('schema') != 'ascend-subjects-v1' or requested not in (state.get('subjects'), state.get('original_subjects')):
+                raise ValueError('retained subject configuration changed')
+
+    @contextmanager
+    def _transaction(self):
+        with (self.root / '.subjects.lock').open('a+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            state = json.loads(self.path.read_bytes()) if self.path.exists() else {}
+            if state.get('subjects'):
+                self._bind(state['subjects'])
+            yield state
+            atomic(self.path, canonical(state))
+            if state.get('subjects'):
+                self._bind(state['subjects'])
+
+    def _bind(self, rows):
+        self.subjects = _subjects(rows)
+        self.identities = [row.as_dict() for row in self.subjects]
+        self.index = {row.subject_id: i for i, row in enumerate(self.subjects)}
+
+    def edit(self, kind, value, *, expected, proposal_id):
+        """Apply an approved edit without changing reached subjects or reserved waves."""
+        from .subject_memory import digest
+        with self._transaction() as state:
+            if proposal_id in state.get('edits', {}):
+                return state['edits'][proposal_id]
+            if digest(state) != expected:
+                raise ValueError('curriculum proposal is stale; preview again')
+            if kind == 'subjects':
+                rows = [row.as_dict() for row in _subjects(value)]
+                protected = min(len(self.subjects), state['frontier'] + 1)
+                if rows[:protected] != state['subjects'][:protected]:
+                    raise ValueError('active and reached subjects cannot be edited')
+                ids = {row['subject_id'] for row in rows}
+                if any(row['subject_id'] not in ids for row in state.get('project_queue', [])):
+                    raise ValueError('remove queued projects before removing their subject')
+                state.setdefault('original_subjects', state['subjects'])
+                state['subjects'] = rows
+                if state['current'] is None and state['frontier'] < len(rows):
+                    state['current'] = state['frontier']
+            elif kind == 'projects':
+                if any(row['subject_id'] not in self.index for row in value):
+                    raise ValueError('queued project names an unknown subject')
+                reserved = {row['item']['project_id'] for rows in state.get('claimed_projects', {}).values()
+                            for row in rows}
+                if any(row['item']['project_id'] in reserved for row in value):
+                    raise ValueError('project is already reserved for execution')
+                state['project_queue'] = value
+            else:
+                raise ValueError('unknown curriculum edit')
+            receipt = dict(proposal_id=proposal_id, revision=state.get('revision', 0) + 1)
+            state['revision'] = receipt['revision']
+            state.setdefault('edits', {})[proposal_id] = receipt
+            return receipt
+
+    def prioritize_projects(self):
+        """Visit approved reached-subject work only between immutable waves."""
+        with self._transaction() as state:
+            if any(row['status'] != 'completed' for row in state['waves'].values()):
+                return False
+            # Claiming removes queued plans before the campaign saves its pending
+            # wave. Resume that reservation before restoring the revisit's return
+            # subject, even when the now-empty queue would otherwise look done.
+            for wave_id, rows in state.get('claimed_projects', {}).items():
+                if rows and wave_id not in state['waves']:
+                    state['current'] = self.index[rows[0]['subject_id']]
+                    return True
+            queue = state.get('project_queue', [])
+            current = state['current']
+            current_id = self.subjects[current].subject_id if current is not None else None
+            if any(row['subject_id'] == current_id for row in queue):
+                return True
+            if 'queue_return' in state:
+                state['current'] = state.pop('queue_return')
+                current = state['current']
+            selected = next((self.index[row['subject_id']] for row in queue
+                             if self.index[row['subject_id']] <= state['frontier']), None)
+            if selected is None:
+                return False
+            state['queue_return'] = current
+            state['current'] = selected
+            state['decisions'].append(dict(action='revisit', subject_id=self.subjects[selected].subject_id,
+                reason='Execute approved queued projects', evidence=[row['item']['project_id'] for row in queue
+                    if row['subject_id'] == self.subjects[selected].subject_id]))
+            return True
+
+    def claim_projects(self, wave_id):
+        """Reserve a queued wave once; repeat after interruption returns the same plans."""
+        with self._transaction() as state:
+            claimed = state.setdefault('claimed_projects', {})
+            if wave_id in claimed:
+                return [row['item'] for row in claimed[wave_id]]
+            if state['current'] is None:
+                return []
+            subject_id = self.subjects[state['current']].subject_id
+            rows = [row for row in state.get('project_queue', []) if row['subject_id'] == subject_id]
+            if not rows:
+                return []
+            claimed[wave_id] = rows
+            state['project_queue'] = [row for row in state['project_queue'] if row['subject_id'] != subject_id]
+            return [row['item'] for row in rows]
+
+    def state(self):
+        with self._transaction() as state:
+            return json.loads(canonical(state))
+
+    @staticmethod
+    def _open_repairs(state, subject_id=None):
+        return [row for row in state['repairs'].values() if row['status'] == 'open'
+                and (subject_id is None or row['subject_id'] == subject_id)]
+
+    def context(self):
+        state = self.state()
+        current = state['current']
+        return dict(current_subject=None if current is None else self.identities[current],
+                    subjects=self.identities,
+                    queued_projects=[dict(subject_id=row['subject_id'], project_id=row['item']['project_id'])
+                                     for row in state.get('project_queue', [])],
+                    completed_waves={row.subject_id: sum(wave['status'] == 'completed' and
+                        wave['subject_id'] == row.subject_id for wave in state['waves'].values())
+                        for row in self.subjects},
+                    repairs=self._open_repairs(state),
+                    pending_reviews=[key for key, row in state['reviews'].items() if row['status'] == 'pending'],
+                    complete=self.is_complete(state))
+
+    def is_complete(self, state=None):
+        state = self.state() if state is None else state
+        return (state['frontier'] == len(self.subjects) and state['current'] is None
+                and not state.get('project_queue') and not self._open_repairs(state)
+                and not any(rows and wave_id not in state['waves']
+                            for wave_id, rows in state.get('claimed_projects', {}).items())
+                and all(row['status'] != 'pending' for row in state['reviews'].values())
+                and all(row['status'] == 'completed' for row in state['waves'].values()))
+
+    def start_wave(self, wave_id, memory_snapshot_sha256):
+        _text(wave_id, 'wave_id')
+        if not isinstance(memory_snapshot_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', memory_snapshot_sha256):
+            raise ValueError('memory snapshot must be a SHA-256')
+        with self._transaction() as state:
+            if wave_id in state['waves']:
+                retained = state['waves'][wave_id]
+                if retained['memory_snapshot_sha256'] != memory_snapshot_sha256:
+                    raise ValueError('wave memory snapshot changed')
+                return dict(retained)
+            if state['current'] is None:
+                raise ValueError('no current subject; revisit an earlier subject to schedule more work')
+            row = dict(wave_id=wave_id, subject_id=self.subjects[state['current']].subject_id,
+                       memory_snapshot_sha256=memory_snapshot_sha256, status='running', review_ids=[])
+            state['waves'][wave_id] = row
+            return dict(row)
+
+    def complete_wave(self, wave_id, review_ids=()):
+        ids = list(review_ids)
+        if len(set(ids)) != len(ids):
+            raise ValueError('review IDs must be unique')
+        for key in ids:
+            _text(key, 'review ID')
+        with self._transaction() as state:
+            row = state['waves'][wave_id]
+            if row['status'] == 'completed':
+                if row['review_ids'] != ids:
+                    raise ValueError('completed wave reviews changed')
+                return dict(row)
+            for key in ids:
+                if key in state['reviews']:
+                    raise ValueError('review already belongs to another wave')
+            for key in ids:
+                state['reviews'][key] = dict(wave_id=wave_id, subject_id=row['subject_id'], status='pending')
+            row.update(status='completed', review_ids=ids)
+            return dict(row)
+
+    def resolve_review(self, review_id, outcome):
+        if outcome not in {'accepted', 'rejected'}:
+            raise ValueError('review outcome must be accepted or rejected')
+        with self._transaction() as state:
+            row = state['reviews'][review_id]
+            if row['status'] not in {'pending', outcome}:
+                raise ValueError('review already has a different outcome')
+            row['status'] = outcome
+
+    def override_review(self, review_id, receipt):
+        """Record a user's admission override separately from the original outcome."""
+        with self._transaction() as state:
+            row = state['reviews'][review_id]
+            row.setdefault('original_status', row['status'])
+            row.update(status='accepted', manual_override=receipt)
+    def register_manual_review(self, review_id, subject_id):
+        """Link a continuation review without rewriting completed wave receipts."""
+        if subject_id not in self.index:
+            raise ValueError('unknown subject for manual review')
+        with self._transaction() as state:
+            state['reviews'].setdefault(review_id, dict(wave_id='manual-' + review_id,
+                subject_id=subject_id, status='pending'))
+
+    def supersede_review(self, review_id, receipt):
+        """Settle abandoned admission work without replacing a prior verdict."""
+        with self._transaction() as state:
+            row = state['reviews'].get(review_id)
+            if row is not None:
+                row.setdefault('original_status', row['status'])
+                row['supersession'] = receipt
+                if row['status'] == 'pending':
+                    row['status'] = 'rejected'
+
+    def add_repair(self, repair_id, subject_id, project_id, reason, evidence):
+        if subject_id not in self.index:
+            raise ValueError('unknown repair subject')
+        row = dict(repair_id=_text(repair_id, 'repair_id'), subject_id=subject_id,
+                   project_id=_text(project_id, 'project_id'), reason=_text(reason, 'reason'),
+                   evidence=_evidence(evidence), status='open')
+        with self._transaction() as state:
+            old = state['repairs'].get(repair_id)
+            if old is not None:
+                if any(old[key] != value for key, value in row.items() if key != 'status'):
+                    raise ValueError('repair identity reused with different evidence')
+                return dict(old)
+            state['repairs'][repair_id] = row
+            return dict(row)
+
+    def resolve_repair(self, repair_id, evidence):
+        references = _evidence(evidence)
+        with self._transaction() as state:
+            row = state['repairs'][repair_id]
+            if row['status'] == 'resolved' and row['resolution_evidence'] != references:
+                raise ValueError('repair resolution evidence changed')
+            row.update(status='resolved', resolution_evidence=references)
+
+    def decide(self, decision):
+        """Apply an agent decision; invalid decisions leave retained state intact."""
+        action = decision.get('action')
+        reason = _text(decision.get('reason'), 'reason')
+        evidence = _evidence(decision.get('evidence'))
+        if action not in {'continue', 'advance', 'revisit', 'repair', 'complete'}:
+            raise ValueError('unknown subject decision')
+        with self._transaction() as state:
+            target = state['current']
+            if action == 'complete':
+                if not self.is_complete(state):
+                    raise ValueError('completion requires all subjects and reviews settled without open repairs')
+            elif action in {'revisit', 'repair'}:
+                subject_id = decision.get('subject_id')
+                if action == 'repair':
+                    repair = state['repairs'].get(decision.get('repair_id'))
+                    if repair is None or repair['status'] != 'open':
+                        raise ValueError('repair decision requires an open repair')
+                    subject_id = repair['subject_id']
+                if subject_id not in self.index or self.index[subject_id] > state['frontier']:
+                    raise ValueError('can only revisit previously reached subjects')
+                target = self.index[subject_id]
+            elif action == 'advance':
+                if target is None:
+                    raise ValueError('no current subject to advance')
+                subject = self.subjects[target]
+                if any(row['subject_id'] == subject.subject_id for row in state.get('project_queue', [])):
+                    raise ValueError('subject has approved queued projects')
+                if any(wave_id not in state['waves'] and any(
+                        row['subject_id'] == subject.subject_id for row in rows)
+                        for wave_id, rows in state.get('claimed_projects', {}).items()):
+                    raise ValueError('subject has reserved projects awaiting a wave')
+                waves = [row for row in state['waves'].values() if row['subject_id'] == subject.subject_id]
+                if sum(row['status'] == 'completed' for row in waves) < subject.min_waves:
+                    raise ValueError('subject minimum waves not complete')
+                if any(row['status'] != 'completed' for row in waves) or self._open_repairs(state, subject.subject_id):
+                    raise ValueError('subject has running waves or open repairs')
+                if target == state['frontier']:
+                    state['frontier'] += 1
+                target = state['frontier'] if state['frontier'] < len(self.subjects) else None
+            elif target is None:
+                raise ValueError('no current subject to continue')
+            state['current'] = target
+            state['decisions'].append(dict(decision, reason=reason, evidence=evidence))
+            return json.loads(canonical(state))
+
+
+class SubjectCurriculumAgent:
+    """Small provider-neutral decision boundary; execution remains caller owned."""
+    def __init__(self, complete):
+        self.complete = complete
+
+    def decide(self, scheduler, *, memory_context, remaining_seconds):
+        if remaining_seconds <= 0:
+            raise TimeoutError('subject curriculum elapsed allowance exhausted')
+        context = dict(scheduler.context(), memory=memory_context, remaining_seconds=remaining_seconds)
+        raw = self.complete(({'role': 'system', 'content': (
+            'Choose the next curriculum action using accepted memory and retained evidence. '
+            'Return JSON {"action":"continue|advance|revisit|repair|complete","reason":"...",'
+            '"evidence":["artifact or memory reference"],"subject_id":"optional",'
+            '"repair_id":"optional"}. Run the subject minimum waves before advancing; '
+            'repair incomplete or accidentally successful projects; revisit a subject when '
+            'memory lacks useful coverage. Pending reviews permit provisional advancement. '
+            'For a repair, name its existing repair_id; for a revisit name subject_id. '
+            'After late memory rejection, reassess the gap: revisit a subject or choose complete '
+            'when all subject minima/reviews/repairs are settled and more work is unnecessary.')} ,
+            {'role': 'user', 'content': json.dumps(context, sort_keys=True)}),
+            remaining_seconds=remaining_seconds)
+        decision = json.loads(raw)
+        if not isinstance(decision, dict):
+            raise ValueError('subject decision must be an object')
+        return scheduler.decide(decision)

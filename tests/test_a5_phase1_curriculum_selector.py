@@ -80,6 +80,32 @@ def context(**updates):
     return CurriculumContext(**values)
 
 
+def test_selection_receives_prior_outcomes_and_structured_project_grammar():
+    prior_spec = project("prior")
+    prior = PriorOutcome(
+        "prior", ProjectInformation.from_project(prior_spec), True,
+        "Movement passed host verification.",
+    )
+    calls = []
+
+    def complete(messages):
+        calls.append(messages)
+        return "DECISION: SATURATED\n" + json.dumps({"reason": "coverage complete"})
+
+    decision, _ = CurriculumAgent(complete).select(context(
+        pre_wave_coverage=(Capability.GM_UB_MOVEMENT,), prior_outcomes=(prior,)
+    ))
+    assert isinstance(decision, TerminalDecision)
+    payload = json.loads(calls[0][-1]["content"].splitlines()[-1])
+    assert payload["objective"] == context().objective
+    assert payload["pre_wave_coverage"] == [Capability.GM_UB_MOVEMENT.value]
+    assert payload["prior_outcomes"] == [prior.prompt_dict()]
+    rules = payload["bounded_project_grammar"]["capability_operation_rules"]
+    # These structured operation labels feed admission and project construction.
+    assert rules["simd-vector"] == ["add", "multiply", "relu"]
+    assert rules["simt-reduction"] == ["reduce-sum"]
+    assert rules["simt-mask"] == ["mask-positive"]
+    assert rules["cube-tiling"] == ["matmul"]
 
 
 def test_strict_parser_accepts_wave_and_preserves_context_across_turns():
@@ -146,7 +172,7 @@ def test_selection_validation_exhaustion_is_bounded_and_diagnostic():
         return wave([project(capabilities=["unknown"])])
 
     with pytest.raises(ValueError, match="time budget exhausted.*unregistered capability"):
-        CurriculumAgent(complete).select(context())
+        CurriculumAgent(complete).select(context(remaining_seconds=3000))
     assert len(calls) == 3
     assert [len(messages) for messages in calls] == [2, 4, 6]
 
@@ -598,8 +624,17 @@ def bounded_fake_selection_clock(monkeypatch):
     """Negative fake completions consume time instead of relying on retry counts."""
     original = CurriculumAgent.__init__
     def initialize(self, *args, **kwargs):
-        ticks = iter(range(0, 1000000, 1000))
-        kwargs.setdefault("clock", lambda: next(ticks))
+        if kwargs.get("clock") is None:
+            now = [0.0]
+            complete = args[0] if args else kwargs["complete"]
+            def timed_complete(messages):
+                now[0] += 1000
+                return complete(messages)
+            kwargs["clock"] = lambda: now[0]
+            if args:
+                args = (timed_complete, *args[1:])
+            else:
+                kwargs["complete"] = timed_complete
         original(self, *args, **kwargs)
     monkeypatch.setattr(CurriculumAgent, "__init__", initialize)
 

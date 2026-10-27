@@ -3,12 +3,23 @@
 Run only in an isolated, bounded worker using the checked A3 profile. The worker
 must select its actual NPU device before loading/creating the frozen reference.
 `optimizer.native.evaluate(reference, candidate, directory, *, device, arch,
-block_count=1, benchmark=False, profile=False)` accepts a `PreparedReference` or
+block_count=1, benchmark=False, profile=False, cache_directory=None)` accepts a `PreparedReference` or
 an authenticated frozen reference directory. It never generates cases. Candidate
 execution is arbitrary native code, so use one subprocess per candidate.
 
 The evaluator compiles one case specialization, with a unique Torch dispatcher
 namespace, per frozen case. `describe_case(prepared, row)` exposes the ABI contract.
+Compile-only, evaluation, and profiling workers share a job-owned compiled cache
+beside the frozen baseline. A hit requires the same candidate, full case contract,
+architecture, block count, wrapper implementation, and observed toolchain/runtime
+identity; both wrapper and binary hashes are checked before loading. Results record
+`cache_key`, `cache_hit`, and the original binary/wrapper hashes. Torch registration
+is reused within a process. Failed builds do not publish hits, and a job-level lock
+protects concurrent compilation and eviction. The cache retains at most 2 GiB of
+recent entries (plus a single current entry if that entry alone exceeds the limit).
+Direct API callers can supply the same `cache_directory` to all three operations;
+without it, a cache is created beside the case directories. Logs and wrappers remain
+in each operation's evidence directory even on a hit; binaries remain remote.
 The device entrypoint is:
 
 ```cpp
