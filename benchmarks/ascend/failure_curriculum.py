@@ -9,7 +9,7 @@ from optimizer.jobs import JobStore, atomic, canonical, sha
 from .phase2_feedback import FeedbackStore
 
 
-GUIDANCE = '''Investigate the supplied Phase 2 observations, which are failures or
+GUIDANCE = '''Investigate the supplied Phase 1, Phase 2 and optimizer observations, which are failures or
 working controls, NOT verified reusable knowledge. Distinguish learnable kernel,
 numerical, compilation and performance issues from infrastructure/provider errors,
 invalid specifications and suspected unsupported/impossible requirements. A budget
@@ -27,7 +27,8 @@ Add optional top-level failure_investigations to the ordinary DECISION JSON,
 outside the strict WaveSpec: [{"feedback_id":"...","status":"investigating",
 "classification":"learnable","reason":"...","project_id":"probe-id",
 "control_project_id":"control-id","hypothesis":"...","observation":"..."}].
-Every project in a feedback-directed wave must be a probe or control in this list.
+Prioritize remediation; fill remaining wave slots with new projects. Only remedial
+projects require probe/control lineage in this list.
 Classifications: learnable, infrastructure, provider, invalid-specification,
 suspected-unsupported, suspected-impossible. Status: investigating, deferred,
 ready-to-retry. Deferred needs reason; budget exhaustion alone is not a reason
@@ -53,11 +54,11 @@ def select_feedback(root, target, ids=(), *, retry_id=None):
     if retry_id:
         selected = [retry_id]
     if not selected:
-        raise ValueError('no unresolved Phase 2 feedback selected')
+        raise ValueError('no unresolved failure feedback selected')
     result = []
     for key in dict.fromkeys(selected):
         if key not in by_id:
-            raise ValueError('unknown Phase 2 feedback ID: ' + key)
+            raise ValueError('unknown failure feedback ID: ' + key)
         row = by_id[key]
         outcome = row['outcome']
         if not compatible(outcome):
@@ -77,12 +78,27 @@ class FailureCurriculum:
         self.lineage = json.loads(self.path.read_bytes()) if self.path.exists() else []
         self.ids = {r['feedback_id'] for r in selection['selected']}
 
+    def refresh(self, target):
+        """Reload unresolved observations before selecting the next mixed wave."""
+        try:
+            self.selection = select_feedback(self.store.root, target)
+        except ValueError as error:
+            if str(error) != 'no unresolved failure feedback selected':
+                raise
+            self.selection = dict(selected=[], controls=[])
+        self.ids = {row['feedback_id'] for row in self.selection['selected']}
+        return self.selection
+
     def context(self, state):
         self.state = state
+        self.case_manifests = {}
         rows = []
         for role in ('selected', 'controls'):
             for row in self.selection[role]:
                 out = row['outcome']
+                cases = canonical(self.store.failure_cases(row['feedback_id']))
+                digest = sha(cases)
+                self.case_manifests[digest] = cases
                 rows.append(dict(feedback_id=row['feedback_id'], role=role,
                     category=out['category'], task={k: v for k, v in out['task'].items() if k != 'submission'},
                     task_sha256=sha(canonical(out['task'])),
@@ -90,7 +106,8 @@ class FailureCurriculum:
                     investigations=[r for r in self.lineage if r['feedback_id'] == row['feedback_id']][-3:],
                     interpretation=out['interpretation'],
                     host_result=json.dumps(out['result'].get('result'), sort_keys=True)[:4096],
-                    speedup=out['result'].get('speedup'), evidence=out['evidence']))
+                    speedup=out['result'].get('speedup'), evidence=out['evidence'],
+                    failure_cases_file=dict(sha256=digest, size=len(cases))))
         # Keep source/evidence hash-readable, never put entire candidate/report in context.
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
@@ -101,6 +118,8 @@ class FailureCurriculum:
             out = row['outcome']
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
+                failure_cases_file=next(item['failure_cases_file'] for item in rows
+                    if item['feedback_id'] == row['feedback_id']),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
                 task_sha256=sha(canonical(out['task'])),
@@ -111,12 +130,21 @@ class FailureCurriculum:
         digest = sha256
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
+        if digest in getattr(self, 'case_manifests', {}):
+            data = self.case_manifests[digest]
+            return dict(sha256=digest, offset=offset, size=len(data),
+                text=data[offset:offset+limit].decode(errors='replace'),
+                next_offset=offset+limit if offset+limit < len(data) else None)
         for row in self.selection['selected'] + self.selection['controls']:
             task = canonical(row['outcome']['task'])
             if sha(task) == digest:
                 return dict(sha256=digest, offset=offset, size=len(task),
                     text=task[offset:offset+limit].decode(errors='replace'),
                     next_offset=offset+limit if offset+limit < len(task) else None)
+            try:
+                return self.store.read_failure_artifact(row['feedback_id'], digest, offset, limit)
+            except FileNotFoundError:
+                pass
             for ref in row['outcome']['evidence'].values():
                 if ref['sha256'] == digest:
                     return self.store.read_evidence(digest, offset=offset, limit=limit)
@@ -127,7 +155,6 @@ class FailureCurriculum:
             raise ValueError('failure_investigations must be a list')
         projects = {p.spec.project_id for p in wave.projects} if wave else set()
         prior = {p.project_id for p in context.prior_outcomes if p.verified}
-        covered = set()
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError('failure_investigations entries must be objects')
@@ -147,15 +174,12 @@ class FailureCurriculum:
             if row['status'] == 'investigating':
                 if probe not in projects or not row.get('hypothesis') or not row.get('observation'):
                     raise ValueError('investigation requires a small probe, hypothesis and observation')
-                covered.update({probe, control} & projects)
             elif not any(old['feedback_id'] == row['feedback_id'] and
                     old.get('project_id') == probe and old.get('control_project_id') == control
                     for old in self.lineage):
                 raise ValueError('retry recommendation requires a previously linked probe/control')
             elif not self._supported(row, self.state):
                 raise ValueError('retry recommendation requires committed host probe/control evidence')
-        if projects - covered:
-            raise ValueError('feedback wave contains projects without investigation lineage')
         latest = {row['feedback_id']: row for row in [*self.lineage, *rows]}
         if wave is None and any(latest.get(key, {}).get('status') not in
                 {'ready-to-retry', 'deferred'} for key in self.ids):
@@ -233,7 +257,11 @@ def retry_spec(selection, target):
     manifest = frozen.get('manifest', {})
     if not frozen.get('suite_sha256') or not manifest.get('policy') or not manifest.get('submission'):
         raise ValueError('original frozen suite or comparison policy is missing')
-    return dict(feedback_id=row['feedback_id'], task=out['task'],
+    task = out['task']
+    if out.get('source_type') == 'optimizer':
+        task = dict(task, submission=manifest['submission'],
+                    rationale=task.get('rationale', 'Retry the original frozen optimizer contract'))
+    return dict(feedback_id=row['feedback_id'], task=task,
         suite_sha256=frozen['suite_sha256'], policy=manifest['policy'],
         frozen_submission=manifest.get('submission'),
         max_cases=out['runtime'].get('max_cases') or 24)
@@ -246,6 +274,13 @@ def link_retry(job):
     store = FeedbackStore(job['feedback_root'])
     store.import_campaign(job['root'])
     original = next(r for r in store.records() if r['feedback_id'] == job['retry_feedback_id'])
+    if original['outcome'].get('source_type') == 'optimizer':
+        for row in store.records():
+            outcome = row['outcome']
+            if (outcome['source_root'] == str(Path(job['root']).resolve())
+                    and outcome['task'].get('task_id') == original['outcome']['task']['task_id']):
+                store.link_original_retry(original['feedback_id'], row['feedback_id'])
+        return
     retries = [r for r in store.records() if r['outcome']['source_root'] == str(Path(job['root']).resolve())
                and r['outcome']['task'] == original['outcome']['task']]
     def merge(current):

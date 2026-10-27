@@ -155,3 +155,62 @@ def test_mutated_prepared_reference_is_rejected_before_compilation(tmp_path, mon
     monkeypatch.setattr(native, '_compile_case', lambda *a, **k: pytest.fail('compiled mutated suite'))
     with pytest.raises(ValueError, match='baseline'):
         native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test')
+
+
+def test_failed_case_retains_exact_inputs_outputs_and_layout(tmp_path, monkeypatch):
+    prepared = reference()
+    def compile_case(*args, **kwargs):
+        return lambda inputs, states: [inputs[0] * 0, inputs[0] + 1], {'binary_sha256': 'fake'}
+    monkeypatch.setattr(native, '_compile_case', compile_case)
+    result = native.evaluate(prepared, 'source', tmp_path, device='cpu', arch='test', block_count=2)
+    case = result['failure_case']
+    tensor = case['inputs']['args']['items'][0]
+    raw = prepared.cases[0]['args'][0].contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    assert bytes.fromhex(tensor['bytes_hex']) == raw
+    assert tensor['strides'] == [1, 3]
+    assert case['inputs']['args']['items'][1] == 2
+    assert [float(value) for value in case['observed']['a']['preview']] == [0.0] * 6
+    assert case['expected']['a']['bytes_hex'] != case['observed']['a']['bytes_hex']
+    assert case['block_count'] == 2
+    assert case['suite_sha256'] == prepared.manifest['suite_sha256']
+    assert case['metrics']
+    assert case['mismatch_samples']
+    assert case['mismatch_samples'][0]['expected'] != case['mismatch_samples'][0]['observed']
+
+
+@pytest.mark.parametrize('observed', [1e38, -1e38, float('inf'), -float('inf'), float('nan'), 1.0])
+def test_failed_comparison_metrics_publish_with_exact_reproducer(tmp_path, monkeypatch, observed):
+    import math
+    from optimizer.jobs import sha
+    from optimizer.reference import ReferenceError, compare_outputs
+    from optimizer.remote_worker import publish
+
+    prepared = prepare_reference(dict(source='def forward(x): return torch.zeros_like(x)',
+        entrypoint='forward', signatures=[dict(args=[dict(shape=[2], dtype='float32')])]),
+        max_cases=1)
+    expected = prepared.cases[0]['output']
+    actual = torch.full_like(expected, observed)
+    with pytest.raises(ReferenceError) as error:
+        compare_outputs(expected, actual, inputs=prepared.cases[0]['args'])
+    raw_metrics = error.value.metrics
+    if math.isfinite(observed) and abs(observed) > 1e37:
+        assert math.isinf(raw_metrics['MERE']) and raw_metrics['MERE'] > 0
+    monkeypatch.setattr(native, '_compile_case', lambda *args, **kwargs:
+                        (lambda inputs, states: [actual.clone()], {}))
+    result = native.evaluate(prepared, 'wrong kernel', tmp_path, device='cpu', arch='test')
+    assert result['status'] == 'incorrect'
+    case = result['failure_case']
+    for key, value in raw_metrics.items():
+        assert case['metrics'][key] == (
+            repr(value) if isinstance(value, float) and not math.isfinite(value) else value)
+    raw = lambda tensor: tensor.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+    assert bytes.fromhex(case['expected']['bytes_hex']) == raw(expected)
+    assert bytes.fromhex(case['observed']['bytes_hex']) == raw(actual)
+    assert bytes.fromhex(case['inputs']['args']['items'][0]['bytes_hex']) == raw(
+        prepared.cases[0]['args'][0])
+    publish(tmp_path, result)
+    retained = (tmp_path / 'result.json').read_bytes()
+    assert json.loads(retained) == result
+    published = next(row for row in json.loads((tmp_path / 'files.json').read_bytes())
+                     if row['path'] == 'result.json')
+    assert published['sha256'] == sha(retained) and published['size'] == len(retained)
