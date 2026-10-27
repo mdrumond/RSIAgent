@@ -565,7 +565,8 @@ class FeedbackStore:
                     ref = outcome['evidence'][role]
                     return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
                 baseline = artifact(original, 'baseline')
-                if baseline != artifact(retry, 'baseline'):
+                binding = _baseline_identity(original)
+                if binding is None or _baseline_identity(retry) != binding:
                     return False
                 measured = score(baseline, artifact(retry, 'evaluation'))
                 return measured is not None and measured >= 1.0
