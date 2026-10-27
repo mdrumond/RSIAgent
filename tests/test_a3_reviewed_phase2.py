@@ -15,8 +15,8 @@ from tests.test_a5_phase2_source_provider import GUIDE, ENVIRONMENT
 SOURCE = 'extern "C" __global__ __aicore__ void dense_attention(GM_ADDR gm_q, GM_ADDR gm_k, GM_ADDR gm_v, GM_ADDR gm_output) {}'
 
 
-def native_source(tmp_path, *, profiling=False):
-    root, source, review_path, memory = _source(tmp_path)
+def native_source(tmp_path, *, profiling=False, partial=False):
+    root, source, review_path, memory = _source(tmp_path, partial=partial)
     identity = dict(schema="ascend-native-adaptive-identity-v1", language="ascend-c",
                     target="Ascend910_9382", arch="dav-c220", execution_profile="bz-a3-1",
                     guide_sha256=hashlib.sha256(GUIDE.encode()).hexdigest(), cpl_skills_revision="1" * 40,

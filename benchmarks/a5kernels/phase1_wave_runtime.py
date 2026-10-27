@@ -89,7 +89,7 @@ WaveProjectExecutor = Callable[[WaveProjectRequest], WaveProjectResult]
 
 
 class LiveWaveCoordinator:
-    """Wait for all siblings; optionally skip completed semantic failures.
+    """Settle siblings, then publish only finalized verified deltas.
 
     Only verified deltas become commits. The default retains the original
     strict all-verified barrier for standalone callers.
@@ -102,7 +102,8 @@ class LiveWaveCoordinator:
         pre_wave_memory: bytes,
         execute: WaveProjectExecutor,
         max_parallel: int,
-        *, allow_semantic_failures: bool = False, inputs_by_project=None,
+        *, allow_semantic_failures: bool = False, allow_partial: bool = False,
+        remaining_seconds: Callable[[], float] | None = None, inputs_by_project=None,
     ) -> None:
         if not isinstance(wave, WaveSpec):
             raise TypeError("wave must be a WaveSpec")
@@ -120,6 +121,8 @@ class LiveWaveCoordinator:
         self.execute = execute
         self.max_parallel = max_parallel
         self.allow_semantic_failures = allow_semantic_failures
+        self.allow_partial = allow_partial
+        self.remaining_seconds = remaining_seconds
         self.inputs_by_project = inputs_by_project or {}
 
     def run(self) -> WaveConsolidation:
@@ -129,13 +132,10 @@ class LiveWaveCoordinator:
             return published
 
         assignments = self.wave.assignments()
-        outcomes: dict[str, ProjectOutcome] = {}
         pending = []
         for assignment in assignments:
             outcome = self._load_outcome(assignment)
-            if outcome is not None and (outcome.verified or self.allow_semantic_failures):
-                outcomes[assignment.project_id] = outcome
-            else:
+            if outcome is None or not (outcome.verified or self.allow_semantic_failures or self.allow_partial):
                 pending.append(assignment)
 
         failures: list[tuple[str, Exception]] = []
@@ -150,18 +150,39 @@ class LiveWaveCoordinator:
             for future in as_completed(futures):
                 assignment = futures[future]
                 try:
-                    outcomes[assignment.project_id] = future.result()
-                except Exception as exc:  # wait for siblings before surfacing it
+                    future.result()
+                except Exception as exc:  # settle siblings before closing the wave
+                    if self.allow_partial:
+                        status = "deadline-exhausted" if self.remaining_seconds is not None and self.remaining_seconds() <= 0 else "infrastructure-failure"
+                        self._interrupt(assignment, status, f"{type(exc).__name__}: {exc}")
                     failures.append((assignment.project_id, exc))
 
-        if failures:
+        if failures and not self.allow_partial:
             project_id, failure = failures[0]
             raise RuntimeError(
                 f"wave project {project_id!r} failed before verification"
             ) from failure
+        return self.finalize_retained()
+
+    def finalize_retained(self) -> WaveConsolidation:
+        """Close only durable terminal branches; never call an executor."""
+        self._ensure_plan()
+        published = self._load_publication()
+        if published is not None:
+            return published
+        outcomes = []
+        for assignment in self.wave.assignments():
+            outcome = self._load_outcome(assignment)
+            if outcome is not None:
+                outcomes.append(outcome)
+            elif self.allow_partial:
+                path = self.root / "branches" / assignment.project_id / "interruption.json"
+                if not path.exists():
+                    self._interrupt(assignment, "interrupted" if path.parent.exists() else "not-started",
+                                    "No finalized outcome retained at wave close")
         try:
-            consolidation = consolidate_wave(self.wave, tuple(outcomes.values()),
-                                             allow_semantic_failures=self.allow_semantic_failures)
+            consolidation = consolidate_wave(self.wave, outcomes,
+                allow_semantic_failures=self.allow_semantic_failures, allow_partial=self.allow_partial)
         except ValueError as exc:
             raise RuntimeError(f"wave is not verified: {exc}") from exc
         self._publish(consolidation)
@@ -175,6 +196,9 @@ class LiveWaveCoordinator:
     def _execute_one(self, assignment: ProjectAssignment) -> ProjectOutcome:
         branch_root = self.root / "branches" / assignment.project_id
         branch_root.mkdir(parents=True, exist_ok=True)
+        if self.remaining_seconds is not None and self.remaining_seconds() <= 0:
+            self._interrupt(assignment, "deadline-exhausted", "Wave deadline reached before dispatch")
+            raise TimeoutError("wave deadline reached before dispatch")
         inputs = self.inputs_by_project.get(assignment.project_id)
         if inputs is None:
             inputs = materialize_inputs(assignment.spec)
@@ -187,7 +211,7 @@ class LiveWaveCoordinator:
                 oracle=evaluate_reference(assignment.spec, inputs),
             ))
         except SemanticProjectFailure as exc:
-            if not self.allow_semantic_failures:
+            if not (self.allow_semantic_failures or self.allow_partial):
                 raise
             # No kernel memory is manufactured for an unverified attempt.
             from benchmarks.a5kernels.phase1_project import EvidenceClassification
@@ -197,6 +221,9 @@ class LiveWaveCoordinator:
                 EvidenceClassification.ACTOR_UNVERIFIED, exc.summary), payload)
         if not isinstance(result, WaveProjectResult):
             raise TypeError("project executor must return WaveProjectResult")
+        if self.remaining_seconds is not None and self.remaining_seconds() <= 0:
+            self._interrupt(assignment, "deadline-exhausted", "Project completed after the wave deadline")
+            raise TimeoutError("project completed after wave deadline")
         delta_sha256 = hashlib.sha256(result.memory_delta).hexdigest()
         evidence_sha256 = hashlib.sha256(result.evidence_payload).hexdigest()
         # Invalidate the previous generation first.  A crash after this point is
@@ -223,6 +250,12 @@ class LiveWaveCoordinator:
             assignment.authored_ordinal,
             result.verified,
         )
+
+    def _interrupt(self, assignment, classification, summary):
+        self._atomic_json(self.root / "branches" / assignment.project_id / "interruption.json", {
+            "project_id": assignment.project_id, "wave_fingerprint": self.wave.fingerprint,
+            "classification": classification, "summary": summary[:2000],
+        })
 
     def _load_outcome(self, assignment: ProjectAssignment) -> ProjectOutcome | None:
         branch_root = self.root / "branches" / assignment.project_id
@@ -317,10 +350,14 @@ class LiveWaveCoordinator:
                 for item in consolidation.commits
             ],
         }
+        accepted = {item.project_id for item in consolidation.commits}
         skipped = [assignment.project_id for assignment in self.wave.assignments()
-                   if not self._load_outcome(assignment).verified]
+                   if assignment.project_id not in accepted]
         if skipped:
             value["skipped_projects"] = skipped
+        if self.allow_partial:
+            value["completion"] = "complete" if not skipped else "partial" if accepted else "empty"
+            value["skipped_reasons"] = {project_id: self._skip_reason(project_id) for project_id in skipped}
         self._atomic_json(self.root / "published.json", value)
 
     def _load_publication(self) -> WaveConsolidation | None:
@@ -329,7 +366,7 @@ class LiveWaveCoordinator:
             return None
         value = self._read_json(path)
         if (
-            set(value) - {"skipped_projects"} != {
+            set(value) - {"skipped_projects", "completion", "skipped_reasons"} != {
                 "schema", "wave_id", "wave_fingerprint",
                 "pre_wave_memory_sha256", "commits",
                 "consolidated_memory_sha256",
@@ -349,12 +386,19 @@ class LiveWaveCoordinator:
                 for assignment in self.wave.assignments()
                 if (outcome := self._load_outcome(assignment)) is not None
             ),
-            allow_semantic_failures=self.allow_semantic_failures,
+            allow_semantic_failures=self.allow_semantic_failures, allow_partial=self.allow_partial,
         )
+        accepted = {item.project_id for item in expected.commits}
         skipped = [assignment.project_id for assignment in self.wave.assignments()
-                   if not self._load_outcome(assignment).verified]
+                   if assignment.project_id not in accepted]
         if value.get("skipped_projects", []) != skipped:
             raise ValueError("published skipped projects differ from branch outcomes")
+        if "completion" in value:
+            completion = "complete" if not skipped else "partial" if accepted else "empty"
+            if value["completion"] != completion or value.get("skipped_reasons") != {
+                project_id: self._skip_reason(project_id) for project_id in skipped
+            }:
+                raise ValueError("published wave closure differs from retained branches")
         loaded = WaveConsolidation(
             value["wave_id"], value["pre_wave_memory_sha256"], commits,
         )
@@ -367,6 +411,16 @@ class LiveWaveCoordinator:
         if hashlib.sha256(memory).hexdigest() != value["consolidated_memory_sha256"]:
             raise ValueError("published consolidated memory does not match publication")
         return loaded
+
+    def _skip_reason(self, project_id):
+        branch = self.root / "branches" / project_id
+        if (branch / "outcome.json").exists():
+            outcome = self._read_json(branch / "outcome.json")
+            return {"classification": outcome["classification"], "summary": "Project did not finalize verified memory"}
+        record = self._read_json(branch / "interruption.json")
+        if record.get("wave_fingerprint") != self.wave.fingerprint or record.get("project_id") != project_id:
+            raise ValueError("retained interruption does not match wave plan")
+        return {k: record[k] for k in ("classification", "summary")}
 
     def read_published_memory(self) -> bytes:
         """Return the exact next-wave memory snapshot after verified publication."""

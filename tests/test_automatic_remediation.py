@@ -10,7 +10,8 @@ from test_a5_phase1_adaptive import _project, _wave, _result
 
 @pytest.mark.parametrize("assessment_error", [False, True])
 @pytest.mark.parametrize("ready_wave", [False, True])
-def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error, ready_wave):
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error, ready_wave, allow_partial):
     calls, executions = [], []
     runner = None
     automatic = None
@@ -40,7 +41,7 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
         passed = request.spec.project_id != 'original' or len(executions) > 1
         return _result(request.spec, passed, 'host outcome')
     runner = AdaptivePhase1Coordinator(tmp_path / 'run', 'Repair failures.', b'{}',
-        CurriculumAgent(complete), execute, max_parallel=1, project_target=1)
+        CurriculumAgent(complete), execute, max_parallel=1, project_target=1, allow_partial=allow_partial)
     automatic = AutomaticRemediation(runner, target='a3')
     from types import SimpleNamespace
     assessments, ordinary_assessments = [], []

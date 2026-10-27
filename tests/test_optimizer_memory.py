@@ -144,3 +144,41 @@ def test_committed_phase1_export_keeps_authenticated_inherited_reviewed_memory(t
     (directory/'artifacts/objects'/memory['source_revision'][:2]/memory['source_revision'][2:]).write_bytes(b'corrupt')
     with pytest.raises(ValueError, match='snapshot bytes changed|CAS mismatch'):
         freeze_committed_phase1(root, initial)
+
+
+def test_committed_partial_wave_export_retains_authenticated_interruption_and_is_portable(tmp_path):
+    import base64
+    import copy
+    import shutil
+    from tests.test_a3_reviewed_phase2 import native_source
+    from optimizer.memory import freeze_committed_phase1
+    root, _, memory = native_source(tmp_path, partial=True)
+    from benchmarks.a5kernels.phase1_adaptive import retained_failure_outcome
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    state_path = root / 'state.json'
+    state = json.loads(state_path.read_bytes())
+    state['prior_outcomes'][0]['summary'] = 'host verified'
+    wave = WaveSpec.from_mapping(json.loads((root / 'waves/wave-01/plan.json').read_bytes())['wave'])
+    offline = next(item.spec for item in wave.projects if item.spec.project_id == 'offline')
+    state['failed_outcomes'] = [retained_failure_outcome(root, 'wave-01', offline)]
+    state_path.write_text(json.dumps(state))
+    branch = 'waves/wave-01/branches/offline'
+    path = root / branch / 'interruption.json'
+    retained = path.read_bytes()
+    exported = freeze_committed_phase1(root, b'')
+    assert exported['memory_entries'] == [memory]
+    assert base64.b64decode(exported['files'][branch + '/interruption.json']['base64']) == retained
+    assert all(branch + '/' + name not in exported['files'] for name in (
+        'outcome.json', 'memory-delta.bin', 'execution-evidence.bin'))
+    verify_snapshot(exported)
+    record = json.loads(retained)
+    record['wave_fingerprint'] = '0' * 64
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError):
+        freeze_committed_phase1(root, b'')
+    shutil.rmtree(root)
+    verify_snapshot(exported)
+    corrupt = copy.deepcopy(exported)
+    corrupt['files'][branch + '/interruption.json']['base64'] = base64.b64encode(b'{}').decode()
+    with pytest.raises(ValueError, match='digest mismatch'):
+        verify_snapshot(corrupt)
