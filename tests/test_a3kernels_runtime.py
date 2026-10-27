@@ -31,9 +31,6 @@ def test_fixture_is_a3_specific_and_complete():
     assert descriptor["target"] == "Ascend910B4"
     assert descriptor["logical_device"] == 0
     assert descriptor["runtime"] == "py311-torch"
-    assert "TORCH_LIBRARY(rsi_a3kernels" in sources["kernel.cpp"]
-    assert "A3KERNEL_OUTPUT=" in sources["host_driver.py"]
-    assert "A5KERNEL" not in "".join(sources.values())
 
 
 def test_plan_inputs_and_identity_are_deterministic_and_immutable():

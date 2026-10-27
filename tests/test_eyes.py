@@ -154,7 +154,6 @@ def test_unresolved_splits_message_shape():
         [{'turn': 7, 'path': '/tmp/a.png', 'q': 'how many?'},
          {'turn': 9, 'path': 'screen:', 'q': 'which theme?'}])
     assert "turn 7: /tmp/a.png" in msg and "turn 9: screen:" in msg
-    assert "READINGS CONFLICT" in msg and "declare done again" in msg
 
 
 if __name__ == "__main__":

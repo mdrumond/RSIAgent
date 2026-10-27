@@ -225,6 +225,7 @@ def test_broken_symlink_is_captured_replayed_and_verified_without_following(
 
     class LocalVM:
         def run_command(self, command, timeout=None, cap=None):
+            command = command.replace('/tmp/proj_err', shlex.quote(str(guest_tmp / 'proj_err')))
             completed = subprocess.run(
                 ["bash", "-lc", command], capture_output=True, text=True,
                 timeout=timeout, check=False)
