@@ -256,7 +256,7 @@ def build_controller(job):
         arguments += ["--worker-config", job["worker_config"]]
     with redirect_stdout(io.StringIO()):
         target_main(["--target", job["target"], *arguments], native_builder=capture,
-                    native_parallel=job["phase"] == 1,
+                    native_parallel=job["phase"] == 1 and not job.get("phase1_original_retry"),
                     a5_main=lambda argv: a5_main(argv, builder=capture))
     return captured[0]
 
