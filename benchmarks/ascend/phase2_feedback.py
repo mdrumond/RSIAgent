@@ -564,22 +564,28 @@ class FeedbackStore:
                 or original['language'] not in {'ascend-c', 'catlass-dsl'}):
             return False
         try:
-            if original['source_type'] == 'phase2' or retry['evidence'].get('result_artifact'):
-                baseline = _baseline_identity(original)
-                return (baseline is not None and baseline == _baseline_identity(retry)
-                        and _verified_retry(retry)
-                        and _category(original['task'], retry['result']) == 'verified-success')
             if original['source_type'] == 'optimizer':
                 from optimizer.loop import score
                 def artifact(outcome, role):
                     ref = outcome['evidence'][role]
                     return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
                 baseline = artifact(original, 'baseline')
-                retry_baseline = artifact(retry, 'baseline')
-                if _baseline_identity(original) is None or _baseline_identity(original) != _baseline_identity(retry):
+                binding = _baseline_identity(original)
+                if binding is None or _baseline_identity(retry) != binding:
                     return False
-                measured = score(retry_baseline, artifact(retry, 'evaluation'))
+                if retry['evidence'].get('result_artifact'):
+                    if not _verified_retry(retry):
+                        return False
+                    evaluation = retry['result']['result']
+                else:
+                    evaluation = artifact(retry, 'evaluation')
+                measured = score(baseline, evaluation)
                 return measured is not None and measured >= 1.0
+            if original['source_type'] == 'phase2':
+                baseline = _baseline_identity(original)
+                return (baseline is not None and baseline == _baseline_identity(retry)
+                        and _verified_retry(retry)
+                        and _category(original['task'], retry['result']) == 'verified-success')
             plan_ref = retry['evidence']['plan']
             plan_data = Path(plan_ref['retained_path']).read_bytes()
             if sha(plan_data) != plan_ref['sha256']:
