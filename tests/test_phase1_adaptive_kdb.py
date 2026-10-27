@@ -9,6 +9,7 @@ import pytest
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActionContext
 from benchmarks.a5kernels.knowledge import KnowledgeDB
+from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
 from benchmarks.ascend.phase1_knowledge import NativeAdaptiveKnowledge, adaptive_knowledge_identity
 from benchmarks.ascend.production import NativeProductionConfig, build_native_adaptive_phase1
@@ -260,3 +261,32 @@ def test_usefulness_lessons_have_independent_selection_budgets_and_resume_reuses
     resumed = knowledge.curriculum_query(KnowledgeQuery('pipeline', 1))
     assert resumed == () and resumed.search_details['status'] == 'insufficient'
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize('spent', [30, 90])
+def test_legacy_selection_layout_preserves_elapsed_allowance_on_resume(tmp_path, spent):
+    from test_a5_phase1_curriculum_selector import context
+    cfg, calls = config(tmp_path), []
+    selection = context()
+    legacy = (cfg.root / 'curriculum-librarian' /
+              f'{selection.wave_index:03}-{selection.pre_wave_memory_sha256}')
+    legacy.mkdir(parents=True)
+    old = canonical_bytes(dict(max_seconds=90, elapsed_seconds=spent, active_since=None))
+    (legacy / 'librarian-budget.json').write_bytes(old)
+    knowledge = NativeAdaptiveKnowledge(cfg, Embeddings(), completion(calls))
+    knowledge.begin_selection(selection)
+    root = knowledge.selection[0]
+    assert root != legacy
+    result = knowledge.curriculum_query(KnowledgeQuery('pipeline', 1))
+    assert result.search_details['status'] == ('complete' if spent < 90 else 'insufficient')
+    assert len(calls) == (1 if spent < 90 else 0)
+    if calls:
+        assert 0 < calls[0][1] <= 90 - spent
+    retained = json.loads((root / 'librarian-budget.json').read_bytes())
+    assert retained['elapsed_seconds'] >= spent and retained['active_since'] is None
+    assert (legacy / 'librarian-budget.json').read_bytes() == old
+    # A later begin must keep the new directory's accumulated charge.
+    charged = canonical_bytes(dict(max_seconds=90, elapsed_seconds=90, active_since=None))
+    (root / 'librarian-budget.json').write_bytes(charged)
+    knowledge.begin_selection(selection)
+    assert (root / 'librarian-budget.json').read_bytes() == charged

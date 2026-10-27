@@ -172,8 +172,21 @@ class NativeAdaptiveKnowledge:
             pre_wave_memory_sha256=context.pre_wave_memory_sha256,
             coverage=[item.value for item in context.pre_wave_coverage],
             prior_projects=[item.project_id for item in context.prior_outcomes]))).hexdigest()
-        self.selection = (Path(self.config.root) / 'curriculum-librarian' /
-            f'{context.wave_index:03}-{context.pre_wave_memory_sha256}-{selection_id}', context.objective,
+        parent = Path(self.config.root) / 'curriculum-librarian'
+        legacy = parent / f'{context.wave_index:03}-{context.pre_wave_memory_sha256}'
+        root = parent / f'{legacy.name}-{selection_id}'
+        old_budget = legacy / 'librarian-budget.json'
+        if old_budget.is_file():
+            # Old directories did not bind the objective. Conservatively inherit
+            # their spent allowance, including an interrupted active interval,
+            # once per selection. Subsequent selections own independent files.
+            root.mkdir(parents=True, exist_ok=True)
+            try:
+                with (root / 'librarian-budget.json').open('xb') as stream:
+                    stream.write(old_budget.read_bytes())
+            except FileExistsError:
+                pass
+        self.selection = (root, context.objective,
             dict(wave_index=context.wave_index, coverage=[item.value for item in context.pre_wave_coverage],
                  prior_projects=[item.project_id for item in context.prior_outcomes], **self.context()))
 
