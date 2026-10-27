@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import hashlib
 import json
 import time
@@ -16,6 +17,53 @@ from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator
 from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
 from benchmarks.ascend.phase2_target_selector import TargetCurriculumContext
+
+
+def _retained_artifact_page(ref, payload, artifacts):
+    """Authenticate one linked artifact without loading its full body."""
+    digest = payload['sha256']
+    offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
+    hasher, decoder = hashlib.sha256(), codecs.getincrementaldecoder('utf-8')()
+    utf8 = True
+    path = artifacts._path(digest)
+    if not path.is_file():
+        path = Path(ref['retained_path'])
+    with path.open('rb') as stream:
+        while block := stream.read(1024 * 1024):
+            hasher.update(block)
+            if utf8:
+                try:
+                    decoder.decode(block)
+                except UnicodeDecodeError:
+                    utf8 = False
+        if hasher.hexdigest() != digest:
+            raise ValueError('native failure artifact digest mismatch')
+        if utf8:
+            try:
+                decoder.decode(b'', final=True)
+            except UnicodeDecodeError:
+                utf8 = False
+        size = stream.tell()
+        stream.seek(offset)
+        page = stream.read(limit)
+    raw = dict(event='artifact-page', sha256=digest, offset=offset, size_bytes=size,
+               next_offset=offset + len(page) if offset + len(page) < size else None)
+    view = dict(raw)
+    if not utf8 or (page and page[0] & 0xC0 == 0x80):
+        view.update(encoding='binary', text_available=False,
+                    note='No UTF-8 preview at this byte offset; exact bytes remain in the retained artifact.')
+    else:
+        text = page.decode('utf-8', errors='ignore')
+        consumed = len(text.encode('utf-8'))
+        if page and not consumed:
+            raise ValueError('page limit cannot fit the next UTF-8 codepoint; use limit >= 4')
+        page = page[:consumed]
+        view.update(encoding='utf-8', text_available=True, text=text,
+                    next_offset=offset + consumed if offset + consumed < size else None)
+        raw['next_offset'] = view['next_offset']
+    raw.update(text=page.decode('utf-8', errors='replace'), base64=base64.b64encode(page).decode('ascii'))
+    view.update(page_bytes=len(page), full_observation_sha256=artifacts.put_json(raw))
+    return view
 
 
 class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
@@ -75,9 +123,6 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         files = ContextFiles(self.root / 'curriculum' / 'context')
         observed = files.put('latest-target-attempt', targets[-1])
         from .phase2_feedback import FeedbackStore
-        from .failure_handoff import FailureArtifactReader
-        from .agent_presentation import artifact_page_presentation
-        from types import SimpleNamespace
         cases, raw_refs = [], {}
         for attempt in state['attempts']:
             branch = self.root / 'waves' / attempt['wave_id'] / 'branches' / attempt['project_id']
@@ -86,14 +131,6 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
             for case in retained:
                 raw_refs.update({ref['sha256']: ref for ref in case['artifacts'].values()})
         case_file = files.put('native-failure-cases', cases)
-        def raw_bytes(digest):
-            if digest not in raw_refs:
-                raise FileNotFoundError('artifact is not linked native failure evidence')
-            data = Path(raw_refs[digest]['retained_path']).read_bytes()
-            if hashlib.sha256(data).hexdigest() != digest:
-                raise ValueError('native failure artifact digest mismatch')
-            return data
-        failure_reader = FailureArtifactReader(files.artifacts, SimpleNamespace(read_bytes=raw_bytes))
         memory_reader = reader
         def reader(**payload):
             if payload.get('sha256') in {observed['sha256'], case_file['sha256']}:
@@ -102,7 +139,7 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
                 offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
                 if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
                     raise ValueError('artifact page requires nonnegative offset and limit 1..8192')
-                return files.record_read(artifact_page_presentation(payload, failure_reader))
+                return files.record_read(_retained_artifact_page(raw_refs[payload['sha256']], payload, files.artifacts))
             return memory_reader(**payload)
         return TargetCurriculumContext(self.target, _preview(targets[-1]),
             tuple([*self._curriculum_feedback(state),
