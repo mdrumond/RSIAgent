@@ -91,10 +91,14 @@ class FailureCurriculum:
 
     def context(self, state):
         self.state = state
+        self.case_manifests = {}
         rows = []
         for role in ('selected', 'controls'):
             for row in self.selection[role]:
                 out = row['outcome']
+                cases = canonical(self.store.failure_cases(row['feedback_id']))
+                digest = sha(cases)
+                self.case_manifests[digest] = cases
                 rows.append(dict(feedback_id=row['feedback_id'], role=role,
                     category=out['category'], task={k: v for k, v in out['task'].items() if k != 'submission'},
                     task_sha256=sha(canonical(out['task'])),
@@ -102,7 +106,8 @@ class FailureCurriculum:
                     investigations=[r for r in self.lineage if r['feedback_id'] == row['feedback_id']][-3:],
                     interpretation=out['interpretation'],
                     host_result=json.dumps(out['result'].get('result'), sort_keys=True)[:4096],
-                    speedup=out['result'].get('speedup'), evidence=out['evidence']))
+                    speedup=out['result'].get('speedup'), evidence=out['evidence'],
+                    failure_cases_file=dict(sha256=digest, size=len(cases))))
         # Keep source/evidence hash-readable, never put entire candidate/report in context.
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
@@ -113,6 +118,8 @@ class FailureCurriculum:
             out = row['outcome']
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
+                failure_cases_file=next(item['failure_cases_file'] for item in rows
+                    if item['feedback_id'] == row['feedback_id']),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
                 task_sha256=sha(canonical(out['task'])),
@@ -123,12 +130,21 @@ class FailureCurriculum:
         digest = sha256
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
+        if digest in getattr(self, 'case_manifests', {}):
+            data = self.case_manifests[digest]
+            return dict(sha256=digest, offset=offset, size=len(data),
+                text=data[offset:offset+limit].decode(errors='replace'),
+                next_offset=offset+limit if offset+limit < len(data) else None)
         for row in self.selection['selected'] + self.selection['controls']:
             task = canonical(row['outcome']['task'])
             if sha(task) == digest:
                 return dict(sha256=digest, offset=offset, size=len(task),
                     text=task[offset:offset+limit].decode(errors='replace'),
                     next_offset=offset+limit if offset+limit < len(task) else None)
+            try:
+                return self.store.read_failure_artifact(row['feedback_id'], digest, offset, limit)
+            except FileNotFoundError:
+                pass
             for ref in row['outcome']['evidence'].values():
                 if ref['sha256'] == digest:
                     return self.store.read_evidence(digest, offset=offset, limit=limit)
