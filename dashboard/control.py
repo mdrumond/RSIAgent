@@ -267,8 +267,15 @@ class ControlManager:
                 raise ControlError('select an unresolved, non-infrastructure failure')
             if action == 'investigate' and state.get('classification') in {'infrastructure', 'provider'}:
                 raise ControlError('infrastructure/provider observations are not kernel investigations')
-            if action == 'retry-feedback' and not outcome.get('task'):
-                raise ControlError('retry requires the retained original task')
+            if action == 'retry-feedback':
+                if outcome.get('source_type') == 'phase1':
+                    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
+                    try:
+                        ProjectSpec.from_mapping(outcome.get('original_spec'))
+                    except (ValueError, TypeError, KeyError):
+                        raise ControlError('retry requires the frozen original Phase 1 project specification')
+                elif not outcome.get('task'):
+                    raise ControlError('retry requires the retained original task')
         if action == 'investigate':
             if type(payload.get('project_target')) is not int or payload['project_target'] < 1:
                 raise ControlError('an explicit positive project budget is required')
@@ -279,7 +286,7 @@ class ControlManager:
         if not isinstance(runner, str) or not runner:
             raise ControlError("control runner is not configured")
         if action == 'import-feedback':
-            return [sys.executable, runner, 'feedback-phase2', '--feedback-root',
+            return [sys.executable, runner, 'feedback', '--source-type', 'all', '--feedback-root',
                     str(self.feedback.root), '--dashboard-config', str(self.config_path)]
         if action in {"start", "investigate", "retry-feedback"}:
             preset = self.presets[payload["preset_id"]]

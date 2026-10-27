@@ -144,7 +144,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     resumed_runtime = (root / 'subject-runtime.json').exists()
     from .runtime_allocation import admit_identity
     identity = admit_identity(root, dict(target=target, max_seconds=max_seconds,
-        settings_sha256=hashlib.sha256(canonical(settings)).hexdigest()),
+        settings_sha256=hashlib.sha256(canonical({key: value for key, value in settings.items()
+            if key != 'native_operation_root'})).hexdigest()),
         referenced_settings(settings, contents=True), previous=previous_runtime_configs)
     bound = compose(settings, target=target, root=root, initial_memory=initial_memory,
                     max_seconds=max_seconds)
@@ -293,7 +294,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             target_contract = None
         recovery = item.get('recovery')
         if recovery is None:
-            return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
+                binding_root=root / 'binding')
         if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
                 or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
             raise ValueError('recovery requires a reason and retained artifact references')
@@ -306,7 +308,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         previous = actor.immutable_context
         actor.immutable_context = previous + b'\nOriginal failure context (not learned memory; read full registry by SHA): ' + canonical(preview)
         try:
-            return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
+                binding_root=root / 'binding')
         finally:
             actor.immutable_context = previous
 
@@ -530,6 +533,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
         if bound.get('environment_check_cache'):
             arm_settings['environment_check_cache'] = bound['environment_check_cache']
+        if bound.get('native_operation_root'):
+            arm_settings['native_operation_root'] = bound['native_operation_root']
         if optimizer_config is not None:
             arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
             for key in ('cache_directory', 'compile_cache_directory'):

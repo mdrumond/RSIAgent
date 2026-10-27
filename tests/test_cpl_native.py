@@ -62,6 +62,7 @@ def test_cpl_compiles_executes_and_reuses_retained_handle_without_resubmit(tmp_p
     plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
     compilation = candidate.compile(plan, tmp_path/'bundle')
     receipt = candidate.execute_receipt(compilation)
+    assert json.loads((candidate.root / plan.execution_id / 'candidate.json').read_bytes()) == dict(project_id=plan.project_id)
     assert receipt.output == EXPECTED
     assert receipt.job_handle.startswith('remote:fixture:job:')
     assert candidate.compile(plan, tmp_path/'bundle') == compilation
@@ -377,6 +378,35 @@ def test_non_json_cli_failure_retains_bounded_diagnostics_without_replay(tmp_pat
     with pytest.raises(_PendingObservation, match='ambiguous'):
         backend(tmp_path, rejected).run_remote(('true',), key='health')
     assert len(calls)==1
+
+
+def test_readonly_recovery_settles_disconnected_job_without_submission(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    remote.unavailable = True
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(['python', '-c', 'pass'], key='health/interrupted')
+    before = len([call for call in remote.calls if call[2] == 'run'])
+    candidate.recover_owned_operations()
+    record = json.loads((candidate.root/'health/interrupted/operation.json').read_text())
+    assert record['state'] == 'completed'
+    assert len([call for call in remote.calls if call[2] == 'run']) == before == 1
+    assert candidate.run_remote(['python', '-c', 'pass'], key='health/interrupted').returncode == 0
+
+
+def test_readonly_recovery_preserves_ambiguous_and_foreign_allocation_records(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    identity = dict(route=candidate.runtime_identity, workspace='/owned/task', arguments=[])
+    for name, row in {'ambiguous':dict(identity=identity, state='submitting'),
+            'foreign':dict(identity=dict(identity, route=dict(candidate.runtime_identity, physical_device=2)),
+                           state='running', handle='remote:fixture:job:other')}.items():
+        path = candidate.root/name/'operation.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(row))
+    candidate.recover_owned_operations()
+    assert not remote.calls
+    assert json.loads((candidate.root/'ambiguous/operation.json').read_text())['state']=='submitting'
 
 
 @pytest.mark.parametrize('deadline', [False, True])

@@ -236,6 +236,30 @@ class CplNativeCandidateBackend:
         _save(path, record)
         return result
 
+    def recover_owned_operations(self, *, seconds=30, remaining_seconds=None):
+        """Observe this binding's retained handles without submitting device work."""
+        deadline = self.clock() + min(seconds, self.timeout)
+        for path in Path(getattr(self, 'recovery_root', self.root)).rglob('operation.json'):
+            record = json.loads(path.read_text())
+            if ('result' in record or record.get('state') in ('new', 'completed', 'failed', 'cancelled')):
+                continue
+            identity = record.get('identity', {})
+            if identity.get('route') != self.runtime_identity or identity.get('workspace') != str(self._workspace):
+                continue
+            handle = record.get('handle')
+            if not handle:
+                continue  # Ambiguous submissions must remain blocked, never resubmitted.
+            if not any(handle.startswith(f'remote:{self.target}:{kind}:') for kind in ('job', 'transfer')):
+                raise ProjectInfrastructureError('retained CPL operation has a foreign handle')
+            remaining = min(deadline-self.clock(), remaining_seconds() if remaining_seconds else float("inf"))
+            if remaining <= 0:
+                break
+            observed = self._call(('observe', handle), seconds=remaining)
+            if observed.get('handle') != handle:
+                raise ProjectInfrastructureError('CPL observation returned a foreign handle')
+            record['state'] = observed.get('state')
+            _save(path, record)
+
     def _wire_path(self, path):
         selected = PurePosixPath(path)
         return str(selected.relative_to(self.registry_workspace)) if self.registry_workspace is not None else str(selected)
@@ -296,6 +320,7 @@ class CplNativeCandidateBackend:
     def compile(self, plan, local_directory):
         self._require_plan(plan)
         key = plan.execution_id
+        _save(self.root / key / 'candidate.json', dict(project_id=plan.project_id))
         bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
         archive = self._workspace / (key+'.tar')
         self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')

@@ -31,6 +31,7 @@ from benchmarks.a5kernels.phase1_project_executor import (
     ProjectCompileResult,
     ProjectExecutionResult,
     ProjectExecutor,
+    _tensor_payload, _expected_payload,
 )
 from benchmarks.a5kernels.phase1_project import EvidenceClassification
 from benchmarks.a5kernels.trial import (
@@ -206,6 +207,15 @@ class _ProjectActions:
         self.host_facts: list[HostFact] = []
         self.observed_failures: dict[FailureMode, int] = {}
         self.latest_run_at: int | None = None
+        self.failure_context = None
+        if request.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureContext
+            self.failure_context = FailureContext(request.failure_context, request.spec,
+                                                  prepared.inputs, prepared.expected)
+            self.failure_context.require_repair_evidence(request.spec)
+            if self.failure_context.compatible:
+                # Historical authenticated negative evidence predates every action here.
+                self.observed_failures[request.spec.failure_mode] = -1
 
     def __call__(self, action: TrialAction) -> ActionOutcome:
         from benchmarks.ascend.execution import process_deadline
@@ -294,7 +304,10 @@ class _ProjectActions:
         if not result.observation.passed:
             self.observed_failures[FailureMode.COMPILE] = len(self.actions)
             retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
-                "compile-failure", result.observation.diagnostic, {"diagnostics": result.artifact},
+                "compile-failure", result.observation.diagnostic, {
+                    "diagnostics": result.artifact,
+                    "inputs": {"tensors": [_tensor_payload(x) for x in self.prepared.inputs]},
+                    "expected": _expected_payload(self.prepared.expected)},
                 self.prepared.expected.dtype)
         return self._observation({
             "event": "host-compile", "source_sha256": self.source_sha256,
@@ -522,7 +535,20 @@ class AdaptiveActorProjectExecutor:
         if remaining is not None and remaining <= 0:
             raise RuntimeError("project time budget exhausted")
         max_seconds = min(self.max_seconds, remaining) if remaining is not None else self.max_seconds
-        prepared = self.executor.prepare(request.spec)
+        executor = self.executor
+        if request.failure_context is not None and request.failure_context.get('original_retry'):
+            from benchmarks.ascend.failure_handoff import original_retry_inputs
+            from benchmarks.ascend.phase2_feedback import FeedbackStore
+            inputs = original_retry_inputs(FeedbackStore(request.failure_context['root']),
+                request.failure_context['feedback_ids'][0], request.spec)
+            if inputs is not None:
+                executor = executor.bind_case(request.spec, inputs)
+        if request.failure_context is not None and request.spec.failure_mode is not FailureMode.NONE:
+            from benchmarks.ascend.failure_handoff import FailureContext
+            failure = FailureContext(request.failure_context, request.spec)
+            failure.require_repair_evidence(request.spec)
+            executor = executor.bind_case(request.spec, failure.inputs)
+        prepared = executor.prepare(request.spec)
         if (
             prepared.spec != request.spec
             or prepared.inputs != request.inputs
@@ -533,7 +559,7 @@ class AdaptiveActorProjectExecutor:
         artifacts = ContentAddressedArtifacts(root / "artifacts")
         memory_sha256 = artifacts.put_bytes(request.pre_wave_memory)
         actions = _ProjectActions(
-            self.executor, request, prepared, artifacts,
+            executor, request, prepared, artifacts,
             max_actions=self.max_actions, max_seconds=max(0.001, max_seconds-(time.monotonic()-started)), max_source_bytes=self.max_source_bytes,
             query_knowledge=self.query_knowledge,
             request_profile=self.request_profile,
@@ -543,6 +569,24 @@ class AdaptiveActorProjectExecutor:
         actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
         actions.read_artifacts = MemoryArtifactReader(request, artifacts)
+        if actions.failure_context is not None:
+            from benchmarks.ascend.failure_handoff import FailureArtifactReader
+            actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
+        repair_protocol = ''
+        if request.spec.failure_mode is not FailureMode.NONE:
+            repair_protocol = (
+                f'Failure-repair task: required original failure = {request.spec.failure_mode.value}. '
+                'Follow reproduce -> observe the specified failure in host evidence -> repair '
+                '-> verify the repaired current source -> submit. Use the supplied buggy example '
+                'when available. If none is supplied, construct a faithful, safe reproducer of '
+                'the specified failure; an unrelated compiler error or numerical bug is not a '
+                'substitute. Never reproduce unsafe or hanging behavior. If the specified '
+                'original failure is already retained by the host, skip reproduction. '
+                'A passing implementation alone does not satisfy this repair task. If submit '
+                'reports missing observed-original-failure evidence, collect that specified '
+                'failure, repair it, verify again, then submit; do not loop over passing runs '
+                'or repeat submit without supplying the missing evidence.\n'
+            )
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "
@@ -550,7 +594,14 @@ class AdaptiveActorProjectExecutor:
                    "does not establish Catlass instruction coverage; inspect raw report. "
                    "Unavailable tools are reported explicitly. Do not deliberately run "
                    "hanging kernels; bounded termination does not guarantee device recovery.\n")
-        opening = (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
+        opening = repair_protocol + (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
+        if actions.failure_context is not None:
+            opening += ("\nLinked observed failures (unverified context, not reusable memory): "
+                        + json.dumps(actions.failure_context.presentation(), sort_keys=True)
+                        + "\nRead the supplied source, exact inputs, expected and observed results using "
+                        "read-artifact. A compatible attached case satisfies the negative-example "
+                        "requirement; repair it and host-verify your current source. Do not invent "
+                        "a new mismatch. Incompatible cases are context only.\n")
         opening += prepared.instruction + "\nPre-wave memory (immutable, readable index): " + json.dumps(
             memory_presentation(request.pre_wave_memory, artifacts),
             sort_keys=True, separators=(",", ":"))
@@ -558,13 +609,23 @@ class AdaptiveActorProjectExecutor:
                     '{"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}. '
                     'Offsets and limits are bytes; follow next_offset for more. '
                     'Observation previews do not replace authoritative host verification.')
+        measurements = []
+        if request.spec.timing_lengths or "sync-performance" in request.spec.learning_focus:
+            measurements.append('timing with {"request-timing":{}}')
+        if request.spec.profile_metric is not None:
+            measurements.append('profiling with {"request-profile":{}}')
+        if measurements:
+            opening += (
+                '\nAfter host verification of the repaired current source, obtain the required '
+                + ' and '.join(measurements) + '. The host selects measurement cases from the '
+                'project spec. Inspect returned raw evidence and report scope and uncertainty. '
+                'Source edits require renewed verification and applicable measurements.'
+            )
+        else:
+            opening += '\nThis spec requires no timing or profiling; do not add optional measurements.'
         opening += (
-            '\nAfter host verification of the current source, request timing with '
-            '{"request-timing":{}} and profiling with {"request-profile":{}}. '
-            'The host selects timing lengths and profiler metric from the project spec. '
-            'Inspect returned raw measurements and diagnostics; compile success is not correctness. '
-            'Rewriting source requires new verification and new measurements before submit. '
-            'Report measurement scope and uncertainty when distilling performance lessons.'
+            '\nCompile success does not establish correctness. Once current-source verification '
+            'and all specified evidence requirements are satisfied, submit as the next action.'
         )
         if self.immutable_context:
             opening += (

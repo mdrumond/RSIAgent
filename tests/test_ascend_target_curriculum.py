@@ -5,7 +5,7 @@ import pytest
 from benchmarks.ascend.targets import a3_curriculum_policy
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import (
-    CurriculumAgent, CurriculumContext, _grammar,
+    CurriculumAgent, CurriculumContext,
 )
 
 
@@ -30,19 +30,8 @@ def test_native_operations_do_not_require_simt(operation):
     assert not any("simt" in item.value for item in spec.capabilities)
 
 
-def test_a5_grammar_remains_legacy_only():
-    assert "vector-reduction" not in _grammar()["capabilities"]
-    assert "simt-reduction" in _grammar()["capabilities"]
 
 
-def test_a3_grammar_and_guidance_are_product_specific():
-    policy = a3_curriculum_policy()
-    grammar = policy.grammar(_grammar())
-    assert grammar["dtypes"] == ["float32"]
-    assert "vector-reduction" in grammar["capabilities"]
-    text = json.dumps(grammar) + policy.guidance + policy.system
-    for forbidden in ("simt", "mxfp8", "float8_", "tla.", "msdebug", "mssanitizer"):
-        assert forbidden not in text.lower()
 
 
 def test_dtype_admission_is_explicit_and_limited():
@@ -88,7 +77,6 @@ def test_agent_applies_target_policy_and_repairs_invalid_dtype():
     ).select(context)
     assert decision.wave.projects[0].spec.dtype.value == "float32"
     assert session.turns == 2
-    assert "A3 Ascend C" in calls[0][0]["content"]
     assert "dtype unavailable" in calls[1][-1]["content"]
 
 

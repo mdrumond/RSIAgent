@@ -564,6 +564,116 @@ def test_actor_inherits_executor_deadline_and_preserves_clock_on_clone(monkeypat
     assert active.deadline == active.gateway.deadline == 9
 
 
+def test_actor_reports_rejected_action_for_next_turn_recovery(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    observations = []
+    class RecoveringSession:
+        completion_tokens = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, context, *args, **kwargs):
+            observations.append(context['latest_host_observation'])
+            if len(observations) == 1:
+                raise actor_module.ActionError('Pi returned no accepted host action')
+            host = json.loads(context['latest_host_observation'])['host']
+            assert host['event'] == 'invalid-action'
+            assert host['error'] == 'Pi returned no accepted host action'
+            return 'submit', {}
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: RecoveringSession())
+    driver = actor_module.PiActorDriver(DirectCompletionProvider({
+        'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
+    executed = []
+    def execute(action):
+        executed.append(action.kind)
+        return ActionOutcome('{}', True, 'host-verified')
+    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
+                     workspace=tmp_path, context=None, turn_parser=parse_trial_action,
+                     action_executor=execute)
+    assert outcome.status == 'host-verified'
+    assert executed == ['submit']
+    assert len(observations) == 2
+
+
+def test_real_pi_actor_waits_for_submit_acceptance(monkeypatch, tmp_path):
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import A5BackendModel, MODEL_IDENTITIES
+    from coding.pi.actor import PiActorDriver
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('npm ci --prefix integrations/pi required')
+    actions = [('run', {}), ('submit', {}), ('request-timing', {}), ('submit', {})]
+    calls = []
+    def provider(*args, **kwargs):
+        calls.append(json.loads(kwargs['data']))
+        name, payload = actions[len(calls)-1]
+        return stream(name, payload, len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    seen = []
+    verified, timed = False, False
+    def execute(action):
+        nonlocal verified, timed
+        seen.append(action.kind)
+        if action.kind == 'run':
+            verified = True
+            host = {'classification': 'host-verified'}
+        elif action.kind == 'request-timing':
+            assert verified
+            timed = True
+            host = {'event': 'performance-study', 'passed': True}
+        else:
+            assert action.kind == 'submit'
+            if verified and timed:
+                return ActionOutcome('{}', True, 'host-verified')
+            host = {'error': 'submit requires retained project evidence', 'missing': ['performance-study']}
+        return ActionOutcome(json.dumps({'host': host}), False, 'continue')
+    driver = PiActorDriver(DirectCompletionProvider({'DEEPSEEK_API_KEY': 'fake'},
+        models=(A5BackendModel.DEEPSEEK_FLASH,)), max_seconds=30)
+    profile = direct_profile(next(i for i in MODEL_IDENTITIES if i.backend_model is A5BackendModel.DEEPSEEK_FLASH))
+    outcome = driver('Synthetic task requires verified correctness and timing.', profile=profile,
+                     workspace=tmp_path, context=None, turn_parser=parse_trial_action,
+                     action_executor=execute)
+    assert outcome.status == 'host-verified'
+    assert seen == ['run', 'submit', 'request-timing', 'submit']
+    assert len(calls) == 4
+
+
+def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    requests = []
+    class FakeSession:
+        completion_tokens = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, payload, allowed, **kwargs):
+            requests.append((payload, set(allowed)))
+            return ('not-an-action', {}) if len(requests) == 1 else ('submit', {})
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
+    driver = actor_module.PiActorDriver(DirectCompletionProvider(
+        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
+    executed = []
+    def execute(action):
+        executed.append(action.kind)
+        return ActionOutcome('{}', True, 'passed')
+    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
+                     workspace=tmp_path, context=None,
+                     turn_parser=parse_trial_action, action_executor=execute)
+    assert outcome.status == 'passed' and executed == ['submit']
+    feedback = json.loads(requests[1][0]['latest_host_observation'])['host']
+    assert feedback['event'] == 'invalid-action'
+    assert feedback['allowed_actions'] == sorted(requests[1][1])
+    assert 'submit' in feedback['allowed_actions']
+
+
 def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
     requests = []
     context = {'guide': 'Page contents. ' * 2000,

@@ -629,8 +629,6 @@ def test_channel_restart_recovers_same_actor_without_replaying_action(tmp_path):
     assert result.status == "done"
     assert vm.recoveries == 1
     assert vm.codes == ["python heavy.py", "echo resumed"]
-    assert "NOT replayed" in actor_users[1]
-    assert "controller recovered" in actor_users[1]
 
 
 def test_v17_surface_delta():

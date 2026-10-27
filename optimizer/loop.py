@@ -17,7 +17,7 @@ import time
 
 from core.knowledge_presentation import compact_knowledge_result
 
-from .cases import validate_submission
+from .cases import validate_submission, normalize_job_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
 from .control import ObservationUnavailable, WorkerStopped
@@ -97,16 +97,7 @@ class OptimizationLoop:
             self._save()
 
     def _spec(self, submission):
-        signature = submission['signature']
-        if isinstance(signature, dict) and 'signatures' in signature:
-            if set(signature) != {'signatures'}:
-                raise ValueError('signature envelope contains unexpected fields')
-            signatures = signature['signatures']
-        else:
-            # Preserve jobs created by the original CLI's list/single-case API.
-            signatures = signature if isinstance(signature, list) else [signature]
-        return validate_submission({k: submission[k] for k in ('source', 'entrypoint', 'init_args', 'init_kwargs')}
-                                   | {'signatures': signatures})
+        return normalize_job_submission(submission)
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         try:
@@ -407,7 +398,9 @@ class OptimizationLoop:
                 if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
                     record = self._artifact('context-' + key, context[key])
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
-        value = self._action(stage, lambda: self.agent.complete(stage, context, self._record))
+        from benchmarks.ascend.status_descriptions import describe_statuses
+        presentation = describe_statuses(context)
+        value = self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
         if value is not None and control.pending():
             # A redirection arriving in flight supersedes this unexecuted action.
             self.state.pop('model_action', None)

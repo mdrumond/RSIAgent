@@ -59,6 +59,8 @@
     try {
       const state = await read(base);
       document.querySelector('#optimizer-progress').textContent = `${state.status} · ${state.stage}${state.stop_requested ? ' · stop requested' : ''}`;
+      const explanations = document.querySelector('#optimizer-explanations');
+      explanations.replaceChildren(); window.renderStatusExplanations(explanations, state);
       document.querySelector('#optimizer-budget').textContent = `${state.attempts} attempts; ${Math.round(state.elapsed_seconds)} / ${state.max_seconds} seconds`;
       document.querySelector('#optimizer-handles').textContent = state.handles.map(row => `${row.operation}: ${row.handle}`).join('\n');
       document.querySelector('#optimizer-stop').disabled = !(state.worker_active || ['running', 'queued'].includes(state.status)) || state.stop_requested;
@@ -113,6 +115,7 @@
           try {
             const data = await read(`${base}/events/${event.sequence}`);
             const pre = document.createElement('pre'); pre.textContent = JSON.stringify(data.payload, null, 2); detail.append(pre);
+            window.renderStatusExplanations(detail, data.presentation || data);
             if (data.payload?.sha256 && data.payload?.name) {
               const button = document.createElement('button'); button.textContent = `Load retained ${data.payload.name}`;
               button.addEventListener('click', async () => {

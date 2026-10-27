@@ -76,6 +76,7 @@ class PiActorDriver(DirectActorDriver):
         runtime_preflight()
         kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
         super().__init__(*args, max_seconds=max_seconds, **kwargs)
+        self.system_prompt = typed_contract(self.system_prompt)
 
     def with_trace(self, trace_event):
         return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
@@ -132,6 +133,7 @@ class PiActorDriver(DirectActorDriver):
                     return ActorOutcome('user-stopped', turn, tokens)
                 turn += 1
                 before = session.completion_tokens
+                action_error = None
                 def record(kind, payload):
                     self._trace("tool", {"name": kind, "turn": turn, **payload})
                     if recorder.enabled:
@@ -154,9 +156,10 @@ class PiActorDriver(DirectActorDriver):
                 except PiDeadlineError:
                     tokens += session.completion_tokens-before
                     break
-                except ActionError as error:
+                except ActionError as exc:
+                    action_error = str(exc)[:500]
                     text = "{}"
-                    latest = json.dumps({"host": {"event": "invalid-action", "reason": str(error),
+                    latest = json.dumps({"host": {"event": "invalid-action", "reason": action_error,
                         "allowed_actions": sorted(allowed)}})
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
@@ -169,10 +172,15 @@ class PiActorDriver(DirectActorDriver):
                     continue
                 action = turn_parser(text)
                 if action is None:
-                    if text != "{}" or latest is None:
-                        latest = json.dumps({"host": {"event": "invalid-action",
-                            "reason": "Selected action does not match the host protocol",
-                            "allowed_actions": sorted(allowed)}})
+                    host = {
+                        "event": "invalid-action",
+                        "description": "The response could not be parsed as an accepted action. No action was executed.",
+                        "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
+                        "allowed_actions": sorted(allowed),
+                    }
+                    if action_error:
+                        host["error"] = action_error
+                    latest = json.dumps({"host": host})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation

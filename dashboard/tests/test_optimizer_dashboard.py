@@ -111,3 +111,27 @@ def test_launch_failure_and_live_http(setup):
     finally:
         server.shutdown()
         thread.join()
+
+
+def test_optimizer_status_and_event_explanations_preserve_raw_observation(setup):
+    app, _, _ = setup
+    client = app.test_client()
+    response = client.post('/api/optimizer/jobs', json=dict(name='repair', source='def forward(x): return x',
+        entrypoint='forward', signature=[{'shape': [3]}], memory_root='/memory'), headers=headers(client))
+    assert response.status_code == 202
+    identifier = response.json['job_id']
+    store = app.extensions['optimizer'].store
+    store.transition(identifier, 'running', stage='optimize')
+    raw = dict(classification='host-mismatch', missing=['observed-host-mismatch'])
+    store.add_event(identifier, 'verification', raw)
+    state = client.get(f'/api/optimizer/jobs/{identifier}').json
+    assert {row['code'] for row in state['status_explanations']} == {'running', 'optimize'}
+    page = client.get('/optimizer/' + identifier).text
+    assert 'frozen reference and correctness suite' in page
+    assert 'Next:' in page
+    events = store.events(identifier)
+    sequence = events[-1]['sequence']
+    event = client.get(f'/api/optimizer/jobs/{identifier}/events/{sequence}').json
+    assert event['payload'] == raw
+    assert any(row['code'] == 'observed-host-mismatch' for row in event['presentation']['status_explanations'])
+    assert store.events(identifier)[-1]['payload'] == raw
