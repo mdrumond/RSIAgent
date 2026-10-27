@@ -25,7 +25,7 @@ class ContextBudget:
 
 DEFAULT_CONTEXT_BUDGETS = {
     "openai/gpt-5.6-sol": ContextBudget(128 * 1024, 80 * 1024, 192 * 1024),
-    "deepseek-flash": ContextBudget(32 * 1024, 24 * 1024, 48 * 1024),
+    "deepseek-flash": ContextBudget(128 * 1024, 80 * 1024, 192 * 1024),
 }
 
 
@@ -97,15 +97,31 @@ class WorkingContext:
             while len(self.recent) - len(batch) > 2:
                 candidate = batch + [self.recent[len(batch)]]
                 summary_messages = self._summary_messages(candidate, budget)
-                if request_bytes(profile.request(summary_messages)) > budget.target:
+                # Reserve a bounded correction message on every attempt, including
+                # the first, so retries can reuse the exact original batch.
+                reserved = summary_messages + [{"role": "user", "content": "x" * 512}]
+                if request_bytes(profile.request(reserved)) > budget.target:
                     break
                 batch = candidate
             if not batch:
                 raise ContextBudgetError("single exchange exceeds work-log input budget")
             summary_messages = self._summary_messages(batch, budget)
-            log = summarize(summary_messages)
-            if not isinstance(log, str) or not log.strip() or len(log.encode("utf-8")) > budget.target // 4:
-                raise ContextBudgetError("model work log is empty or exceeds work-log byte budget")
+            limit = budget.target // 4
+            correction = []
+            for attempt in range(3):
+                log = summarize(summary_messages + correction)
+                size = len(log.encode("utf-8")) if isinstance(log, str) else None
+                if isinstance(log, str) and log.strip() and size <= limit:
+                    break
+                measured = f"{size} UTF-8 bytes" if size is not None else "non-text (UTF-8 size unavailable)"
+                reason = "empty" if isinstance(log, str) and not log.strip() else "invalid"
+                feedback = (f"Previous work log was {reason}: {measured}; limit {limit} UTF-8 bytes. "
+                            "Regenerate a non-empty text log from the original input above. "
+                            "Return only the updated log within the limit.")
+                if attempt == 2:
+                    raise ContextBudgetError(f"model work log invalid after 3 attempts: {measured}; "
+                                             f"limit {limit} UTF-8 bytes ({reason})")
+                correction = [{"role": "user", "content": feedback}]
             self.work_log = log
             del self.recent[:len(batch)]
         return self.messages()

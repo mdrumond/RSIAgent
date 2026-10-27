@@ -15,6 +15,8 @@ import math
 import re
 import time
 
+from core.knowledge_presentation import compact_knowledge_result
+
 from .cases import validate_submission, normalize_job_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
@@ -99,8 +101,10 @@ class OptimizationLoop:
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         try:
-            return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
-                             memory_snapshot=memory_snapshot, context=context)
+            from benchmarks.ascend.actor_control import ActorControl
+            with ActorControl(self.directory.parent).lease():
+                return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
+                                 memory_snapshot=memory_snapshot, context=context)
         finally:
             close = getattr(self.agent, "close", None)
             if close is not None:
@@ -316,14 +320,43 @@ class OptimizationLoop:
             self._save()
 
     def _model(self, stage, context):
+        original_context = context
+        from benchmarks.ascend.actor_control import ActorControl, ActorStopped
+        control = ActorControl(self.directory.parent)
         retained = self.state.get('model_action', self.state.get('action_result'))
-        if retained and retained.get('name') == stage:
+        if retained and retained.get('name') == stage and not control.pending():
             # The caller removes this result in the same checkpoint that applies
             # it. A crash in between must not issue another billable request.
             return self._read(retained)
+        if retained and retained.get('name') == stage:
+            self.state.pop('model_action', None)
+            self.state.pop('action_result', None)
         self.state['turn'] += 1
         self._save()
         context = {**context, **self.context}
+        checkpoint = control.status()['checkpoint'] or {}
+        feedback = checkpoint.get('feedback', self.state.get('user_feedback', []))
+        self.state['user_feedback'] = feedback
+        try:
+            control.boundary({'turn': self.state['turn'], 'feedback': feedback}, feedback)
+        except ActorStopped:
+            row = self.store.stop(self.key)
+            if row['status'] == 'running':
+                self.store.transition(self.key, 'stopped')
+            return None
+        self._save()
+        context['user_feedback'] = feedback
+        # History can be paged as a whole by the coding context layer. Keep the
+        # latest bounded knowledge response readable independently of that list.
+        for entry in reversed(self.state['history']):
+            if entry.get('tool', {}).get('action') == 'query-knowledge':
+                knowledge = entry.get('content')
+                if (isinstance(knowledge, dict)
+                        and knowledge.get('event') == 'knowledge-query'
+                        and 'results_index_sha256' in knowledge
+                        and len(canonical(knowledge)) <= 3500):
+                    context['latest_knowledge'] = knowledge
+                break
         row = self.store.get(self.key)
         context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
         if self.agent.identity.get('coding_engine') == 'pi':
@@ -344,6 +377,12 @@ class OptimizationLoop:
                               'result': row.get('result'), 'summary': str(row.get('summary', ''))[:500]}
                 content = json.dumps(row.get('content'), ensure_ascii=True)
                 size = 12000 if index == len(recent) - 1 and 'tool' in row else 1500
+                if (row.get('tool', {}).get('action') == 'query-knowledge'
+                        and isinstance(row.get('content'), dict)
+                        and row['content'].get('event') == 'knowledge-query'
+                        and 'results_index_sha256' in row['content']
+                        and len(canonical(row['content'])) <= 3500):
+                    size = len(content)
                 record['content_preview'] = content[:size]
                 record['content_truncated'] = len(content) > size
                 history.append(record)
@@ -361,7 +400,14 @@ class OptimizationLoop:
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
         from benchmarks.ascend.status_descriptions import describe_statuses
         presentation = describe_statuses(context)
-        return self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
+        value = self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
+        if value is not None and control.pending():
+            # A redirection arriving in flight supersedes this unexecuted action.
+            self.state.pop('model_action', None)
+            self.state.pop('action_result', None)
+            self._save()
+            return self._model(stage, original_context)
+        return value
 
     def _tool(self, action, snapshot):
         # Model request mistakes are feedback, not evidence/transport failures.
@@ -416,8 +462,12 @@ class OptimizationLoop:
                 raise ValueError('invalid memory index')
             result = snapshot['memory_entries'][index]
         elif action['action'] == 'query-knowledge' and set(action) == {'action', 'query'}:
-            result = self._action('knowledge', lambda: self.knowledge(action['query'])
-                                  if self.knowledge else {'status': 'unavailable'})
+            def query():
+                raw = self.knowledge(action['query']) if self.knowledge else {'status': 'unavailable'}
+                return compact_knowledge_result(action['query'], raw, lambda content:
+                    self.store.put_artifact(self.key, 'knowledge-source', content)['sha256'])
+
+            result = self._action('knowledge', query)
         else:
             raise ValueError('invalid tool action')
         self._tool_result(action, result)

@@ -1,8 +1,8 @@
-"""Run a reviewed native A3 handoff, or dispatch the unchanged A5 CLI."""
+"""Read historical Phase 2 results; new work uses the subject curriculum."""
 
 import argparse
 import json
-from benchmarks.ascend.status_descriptions import describe_statuses
+from .status_descriptions import describe_statuses
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -55,30 +55,22 @@ def main(argv=None, *, runner_factory=native_runner, sleeper=time.sleep):
         from run_a5_phase2 import main as a5_main
         return a5_main(remaining)
     parser = argparse.ArgumentParser(description=__doc__, parents=[selector])
-    parser.add_argument("command", choices=("admit", "run"))
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("command", choices=("admit", "run", "report"))
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--worker-config", type=Path)
     parser.add_argument("--root", type=Path, required=True)
-    parser.add_argument("--phase1-root", type=Path, required=True)
-    parser.add_argument("--initial-memory", type=Path, required=True)
-    parser.add_argument("--review", type=Path, required=True)
+    parser.add_argument("--phase1-root", type=Path)
+    parser.add_argument("--initial-memory", type=Path)
+    parser.add_argument("--review", type=Path)
     parser.add_argument("--env-file", type=Path)
     args = parser.parse_args(remaining)
-    if args.command == "admit":
-        snapshot = admit_native_snapshot(args.phase1_root, args.initial_memory.read_bytes(), args.review, args.root)
-        print(json.dumps({"snapshot_id": snapshot.snapshot_id, "cell_id": snapshot.destination.cell_id}))
-        return 0
-    from benchmarks.ascend.attention import AttentionInfrastructureError
-    from run_a5_phase2 import MAX_INFRASTRUCTURE_RETRIES, BACKOFF_SECONDS
-    for attempt in range(MAX_INFRASTRUCTURE_RETRIES + 1):
-        try:
-            result = runner_factory(args).run()
-            print(json.dumps(describe_statuses(result)))
-            return 0
-        except AttentionInfrastructureError:
-            if attempt == MAX_INFRASTRUCTURE_RETRIES:
-                raise
-            sleeper(BACKOFF_SECONDS)
+    if args.command != 'report':
+        parser.error('Ascend Phase 2 execution and admission are retired; use run_ascend_subjects.py; historical report remains available')
+    state = args.root / 'state.json'
+    result = dict(state=json.loads(state.read_bytes()) if state.is_file() else None,
+                  records=[json.loads(path.read_bytes()) for path in sorted(args.root.rglob('terminal.json'))])
+    print(json.dumps(describe_statuses(result), sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
