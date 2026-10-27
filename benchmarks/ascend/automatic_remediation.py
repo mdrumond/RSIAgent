@@ -278,9 +278,6 @@ def optimizer_retry_adapter(runner, store, config):
             atomic(allocation_path, canonical(dict(seconds=allocation)))
         expected = retry_spec(dict(selected=[row]), 'a3')
         task = expected['task']
-        if row['outcome']['source_type'] == 'optimizer':
-            from optimizer.cases import normalize_job_submission
-            task = dict(task, submission=normalize_job_submission(task['submission']))
         bound = dict(config, phase2_attempt_seconds=allocation, max_cases=expected['max_cases'])
         remaining()
         executor = OptimizerTaskExecutor(directory, task, memory, bound, expected_baseline=expected)
