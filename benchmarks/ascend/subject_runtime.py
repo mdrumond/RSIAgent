@@ -182,9 +182,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     verifier_identity = dict(engine='pi' if verifier_sessions is not None else 'completion',
         engine_origin='legacy-resume' if legacy_default else 'configured' if 'verifier_engine' in settings else 'provider-default',
         model=verifier_complete.model, role='project-verifier',
-        runtime=ENGINE_IDENTITY if verifier_sessions is not None else None,
-        context_policy='review-state-aggregate-v1' if verifier_sessions is not None else 'bounded-messages-v1',
-        selection_policy='first-host-action-v1' if verifier_sessions is not None else 'json-action-v1')
+        runtime=dict(ENGINE_IDENTITY, context_policy='native-review-whole-request-v1',
+                     verifier_loop='native-reads-standalone-terminal-v1') if verifier_sessions is not None else None,
+        context_policy='native-review-whole-request-v1' if verifier_sessions is not None else 'bounded-messages-v1',
+        selection_policy='native-read-loop-standalone-terminal-v1' if verifier_sessions is not None else 'json-action-v1')
     if saved_verifier and saved_verifier != verifier_identity:
         raise ValueError('project verifier engine or model changed on resume')
     atomic(verifier_identity_path, canonical(verifier_identity))

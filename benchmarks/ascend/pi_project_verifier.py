@@ -3,29 +3,23 @@ from contextlib import contextmanager
 import time
 
 from coding.pi.schema import STRING, INTEGER, obj
-from coding.pi.session import PiCodingSession
+from .native_review import PiReviewSession
 from .project_verifier import REVIEW_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS
 from .review_context import ReviewContextRecords
 
-SYSTEM = REVIEW_INSTRUCTIONS + '''Use the declared typed tools, never print JSON action envelopes.
-Choose one host action per turn. If multiple tools are emitted, only the first
-queued action is selected; extras are rejected without execution.
-The queued receipt is not execution: the next
-host snapshot contains the authoritative observation. Use submit_review for a
-terminal accept/repair proposal; the host validates it before admission. Its
-fields follow the evidence instructions below. Use review_state.missing_required_artifacts
-for the exact artifact roles and SHA256 values still required before acceptance.
-Evidence arrays must contain only bare SHA256 strings copied from
-review_state.allowed_evidence. Put interpretation in reason, never in evidence.
-Memory citations must be exact objects from review_state.citations; use [] when
-that list is empty. Do not invent source-line citations. Snippet line numbers
-are 1-based; omit snippet text to let the host extract the exact observed lines.
-Aggregate drafts, retained lessons, KDB observations, citations or artifact pages
-may be represented by a record/bytes/preview/read_with pointer instead of inline
-contents. Use read_context with that record digest and returned next_offset to
-inspect their exact data; a pointer is not an empty result. Required-read and
-host-check controls remain directly visible and authoritative.
-Use read_context to page context records if previews are insufficient.
+SYSTEM = REVIEW_INSTRUCTIONS + '''Use the declared typed native tools; never print JSON action envelopes.
+Read/list/query tools return real host observations immediately and may be called
+together. submit_review and request_check must each be the only tool in its
+assistant message. Only a host-validated terminal decision ends the review.
+Use review_context.host.review_state.missing_required_artifacts for exact roles
+and hashes still required; ready_for_decision is guidance, not automatic acceptance.
+Evidence arrays contain only bare hashes from allowed_evidence. Citations must
+be exact KDB objects from review_state.citations (or [] when none). Snippet lines
+start at 1. Put interpretation in reason, never in evidence references.
+Read pages contain at most 2048 bytes; use the exact returned next_offset.
+Large observations and older complete exchanges have lossless read_context
+record pointers; a pointer is not an empty result. Current host controls and
+known counterevidence remain authoritative. Legitimate rereads remain available.
 ''' + EVIDENCE_INSTRUCTIONS
 
 def nullable(schema):
@@ -84,9 +78,9 @@ def session_factory(settings, provider, complete):
             # CLI/env-file credentials remain private to the provider and host
             # gateway. Never replace them with a possibly different ambient key.
             environment = provider.coding_environment() if hasattr(provider, 'coding_environment') else None
-            with PiCodingSession(model=complete.model, schemas=SCHEMAS, environ=environment,
+            with PiReviewSession(model=complete.model, schemas=SCHEMAS, environ=environment,
                     deadline=time.monotonic() + max_seconds, system_prompt=SYSTEM,
-                    first_action_only=True, context_factory=ReviewContextRecords) as session:
+                    context_factory=ReviewContextRecords) as session:
                 yield session
         except (PiCancelled, PiDeadlineError) as error:
             raise TimeoutError('Pi project review interrupted: ' + type(error).__name__) from None

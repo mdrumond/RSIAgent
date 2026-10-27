@@ -51,11 +51,12 @@ def safe_provider_error(error, api_key, token):
 
 
 class Gateway:
-    def __init__(self, provider, api_key, budget, label, *, max_calls=9, deadline=None, max_output_tokens=None, records_path=None, hard_bytes=49152, on_record=None):
+    def __init__(self, provider, api_key, budget, label, *, max_calls=9, deadline=None, max_output_tokens=None, records_path=None, hard_bytes=49152, on_record=None, request_projector=None):
         self.provider, self.spec = provider, dict(PROVIDERS[provider])
         if max_output_tokens is not None:
             self.spec["max_tokens"] = max_output_tokens
         self.records_path = records_path
+        self.request_projector = request_projector
         self.hard_bytes = hard_bytes
         self.on_record = on_record or (lambda *_: None)
         self.finished = threading.Event()
@@ -92,6 +93,8 @@ class Gateway:
         if request.get("stream") and not responses:
             request["stream_options"] = {"include_usage": True}
         request["parallel_tool_calls"] = False
+        if self.request_projector is not None:
+            request = self.request_projector(request, responses=responses, hard_bytes=self.hard_bytes)
         encoded = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode()
         if len(encoded) > self.hard_bytes:
             raise ValueError("provider request exceeds context hard byte budget")
@@ -117,7 +120,7 @@ class Gateway:
                 started_epoch = time.time()
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
-                    if not 0 < size <= 524288:
+                    if not 0 < size <= (8388608 if owner.request_projector is not None else 524288):
                         return self.error(413, "smoke request size limit")
                     payload = json.loads(self.rfile.read(size))
                     responses = self.path == "/v1/responses"

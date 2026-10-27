@@ -16,7 +16,7 @@ from test_pi_runtime import stream
 
 def test_production_defaults_pi_but_injected_transport_stays_compatible(monkeypatch):
     made = []
-    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiCodingSession',
+    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiReviewSession',
                         lambda **kwargs: made.append(kwargs) or nullcontext(kwargs))
     completion = SimpleNamespace(model='deepseek-flash')
     live = SimpleNamespace(_transport=openai_compatible_transport)
@@ -66,7 +66,7 @@ def test_subject_composition_selects_configured_verifier_model(tmp_path, monkeyp
     from benchmarks.ascend.subjects import Subject
     from test_subject_runtime import bound
     made = []
-    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiCodingSession',
+    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiReviewSession',
                         lambda **kwargs: made.append(kwargs) or nullcontext(kwargs))
     campaign = build_subject_campaign({'verifier_engine': 'pi', 'verifier_model': 'deepseek-flash',
         'memory_verification': False}, target='a3', root=tmp_path,
@@ -115,6 +115,7 @@ def test_new_live_composition_pins_pi_engine(tmp_path):
     identity = json.loads((tmp_path/'project-verifier-runtime.json').read_text())
     assert identity['engine'] == 'pi'
     assert identity['runtime']['pi_version'] == '1.3.0'
+    assert identity['runtime']['context_policy'] == identity['context_policy']
 
 
 def stream_many(actions):
@@ -139,33 +140,37 @@ def stream_many(actions):
     return Response()
 
 
-def test_real_pi_multi_tool_reply_executes_only_first_and_cannot_submit_early(monkeypatch):
+def test_compat_first_arriving_action_cannot_bypass_host_evidence_gate(monkeypatch):
     try:
         runtime_preflight()
     except RuntimeError:
         pytest.skip('Node22 and pinned Pi required')
     h = Harness([])
-    first = [*prerequisites()[:3], decision(memory())]
-    tail = iter([*prerequisites()[1:], decision(memory())])
     calls = []
     def provider(*_, **options):
-        calls.append(json.loads(options['data']))
+        body = json.loads(options['data'])
+        calls.append(body)
         if len(calls) == 1:
-            return stream_many(first)
-        action = next(tail)
+            return stream_many([*prerequisites()[:3], decision(memory())])
+        # The legacy extension permits parallel HTTP arrivals. Whichever call
+        # arrived first, follow the authoritative host's remaining evidence.
+        snapshot = json.loads(next(m['content'] for m in body['messages'] if m['role'] == 'user'))
+        state = snapshot['context']['host']['review_state']
+        if state['missing_required_artifacts']:
+            action = {'read_artifact': {'sha256': state['missing_required_artifacts'][0]['sha256']}}
+        elif not state['knowledge_queried']:
+            action = {'knowledge_query': {'query': 'increment'}}
+        else:
+            action = decision(memory())
         name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
         return stream(name, args, len(calls))
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
         environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
         deadline=time.monotonic()+options['max_seconds'], first_action_only=True)
-    result = h.agent.review(request(), max_seconds=30)
-    assert result == decision(memory())
-    assert [digest for digest, _ in h.reads[:3]] == [S, R, L]
-    assert len(calls) == 5
+    assert h.agent.review(request(), max_seconds=30) == decision(memory())
+    assert {digest for digest, _ in h.reads} == {S, R, L}
     selected = [e['payload'] for e in h.agent.last_trace if e['kind'] == 'pi-action']
-    assert selected[0]['name'] == 'read_artifact'
-    assert selected[0]['arguments']['sha256'] == S
     assert selected[0]['discarded_actions'] == 3
     assert len([e for e in h.agent.last_trace if e['kind'] == 'pi-action-rejected']) == 3
     assert len([e for e in h.agent.last_trace if e['kind'] == 'decision']) == 1
@@ -273,13 +278,17 @@ def test_real_pi_gateway_uses_private_provider_credential(monkeypatch, ambient):
     private = 'configured-private-provider-key'
     provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': private}, models=[selected])
     calls = []
+    actions = iter([*prerequisites(), decision(memory())])
     def http(*_, **options):
         calls.append(options)
-        return stream('read_artifact', {'sha256': S})
+        action = next(actions)
+        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
+        return stream(name, args, len(calls))
     monkeypatch.setattr('coding.pi.gateway.requests.post', http)
     create = session_factory({}, provider, SimpleNamespace(model='deepseek-flash'))
-    with create(max_seconds=15) as session:
-        assert session.next_action({}, ['read_artifact']) == ('read_artifact', {'sha256': S})
+    h = Harness([])
+    h.agent.session_factory = create
+    assert h.agent.review(request(), max_seconds=15) == decision(memory())
     assert calls[0]['headers']['Authorization'] == 'Bearer ' + private
     assert private not in calls[0]['data'].decode()
 
@@ -298,7 +307,7 @@ def test_production_review_boundary_normalizes_pi_failures(monkeypatch, failure,
         def __enter__(self): return self
         def __exit__(self, *_): pass
         def next_action(self, *args, **kwargs): raise classes[failure]('synthetic failure')
-    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiCodingSession', Failing)
+    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiReviewSession', Failing)
     h = Harness([])
     h.agent.session_factory = session_factory({'verifier_engine': 'pi'}, object(),
                                              SimpleNamespace(model='deepseek-flash'))

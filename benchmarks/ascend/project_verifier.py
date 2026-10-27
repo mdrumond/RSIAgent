@@ -211,162 +211,33 @@ class ProjectVerifierAgent:
             return self._review(request, remaining, feedback, session)
 
     def _review(self, request, remaining, feedback, session):
-        registry = dict(request.artifacts)
-        if request.source_sha256 is not None:
-            registry['source'] = request.source_sha256
-        known = set(registry.values())
-        if request.source_sha256 is not None:
-            known.add(request.source_sha256)
-        read = set()
-        observed = {}
-        versions, citations = set(), []
-        queried = self.query_knowledge is None
-        host_ok = request.host_verified
-        required = {digest for role, digest in request.artifacts.items()
-                    if any(part in role.lower() for part in ('result', 'log', 'evidence', 'execution'))}
-        if request.source_sha256 is not None:
-            required.add(request.source_sha256)
-        project = asdict(request)
-        project.update(artifacts=artifact_preview(registry), artifact_count=len(registry))
-        context = {'project': project, 'rewrite_feedback': feedback,
-                   'tools': {'knowledge_query': self.query_knowledge is not None,
-                             'request_check': self.request_check is not None}}
+        state = ReviewState(self, request, remaining, feedback)
+        if session is not None and hasattr(session, 'review'):
+            return session.review(state)
         messages = [{'role': 'system', 'content': SYSTEM},
-                    {'role': 'user', 'content': json.dumps(context, sort_keys=True)}]
-        self._record('request', dict(context, project=asdict(request)))
-        pages, tools, feedback_observation = {}, {}, None
+                    {'role': 'user', 'content': json.dumps(state.context, sort_keys=True)}]
         while True:
-            missing = [dict(sha256=digest, roles=sorted(role for role, value in registry.items()
-                       if value == digest)) for digest in sorted(required - read)]
-            state = dict(read_artifacts=sorted(read), allowed_evidence=sorted(read), missing_required_artifacts=missing,
-                observed_versions=sorted(versions), citations=citations, host_checks_passed=host_ok,
-                knowledge_queried=queried)
             if session is None:
-                working = bounded_review_messages(messages, state)
-                response = self.complete(tuple(working), remaining_seconds=remaining())
+                response = self.complete(tuple(bounded_review_messages(messages, state.summary())),
+                                         remaining_seconds=remaining())
             else:
-                allowed = ['list_artifacts', 'read_artifact', 'submit_review']
-                if self.query_knowledge is not None:
-                    allowed.append('knowledge_query')
-                if self.request_check is not None:
-                    allowed.append('request_check')
                 from coding.pi.session import ActionError
                 try:
-                    name, args = session.next_action(dict(project=context, review_state=state,
-                        artifact_pages=list(pages.values()), tool_observations=tools,
-                        validation_feedback=feedback_observation), allowed, record=self._record)
+                    name, args = session.next_action(dict(project=state.context, review_state=state.summary(),
+                        artifact_pages=list(state.pages.values()), tool_observations=state.tools,
+                        validation_feedback=state.feedback), state.allowed(), record=self._record)
                     response = json.dumps(args if name == 'submit_review' else {name: args})
                 except ActionError as error:
-                    # Invalid typed arguments have no host effects. Correct them
-                    # against current state, without replaying an ever-growing history.
                     response = json.dumps({'invalid_typed_action': str(error)})
             remaining()
-            self._record('response', response)
             messages.append({'role': 'assistant', 'content': response})
             try:
                 value = json.loads(response)
-                if not isinstance(value, dict):
-                    raise ValueError('reply must be a JSON object')
-                if set(value) == {'list_artifacts'}:
-                    observation = artifact_page(registry, value['list_artifacts'])
-                elif set(value) == {'read_artifact'}:
-                    payload = value['read_artifact']
-                    if not isinstance(payload, dict) or set(payload) - {'sha256', 'offset', 'limit'}:
-                        raise ValueError('invalid artifact read')
-                    digest = _digest(payload['sha256'])
-                    if digest not in known:
-                        raise ValueError('artifact is not admitted by the project or observed tools')
-                    data = self.read_artifact(digest, remaining_seconds=remaining())
-                    if not isinstance(data, bytes) or hashlib.sha256(data).hexdigest() != digest:
-                        raise ValueError('artifact bytes do not match their identity')
-                    offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
-                    if type(offset) is not int or not 0 <= offset <= len(data) or type(limit) is not int or not 1 <= limit <= 65536:
-                        raise ValueError('invalid artifact page')
-                    page = data[offset:offset + min(limit,8192)]
-                    if page or not data:
-                        read.add(digest)
-                        observed.setdefault(digest, []).append((offset, offset + len(page)))
-                    observation = {'sha256': digest, 'offset': offset, 'size': len(data),
-                                   'text': page.decode('utf-8', errors='replace'),
-                                   'next_offset': offset + len(page) if offset + len(page) < len(data) else None}
-                elif set(value) == {'knowledge_query'}:
-                    payload = value['knowledge_query']
-                    if self.query_knowledge is None:
-                        raise ValueError('knowledge query is unavailable')
-                    if not isinstance(payload, dict) or set(payload) != {'query'}:
-                        raise ValueError('knowledge query requires query')
-                    _text(payload['query'], 'query')
-                    observation = self.query_knowledge(payload, remaining_seconds=remaining())
-                    if not isinstance(observation, Mapping):
-                        raise ValueError('knowledge result must be a mapping')
-                    for memory in observation.get('memories', []):
-                        versions.add((_text(memory['memory_id'], 'memory_id'),
-                                      _text(memory['version'], 'version')))
-                        for digest in memory.get('artifacts', {}).values():
-                            known.add(_digest(digest))
-                    citations.extend(observation.get('citations', []))
-                    observation = knowledge_preview(observation, registry)
-                    queried = True
-                elif set(value) == {'request_check'}:
-                    if self.request_check is None:
-                        raise ValueError('additional checks are unavailable')
-                    payload = value['request_check']
-                    if not isinstance(payload, dict) or set(payload) != {'hypothesis', 'check'} or not isinstance(payload['check'], dict):
-                        raise ValueError('check requires hypothesis and check object')
-                    _text(payload['hypothesis'], 'hypothesis')
-                    observation = self.request_check(payload, remaining_seconds=remaining())
-                    if not isinstance(observation, Mapping) or type(observation.get('host_verified')) is not bool:
-                        raise ValueError('check must return host_verified and artifact references')
-                    host_ok = host_ok and observation['host_verified']
-                    registry.update({'check:' + str(len(registry)) + ':' + role: digest
-                                     for role, digest in observation.get('artifacts', {}).items()})
-                    for digest in observation.get('artifacts', {}).values():
-                        required.add(_digest(digest))
-                        known.add(digest)
-                    observation = dict(host_verified=observation['host_verified'],
-                                       artifacts=artifact_preview(registry), artifact_count=len(registry))
-                else:
-                    self._validate_decision(value, request, read, required, host_ok,
-                                            queried, versions, citations, remaining, observed)
-                    remaining()
-                    self._record('decision', value)
-                    return value
-                remaining()
-                self._record('tool', {'action': value, 'observation': observation})
-                if session is not None:
-                    if 'read_artifact' in value:
-                        key = (observation['sha256'], observation['offset'])
-                        pages.pop(key, None)
-                        pages[key] = observation
-                        # Context retention, not a runtime stopping budget. Raw
-                        # evidence remains in the trace and can be paged again.
-                        while len(pages) > 8 or (len(pages) > 1 and
-                                len(json.dumps(list(pages.values())).encode()) > 12000):
-                            pages.pop(next(iter(pages)))
-                    else:
-                        tools[next(iter(value))] = observation
-            except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-                observation = {'error': str(exc), 'error_code': getattr(exc, 'code', 'invalid-review-action'),
-                    'missing_required_artifacts': [dict(sha256=digest,
-                        roles=sorted(role for role, value in registry.items() if value == digest))
-                        for digest in sorted(required - read)],
-                    'knowledge_query_required': not queried,
-                    'allowed_evidence': sorted(read), 'allowed_citations': citations,
-                    'expected_top_level': [
-                    ['list_artifacts'], ['read_artifact'], ['knowledge_query'], ['request_check'],
-                    ['decision', 'reason', 'evidence', 'repair', 'memory']],
-                    'correction': ('Correct the reported validation error while preserving your evidence-based judgment. '
-                                   'For snippets select observed sha256/start_line/end_line and omit text to extract exact code. '
-                                   'For unread evidence, read the referenced artifact or remove that unsupported citation. '
-                                   'Use only one permitted top-level key set.')}
-                if session is not None:
-                    observation.pop('expected_top_level', None)
-                    observation['correction'] = ('Use the declared typed tools. Evidence must be bare SHA256 '
-                        'strings from allowed_evidence, not descriptions. Citations must be exact '
-                        'allowed_citations objects or [] when none exist. Source snippet lines start at 1. '
-                        'Read only the missing required artifacts; do not reread evidence to fix its format.')
-                    feedback_observation = observation
-                self._record('feedback', observation)
+            except (ValueError, TypeError):
+                value = None
+            observation = state.execute(value, raw_response=response)
+            if state.decision is not None:
+                return state.decision
             messages.append({'role': 'user', 'content': json.dumps(observation, sort_keys=True)})
 
     def _validate_decision(self, value, request, read, required, host_ok, queried,
@@ -465,3 +336,182 @@ class ProjectVerifierAgent:
                 snippet['text'] = exact
                 return
         raise ValueError('read all quoted source bytes before quoting a snippet')
+
+
+class ReviewState:
+    """One host-owned decision/read contract shared by completion and native Pi."""
+    def __init__(self, agent, request, remaining, feedback):
+        self.agent, self.request, self.remaining = agent, request, remaining
+        self.registry = dict(request.artifacts)
+        if request.source_sha256 is not None:
+            self.registry['source'] = request.source_sha256
+        self.known = set(self.registry.values())
+        self.read, self.observed, self.versions, self.citations = set(), {}, set(), []
+        self.queried, self.host_ok = agent.query_knowledge is None, request.host_verified
+        self.required = {digest for role, digest in request.artifacts.items()
+            if any(part in role.lower() for part in ('result', 'log', 'evidence', 'execution'))}
+        if request.source_sha256 is not None:
+            self.required.add(request.source_sha256)
+        project = asdict(request)
+        project.update(artifacts=artifact_preview(self.registry), artifact_count=len(self.registry))
+        self.context = dict(project=project, rewrite_feedback=feedback,
+            tools=dict(knowledge_query=agent.query_knowledge is not None,
+                       request_check=agent.request_check is not None))
+        agent._record('request', dict(self.context, project=asdict(request)))
+        self.pages, self.tools, self.cache, self.read_requests = {}, {}, {}, {}
+        self.native, self.feedback, self.decision, self.raw_observation = False, None, None, None
+
+    def roles(self, digest):
+        return sorted(role for role, value in self.registry.items() if value == digest)
+
+    def allowed(self):
+        return ['list_artifacts', 'read_artifact', 'submit_review'] + (
+            ['knowledge_query'] if self.agent.query_knowledge is not None else []) + (
+            ['request_check'] if self.agent.request_check is not None else [])
+
+    def summary(self):
+        ready = not (self.required - self.read) and self.queried
+        return dict(read_artifacts=sorted(self.read), allowed_evidence=sorted(self.read),
+            missing_required_artifacts=[dict(sha256=digest, roles=self.roles(digest))
+                                        for digest in sorted(self.required - self.read)],
+            observed_versions=sorted(self.versions), citations=self.citations,
+            host_checks_passed=self.host_ok, knowledge_queried=self.queried,
+            ready_for_decision=ready,
+            read_progress=[dict(sha256=h, roles=self.roles(h), observed_ranges=self.observed[h],
+                requests=sum(n for (digest, _, _), n in self.read_requests.items() if digest == h))
+                for h in sorted(self.read)] if self.native else [],
+            guidance=('Evidence prerequisites are complete; submit a justified accept or repair when ready. '
+                      'Further reads remain available.' if ready else 'Read the missing evidence and query related memory.'))
+
+    def execute(self, value, *, raw_response=None):
+        self.remaining()
+        self.raw_observation = None
+        self.agent._record('response', json.dumps(value) if raw_response is None else raw_response)
+        registry, known, read, observed = self.registry, self.known, self.read, self.observed
+        versions, citations, required = self.versions, self.citations, self.required
+        queried, host_ok, request, remaining = self.queried, self.host_ok, self.request, self.remaining
+        try:
+            if not isinstance(value, dict):
+                raise ValueError('reply must be a JSON object')
+            if set(value) == {'list_artifacts'}:
+                observation = artifact_page(registry, value['list_artifacts'])
+            elif set(value) == {'read_artifact'}:
+                payload = value['read_artifact']
+                if not isinstance(payload, dict) or set(payload) - {'sha256', 'offset', 'limit'}:
+                    raise ValueError('invalid artifact read')
+                digest = _digest(payload['sha256'])
+                if digest not in known:
+                    raise ValueError('artifact is not admitted by the project or observed tools')
+                cached = self.native and digest in self.cache
+                data = self.cache[digest] if cached else self.agent.read_artifact(digest, remaining_seconds=remaining())
+                if not isinstance(data, bytes) or hashlib.sha256(data).hexdigest() != digest:
+                    raise ValueError('artifact bytes do not match their identity')
+                if self.native:
+                    self.cache[digest] = data
+                offset, limit = payload.get('offset', 0), payload.get('limit', 2048 if self.native else 8192)
+                if type(offset) is not int or not 0 <= offset <= len(data) or type(limit) is not int or not 1 <= limit <= 65536:
+                    raise ValueError('invalid artifact page')
+                end = min(len(data), offset + min(limit, 2048 if self.native else 8192))
+                if self.native:
+                    if offset < len(data) and offset and data[offset] & 0xC0 == 0x80:
+                        raise ValueError('offset must be a returned UTF-8 page boundary')
+                    while end < len(data) and end > offset and data[end] & 0xC0 == 0x80:
+                        end -= 1
+                    if end == offset and offset < len(data):
+                        raise ValueError('page limit is too small for the next UTF-8 character')
+                page = data[offset:end]
+                if self.native:
+                    # Keep escaped JSON page envelopes bounded as well as bytes.
+                    while len(json.dumps(dict(text=page.decode('utf-8', errors='replace')),
+                                         ensure_ascii=False).encode()) > 3000:
+                        end = offset + len(page)//2
+                        while end > offset and data[end] & 0xC0 == 0x80:
+                            end -= 1
+                        page = data[offset:end]
+                if page or not data:
+                    read.add(digest)
+                    observed.setdefault(digest, []).append((offset, offset + len(page)))
+                    if self.native:
+                        merged = []
+                        for first, last in sorted(observed[digest]):
+                            if merged and first <= merged[-1][1]:
+                                merged[-1] = (merged[-1][0], max(last, merged[-1][1]))
+                            else:
+                                merged.append((first, last))
+                        observed[digest] = merged
+                observation = {'sha256': digest, 'offset': offset, 'size': len(data),
+                               'text': page.decode('utf-8', errors='replace'),
+                               'next_offset': offset + len(page) if offset + len(page) < len(data) else None}
+                if self.native:
+                    key = (digest, offset, len(page))
+                    repeat = key in self.read_requests
+                    self.read_requests[key] = self.read_requests.get(key, 0) + 1
+                    observation.update(cache_hit=cached, repeat=repeat, page_requests=self.read_requests[key])
+                    self.agent._record('review-read', dict(sha256=digest, offset=offset, bytes=len(page),
+                        cache_hit=cached, repeat=repeat, roles=self.roles(digest)))
+            elif set(value) == {'knowledge_query'}:
+                payload = value['knowledge_query']
+                if self.agent.query_knowledge is None:
+                    raise ValueError('knowledge query is unavailable')
+                if not isinstance(payload, dict) or set(payload) != {'query'}:
+                    raise ValueError('knowledge query requires query')
+                _text(payload['query'], 'query')
+                observation = self.agent.query_knowledge(payload, remaining_seconds=remaining())
+                if not isinstance(observation, Mapping):
+                    raise ValueError('knowledge result must be a mapping')
+                for memory in observation.get('memories', []):
+                    versions.add((_text(memory['memory_id'], 'memory_id'),
+                                  _text(memory['version'], 'version')))
+                    for digest in memory.get('artifacts', {}).values():
+                        known.add(_digest(digest))
+                citations.extend(observation.get('citations', []))
+                self.raw_observation = observation
+                observation = knowledge_preview(observation, registry)
+                queried = True
+            elif set(value) == {'request_check'}:
+                if self.agent.request_check is None:
+                    raise ValueError('additional checks are unavailable')
+                payload = value['request_check']
+                if not isinstance(payload, dict) or set(payload) != {'hypothesis', 'check'} or not isinstance(payload['check'], dict):
+                    raise ValueError('check requires hypothesis and check object')
+                _text(payload['hypothesis'], 'hypothesis')
+                observation = self.agent.request_check(payload, remaining_seconds=remaining())
+                if not isinstance(observation, Mapping) or type(observation.get('host_verified')) is not bool:
+                    raise ValueError('check must return host_verified and artifact references')
+                host_ok = host_ok and observation['host_verified']
+                registry.update({'check:' + str(len(registry)) + ':' + role: digest
+                                 for role, digest in observation.get('artifacts', {}).items()})
+                for digest in observation.get('artifacts', {}).values():
+                    required.add(_digest(digest))
+                    known.add(digest)
+                observation = dict(host_verified=observation['host_verified'],
+                                   artifacts=artifact_preview(registry), artifact_count=len(registry))
+            else:
+                self.agent._validate_decision(value, request, read, required, host_ok,
+                                        queried, versions, citations, remaining, observed)
+                remaining()
+                self.agent._record('decision', value)
+                self.decision = value
+                return value
+            remaining()
+            self.agent._record('tool', {'action': value, 'observation': observation})
+            if 'read_artifact' in value:
+                key = (observation['sha256'], observation['offset'])
+                self.pages.pop(key, None)
+                self.pages[key] = observation
+                while len(self.pages) > 8 or (len(self.pages) > 1 and
+                        len(json.dumps(list(self.pages.values())).encode()) > 12000):
+                    self.pages.pop(next(iter(self.pages)))
+            else:
+                self.tools[next(iter(value))] = observation
+            return observation
+        except (ValueError, KeyError, TypeError, UnicodeDecodeError) as error:
+            observation = dict(error=str(error), error_code=getattr(error, 'code', 'invalid-review-action'),
+                missing_required_artifacts=[dict(sha256=h, roles=self.roles(h)) for h in sorted(required-read)],
+                knowledge_query_required=not queried, allowed_evidence=sorted(read), allowed_citations=citations,
+                correction='Use exact allowed evidence hashes/citations, 1-based source lines, and read missing evidence.')
+            self.feedback = observation
+            self.agent._record('feedback', observation)
+            return observation
+        finally:
+            self.queried, self.host_ok = queried, host_ok

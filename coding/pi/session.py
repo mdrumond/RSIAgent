@@ -223,7 +223,7 @@ class PiCodingSession:
                 "--thinking", "off" if self.gateway.provider == "deepseek" else "high",
                 "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "--no-themes", "--no-context-files", "--no-mcp", "--offline", "--no-approve",
-                "--extension", str(ROOT / "integrations/pi/host-actions.ts"),
+                "--extension", str(getattr(self, "extension_file", ROOT / "integrations/pi/host-actions.ts")),
                 "--system-prompt", self.system_prompt]
         self.rpc = self.stack.enter_context(PiRPC(argv, cwd=directory, env=env,
                                                  own_process_group=self.own_process_group))
