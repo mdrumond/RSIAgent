@@ -234,7 +234,8 @@ def test_measurement_callbacks_readmit_after_last_correctness_run(tmp_path, monk
     assert calls.count(name.removeprefix('request_')) == 2
 
 
-def test_campaign_reservation_serializes_parent_and_trial_admission_through_dispatch(tmp_path, monkeypatch):
+@pytest.mark.parametrize('bound_case', [False, True])
+def test_campaign_reservation_serializes_parent_and_trial_admission_through_dispatch(tmp_path, monkeypatch, bound_case):
     import threading
     from contextlib import contextmanager
     parent, parent_calls = compose(tmp_path/'parent',monkeypatch,operation_root=tmp_path)
@@ -246,6 +247,12 @@ def test_campaign_reservation_serializes_parent_and_trial_admission_through_disp
         assert release.wait(5)
         parent_calls.append('device-settled')
     parent['actor'].executor._executor.execute = execute
+    if bound_case:
+        parent['actor'].executor._executor.bind_case = lambda *args: SimpleNamespace(execute=execute)
+        trial_execute = trial['actor'].executor._executor.execute
+        trial['actor'].executor._executor.bind_case = lambda *args: SimpleNamespace(execute=trial_execute)
+        parent['actor'].executor = parent['actor'].executor.bind_case(None, ())
+        trial['actor'].executor = trial['actor'].executor.bind_case(None, ())
     reserve = trial['actor'].executor._check.reserve
     @contextmanager
     def observed_reserve():
@@ -269,3 +276,36 @@ def test_campaign_reservation_serializes_parent_and_trial_admission_through_disp
     assert not first.is_alive() and not second.is_alive() and not errors
     assert parent_calls[-1] == 'device-settled'
     assert trial_calls == ['probe-compile','probe-execute','extra-check']
+
+
+@pytest.mark.parametrize('operation', ['compile','execute'])
+@pytest.mark.parametrize('case_offset', [1,2])
+def test_bound_original_or_remedial_case_keeps_admission_and_exact_inputs(tmp_path, monkeypatch, operation, case_offset):
+    bound, calls = compose(tmp_path/'foreground',monkeypatch,operation_root=tmp_path)
+    spec = request(tmp_path).spec
+    inputs = tuple(materialize_inputs(spec))
+    dispatched = []
+    class Executor:
+        def __init__(self, retained=None): self.retained = retained
+        def bind_case(self, selected, values):
+            assert selected == spec
+            return Executor(values)
+        def compile(self, selected, source):
+            dispatched.append(('compile',self.retained))
+            return self.retained
+        def execute(self, selected, source):
+            dispatched.append(('execute',self.retained))
+            return self.retained
+    bound['actor'].executor._executor = Executor()
+    selected = bound['actor'].executor.bind_case(spec,inputs)
+    if case_offset == 2:
+        selected = selected.bind_case(spec,inputs)
+    pending = tmp_path/'trial/runtime/operation.json'
+    pending.parent.mkdir(parents=True)
+    pending.write_text(json.dumps(dict(state='running',handle='remote:registry-target:job:trial')))
+    with pytest.raises(ProjectInfrastructureError,match='unsettled'):
+        getattr(selected,operation)(spec,'candidate')
+    assert not dispatched and not calls
+    pending.write_text(json.dumps(dict(state='completed',handle='remote:registry-target:job:trial')))
+    assert getattr(selected,operation)(spec,'candidate') == inputs
+    assert dispatched == [(operation,inputs)]

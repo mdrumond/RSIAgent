@@ -35,6 +35,9 @@ class _CheckedExecutor:
     def __getattr__(self, name):
         return getattr(self._executor, name)
 
+    def bind_case(self, *args, **kwargs):
+        return _CheckedExecutor(self._executor.bind_case(*args, **kwargs), self._check)
+
     def _call(self, name, *args, **kwargs):
         with self._check.reserve():
             self._check()
