@@ -476,64 +476,18 @@ def test_missing_with_kdb_inputs_fail_before_bz(tmp_path):
     assert backend.calls == []
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [RuntimeUnavailableError("offline"), AttentionInfrastructureError("lost")],
-)
-def test_cli_retries_infrastructure_exactly_three_times(tmp_path, failure, capsys):
-    _composition, _source, destination, snapshot = _snapshot(tmp_path)
-    dependencies = _dependencies(snapshot)
-    calls = []
-    sleeps = []
-
-    def factory(_args):
-        calls.append(1)
-        if len(calls) <= 3:
-            raise type(failure)(str(failure))
-        return snapshot, dependencies
-
-    assert run_a5_phase2.main(
-        ["run", "--root", str(tmp_path / "phase2"),
-         "--snapshot", str(snapshot.root), "--cell-id", destination.cell_id],
-        runtime_factory=factory, sleeper=sleeps.append,
-    ) == 0
-    assert len(calls) == 4
-    assert sleeps == [120, 120, 120]
-    assert json.loads(capsys.readouterr().out)["status"] == "passed"
-
-
-def test_cli_does_not_retry_semantic_configuration_failure(tmp_path):
-    calls = []
-
-    def factory(_args):
-        calls.append(1)
-        raise ValueError("identity mismatch")
-
-    with pytest.raises(ValueError, match="identity"):
-        run_a5_phase2.main(
-            ["run", "--root", str(tmp_path / "phase2"),
-             "--snapshot", str(tmp_path / "snapshot"), "--cell-id", "cell"],
-            runtime_factory=factory, sleeper=pytest.fail,
-        )
-    assert calls == [1]
-
-
-def test_cli_stops_after_three_infrastructure_retries(tmp_path):
-    calls = []
-    sleeps = []
-
-    def factory(_args):
-        calls.append(1)
-        raise RuntimeUnavailableError("still offline")
-
-    with pytest.raises(RuntimeUnavailableError, match="offline"):
-        run_a5_phase2.main(
-            ["run", "--root", str(tmp_path / "phase2"),
-             "--snapshot", str(tmp_path / "snapshot"), "--cell-id", "cell"],
-            runtime_factory=factory, sleeper=sleeps.append,
-        )
-    assert len(calls) == 4
-    assert sleeps == [120, 120, 120]
+@pytest.mark.parametrize('failure', [RuntimeUnavailableError('offline'), ValueError('identity')])
+def test_retired_cli_does_not_dispatch_or_retry_production(tmp_path, failure):
+    calls, sleeps = [], []
+    def factory(args):
+        calls.append(args)
+        raise failure
+    with pytest.raises(SystemExit) as error:
+        run_a5_phase2.main(['run', '--root', str(tmp_path / 'phase2'),
+            '--snapshot', 'absent', '--cell-id', 'old-cell'],
+            runtime_factory=factory, sleeper=sleeps.append)
+    assert error.value.code == 2
+    assert calls == [] and sleeps == []
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")

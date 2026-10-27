@@ -95,6 +95,7 @@ class AdaptiveProjectRequest:
     oracle: ReferenceOutput
     memory_root: Path | None = None
     remaining_seconds: float | None = None
+    publish_learning: bool = True
 
 
 @dataclass(frozen=True)
