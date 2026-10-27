@@ -152,3 +152,28 @@ resume rejects a changed identity. Historical runtime directories without this
 file retain completion delivery rather than silently switching engines. New
 engine configurations require a new runtime directory. Pi does not change remote
 job queues, host verification, or the independent A/B publication gates.
+
+## Retrospective native runs
+
+A3 campaigns may pass `compose_cpl_production` from
+`benchmarks.ascend.retrospective_runtime` to `build_subject_campaign(compose=...)`.
+The same ignored Phase1 settings select provider/model, reference KDB, guide and
+workspace. The native JSON additionally requires `transport_target` and a named
+registry `runtime`; `registry_workspace` is optional. This path never invokes the
+legacy validation wrapper. Each fresh binding checks a known-good compile and
+exact host oracle before Actor work or additional verifier execution. The check
+consumes the current elapsed allocation. Optional `stop_file` belongs to this
+campaign only. `campaign.check_environment(force=True)` explicitly refreshes the
+check between batches; completed historical results do not require a device.
+
+`campaign.review_retained(item, request, **review_options)` registers an immutable
+historical graph plan before independent review, allowing extra host checks
+without rerunning its original Actor. Recovery items may add
+`recovery: {"reason": "...", "artifacts": {"role": "SHA256"}}`; referenced artifacts
+must already exist in the campaign store. The Actor receives this original-failure
+context separately from accepted learned memory, and the context is restored after
+execution. Original project specs and frozen accepted-memory snapshots are unchanged.
+
+The CPL adapter and environment probe retain reviewed behavior from PR186
+(`48592246`) and PR200 (`37004d1`), respectively. Terminal result collection is
+bounded read-only recovery: it cannot extend command execution or resubmit jobs.

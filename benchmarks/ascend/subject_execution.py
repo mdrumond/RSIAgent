@@ -15,6 +15,9 @@ import time
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
+from coding.pi.rpc import PiError
 from optimizer.jobs import atomic, canonical, sha
 from optimizer.memory import verify_snapshot
 
@@ -101,6 +104,7 @@ class SubjectExecutor:
             if artifacts is None:
                 raise ValueError('qualified target requires its retained artifact store')
             target.verify(artifacts, composed, policy)
+        started, epoch = self.clock(), time.time()
         request = replace(request, publish_learning=False)
         root = Path(request.branch_root)
         store = ContentAddressedArtifacts(root / 'artifacts')
@@ -153,6 +157,13 @@ class SubjectExecutor:
                                 evidence=payload, host_facts=payload.get('host_facts', []))
             admitted = payload.get('admitted_artifact_sha256', [])
             source, verified = payload.get('source_sha256'), False
+        except (ProjectInfrastructureError, TimeoutError, PiError, ProviderRejectionError) as error:
+            from .arm_evidence import interrupted_outcome
+            outcome = interrupted_outcome(root.parent, error, store, started_epoch=epoch,
+                elapsed_seconds=max(0, self.clock()-started), project_root=root)
+            root.mkdir(parents=True, exist_ok=True)
+            atomic(checkpoint, canonical(dict(identity=identity, outcome=outcome.as_dict())))
+            return portable(outcome.as_dict())
         refs = {'result:execution': store.put_json(observations)}
         if source is not None:
             store.read_bytes(source)

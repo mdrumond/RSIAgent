@@ -18,6 +18,7 @@ import time
 from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .subject_execution import SubjectOutcome
+from .arm_evidence import arm_evidence, interrupted_outcome, timing_summary
 from .project_verifier import bounded_review_messages, artifact_preview, artifact_page
 from .time_budget import AttemptTimeBudget
 
@@ -357,6 +358,7 @@ class MemoryVerifier:
                     arm_dir.mkdir(exist_ok=True)
                     arm_budget = AttemptTimeBudget(arm_dir / 'elapsed.json', state['arm_allocation'],
                                                   clock=self.clock, wall_clock=self.wall_clock)
+                    arm_started, arm_epoch = self.clock(), self.wall_clock()
                     try:
                         allowance = arm_budget.deadline - self.clock()
                         if allowance <= 0 or remaining() < allowance:
@@ -374,7 +376,12 @@ class MemoryVerifier:
                             raise TypeError('arm must return a host-owned SubjectOutcome')
                         for digest in outcome.artifacts.values():
                             store.put_bytes(outcome.read_artifact(digest))
-                        status = outcome.observations
+                        retained, _, _, _, spans, provider_seconds = arm_evidence(arm_dir, store)
+                        status = dict(outcome.observations, timing=timing_summary(spans, arm_epoch,
+                            max(0, self.clock()-arm_started), provider_seconds))
+                        outcome = SubjectOutcome(outcome.host_verified, outcome.source_sha256,
+                            {**outcome.artifacts, **retained, 'result:execution': store.put_json(status)},
+                            status, store.root)
                         evidence = status.get('evidence', {})
                         statuses = [status.get('classification'), status.get('status'), status.get('actor_status')]
                         if isinstance(evidence, dict):
@@ -387,8 +394,12 @@ class MemoryVerifier:
                             error_type=None if valid else 'InvalidArmStatus' if invalid else 'TimeoutError')
                         state['trace'].append(dict(kind='arm-completed', arm=name, **state['arms'][name]))
                     except Exception as error:
-                        state['arms'][name] = dict(outcome=None, valid=False, error_type=type(error).__name__)
-                        state['trace'].append(dict(kind='arm-inconclusive', arm=name, error_type=type(error).__name__))
+                        outcome = interrupted_outcome(arm_dir, error, store, started_epoch=arm_epoch,
+                            elapsed_seconds=max(0, self.clock()-arm_started))
+                        state['arms'][name] = dict(outcome=outcome.as_dict(), valid=False,
+                            error_type=type(error).__name__)
+                        state['trace'].append(dict(kind='arm-inconclusive', arm=name,
+                            error_type=type(error).__name__, interruption_reason=outcome.observations['interruption_reason']))
                     finally:
                         arm_budget.close()
                         save()

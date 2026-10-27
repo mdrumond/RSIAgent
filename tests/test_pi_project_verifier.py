@@ -204,3 +204,46 @@ def test_real_pi_rejects_prose_evidence_then_corrects_without_context_growth(mon
                  if e['kind'] == 'pi-action' and e['payload']['name'] == 'submit_review']
     assert len(submitted) == 1
     assert submitted[0]['arguments']['evidence'] == [R]
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_admitted_runtime_config_preserves_verifier_route_and_retained_review(tmp_path, legacy):
+    from benchmarks.ascend.subject_runtime import build_subject_campaign, referenced_settings
+    from benchmarks.ascend.project_verifier import ProjectReview
+    from benchmarks.ascend.subjects import Subject
+    from optimizer.jobs import canonical
+    from test_subject_runtime import bound
+    from test_a5_phase1_adaptive import _project
+    import hashlib
+    native = tmp_path/'native.json'
+    native.write_text(json.dumps({'physical_device': 0, 'workspace': 'retained', 'compiler': 'pin'}))
+    settings = {'phase1_arguments': ['--worker-config', str(native)], 'memory_verification': False}
+    root = tmp_path/'run'
+    root.mkdir()
+    if legacy:
+        (root/'subject-runtime.json').write_bytes(canonical(dict(target='a3', max_seconds=7200,
+            settings_sha256=hashlib.sha256(canonical(settings)).hexdigest(),
+            referenced_json_sha256=referenced_settings(settings))))
+    def compose(*args, **options):
+        result = bound(root)
+        result['provider'] = SimpleNamespace(_transport=openai_compatible_transport)
+        result['coordinator'].curriculum.target_policy = SimpleNamespace(admit=lambda _: None)
+        result['check_environment'] = lambda **_: 'environment-checked'
+        return result
+    options = dict(target='a3', root=root, subjects=[Subject('s', 'copies')],
+                   initial_memory=b'', compose=compose)
+    campaign = build_subject_campaign(settings, **options)
+    assert (campaign.verifier.session_factory is None) is legacy
+    assert json.loads((root/'subject-runtime.json').read_text())['schema'] == 'subject-runtime-v2'
+    assert campaign.check_environment() == 'environment-checked'
+    calls = []
+    campaign.verifier.review = lambda request, **kwargs: calls.append(request) or {'decision': 'repair'}
+    item = dict(project_id='retained', spec=_project('retained', 'gm-ub-movement'))
+    request = ProjectReview('retained', None, False, {})
+    assert campaign.review_retained(item, request, max_seconds=10) == {'decision': 'repair'}
+    assert calls == [request]
+    native.write_text(json.dumps({'physical_device': 1, 'workspace': 'retained', 'compiler': 'pin'}))
+    resumed = build_subject_campaign(settings, **options)
+    assert (resumed.verifier.session_factory is None) is legacy
+    allocations = json.loads((root/'execution-allocations.json').read_text())
+    assert allocations[-1]['allocation']['worker']['physical_device'] == 1
