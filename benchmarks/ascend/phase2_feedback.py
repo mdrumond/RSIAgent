@@ -465,12 +465,18 @@ class FeedbackStore:
                 result = dict(job_id=job['job_id'], verified=bool(best),
                     classification=job['status'], speedup=best.get('speedup'),
                     result=best.get('content', {}))
+                def read_artifact(ref, role):
+                    try:
+                        return store.read_artifact(job['job_id'], ref['sha256'])
+                    except (KeyError, TypeError, ValueError, OSError) as error:
+                        report['warnings'].append(f'{manifest}: unavailable {role} artifact: {error}')
+                        return None
                 evidence = {}
                 for role, ref in dict(baseline=state.get('baseline'), submission=state.get('spec'), candidate=best.get('source'),
                                       evaluation=best.get('result')).items():
                     if ref:
-                        store.read_artifact(job['job_id'], ref['sha256'])
-                        evidence[role] = dict(ref, job_root=str(root), job_id=job['job_id'])
+                        if read_artifact(ref, role) is not None:
+                            evidence[role] = dict(ref, job_root=str(root), job_id=job['job_id'])
                 spec = store.submission(job['job_id'])
                 observed_target, observed_language = self._identity(root,
                     None if target == 'unknown' else target,
@@ -508,15 +514,18 @@ class FeedbackStore:
                                 if not ref or ref['sha256'] in seen:
                                     continue
                                 seen.add(ref['sha256'])
-                                retained = json.loads(store.read_artifact(job['job_id'], ref['sha256']))
+                                data = read_artifact(ref, 'historical candidate')
+                                if data is None:
+                                    continue
+                                retained = json.loads(data)
                                 if isinstance(retained, str):
                                     historical_sources[sha(retained.encode())] = ref
                         source = historical_sources.get(candidate['candidate_sha256'])
                     refs = {role: ref for role, ref in evidence.items() if role == 'baseline'}
                     for role, ref in dict(source=source, evaluation=candidate['result']).items():
                         if ref:
-                            data = store.read_artifact(job['job_id'], ref['sha256'])
-                            refs[role] = dict(ref, retained_path=str(store.artifact_path(job['job_id'], ref['sha256'])))
+                            if read_artifact(ref, 'failed candidate ' + role) is not None:
+                                refs[role] = dict(ref, retained_path=str(store.artifact_path(job['job_id'], ref['sha256'])))
                     # Configuration distinguishes repeated source with different launch settings.
                     identity = candidate.get('configuration_sha256', candidate['candidate_sha256'])
                     failed_result = dict(job_id=job['job_id'], verified=False,
