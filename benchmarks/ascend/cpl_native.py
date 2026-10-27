@@ -191,7 +191,7 @@ class CplNativeCandidateBackend:
         _save(path, record)
         return result
 
-    def recover_owned_operations(self, *, seconds=30):
+    def recover_owned_operations(self, *, seconds=30, remaining_seconds=None):
         """Observe this binding's retained handles without submitting device work."""
         deadline = self.clock() + min(seconds, self.timeout)
         for path in Path(getattr(self, 'recovery_root', self.root)).rglob('operation.json'):
@@ -206,7 +206,7 @@ class CplNativeCandidateBackend:
                 continue  # Ambiguous submissions must remain blocked, never resubmitted.
             if not any(handle.startswith(f'remote:{self.target}:{kind}:') for kind in ('job', 'transfer')):
                 raise ProjectInfrastructureError('retained CPL operation has a foreign handle')
-            remaining = deadline - self.clock()
+            remaining = min(deadline-self.clock(), remaining_seconds() if remaining_seconds else float("inf"))
             if remaining <= 0:
                 break
             observed = self._call(('observe', handle), seconds=remaining)

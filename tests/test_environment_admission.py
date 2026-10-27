@@ -9,7 +9,7 @@ from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 
 def setup(tmp_path, monkeypatch, *, device=1, cache=None, clock=None):
     root=tmp_path;root.mkdir(parents=True, exist_ok=True)
-    transport=SimpleNamespace(recover_owned_operations=lambda:None, runtime_identity={'target':'gz-a3-2','runtime':'named','physical_device':device})
+    transport=SimpleNamespace(recover_owned_operations=lambda **kwargs:None, runtime_identity={'target':'gz-a3-2','runtime':'named','physical_device':device})
     health=[];probes=[]
     def fresh(t, r, **kwargs):
         health.append(t.runtime_identity['physical_device'])
@@ -143,7 +143,7 @@ def test_admission_recovers_owned_handle_before_deciding_pending(tmp_path, monke
     admission, health, probes, transport = setup(tmp_path, monkeypatch)
     operation = tmp_path/'operation.json'
     operation.write_text(json.dumps({'state':'running','handle':'remote:t:job:owned'}))
-    def recover():
+    def recover(**kwargs):
         operation.write_text(json.dumps({'state':'completed','handle':'remote:t:job:owned'}))
     transport.recover_owned_operations = recover
     admission(lambda:100)
@@ -159,7 +159,7 @@ def test_shared_scope_keeps_owned_recovery_and_foreign_trial_blocking(tmp_path, 
     other.parent.mkdir(parents=True)
     other.write_text(json.dumps(dict(state='running', handle='remote:t:job:trial')))
     recovered = []
-    def recover():
+    def recover(**kwargs):
         recovered.append('owned')
         own.write_text(json.dumps(dict(state='completed', handle='remote:t:job:owned')))
     transport.recover_owned_operations = recover
@@ -203,3 +203,32 @@ def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, 
     assert len(calls) == 1 and json.loads(journal.read_text())['state'] == state
     from benchmarks.ascend.runtime_allocation import unsettled_operations
     assert bool(unsettled_operations(root)) == (state == 'running')
+
+
+def test_owned_and_trial_recovery_share_remaining_elapsed_allocation(tmp_path, monkeypatch):
+    import subprocess
+    from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
+    now, observations = [0.0], []
+    monkeypatch.setattr(module.time,'monotonic',lambda:now[0])
+    root = tmp_path/'campaign'
+    def client(argv, **kwargs):
+        assert argv[2] == 'observe'
+        observations.append((argv[3],kwargs['timeout']))
+        now[0] += 2 if argv[3].endswith(':owned') else 3
+        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state='completed',handle=argv[3])),'')
+    foreground = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
+        remote_workspace='/owned/foreground',physical_device=0,state_directory=root/'foreground',
+        process_runner=client,clock=lambda:now[0])
+    for directory, workspace, handle in [(foreground.root,'/owned/foreground','owned'),
+                                           (root/'trial/runtime','/owned/trial','trial')]:
+        journal = directory/'operation.json'
+        journal.parent.mkdir(parents=True,exist_ok=True)
+        journal.write_text(json.dumps(dict(state='queued',handle='remote:fixture:job:'+handle,
+            identity=dict(route=foreground.runtime_identity,workspace=workspace,arguments=[]))))
+    admission, health, probes, _ = setup(root/'foreground',monkeypatch)
+    admission.transports = (foreground,)
+    admission.pending_root = root
+    with pytest.raises(TimeoutError,match='allocation exhausted'):
+        admission(lambda:max(0,5-now[0]))
+    assert observations == [('remote:fixture:job:owned',5),('remote:fixture:job:trial',3)]
+    assert now[0] == 5 and not health and not probes

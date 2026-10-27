@@ -154,7 +154,7 @@ def verify_dependencies(actual, pinned):
         raise ProjectInfrastructureError('discovered environment differs from pinned '+', '.join(mismatches))
 
 
-def recover_campaign_operations(root, transports, *, seconds=30):
+def recover_campaign_operations(root, transports, *, seconds=30, remaining=lambda: float("inf")):
     """Reconstruct retained owning bindings for read-only sibling observation."""
     from .cpl_native import CplNativeCandidateBackend
     clients = {transport.target: transport for transport in transports
@@ -169,7 +169,7 @@ def recover_campaign_operations(root, transports, *, seconds=30):
         client = clients.get(route.get('target'))
         if client is None or not record.get('handle'):
             continue
-        left = deadline-time.monotonic()
+        left = min(deadline-time.monotonic(), remaining())
         if left <= 0:
             break
         owner = CplNativeCandidateBackend(cpl_remote=client._cpl, target=route['target'],
@@ -178,7 +178,7 @@ def recover_campaign_operations(root, transports, *, seconds=30):
             process_runner=client._run, timeout=left)
         if owner.runtime_identity != route:
             raise ProjectInfrastructureError('retained owning binding identity changed')
-        owner.recover_owned_operations(seconds=left)
+        owner.recover_owned_operations(seconds=left, remaining_seconds=remaining)
 
 
 class EnvironmentAdmission:
@@ -201,9 +201,17 @@ class EnvironmentAdmission:
         from benchmarks.a3kernels.native_smoke import smoke_plan
         identities, health_paths = [], []
         try:
+            recovery_deadline = time.monotonic() + min(30, remaining())
+            def recovery_remaining():
+                return max(0, min(remaining(), recovery_deadline-time.monotonic()))
             for transport in self.transports:
-                transport.recover_owned_operations()
-            recover_campaign_operations(self.pending_root, self.transports)
+                if recovery_remaining() <= 0:
+                    raise TimeoutError('native recovery elapsed allocation exhausted')
+                transport.recover_owned_operations(seconds=recovery_remaining(), remaining_seconds=recovery_remaining)
+            recover_campaign_operations(self.pending_root, self.transports,
+                seconds=recovery_remaining(), remaining=recovery_remaining)
+            if remaining() <= 0:
+                raise TimeoutError('native recovery elapsed allocation exhausted')
             if unsettled_operations(self.pending_root):
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
             for transport in self.transports:
