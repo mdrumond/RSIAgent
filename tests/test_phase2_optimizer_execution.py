@@ -340,3 +340,43 @@ def test_failed_job_recovery_honors_explicit_stop(tmp_path):
     with pytest.raises(ValueError, match='without a stop request'):
         execution.store.recover(execution.job_id)
     assert execution.store.get(execution.job_id) == before
+
+
+@pytest.mark.parametrize('boundary', ['deadline', 'user-stop', 'client-timeout', 'failed-cancel'])
+def test_real_transport_interruption_after_evaluation_preserves_only_settled_budget_result(tmp_path, boundary):
+    import time
+    from types import SimpleNamespace
+    from optimizer.transport import CheckedTransport
+    execution, _, backend = executor(tmp_path, [candidate('good')])
+    stopped = False
+    calls = []
+    transport = None
+    def run(argv, **kwargs):
+        nonlocal stopped
+        calls.append(argv)
+        if 'cancel' in argv:
+            return SimpleNamespace(returncode=1 if boundary == 'failed-cancel' else 0, stdout='', stderr='')
+        if boundary == 'user-stop':
+            execution.store.stop(execution.job_id)
+            stopped = True
+        elif boundary != 'client-timeout':
+            transport.deadline = backend.deadline = time.monotonic() - 1
+            stopped = True
+        return SimpleNamespace(returncode=-15, interrupted=True, stderr='', stdout=(
+            'BZ_A3_REMOTE_HANDLE=remote:bz-a3-1:job:profile-test\n'
+            'CATLASS_VALIDATION_HANDLE=bz-a3-1:profile-test\n'))
+    transport = CheckedTransport({'validation_wrapper': '/profiles/validate', 'profile': 'bz-a3-1',
+        'runtime': 'py311-torch', 'physical_device': 0, 'cpl_remote': '/cpl-remote'},
+        run=run, stopped=lambda: stopped)
+    backend.profile = lambda source, directory, **kwargs: transport.execute(directory, ['true'])
+    if boundary == 'deadline':
+        result = execution.attempt('target-001')
+        assert result['verified']
+        assert execution.attempt('target-001') == result
+        assert 'pending' not in execution._state()
+    else:
+        with pytest.raises(WorkerStopped if boundary == 'user-stop' else ObservationUnavailable):
+            execution.attempt('target-001')
+        assert 'evaluation' in execution._state()['pending']
+        assert execution._event('phase2-attempt-result') is None
+    assert len(backend.evaluations) == 1

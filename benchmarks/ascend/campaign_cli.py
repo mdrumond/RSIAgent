@@ -473,6 +473,10 @@ def adopt_campaign(root, control, objective, initial_memory, config, legacy_revi
         "measurement_actions": {"profiling": True, "timing": True},
         "kdb_collection": native.get("collection") if knowledge == "with-kdb" else None,
     }
+    if native.get("curriculum_kdb", False):
+        if knowledge != "with-kdb":
+            raise ValueError("KDB-off treatment cannot enable curriculum KDB")
+        expected_identity["curriculum_kdb"] = {"enabled": True, "manifests": {}}
     if knowledge == "with-kdb":
         import sqlite3
         from benchmarks.a5kernels.knowledge import CollectionManifest, collection_names
@@ -483,6 +487,9 @@ def adopt_campaign(root, control, objective, initial_memory, config, legacy_revi
                 for name in collection_names(native["collection"])]
         finally:
             connection.close()
+        if native.get("curriculum_kdb", False):
+            expected_identity["curriculum_kdb"]["manifests"] = {
+                manifest.collection: manifest.fingerprint for manifest in manifests}
         expected_identity["kdb_manifest"] = (manifests[0].fingerprint
             if isinstance(native["collection"], str)
             else {manifest.collection: manifest.fingerprint for manifest in manifests})
@@ -942,6 +949,8 @@ def main(argv=None, *, screen=start_screen):
                                         env_file=args.env_file)))
         return
     if args.command == "start":
+        if args.phase == 2:
+            parser.error('new Ascend Phase 2 launches are retired; use run_ascend_subjects.py')
         from benchmarks.a5kernels.sft_dataset import SourceManifest
         if args.project_target < 1:
             parser.error("--project-target must be positive")
@@ -1061,6 +1070,9 @@ def main(argv=None, *, screen=start_screen):
         _write(control / "job.json", job)
     else:
         job = _read(control / "job.json")
+    if job.get('phase') in (2, '2') and args.command in {
+            'resume', 'continue', 'sample', 'approve', 'reject', 'run-approved', '_campaign'}:
+        parser.error('Ascend Phase 2 execution is retired; use run_ascend_subjects.py; historical status, collection and packaging remain available')
     if args.command in {"start", "resume", "continue"}:
         with (control / "campaign.lock").open("a") as lock:
             try:

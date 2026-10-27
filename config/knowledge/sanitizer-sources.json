@@ -1,0 +1,52 @@
+{
+  "sources": [
+    {
+      "name": "mssanitizer-en",
+      "repository": "https://github.com/Ascend/mssanitizer.git",
+      "revision": "78037658773f27796624148ce7680ccb9e24ae66",
+      "document_language": "en",
+      "kernel_languages": [
+        "ascend-c",
+        "triton"
+      ],
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "b638cc8ca486ec24e2539a18ba7f8518934b09dc14a0e29f8e9a2caffb772720"
+        },
+        {
+          "path": "docs/en/best_practices/mssanitizer_basic_cases.md",
+          "sha256": "6dd894d25b120951c154c9b17fcc09bb5debcc08f420b9952a779c719705d3bb"
+        },
+        {
+          "path": "docs/en/install_guide/mssanitizer_install_guide.md",
+          "sha256": "cdaee07dee19ee23abaddd5e3927475002a3f44db0d5ea288c7705e32a3ffcb5"
+        },
+        {
+          "path": "docs/en/legal/license_notice.md",
+          "sha256": "2c8e99c1b240e42d3574ac741641f4115de7294107a43700819871dc4658e1b8"
+        },
+        {
+          "path": "docs/en/quick_start/mssanitizer_quick_start.md",
+          "sha256": "1c013c10dd443bb510d82d31aa1128b6076eec89f8ca2ac367dda29fb087a0c8"
+        },
+        {
+          "path": "docs/en/release_notes/release_notes.md",
+          "sha256": "68584368c5a1d6c5c2d5446b1d27a6b395fe68878c705344ead2e06753f588d1"
+        },
+        {
+          "path": "docs/en/support/mssanitizer_faq.md",
+          "sha256": "439a55508bbc0a9002824c70be3f0aca9c682c6963725de8bcbf31ba22acd168"
+        },
+        {
+          "path": "docs/en/user_guide/compile_option_config.md",
+          "sha256": "fcd38776571b9db723ae5ad0ca34e967858a0ead13257efb5aaee9d4ee351eae"
+        },
+        {
+          "path": "docs/en/user_guide/mssanitizer_user_guide.md",
+          "sha256": "e864f3c56885d4ddc8f9bbe33b075feea4c0383df0274031e261e06a7de87903"
+        }
+      ]
+    }
+  ]
+}

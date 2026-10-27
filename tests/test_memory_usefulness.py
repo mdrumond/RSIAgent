@@ -162,8 +162,12 @@ def test_factory_caps_every_provider_call_by_local_pair_and_parent(tmp_path, ins
     class Provider:
         def complete(self, profile, messages, *, max_seconds):
             calls.append(max_seconds)
-            if 'memory usefulness verifier' in messages[0]['content']:
-                stage = json.loads(messages[-1]['content'])['stage']
+            try:
+                payload = json.loads(messages[-1]['content'])
+            except ValueError:
+                payload = {}
+            if 'stage' in payload:
+                stage = payload['stage']
                 now[0] += inspection_seconds if stage == 'inspect' else 0
                 return SimpleNamespace(text=stage)
             now[0] += 2
@@ -212,10 +216,18 @@ def test_semantic_failure_arms_retain_linkable_evidence(tmp_path):
 def test_shared_actor_contract_withholds_teaching_fields_without_changing_host_task(tmp_path):
     from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
     from benchmarks.ascend.memory_usefulness import actor_project
-    authored = _project('reuse-private-lesson', 'gm-ub-movement')
-    authored['hypothesis'] = 'Expected lesson: private optimization guidance'
-    authored['graph']['inputs'][0]['name'] = 'privatelesson'
-    authored['graph']['nodes'][0]['operands'][0] = 'privatelesson'
+    marker = 'privlesson'
+    authored = _project(marker + '-project', 'gm-ub-movement')
+    authored['hypothesis'] = 'Expected lesson: ' + marker
+    names = {}
+    for index, row in enumerate(authored['graph']['inputs']):
+        names[row['name']] = marker + 'i' + str(index)
+        row['name'] = names[row['name']]
+    for index, row in enumerate(authored['graph']['nodes']):
+        names[row['name']] = marker + 'n' + str(index)
+        row['name'] = names[row['name']]
+        row['operands'] = [names[name] for name in row['operands']]
+    authored['graph']['output'] = names[authored['graph']['output']]
     spec = ProjectSpec.from_mapping(authored)
     hidden = actor_project(spec)
     original_inputs = materialize_inputs(spec)
@@ -226,11 +238,14 @@ def test_shared_actor_contract_withholds_teaching_fields_without_changing_host_t
         return _result(request.spec, True, 'host pass')
     verifier = UsefulnessVerifier(tmp_path, CurriculumAgent(lambda messages: _wave(messages[-1]['content'], [authored])),
         execute, lambda stage, evidence: stage, enabled=True)
-    lesson = {'claim': 'private optimization guidance'}
+    lesson = {'claim': marker}
     result = verifier.assess_lesson(lesson,
         b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'source')
     assert result['outcome'] == 'both-succeeded'
     assert requests[0].spec == requests[1].spec == hidden
+    assert all(marker not in json.dumps(request.spec.as_dict()) for request in requests)
+    frozen = json.loads((tmp_path / result['experiment_id'] / '0001.json').read_bytes())
+    assert frozen['curriculum_project'] == authored and frozen['project'] == hidden.as_dict()
     assert requests[0].inputs == requests[1].inputs and requests[0].oracle == requests[1].oracle
     assert requests[0].oracle.storage == evaluate_reference(spec, requests[0].inputs).storage
     control = json.loads(requests[0].pre_wave_memory)
@@ -291,3 +306,7 @@ def test_completed_host_pair_survives_optional_interpretation_failure(tmp_path, 
     for arm in ('control', 'treatment'):
         data = (tmp_path/result['experiment_id']/arm/'evidence.json').read_bytes()
         assert hashlib.sha256(data).hexdigest() == result['arms'][arm]['evidence_sha256']
+    assert verifier.assess_lesson({'claim': 'new'},
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'host-pair') == result
+    assert len(requests) == 2
+    assert stages == (['inspect'] if interpretation_failure == 'deadline' else ['inspect', 'interpret'])

@@ -143,3 +143,52 @@ def test_parallel_native_composition_preserves_each_workers_runtime_on_resume(tm
         actors = tuple(controller.execute_project.actors.queue)
         assert [actor.executor.runtime_identity for actor in actors] == [
             native_target_runtime(config, worker.transport) for worker in workers]
+
+
+@pytest.mark.parametrize('lock_wait', [1, 6])
+def test_native_curriculum_bounds_shared_lock_and_forwards_remaining(tmp_path, monkeypatch, lock_wait):
+    import benchmarks.ascend.production as production
+    import benchmarks.a5kernels.phase1_adaptive_production as adaptive
+    from benchmarks.a5kernels.knowledge import KnowledgeDB
+    from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import direct_profile
+    from test_expanded_kdb import Embeddings
+    clock, acquired, released, queries = SimpleNamespace(value=1000), [], [], []
+    class WaitingLock:
+        def acquire(self, *, timeout):
+            acquired.append(timeout)
+            clock.value += lock_wait
+            return True
+        def release(self):
+            released.append(True)
+    monkeypatch.setattr(production, 'Lock', WaitingLock)
+    def query(action, *, check_remaining):
+        queries.append((action.query, check_remaining()))
+        return ()
+    monkeypatch.setattr(adaptive, 'curriculum_knowledge', lambda *args: (query, {'enabled': True, 'manifests': {}}))
+    guide, embeddings = b'Native guide', Embeddings()
+    source = tmp_path/'guide.cpp'
+    source.write_text('vector copy kernel')
+    database_path = tmp_path/'native.sqlite3'
+    with KnowledgeDB(database_path, embeddings) as database:
+        database.index(tmp_path, [source], collection='native', language='en', kernel_languages=('ascend-c',))
+    config = NativeProductionConfig(tmp_path/'campaign', 'Ascend910B4', 'dav-c220', 'bz-a3-1',
+        hashlib.sha256(guide).hexdigest(), 'a'*40, kdb=database_path, collection='native', curriculum_kdb=True)
+    controller = build_native_adaptive_phase1(config=config, native_transport=NativeTransport(),
+        profile=direct_profile(MODEL_IDENTITIES[0]), guide_bytes=guide, objective='Learn native kernels',
+        initial_memory=b'', environment={'OPENAI_API_KEY': 'test', 'DEEPSEEK_API_KEY': 'test'}, embeddings=embeddings)
+    def remaining():
+        seconds = 1005-clock.value
+        if seconds <= 0:
+            raise TimeoutError('selection expired while awaiting model lock')
+        return seconds
+    if lock_wait < 5:
+        assert controller.curriculum.query_knowledge(KnowledgeQuery('copy'), check_remaining=remaining) == ()
+        assert queries == [('copy', 4)]
+    else:
+        with pytest.raises(TimeoutError):
+            controller.curriculum.query_knowledge(KnowledgeQuery('copy'), check_remaining=remaining)
+        assert queries == []
+    assert acquired == [5]
+    assert released == [True]
