@@ -308,6 +308,8 @@ def test_restart_status_uses_authoritative_accessor_without_dispatch(setup):
 
 
 def test_target_preview_checks_observed_runtime_before_accepting_qualification(setup, monkeypatch):
+    from pathlib import Path
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / 'tests'))
     from test_ascend_phase2_targets import qualified, RUNTIME
     from benchmarks.ascend.targets import a3_curriculum_policy
     from copy import deepcopy
@@ -373,5 +375,40 @@ def test_configured_a3_optimizer_can_be_previewed_without_execution(setup):
         assert len(calls) == 1 and result['result']['after'] == queued
         assert setup[2].state().get('project_queue', []) == []
         assert not list(setup[1].glob('**/jobs'))
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_old_restart_recovery_remains_visible_after_twenty_other_previews(setup):
+    import os
+    from dashboard.subject_services import subject_editor
+    config, root, _ = setup
+    app, _ = application(setup, [dict(item=item('retry'), instruction='Inspect padding.')])
+    client = app.test_client()
+    try:
+        proposal = settled(app, submit(client, 'curriculum-preview', dict(campaign_id='research',
+            kind='restart', project_id='original', instructions='Fix prompt', format_seconds=10), 'old'))['result']
+        subject_editor(root).approve(proposal['id'])
+        directory = root / 'curriculum-edits'
+        os.utime(directory / (proposal['id'] + '.json'), (100, 100))
+        for index in range(20):
+            other = dict(proposal, id=f'{index:032x}', project='another', status='proposed')
+            path = directory / (other['id'] + '.json')
+            path.write_bytes(canonical(other))
+            os.utime(path, (101 + index, 101 + index))
+        proposals = client.get('/api/curriculum/research/proposals').get_json()['proposals']
+        assert proposal['id'] in [row['id'] for row in proposals]
+        from html.parser import HTMLParser
+        class Actions(HTMLParser):
+            def __init__(self):
+                super().__init__()
+                self.ids = []
+            def handle_starttag(self, tag, attrs):
+                values = dict(attrs)
+                if tag == 'button' and 'data-curriculum-approve' in values:
+                    self.ids.append(values['data-curriculum-approve'])
+        actions = Actions()
+        actions.feed(client.get('/campaign/research/project/original').get_data(as_text=True))
+        assert actions.ids == [proposal['id']]
     finally:
         app.extensions['dashboard_controls'].close()
