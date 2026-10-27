@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 from pathlib import Path
 import sys
 import time
@@ -177,7 +178,7 @@ def main(
         value = composition.report()
     else:
         value = composition.report()
-    print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    print(json.dumps(describe_statuses(value), sort_keys=True, separators=(",", ":")))
     return 0
 
 

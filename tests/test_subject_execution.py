@@ -218,3 +218,27 @@ def test_optimizer_reconstruction_uses_new_attempt_memory_without_recreating_job
     changed_task = {**task, 'rationale': 'different frozen task'}
     with pytest.raises(ValueError, match='frozen task'):
         reconstructed.optimizer(**{**options, 'task': changed_task}, memory_snapshot=current, attempt_id='third')
+
+
+def test_completed_graph_recovers_original_allocation_without_rewriting_checkpoint(tmp_path):
+    execution, actor = graph_actor(tmp_path, [
+        '{"write":{"slot":"kernel","content":"fixed source"}}', '{"run":{}}', '{"submit":{}}'])
+    execution.executor.runtime_identity = dict(RUNTIME, device='0')
+    adapter = SubjectExecutor(execution)
+    request = _request(tmp_path, execution.executor)
+    original = adapter.graph(request)
+    checkpoint = request.branch_root/'subject-execution.json'
+    before = checkpoint.read_bytes()
+    calls = len(actor.observations)
+    execution.executor.runtime_identity = dict(RUNTIME, device='2')
+    assert adapter.graph(request, allow_device_migration=True).as_dict() == original.as_dict()
+    assert checkpoint.read_bytes() == before and len(actor.observations) == calls
+    with pytest.raises(ValueError, match='request changed'):
+        adapter.graph(replace(request, pre_wave_memory=b'changed'), allow_device_migration=True)
+    execution.executor.runtime_identity = dict(RUNTIME, device='2', compiler='different')
+    with pytest.raises(ValueError, match='request changed'):
+        adapter.graph(request, allow_device_migration=True)
+    execution.executor.runtime_identity = dict(RUNTIME, device='2')
+    fresh = replace(request, branch_root=tmp_path/'fresh')
+    adapter.graph(fresh, allow_device_migration=True)
+    assert json.loads((fresh.branch_root/'subject-execution.json').read_bytes())['identity']['runtime']['device'] == '2'

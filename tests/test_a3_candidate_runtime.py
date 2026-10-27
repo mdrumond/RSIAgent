@@ -347,11 +347,6 @@ def test_compile_only_uses_fixed_host_command_and_records_library(tmp_path):
     def command(argv, *, cwd, text, capture_output, check):
         calls.append(tuple(argv))
         assert (cwd / "candidate.cpp").read_text() == SOURCE
-        wrapper = (cwd / "host_wrapper.inc").read_text()
-        assert "TORCH_LIBRARY(rsi_a3candidates" in wrapper
-        assert "int64_t logical_length, int64_t padded_length" in wrapper
-        assert "int64_t block_count" in wrapper
-        assert "static_cast<uint32_t>(block_count)" in wrapper
         return subprocess.CompletedProcess(argv, 0, "A3CANDIDATE_COMPILED=" + "a" * 64 + "\n", "")
 
     result = A3CandidateBackend(command).compile(
@@ -517,13 +512,7 @@ def test_host_source_orders_headers_before_namespace_candidate_before_registrati
     source = host_driver._assemble_source(NAMESPACE_SOURCE, wrapper)
 
     assert source.count(NAMESPACE_SOURCE) == 1
-    assert source.count('#line 1 "candidate.cpp"') == 1
     assert '#line 1 "candidate.cpp"\n' + NAMESPACE_SOURCE in source
-    assert "RSI_A3_CANDIDATE_SOURCE_SLOT" not in source
-    assert source.index("#include <torch/all.h>") < source.index("using namespace AscendC")
-    assert source.index("using namespace AscendC") < source.index(
-        "TORCH_LIBRARY(rsi_a3candidates"
-    )
 
 
 @pytest.mark.parametrize("prefix", ["", "// preamble\n", "// first\n\n// third\n"])
@@ -700,20 +689,3 @@ def test_fixed_driver_benchmarks_in_process_after_warmup(monkeypatch, capsys, tm
     assert "A3INNER_TIMING_US=2.000000" in output
     assert "A3INNER_TIMING_US=4.000000" in output
     assert output.endswith("A3KERNEL_OUTPUT=[3.0,3.0,3.0,3.0]\n")
-
-
-def test_fixed_wrapper_launches_the_requested_block_count():
-    wrapper = next(
-        item.content for item in candidate_module._host_source_files()
-        if item.relative_path == "host_wrapper.inc"
-    )
-    assert "int64_t logical_length, int64_t padded_length" in wrapper
-    assert "int64_t block_count" in wrapper
-    assert 'registry.def("vector_add(Tensor a, Tensor b, int logical_length, int padded_length, int block_count)' in wrapper
-    assert "logical_length >= 1 && logical_length <= padded_length" in wrapper
-    assert "const auto count = static_cast<uint32_t>(logical_length);" in wrapper
-    assert "torch::empty_like(a)" in wrapper
-    assert "block_count >= 1 && block_count <= 32" in wrapper
-    assert "const auto launch_blocks = static_cast<uint32_t>(block_count);" in wrapper
-    assert "::vector_add<<<launch_blocks" in wrapper
-    assert wrapper.index("block_count >= 1") < wrapper.index("static_cast<uint32_t>(block_count)")

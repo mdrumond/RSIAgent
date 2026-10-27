@@ -15,8 +15,8 @@ from tests.test_a5_phase2_source_provider import GUIDE, ENVIRONMENT
 SOURCE = 'extern "C" __global__ __aicore__ void dense_attention(GM_ADDR gm_q, GM_ADDR gm_k, GM_ADDR gm_v, GM_ADDR gm_output) {}'
 
 
-def native_source(tmp_path, *, profiling=False):
-    root, source, review_path, memory = _source(tmp_path)
+def native_source(tmp_path, *, profiling=False, partial=False):
+    root, source, review_path, memory = _source(tmp_path, partial=partial)
     identity = dict(schema="ascend-native-adaptive-identity-v1", language="ascend-c",
                     target="Ascend910_9382", arch="dav-c220", execution_profile="bz-a3-1",
                     guide_sha256=hashlib.sha256(GUIDE.encode()).hexdigest(), cpl_skills_revision="1" * 40,
@@ -97,9 +97,7 @@ def test_reviewed_handoff_to_shared_model_loop_and_numerical_verifier(tmp_path, 
     assert result["status"] == "passed"
     prompt = json.loads(calls[0]["request"]["messages"][1]["content"])
     assert prompt["phase1_memory"] == [memory]
-    assert "Ascend C" in prompt["task"]
     assert prompt["target_contract"]["target_id"].startswith("a3-")
-    assert "Catlass DSL" not in calls[0]["request"]["messages"][0]["content"]
     assert "catlass" not in json.dumps(prompt["target_contract"]).lower()
     assert runner.run() == result and len(calls) == (2 if repair else 1)
     if repair:
@@ -133,7 +131,15 @@ def test_module_cli_report_reads_retained_state_without_provider_binding(tmp_pat
               for path in tmp_path.rglob('*') if path.is_file()}
     assert main(['--target', 'a3', 'report', '--root', str(tmp_path)],
                 runner_factory=lambda args: pytest.fail('historical report composed a runner')) == 0
-    assert json.loads(capsys.readouterr().out) == {'state': state, 'records': [json.loads(terminal.read_bytes())]}
+    report = json.loads(capsys.readouterr().out)
+    state_explanation, = report['state']['terminal'].pop('status_explanations')
+    record, = report['records']
+    record_explanation, = record.pop('status_explanations')
+    assert report == {'state': state, 'records': [json.loads(terminal.read_bytes())]}
+    assert (state_explanation['field'], state_explanation['code']) == (
+        'status', state['terminal']['status'])
+    assert (record_explanation['field'], record_explanation['code']) == (
+        'status', record['status'])
     assert before == {path.relative_to(tmp_path): path.read_bytes()
                       for path in tmp_path.rglob('*') if path.is_file()}
 

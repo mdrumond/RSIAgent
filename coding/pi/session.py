@@ -20,13 +20,22 @@ from .schema import STRING, INTEGER, obj, validate
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_IDENTITY = {"coding_engine": "pi", "pi_version": "1.3.0",
-                   "adapter_version": 3, "context_policy": "host-turn-history-v2",
+                   "adapter_version": 4, "context_policy": "bounded-host-turn-history-v3",
                    "budget_policy": "elapsed-time-v1"}
 SYSTEM = (
     "You are the coding engine inside a host-controlled kernel attempt. "
     "Use the declared typed tools; never print a JSON action envelope. "
     "Select exactly one host action. A queued receipt is NOT execution or success. "
     "Only the next authoritative host observation establishes compilation, correctness or timing. "
+    "When submit is offered, a successful run alone does not finish the attempt. "
+    "Once the current source is host-verified and all evidence required by the task is retained, "
+    "call the submit tool as your next action. Do not add optional timing, profiling, source edits, "
+    "or repeated compile/run calls after the task is satisfied. If submit reports missing evidence, "
+    "obtain that evidence and submit again. A pass for an older source does not verify current edits. "
+    "For a failure-repair task, first retain a host observation of the specified original failure, "
+    "then repair, verify the current source, and submit. Skip reproduction when that failure is "
+    "already retained. A missing-original-failure rejection requires that missing reproduction "
+    "and a verified repair, not repeated passing runs or repeated submit calls. "
     "Follow the task ABI, allowed actions, frozen case suite and remaining limits. "
     "Read admitted context records with read_context when their previews are insufficient. "
     "Use edit_source for small corrections with the exact current source hash. "
@@ -211,7 +220,8 @@ class PiCodingSession:
                "PI_CODING_AGENT_DIR": str(directory), "PI_OFFLINE": "1",
                "RSI_PI_GATEWAY_TOKEN": self.gateway.token, "RSI_PI_TOOL_TOKEN": self.token,
                "RSI_PI_TOOL_URL": f"http://127.0.0.1:{server.server_port}",
-               "RSI_PI_SCHEMAS": str(directory / "schemas.json")}
+               "RSI_PI_SCHEMAS": str(directory / "schemas.json"),
+               "RSI_PI_REQUEST_BYTES": str(self.gateway.hard_bytes)}
         argv = [str(self.executable), "--mode", "rpc", "--no-session",
                 "--provider", "rsi-host", "--model", spec["model"],
                 "--thinking", "off" if self.gateway.provider == "deepseek" else "high",

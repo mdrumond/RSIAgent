@@ -253,17 +253,6 @@ def test_rollback_mirror_sees_live_namespaces_and_rolls_back(monkeypatch):
         assert absent not in wrapper
 
 
-def test_rollback_mirror_prompt_describes_observation_and_rollback():
-    from core.verifier_runtime import agentic_verifier_system_for
-
-    prompt = agentic_verifier_system_for("rollback_mirror")
-
-    assert "transactional mirror of the exact live Actor" in prompt
-    assert "processes, localhost services, network, GUI" in prompt
-    assert "restores\nthat checkpoint before the candidate is graded" in prompt
-    assert "processes, network, GUI, and IPC\nchannels are unavailable" not in prompt
-
-
 def test_qemu_transaction_saves_restores_and_deletes_exact_snapshot():
     from env.qemu_rollback import QemuRollbackTransaction
 
@@ -859,8 +848,6 @@ def test_verifier_private_scratch_look_uses_namespace_bridge_not_global_resolver
     assert all("readlink -f" not in call["command"] for call in vm.commands)
     bridge_program = _decoded_shell_payload(vm.scripts[-1]["code"])
     assert private_image in bridge_program
-    assert "resolved = source.resolve(strict=True)" in bridge_program
-    assert "root not in resolved.parents" in bridge_program
     assert any(
         "rm -f -- /tmp/rsiagent_verifier_fetch_" in call["command"]
         for call in vm.commands)

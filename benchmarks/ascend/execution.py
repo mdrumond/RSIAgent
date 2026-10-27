@@ -43,7 +43,10 @@ def apply_worker_config(config, worker_config_path=None):
         settings.update(worker)
         if 'target' in config and 'target' in worker:
             settings['target'] = config['target']
-            settings['transport_target'] = worker['target']
+            # Registry worker files use target as a route alias; complete native
+            # files retain the product here and carry an explicit transport route.
+            if 'transport_target' not in worker and worker['target'] != config['target']:
+                settings['transport_target'] = worker['target']
         if execution_mode(worker) == 'remote' and 'profile' in worker and 'execution_profile' not in worker:
             settings['execution_profile'] = worker['profile']
     if execution_mode(settings) == 'local':

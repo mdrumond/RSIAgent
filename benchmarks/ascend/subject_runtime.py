@@ -51,7 +51,7 @@ class _SelectionResults(tuple):
         return value
 
 
-def referenced_settings(settings):
+def referenced_settings(settings, *, contents=False):
     """Freeze ignored runtime JSON bytes without persisting their contents."""
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument('--config'); parser.add_argument('--worker-config')
@@ -59,8 +59,8 @@ def referenced_settings(settings):
     paths = dict(config=options.config, worker=options.worker_config)
     if isinstance(settings.get('optimizer_worker_config'), str):
         paths['optimizer_worker'] = settings['optimizer_worker_config']
-    return {role: hashlib.sha256(Path(path).read_bytes()).hexdigest()
-            for role, path in paths.items() if path is not None}
+    raw = {role: Path(path).read_bytes() for role, path in paths.items() if path is not None}
+    return raw if contents else {role: hashlib.sha256(value).hexdigest() for role, value in raw.items()}
 
 
 def bounded_completion(provider, profile, messages, remaining_seconds):
@@ -95,7 +95,7 @@ def bounded_completion(provider, profile, messages, remaining_seconds):
         raise
 
 
-def compose_production(settings, *, target, root, initial_memory, max_seconds):
+def compose_production(settings, *, target, root, initial_memory, max_seconds, native_options=None):
     """Capture existing CLI composition without invoking its learning loop."""
     from .phase1_cli import main as native_main
     from .production import build_native_adaptive_phase1
@@ -127,26 +127,25 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds):
             '--objective', 'Subject curriculum production binding', '--initial-memory', str(seed),
             '--max-seconds', str(max_seconds), *arguments]
     with redirect_stdout(io.StringIO()):
-        native_main(argv, native_parallel=False,
+        native_main(argv, native_parallel=False, **(native_options or {}),
             native_builder=lambda **options: capture(build_native_adaptive_phase1, options),
             a5_main=lambda args: a5_main(args, builder=lambda **options: capture(build_adaptive_phase1, options)))
     return captured[0]
 
 
 def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
-                           max_seconds=7200, compose=compose_production):
+                           max_seconds=7200, compose=compose_production, previous_runtime_configs=None):
     subjects = tuple(subjects)
     if target == 'a5' and any((getattr(subject, 'task', None) or {}).get('kind') == 'optimizer'
                               for subject in subjects):
         raise ValueError('A5 Catlass optimizer subjects are unsupported; use qualified graph/performance targets')
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    identity = dict(target=target, max_seconds=max_seconds, settings_sha256=hashlib.sha256(canonical(settings)).hexdigest(),
-                    referenced_json_sha256=referenced_settings(settings))
-    identity_path = root / 'subject-runtime.json'
-    if identity_path.exists() and json.loads(identity_path.read_bytes()) != identity:
-        raise ValueError('subject runtime settings or target changed on resume')
-    atomic(identity_path, canonical(identity))
+    from .runtime_allocation import admit_identity
+    identity = admit_identity(root, dict(target=target, max_seconds=max_seconds,
+        settings_sha256=hashlib.sha256(canonical({key: value for key, value in settings.items()
+            if key != 'native_operation_root'})).hexdigest()),
+        referenced_settings(settings, contents=True), previous=previous_runtime_configs)
     bound = compose(settings, target=target, root=root, initial_memory=initial_memory,
                     max_seconds=max_seconds)
     actor, provider, profile = bound['actor'], bound['provider'], bound['profile']
@@ -243,8 +242,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
                             artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
             frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
+            manual = Path(directory) / 'manual-execution.json'
+            attempt_id = json.loads(manual.read_bytes())['attempt_id'] if manual.exists() else item['project_id']
             return executor.optimizer(directory, item['task']['task'], frozen,
-                attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
+                attempt_id=attempt_id, remaining_seconds=remaining_seconds, artifacts=store)
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
@@ -266,7 +267,24 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 store.put_bytes(qualification.read_bytes(digest))
         else:
             target_contract = None
-        return executor.graph(request, target=target_contract, artifacts=store, policy=policy)
+        recovery = item.get('recovery')
+        if recovery is None:
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True)
+        if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
+                or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
+            raise ValueError('recovery requires a reason and retained artifact references')
+        for digest in set(recovery['artifacts'].values()):
+            branch_artifacts.put_bytes(store.read_bytes(digest))
+        registry = branch_artifacts.put_bytes(canonical(recovery))
+        from .project_verifier import artifact_preview
+        preview = dict(reason=recovery['reason'][:1024], artifacts=artifact_preview(recovery['artifacts']),
+                       registry_sha256=registry, artifact_count=len(recovery['artifacts']))
+        previous = actor.immutable_context
+        actor.immutable_context = previous + b'\nOriginal failure context (not learned memory; read full registry by SHA): ' + canonical(preview)
+        try:
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True)
+        finally:
+            actor.immutable_context = previous
 
     def select_wave(context, snapshot, history, *, remaining_seconds, project_limit=64):
         deadline = time.monotonic() + remaining_seconds
@@ -383,6 +401,35 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
         max_seconds=max_seconds, index_memory=knowledge.index)
+    def review_retained(item, request, **options):
+        if item.get('project_id') != request.project_id or 'spec' not in item:
+            raise ValueError('retained review requires its original graph project')
+        policy.admit(ProjectSpec.from_mapping(item['spec']))
+        previous = plans.get(request.project_id)
+        if previous is not None and {k: v for k, v in previous.items() if k != '_ordinal'} != item:
+            raise ValueError('retained project plan changed')
+        plans[request.project_id] = dict(item, _ordinal=(previous or {}).get('_ordinal',
+            max((row.get('_ordinal', 0) for row in plans.values()), default=0) + 1))
+        atomic(plans_path, canonical(plans))
+        return verifier.review(request, **options)
+
+    campaign.review_retained = review_retained
+    if 'check_environment' in bound:
+        campaign.check_environment = bound['check_environment']
+    from .subject_editing import SubjectEdits, validate_project
+    def admit_edit(item):
+        observed_runtime = getattr(actor.executor, 'runtime_identity', None)
+        if item.get('task', {}).get('kind') == 'target' and observed_runtime is None:
+            raise ValueError('target approval requires an observed composed runtime')
+        validate_project(item, runtime=observed_runtime, policy=policy)
+        if item.get('task', {}).get('kind') == 'optimizer':
+            if target == 'a5' or optimizer_factory is None:
+                raise ValueError('optimizer projects are unavailable for this campaign runtime')
+        else:
+            policy.admit(ProjectSpec.from_mapping(item['spec']))
+        return item
+    campaign.curriculum_edits = SubjectEdits(root, campaign.scheduler, curriculum_complete,
+                                             validate_item=admit_edit, target_policy=policy)
     campaign.role_complete = role_complete
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
@@ -423,7 +470,9 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if seconds <= 0:
                 raise TimeoutError('trial arm elapsed allocation exhausted before execution')
             return seconds
-        if referenced_settings(settings) != identity['referenced_json_sha256']:
+        from .runtime_allocation import configuration
+        current_semantics = {role: configuration(raw)[0] for role, raw in referenced_settings(settings, contents=True).items()}
+        if current_semantics != identity['referenced_semantic_sha256']:
             raise ValueError('referenced runtime settings changed before trial composition')
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
@@ -455,6 +504,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             elif not argument.startswith('--worker-config='):
                 filtered.append(argument)
         arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
+        if bound.get('environment_check_cache'):
+            arm_settings['environment_check_cache'] = bound['environment_check_cache']
+        if bound.get('native_operation_root'):
+            arm_settings['native_operation_root'] = bound['native_operation_root']
         if optimizer_config is not None:
             arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
             for key in ('cache_directory', 'compile_cache_directory'):

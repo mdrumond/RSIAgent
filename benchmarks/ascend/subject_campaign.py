@@ -14,6 +14,19 @@ from .subject_memory import SubjectMemory, StaleMemory
 from .time_budget import AttemptTimeBudget
 
 
+def _effective_project(projects, project_id):
+    """Resolve a canceled wave entry to its current replacement evidence."""
+    seen = set()
+    while True:
+        if project_id in seen:
+            raise ValueError('cyclic project supersession')
+        seen.add(project_id)
+        record = projects.get(project_id, {})
+        if not record.get('superseded_by'):
+            return project_id, record
+        project_id = record['superseded_by']
+
+
 class SubjectCampaign:
     def __init__(self, root, subjects, initial_memory, *, select_wave, execute, verifier,
                  complete, max_seconds=7200, memory_gate=None, index_memory=None,
@@ -83,12 +96,18 @@ class SubjectCampaign:
             return
         remaining = max(0, self.budget.deadline-self.clock())
         for result in self.memory_gate.poll(remaining_seconds=remaining):
-            self.scheduler.resolve_review(result['review_id'], result['outcome'])
+            if result.get('manual_override'):
+                self.scheduler.override_review(result['review_id'], result['manual_override'])
+            else:
+                self.scheduler.resolve_review(result['review_id'], result['outcome'])
             rows=self.state.setdefault('memory_reviews',{})
-            if result['review_id'] not in rows:
+            if result['review_id'] not in rows or result.get('manual_override') and not rows[result['review_id']].get('manual_override'):
+                prior = rows.get(result['review_id'])
                 rows[result['review_id']] = dict(outcome=result['outcome'], judgment=result.get('judgment'),
                     rewrites=result.get('rewrites'), subject_id=result['provenance'].get('subject_id'),
                     sequence=max((row.get('sequence',0) for row in rows.values()),default=0)+1)
+                if result.get('manual_override'):
+                    rows[result['review_id']].update(manual_override=result['manual_override'], original_review=prior)
                 if result['outcome']=='rejected':
                     self.state['needs_decision']=True
                 if result.get('repair'):
@@ -99,7 +118,7 @@ class SubjectCampaign:
                     self.state['needs_decision'] = True
                 self._save()
             if hasattr(self.memory_gate, 'acknowledge'):
-                self.memory_gate.acknowledge(result['review_id'])
+                self.memory_gate.acknowledge(result.get('delivery_id', result['review_id']))
 
     def _review(self, project_id, record):
         if record.get('review') is not None:
@@ -108,6 +127,12 @@ class SubjectCampaign:
         obligations = self.scheduler.state()['repairs']
         linked = {key: self.state['projects'].get(obligations.get(key, {}).get('project_id',key))
                   for key in record.get('repairs', [])}
+        for key, original in linked.items():
+            if original is not None and original.get('prior_project_sha256'):
+                prior = self.artifacts.read_json(original['prior_project_sha256'])
+                if (original is record or not original.get('review')
+                        or prior.get('review_sha256') in obligations[key]['evidence']):
+                    linked[key] = prior
         artifacts = dict(outcome['artifacts'])
         plan = record.get('plan')
         if plan is None:
@@ -127,8 +152,9 @@ class SubjectCampaign:
         sibling_evidence = {}
         pending = self.state.get('pending') or {}
         for pid in pending.get('projects', []):
-            sibling = self.state['projects'].get(pid, {})
-            if pid != project_id and set(record.get('repairs', [])) & set(sibling.get('repairs', [])):
+            pid, sibling = _effective_project(self.state['projects'], pid)
+            if (pid != project_id and pid not in record.get('supersedes', [])
+                    and set(record.get('repairs', [])) & set(sibling.get('repairs', []))):
                 sibling_evidence[pid] = sibling['outcome']['observations']
                 artifacts.update({f'sibling:{pid}:{role}': sha for role, sha in sibling['outcome']['artifacts'].items()})
         objective = json.dumps(dict(subject=record['objective'], project=project, sibling_evidence=sibling_evidence, repairs={
@@ -154,7 +180,9 @@ class SubjectCampaign:
         review_ids = pending.get('review_ids')
         if review_ids is None:
             review_ids = [pid for pid in pending['projects']
-                      if self.state['projects'][pid]['review']['decision'] == 'accept'
+                      if not self.state['projects'][pid].get('superseded_by')
+                      and self.state['projects'][pid]['review']['decision'] == 'accept'
+                      and not self.state['projects'][pid].get('manual_review_id')
                       and self.state['projects'][pid]['review']['memory'] is not None]
             pending['review_ids'] = review_ids
             self._save()
@@ -162,7 +190,15 @@ class SubjectCampaign:
         subject = pending['subject']['subject_id']
         for pid in pending['projects']:
             record = self.state['projects'][pid]
+            if record.get('superseded_by'):
+                self.scheduler.supersede_review(pid, dict(record['cancellation'],
+                    replacement_project=record['superseded_by']))
+                continue
             review = record['review']
+            if record.get('manual_review_id'):
+                self.scheduler.supersede_review(pid, dict(request_id=record['manual_request'],
+                    replacement_review=record['manual_review_id']))
+                continue
             evidence = [record['review_sha256']]
             if review['decision'] == 'repair':
                 if pid in review_ids:
@@ -191,11 +227,14 @@ class SubjectCampaign:
                 self.memory_gate.submit(pid, review['memory'], provenance,
                     record['review_request'], remaining_seconds=self._remaining())
         linked_repairs = {}
-        for pid in pending['projects']:
-            for repair_id in self.state['projects'][pid].get('repairs', []):
-                linked_repairs.setdefault(repair_id, []).append(self.state['projects'][pid])
+        effective = dict(_effective_project(self.state['projects'], pid) for pid in pending['projects'])
+        for record in effective.values():
+            for repair_id in record.get('repairs', []):
+                linked_repairs.setdefault(repair_id, []).append(record)
+        obligations = self.scheduler.state()['repairs']
         for repair_id, records in linked_repairs.items():
-            if all(row['review']['decision'] == 'accept' for row in records):
+            if (obligations[repair_id]['status'] == 'open'
+                    and all(row['review']['decision'] == 'accept' for row in records)):
                 self.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in records])
         if pending['wave_id'] not in self.state['waves']:
             self.state['waves'].append(pending['wave_id'])
@@ -204,11 +243,15 @@ class SubjectCampaign:
 
     def _run_wave(self, pending):
         for item in pending['items']:
+            if (self.root / 'manual-pause.json').exists():
+                raise TimeoutError('manual interaction queued at campaign checkpoint')
             self._remaining()
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
                 objective=pending['subject']['objective'], repairs=item.get('repairs', []),
                 wave_index=len(self.state['waves'])+1, plan=json.loads(canonical(item))))
+            if record.get('superseded_by'):
+                continue
             if 'outcome' not in record:
                 directory = self.root / 'waves' / pending['wave_id'] / pid
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
@@ -216,7 +259,10 @@ class SubjectCampaign:
                 self._save()
         # All linked probes and controls must finish before either is reviewed.
         for pid in pending['projects']:
-            self._review(pid, self.state['projects'][pid])
+            if (self.root / 'manual-pause.json').exists():
+                raise TimeoutError('manual interaction queued at campaign checkpoint')
+            if not self.state['projects'][pid].get('superseded_by'):
+                self._review(pid, self.state['projects'][pid])
         self._publish_wave(pending)
 
     def _run(self):
@@ -226,7 +272,12 @@ class SubjectCampaign:
         try:
             while True:
                 self._remaining()
+                if (self.root / 'manual-pause.json').exists():
+                    raise TimeoutError('manual interaction queued at campaign checkpoint')
                 self._settle_reviews()
+                if self.state['pending'] is None and self.scheduler.prioritize_projects():
+                    self.state.update(needs_decision=False, terminal=None)
+                    self._save()
                 if self.scheduler.is_complete() and not self.state['needs_decision']:
                     self.state['terminal'] = 'COMPLETE'
                     self._save()
@@ -258,8 +309,10 @@ class SubjectCampaign:
                     continue
                 snapshot = self.memory.snapshot()
                 wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
-                items = self.select_wave(context, snapshot, self.state['projects'],
-                                         remaining_seconds=self._remaining())
+                items = self.scheduler.claim_projects(wave_id)
+                if not items:
+                    items = self.select_wave(context, snapshot, self.state['projects'],
+                                             remaining_seconds=self._remaining())
                 if not items or len({i['project_id'] for i in items}) != len(items):
                     raise ValueError('wave must contain unique projects')
                 if set(i['project_id'] for i in items) & self.state['projects'].keys():

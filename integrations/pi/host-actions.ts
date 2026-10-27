@@ -15,6 +15,7 @@ async function host(name: string, args: unknown, signal?: AbortSignal) {
 
 export default function (pi: ExtensionAPI) {
   const schemas = JSON.parse(readFileSync(process.env.RSI_PI_SCHEMAS!, "utf8"));
+  const requestBytes = Number(process.env.RSI_PI_REQUEST_BYTES ?? 49152);
   for (const [name, parameters] of Object.entries(schemas)) {
     pi.registerTool(defineTool({
       name, label: name,
@@ -43,29 +44,47 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("context", async (event, ctx) => {
     const snapshot = await host("snapshot", {}, ctx.signal);
-    // Pi owns the tool loop. Refresh host state at the user boundary, while
-    // preserving every complete exchange selected during this host turn.
+    // A host turn is a new authoritative snapshot. Keep the pages read within
+    // that turn together, so reading a later page does not erase an earlier one.
     let boundary = -1;
     for (let i = event.messages.length - 1; i >= 0; i--) {
       if (event.messages[i].role === "user") { boundary = i; break; }
     }
-    const exchange: typeof event.messages = [];
-    for (let i = boundary + 1; i < event.messages.length; i++) {
+    const exchanges: (typeof event.messages)[] = [];
+    const pages = new Set<string>();
+    const snapshotMessage = { role: "user" as const, content: JSON.stringify(snapshot),
+      timestamp: Date.now() };
+    // Provider messages wrap JSON text inside JSON strings. Double serialization
+    // conservatively covers argument/result escaping in the pinned SDK's chat
+    // and Responses projections. Include active schemas and the system prompt;
+    // reserve 8 KiB for provider envelopes and projection metadata as well.
+    const wireBound = (value: unknown) => Buffer.byteLength(JSON.stringify(JSON.stringify(value)));
+    const active = new Set(pi.getActiveTools());
+    const tools = pi.getAllTools().filter(tool => active.has(tool.name))
+      .map(({ name, description, parameters }) => ({ name, description, parameters }));
+    let bytes = wireBound({ system: ctx.getSystemPrompt(), tools }) + 8192
+      + Buffer.byteLength(JSON.stringify(snapshotMessage));
+    for (let i = event.messages.length - 1; i > boundary; i--) {
       const message = event.messages[i];
-      if (message.role !== "assistant") continue;
+      if (message.role !== "assistant" || message.stopReason !== "toolUse") continue;
       const calls = message.content.filter(c => c.type === "toolCall");
-      if (!calls.length) { exchange.push(message); continue; }
-      const results = [];
-      for (let j = i + 1; j < event.messages.length; j++) {
-        const candidate = event.messages[j];
-        if (candidate.role !== "toolResult") break;
-        if (calls.some(c => c.id === candidate.toolCallId)) results.push(candidate);
-      }
-      if (calls.every(c => results.some(r => r.toolCallId === c.id))) {
-        exchange.push(message, ...results);
+      const results = event.messages.slice(i + 1).filter(m => m.role === "toolResult"
+        && calls.some(c => c.id === m.toolCallId));
+      if (calls.length && calls.every(c => results.some(r => r.role === "toolResult" && r.toolCallId === c.id))) {
+        const keys = calls.map(c => c.name === "read_context"
+          ? JSON.stringify([c.name, c.arguments.record, c.arguments.offset ?? 0, c.arguments.limit ?? 4096])
+          : c.name + JSON.stringify(c.arguments));
+        if (keys.every(key => pages.has(key))) continue;
+        const exchange = [message, ...results];
+        const size = wireBound(exchange);
+        // The current snapshot and latest complete exchange stay mandatory.
+        // Admit older exchanges only below the gateway's complete request cap.
+        if (exchanges.length && bytes + size > requestBytes) continue;
+        exchanges.push(exchange);
+        bytes += size;
+        keys.forEach(key => pages.add(key));
       }
     }
-    return { messages: [{ role: "user" as const, content: JSON.stringify(snapshot),
-      timestamp: Date.now() }, ...exchange] };
+    return { messages: [snapshotMessage, ...exchanges.reverse().flat()] };
   });
 }

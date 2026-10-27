@@ -92,12 +92,18 @@ def _published_evidence(root, state, initial):
         reader = LiveWaveCoordinator(
             wave_root, wave, pre_memory, lambda _: None, 1,
             allow_semantic_failures=True,
+            allow_partial=_read(wave_root / "published.json").get("completion") in {"partial", "empty"},
         )
         reader.read_published_memory()  # authenticates outcomes and both evidence digests
         for name in ("plan.json", "published.json", "consolidated-memory.json"):
             files[f"waves/{wave_id}/{name}"] = (wave_root / name).read_bytes()
         for project in wave.projects:
             branch = wave_root / "branches" / project.spec.project_id
+            if not (branch / "outcome.json").exists():
+                # The publication reader authenticates the skipped interruption record.
+                files[f"waves/{wave_id}/branches/{project.spec.project_id}/interruption.json"] = (
+                    branch / "interruption.json").read_bytes()
+                continue
             for name in ("outcome.json", "memory-delta.bin", "execution-evidence.bin"):
                 files[f"waves/{wave_id}/branches/{project.spec.project_id}/{name}"] = (branch / name).read_bytes()
             if not _read(branch / "outcome.json")["verified"]:

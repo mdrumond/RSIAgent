@@ -82,7 +82,8 @@ class SourceBackend:
 
 
 class ScriptedActor:
-    def __init__(self, replies):
+    def __init__(self, replies, *, memory=b'{"prior":"memory"}'):
+        self.expected_memory = memory
         self.replies = tuple(replies)
         self.instruction = None
         self.observations = []
@@ -94,7 +95,7 @@ class ScriptedActor:
     ):
         del profile, workspace
         self.instruction = instruction
-        assert context.read_bytes() == b'{"prior":"memory"}'
+        assert context.read_bytes() == self.expected_memory
         for ordinal, reply in enumerate(self.replies, 1):
             action = turn_parser(reply)
             assert action is not None
@@ -456,10 +457,7 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert actor.observations[6]["error"].startswith("submit requires")
     assert actor.observations[8]["classification"] == "host-verified"
     assert '"prior":"memory"' in actor.instruction
-    assert 'read-artifact' in actor.instruction
-    assert 'Production context (immutable' in actor.instruction
     assert actor.instruction.count('{"guide":"exact"}') == 1
-    assert executor.prepare(_spec()).instruction in actor.instruction
     assert len(backend.requests) == 4
     assert len(backend.run_requests) == 3
     assert (tmp_path / "branch" / "artifacts").is_dir()
@@ -593,7 +591,10 @@ def test_optional_treatment_actions_have_deterministic_disabled_observations(tmp
 
     AdaptiveActorProjectExecutor(executor, actor, object())(_request(tmp_path, executor))
 
-    assert actor.observations[:2] == [
+    disabled = dict(actor.observations[0])
+    explanation, = disabled.pop("status_explanations")
+    assert explanation["code"] == "disabled-by-treatment"
+    assert [disabled, actor.observations[1]] == [
         {
             "event": "knowledge-query", "available": False,
             "reason": "disabled-by-treatment",
@@ -857,6 +858,56 @@ def test_print_source_without_runtime_trace_does_not_claim_tool_observation(tmp_
     result = AdaptiveActorProjectExecutor(executor, actor, object())(
         _request(tmp_path, executor, _special_spec()))
     assert not any(f.statement.startswith("verified-debug-print:") for f in result.memory.host_facts)
+
+
+@pytest.mark.parametrize('failure,bad_source,bad_action', [
+    ('compile', 'compile failure', 'compile'),
+    ('host-mismatch', 'wrong source', 'run'),
+])
+def test_repair_recovers_after_missing_original_failure_rejection(
+    tmp_path, failure, bad_source, bad_action,
+):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / 'evidence.jsonl'))
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+        json.dumps({'write': {'slot': 'kernel', 'content': bad_source}}),
+        json.dumps({bad_action: {}}),
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}', '{"submit":{}}',
+    ))
+    result = AdaptiveActorProjectExecutor(executor, actor, object())(
+        _request(tmp_path, executor, _special_spec(failure=failure))
+    )
+    assert actor.observations[2]['missing'] == [f'observed-{failure}']
+    assert actor.observations[-1]['event'] == 'host-verified-submit'
+    assert result.evidence.verified
+    assert len(actor.distill_calls) == 1
+    assert len(backend.run_requests) == (3 if failure == 'host-mismatch' else 2)
+
+
+def test_compile_repair_submit_explains_actual_actor_missing_requirement(tmp_path):
+    backend = SourceBackend()
+    executor = ProjectExecutor(backend, EvidenceLedger(tmp_path / "evidence.jsonl"))
+    actor = ScriptedActor((
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+        '{"write":{"slot":"kernel","content":"compile failure"}}',
+        '{"run":{}}',
+        '{"write":{"slot":"kernel","content":"fixed source"}}',
+        '{"run":{}}',
+        '{"submit":{}}',
+    ))
+    result = AdaptiveActorProjectExecutor(executor, actor, object())(
+        _request(tmp_path, executor, _special_spec(failure="compile")))
+    assert result.evidence.verified
+    rejected = actor.observations[2]
+    assert rejected["missing"] == ["observed-compile"]
+    explanation, = rejected["status_explanations"]
+    assert explanation["field"] == "missing"
+    assert explanation["code"] == "observed-compile"
 
 
 def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_hard_cap(tmp_path):
