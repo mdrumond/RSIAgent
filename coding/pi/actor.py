@@ -159,8 +159,6 @@ class PiActorDriver(DirectActorDriver):
                 except ActionError as exc:
                     action_error = str(exc)[:500]
                     text = "{}"
-                    latest = json.dumps({"host": {"event": "invalid-action", "reason": action_error,
-                        "allowed_actions": sorted(allowed)}})
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
                 self._trace("message", {"role": "assistant", "content": text})
@@ -177,6 +175,7 @@ class PiActorDriver(DirectActorDriver):
                         "description": "The response could not be parsed as an accepted action. No action was executed.",
                         "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
                         "allowed_actions": sorted(allowed),
+                        "reason": action_error or "Selected action does not match the host protocol",
                     }
                     if action_error:
                         host["error"] = action_error

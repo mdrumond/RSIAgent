@@ -290,6 +290,8 @@ def test_context_read_telemetry_and_actionable_validation():
         with pytest.raises(ValueError, match=r'arguments.source: expected string'):
             pi._operation('write', {'source': 1})
         assert pi.pending is None and pi.mutations == 0
+
+
 def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monkeypatch):
     instruction = 'Instruction body. ' * 600
     source = 'kernel source;\n' * 160
@@ -579,7 +581,7 @@ def test_actor_reports_rejected_action_for_next_turn_recovery(monkeypatch, tmp_p
             observations.append(context['latest_host_observation'])
             if len(observations) == 1:
                 raise actor_module.ActionError('Pi returned no accepted host action')
-            host = json.loads(context['latest_host_observation'])['host']
+            host = context['latest_host_observation']['host']
             assert host['event'] == 'invalid-action'
             assert host['error'] == 'Pi returned no accepted host action'
             return 'submit', {}
@@ -668,7 +670,7 @@ def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_pat
                      workspace=tmp_path, context=None,
                      turn_parser=parse_trial_action, action_executor=execute)
     assert outcome.status == 'passed' and executed == ['submit']
-    feedback = json.loads(requests[1][0]['latest_host_observation'])['host']
+    feedback = requests[1][0]['latest_host_observation']['host']
     assert feedback['event'] == 'invalid-action'
     assert feedback['allowed_actions'] == sorted(requests[1][1])
     assert 'submit' in feedback['allowed_actions']
