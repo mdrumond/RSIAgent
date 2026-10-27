@@ -108,18 +108,34 @@ def test_reviewed_handoff_to_shared_model_loop_and_numerical_verifier(tmp_path, 
         assert second["phase2_memory"][0]["failed_cases"][0]["failure"] == "numerical-mismatch"
 
 
-def test_cli_admit_and_injected_run(tmp_path, capsys):
+@pytest.mark.parametrize('command', ['admit', 'run'])
+def test_module_cli_retires_native_launch_before_handoff_or_runner(tmp_path, monkeypatch, command):
+    from benchmarks.ascend import phase2_cli
+    calls = []
+    monkeypatch.setattr(phase2_cli, 'admit_native_snapshot', lambda *args: calls.append('admit'))
+    root = tmp_path / 'new-phase2'
+    with pytest.raises(SystemExit) as error:
+        phase2_cli.main(['--target', 'a3', command, '--root', str(root)],
+                       runner_factory=lambda args: calls.append('runner'))
+    assert error.value.code == 2
+    assert calls == []
+    assert not root.exists()
+
+
+def test_module_cli_report_reads_retained_state_without_provider_binding(tmp_path, capsys):
     from benchmarks.ascend.phase2_cli import main
-    root, review, _ = native_source(tmp_path)
-    initial = tmp_path / "initial.bin"
-    initial.write_bytes(b"")
-    args = ["--target", "a3", "admit", "--config", str(tmp_path / "runtime.json"),
-            "--root", str(tmp_path / "phase2"), "--phase1-root", str(root),
-            "--initial-memory", str(initial), "--review", str(review)]
-    assert main(args) == 0
-    assert json.loads(capsys.readouterr().out)["cell_id"].startswith("a3-phase2-cell-")
-    args[2] = "run"
-    assert main(args, runner_factory=lambda _: SimpleNamespace(run=lambda: {"status": "passed"})) == 0
+    state = {'phase': 'adaptive-phase2', 'terminal': {'status': 'SATURATED'}}
+    (tmp_path / 'state.json').write_text(json.dumps(state))
+    terminal = tmp_path / 'cells' / 'old-native' / 'terminal.json'
+    terminal.parent.mkdir(parents=True)
+    terminal.write_text(json.dumps({'cell_id': 'old-native', 'status': 'passed'}))
+    before = {path.relative_to(tmp_path): path.read_bytes()
+              for path in tmp_path.rglob('*') if path.is_file()}
+    assert main(['--target', 'a3', 'report', '--root', str(tmp_path)],
+                runner_factory=lambda args: pytest.fail('historical report composed a runner')) == 0
+    assert json.loads(capsys.readouterr().out) == {'state': state, 'records': [json.loads(terminal.read_bytes())]}
+    assert before == {path.relative_to(tmp_path): path.read_bytes()
+                      for path in tmp_path.rglob('*') if path.is_file()}
 
 
 def test_cli_native_builder_reuses_shared_runtime_config(tmp_path, monkeypatch):

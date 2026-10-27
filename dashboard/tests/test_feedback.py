@@ -97,17 +97,15 @@ def test_import_and_bounded_phase1_use_existing_async_runner(feedback):
                         '--failure-id', row['feedback_id']]
 
 
-def test_retry_is_one_original_goal_with_reviewed_memory_and_no_approval_flag(feedback):
+def test_retired_retry_is_refused_before_runner_and_preserves_history(feedback):
     client, app, config, row, calls = feedback
-    completed(client, submit(client, 'retry-feedback', dict(
-        preset_id='phase2', feedback_ids=[row['feedback_id']])))
-    argv = calls[-1]
-    assert '--approval-mode' not in argv
-    assert argv[argv.index('--project-target') + 1] == '1'
-    assert argv[argv.index('--phase1-root') + 1] == '/reviewed-phase1'
-    assert argv[argv.index('--review') + 1] == '/review.json'
-    assert argv[-2:] == ['--retry-feedback-id', row['feedback_id']]
-    assert client.get('/api/feedback').get_json() == [row]  # start does not rewrite history
+    response = submit(client, 'retry-feedback', dict(
+        preset_id='phase2', feedback_ids=[row['feedback_id']]))
+    assert response.status_code == 409
+    assert calls == []
+    assert not (config.parent / 'new2').exists()
+    assert not (config.parent / 'control2').exists()
+    assert client.get('/api/feedback').get_json() == [row]
 
 
 @pytest.mark.parametrize('status', ['resolved', 'deferred'])
@@ -122,20 +120,19 @@ def test_deferred_and_resolved_visible_but_not_selected(feedback, status):
 
 
 @pytest.mark.parametrize('classification', ['infrastructure', 'provider'])
-def test_classified_infrastructure_selectable_for_retry_not_kernel_investigation(feedback, classification):
+def test_classified_infrastructure_is_readable_but_no_retired_retry_or_investigation(feedback, classification):
     client, app, config, row, calls = feedback
     row['outcome'].update(category='incorrect', verified=False)
     row['investigation'].update(classification=classification, reason='not a kernel defect')
     write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
     page = client.get('/feedback').get_data(as_text=True)
-    assert 'not a kernel defect' in page and 'name="feedback_id"' in page
-    assert 'Select for retry only' in page
+    assert 'not a kernel defect' in page and 'name="feedback_id"' not in page
     assert submit(client, 'investigate', dict(preset_id='phase1',
         feedback_ids=[row['feedback_id']], project_target=2)).status_code == 409
     assert not calls
-    # An explicit original-target retry is still permitted; only investigation is excluded.
-    completed(client, submit(client, 'retry-feedback', dict(
-        preset_id='phase2', feedback_ids=[row['feedback_id']])))
+    assert submit(client, 'retry-feedback', dict(
+        preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
+    assert calls == []
 
 
 def test_unclassified_budget_failure_remains_available_for_curriculum_triage(feedback):
@@ -237,9 +234,10 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
     baseline = jobs.put_artifact(job_id, 'baseline.json', frozen)
     row['outcome']['evidence']['baseline'] = dict(baseline, job_root=str(root / 'jobs'), job_id=job_id)
     write(root / 'feedback' / (row['feedback_id'] + '.json'), row)
-    screens = []
+    screens, invocations = [], []
 
     def real_cli(argv, **kwargs):
+        invocations.append(argv)
         output = io.StringIO()
         with redirect_stdout(output):
             campaign_cli.main(argv[2:], screen=lambda job, role: screens.append(role) or 'not-started')
@@ -248,7 +246,14 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
     manager.runner = real_cli
     payload = {} if phase is None else dict(preset_id=f'phase{phase}',
         feedback_ids=[row['feedback_id']], project_target=2)
-    completed(client, submit(client, action, payload))
+    response = submit(client, action, payload)
+    if phase == 2:
+        assert response.status_code == 409
+        assert invocations == [] and screens == []
+        assert not (root / 'control2').exists() and not (root / 'new2').exists()
+        assert client.get('/api/feedback').get_json() == [row]
+        return
+    completed(client, response)
     if phase:
         job = json.loads((root / f'control{phase}' / 'job.json').read_text())
         assert job['failure_ids'] == [row['feedback_id']]
@@ -258,3 +263,22 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
         assert screens == ['collector', 'campaign']  # callbacks only; no processes launched
     else:
         assert not screens
+
+
+def test_feedback_destinations_and_actions_exclude_retired_phase2(feedback):
+    from html.parser import HTMLParser
+    class Controls(HTMLParser):
+        def __init__(self, html):
+            super().__init__()
+            self.destinations, self.actions = [], []
+            self.feed(html)
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if tag == 'option':
+                self.destinations.append(attrs.get('value'))
+            if tag == 'button' and 'data-feedback-action' in attrs:
+                self.actions.append(attrs['data-feedback-action'])
+    client, _, _, _, _ = feedback
+    controls = Controls(client.get('/feedback').get_data(as_text=True))
+    assert controls.destinations == ['phase1']
+    assert controls.actions == ['investigate']

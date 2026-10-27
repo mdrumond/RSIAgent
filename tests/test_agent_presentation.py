@@ -208,3 +208,60 @@ def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_pat
     assert not current._path(evidence).exists()
     with pytest.raises(FileNotFoundError):
         reader.read_bytes("f" * 64)
+
+
+def test_subject_catalog_keeps_useful_lessons_and_exact_documents_within_one_page(tmp_path):
+    store = ContentAddressedArtifacts(tmp_path)
+    source = store.put_bytes(b'out = max(x, 0)\n')
+    proposal = dict(summary='Clamp negative values', applicability='float32 vectors',
+                    preconditions='Padded storage', expectations='Logical values match relu',
+                    limitations='No timing claim', before=None,
+                    after=dict(sha256=source, start_line=1, end_line=1,
+                               text='out = max(x, 0)\n'), evidence=[source])
+    record = dict(memory_id='accepted-relu', proposal=proposal,
+                  provenance={'logs': 'old trace\n' * 9000})
+    raw = canonical_bytes(dict(schema='subject-memory-snapshot-v1', initial_memory='Use host oracles',
+                               memories=[dict(record, memory_id=f'lesson-{i}') for i in range(100)]))
+    view = memory_presentation(raw, store)
+    assert len(canonical_bytes(view)) <= 8192
+    assert 0 < view['shown_count'] < 100
+    assert view['shown_count'] + view['omitted_count'] == view['memory_count'] == 100
+    assert store.read_bytes(view['sha256']) == raw
+    assert store.read_bytes(view['initial_memory_sha256']) == b'Use host oracles'
+    for index, row in enumerate(view['memories']):
+        assert store.read_json(row['memory_document_sha256']) == dict(record, memory_id=f'lesson-{index}')
+        assert row['version'] == row['memory_document_sha256']
+        assert store.read_json(row['proposal_sha256']) == proposal
+        assert row['summary'] == proposal['summary']
+        assert row['after'] == proposal['after']
+
+
+def test_subject_unicode_and_long_examples_stay_bounded_and_readable_by_reference(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.ascend.agent_presentation import MemoryArtifactReader
+    shared = ContentAddressedArtifacts(tmp_path / 'shared')
+    current = ContentAddressedArtifacts(tmp_path / 'branch' / 'artifacts')
+    code = ('out = x\n' * 10000).encode()
+    source = shared.put_bytes(code)
+    unrelated = shared.put_bytes(b'not reachable from this memory')
+    # Reproduce the production eager-copy boundary: selected source only.
+    current.put_bytes(shared.read_bytes(source))
+    proposal = dict(summary='修正' * 10000, applicability='适用' * 10000,
+                    preconditions='前提' * 10000, expectations='结果' * 10000,
+                    limitations='限制' * 10000, before=None,
+                    after=dict(sha256=source, start_line=1, end_line=10000, text=code.decode()),
+                    evidence=[source] * 100)
+    record = dict(memory_id='unicode', proposal=proposal, provenance={})
+    raw = canonical_bytes(dict(schema='subject-memory-snapshot-v1', initial_memory='种子' * 10000,
+                               memories=[record]))
+    reader = MemoryArtifactReader(SimpleNamespace(pre_wave_memory=raw), current)
+    view = memory_presentation(raw, current)
+    assert len(canonical_bytes(view)) <= 8192
+    row = view['memories'][0]
+    assert len(row['summary']) > 0
+    assert 'text' not in row['after']
+    assert row['omitted_evidence_count'] == 96
+    assert json.loads(reader.read_bytes(row['proposal_sha256'])) == proposal
+    assert reader.read_bytes(row['after']['sha256']) == code
+    with pytest.raises(FileNotFoundError):
+        reader.read_bytes(unrelated)
