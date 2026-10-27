@@ -38,16 +38,21 @@ use the complete published name, not that prefix. Its metadata identifies
 English documentation relevant to Ascend C and Triton. This is reference
 applicability, not evidence of support on a particular chip or compiler.
 
-## Offer the collection in both phases
+## Offer the collection in a new subject campaign
 
-For a **new** native Phase 1 campaign, set the KDB path to the new database and
-extend `collection` to a list containing the existing Ascend C collection(s)
-plus the published sanitizer collection. Preserve an explicitly Ascend C-capable
-code collection. For a new Phase 2 campaign, retain the same collection list and
-all manifest fingerprints from the reviewed Phase 1 handoff in its `knowledge`
-configuration. Do not retrofit an existing experiment: its collection selection
-and fingerprints are part of its identity. KDB-off configurations stay off.
-A5 launchers accept repeated `--collection` options for the equivalent selection.
+Use the [subject curriculum](subject-curriculum.md) for new Ascend work. Its
+ignored runtime settings retain the existing Phase 1 KDB arguments in
+`phase1_arguments`. With the native A3 binding, set the referenced runtime
+configuration's `kdb` path to the new database and extend `collection` to a list
+containing the existing Ascend C collection(s) plus the published sanitizer
+collection. Preserve an explicitly Ascend C-capable code collection. The A5
+binding accepts repeated `--collection` options for the equivalent selection.
+KDB-off configurations stay off.
+
+Do not retrofit an existing experiment: its collection selection and manifest
+fingerprints are part of its identity. Historical Phase 2 handoffs retain their
+reviewed collection list and fingerprints for evidence inspection; new separate
+Phase 2 launches are [retired](phase2-retirement.md).
 
 Validate retrieval through the existing read-only Knowledge Agent gate:
 
