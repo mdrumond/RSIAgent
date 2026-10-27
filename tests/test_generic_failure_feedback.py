@@ -423,7 +423,8 @@ def test_curriculum_discovers_and_pages_only_selected_failure_cases(tmp_path, mo
 
 
 
-def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(tmp_path):
+@pytest.mark.parametrize('historical_sources', [False, True])
+def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(tmp_path, historical_sources):
     from optimizer.loop import OptimizationLoop
     from test_optimizer_loop import Agent, Backend, candidate
     body = dict(files={}, memory_entries=[{'lesson': 'Retained context'}],
@@ -440,6 +441,10 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
             return {'status': 'compile-error', 'stderr': 'Observed compile diagnostic'}
         def evaluate(self, source, directory, *, block_count):
             self.evaluations.append(source)
+            if historical_sources:
+                return dict(status='compile-error', suite_sha256='suite',
+                    candidate_sha256=sha(source.encode()), cases=[dict(case='case-000',
+                        error='compiler rejected candidate', compiler_diagnostics='Actual retained diagnostic')])
             return dict(status='incorrect', suite_sha256='suite', cases=[],
                 candidate_sha256=sha(source.encode()), failure_case=dict(
                     schema='failure-case-v1', classification='host-mismatch',
@@ -455,7 +460,17 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
         candidate('bad-one'), dict(action='query-knowledge', query='Second retrieval'),
         candidate('bad-two'), dict(action='read-memory', index=0),
         dict(action='finish', summary='Retained failed candidates')]
-    result = OptimizationLoop(jobs, key, Agent(actions), backend).run()
+    loop = OptimizationLoop(jobs, key, Agent(actions), backend)
+    if historical_sources:
+        # The old producer retained canonical source artifacts and current
+        # candidate state, but not the additive history.source reference.
+        def save_legacy_state():
+            state = json.loads(canonical(loop.state))
+            for row in state['history']:
+                row.pop('source', None)
+            jobs.add_event(key, 'optimizer-state', state)
+        loop._save = save_legacy_state
+    result = loop.run()
     assert result['status'] == 'completed' and backend.evaluations == ['bad-one', 'bad-two']
     history = OptimizationLoop(jobs, key, Agent([]), backend).state['history']
     assert [row.get('tool', {}).get('action') for row in history if 'tool' in row] == [
@@ -468,6 +483,9 @@ def test_optimizer_import_keeps_failed_candidates_after_interleaved_real_tools(t
     candidates = [row for row in records if ':candidate:' in row['outcome']['attempt_id']]
     assert {row['outcome']['result']['source_sha256'] for row in candidates} == {
         sha(b'bad-one'), sha(b'bad-two')}
+    for row in candidates:
+        source = store.failure_cases(row['feedback_id'])[0]['artifacts']['source']['sha256']
+        assert sha(json.loads(store.failure_artifact_bytes(row['feedback_id'], source)).encode()) == row['outcome']['result']['source_sha256']
     assert all(store.failure_cases(row['feedback_id'])[0]['availability']['complete'] for row in candidates)
     repeated = store.import_optimizer(jobs.root)
     assert repeated['existing'] == 3 and repeated['warnings'] == []
@@ -517,3 +535,91 @@ def test_a5_production_identity_imports_selects_and_authenticates_original_retry
 ])
 def test_identity_normalization_keeps_unknown_schemas_and_existing_aliases(tmp_path, identity, target, language):
     assert FeedbackStore._identity(tmp_path, None, None, identity) == (target, language)
+
+
+@pytest.mark.parametrize('change_contract', [False, True])
+def test_retained_campaign_retry_links_standalone_optimizer_without_new_launch(
+        tmp_path, change_contract):
+    from benchmarks.ascend.campaign_cli import main, campaign_worker
+    from benchmarks.ascend.failure_curriculum import link_retry, retry_spec
+    from benchmarks.ascend.phase2_optimizer_campaign import OptimizerPhase2Coordinator
+    from test_ascend_phase2_optimizer_tasks import seed
+
+    submission = dict(source='def forward(x): return x', entrypoint='forward',
+        signatures=[dict(args=[dict(shape=[5], dtype='float32')])], init_args=[], init_kwargs={})
+    memory = seed()
+    memory['source_identity'] = dict(target='a3', language='ascend-c')
+    memory['snapshot_id'] = sha(canonical({k: v for k, v in memory.items() if k != 'snapshot_id'}))
+    jobs = JobStore(tmp_path / 'original-jobs')
+    original_job = jobs.create(submission['source'], submission['entrypoint'],
+        {'signatures': submission['signatures']}, memory, name='original-task')
+    key = original_job['job_id']
+    frozen = dict(suite_sha256='1' * 64,
+        manifest=dict(policy={'rtol': 1e-5}, submission=submission),
+        cases=[dict(case='case-000', timing={'torch': {'latency_us': 10}})])
+    baseline = jobs.put_artifact(key, 'baseline', canonical(frozen))
+    jobs.transition(key, 'running')
+    jobs.add_event(key, 'optimizer-state', dict(baseline=baseline, history=[]))
+    jobs.transition(key, 'failed')
+    store = FeedbackStore(tmp_path / 'feedback')
+    assert store.import_optimizer(jobs.root)['imported'] == 1
+    original = store.records()[0]
+    pinned = retry_spec(dict(selected=[original]), 'a3')
+    assert pinned['task']['submission'] == submission
+    task = json.loads(canonical(pinned['task']))
+    if change_contract:
+        task['submission']['source'] = 'def forward(x): return x + 1'
+    repeated = json.loads(canonical(frozen))
+    repeated['cases'][0]['timing']['torch']['latency_us'] = 12
+
+    class Retried:
+        def __init__(self, directory, selected, memory):
+            self.task = selected
+            spec = selected['submission']
+            self.jobs = JobStore(directory / 'jobs')
+            self.key = self.jobs.create(spec['source'], spec['entrypoint'],
+                {'signatures': spec['signatures']}, memory,
+                init_args=spec.get('init_args'), init_kwargs=spec.get('init_kwargs'))['job_id']
+            self.baseline = self.jobs.put_artifact(self.key, 'baseline', canonical(repeated))
+        def prepare(self):
+            return repeated
+        def attempt(self, attempt_id, **kwargs):
+            source = 'candidate for the retained task'
+            result = dict(attempt_id=attempt_id, task_id=self.task['task_id'], job_id=self.key,
+                verified=True, speedup=2, baseline=self.baseline, source_sha256=sha(source.encode()),
+                candidate=self.jobs.put_artifact(self.key, 'candidate', canonical(source)),
+                result=dict(status='verified', candidate_sha256=sha(source.encode()),
+                    suite_sha256=frozen['suite_sha256'], cases=[dict(case='case-000',
+                        timing={'ascendc': {'latency_us': 5}})]))
+            result['result_artifact'] = self.jobs.put_artifact(self.key, 'result', canonical(result))
+            self.jobs.add_event(self.key, 'phase2-attempt-result', result)
+            return result
+
+    root = tmp_path / 'retained-retry'
+    campaign = OptimizerPhase2Coordinator(root, 'Retained original retry', memory,
+        lambda _: json.dumps(dict(action='ready', reason='Retained host result')), Retried,
+        feedback_root=store.root, fixed_task=task)
+    assert campaign.resume()['status'] == 'READY'
+    # This is retained-result finalization through the existing worker API, not
+    # permission to launch a retired Phase2 campaign from the CLI.
+    control = tmp_path / 'control'
+    control.mkdir()
+    job = dict(root=str(root), control=str(control), feedback_root=str(store.root),
+               retry_feedback_id=original['feedback_id'])
+    assert campaign_worker(job, builder=lambda _: campaign)['status'] == 'READY'
+    updated = next(row for row in store.records() if row['feedback_id'] == original['feedback_id'])
+    assert (updated['investigation']['status'] == 'resolved') is not change_contract
+    assert len(updated['investigation']['retries']) == 1
+    assert json.loads((control / 'worker.json').read_bytes())['status'] == 'complete'
+    link_retry(job)
+    assert next(row for row in store.records() if row['feedback_id'] == original['feedback_id']) == updated
+    before = (store.root / (original['feedback_id'] + '.json')).read_bytes()
+    with pytest.raises(SystemExit) as error:
+        main(['start', '--phase', '2', '--target', 'a3', '--control', str(tmp_path / 'new-control'),
+            '--root', str(tmp_path / 'new-campaign'), '--objective', 'Original retry',
+            '--config', 'absent', '--initial-memory', 'absent', '--project-target', '1',
+            '--retry-feedback-id', original['feedback_id'], '--feedback-root', str(store.root)],
+            screen=lambda *args: pytest.fail('retired retry dispatched an agent'))
+    assert error.value.code == 2
+    assert not (tmp_path / 'new-control').exists() and not (tmp_path / 'new-campaign').exists()
+    assert (store.root / (original['feedback_id'] + '.json')).read_bytes() == before

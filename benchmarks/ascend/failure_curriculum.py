@@ -362,7 +362,11 @@ def retry_spec(selection, target):
     manifest = frozen.get('manifest', {})
     if not frozen.get('suite_sha256') or not manifest.get('policy') or not manifest.get('submission'):
         raise ValueError('original frozen suite or comparison policy is missing')
-    return dict(feedback_id=row['feedback_id'], task=out['task'],
+    task = out['task']
+    if out.get('source_type') == 'optimizer':
+        task = dict(task, submission=manifest['submission'],
+                    rationale=task.get('rationale', 'Retry the original frozen optimizer contract'))
+    return dict(feedback_id=row['feedback_id'], task=task,
         suite_sha256=frozen['suite_sha256'], policy=manifest['policy'],
         frozen_submission=manifest.get('submission'),
         max_cases=out['runtime'].get('max_cases') or 24)
@@ -375,6 +379,13 @@ def link_retry(job):
     store = FeedbackStore(job['feedback_root'])
     store.import_campaign(job['root'])
     original = next(r for r in store.records() if r['feedback_id'] == job['retry_feedback_id'])
+    if original['outcome'].get('source_type') == 'optimizer':
+        for row in store.records():
+            outcome = row['outcome']
+            if (outcome['source_root'] == str(Path(job['root']).resolve())
+                    and outcome['task'].get('task_id') == original['outcome']['task']['task_id']):
+                store.link_original_retry(original['feedback_id'], row['feedback_id'])
+        return
     retries = [r for r in store.records() if r['outcome']['source_root'] == str(Path(job['root']).resolve())
                and r['outcome']['task'] == original['outcome']['task']]
     def merge(current):
