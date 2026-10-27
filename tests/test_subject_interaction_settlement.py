@@ -31,7 +31,8 @@ def real_builder(root, scheduler, artifacts, *, decision='accept', reviewed=None
         def review(request, **options):
             if reviewed is not None:
                 reviewed(request)
-            return dict(decision=decision, reason='observed result', evidence=['a'*64], memory=None)
+            return dict(decision=decision(request) if callable(decision) else decision,
+                        reason='observed result', evidence=['a'*64], memory=None)
         def complete(*args, **kwargs):
             action = 'advance' if scheduler.context()['current_subject'] is not None else 'complete'
             return json.dumps(dict(action=action, reason='settled', evidence=['retained']))
@@ -313,3 +314,72 @@ def test_new_feedback_key_cannot_bypass_unsettled_request(tmp_path):
         interaction.submit_feedback(config, 'campaign', 'one', 'new instructions', 'different-key', 30,
             launcher=lambda *args: pytest.fail('unsettled execution cannot launch again'))
     assert len(list((root/'dashboard-requests').glob('*.json'))) == 1
+
+
+@pytest.mark.parametrize('sequence', [('control',), ('replacement',), ('replacement', 'control')])
+def test_sequential_paired_restarts_use_current_evidence_and_resume_without_old_execution(tmp_path, sequence):
+    config, root, _, scheduler, artifacts = setup(tmp_path)
+    snapshot = scheduler.state()['waves']['wave-1']['memory_snapshot_sha256']
+    scheduler.start_wave('wave-2', snapshot)
+    scheduler.complete_wave('wave-2')
+    scheduler.start_wave('reserved', snapshot)
+    scheduler.add_repair('paired', 'study', 'failed-origin', 'repair both', ['a'*64])
+    plans = [dict(project_id=pid, repairs=['paired'] if pid != 'unrelated' else [],
+                  spec={'project_id': pid}) for pid in ('one', 'control', 'unrelated')]
+    state = json.loads((root/'subject-campaign.json').read_bytes())
+    state.update(projects={'failed-origin': dict(objective='original failure', wave_index=1,
+        outcome={'host_verified': False, 'artifacts': {}, 'observations': {}},
+        review={'decision': 'repair', 'reason': 'old failure'})}, waves=['wave-1', 'wave-2'],
+        pending=dict(wave_id='reserved', subject={'subject_id': 'study', 'objective': 'Study'},
+                     memory_sha256=snapshot, projects=[plan['project_id'] for plan in plans], items=plans))
+    atomic(root/'subject-campaign.json', canonical(state))
+    (root/'curriculum-edits').mkdir()
+    executed, reviewed = [], {}
+    def execute(plan, frozen, directory, **options):
+        executed.append(plan['project_id'])
+        assert plan['project_id'] != 'one'
+        source = artifacts.put_bytes(plan['project_id'].encode())
+        return SubjectOutcome(True, source, {'source': source},
+                              {'comparison': plan['project_id']}, artifacts.root)
+    def verify(request):
+        reviewed[request.project_id] = request
+    def decision(request):
+        # Replacing a failed replacement must settle against its new verdict,
+        # rather than counting the canceled failure during repair publication.
+        return 'repair' if request.project_id == 'replacement' and 'replacement' in sequence else 'accept'
+    builder = real_builder(root, scheduler, artifacts, execution=execute, reviewed=verify, decision=decision)
+    def restart(source, replacement, number):
+        proposal = dict(id=f'{number:032x}', kind='restart', status='approved', project=source,
+            after=dict(item=dict(project_id=replacement, repairs=[], spec={'project_id': replacement}),
+                       instruction='review the current paired evidence'))
+        atomic(root/'curriculum-edits'/(proposal['id']+'.json'), canonical(proposal))
+        operation = interaction.request_restart(config, 'campaign', proposal, 15,
+            'sequential-'+str(number), launcher=lambda *args: None)
+        result = interaction.run_request(config, 'campaign', operation['id'], builder=builder)
+        assert result['status'] == 'succeeded', result
+        return result
+    restart('one', 'replacement', 1)
+    initial_probe_review = reviewed['replacement']
+    initial_control_review = reviewed['control']
+    latest = {'probe': 'replacement', 'control': 'control'}
+    for number, source in enumerate(sequence, 2):
+        replacement = source+'-next'
+        result = restart(source, replacement, number)
+        kind = 'probe' if source == 'replacement' else 'control'
+        other = latest['control' if kind == 'probe' else 'probe']
+        latest[kind] = replacement
+        review = reviewed[result['result']['project_id']]
+        assert json.loads(review.objective)['sibling_evidence'] == {other: {'comparison': other}}
+        assert review.artifacts[f'sibling:{other}:source'] == artifacts.put_bytes(other.encode())
+        state = json.loads((root/'subject-campaign.json').read_bytes())
+        assert state['projects'][source]['superseded_by'] == replacement
+        assert state['projects'][source]['cancellation']['reason'] == 'reviewed-restart'
+        assert 'unrelated' not in state['projects']
+    # Existing verifier decisions keep their original comparison context.
+    assert reviewed['replacement'] is initial_probe_review
+    assert reviewed['control'] is initial_control_review
+    assert all(row['status'] == 'resolved' for row in scheduler.state()['repairs'].values())
+    assert builder().run()['terminal'] == 'COMPLETE'
+    assert executed == ['replacement', 'control', *(source+'-next' for source in sequence), 'unrelated']
+    assert all(not role.startswith('sibling:one:')
+               for review in reviewed.values() for role in review.artifacts)

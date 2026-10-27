@@ -227,9 +227,8 @@ class SubjectCampaign:
                 self.memory_gate.submit(pid, review['memory'], provenance,
                     record['review_request'], remaining_seconds=self._remaining())
         linked_repairs = {}
-        for pid in pending['projects']:
-            record = self.state['projects'][pid]
-            record = self.state['projects'].get(record.get('superseded_by'), record)
+        effective = dict(_effective_project(self.state['projects'], pid) for pid in pending['projects'])
+        for record in effective.values():
             for repair_id in record.get('repairs', []):
                 linked_repairs.setdefault(repair_id, []).append(record)
         obligations = self.scheduler.state()['repairs']

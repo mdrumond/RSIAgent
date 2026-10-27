@@ -14,6 +14,7 @@ import time
 
 from optimizer.jobs import atomic, canonical
 from .actor_control import ActorControl, grant_elapsed
+from .subject_campaign import _effective_project
 
 
 def _read(path, default=None):
@@ -296,10 +297,9 @@ def _execute(campaign, request, original, directory, request_path):
         existing = campaign.state['projects'].get(pid)
         if existing and existing.get('manual_request') != request['id']:
             raise ValueError('restart project ID was already used')
-        if request['project_id'] in pending.get('projects', []):
-            campaign.state['projects'][request['project_id']] = dict(original,
-                wave_index=original.get('wave_index', len(campaign.state['waves'])+1),
-                superseded_by=pid, cancellation=dict(request_id=request['id'], reason='reviewed-restart'))
+        campaign.state['projects'][request['project_id']] = dict(original,
+            wave_index=original.get('wave_index', len(campaign.state['waves'])+1),
+            superseded_by=pid, cancellation=dict(request_id=request['id'], reason='reviewed-restart'))
         directory = root / 'manual-attempts' / request['id'] / pid
         original = dict(objective=original['objective'], plan=item,
             wave_index=original.get('wave_index', 0), restart_of=request['project_id'],
@@ -375,7 +375,7 @@ def _execute(campaign, request, original, directory, request_path):
     review_id = pid + '-manual-' + request['id']
     record['manual_review_id'] = review_id
     review = record['review']
-    _settle_manual_repairs(campaign, pid, record, review_id, request['project_id'])
+    _settle_manual_repairs(campaign, pid, record, review_id)
     if review.get('memory') is not None and review['decision'] == 'accept':
         campaign.scheduler.register_manual_review(review_id, subject_id)
         provenance = dict(project_id=pid,
@@ -394,7 +394,7 @@ def _execute(campaign, request, original, directory, request_path):
     return dict(project_id=pid, review_id=review_id, directory=str(directory.relative_to(root)))
 
 
-def _settle_manual_repairs(campaign, pid, record, review_id, source_pid):
+def _settle_manual_repairs(campaign, pid, record, review_id):
     """Mirror publication's project repair decisions, including paired probes."""
     review = record['review']
     if review['decision'] == 'repair':
@@ -403,12 +403,6 @@ def _settle_manual_repairs(campaign, pid, record, review_id, source_pid):
         return
     if review['decision'] != 'accept':
         return
-    excluded, parent = set(), source_pid
-    while parent != pid and parent not in excluded:
-        excluded.add(parent)
-        parent = campaign.state['projects'].get(parent, {}).get('restart_of')
-        if parent is None:
-            break
     pending = campaign.state.get('pending') or {}
     siblings = {pid: record}
     for key, row in campaign.state['projects'].items():
@@ -417,12 +411,13 @@ def _settle_manual_repairs(campaign, pid, record, review_id, source_pid):
             if 0 < ordinal <= len(campaign.state['waves']) else None)
         if key in pending.get('projects', []):
             wave = pending['wave_id']
-        if key not in excluded and wave == record['origin_wave_id']:
+        if wave == record['origin_wave_id']:
+            key, row = _effective_project(campaign.state['projects'], key)
             siblings[key] = row
     if pending.get('wave_id') == record['origin_wave_id']:
         for item in pending.get('items', []):
-            if item['project_id'] not in excluded:
-                siblings.setdefault(item['project_id'], dict(repairs=item.get('repairs', [])))
+            key, row = _effective_project(campaign.state['projects'], item['project_id'])
+            siblings.setdefault(key, row or dict(repairs=item.get('repairs', [])))
     obligations = campaign.scheduler.state()['repairs']
     for repair_id in record.get('repairs', []):
         if obligations.get(repair_id, {}).get('status') != 'open':
@@ -438,7 +433,7 @@ def _finish_linked_siblings(campaign, record, snapshot, request, request_path):
     pending = campaign.state.get('pending') or {}
     if pending.get('wave_id') != record['origin_wave_id']:
         return
-    linked = []
+    linked = {}
     for item in pending.get('items', []):
         pid = item['project_id']
         if (pid == record['plan']['project_id'] or pid in record.get('supersedes', [])
@@ -447,17 +442,21 @@ def _finish_linked_siblings(campaign, record, snapshot, request, request_path):
         row = campaign.state['projects'].setdefault(pid, dict(plan=item,
             objective=pending['subject']['objective'], repairs=item.get('repairs', []),
             wave_index=len(campaign.state['waves'])+1))
-        linked.append((pid, row))
+        pid, row = _effective_project(campaign.state['projects'], pid)
+        if pid == record['plan']['project_id']:
+            continue
+        linked[pid] = row
         if 'outcome' not in row:
             request['phase'] = 'executing'
             atomic(request_path, canonical(request))
-            directory = campaign.root / 'waves' / pending['wave_id'] / pid
-            row['outcome'] = campaign.execute(item, snapshot, directory,
+            directory = (campaign.root / row['directory'] if row.get('directory')
+                         else campaign.root / 'waves' / pending['wave_id'] / pid)
+            row['outcome'] = campaign.execute(row['plan'], snapshot, directory,
                 remaining_seconds=campaign._remaining()).as_dict()
             campaign._save()
     request['phase'] = 'reviewing'
     atomic(request_path, canonical(request))
-    for pid, row in linked:
+    for pid, row in linked.items():
         campaign._review(pid, row)
         if row['review']['decision'] == 'repair':
             campaign.scheduler.add_repair(pid, record['subject_id'], pid,
