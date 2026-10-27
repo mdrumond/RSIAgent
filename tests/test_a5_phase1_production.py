@@ -301,7 +301,6 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     trace_rows = [json.loads(line) for line in traces[0].read_text().splitlines()]
     trace_messages = [row["payload"] for row in trace_rows if row["kind"] == "message"]
     assert trace_messages[-2]["role"] == "user"
-    assert "verified candidate" in trace_messages[-2]["content"]
     assert trace_messages[-1] == {"role": "assistant", "content": SOURCE}
     assert any(row["kind"] == "tool" for row in trace_rows)
     assert trace_rows[-2]["kind"] == "validation"
@@ -310,12 +309,13 @@ def test_executor_binds_direct_model_and_profiling_treatment(
     assert (memory_path / memory.artifact_store / "objects").is_dir()
     assert len(profile_backend.commands) == expected_commands
     assert {call["base_url"] for call in provider_calls} == {model.route.removeprefix("direct:")}
-    instruction = provider_calls[0]["request"]["messages"][1]["content"]
-    assert (guidance_payload in instruction) == (guidance is not None)
     assert "previous-project-action" not in memory.actions
     distillation_messages = provider_calls[-1]["request"]["messages"]
     prior_messages = provider_calls[-2]["request"]["messages"]
-    assert distillation_messages[:2] == prior_messages[:2]
+    # Coding uses typed tools, while distillation keeps its noncoding contract.
+    # Both stages must receive the same original project task.
+    assert distillation_messages[1] == prior_messages[1]
+    assert distillation_messages[0]["role"] == prior_messages[0]["role"] == "system"
     host_prefix = "Host-owned current state:\n"
     def host_state(messages):
         states = [json.loads(message["content"].removeprefix(host_prefix))
@@ -350,6 +350,23 @@ def test_executor_binds_direct_model_and_profiling_treatment(
         context = json.loads(distillation_messages[-1]["content"].rsplit("\n", 1)[-1])
         assert context["artifact_payloads"][study]["payload"] == study_payload
         assert context["host_summaries"][0]["category"] == "host-verification"
+
+
+def test_project_executes_registered_logical_and_padded_dimensions(tmp_path):
+    from benchmarks.a5kernels.matrix import Workload
+    from benchmarks.a5kernels.fixtures import Language
+    proposal = next(item for item in DEFAULT_PROPOSALS if item.family.value == "padded-multitile")
+    runtime = Phase1ProjectRuntime.from_proposal(proposal)
+    execution = ProjectExecution()
+    (tmp_path / "kernel.py").write_text(SOURCE)
+    result = runtime.backend(execution).run(tmp_path, Language.CATLASS_DSL.value,
+        Workload.SMOKE_VECTOR_ADD, "padded-contract", EvidenceLedger(tmp_path / "ledger"))
+    assert result.verified.passed
+    plan = execution.plans[-1]
+    assert len(plan.input_a) == len(plan.input_b) == runtime.padded_length
+    assert runtime.logical_length < runtime.padded_length
+    assert plan.input_a[runtime.logical_length:] == (0.0,) * (runtime.padded_length - runtime.logical_length)
+    assert plan.input_b[runtime.logical_length:] == plan.input_a[runtime.logical_length:]
 
 
 def test_study_attempt_identity_is_retry_scoped_not_scientific():

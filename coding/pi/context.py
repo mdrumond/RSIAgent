@@ -1,6 +1,7 @@
 """Deterministic admission and bounded, addressable context; no paid compaction."""
 import hashlib
 import json
+import re
 
 
 class ContextLimitError(ValueError):
@@ -45,7 +46,18 @@ class ContextRecords:
                 return self.admit(value)
             return [self.compact(item, threshold) for item in value]
         if isinstance(value, dict):
-            return {key: self.compact(item, threshold) for key, item in value.items()}
+            result = {}
+            for key, item in value.items():
+                if key in {"diagnostic", "compile_diagnostic", "detail"} and isinstance(item, str) and len(item.encode()) > threshold:
+                    # Keep compiler errors visible even after a long warning preamble.
+                    errors = [line for line in item.splitlines()
+                              if re.search(r"(?:fatal )?error:|undefined reference", line)]
+                    if errors:
+                        result[key] = {"errors": "\n".join(errors).encode()[:2048].decode(errors="ignore"),
+                                       "full": self.admit(item)}
+                        continue
+                result[key] = self.compact(item, threshold)
+            return result
         return value
 
     def snapshot(self, context, *, target=24576):

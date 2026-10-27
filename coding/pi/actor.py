@@ -1,6 +1,7 @@
 """Pi action driver, retaining the existing noncoding terminal distillation."""
 import json
 import hashlib
+import re
 
 from benchmarks.a5kernels.phase1_provider import (
     DirectActorDriver, _ActorContinuation, _ProviderEvidenceRecorder,
@@ -21,6 +22,61 @@ def _typed_contract(contract):
         "action arguments; do not print them as JSON responses:",
         1,
     )
+
+
+
+def observation_context(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            pass
+    return value
+
+
+
+def task_contract(executor):
+    """Expose layout and ABI metadata without oracle values or tensor storage."""
+    prepared = getattr(executor, "prepared", None)
+    if prepared is None:
+        return None
+    spec, abi = prepared.spec, prepared.abi
+    input_names = abi.input_arguments[:len(prepared.inputs)]
+    auxiliary = [{"argument": name, "kind": "auxiliary"}
+                 for name in abi.input_arguments[len(prepared.inputs):]]
+    if spec.dtype.value in {"mxfp8_e4m3fn", "mxfp8_e5m2"}:
+        for index, item in enumerate(auxiliary):
+            if index >= len(prepared.inputs):
+                break
+            rows, cols = prepared.inputs[index].shape
+            k, outer = (cols, rows) if index == 0 else (rows, cols)
+            groups = ((k + 31) // 32 + 1) // 2 * 2
+            item.update(kind="mx-scale", dtype="E8M0", group_size=32,
+                logical_shape=[outer, groups] if index == 0 else [groups, outer],
+                physical_shape=[outer, groups],
+                layout="RowMajorMxScaleA" if index == 0 else "ColMajorMxScaleB")
+    return {
+        "shape": list(spec.shape), "dtype": spec.dtype.value,
+        "padding_multiple": spec.padding_multiple, "block_count": spec.block_count,
+        "abi": {"kernel_name": abi.kernel_name, "input_arguments": list(abi.input_arguments),
+                "output_argument": abi.output_argument},
+        "graph": spec.graph.as_dict(),
+        "inputs": [{"argument": name, "logical_shape": list(tensor.shape),
+                    "physical_shape": list(tensor.physical_shape)}
+                   for name, tensor in zip(input_names, prepared.inputs, strict=True)],
+        "auxiliary_inputs": auxiliary,
+        "output": {"argument": abi.output_argument, "logical_shape": list(prepared.expected.shape),
+                   "physical_shape": list(prepared.expected.physical_shape),
+                   "dtype": prepared.expected.dtype},
+    }
+
+
+def typed_contract(prompt):
+    """Replace the registered JSON wire protocol without changing legacy callers."""
+    return re.sub(r"Respond with exactly one JSON object:.*?(?=You cannot choose paths)",
+        "Select one declared typed host tool. Read artifacts with read-artifact using its "
+        "sha256 and returned next_offset; pages are UTF-8 text, at most 8192 bytes. "
+        "Diagnostic observations never establish correctness or timing.\n", prompt, flags=re.S)
 
 
 class PiActorDriver(DirectActorDriver):
@@ -56,6 +112,7 @@ class PiActorDriver(DirectActorDriver):
         turn = conversation.turn
         deadline = min(self.clock() + self.max_seconds,
                        getattr(action_executor, "deadline", float("inf")))
+        contract = task_contract(action_executor)
         latest = None
         history = []
         source = getattr(action_executor, 'source', None)
@@ -94,8 +151,9 @@ class PiActorDriver(DirectActorDriver):
                         recorder._append(kind, digest, turn=turn)
                 try:
                     name, args = session.next_action({
-                        "instruction": instruction, "contract": self.system_prompt,
-                        "latest_host_observation": latest, "source": source,
+                        "instruction": instruction, "contract": typed_contract(self.system_prompt),
+                        "task_contract": contract,
+                        "latest_host_observation": observation_context(latest), "source": source,
                         "recent_host_observations": history[-6:],
                         "remaining_seconds": max(0, deadline-self.clock()),
                         "coding": ENGINE_IDENTITY,
@@ -127,6 +185,7 @@ class PiActorDriver(DirectActorDriver):
                         "description": "The response could not be parsed as an accepted action. No action was executed.",
                         "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
                         "allowed_actions": sorted(allowed),
+                        "reason": action_error or "Selected action does not match the host protocol",
                     }
                     if action_error:
                         host["error"] = action_error
