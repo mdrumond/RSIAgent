@@ -285,7 +285,7 @@ class AdaptivePhase1Coordinator:
         executed_waves = 0
         while True:
             if self._time_exhausted(state):
-                return self._report(state)
+                return self._deadline_report(state)
             remediate = self.automatic_remediation
             obligations = remediate.refresh(state) if remediate else False
             if obligations:
@@ -381,7 +381,13 @@ class AdaptivePhase1Coordinator:
             self._assess_committed_memory(state)
             executed_waves += 1
             if self.allow_partial and self._partial_closed(state):
-                return self._report(state)
+                # Semantic failures have settled evidence for remediation. An
+                # unfinished branch still requires explicit infrastructure recovery.
+                settled = all((self.root / "waves" / wave.wave_id / "branches" /
+                               project.spec.project_id / "outcome.json").is_file()
+                              for project in wave.projects)
+                if remediate is None or not settled:
+                    return self._report(state)
             if wave_limit is not None and executed_waves >= wave_limit:
                 return self._report(state)
 

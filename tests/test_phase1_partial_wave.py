@@ -269,3 +269,83 @@ def test_explicit_partial_continuation_does_not_renew_exhausted_allocation(tmp_p
     result = runner.resume()
     assert result['status'] == 'TIME_BUDGET_EXHAUSTED' and result['remaining_seconds'] == 0
     assert len(selected) == 1 and executed == ['good', 'offline']
+
+
+def test_first_resume_after_active_allocation_crash_publishes_retained_siblings(tmp_path):
+    def select(messages):
+        return _wave(messages[-1]['content'], [_project('good', 'gm-ub-movement'),
+                                              _project('offline', 'simd-vector')])
+    def execute(request):
+        if request.spec.project_id == 'offline':
+            raise OSError('lost observation')
+        return _result(request.spec, True, 'host pass')
+    strict = AdaptivePhase1Coordinator(tmp_path, 'Recover', SEED, CurriculumAgent(select), execute,
+        max_parallel=1, project_target=2, max_seconds=100, clock=lambda: 0)
+    proposal = strict.propose_wave()
+    strict.approve_wave(proposal, ['good', 'offline'])
+    with pytest.raises(RuntimeError, match='failed before verification'):
+        strict.run_approved_wave()
+    state_path = tmp_path/'state.json'
+    state = json.loads(state_path.read_bytes())
+    state.update(allocation_active=True, elapsed_seconds=3)
+    state_path.write_text(json.dumps(state))
+    retained = {path.relative_to(tmp_path): path.read_bytes()
+                for path in (tmp_path/'waves/wave-001/branches/good').rglob('*') if path.is_file()}
+    def forbidden(*args):
+        pytest.fail('crash recovery must not select or execute new work')
+    recovery = AdaptivePhase1Coordinator(tmp_path, 'Recover', SEED, CurriculumAgent(forbidden), forbidden,
+        max_parallel=1, project_target=2, max_seconds=100, clock=lambda: 0, allow_partial=True)
+    report = recovery.resume()
+    assert report['published_projects'] == ['good'] and report['failed_projects'] == 1
+    assert report['status'] == 'TIME_BUDGET_EXHAUSTED' and report['remaining_seconds'] == 0
+    assert report['elapsed_seconds'] == 100 and not (tmp_path/'pending.json').exists()
+    assert report['wave_results'][-1]['closure_reason'] == 'deadline'
+    assert all((tmp_path/path).read_bytes() == data for path, data in retained.items())
+    assert recovery.resume() == report
+
+
+def test_automatic_remediation_keeps_infrastructure_partial_boundary(tmp_path):
+    from benchmarks.ascend.automatic_remediation import AutomaticRemediation
+    selected, executed = [], []
+    def select(messages):
+        selected.append(messages)
+        return _wave(messages[-1]['content'], [_project('bad', 'gm-ub-movement'),
+                                              _project('offline', 'simd-vector')])
+    def execute(request):
+        executed.append(request.spec.project_id)
+        if request.spec.project_id == 'offline':
+            raise OSError('unsettled transport observation')
+        return _result(request.spec, False, 'host mismatch')
+    runner = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
+        max_parallel=1, project_target=2, max_seconds=100, allow_partial=True)
+    AutomaticRemediation(runner, target='a3')
+    report = runner.run()
+    assert report['status'] == 'WAVE_CLOSED'
+    assert len(selected) == 1 and executed == ['bad', 'offline']
+    assert report['published_projects'] == [] and report['failed_projects'] == 2
+
+
+def test_settled_semantic_partial_enters_remediation_without_manual_resume(tmp_path):
+    from benchmarks.ascend.automatic_remediation import AutomaticRemediation
+    selected, executed = [], []
+    automatic = None
+    def select(messages):
+        selected.append(messages)
+        if len(selected) == 1:
+            return _wave(messages[-1]['content'], [_project('bad', 'gm-ub-movement'),
+                                                  _project('good', 'simd-vector')])
+        key, = automatic.feedback.ids
+        return 'DECISION: SATURATED\n' + json.dumps(dict(reason='defer selected failure',
+            failure_investigations=[dict(feedback_id=key, status='deferred', classification='learnable',
+                reason='await another investigation')]))
+    def execute(request):
+        executed.append(request.spec.project_id)
+        return _result(request.spec, request.spec.project_id == 'good', 'host observation')
+    runner = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
+        max_parallel=1, project_target=2, max_seconds=100, allow_partial=True)
+    automatic = AutomaticRemediation(runner, target='a3')
+    report = runner.run()
+    assert len(selected) == 2 and executed == ['bad', 'good']
+    assert report['status'] == 'SATURATED' and report['published_projects'] == ['good']
+    assert len(automatic.store.records()) == 2
+    assert next(row for row in automatic.store.records() if row['outcome']['attempt_id'] == 'bad')['lifecycle'] == 'failed'

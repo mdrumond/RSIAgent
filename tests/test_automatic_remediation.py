@@ -10,7 +10,8 @@ from test_a5_phase1_adaptive import _project, _wave, _result
 
 @pytest.mark.parametrize("assessment_error", [False, True])
 @pytest.mark.parametrize("ready_wave", [False, True])
-def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error, ready_wave):
+@pytest.mark.parametrize("allow_partial", [False, True])
+def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path, assessment_error, ready_wave, allow_partial):
     calls, executions = [], []
     runner = None
     automatic = None
@@ -40,7 +41,7 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
         passed = request.spec.project_id != 'original' or len(executions) > 1
         return _result(request.spec, passed, 'host outcome')
     runner = AdaptivePhase1Coordinator(tmp_path / 'run', 'Repair failures.', b'{}',
-        CurriculumAgent(complete), execute, max_parallel=1, project_target=1)
+        CurriculumAgent(complete), execute, max_parallel=1, project_target=1, allow_partial=allow_partial)
     automatic = AutomaticRemediation(runner, target='a3')
     from types import SimpleNamespace
     assessments, ordinary_assessments = [], []
@@ -495,7 +496,10 @@ def test_failed_original_retry_checkpoint_survives_restart_until_new_ready_recom
     state = json.loads(state_path.read_bytes())
     state['terminal'] = None
     state['failure_investigations'] = [dict(update, status='ready-to-retry', reason='new reviewed evidence')]
-    automatic.feedback.record(state['failure_investigations'], state)
+    from benchmarks.ascend.failure_curriculum import FailureCurriculum, select_feedback
+    review = FailureCurriculum(resumed.root, automatic.store.root,
+        select_feedback(automatic.store.root, 'a3', [key]))
+    review.record(state['failure_investigations'], state)
     atomic(state_path, canonical(state))
     resumed.resume()
     assert executions.count('original') == 3
