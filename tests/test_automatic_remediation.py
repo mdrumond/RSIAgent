@@ -184,21 +184,63 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         row['outcome'].update(source_type='optimizer', original_spec=original,
             task=dict(task_id='original', submission=original))
         atomic(store.root / (row['feedback_id'] + '.json'), canonical(row))
-    received = []
+    received, children, now = [], [], [0]
     def factory(directory, task, memory, bound, **kwargs):
         received.append(memory)
         assert type(bound['phase2_attempt_seconds']) is int and bound['phase2_attempt_seconds'] == 30
         assert bound['max_cases'] == 2
-        return OptimizerTaskExecutor(directory, task, memory, bound,
-            agent=Agent([candidate('good')]), backend=FrozenBackend(12), **kwargs)
+        backend = FrozenBackend(12)
+        backend.interrupt = not children
+        child = OptimizerTaskExecutor(directory, task, memory, bound,
+            agent=Agent([candidate('good')]), backend=backend, **kwargs)
+        prepare = child.prepare
+        def charged_prepare():
+            value = prepare()
+            now[0] += 2
+            return value
+        child.prepare = charged_prepare
+        children.append(child)
+        return child
     monkeypatch.setattr('benchmarks.ascend.phase2_optimizer_execution.OptimizerTaskExecutor', factory)
-    runner = SimpleNamespace(root=source, initial_memory=b'')
+    runner = SimpleNamespace(root=source, initial_memory=b'', clock=lambda: now[0])
     retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
-    retry(row, tmp_path/'retried', 30.75)
+    from optimizer.control import ObservationUnavailable, WorkerStopped
+    with pytest.raises(ObservationUnavailable):
+        retry(row, tmp_path/'retried', 30.75)
+    # Older retained children have no allocation receipt; recover their immutable submission.
+    (tmp_path/'retried/retry-allocation.json').unlink()
+    retry(row, tmp_path/'retried', 20.5)
+    assert children[1].job_id == children[0].job_id
+    assert children[1]._backend.prepares == 0
+    assert children[1]._agent.contexts == []
+    assert len(children[1]._backend.evaluations) == 1
+    import time
+    assert 0 < children[1].deadline - time.monotonic() <= 18.5
     retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
     assert store.link_original_retry(row['feedback_id'], retried['feedback_id'])['lifecycle'] == 'fixed'
     assert received[0]['phase'] == 'committed-phase1'
     assert len(received[0]['memory_entries']) == 1
+    # The same pending child survives a lower parent allowance and changed memory.
+    monkeypatch.setattr('optimizer.memory.freeze_committed_phase1', lambda *args: pytest.fail('snapshot refrozen'))
+    retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
+    retry(row, tmp_path/'retried', 12.5)
+    assert children[1].job_id == children[0].job_id
+    assert received[1] == received[0]
+    assert children[1]._backend.prepares == 0
+    assert children[2].job_id == children[0].job_id
+    assert children[2]._backend.evaluations == []
+    assert children[2]._agent.contexts == []
+    # Export time belongs to this retry, so exhausted setup cannot dispatch.
+    now = [0]
+    runner.clock = lambda: now[0]
+    def slow_export(*args):
+        now[0] += 40
+        return received[0]
+    monkeypatch.setattr('optimizer.memory.freeze_committed_phase1', slow_export)
+    slow_retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
+    with pytest.raises(WorkerStopped, match='elapsed-time'):
+        slow_retry(row, tmp_path/'setup-expired', 30.75)
+    assert len(children) == 3
 
 
 def test_original_retry_propagates_only_remaining_failure_seconds(tmp_path):
@@ -278,3 +320,42 @@ def test_selection_uses_failure_allowance_and_discards_late_wave(tmp_path, late_
     assert runner.run()['status'] == 'STALLED'
     assert len(prompts) == 2 and not executed
     assert next(iter(automatic.state['failures'].values()))['remaining_seconds'] == 0
+
+
+def test_interrupted_failure_clock_excludes_expired_obligation(tmp_path, monkeypatch):
+    from test_generic_failure_feedback import phase1
+    phase1(tmp_path/'source')
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: pytest.fail('expired dispatch'), max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', seconds=10,
+        sources=[dict(type='phase1', root=str(tmp_path/'source'))])
+    state = runner._load_state()
+    automatic.refresh(state)
+    budget = next(iter(automatic.budgets.values()))
+    budget.path.parent.mkdir(parents=True, exist_ok=True)
+    budget.path.write_text(json.dumps(dict(max_seconds=10, elapsed_seconds=2, active_since=100)))
+    monkeypatch.setattr('time.time', lambda: 109)
+    assert not automatic.refresh(state)
+    assert next(iter(automatic.state['failures'].values()))['remaining_seconds'] == 0
+
+
+def test_retry_rechecks_recovered_clock_inside_active(tmp_path, monkeypatch):
+    from test_generic_failure_feedback import phase1
+    phase1(tmp_path/'source')
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', seconds=10,
+        sources=[dict(type='phase1', root=str(tmp_path/'source'))])
+    state = runner._load_state()
+    automatic.refresh(state)
+    key = next(iter(automatic.budgets))
+    automatic.store.update_investigation(key, status='ready-to-retry', evidence=['probe'])
+    automatic.refresh(state)
+    budget = automatic.budgets[key]
+    budget.path.parent.mkdir(parents=True, exist_ok=True)
+    budget.path.write_text(json.dumps(dict(max_seconds=10, elapsed_seconds=2, active_since=100)))
+    wall = iter([107, 109])
+    monkeypatch.setattr('time.time', lambda: next(wall, 109))
+    automatic._phase1_retry = lambda *args: pytest.fail('expired dispatch')
+    automatic.retry_ready(state)
+    assert automatic.state['failures'][key]['retries'] == []

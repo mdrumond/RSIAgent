@@ -680,3 +680,31 @@ def test_missing_retry_justification_is_corrected_before_wave_execution(tmp_path
     decision, _ = agent.select(context, remaining_projects=1)
     assert len(calls) == 2
     assert decision.failure_investigations[0]['retry_skip_reason']
+
+
+def test_linked_failed_retry_is_readable_without_becoming_an_obligation(tmp_path):
+    from test_curriculum_context_files import read_all
+    store, selection, feedback = setup(tmp_path)
+    original = selection['selected'][0]['feedback_id']
+    campaign(tmp_path/'retry', result=dict(verified=False, summary='new diagnostic',
+        result=dict(status='compile-error')))
+    campaign(tmp_path/'unrelated', task=dict(task_id='private', submission=dict(source='private')))
+    store.import_campaign(tmp_path/'retry')
+    store.import_campaign(tmp_path/'unrelated')
+    records = store.records()
+    retry = next(row for row in records if row['outcome']['source_root'] == str((tmp_path/'retry').resolve()))
+    private = next(row for row in records if row['outcome']['source_root'] == str((tmp_path/'unrelated').resolve()))
+    store.link_original_retry(original, retry['feedback_id'])
+    feedback.selection['selected'] = [next(row for row in store.records() if row['feedback_id'] == original)]
+    feedback.lineage = [dict(feedback_id=original, project_id='new-probe', status='investigating')]
+    context = feedback.context({})
+    assert feedback.ids == {original}
+    linked = read_all(feedback.read, context[-1]['selected'][0]['linked_retries_file'])
+    assert [row['feedback_id'] for row in linked] == [retry['feedback_id']]
+    assert linked[0]['category'] == 'compile-failure'
+    assert read_all(feedback.read, linked[0]['failure_cases_file']) == store.failure_cases(retry['feedback_id'])
+    ref = next(iter(retry['outcome']['evidence'].values()))
+    assert feedback.read(ref['sha256'])['text']
+    assert feedback.project_context('new-probe')['feedback_ids'] == [original, retry['feedback_id']]
+    with pytest.raises(ValueError, match='not in selected'):
+        feedback.read(sha(canonical(private['outcome']['task'])))

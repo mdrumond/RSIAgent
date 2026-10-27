@@ -118,13 +118,25 @@ class FailureCurriculum:
         self.ids = {row['feedback_id'] for row in self.selection['selected']}
         return self.selection
 
+    def linked_retries(self, row):
+        """Linked observations are evidence for the original, never obligations."""
+        keys = set(row['investigation'].get('retries', []))
+        return [record for record in self.store.records() if record['feedback_id'] in keys]
+
+    def evidence_rows(self):
+        rows = self.selection['selected'] + self.selection['controls']
+        return rows + [retry for row in self.selection['selected'] for retry in self.linked_retries(row)]
+
     def context(self, state):
         self.state = state
         from .context_files import ContextFiles
         self.context_files = ContextFiles(self.root / "curriculum" / "context")
         rows = []
-        for role in ('selected', 'controls'):
-            for row in self.selection[role]:
+        for role, entries in (('selected', self.selection['selected']),
+                              ('controls', self.selection['controls']),
+                              ('linked-retries', [retry for row in self.selection['selected']
+                                  for retry in self.linked_retries(row)])):
+            for row in entries:
                 out = row['outcome']
                 rows.append(dict(feedback_id=row['feedback_id'], role=role,
                     category=out['category'], lifecycle=row.get('lifecycle'),
@@ -149,6 +161,9 @@ class FailureCurriculum:
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
                 failure_cases_file=next(item['failure_cases_file'] for item in rows if item['feedback_id'] == row['feedback_id']),
+                linked_retries_file=self.context_files.put('linked-retries-' + row['feedback_id'],
+                    [item for item in rows if item['feedback_id'] in
+                     {retry['feedback_id'] for retry in self.linked_retries(row)}]),
                 retry_eligible_pairs=eligible.get(row['feedback_id'], []),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
@@ -181,7 +196,7 @@ class FailureCurriculum:
         digest = sha256
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
-        for row in self.selection['selected'] + self.selection['controls']:
+        for row in self.evidence_rows():
             task = canonical(row['outcome']['task'])
             if sha(task) == digest:
                 return dict(sha256=digest, offset=offset, size=len(task),
@@ -253,13 +268,17 @@ class FailureCurriculum:
                 mode = getattr(spec, 'failure_mode', None)
                 if mode is not None and mode.value != 'none':
                     from .failure_handoff import FailureContext
-                    FailureContext(dict(root=str(self.store.root), feedback_ids=keys), spec).require_repair_evidence(spec)
+                    linked = [retry['feedback_id'] for selected in self.selection['selected']
+                        if selected['feedback_id'] in keys for retry in self.linked_retries(selected)]
+                    FailureContext(dict(root=str(self.store.root), feedback_ids=keys + linked), spec).require_repair_evidence(spec)
         return tuple(rows)
 
     def project_context(self, project_id):
         keys = list(dict.fromkeys(row['feedback_id'] for row in self.lineage
                                  if row.get('project_id') == project_id and row['feedback_id'] in self.ids))
-        return dict(root=str(self.store.root), feedback_ids=keys) if keys else None
+        linked = [retry['feedback_id'] for row in self.selection['selected']
+                  if row['feedback_id'] in keys for retry in self.linked_retries(row)]
+        return dict(root=str(self.store.root), feedback_ids=list(dict.fromkeys(keys + linked))) if keys else None
 
     def record(self, rows, state=None):
         if state is not None:
