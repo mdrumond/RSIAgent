@@ -14,6 +14,19 @@ from .subject_memory import SubjectMemory, StaleMemory
 from .time_budget import AttemptTimeBudget
 
 
+def _effective_project(projects, project_id):
+    """Resolve a canceled wave entry to its current replacement evidence."""
+    seen = set()
+    while True:
+        if project_id in seen:
+            raise ValueError('cyclic project supersession')
+        seen.add(project_id)
+        record = projects[project_id]
+        if not record.get('superseded_by'):
+            return project_id, record
+        project_id = record['superseded_by']
+
+
 class SubjectCampaign:
     def __init__(self, root, subjects, initial_memory, *, select_wave, execute, verifier,
                  complete, max_seconds=7200, memory_gate=None, index_memory=None,
@@ -139,7 +152,7 @@ class SubjectCampaign:
         sibling_evidence = {}
         pending = self.state.get('pending') or {}
         for pid in pending.get('projects', []):
-            sibling = self.state['projects'].get(pid, {})
+            pid, sibling = _effective_project(self.state['projects'], pid)
             if (pid != project_id and pid not in record.get('supersedes', [])
                     and set(record.get('repairs', [])) & set(sibling.get('repairs', []))):
                 sibling_evidence[pid] = sibling['outcome']['observations']

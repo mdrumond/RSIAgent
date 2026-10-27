@@ -217,7 +217,8 @@ def test_successful_probe_keeps_repair_open_until_linked_control_accepts(tmp_pat
 
 
 @pytest.mark.parametrize('cached_reviews', [False, True])
-def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repairs(tmp_path, cached_reviews):
+@pytest.mark.parametrize('paired', [False, True])
+def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repairs(tmp_path, cached_reviews, paired):
     config, root, _, scheduler, artifacts = setup(tmp_path)
     snapshot = scheduler.state()['waves']['wave-1']['memory_snapshot_sha256']
     scheduler.start_wave('wave-2', snapshot)
@@ -232,6 +233,10 @@ def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repa
     state['waves'] = ['wave-1', 'wave-2']
     state['pending'] = dict(wave_id='reserved', subject={'subject_id': 'study', 'objective': 'Study'},
         memory_sha256=snapshot, projects=['one'], items=[item])
+    if paired:
+        state['pending']['projects'].append('control')
+        state['pending']['items'].append(dict(project_id='control', repairs=['obligation'],
+                                             spec={'project_id': 'control'}))
     if cached_reviews:
         state['pending']['review_ids'] = ['one']
     atomic(root/'subject-campaign.json', canonical(state))
@@ -241,23 +246,34 @@ def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repa
     (root/'curriculum-edits').mkdir()
     atomic(root/'curriculum-edits'/(proposal['id']+'.json'), canonical(proposal))
     operation = interaction.request_restart(config, 'campaign', proposal, 15, 'reserved-restart', launcher=lambda *args: None)
-    executed = []
+    executed, reviewed = [], {}
     def execute(plan, frozen, directory, **options):
         executed.append(plan['project_id'])
         assert plan['project_id'] != 'one'
-        source = artifacts.put_bytes(b'repaired source')
-        return SubjectOutcome(True, source, {'source': source}, {}, artifacts.root)
-    builder = real_builder(root, scheduler, artifacts, execution=execute)
+        source = artifacts.put_bytes(plan['project_id'].encode())
+        return SubjectOutcome(True, source, {'source': source},
+                              {'comparison': plan['project_id']}, artifacts.root)
+    def verify(request):
+        reviewed[request.project_id] = request
+    builder = real_builder(root, scheduler, artifacts, execution=execute, reviewed=verify)
     result = interaction.run_request(config, 'campaign', operation['id'], builder=builder)
     assert result['status'] == 'succeeded'
     state = json.loads((root/'subject-campaign.json').read_bytes())
     assert state['projects']['one']['superseded_by'] == 'replacement'
     assert 'outcome' not in state['projects']['one']
-    assert state['pending']['items'] == [item]
+    assert state['pending']['items'][0] == item
     assert state['projects']['replacement']['subject_id'] == 'study'
     assert scheduler.state()['repairs']['obligation']['status'] == 'resolved'
     assert builder().run()['terminal'] == 'COMPLETE'
-    assert executed == ['replacement']
+    assert executed == (['replacement', 'control'] if paired else ['replacement'])
+    if paired:
+        for project, sibling in [('control', 'replacement'), ('replacement', 'control')]:
+            request = reviewed[project]
+            assert json.loads(request.objective)['sibling_evidence'] == {
+                sibling: {'comparison': sibling}}
+            assert request.artifacts[f'sibling:{sibling}:source'] == artifacts.put_bytes(sibling.encode())
+        assert all(not role.startswith('sibling:one:')
+                   for request in reviewed.values() for role in request.artifacts)
     if cached_reviews:
         superseded = scheduler.state()['reviews']['one']
         assert superseded['status'] == 'rejected'
