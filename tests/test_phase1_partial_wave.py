@@ -166,3 +166,39 @@ def test_closed_partial_wave_requires_explicit_next_proposal(tmp_path):
     assert report['published_projects'] == ['good', 'fresh']
     assert report['wave_results'][-1]['status'] == 'complete'
     assert executed.count('offline') == 1 and len(calls) == 2
+
+
+def test_partial_usefulness_only_assesses_published_memory_not_unfinalized_delta(tmp_path):
+    assessed = []
+    def select(messages):
+        return _wave(messages[-1]['content'], [_project('good', 'gm-ub-movement'),
+                                              _project('offline', 'simd-vector')])
+    def execute(request):
+        if request.spec.project_id == 'offline':
+            # A process can disappear after staging a delta but before outcome.
+            (request.branch_root / 'memory-delta.bin').write_bytes(b'unfinalized delta')
+            raise OSError('lost before terminal outcome')
+        return _result(request.spec, True, 'host pass')
+    runner = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
+        max_parallel=1, project_target=2, allow_partial=True)
+    runner.usefulness_verifier = SimpleNamespace(enabled=True,
+        assess_memory=lambda memory, prior, source: assessed.append(source))
+    report = runner.run()
+    assert report['status'] == 'WAVE_CLOSED' and report['published_projects'] == ['good']
+    assert assessed == ['wave-001/good']
+    assert not (tmp_path / 'waves/wave-001/branches/offline/outcome.json').exists()
+
+
+def test_project_admission_timeout_does_not_quarantine_a_healthy_worker():
+    from benchmarks.a5kernels.phase1_wave_runtime import ProjectAdmissionTimeout
+    calls = []
+    def worker(request):
+        calls.append(request)
+        if request == 'expired':
+            raise ProjectAdmissionTimeout('expired before work admission')
+        return 'completed'
+    pool = NativeProjectPool([worker])
+    with pytest.raises(ProjectAdmissionTimeout):
+        pool('expired')
+    assert pool('fresh') == 'completed'
+    assert pool.quarantined == [] and calls == ['expired', 'fresh']

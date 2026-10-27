@@ -9,14 +9,16 @@ from optimizer.jobs import JobStore, atomic, canonical, sha
 from .phase2_feedback import FeedbackStore
 
 
-GUIDANCE = '''Investigate the supplied Phase 2 observations, which are failures or
+GUIDANCE = '''Investigate the supplied Phase 1, Phase 2 and optimizer observations, which are failures or
 working controls, NOT verified reusable knowledge. Distinguish learnable kernel,
 numerical, compilation and performance issues from infrastructure/provider errors,
 invalid specifications and suspected unsupported/impossible requirements. A budget
 exhaustion never proves impossibility. Explain evidence-based deferrals; do not
 invent projects to repair infrastructure. Read retained source/host diagnostics
 with {"read_artifact":{"sha256":"exact hash","offset":0,"limit":8192}};
-at most six reads per selection. Raw profiling stays remote; use compact digests.
+Reads share the remaining elapsed allowance. Optional detailed failure-case files
+include exact input/expected/observed artifact references and availability explanations;
+read them when those details are needed for a repair. Raw profiling stays remote; use compact digests.
 The selection-index lists EVERY selected failure, including observations outside
 the current detailed page. Use its classifications/summaries to defer infrastructure
 or provider failures without inventing kernel work; its hashes are also readable.
@@ -27,7 +29,14 @@ Add optional top-level failure_investigations to the ordinary DECISION JSON,
 outside the strict WaveSpec: [{"feedback_id":"...","status":"investigating",
 "classification":"learnable","reason":"...","project_id":"probe-id",
 "control_project_id":"control-id","hypothesis":"...","observation":"..."}].
-Every project in a feedback-directed wave must be a probe or control in this list.
+For remedial metric studies, use one supported bounded sweep rather than serial
+one-parameter projects; correctness and failure-isolation probes remain distinct.
+Prioritize remediation; fill remaining wave slots with new projects. Only remedial
+projects require probe/control lineage in this list. Use failure_mode=none and omit
+failure-repair for exploratory probes doing a different computation. A repair
+requires the attached observed failing case for the same graph, dtype, exact
+inputs, expected results and comparison policy; never ask the actor to invent
+or rediscover a mismatch. The observer supplies the failing example.
 Classifications: learnable, infrastructure, provider, invalid-specification,
 suspected-unsupported, suspected-impossible. Status: investigating, deferred,
 ready-to-retry. Deferred needs reason; budget exhaustion alone is not a reason
@@ -35,6 +44,27 @@ to label a specification impossible. Recommend ready-to-retry only for a previou
 linked, committed experiment with retained host evidence and a verified control;
 the probe may have failed usefully. This recommends a retry, never proves a root
 cause or resolves the original task. Terminal decisions may carry the same list.
+The goal of remediation is to improve outcomes on the original failed project.
+The original retry is a fresh repair attempt using current memory, not a replay of
+the old candidate, and is exempt from new-project novelty. A known applicable cause
+and repair lesson means retry next unless a concrete execution blocker remains.
+Missing coverage of unrelated operators or layouts does not justify delaying it.
+Once a linked experiment has committed host evidence and a verified control,
+make ready-to-retry the default when that evidence suggests a plausible repair. The original retry is itself an experiment:
+it tests whether the learned knowledge transfers. You do not need a complete
+root-cause explanation before recommending it. Further investigation may be
+appropriate. If you keep a failure investigating despite eligible probe/control
+evidence, use the existing reason field to identify the remaining uncertainty and
+explain why another probe is more useful than retrying the original now. The
+selection-index exposes host-derived retry_eligible_pairs. Every selection,
+including an otherwise new-project-only wave, must explicitly update each eligible
+failure still investigating with a nonempty reason. Continuing investigating also
+requires a separate nonempty retry_skip_reason stating the remaining uncertainty
+and why the proposed probe is more useful than retrying the original now. Missing
+updates or retry_skip_reason will be rejected. Explicit deferral uses its existing
+reason; ready-to-retry needs no retry_skip_reason. Consider
+the remaining elapsed allowance and leave time for the original retry. A passing
+remedial project alone never proves the original is fixed.
 Never mark a failure resolved: only a successful original-target retry can do so.'''
 
 
@@ -53,11 +83,11 @@ def select_feedback(root, target, ids=(), *, retry_id=None):
     if retry_id:
         selected = [retry_id]
     if not selected:
-        raise ValueError('no unresolved Phase 2 feedback selected')
+        raise ValueError('no unresolved failure feedback selected')
     result = []
     for key in dict.fromkeys(selected):
         if key not in by_id:
-            raise ValueError('unknown Phase 2 feedback ID: ' + key)
+            raise ValueError('unknown failure feedback ID: ' + key)
         row = by_id[key]
         outcome = row['outcome']
         if not compatible(outcome):
@@ -77,49 +107,115 @@ class FailureCurriculum:
         self.lineage = json.loads(self.path.read_bytes()) if self.path.exists() else []
         self.ids = {r['feedback_id'] for r in selection['selected']}
 
+    def refresh(self, target):
+        """Reload unresolved observations before selecting the next mixed wave."""
+        try:
+            self.selection = select_feedback(self.store.root, target)
+        except ValueError as error:
+            if str(error) != 'no unresolved failure feedback selected':
+                raise
+            self.selection = dict(selected=[], controls=[])
+        self.ids = {row['feedback_id'] for row in self.selection['selected']}
+        return self.selection
+
+    def linked_retries(self, row, records=None):
+        """Linked observations are evidence for the original, never obligations."""
+        if records is None:
+            records = {record['feedback_id']: record for record in self.store.records()}
+        current = records.get(row['feedback_id'], row)
+        return [records[key] for key in current['investigation'].get('retries', []) if key in records]
+
+    def evidence_rows(self):
+        records = {record['feedback_id']: record for record in self.store.records()}
+        rows = self.selection['selected'] + self.selection['controls']
+        return rows + [retry for row in self.selection['selected']
+                       for retry in self.linked_retries(row, records)]
+
     def context(self, state):
         self.state = state
+        from .context_files import ContextFiles
+        self.context_files = ContextFiles(self.root / "curriculum" / "context")
+        records = {record['feedback_id']: record for record in self.store.records()}
+        linked = {row['feedback_id']: self.linked_retries(row, records)
+                  for row in self.selection['selected']}
         rows = []
-        for role in ('selected', 'controls'):
-            for row in self.selection[role]:
+        for role, entries in (('selected', self.selection['selected']),
+                              ('controls', self.selection['controls']),
+                              ('linked-retries', [retry for retries in linked.values() for retry in retries])):
+            for row in entries:
                 out = row['outcome']
                 rows.append(dict(feedback_id=row['feedback_id'], role=role,
-                    category=out['category'], task={k: v for k, v in out['task'].items() if k != 'submission'},
+                    category=out['category'], lifecycle=row.get('lifecycle'),
+                    retries=row['investigation']['retries'], task={k: v for k, v in out['task'].items() if k != 'submission'},
                     task_sha256=sha(canonical(out['task'])),
                     submission_preview=json.dumps(out['task'].get('submission'), sort_keys=True)[:2048],
                     investigations=[r for r in self.lineage if r['feedback_id'] == row['feedback_id']][-3:],
                     interpretation=out['interpretation'],
                     host_result=json.dumps(out['result'].get('result'), sort_keys=True)[:4096],
-                    speedup=out['result'].get('speedup'), evidence=out['evidence']))
+                    speedup=out['result'].get('speedup'), evidence=out['evidence'],
+                    failure_cases_file=self.context_files.put('failure-cases-' + row['feedback_id'],
+                        self.store.failure_cases(row['feedback_id']))))
         # Keep source/evidence hash-readable, never put entire candidate/report in context.
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
         chosen = [r for r in rows if r['role'] == 'selected'][start:start+8] + [r for r in rows if r['role'] == 'controls'][:2]
+        presentations = {row['feedback_id']: row for row in rows}
         manifest = []
+        eligible = self.retry_eligible_pairs(state)
         latest = {row['feedback_id']: row for row in self.lineage}
         for row in self.selection['selected']:
             out = row['outcome']
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
+                failure_cases_file=next(item['failure_cases_file'] for item in rows if item['feedback_id'] == row['feedback_id']),
+                linked_retries_file=self.context_files.put('linked-retries-' + row['feedback_id'],
+                    [presentations[retry['feedback_id']] for retry in linked[row['feedback_id']]]),
+                retry_eligible_pairs=eligible.get(row['feedback_id'], []),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
                 task_sha256=sha(canonical(out['task'])),
                 evidence={role: ref['sha256'] for role, ref in out['evidence'].items()}))
         return (*(_preview(row) for row in chosen), {'role': 'selection-index', 'selected': manifest})
 
+    def retry_eligible_pairs(self, state):
+        """Only committed linked probe/control evidence makes an original eligible."""
+        eligible = {}
+        for row in self.lineage:
+            key = row['feedback_id']
+            if key not in self.ids or not self._supported(row, state):
+                continue
+            pair = dict(project_id=row['project_id'], control_project_id=row['control_project_id'], host_supported=True)
+            pairs = eligible.setdefault(key, [])
+            if pair not in pairs:
+                pairs.append(pair)
+        return eligible
+
     def read(self, sha256, offset=0, limit=8192):
+        if not hasattr(self, 'context_files'):
+            from .context_files import ContextFiles
+            self.context_files = ContextFiles(self.root / 'curriculum' / 'context')
+        if sha256 in self.context_files.advertised:
+            return self.context_files.read(sha256, offset, limit)
+        return self.context_files.record_read(self._read_evidence(sha256, offset, limit))
+
+    def _read_evidence(self, sha256, offset=0, limit=8192):
         digest = sha256
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
-        for row in self.selection['selected'] + self.selection['controls']:
+        records = self.evidence_rows()
+        for row in records:
             task = canonical(row['outcome']['task'])
             if sha(task) == digest:
                 return dict(sha256=digest, offset=offset, size=len(task),
                     text=task[offset:offset+limit].decode(errors='replace'),
                     next_offset=offset+limit if offset+limit < len(task) else None)
+            try:
+                return self.store.read_failure_artifact(row['feedback_id'], digest, offset, limit)
+            except FileNotFoundError:
+                pass
             for ref in row['outcome']['evidence'].values():
                 if ref['sha256'] == digest:
-                    return self.store.read_evidence(digest, offset=offset, limit=limit)
+                    return self.store.read_evidence(digest, offset=offset, limit=limit, records=records)
         raise ValueError('artifact is not in selected feedback')
 
     def admit(self, rows, wave, context):
@@ -127,7 +223,6 @@ class FailureCurriculum:
             raise ValueError('failure_investigations must be a list')
         projects = {p.spec.project_id for p in wave.projects} if wave else set()
         prior = {p.project_id for p in context.prior_outcomes if p.verified}
-        covered = set()
         for row in rows:
             if not isinstance(row, dict):
                 raise ValueError('failure_investigations entries must be objects')
@@ -147,20 +242,52 @@ class FailureCurriculum:
             if row['status'] == 'investigating':
                 if probe not in projects or not row.get('hypothesis') or not row.get('observation'):
                     raise ValueError('investigation requires a small probe, hypothesis and observation')
-                covered.update({probe, control} & projects)
             elif not any(old['feedback_id'] == row['feedback_id'] and
                     old.get('project_id') == probe and old.get('control_project_id') == control
                     for old in self.lineage):
                 raise ValueError('retry recommendation requires a previously linked probe/control')
             elif not self._supported(row, self.state):
                 raise ValueError('retry recommendation requires committed host probe/control evidence')
-        if projects - covered:
-            raise ValueError('feedback wave contains projects without investigation lineage')
+        eligible = self.retry_eligible_pairs(getattr(self, 'state', {}))
+        submitted = {row['feedback_id']: row for row in rows}
+        current = {row['feedback_id']: row['investigation'] for row in self.selection['selected']}
+        current.update({row['feedback_id']: row for row in self.lineage})
+        for key in eligible:
+            if current[key]['status'] in {'deferred', 'resolved'}:
+                continue
+            update = submitted.get(key)
+            if update is None:
+                if current[key]['status'] == 'ready-to-retry':
+                    continue
+                raise ValueError('retry-eligible failure requires an explicit investigation update with reason: ' + key)
+            if update['status'] == 'investigating' and (
+                    not isinstance(update.get('retry_skip_reason'), str)
+                    or not update['retry_skip_reason'].strip()):
+                raise ValueError('retry-eligible investigation requires retry_skip_reason explaining why another probe is preferable: ' + key)
         latest = {row['feedback_id']: row for row in [*self.lineage, *rows]}
         if wave is None and any(latest.get(key, {}).get('status') not in
                 {'ready-to-retry', 'deferred'} for key in self.ids):
             raise ValueError('terminal feedback curriculum must recommend retry or explain deferral for every selected failure')
+        if wave is not None:
+            records = {record['feedback_id']: record for record in self.store.records()}
+            for project in wave.projects:
+                spec = project.spec
+                keys = [row['feedback_id'] for row in rows if row.get('project_id') == spec.project_id]
+                mode = getattr(spec, 'failure_mode', None)
+                if mode is not None and mode.value != 'none':
+                    from .failure_handoff import FailureContext
+                    linked = [retry['feedback_id'] for selected in self.selection['selected']
+                        if selected['feedback_id'] in keys for retry in self.linked_retries(selected, records)]
+                    FailureContext(dict(root=str(self.store.root), feedback_ids=keys + linked), spec).require_repair_evidence(spec)
         return tuple(rows)
+
+    def project_context(self, project_id):
+        keys = list(dict.fromkeys(row['feedback_id'] for row in self.lineage
+                                 if row.get('project_id') == project_id and row['feedback_id'] in self.ids))
+        records = {record['feedback_id']: record for record in self.store.records()}
+        linked = [retry['feedback_id'] for row in self.selection['selected']
+                  if row['feedback_id'] in keys for retry in self.linked_retries(row, records)]
+        return dict(root=str(self.store.root), feedback_ids=list(dict.fromkeys(keys + linked))) if keys else None
 
     def record(self, rows, state=None):
         if state is not None:
@@ -214,7 +341,9 @@ class FailureCurriculum:
                 other = [r for r in current['projects'] if
                          not isinstance(r, dict) or r.get('campaign_root') != str(self.root)]
                 other_evidence = [e for e in current['evidence'] if e not in evidence]
-                return dict(status=status, classification=latest['classification'], reason=latest['reason'],
+                return dict(status=status, classification=latest['classification'],
+                    reason=(latest['reason'] + '\nRetry skipped: ' + latest['retry_skip_reason']
+                            if status == 'investigating' and latest.get('retry_skip_reason') else latest['reason']),
                     projects=[*other, *(dict(row, campaign_root=str(self.root)) for row in rows)],
                     evidence=[*other_evidence, *evidence])
             self.store.update_investigation(key, merge=merge)
@@ -233,7 +362,11 @@ def retry_spec(selection, target):
     manifest = frozen.get('manifest', {})
     if not frozen.get('suite_sha256') or not manifest.get('policy') or not manifest.get('submission'):
         raise ValueError('original frozen suite or comparison policy is missing')
-    return dict(feedback_id=row['feedback_id'], task=out['task'],
+    task = out['task']
+    if out.get('source_type') == 'optimizer':
+        task = dict(task, submission=manifest['submission'],
+                    rationale=task.get('rationale', 'Retry the original frozen optimizer contract'))
+    return dict(feedback_id=row['feedback_id'], task=task,
         suite_sha256=frozen['suite_sha256'], policy=manifest['policy'],
         frozen_submission=manifest.get('submission'),
         max_cases=out['runtime'].get('max_cases') or 24)
@@ -246,6 +379,13 @@ def link_retry(job):
     store = FeedbackStore(job['feedback_root'])
     store.import_campaign(job['root'])
     original = next(r for r in store.records() if r['feedback_id'] == job['retry_feedback_id'])
+    if original['outcome'].get('source_type') == 'optimizer':
+        for row in store.records():
+            outcome = row['outcome']
+            if (outcome['source_root'] == str(Path(job['root']).resolve())
+                    and outcome['task'].get('task_id') == original['outcome']['task']['task_id']):
+                store.link_original_retry(original['feedback_id'], row['feedback_id'])
+        return
     retries = [r for r in store.records() if r['outcome']['source_root'] == str(Path(job['root']).resolve())
                and r['outcome']['task'] == original['outcome']['task']]
     def merge(current):

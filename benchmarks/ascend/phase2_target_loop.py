@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import hashlib
 import json
 import time
+from pathlib import Path
 
 from .phase2_time import Phase2TimeBudget
 
@@ -15,6 +17,53 @@ from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator
 from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
 from benchmarks.ascend.phase2_target_selector import TargetCurriculumContext
+
+
+def _retained_artifact_page(ref, payload, artifacts):
+    """Authenticate one linked artifact without loading its full body."""
+    digest = payload['sha256']
+    offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
+    hasher, decoder = hashlib.sha256(), codecs.getincrementaldecoder('utf-8')()
+    utf8 = True
+    path = artifacts._path(digest)
+    if not path.is_file():
+        path = Path(ref['retained_path'])
+    with path.open('rb') as stream:
+        while block := stream.read(1024 * 1024):
+            hasher.update(block)
+            if utf8:
+                try:
+                    decoder.decode(block)
+                except UnicodeDecodeError:
+                    utf8 = False
+        if hasher.hexdigest() != digest:
+            raise ValueError('native failure artifact digest mismatch')
+        if utf8:
+            try:
+                decoder.decode(b'', final=True)
+            except UnicodeDecodeError:
+                utf8 = False
+        size = stream.tell()
+        stream.seek(offset)
+        page = stream.read(limit)
+    raw = dict(event='artifact-page', sha256=digest, offset=offset, size_bytes=size,
+               next_offset=offset + len(page) if offset + len(page) < size else None)
+    view = dict(raw)
+    if not utf8 or (page and page[0] & 0xC0 == 0x80):
+        view.update(encoding='binary', text_available=False,
+                    note='No UTF-8 preview at this byte offset; exact bytes remain in the retained artifact.')
+    else:
+        text = page.decode('utf-8', errors='ignore')
+        consumed = len(text.encode('utf-8'))
+        if page and not consumed:
+            raise ValueError('page limit cannot fit the next UTF-8 codepoint; use limit >= 4')
+        page = page[:consumed]
+        view.update(encoding='utf-8', text_available=True, text=text,
+                    next_offset=offset + consumed if offset + consumed < size else None)
+        raw['next_offset'] = view['next_offset']
+    raw.update(text=page.decode('utf-8', errors='replace'), base64=base64.b64encode(page).decode('ascii'))
+    view.update(page_bytes=len(page), full_observation_sha256=artifacts.put_json(raw))
+    return view
 
 
 class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
@@ -68,13 +117,38 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         targets = [row for row in state["attempts"] if row["kind"] == "target"]
         if not targets:
             raise ValueError("execute the fixed target before curriculum review")
-        return TargetCurriculumContext(self.target, targets[-1],
+        refs, reader = self._context_files(state)
+        from .context_files import ContextFiles
+        from .agent_presentation import _preview
+        files = ContextFiles(self.root / 'curriculum' / 'context')
+        observed = files.put('latest-target-attempt', targets[-1])
+        from .phase2_feedback import FeedbackStore
+        cases, raw_refs = [], {}
+        for attempt in state['attempts']:
+            branch = self.root / 'waves' / attempt['wave_id'] / 'branches' / attempt['project_id']
+            retained = FeedbackStore._phase1_failure_cases(branch, attempt['spec'])
+            cases.extend(retained)
+            for case in retained:
+                raw_refs.update({ref['sha256']: ref for ref in case['artifacts'].values()})
+        case_file = files.put('native-failure-cases', cases)
+        memory_reader = reader
+        def reader(**payload):
+            if payload.get('sha256') in {observed['sha256'], case_file['sha256']}:
+                return files.read(**payload)
+            if payload.get('sha256') in raw_refs:
+                offset, limit = payload.get('offset', 0), payload.get('limit', 8192)
+                if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
+                    raise ValueError('artifact page requires nonnegative offset and limit 1..8192')
+                return files.record_read(_retained_artifact_page(raw_refs[payload['sha256']], payload, files.artifacts))
+            return memory_reader(**payload)
+        return TargetCurriculumContext(self.target, _preview(targets[-1]),
             tuple([*self._curriculum_feedback(state),
                    *[row for row in state["attempts"][-2:] if row["kind"] == "practice"]]),
             self.time.remaining,
             self.time.practice_remaining, self.available_tools,
             used_project_ids=tuple(sorted({row["project_id"]
-                for row in [*self.seed_outcomes, *state["attempts"]]})))
+                for row in [*self.seed_outcomes, *state["attempts"]]})),
+            context_files=(*refs, observed, case_file), artifact_reader=reader)
 
     def _select_pending(self, state):
         snapshot = self._memory_snapshot(state)

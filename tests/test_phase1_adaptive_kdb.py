@@ -1,6 +1,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -185,3 +186,26 @@ def test_gz_binding_records_selected_transport_runtime_without_substitution(tmp_
     assert native_target_runtime(cfg, transport)['runtime'] == 'another-registered-runtime'
     transport.runtime_identity = {}
     assert native_target_runtime(cfg, transport) is None
+
+
+def test_collection_setup_consumes_shared_librarian_allowance(tmp_path, monkeypatch):
+    import benchmarks.ascend.phase1_knowledge as module
+    cfg, calls = replace(config(tmp_path), librarian_seconds=1), []
+    knowledge = NativeAdaptiveKnowledge(cfg, Embeddings(), completion(calls))
+    clock = [100.0]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    original_gate = knowledge._gate
+    gates = []
+    def delayed_gate(root):
+        gate = original_gate(root)
+        gates.append(gate)
+        clock[0] += 2
+        return gate
+    monkeypatch.setattr(knowledge, '_gate', delayed_gate)
+    result = knowledge.actor_query({'query': 'pipeline'}, actor_context(tmp_path))
+    assert result.observation['status'] == 'insufficient' and not result.citations
+    assert calls == []
+    state = json.loads((tmp_path / 'branch' / 'librarian-budget.json').read_bytes())
+    assert state['elapsed_seconds'] == 2 and state['active_since'] is None
+    with pytest.raises(sqlite3.ProgrammingError):
+        gates[0].database.connection.execute('SELECT 1')

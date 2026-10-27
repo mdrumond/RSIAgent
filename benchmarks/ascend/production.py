@@ -161,7 +161,9 @@ class NativeProjectPool:
             self.live += 1
 
     def __call__(self, request):
-        from benchmarks.a5kernels.phase1_wave_runtime import ProjectAdmissionTimeout, SemanticProjectFailure
+        from benchmarks.a5kernels.phase1_wave_runtime import (
+            ProjectAdmissionTimeout, SemanticProjectFailure,
+        )
         import time
         seconds = getattr(request, "remaining_seconds", None)
         deadline = time.monotonic() + seconds if seconds is not None else float("inf")

@@ -77,5 +77,6 @@ def test_stop_kills_provider_descendants(tmp_path):
             state = stat.read_text().split()[2]
         except (FileNotFoundError, ProcessLookupError):
             continue  # The killed descendant was reaped between observations.
-        assert state == 'Z'
+        # Linux may briefly expose a dead task before it becomes a zombie or is reaped.
+        assert state in {'X', 'Z'}
     assert agent.process is None

@@ -260,11 +260,15 @@ def test_duplicate_practice_correction_is_bounded_without_consuming_attempts(tmp
     c.run_attempt()
     calls = []
     duplicate = replace(practice(c), project_id=c.seed_outcomes[0]["project_id"])
-    c.curriculum = TargetCurriculumAgent(lambda messages: (
-        calls.append(messages), wire("PRACTICE", duplicate))[1])
-    with pytest.raises(ValueError, match="after 3 attempts.*fresh project ID"):
+    selection_time = [0]
+    def invalid(messages):
+        calls.append(messages)
+        selection_time[0] += 20
+        return wire("PRACTICE", duplicate)
+    c.curriculum = TargetCurriculumAgent(invalid, clock=lambda: selection_time[0])
+    with pytest.raises(ValueError, match="elapsed-time budget exhausted.*fresh project ID"):
         c.resume()
-    assert len(calls) == 3
+    assert len(calls) > 3
     assert len(requests) == 1
     assert not (c.root / "pending.json").exists()
     assert c.report()["practice_attempts"] == 0
@@ -381,3 +385,119 @@ def test_archive_next_kind_matches_completed_history_including_pending_work(tmp_
         _verify_adaptive_state(c.root, state)
     c._atomic_json(c.root / "state.json", state)
     assert {"kind": "invalid-adaptive-memory-chain"} in inventory_campaign(c.root)["issues"]
+
+
+def test_native_curriculum_reads_retained_failure_case_and_candidate_only(tmp_path):
+    from pathlib import Path
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    source = b'actual wrong candidate'
+    def execute(request, count):
+        objects = ContentAddressedArtifacts(request.branch_root/'artifacts')
+        source_hash = objects.put_bytes(source)
+        payloads = dict(inputs={'tensors':[{'storage':list(request.inputs[0].storage)}]},
+                        expected={'dtype':'float32','storage':list(request.oracle.storage)},
+                        observed={'output':[0.0]*len(request.oracle.storage)})
+        retain_phase1_failure(objects, request.spec, source_hash, 'host-mismatch',
+                              'Actual retained mismatch.', payloads, 'float32')
+        result = _result(request.spec, False, 'host mismatch')
+        return replace(result, evidence_payload=canonical_bytes(dict(classification='host-mismatch',
+            source_sha256=source_hash, artifacts={name:objects.put_json(value) for name,value in payloads.items()})))
+    coordinator, _, _ = build(tmp_path, [], execute=execute)
+    coordinator.run_attempt()
+    state = coordinator._load_state()
+    context = coordinator._context(state, coordinator._memory_snapshot(state))
+    case_ref = next(ref for ref in context.context_files if ref['filename'].startswith('native-failure-cases'))
+    cases = json.loads(context.artifact_reader(**case_ref['read_artifact'])['text'])
+    assert cases and cases[0]['classification']=='host-mismatch'
+    raw = cases[0]['artifacts']
+    assert context.artifact_reader(sha256=raw['source']['sha256'])['text']==source.decode()
+    expected = json.loads(context.artifact_reader(sha256=raw['expected']['sha256'])['text'])
+    assert expected['storage']
+    with pytest.raises(ValueError):
+        context.artifact_reader(sha256=coordinator.target.reference_sha256)
+    artifact = Path(raw['source']['retained_path'])
+    artifact.write_bytes(b'changed')
+    with pytest.raises(ValueError, match='digest mismatch'):
+        context.artifact_reader(sha256=raw['source']['sha256'])
+
+
+@pytest.mark.parametrize('retained_copy', [False, True])
+def test_native_failure_pages_stream_only_the_selected_large_artifact(tmp_path, monkeypatch, retained_copy):
+    from pathlib import Path
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    from benchmarks.ascend.failure_cases import retain_phase1_failure
+    observed = {'output': [0.0] * 600000}
+    data = canonical_bytes(observed)
+    assert len(data) > 2 * 1024 * 1024
+
+    def execute(request, count):
+        objects = ContentAddressedArtifacts(request.branch_root / 'artifacts')
+        source = objects.put_bytes(b'wrong candidate')
+        payloads = dict(inputs={'tensors': []}, expected={'storage': list(request.oracle.storage)},
+                        observed=observed)
+        retain_phase1_failure(objects, request.spec, source, 'host-mismatch', 'Wrong output shape.',
+                              payloads, 'float32')
+        result = _result(request.spec, False, 'host mismatch')
+        return replace(result, evidence_payload=canonical_bytes(dict(classification='host-mismatch',
+            source_sha256=source, artifacts={name: objects.put_json(value) for name, value in payloads.items()})))
+
+    coordinator, _, _ = build(tmp_path, [], execute=execute)
+    coordinator.run_attempt()
+    state = coordinator._load_state()
+    context = coordinator._context(state, coordinator._memory_snapshot(state))
+    ref = next(r for r in context.context_files if r['filename'].startswith('native-failure-cases'))
+    case = json.loads(context.artifact_reader(**ref['read_artifact'])['text'])[0]
+    selected = case['artifacts']['observed']
+    path = Path(selected['retained_path'])
+    retained = ContentAddressedArtifacts(coordinator.root / 'curriculum/context/artifacts')
+    if retained_copy:
+        retained.put_bytes(data)
+        path.unlink()
+        path = retained._path(selected['sha256'])
+    original_read = Path.read_bytes
+    def bounded_read(self):
+        assert self != path, 'large failure pages must not load the entire artifact'
+        return original_read(self)
+    monkeypatch.setattr(Path, 'read_bytes', bounded_read)
+    # Missing unrelated data must not prevent authenticating this selected page.
+    Path(case['artifacts']['expected']['retained_path']).unlink()
+    page = context.artifact_reader(sha256=selected['sha256'], offset=1024, limit=127)
+    assert page['text'].encode() == data[1024:1151]
+    assert page['encoding'] == 'utf-8' and page['text_available']
+    assert page['size_bytes'] == len(data) and page['page_bytes'] == 127
+    assert page['next_offset'] == 1151
+    import base64
+    raw = retained.read_json(page['full_observation_sha256'])
+    assert base64.b64decode(raw['base64']) == data[1024:1151]
+    audit = (coordinator.root / 'curriculum/context/read-pages.jsonl').read_text().splitlines()
+    assert json.loads(audit[-1]) == page
+    with pytest.raises(ValueError):
+        context.artifact_reader(sha256=coordinator.target.reference_sha256)
+    path.write_bytes(b'changed')
+    with pytest.raises(ValueError, match='digest mismatch'):
+        context.artifact_reader(sha256=selected['sha256'], offset=1024, limit=127)
+
+
+@pytest.mark.parametrize('data,offset,limit', [
+    (b'plain text', 2, 4), ('a€z'.encode(), 0, 3), ('a€z'.encode(), 1, 3),
+    ('a€z'.encode(), 2, 2), (b'\xffbad', 0, 2), (b'', 0, 1), (b'short', 9, 2),
+])
+def test_streamed_native_page_preserves_existing_public_presentation(tmp_path, monkeypatch, data, offset, limit):
+    from pathlib import Path
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.ascend.agent_presentation import artifact_page_presentation
+    from benchmarks.ascend.phase2_target_loop import _retained_artifact_page
+    artifacts = ContentAddressedArtifacts(tmp_path / 'artifacts')
+    digest = artifacts.put_bytes(data)
+    payload = dict(sha256=digest, offset=offset, limit=limit)
+    expected = artifact_page_presentation(payload, artifacts)
+    path = artifacts._path(digest)
+    original_read = Path.read_bytes
+    def no_full_read(self):
+        assert self != path
+        return original_read(self)
+    monkeypatch.setattr(Path, 'read_bytes', no_full_read)
+    assert _retained_artifact_page(dict(retained_path=str(path)), payload, artifacts) == expected

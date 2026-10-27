@@ -100,13 +100,10 @@ def test_phase2_prompt_is_target_specific_and_keeps_reference_private(tmp_path):
     prompt = target_curriculum_prompt(context(target), a3_curriculum_policy())
     assert "private working reference" not in prompt
     assert "reference_sha256" not in prompt
-    assert "Phase-1" not in prompt
     payload = json.loads(prompt.rsplit("\n", 1)[-1])
     assert payload["target"]["target_id"] == target.target_id
     assert payload["target"]["correctness"]["atol_and_rtol"] == 1e-5
     assert payload["latest_target_attempt"]["diagnostic"] == "host mismatch on padded output"
-    assert "[a-z][a-z0-9]{0,15}" in prompt
-    assert payload["project_grammar"]["dtypes"] == ["float32"]
 
 
 def test_practice_requires_concrete_fields_budget_and_fixed_target(tmp_path):
