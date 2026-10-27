@@ -150,6 +150,9 @@ class TraceRecorder:
             "previous_sha256": self._rows[-1]["record_sha256"] if self._rows else None,
         }
         self._rows.append({**body, "record_sha256": _digest(body)})
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("wb" if len(self._rows) == 1 else "ab") as stream:
+            stream.write(_canonical(self._rows[-1]) + b"\n")
 
     def message(
         self, role: str, content: str, *, weight: int | None = None,

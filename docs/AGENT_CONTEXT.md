@@ -3,22 +3,38 @@
 The shared direct provider rejects requests exceeding a local hard byte budget
 before transport. This covers Actor, curriculum, knowledge and distillation
 callers. Limits measure UTF-8 JSON request bytes (including message framing), not
-provider token windows. Canonical model IDs and output settings are unchanged.
+provider token windows. Canonical model IDs and generation/output limits are unchanged.
 
 | Model | Compact above | Target after folding | Hard limit |
 | --- | ---: | ---: | ---: |
 | OpenAI | 128 KiB | 80 KiB | 192 KiB |
-| DeepSeek | 32 KiB | 24 KiB | 48 KiB |
+| DeepSeek | 128 KiB | 80 KiB | 192 KiB |
 
 DirectActorDriver keeps the immutable opening, current host-origin source/status
 facts and recent exchanges separate from a model-written working log. Earlier
 exchanges are summarized in bounded batches. A rewritten candidate clears previous
 candidate status from pinned host state. Logs cannot establish correctness; the
-host verifier and publication rules remain unchanged. A large immutable opening,
-unfoldable exchange, failed summary or oversized work log raises the explicit
-non-infrastructure `ContextBudgetError`, rather than retrying device work.
+host verifier and publication rules remain unchanged.
 
-Configure limits when constructing the shared provider, for example:
+Each summary batch allows three total generation attempts. Empty or oversized
+text receives correction feedback with its measured UTF-8 byte count and required
+limit; nontext callback output receives an explicit type/size-unavailable diagnosis.
+Every attempt regenerates from the original old log and exchanges. Request space
+is reserved for correction feedback, and exchanges are folded only after a valid
+summary is accepted. Neither summaries nor exchanges are silently truncated.
+After three invalid summaries, an explicit non-infrastructure `ContextBudgetError`
+reports the measured size and limit. An immutable opening or unfoldable exchange
+that exceeds its budget also raises this error, rather than retrying device work.
+
+Empty or whitespace-only SDK text with valid positive token usage remains rejected
+by the ordinary provider/Actor contract. Only compaction handles this narrow
+rejection as correctable summary output, retaining its raw text and usage before
+retrying. Nontext responses, missing or invalid usage, provider rejections and
+transport failures retain their existing handling; they do not trigger additional
+summary-correction attempts.
+
+Explicit per-model budget overrides remain supported when constructing the shared
+provider, for example:
 
 ```python
 from benchmarks.ascend.agent_context import ContextBudget
