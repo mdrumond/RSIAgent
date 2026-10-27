@@ -136,7 +136,8 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
 
 
 @pytest.mark.parametrize("standalone", [False, "envelope", "list", "single"])
-def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone):
+@pytest.mark.parametrize("failed_retry", [False, True])
+def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone, failed_retry):
     from types import SimpleNamespace
     from tests.test_a3_reviewed_phase2 import native_source
     from tests.test_phase2_optimizer_execution import Agent, Backend, candidate, snapshot
@@ -151,16 +152,22 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     task = dict(task_id='original', submission=dict(source='def forward(a): return a',
         entrypoint='forward', signatures=[dict(args=[dict(shape=[8], dtype='float32')])]))
     class FrozenBackend(Backend):
-        def __init__(self, latency):
+        def __init__(self, latency, failed=False):
             super().__init__()
-            self.latency = latency
+            self.latency, self.failed = latency, failed
         def prepare(self, spec, directory):
             value = super().prepare(spec, directory)
             value.update(suite_sha256='a'*64, manifest=dict(policy=dict(rtol=.001), submission=spec))
             value['cases'][0]['timing']['torch']['latency_us'] = self.latency
             return value
         def evaluate(self, source, directory, **kwargs):
-            return dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
+            result = dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
+            if self.failed:
+                result.update(status='incorrect', failure_case=dict(schema='failure-case-v1',
+                    classification='host-mismatch', description='retry returned zero',
+                    inputs={'x': [1]}, expected={'output': [1]}, observed={'output': [0]},
+                    diagnostics={'index': 0}, policy={'exact': True}))
+            return result
     config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path/'validation.sh'), max_cases=2)
     original_dir = tmp_path/'external'
     first = OptimizerTaskExecutor(original_dir, task, snapshot(), config,
@@ -189,7 +196,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         received.append(memory)
         assert type(bound['phase2_attempt_seconds']) is int and bound['phase2_attempt_seconds'] == 30
         assert bound['max_cases'] == 2
-        backend = FrozenBackend(12)
+        backend = FrozenBackend(12, failed=failed_retry)
         backend.interrupt = not children
         child = OptimizerTaskExecutor(directory, task, memory, bound,
             agent=Agent([candidate('good')]), backend=backend, **kwargs)
@@ -217,7 +224,21 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     import time
     assert 0 < children[1].deadline - time.monotonic() <= 18.5
     retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
-    assert store.link_original_retry(row['feedback_id'], retried['feedback_id'])['lifecycle'] == 'fixed'
+    linked = store.link_original_retry(row['feedback_id'], retried['feedback_id'])
+    assert linked['lifecycle'] == ('failed' if failed_retry else 'fixed')
+    if failed_retry:
+        from benchmarks.ascend.failure_curriculum import FailureCurriculum
+        from test_curriculum_context_files import read_all
+        case, = store.failure_cases(retried['feedback_id'])
+        assert case['availability']['complete']
+        feedback = FailureCurriculum(source, store.root, dict(selected=[linked], controls=[]))
+        index = feedback.context({})[-1]
+        retry_manifest, = read_all(feedback.read, index['selected'][0]['linked_retries_file'])
+        retained_case, = read_all(feedback.read, retry_manifest['failure_cases_file'])
+        assert retained_case['artifacts'] == case['artifacts']
+        for role, expected_value in dict(source='good', inputs={'x': [1]}, expected={'output': [1]},
+                                         observed={'output': [0]}, diagnostics={'index': 0}).items():
+            assert json.loads(feedback.read(case['artifacts'][role]['sha256'])['text']) == expected_value
     assert received[0]['phase'] == 'committed-phase1'
     assert len(received[0]['memory_entries']) == 1
     # The same pending child survives a lower parent allowance and changed memory.
@@ -359,3 +380,53 @@ def test_retry_rechecks_recovered_clock_inside_active(tmp_path, monkeypatch):
     automatic._phase1_retry = lambda *args: pytest.fail('expired dispatch')
     automatic.retry_ready(state)
     assert automatic.state['failures'][key]['retries'] == []
+
+
+@pytest.mark.parametrize('reviewed', [False, True])
+def test_nested_original_retry_reads_parent_memory_artifacts_and_reviewed_seed(tmp_path, reviewed):
+    import base64
+    import shutil
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
+    from benchmarks.ascend.agent_presentation import MemoryArtifactReader
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from tests.test_a5_phase2_adaptive_memory import _source
+    source_root, source, review, memory = _source(tmp_path/'history')
+    parent = tmp_path/'parent'
+    initial = b'{}'
+    entries = [base64.b64encode(canonical_bytes(memory)).decode()]
+    if reviewed:
+        snapshot = admit_adaptive_snapshot(source_root, b'', review, source, parent)
+        initial = canonical_bytes(dict(schema='ascend-phase2-curriculum-seed-v1',
+            snapshot_id=snapshot.snapshot_id, phase1_memory=[memory]))
+        entries = []
+    requests = []
+    def execute(request):
+        requests.append(request)
+        assert request.memory_root == parent
+        assert request.branch_root.is_relative_to(parent/'original-retries')
+        current = ContentAddressedArtifacts(request.branch_root/'artifacts')
+        reader = MemoryArtifactReader(request, current)
+        assert reader.read_bytes(memory['source_revision']) == b'actual candidate source'
+        evidence = memory['host_facts'][0]['evidence_sha256']
+        assert json.loads(reader.read_bytes(evidence))['host'] == 'verified'
+        assert not current._path(evidence).exists()
+        with pytest.raises(FileNotFoundError):
+            reader.read_bytes('f'*64)
+        return _result(request.spec, True, 'host pass')
+    runner = AdaptivePhase1Coordinator(parent, 'Retry original.', initial,
+        CurriculumAgent(lambda _: ''), execute, max_parallel=1, project_target=1)
+    state = runner._load_state()
+    state['memory_bytes_base64'] = entries
+    if not reviewed:
+        shutil.copytree(source_root/'waves', parent/'waves', dirs_exist_ok=True)
+    retry = object.__new__(AutomaticRemediation)
+    retry.runner, retry.target, retry.store = runner, 'a5', FeedbackStore(tmp_path/'feedback')
+    row = dict(outcome=dict(original_spec=_project('original', 'gm-ub-movement')))
+    directory = parent/'original-retries'/'failure'/'retry-1'
+    retry._phase1_retry(row, directory, state)
+    assert len(requests) == 1
+    # Retained retry replay observes its committed result without another actor.
+    retry._phase1_retry(row, directory, state)
+    assert len(requests) == 1
