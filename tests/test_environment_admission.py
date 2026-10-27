@@ -170,3 +170,27 @@ def test_shared_scope_keeps_owned_recovery_and_foreign_trial_blocking(tmp_path, 
     other.write_text(json.dumps(dict(state='cancelled', handle='remote:t:job:trial')))
     admission(lambda:100)
     assert recovered == ['owned','owned'] and health == [1] and probes == ['probe']
+
+
+@pytest.mark.parametrize('state', ['running','completed'])
+def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, state):
+    import subprocess
+    from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
+    root = tmp_path/'campaign'
+    calls = []
+    def client(argv, **kwargs):
+        calls.append(argv)
+        assert argv[2:] == ('observe','remote:fixture:job:trial')
+        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state=state,handle=argv[3])),'')
+    foreground = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
+        remote_workspace='/owned/foreground',physical_device=0,state_directory=root/'foreground',process_runner=client)
+    trial = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
+        remote_workspace='/owned/trial',physical_device=0,state_directory=root/'trial/runtime/transport')
+    journal = trial.root/'measurement/operation.json'
+    journal.parent.mkdir(parents=True)
+    journal.write_text(json.dumps(dict(state='queued',handle='remote:fixture:job:trial',
+        identity=dict(route=trial.runtime_identity,workspace=str(trial._workspace),arguments=[]))))
+    module.recover_campaign_operations(root,[foreground])
+    assert len(calls) == 1 and json.loads(journal.read_text())['state'] == state
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    assert bool(unsettled_operations(root)) == (state == 'running')

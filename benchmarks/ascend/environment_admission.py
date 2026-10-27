@@ -154,6 +154,33 @@ def verify_dependencies(actual, pinned):
         raise ProjectInfrastructureError('discovered environment differs from pinned '+', '.join(mismatches))
 
 
+def recover_campaign_operations(root, transports, *, seconds=30):
+    """Reconstruct retained owning bindings for read-only sibling observation."""
+    from .cpl_native import CplNativeCandidateBackend
+    clients = {transport.target: transport for transport in transports
+               if isinstance(transport, CplNativeCandidateBackend)}
+    deadline = time.monotonic() + seconds
+    for path in Path(root).rglob('operation.json'):
+        record = json.loads(path.read_bytes())
+        if 'result' in record or record.get('state') in ('new', 'completed', 'failed', 'cancelled'):
+            continue
+        identity = record.get('identity', {})
+        route = identity.get('route', {})
+        client = clients.get(route.get('target'))
+        if client is None or not record.get('handle'):
+            continue
+        left = deadline-time.monotonic()
+        if left <= 0:
+            break
+        owner = CplNativeCandidateBackend(cpl_remote=client._cpl, target=route['target'],
+            runtime=route['runtime'], profile=route['profile'], physical_device=route['physical_device'],
+            remote_workspace=identity['workspace'], state_directory=path.parent,
+            process_runner=client._run, timeout=left)
+        if owner.runtime_identity != route:
+            raise ProjectInfrastructureError('retained owning binding identity changed')
+        owner.recover_owned_operations(seconds=left)
+
+
 class EnvironmentAdmission:
     def __init__(self, check, transports, root, *, cache, dependencies, clock=time.time, pending_root=None):
         self.check, self.transports, self.root = check, tuple(transports), Path(root)
@@ -176,6 +203,7 @@ class EnvironmentAdmission:
         try:
             for transport in self.transports:
                 transport.recover_owned_operations()
+            recover_campaign_operations(self.pending_root, self.transports)
             if unsettled_operations(self.pending_root):
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
             for transport in self.transports:
