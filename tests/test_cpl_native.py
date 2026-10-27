@@ -357,3 +357,32 @@ def test_readonly_recovery_preserves_ambiguous_and_foreign_allocation_records(tm
     candidate.recover_owned_operations()
     assert not remote.calls
     assert json.loads((candidate.root/'ambiguous/operation.json').read_text())['state']=='submitting'
+
+
+@pytest.mark.parametrize('deadline', [False, True])
+def test_real_launcher_distinguishes_deadline_escalation_from_normal_137(tmp_path, deadline):
+    remote = Remote()
+    def launch(argv, **options):
+        if argv[2] != 'run':
+            return remote(argv, **options)
+        remote.calls.append(argv)
+        script = Path(argv[argv.index('--file')+1])
+        result = subprocess.run(('bash', str(script)), capture_output=True, text=True, timeout=15)
+        handle = 'remote:fixture:job:real-launcher'
+        remote.jobs[handle] = result.stdout
+        remote.exit_code = result.returncode
+        return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='completed', handle=handle, exit=result.returncode)), '')
+    candidate = backend(tmp_path, launch, timeout=1 if deadline else 10)
+    marker = tmp_path/'started'
+    command = ('python', '-c',
+        'import signal,time,pathlib,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+        'pathlib.Path(sys.argv[1]).touch(); time.sleep(60)', str(marker)) if deadline else (
+        'python', '-c', 'import sys;sys.exit(137)')
+    if deadline:
+        with pytest.raises(_PendingObservation, match='execution allocation expired'):
+            candidate.run_remote(command, key='real')
+        assert marker.exists()
+        assert remote.exit_code == 124
+    else:
+        assert candidate.run_remote(command, key='real').returncode == 137
+    assert len([call for call in remote.calls if call[2]=='run']) == 1
