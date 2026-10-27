@@ -402,6 +402,7 @@ class OptimizationLoop:
         presentation = describe_statuses(context)
         value = self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
         if value is not None and control.pending():
+            # A redirection arriving in flight supersedes this unexecuted action.
             self.state.pop('model_action', None)
             self.state.pop('action_result', None)
             self._save()

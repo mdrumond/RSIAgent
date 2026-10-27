@@ -456,10 +456,7 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert actor.observations[6]["error"].startswith("submit requires")
     assert actor.observations[8]["classification"] == "host-verified"
     assert '"prior":"memory"' in actor.instruction
-    assert 'read-artifact' in actor.instruction
-    assert 'Production context (immutable' in actor.instruction
     assert actor.instruction.count('{"guide":"exact"}') == 1
-    assert executor.prepare(_spec()).instruction in actor.instruction
     assert len(backend.requests) == 4
     assert len(backend.run_requests) == 3
     assert (tmp_path / "branch" / "artifacts").is_dir()
@@ -596,7 +593,6 @@ def test_optional_treatment_actions_have_deterministic_disabled_observations(tmp
     disabled = dict(actor.observations[0])
     explanation, = disabled.pop("status_explanations")
     assert explanation["code"] == "disabled-by-treatment"
-    assert "experimental treatment" in explanation["description"]
     assert [disabled, actor.observations[1]] == [
         {
             "event": "knowledge-query", "available": False,

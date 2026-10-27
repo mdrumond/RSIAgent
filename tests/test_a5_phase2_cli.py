@@ -102,9 +102,20 @@ def test_retired_phase2_launch_never_composes_or_executes(tmp_path, command):
     assert not (tmp_path / 'out').exists()
 
 
-def test_historical_phase2_report_reads_retained_results(tmp_path, capsys):
+@pytest.mark.parametrize('target', ['a5', 'a3'])
+def test_historical_phase2_report_reads_retained_results(tmp_path, capsys, target):
     terminal = tmp_path / 'cells' / 'old-cell' / 'terminal.json'
     terminal.parent.mkdir(parents=True)
-    terminal.write_text(json.dumps({'cell_id': 'old-cell', 'status': 'passed'}))
-    assert main(['report', '--root', str(tmp_path)]) == 0
-    assert json.loads(capsys.readouterr().out)['records'] == [json.loads(terminal.read_text())]
+    raw = json.dumps({'cell_id': 'old-cell', 'status': 'passed'}).encode()
+    terminal.write_bytes(raw)
+    if target == 'a3':
+        from benchmarks.ascend.phase2_cli import main as report
+        args = ['--target', 'a3']
+    else:
+        report, args = main, []
+    assert report([*args, 'report', '--root', str(tmp_path)]) == 0
+    record, = json.loads(capsys.readouterr().out)['records']
+    explanations = record.pop('status_explanations')
+    assert record == json.loads(raw)
+    assert explanations[0]['code'] == record['status']
+    assert terminal.read_bytes() == raw
