@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from contextlib import nullcontext
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import json
@@ -179,6 +179,8 @@ class AdaptivePhase1Coordinator:
         self.max_seconds, self.clock = max_seconds, clock
         self.failure_feedback = None
         self.allow_partial = allow_partial
+        self.environment_check = None
+        self._checked_environment = None
 
         self.automatic_remediation = None
 
@@ -225,6 +227,7 @@ class AdaptivePhase1Coordinator:
             return operation()
 
     def _run_allocation(self, operation):
+        self._checked_environment = None
         state = self._load_state()
         if state.get("allocation_active"):
             # Exclusive ownership proves the previous interval has no owner.
@@ -370,6 +373,7 @@ class AdaptivePhase1Coordinator:
                 self.max_parallel,
                 allow_semantic_failures=True, allow_partial=self.allow_partial,
                 remaining_seconds=self._remaining_seconds if self.allow_partial else None,
+                before_execute=lambda: self._check_environment(state),
             )
             consolidation = coordinator.resume()
             state = self._finish_wave(state, wave, pending, consolidation,
@@ -748,9 +752,18 @@ class AdaptivePhase1Coordinator:
             "summary": _validated_summary(value["summary"]),
         }
 
-    def _select(self, *args, **kwargs):
+    def _check_environment(self, state, *, remaining_seconds=None):
+        token = (state["wave_index"], getattr(self, "_deadline", None))
+        if self.environment_check is not None and self._checked_environment != token:
+            allowance = (lambda: min(self._remaining_seconds(), remaining_seconds())) if remaining_seconds else self._remaining_seconds
+            self.environment_check(state["wave_index"], allowance)
+            self._checked_environment = token
+
+    def _select(self, context, *args, **kwargs):
+        self._check_environment(self._load_state())
+        context = replace(context, remaining_seconds=min(context.remaining_seconds, self._remaining_seconds()))
         try:
-            return self.curriculum.select(*args, **kwargs)
+            return self.curriculum.select(context, *args, **kwargs)
         except CurriculumSelectionError as error:
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 

@@ -51,7 +51,7 @@ def paired_outcome(control, treatment):
 
 class UsefulnessVerifier:
     def __init__(self, root, curriculum, execute_project, verify, *, enabled=False,
-                 pair_seconds=600, memory_root=None, remaining_seconds=None, clock=time.monotonic):
+                 pair_seconds=600, memory_root=None, remaining_seconds=None, before_live_work=None, clock=time.monotonic):
         if (isinstance(pair_seconds, bool) or not isinstance(pair_seconds, (int, float))
                 or not math.isfinite(pair_seconds) or pair_seconds <= 0):
             raise ValueError('pair allowance must be finite and positive')
@@ -61,6 +61,7 @@ class UsefulnessVerifier:
         self.memory_root = memory_root
         self.remaining_seconds, self.clock = remaining_seconds, clock
         self._experiment_remaining = None
+        self.before_live_work = before_live_work
 
     def _append(self, directory, kind, **body):
         events = list(directory.glob('[0-9]*.json'))
@@ -126,6 +127,9 @@ class UsefulnessVerifier:
                 return available
             self._experiment_remaining = require_time
             try:
+                require_time()
+                if self.before_live_work is not None:
+                    self.before_live_work(require_time)
                 require_time()
                 inspection = self.verify('inspect', {'lesson': lesson, 'host_facts': host_facts})
                 context = CurriculumContext(
@@ -206,7 +210,7 @@ class UsefulnessVerifier:
 
 
 def build_usefulness_verifier(*, root, provider, profile, curriculum, project_actor,
-                             enabled=False, pair_seconds=600, remaining_seconds=None):
+                             enabled=False, pair_seconds=600, remaining_seconds=None, before_live_work=None):
     """Bind production curriculum, provider and host-verified actor execution."""
     from copy import copy
     curriculum = copy(curriculum)
@@ -229,5 +233,5 @@ def build_usefulness_verifier(*, root, provider, profile, curriculum, project_ac
             {'role': 'user', 'content': json.dumps({'stage': stage, **evidence}, sort_keys=True)},
         ))
     verifier = UsefulnessVerifier(Path(root) / 'memory-usefulness', curriculum,
-        project_actor, verify, enabled=enabled, pair_seconds=pair_seconds, memory_root=Path(root), remaining_seconds=remaining_seconds)
+        project_actor, verify, enabled=enabled, pair_seconds=pair_seconds, memory_root=Path(root), remaining_seconds=remaining_seconds, before_live_work=before_live_work)
     return verifier

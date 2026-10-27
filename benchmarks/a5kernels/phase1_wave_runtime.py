@@ -103,7 +103,8 @@ class LiveWaveCoordinator:
         execute: WaveProjectExecutor,
         max_parallel: int,
         *, allow_semantic_failures: bool = False, allow_partial: bool = False,
-        remaining_seconds: Callable[[], float] | None = None, inputs_by_project=None,
+        remaining_seconds: Callable[[], float] | None = None,
+        before_execute: Callable[[], None] | None = None, inputs_by_project=None,
     ) -> None:
         if not isinstance(wave, WaveSpec):
             raise TypeError("wave must be a WaveSpec")
@@ -123,6 +124,7 @@ class LiveWaveCoordinator:
         self.allow_semantic_failures = allow_semantic_failures
         self.allow_partial = allow_partial
         self.remaining_seconds = remaining_seconds
+        self.before_execute = before_execute
         self.inputs_by_project = inputs_by_project or {}
 
     def run(self) -> WaveConsolidation:
@@ -137,6 +139,9 @@ class LiveWaveCoordinator:
             outcome = self._load_outcome(assignment)
             if outcome is None or not (outcome.verified or self.allow_semantic_failures or self.allow_partial):
                 pending.append(assignment)
+
+        if pending and self.before_execute is not None:
+            self.before_execute()
 
         failures: list[tuple[str, Exception]] = []
         with ThreadPoolExecutor(

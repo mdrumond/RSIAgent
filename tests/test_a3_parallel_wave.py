@@ -219,12 +219,16 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
             self.first = True
             transports.append(self)
         def compile(self, plan, directory):
+            if plan.project_id == "sum-three":
+                return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
             if self.first and first_run:
                 self.first = False
                 barrier.wait(timeout=5)  # Fails if the CLI silently remains serial.
             assert f"device-{self.device}" in str(directory)
             return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
         def execute_receipt(self, compiled):
+            if compiled.plan.project_id == "sum-three":
+                return ExecutionReceipt(0, tuple(sum(xs) for xs in zip(*(t.values for t in compiled.plan.inputs))))
             if interrupt and first_run and compiled.plan.project_id == "copy-1":
                 raise OSError("temporary host failure")
             return ExecutionReceipt(0, compiled.plan.inputs[0].values, "synchronized")
@@ -293,6 +297,8 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
         assert report["status"] == "WAVE_CLOSED"
         assert report["published_projects"] == ["copy-0"]
         assert report["wave_results"][-1]["status"] == "partial"
+    environment_reports = list(root.glob("environment-checks/*/*/report.json"))
+    assert environment_reports and all(json.loads(p.read_text())["status"] == "passed" for p in environment_reports)
     assert {transport.device for transport in transports} == {2, 5}
     assert len({transport.state for transport in transports}) == 2
     assert all("native-workers" in str(transport.state) for transport in transports)

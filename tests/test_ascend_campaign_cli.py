@@ -971,6 +971,8 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
         def compile(self, plan, directory):
             return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
         def execute_receipt(self, compiled):
+            if compiled.plan.project_id == "sum-three":
+                return ExecutionReceipt(0, tuple(sum(xs) for xs in zip(*(t.values for t in compiled.plan.inputs))), "synchronized")
             return ExecutionReceipt(0, compiled.plan.inputs[0].values, "synchronized")
         def remote_candidate_directory(self, plan):
             return PurePosixPath("/owned") / plan.execution_id
