@@ -136,14 +136,16 @@ class NativeProjectPool:
             self.actors.put(actor)
 
     def __call__(self, request):
-        from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
+        from benchmarks.a5kernels.phase1_wave_runtime import (
+            ProjectAdmissionTimeout, SemanticProjectFailure,
+        )
         actor = self.actors.get()
         try:
             with self.lock:
                 if self.failure is not None:
                     raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
             return actor(request)
-        except SemanticProjectFailure:
+        except (SemanticProjectFailure, ProjectAdmissionTimeout):
             raise
         except Exception as exc:
             with self.lock:
