@@ -328,6 +328,7 @@ class OptimizationLoop:
             self._save()
 
     def _model(self, stage, context):
+        original_context = context
         from benchmarks.ascend.actor_control import ActorControl, ActorStopped
         control = ActorControl(self.directory.parent)
         retained = self.state.get('model_action', self.state.get('action_result'))
@@ -410,7 +411,7 @@ class OptimizationLoop:
             self.state.pop('model_action', None)
             self.state.pop('action_result', None)
             self._save()
-            return self._model(stage, context)
+            return self._model(stage, original_context)
         return value
 
     def _tool(self, action, snapshot):
