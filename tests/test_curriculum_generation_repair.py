@@ -119,7 +119,7 @@ def test_normalization_does_not_hide_invalid_proposals(change, diagnostic):
         return wave([item])
 
     with pytest.raises(ValueError, match=f"time budget exhausted.*{diagnostic}"):
-        CurriculumAgent(complete).select(context())
+        CurriculumAgent(complete).select(context(remaining_seconds=3000))
     assert len(calls) == 3
 
 
@@ -144,7 +144,16 @@ def bounded_fake_selection_clock(monkeypatch):
     """Negative fake completions consume time instead of relying on retry counts."""
     original = CurriculumAgent.__init__
     def initialize(self, *args, **kwargs):
-        ticks = iter(range(0, 1000000, 1000))
-        kwargs.setdefault("clock", lambda: next(ticks))
+        if kwargs.get("clock") is None:
+            now = [0.0]
+            complete = args[0] if args else kwargs["complete"]
+            def timed_complete(messages):
+                now[0] += 1000
+                return complete(messages)
+            kwargs["clock"] = lambda: now[0]
+            if args:
+                args = (timed_complete, *args[1:])
+            else:
+                kwargs["complete"] = timed_complete
         original(self, *args, **kwargs)
     monkeypatch.setattr(CurriculumAgent, "__init__", initialize)

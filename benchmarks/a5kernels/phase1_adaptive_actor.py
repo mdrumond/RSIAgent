@@ -210,6 +210,12 @@ class _ProjectActions:
         with process_deadline(self.deadline):
             return self._execute_action(action)
 
+    def restore_source(self, source):
+        """Restore editable source only; verification authority must be rebuilt."""
+        result = self._write(TrialAction('write', {'content': source}))
+        if self.source != source:
+            raise ValueError(result.observation)
+
     def _execute_action(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
             raise TypeError("adaptive projects accept only TrialAction values")
@@ -499,6 +505,8 @@ class AdaptiveActorProjectExecutor:
     def __call__(self, request: AdaptiveProjectRequest) -> AdaptiveProjectResult:
         if not isinstance(request, AdaptiveProjectRequest):
             raise TypeError("request must be AdaptiveProjectRequest")
+        if type(request.publish_learning) is not bool:
+            raise TypeError("publish_learning must be boolean")
         started = time.monotonic()
         remaining = getattr(request, "remaining_seconds", None)
         if remaining is not None and remaining <= 0:
@@ -682,9 +690,7 @@ class AdaptiveActorProjectExecutor:
             "host-verification", result.evidence.detail,
             result.artifact_sha256["classification"],
         ))
-        if not getattr(request, "publish_learning", True):
-            distillation = AgentDistillation(True, (), tuple(sorted(actions.admitted)))
-        else:
+        if request.publish_learning:
             learned = self.actor.distill(
                 outcome, admitted_artifacts=actions.admitted,
                 host_summaries=tuple(asdict(fact) for fact in facts),
@@ -695,6 +701,10 @@ class AdaptiveActorProjectExecutor:
                 raise RuntimeError("terminal project omitted exact distillation response")
             distillation = learned.distillation
             artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
+        else:
+            # Subject campaigns and usefulness arms delegate learning independently.
+            # The factual result is still compatible with legacy wave readers.
+            distillation = AgentDistillation(True, (), tuple(sorted(actions.admitted)))
         assert actions.source_sha256 is not None
         memory = Phase1ProjectMemory(
             request.spec, actions.source_sha256, tuple(actions.actions), facts,

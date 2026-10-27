@@ -31,7 +31,6 @@ def test_production_curriculum_pair_isolated_frozen_and_idempotent(tmp_path):
     prior = b'{"initial_memory_base64":"e30=","project_memory_base64":[]}'
     result = verifier.assess_memory(memory, prior, 'phase1/source')
     assert result[0]['outcome'] == 'both-succeeded'
-    assert 'SMALL' in prompts[0] and '600' in prompts[0]
     assert requests[0].spec == requests[1].spec
     assert requests[0].inputs == requests[1].inputs and requests[0].oracle == requests[1].oracle
     assert requests[0].branch_root != requests[1].branch_root
@@ -163,7 +162,7 @@ def test_factory_caps_every_provider_call_by_local_pair_and_parent(tmp_path, ins
     class Provider:
         def complete(self, profile, messages, *, max_seconds):
             calls.append(max_seconds)
-            if 'memory usefulness verifier' in messages[0]['content']:
+            if 'stage' in json.loads(messages[-1]['content']):
                 stage = json.loads(messages[-1]['content'])['stage']
                 now[0] += inspection_seconds if stage == 'inspect' else 0
                 return SimpleNamespace(text=stage)

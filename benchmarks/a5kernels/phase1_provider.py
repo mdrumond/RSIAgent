@@ -117,6 +117,17 @@ def direct_profile(identity: A5ModelIdentity) -> DirectModelProfile:
     )
 
 
+class _EmptyTextCompletion(ValueError):
+    """A rejected textual completion whose raw text and usage remain available."""
+
+    def __init__(self, text, completion_tokens):
+        if (not isinstance(text, str) or text.strip()
+                or type(completion_tokens) is not int or completion_tokens < 1):
+            raise ValueError("empty completion requires text and positive token usage")
+        self.text, self.completion_tokens = text, completion_tokens
+        super().__init__("provider completion must contain non-empty text")
+
+
 @dataclass(frozen=True)
 class DirectCompletion:
     text: str
@@ -125,11 +136,12 @@ class DirectCompletion:
     def __post_init__(self) -> None:
         if (
             not isinstance(self.text, str)
-            or not self.text.strip()
             or type(self.completion_tokens) is not int
             or self.completion_tokens < 1
         ):
             raise ValueError("provider completion must contain text and token usage")
+        if not self.text.strip():
+            raise _EmptyTextCompletion(self.text, self.completion_tokens)
 
 
 Transport = Callable[..., DirectCompletion]
@@ -172,9 +184,11 @@ def openai_compatible_transport(*, base_url, api_key, request) -> DirectCompleti
     )
     try:
         return DirectCompletion(
-            response.choices[0].message.content or "",
+            response.choices[0].message.content,
             response.usage.completion_tokens,
         )
+    except _EmptyTextCompletion:
+        raise
     except (AttributeError, IndexError, TypeError, ValueError):
         raise ValueError("provider response is missing content or token usage") from None
 
@@ -413,6 +427,9 @@ class _ActorContinuation:
     deadline: float | None = None
 
 
+from benchmarks.ascend.actor_control import actor_lease
+
+
 class DirectActorDriver:
     """Run the existing restricted A5 action protocol over one direct profile."""
 
@@ -449,6 +466,10 @@ class DirectActorDriver:
             self._request(recorder, profile, messages, stage="compaction", turn=turn)
             try:
                 completion = self._complete(recorder, profile, messages, stage="compaction", turn=turn)
+            except _EmptyTextCompletion as exc:
+                # Only compaction treats empty textual output as correctable.
+                # Ordinary Actor/provider calls still reject this ValueError.
+                completion = exc
             except Exception as exc:
                 recorder.failure(exc, stage="compaction", turn=turn)
                 if isinstance(exc, ProviderRejectionError):
@@ -475,6 +496,7 @@ class DirectActorDriver:
                                 "stage": stage, "turn": turn, **payload})
         return self.provider.complete(profile, messages, attempt_observer=observe)
 
+    @actor_lease
     def __call__(
         self,
         instruction: str,
@@ -494,11 +516,18 @@ class DirectActorDriver:
         for message in messages:
             self._trace("message", message)
         working = WorkingContext(messages)
+        from benchmarks.ascend.actor_control import ActorConversation, ActorStopped
+        conversation = ActorConversation(workspace, instruction, working, action_executor)
         tokens = 0
-        turn = 0
+        turn = conversation.turn
         ordinary_turns = 0
-        deadline = self.clock() + self.max_seconds
+        deadline = min(self.clock() + self.max_seconds,
+                       getattr(action_executor, 'deadline', float('inf')))
         while self.clock() < deadline:
+            try:
+                conversation.boundary()
+            except ActorStopped:
+                return ActorOutcome('user-stopped', turn, tokens)
             turn += 1
             messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
             tokens += summary_tokens
@@ -513,6 +542,11 @@ class DirectActorDriver:
             messages.append({"role": "assistant", "content": completion.text})
             working.append(messages[-1])
             self._trace("message", messages[-1])
+            if conversation.control.pending():
+                working.append({'role': 'user', 'content':
+                    'The preceding proposed action was not executed because user input arrived.'})
+                conversation.save(turn)
+                continue
             action = turn_parser(completion.text)
             if action is None:
                 observation = json.dumps({
@@ -542,6 +576,7 @@ class DirectActorDriver:
                     messages.append({"role": "user", "content": observation})
                     working.append(messages[-1])
                     self._trace("message", messages[-1])
+                    conversation.save(turn)
                     self._trace("terminal", {
                         "status": outcome.status,
                         "admitted_artifacts": dict(outcome.admitted_artifacts),
@@ -556,6 +591,7 @@ class DirectActorDriver:
             messages.append({"role": "user", "content": observation})
             working.append(messages[-1])
             self._trace("message", messages[-1])
+            conversation.save(turn)
             if action is None:
                 ordinary_turns += 1
         self._trace("terminal", {"status": "time-budget-exhausted"})

@@ -17,6 +17,8 @@ from .transport import CheckedTransport, ObservationUnavailable, WorkerStopped, 
 def load_config(path, worker_config_path=None):
     from benchmarks.ascend.execution import apply_worker_config, execution_mode
     config = apply_worker_config(json.loads(Path(path).read_text()), worker_config_path)
+    from .profile_policy import policy
+    policy(config.get('profiling'))
     if execution_mode(config) == 'local':
         if not Path(config.get('guide', '')).is_absolute():
             raise ValueError('local worker requires an absolute guide path')
@@ -96,7 +98,7 @@ class RemoteBackend:
         command = (f'test -d {quoted(self.config["remote_workspace"])} && mkdir -p {quoted(str(remote_directory))} '
                    f'&& tar -xzf {quoted(str(upload))} -C {quoted(str(remote_directory))} '
                    f'&& cd {quoted(str(remote_directory / "source"))} '
-                   f'&& timeout --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
+                   f'&& timeout --foreground --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
                    f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
         failure = None
         try:
@@ -119,24 +121,32 @@ class RemoteBackend:
                       'operation': operation, 'cases': [], 'remote_directory': str(remote_directory)}
             if (directory / 'transport.log').exists():
                 result['runtime_log_tail'] = (directory / 'transport.log').read_text(errors='replace')[-12000:]
-            atomic(result_path, canonical(result))
             self.store.put_artifact(self.job_id, str(relative / 'result.json'), canonical(result))
+            atomic(result_path, canonical(result))
             return result
         with tarfile.open(compact) as archive:
             rows = json.load(archive.extractfile('files.json'))
-            for row in rows:
-                name = Path(row['path'])
-                if name.is_absolute() or '..' in name.parts:
-                    raise ValueError('invalid compact artifact path')
-                data = archive.extractfile(row['path']).read()
-                if sha(data) != row['sha256'] or len(data) != row['size']:
-                    raise ValueError('compact artifact digest differs')
-                self.store.put_artifact(self.job_id, str(relative / name), data)
-                if name == Path('result.json'):
-                    atomic(result_path, data)
-        if not result_path.exists():
-            raise ValueError('remote compact archive has no result')
-        return json.loads(result_path.read_text())
+            result_data = None
+            def artifacts():
+                nonlocal result_data
+                for row in rows:
+                    name = Path(row['path'])
+                    if name.is_absolute() or '..' in name.parts:
+                        raise ValueError('invalid compact artifact path')
+                    data = archive.extractfile(row['path']).read()
+                    if sha(data) != row['sha256'] or len(data) != row['size']:
+                        raise ValueError('compact artifact digest differs')
+                    if name == Path('result.json'):
+                        # Validate before the batch commits; publish the local
+                        # completion marker only after all other files succeed.
+                        json.loads(data)
+                        result_data = data
+                    yield str(relative / name), data
+                if result_data is None:
+                    raise ValueError('remote compact archive has no result')
+            self.store.put_artifacts(self.job_id, artifacts(), deduplicate=True)
+        atomic(result_path, result_data)
+        return json.loads(result_data)
 
     def prepare(self, spec, directory):
         result = self._operation('prepare', directory, spec=spec)
@@ -158,7 +168,9 @@ class RemoteBackend:
         return self._operation('compile', directory, source=source, block_count=block_count)
 
     def profile(self, source, directory, *, block_count=1):
-        return self._operation('profile', directory, source=source, block_count=block_count)
+        from .profile_policy import policy
+        return self._operation('profile', directory, source=source, block_count=block_count,
+                               profiling=policy(self.config.get('profiling')))
 
 
 class LocalBackend(RemoteBackend):
@@ -272,6 +284,10 @@ def run_worker(root, job_id, config, *, agent=None, transport_factory=None):
         # caller pins a versioned identity; callable names are not stable IDs.
         if transport_factory is not None:
             identity['transport_identity'] = config['transport_identity']
+        # Preserve legacy resume identities when no policy was explicitly set.
+        if 'profiling' in config:
+            from .profile_policy import policy
+            identity['profiling'] = policy(config['profiling'])
         previous = next((event['payload'] for event in store.events(job_id)
                          if event['kind'] == 'worker-configuration'), None)
         if previous is not None and previous != identity:

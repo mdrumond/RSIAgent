@@ -38,7 +38,7 @@ def compose_adaptive_controller(
     immutable_context, max_parallel=1, project_target=None, max_projects=None, max_seconds=7200,
     target_policy=None, profiling_guidance=None, query_knowledge=None,
     request_profile=None, request_timing=None, request_diagnostic=None,
-    diagnostic_instructions=None,
+    diagnostic_instructions=None, curriculum_query_knowledge=None,
     unavailable_capabilities=(),
     reviewed_snapshot=None, trace_hook=None, trace_recorder_factory=None,
     project_actor=None, usefulness_enabled=False, usefulness_pair_seconds=600,
@@ -60,6 +60,7 @@ def compose_adaptive_controller(
         lambda messages: provider.complete(profile, messages).text,
         target_policy=target_policy, profiling_guidance=profiling_guidance,
         unavailable_capabilities=unavailable_capabilities,
+        query_knowledge=curriculum_query_knowledge,
     )
     if reviewed_snapshot is None:
         coordinator = AdaptivePhase1Coordinator(
@@ -96,8 +97,13 @@ class NativeProductionConfig:
     environment_identity: dict | None = None
     profiling_mode: str | None = None
     compiler_version: str | None = None
+    curriculum_kdb: bool = False
 
     def __post_init__(self):
+        if type(self.curriculum_kdb) is not bool:
+            raise TypeError("curriculum_kdb must be boolean")
+        if self.curriculum_kdb and (self.kdb is None or not self.collection):
+            raise ValueError("curriculum KDB requires a configured KDB and collection")
         if self.execution_profile not in {"bz-a3-1", "bz-a3-2", "local"}:
             raise ValueError("native production requires a BZ-A3 or local profile")
         if not self.target or not self.arch:
@@ -231,6 +237,22 @@ def build_native_adaptive_phase1(
                 return query_action(payload, context)
     elif config.collection is not None or embeddings is not None:
         raise ValueError("KDB-off native treatment cannot receive KDB dependencies")
+    curriculum_query = None
+    if config.curriculum_kdb:
+        from benchmarks.a5kernels.phase1_adaptive_production import curriculum_knowledge
+        callback, identity["curriculum_kdb"] = curriculum_knowledge(config, embeddings)
+        def curriculum_query(action, *, check_remaining=None):
+            if check_remaining is None:
+                with query_lock:
+                    return callback(action)
+            if not query_lock.acquire(timeout=check_remaining()):
+                check_remaining()
+                raise TimeoutError('curriculum query lock elapsed allocation exhausted')
+            try:
+                check_remaining()
+                return callback(action, check_remaining=check_remaining)
+            finally:
+                query_lock.release()
     root = Path(config.root)
     root.mkdir(parents=True, exist_ok=True)
     path = root / "campaign-identity.json"
@@ -280,6 +302,7 @@ def build_native_adaptive_phase1(
         project_actor=pool, max_parallel=len(project_workers) or 1,
         target_policy=policy, profiling_guidance=profiling_guidance,
         trace_recorder_factory=trace_recorder_factory,
+        curriculum_query_knowledge=curriculum_query,
         query_knowledge=query, request_profile=request_profile, request_timing=request_timing,
         diagnostic_instructions=diagnostics,
         project_target=project_target, max_projects=max_projects, max_seconds=max_seconds,

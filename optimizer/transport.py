@@ -199,6 +199,14 @@ class CheckedTransport:
                 state['state'] = 'completed'
             atomic(path, canonical(state))
             if getattr(result, 'interrupted', False):
+                if state.get('state') == 'completed':
+                    return  # Terminal remote evidence survives client teardown.
+                # A local observation timeout is still uncertain. Only a real
+                # Stop/budget boundary plus confirmed exact-handle cancellation
+                # can become WorkerStopped (and release optional diagnostics).
+                if self.stopped() and state.get('native_handle'):
+                    self.cancel_pending(directory)
+                    raise WorkerStopped('stopped after cancelling retained operation')
                 raise ObservationUnavailable('local command client interrupted; observe retained handle or recover dispatch')
             if state.get('deadline_expired'):
                 state['state'] = 'cancelled'
