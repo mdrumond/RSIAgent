@@ -234,9 +234,10 @@ def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repa
     state['pending'] = dict(wave_id='reserved', subject={'subject_id': 'study', 'objective': 'Study'},
         memory_sha256=snapshot, projects=['one'], items=[item])
     if paired:
-        state['pending']['projects'].append('control')
-        state['pending']['items'].append(dict(project_id='control', repairs=['obligation'],
-                                             spec={'project_id': 'control'}))
+        state['pending']['projects'].extend(['control', 'unrelated'])
+        state['pending']['items'].extend([
+            dict(project_id='control', repairs=['obligation'], spec={'project_id': 'control'}),
+            dict(project_id='unrelated', repairs=[], spec={'project_id': 'unrelated'})])
     if cached_reviews:
         state['pending']['review_ids'] = ['one']
     atomic(root/'subject-campaign.json', canonical(state))
@@ -264,8 +265,11 @@ def test_reserved_restart_cancels_old_execution_and_normal_resume_preserves_repa
     assert state['pending']['items'][0] == item
     assert state['projects']['replacement']['subject_id'] == 'study'
     assert scheduler.state()['repairs']['obligation']['status'] == 'resolved'
-    assert builder().run()['terminal'] == 'COMPLETE'
     assert executed == (['replacement', 'control'] if paired else ['replacement'])
+    if paired:
+        assert 'unrelated' not in state['projects']
+    assert builder().run()['terminal'] == 'COMPLETE'
+    assert executed == (['replacement', 'control', 'unrelated'] if paired else ['replacement'])
     if paired:
         for project, sibling in [('control', 'replacement'), ('replacement', 'control')]:
             request = reviewed[project]

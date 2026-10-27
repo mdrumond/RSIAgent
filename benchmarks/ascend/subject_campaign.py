@@ -21,7 +21,7 @@ def _effective_project(projects, project_id):
         if project_id in seen:
             raise ValueError('cyclic project supersession')
         seen.add(project_id)
-        record = projects[project_id]
+        record = projects.get(project_id, {})
         if not record.get('superseded_by'):
             return project_id, record
         project_id = record['superseded_by']
