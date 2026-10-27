@@ -39,6 +39,12 @@ class OptimizerTaskExecutor:
             max_seconds=config.get('phase2_attempt_seconds', 7200))
         self.job_id = job['job_id']
         self.job_directory = self.store.root / self.job_id
+        from .actor_control import ActorControl
+        incoming = self.directory / 'actor/actor-control.json'
+        if incoming.exists():
+            control = ActorControl(self.job_directory)
+            for message in ActorControl(incoming.parent).status()['messages']:
+                control.send(message['key'], message['text'])
         identity = {'task': task, 'runtime': {key: config.get(key) for key in (
             'target', 'profile', 'runtime', 'arch', 'physical_device', 'remote_workspace',
             'cpl_remote', 'validation_wrapper', 'max_cases', 'knowledge', 'model_profile')}}

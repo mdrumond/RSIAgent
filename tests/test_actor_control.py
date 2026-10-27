@@ -1,0 +1,173 @@
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from benchmarks.ascend.actor_control import ActorControl, ActorConversation, ActorStopped, grant_elapsed
+from benchmarks.ascend.agent_context import WorkingContext
+from benchmarks.ascend.time_budget import AttemptTimeBudget
+
+
+def test_feedback_order_idempotency_and_atomic_receipts(tmp_path):
+    inbox = ActorControl(tmp_path)
+    assert inbox.send('one', 'change direction')['id'] == 1
+    inbox.send('two', 'retain the old evidence')
+    assert inbox.send('one', 'change direction')['id'] == 1
+    with pytest.raises(ValueError):
+        inbox.send('one', 'a different direction')
+    feedback = []
+    checkpoint = {'feedback': feedback}
+    inbox.boundary(checkpoint, feedback)
+    assert [row['feedback_id'] for row in feedback] == [1, 2]
+    assert all(row['consumed'] is not None for row in inbox.status()['messages'])
+    assert inbox.status()['checkpoint']['feedback'] == feedback
+    inbox.boundary(checkpoint, feedback)
+    assert len(feedback) == 2
+
+
+def test_stop_preserves_checkpoint_without_consuming_feedback(tmp_path):
+    inbox = ActorControl(tmp_path)
+    inbox.send('one', 'redirect')
+    inbox.stop()
+    with pytest.raises(ActorStopped):
+        inbox.boundary({'source': 'old source'}, [])
+    assert inbox.status()['checkpoint']['source'] == 'old source'
+    assert inbox.status()['messages'][0]['consumed'] is None
+    inbox.stop(False)
+    feedback = []
+    inbox.boundary({'feedback': feedback}, feedback)
+    assert feedback[0]['content'] == 'redirect'
+
+
+def test_checkpoint_restores_source_work_log_and_feedback_without_host_authority(tmp_path):
+    fixed = [{'role': 'system', 'content': 'contract'}, {'role': 'user', 'content': 'task'}]
+    working = WorkingContext(fixed)
+    actions = SimpleNamespace(source='saved source')
+    conversation = ActorConversation(tmp_path, 'task', working, actions)
+    ActorControl(tmp_path).send('redirect', 'inspect masks')
+    conversation.boundary()
+    working.work_log = 'Earlier compile failed; inspect retained log.'
+    working.host_state = {'host-verified': {'passed': True}}
+    conversation.save(4)
+    restored = WorkingContext(fixed)
+    sources = []
+    resumed = ActorConversation(tmp_path, 'task', restored,
+                                SimpleNamespace(restore_source=sources.append, source=None))
+    assert resumed.turn == 4 and sources == ['saved source']
+    assert restored.work_log == working.work_log
+    assert restored.host_state == {}
+    assert restored.pinned == [{'role': 'user', 'content': 'inspect masks'}]
+    with pytest.raises(ValueError):
+        ActorConversation(tmp_path, 'changed task', WorkingContext(fixed))
+
+
+def test_explicit_grant_preserves_elapsed_across_original_identity_resume(tmp_path):
+    path, now = tmp_path / 'elapsed.json', [0.0]
+    budget = AttemptTimeBudget(path, 10, clock=lambda: now[0])
+    with pytest.raises(ValueError):
+        grant_elapsed(path, 'grant', 5)
+    now[0] = 7
+    budget.close()
+    assert grant_elapsed(path, 'grant', 5) == 15
+    assert grant_elapsed(path, 'grant', 5) == 15
+    with pytest.raises(ValueError):
+        grant_elapsed(path, 'grant', 7)
+    resumed = AttemptTimeBudget(path, 10, clock=lambda: now[0])
+    assert resumed.deadline - now[0] == 8
+    resumed.close()
+    assert json.loads(path.read_text())['elapsed_seconds'] == 7
+    assert json.loads(path.read_text())['grants'] == {'grant': 5}
+
+
+def test_direct_actor_receives_feedback_and_resumes_without_repeating_action(tmp_path):
+    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, DirectCompletion, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    workspace = tmp_path / 'actor'
+    control = ActorControl(workspace)
+    control.send('first', 'inspect masks')
+    requests, executed = [], []
+    def complete(**options):
+        requests.append(options['request'])
+        return DirectCompletion('{"compile":{}}' if len(requests) == 1 else '{"submit":{}}', 1)
+    provider = DirectCompletionProvider({'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}, transport=complete)
+    def execute(action):
+        executed.append(action.kind)
+        if action.kind == 'compile':
+            control.stop()
+        return ActionOutcome('{"host":{"event":"observed"}}', action.kind == 'submit', 'host-verified')
+    actor = DirectActorDriver(provider)
+    args = dict(profile=direct_profile(MODEL_IDENTITIES[0]), workspace=workspace,
+                context=None, turn_parser=parse_trial_action, action_executor=execute)
+    assert actor('task', **args).status == 'user-stopped'
+    control.stop(False)
+    control.send('second', 'submit after review')
+    assert actor('task', **args).status == 'host-verified'
+    assert executed == ['compile', 'submit']
+    assert [row['content'] for row in requests[0]['messages'] if row['content'] == 'inspect masks'] == ['inspect masks']
+    assert any(row['content'] == 'submit after review' for row in requests[1]['messages'])
+    assert any(row['role'] == 'assistant' and 'compile' in row['content'] for row in requests[1]['messages'])
+
+
+def test_optimizer_delivers_feedback_in_model_context(tmp_path):
+    from optimizer.jobs import JobStore, canonical, sha
+    from optimizer.loop import OptimizationLoop
+    body = {'files': {}, 'memory_entries': []}
+    snapshot = {**body, 'snapshot_id': sha(canonical(body))}
+    store = JobStore(tmp_path / 'jobs')
+    job = store.create('def forward(x): return x', 'forward',
+        {'args': [{'shape': [5], 'dtype': 'float32'}]}, snapshot, max_seconds=100)
+    control = ActorControl(store.root / job['job_id'])
+    control.send('redirect', 'prefer vector work')
+    contexts = []
+    class Agent:
+        identity = {}
+        def complete(self, stage, context, record):
+            contexts.append(context)
+            return {'action': 'finish', 'summary': 'done'}
+    store.transition(job['job_id'], 'running')
+    loop = OptimizationLoop(store, job['job_id'], Agent(), SimpleNamespace())
+    loop.context, loop.single_evaluation, loop.prepare_only = {}, False, False
+    loop._model('optimize', {})
+    assert contexts[0]['user_feedback'][0]['content'] == 'prefer vector work'
+    assert control.status()['messages'][0]['consumed'] is not None
+
+
+@pytest.mark.parametrize('engine', ['direct', 'pi'])
+def test_feedback_arriving_during_model_request_supersedes_unexecuted_action(tmp_path, monkeypatch, engine):
+    from benchmarks.a5kernels.phase1_provider import DirectActorDriver, DirectCompletionProvider, DirectCompletion, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    inbox, requests, actions = ActorControl(tmp_path), [], []
+    def response(context):
+        requests.append(context)
+        if len(requests) == 1:
+            inbox.send('arrived-inflight', 'review direction before executing')
+            return 'compile', {}
+        return 'submit', {}
+    def transport(**kwargs):
+        kind, args = response(kwargs['request'])
+        return DirectCompletion(json.dumps({kind: args}), 1)
+    provider = DirectCompletionProvider({'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}, transport=transport)
+    if engine == 'direct':
+        actor = DirectActorDriver(provider)
+    else:
+        import coding.pi.actor as module
+        monkeypatch.setattr(module, 'runtime_preflight', lambda: None)
+        class Session:
+            completion_tokens = 0
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def next_action(self, context, *args, **kwargs): return response(context)
+        monkeypatch.setattr(module.PiActorDriver, '_new_session', lambda *args: Session())
+        actor = module.PiActorDriver(provider)
+    def execute(action):
+        actions.append(action.kind)
+        return ActionOutcome('{}', True, 'host-verified')
+    result = actor('task', profile=direct_profile(MODEL_IDENTITIES[0]), workspace=tmp_path,
+                   context=None, turn_parser=parse_trial_action, action_executor=execute)
+    assert result.status == 'host-verified' and actions == ['submit']
+    if engine == 'pi':
+        assert requests[1]['user_feedback'][0]['content'] == 'review direction before executing'
+    else:
+        assert any(row['content'] == 'review direction before executing' for row in requests[1]['messages'])
