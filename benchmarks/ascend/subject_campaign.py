@@ -83,12 +83,18 @@ class SubjectCampaign:
             return
         remaining = max(0, self.budget.deadline-self.clock())
         for result in self.memory_gate.poll(remaining_seconds=remaining):
-            self.scheduler.resolve_review(result['review_id'], result['outcome'])
+            if result.get('manual_override'):
+                self.scheduler.override_review(result['review_id'], result['manual_override'])
+            else:
+                self.scheduler.resolve_review(result['review_id'], result['outcome'])
             rows=self.state.setdefault('memory_reviews',{})
-            if result['review_id'] not in rows:
+            if result['review_id'] not in rows or result.get('manual_override') and not rows[result['review_id']].get('manual_override'):
+                prior = rows.get(result['review_id'])
                 rows[result['review_id']] = dict(outcome=result['outcome'], judgment=result.get('judgment'),
                     rewrites=result.get('rewrites'), subject_id=result['provenance'].get('subject_id'),
                     sequence=max((row.get('sequence',0) for row in rows.values()),default=0)+1)
+                if result.get('manual_override'):
+                    rows[result['review_id']].update(manual_override=result['manual_override'], original_review=prior)
                 if result['outcome']=='rejected':
                     self.state['needs_decision']=True
                 if result.get('repair'):
@@ -99,7 +105,7 @@ class SubjectCampaign:
                     self.state['needs_decision'] = True
                 self._save()
             if hasattr(self.memory_gate, 'acknowledge'):
-                self.memory_gate.acknowledge(result['review_id'])
+                self.memory_gate.acknowledge(result.get('delivery_id', result['review_id']))
 
     def _review(self, project_id, record):
         if record.get('review') is not None:

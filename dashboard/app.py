@@ -34,6 +34,8 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     from .curriculum_controls import register_curriculum_controls
     register_curriculum_controls(app, config_path, controls, csrf_token,
                                  binder=curriculum_binder, restart=curriculum_restart, status=curriculum_status)
+    from .memory_controls import register_memory_controls
+    register_memory_controls(app, config_path, csrf_token)
     last = [0.0]
 
     def view():

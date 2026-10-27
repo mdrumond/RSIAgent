@@ -270,6 +270,13 @@ class SubjectScheduler:
                 raise ValueError('review already has a different outcome')
             row['status'] = outcome
 
+    def override_review(self, review_id, receipt):
+        """Record a user's admission override separately from the original outcome."""
+        with self._transaction() as state:
+            row = state['reviews'][review_id]
+            row.setdefault('original_status', row['status'])
+            row.update(status='accepted', manual_override=receipt)
+
     def add_repair(self, repair_id, subject_id, project_id, reason, evidence):
         if subject_id not in self.index:
             raise ValueError('unknown repair subject')
