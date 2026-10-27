@@ -211,7 +211,7 @@ def test_explicit_continuation_acknowledges_only_current_partial_boundary(tmp_pa
         selected.append(messages)
         names = ['good', 'offline'] if len(selected) == 1 else ['fresh', 'offline-next' if next_partial else 'last']
         specs = [_project(name, focus) for name, focus in zip(names,
-            ['gm-ub-movement', 'simd-vector'] if len(selected) == 1 else ['padded-tail', 'pipe-mte2'])]
+            ['gm-ub-movement', 'simd-vector'] if len(selected) == 1 else ['padded-tail', 'simd-vector'])]
         return _wave(messages[-1]['content'], specs)
     def execute(request):
         executed.append(request.spec.project_id)
