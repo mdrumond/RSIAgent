@@ -188,15 +188,21 @@ def test_unpublished_copy_cannot_hide_published_attempt(tmp_path, published_firs
     assert result['memories'][0]['producer']['root'] == 'published'
 
 
-@pytest.mark.parametrize('different', ['target', 'toolchain'])
+@pytest.mark.parametrize('different', ['target', 'toolchain', 'torch_version', 'torch'])
 def test_verification_never_resolves_another_binding(tmp_path, different):
     good, failed = tmp_path / 'verified', tmp_path / 'failed'
     producer(good);producer(failed, terminal='interrupted')
     path = failed / 'campaign-identity.json';identity = json.loads(path.read_bytes())
     if different == 'target':
         identity.update(target='a5', arch='dav-3510')
-    else:
+    elif different == 'toolchain':
         identity['environment_identity']['cann_version'] = '9.3.0'
+    else:
+        good_path = good / 'campaign-identity.json'
+        good_identity = json.loads(good_path.read_bytes())
+        good_identity['environment_identity'][different] = '2.5.1'
+        write(good_path, good_identity)
+        identity['environment_identity'][different] = '2.6.0'
     identity['model'] = {'credential_env': 'PRIVATE', 'secret': 'do-not-import'}
     identity['workspace'] = '/private/machine/path'
     write(path, identity)
@@ -207,6 +213,8 @@ def test_verification_never_resolves_another_binding(tmp_path, different):
     binding = store.read_bytes(result['failures'][0]['review_request']['artifacts']['campaign-binding'])
     assert b'do-not-import' not in binding and b'/private/' not in binding
     assert json.loads(binding)['target'] == identity['target']
+    if different in ('torch_version', 'torch'):
+        assert json.loads(binding)['environment_identity'][different] == '2.6.0'
 
 
 @pytest.mark.parametrize('identity', ['missing', 'target', 'arch'])

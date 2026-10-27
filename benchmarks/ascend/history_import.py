@@ -46,7 +46,7 @@ def _binding(root):
     if not isinstance(environment, dict):
         raise ValueError('environment identity must be an object')
     binding['environment_identity'] = {key: environment[key] for key in
-        ('cann_version', 'compiler_version', 'soc_version', 'torch', 'torch_npu',
+        ('cann_version', 'compiler_version', 'soc_version', 'torch_version', 'torch', 'torch_npu',
          'python_version', 'driver_version', 'firmware_version') if key in environment}
     if not binding.get('target') or not binding.get('arch'):
         binding['unknown_producer'] = _digest(str(root.resolve()).encode())
