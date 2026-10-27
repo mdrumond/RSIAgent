@@ -36,6 +36,13 @@ outside its detailed page. It can page that manifest and the exact authenticated
 input, expected-result, observed-result and diagnostic artifacts without making
 unselected observations readable.
 
+Retained optimizer-backed campaign retry results can still be linked to an
+imported standalone failure. Resolution checks the original frozen submission,
+suite and comparison policy, authenticates the retained retry event/artifacts,
+and evaluates its timing against the original baseline. Remeasured reference
+timings do not change that frozen acceptance contract. This compatibility path
+finalizes retained results; new Phase 2 launches remain retired.
+
 Imports scan retained optimizer states, including nested goal directories, and
 deduplicate retained optimizer job/attempt identities. Restored campaigns retain
 their existing feedback IDs and investigation state, including older path-keyed

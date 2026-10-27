@@ -486,6 +486,7 @@ class FeedbackStore:
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
+                historical_sources = None
                 for candidate in state.get('history', []):
                     content = candidate.get('content', {})
                     if (candidate.get('tool') or not candidate.get('candidate_sha256')
@@ -493,8 +494,18 @@ class FeedbackStore:
                         continue
                     source = candidate.get('source')
                     if not source:
-                        source = next((event['payload'] for event in events if event['kind'] == 'artifact'
-                            and event['payload'].get('sha256') == candidate.get('candidate_sha256')), None)
+                        if historical_sources is None:
+                            historical_sources = {}
+                            seen = set()
+                            for event in events:
+                                ref = event['payload'].get('candidate') if event['kind'] == 'optimizer-state' else None
+                                if not ref or ref['sha256'] in seen:
+                                    continue
+                                seen.add(ref['sha256'])
+                                retained = json.loads(store.read_artifact(job['job_id'], ref['sha256']))
+                                if isinstance(retained, str):
+                                    historical_sources[sha(retained.encode())] = ref
+                        source = historical_sources.get(candidate['candidate_sha256'])
                     refs = {role: ref for role, ref in evidence.items() if role == 'baseline'}
                     for role, ref in dict(source=source, evaluation=candidate['result']).items():
                         if ref:
@@ -513,7 +524,33 @@ class FeedbackStore:
         return report
 
     @staticmethod
+    def _optimizer_campaign_retry(original, retry):
+        """Authenticate historical campaign results against a standalone frozen suite."""
+        if (not retry.get('verified') or original['target'] not in {'a3', 'a5'}
+                or original['target'] != retry.get('target')
+                or original['language'] not in {'ascend-c', 'catlass-dsl'}
+                or original['language'] != retry.get('language')):
+            return False
+        try:
+            from optimizer.loop import score
+            ref = original['evidence']['baseline']
+            if not Path(ref['job_root']).is_dir():
+                return False
+            frozen = json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
+            binding = _baseline_identity(original)
+            if (binding is None or retry['task']['task_id'] != original['task']['task_id']
+                    or retry['task']['submission'] != frozen['manifest']['submission']
+                    or not _verified_retry(retry) or _baseline_identity(retry) != binding):
+                return False
+            measured = score(frozen, retry['result']['result'])
+            return measured is not None and measured >= 1.0
+        except (KeyError, ValueError, OSError, TypeError):
+            return False
+
+    @staticmethod
     def _original_retry(original, retry):
+        if original.get('source_type') == 'optimizer' and retry.get('source_type') == 'phase2':
+            return FeedbackStore._optimizer_campaign_retry(original, retry)
         if (not retry.get('verified') or original.get('source_type') != retry.get('source_type')
                 or original.get('original_spec') != retry.get('original_spec')
                 or original['target'] not in {'a3', 'a5'}
