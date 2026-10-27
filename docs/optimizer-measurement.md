@@ -26,7 +26,30 @@ Group availability requires at least one finite counter belonging to that group;
 ordinary task durations and cycle totals do not qualify. `counter_columns` names
 the qualifying columns and `counter_schema` identifies the supported CANN 9.1
 summary names and retained long-name aliases. Unknown or all-unavailable schemas
-remain downloadable with `available=false` and `no group counters exported`.
+remain retained remotely with `available=false` and `no group counters exported`.
+
+## Bounded worker diagnostics
+
+Worker configuration optionally accepts
+`"profiling": {"max_cases": 1, "groups": ["PipeUtilization"]}`. These are the
+defaults: choose the frozen case with the largest total input tensor element
+count (stable suite-order ties) and ask one pipe-composition question. Selecting
+24 cases and all names in `optimizer.profiles.GROUPS` explicitly opts into the
+old expensive coverage; installed capabilities still determine availability.
+This is diagnostic sampling, not reduced correctness coverage: evaluation and
+canonical timing still cover every frozen case. A separate candidate diagnostic
+rechecks only its selected cases, returns `status=diagnostic`, and captures only
+Ascend C because the Torch baseline was already profiled during preparation.
+Coverage records include suite hash, total count, selected case IDs and groups.
+
+Normalization and analysis run on the remote worker. Portable digests contain
+requested-group counters with original kernel/row identity, units and values,
+plus hashes and remote paths for the full raw/normalized reports. Native rows
+are filtered by the compiled namespace's kernel symbol; missing matching
+counters are unavailable, not zero. No cross-row ratio averages are invented.
+Full profile tables and timelines stay remote, while canonical timing samples
+remain portable. The Actor consumes digests and locally retained artifacts;
+`read-artifact` is not a general remote-file fetch interface.
 
 Full profiler trees remain at the remote `raw_report` locations. Only generated
 compact JSON/CSV artifacts and manifests should be downloaded; no timeline

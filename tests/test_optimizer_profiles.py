@@ -110,3 +110,19 @@ def test_group_counters_accept_measured_zero(tmp_path, monkeypatch, group, colum
     result = profile(lambda: None, tmp_path / 'profiles', [group])['groups'][0]
     assert result['available'] is True
     assert result['counter_columns'] == [column]
+
+
+@pytest.mark.parametrize('value,available', [('NA', False), ('0', True)])
+def test_candidate_availability_ignores_other_kernel_counters(tmp_path, monkeypatch, value, available):
+    monkeypatch.setattr('optimizer.profiles.discover', lambda: {'groups': ['PipeUtilization']})
+    def fake_capture(fn, root, *args, **kwargs):
+        root.mkdir(parents=True)
+        (root / 'op_summary_0.csv').write_text(
+            f'Op Name,aiv_vec_ratio\nother_kernel,90\ncandidate_kernel,{value}\n')
+        return root
+    monkeypatch.setattr('optimizer.profiles.capture', fake_capture)
+    result = profile(lambda: None, tmp_path / 'profiles', ['PipeUtilization'],
+                     identity={'kernel_symbol': 'candidate_kernel'})['groups'][0]
+    assert result['available'] is available
+    if not available:
+        assert result['reason'] == 'no requested counters for candidate kernel symbol'
