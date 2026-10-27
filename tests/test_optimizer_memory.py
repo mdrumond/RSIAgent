@@ -153,6 +153,15 @@ def test_committed_partial_wave_export_retains_authenticated_interruption_and_is
     from tests.test_a3_reviewed_phase2 import native_source
     from optimizer.memory import freeze_committed_phase1
     root, _, memory = native_source(tmp_path, partial=True)
+    from benchmarks.a5kernels.phase1_adaptive import retained_failure_outcome
+    from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    state_path = root / 'state.json'
+    state = json.loads(state_path.read_bytes())
+    state['prior_outcomes'][0]['summary'] = 'host verified'
+    wave = WaveSpec.from_mapping(json.loads((root / 'waves/wave-01/plan.json').read_bytes())['wave'])
+    offline = next(item.spec for item in wave.projects if item.spec.project_id == 'offline')
+    state['failed_outcomes'] = [retained_failure_outcome(root, 'wave-01', offline)]
+    state_path.write_text(json.dumps(state))
     branch = 'waves/wave-01/branches/offline'
     path = root / branch / 'interruption.json'
     retained = path.read_bytes()
