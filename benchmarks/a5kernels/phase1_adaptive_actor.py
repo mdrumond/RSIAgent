@@ -572,6 +572,21 @@ class AdaptiveActorProjectExecutor:
         if actions.failure_context is not None:
             from benchmarks.ascend.failure_handoff import FailureArtifactReader
             actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
+        repair_protocol = ''
+        if request.spec.failure_mode is not FailureMode.NONE:
+            repair_protocol = (
+                f'Failure-repair task: required original failure = {request.spec.failure_mode.value}. '
+                'Follow reproduce -> observe the specified failure in host evidence -> repair '
+                '-> verify the repaired current source -> submit. Use the supplied buggy example '
+                'when available. If none is supplied, construct a faithful, safe reproducer of '
+                'the specified failure; an unrelated compiler error or numerical bug is not a '
+                'substitute. Never reproduce unsafe or hanging behavior. If the specified '
+                'original failure is already retained by the host, skip reproduction. '
+                'A passing implementation alone does not satisfy this repair task. If submit '
+                'reports missing observed-original-failure evidence, collect that specified '
+                'failure, repair it, verify again, then submit; do not loop over passing runs '
+                'or repeat submit without supplying the missing evidence.\n'
+            )
         diagnostics = ("Diagnostics: {\"request-debug\":{}} or "
                    "{\"request-sanitizer\":{\"tool\":\"memcheck\"}} "
                    "(also racecheck/initcheck/synccheck). Available before verification. "
@@ -579,7 +594,7 @@ class AdaptiveActorProjectExecutor:
                    "does not establish Catlass instruction coverage; inspect raw report. "
                    "Unavailable tools are reported explicitly. Do not deliberately run "
                    "hanging kernels; bounded termination does not guarantee device recovery.\n")
-        opening = (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
+        opening = repair_protocol + (diagnostics if self.diagnostic_instructions is None else self.diagnostic_instructions)
         if actions.failure_context is not None:
             opening += ("\nLinked observed failures (unverified context, not reusable memory): "
                         + json.dumps(actions.failure_context.presentation(), sort_keys=True)
@@ -594,13 +609,23 @@ class AdaptiveActorProjectExecutor:
                     '{"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}. '
                     'Offsets and limits are bytes; follow next_offset for more. '
                     'Observation previews do not replace authoritative host verification.')
+        measurements = []
+        if request.spec.timing_lengths or "sync-performance" in request.spec.learning_focus:
+            measurements.append('timing with {"request-timing":{}}')
+        if request.spec.profile_metric is not None:
+            measurements.append('profiling with {"request-profile":{}}')
+        if measurements:
+            opening += (
+                '\nAfter host verification of the repaired current source, obtain the required '
+                + ' and '.join(measurements) + '. The host selects measurement cases from the '
+                'project spec. Inspect returned raw evidence and report scope and uncertainty. '
+                'Source edits require renewed verification and applicable measurements.'
+            )
+        else:
+            opening += '\nThis spec requires no timing or profiling; do not add optional measurements.'
         opening += (
-            '\nAfter host verification of the current source, request timing with '
-            '{"request-timing":{}} and profiling with {"request-profile":{}}. '
-            'The host selects timing lengths and profiler metric from the project spec. '
-            'Inspect returned raw measurements and diagnostics; compile success is not correctness. '
-            'Rewriting source requires new verification and new measurements before submit. '
-            'Report measurement scope and uncertainty when distilling performance lessons.'
+            '\nCompile success does not establish correctness. Once current-source verification '
+            'and all specified evidence requirements are satisfied, submit as the next action.'
         )
         if self.immutable_context:
             opening += (

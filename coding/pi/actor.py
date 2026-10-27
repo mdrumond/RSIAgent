@@ -13,6 +13,16 @@ from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_pref
 from benchmarks.ascend.actor_control import actor_lease
 
 
+def _typed_contract(contract):
+    # The same task contract serves the legacy JSON driver and this typed driver.
+    return contract.replace(
+        "Respond with exactly one JSON object:",
+        "Call the corresponding declared typed tool. The following objects illustrate "
+        "action arguments; do not print them as JSON responses:",
+        1,
+    )
+
+
 class PiActorDriver(DirectActorDriver):
     session_factory = PiCodingSession
 
@@ -20,6 +30,7 @@ class PiActorDriver(DirectActorDriver):
         runtime_preflight()
         kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
         super().__init__(*args, max_seconds=max_seconds, **kwargs)
+        self.system_prompt = _typed_contract(self.system_prompt)
 
     def with_trace(self, trace_event):
         return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
@@ -75,6 +86,7 @@ class PiActorDriver(DirectActorDriver):
                     return ActorOutcome('user-stopped', turn, tokens)
                 turn += 1
                 before = session.completion_tokens
+                action_error = None
                 def record(kind, payload):
                     self._trace("tool", {"name": kind, "turn": turn, **payload})
                     if recorder.enabled:
@@ -96,7 +108,8 @@ class PiActorDriver(DirectActorDriver):
                 except PiDeadlineError:
                     tokens += session.completion_tokens-before
                     break
-                except ActionError:
+                except ActionError as exc:
+                    action_error = str(exc)[:500]
                     text = "{}"
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
@@ -109,12 +122,15 @@ class PiActorDriver(DirectActorDriver):
                     continue
                 action = turn_parser(text)
                 if action is None:
-                    latest = json.dumps({"host": {
+                    host = {
                         "event": "invalid-action",
                         "description": "The response could not be parsed as an accepted action. No action was executed.",
                         "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
                         "allowed_actions": sorted(allowed),
-                    }})
+                    }
+                    if action_error:
+                        host["error"] = action_error
+                    latest = json.dumps({"host": host})
                 else:
                     outcome = action_executor(action)
                     latest = outcome.observation
