@@ -412,3 +412,82 @@ def test_sequential_paired_restarts_use_current_evidence_and_resume_without_old_
     assert executed == ['replacement', 'control', *(source+'-next' for source in sequence), 'unrelated']
     assert all(not role.startswith('sibling:one:')
                for review in reviewed.values() for role in review.artifacts)
+
+
+@pytest.mark.parametrize('interrupted_project,cached', [('one', False), ('control', False), ('control', True)])
+def test_returned_interruption_preserves_observation_barrier_before_more_work(tmp_path, interrupted_project, cached):
+    config, root, _, scheduler, artifacts = setup(tmp_path)
+    scheduler.add_repair('paired', 'study', 'one', 'compare linked probes', ['a'*64])
+    snapshot = scheduler.state()['waves']['wave-1']['memory_snapshot_sha256']
+    scheduler.start_wave('paired-wave', snapshot)
+    state = json.loads((root/'subject-campaign.json').read_bytes())
+    state['projects']['one']['repairs'] = ['paired']
+    items = [dict(project_id=pid, repairs=['paired'], spec={'project_id': pid})
+             for pid in ('one', 'control', 'later')]
+    state['pending'] = dict(wave_id='paired-wave', subject={'subject_id': 'study', 'objective': 'Study'},
+        memory_sha256=snapshot, projects=['one', 'control', 'later'], items=items)
+    source = artifacts.put_bytes(b'partial source before interrupted execution')
+    evidence = artifacts.put_json({'classification': 'interrupted', 'source_sha256': source})
+    partial = SubjectOutcome(False, source, {'source': source, 'result:execution': evidence},
+        dict(classification='interrupted', interruption_reason='transport-unresolved', remote_operations=[]), artifacts.root)
+    # A real graph adapter can omit shared binding handles from remote_operations.
+    handle = 'remote:gz-a3-2:job:00000000-0000-0000-0000-000000000001'
+    operation = root/'binding/transport-state/retained/compile/operation.json'
+    operation.parent.mkdir(parents=True)
+    receipt = dict(handle=handle, state='running', identity={'source_sha256': source})
+    atomic(operation, canonical(receipt))
+    if cached:
+        state['projects']['control'] = dict(plan=items[1], repairs=['paired'], wave_index=2,
+            objective='Study', outcome=partial.as_dict())
+    atomic(root/'subject-campaign.json', canonical(state))
+    executed, reviewed = [], []
+    def execute(item, frozen, directory, **options):
+        executed.append(item['project_id'])
+        assert frozen == artifacts.read_bytes(snapshot)
+        if item['project_id'] == interrupted_project:
+            directory.mkdir(parents=True, exist_ok=True)
+            atomic(directory/'subject-execution.json', canonical(dict(
+                identity={'memory_sha256': snapshot, 'project_id': interrupted_project}, outcome=partial.as_dict())))
+            return partial
+        return SubjectOutcome(True, source, {'source': source}, {}, artifacts.root)
+    operation_request = request(config)
+    builder = real_builder(root, scheduler, artifacts, execution=execute, reviewed=reviewed.append)
+    held = interaction.run_request(config, 'campaign', operation_request['id'], builder=builder)
+    assert held['status'] == 'observation-required' and held['phase'] == 'executing'
+    assert reviewed == []
+    assert executed == (['one'] if interrupted_project == 'one' or cached else ['one', 'control'])
+    assert json.loads((root/'manual-pause.json').read_bytes())['request'] == held['id']
+    retained = held['retained_execution']
+    assert retained['project_id'] == interrupted_project
+    assert held['snapshot_sha256'] == snapshot
+    assert artifacts.read_json(retained['outcome_sha256']) == partial.as_dict()
+    inventory = artifacts.read_json(retained['operations_inventory_sha256'])
+    assert any(artifacts.read_json(row['artifact_sha256']) == receipt for row in inventory)
+    assert scheduler.state()['repairs']['paired']['status'] == 'open'
+    assert json.loads((root/'memory/active.json').read_bytes())['active'] == {}
+    if interrupted_project == 'one':
+        assert retained['attempt']['attempt_id'] == 'one-manual-'+held['id']
+        checkpoint = json.loads((root/retained['checkpoint']).read_bytes())
+        assert checkpoint['identity']['memory_sha256'] == snapshot
+    # Same-key replay observes the held request and never redispatches its work.
+    again = interaction.run_request(config, 'campaign', held['id'],
+        builder=lambda *a: pytest.fail('unsettled manual work cannot rebuild'))
+    assert again['status'] == 'observation-required'
+    # Every linked project remains protected, including a sibling not yet dispatched.
+    for pid in ('one', 'control', 'later'):
+        with pytest.raises(ValueError):
+            interaction.submit_feedback(config, 'campaign', pid, 'new work', 'new-'+pid, 10,
+                launcher=lambda *a: pytest.fail('new key cannot bypass the held linked operation'))
+
+
+def test_returned_semantic_failure_still_enters_review_and_repair(tmp_path):
+    config, root, _, scheduler, artifacts = setup(tmp_path)
+    reviewed = []
+    def execute(*args, **kwargs):
+        return SubjectOutcome(False, None, {}, {'classification': 'actor-unverified'}, artifacts.root)
+    operation = request(config)
+    done = interaction.run_request(config, 'campaign', operation['id'], builder=real_builder(
+        root, scheduler, artifacts, execution=execute, reviewed=reviewed.append, decision='repair'))
+    assert done['status'] == 'succeeded'
+    assert len(reviewed) == 1
+    assert not (root/'manual-pause.json').exists()

@@ -95,7 +95,9 @@ def _unsettled(directory, project_id, exclude):
     for path in directory.glob('*.json'):
         previous = _read(path)
         replacement = previous.get('proposal', {}).get('after', {}).get('item', {}).get('project_id')
-        if (previous['id'] != exclude and project_id in {previous['project_id'], replacement}
+        if (previous['id'] != exclude and project_id in {previous['project_id'], replacement,
+                    *previous.get('affected_projects', []),
+                    previous.get('retained_execution', {}).get('project_id')}
                 and previous['status'] in {'running', 'observation-required'}):
             return previous['id']
 
@@ -257,7 +259,7 @@ def run_request(config_path, campaign_id, identifier, *, builder=build_campaign)
                 budget.close()
             with _lock(path.parent / '.lock'):
                 pause = _read(root / 'manual-pause.json', {})
-                if pause.get('request') == identifier:
+                if pause.get('request') == identifier and request['status'] != 'observation-required':
                     (root / 'manual-pause.json').unlink(missing_ok=True)
             atomic(path, canonical(request))
         return request
@@ -361,12 +363,18 @@ def _execute(campaign, request, original, directory, request_path):
     record = campaign.state['projects'][pid]
     record['subject_id'] = subject_id
     record['origin_wave_id'] = original_wave
+    request['affected_projects'] = sorted({request['project_id'], pid, *(
+        _effective_project(campaign.state['projects'], item['project_id'])[0]
+        for item in pending.get('items', [])
+        if set(item.get('repairs', [])) & set(record.get('repairs', [])))})
     campaign._save()
     if 'outcome' not in record:
         request['phase'] = 'executing'
         atomic(request_path, canonical(request))
         record['outcome'] = campaign.execute(item, snapshot, directory,
             remaining_seconds=campaign._remaining()).as_dict()
+    campaign._save()
+    _require_observed_execution(campaign, pid, record, directory, request, request_path)
     request['phase'] = 'reviewing'
     atomic(request_path, canonical(request))
     campaign._save()
@@ -395,6 +403,36 @@ def _execute(campaign, request, original, directory, request_path):
     campaign._save()
     return dict(project_id=pid, review_id=review_id, directory=str(directory.relative_to(root)))
 
+
+
+def _require_observed_execution(campaign, pid, record, directory, request, request_path):
+    """A retained interruption is not completion, even when execution returned."""
+    outcome = record.get('outcome') or {}
+    observation = outcome.get('observations') or {}
+    if observation.get('classification') != 'interrupted':
+        return
+    request['phase'] = 'executing'
+    # Standalone graph adapters may retain binding receipts outside the project
+    # directory. Keep that campaign inventory without claiming project ownership
+    # or inferring settlement from an empty outcome.remote_operations list.
+    inventory = []
+    paths = set(directory.rglob('operation.json')) | set((campaign.root / 'binding').rglob('operation.json'))
+    for path in sorted(paths):
+        raw = path.read_bytes()
+        inventory.append(dict(path=str(path.relative_to(campaign.root)),
+                              artifact_sha256=campaign.artifacts.put_bytes(raw)))
+    request['retained_execution'] = dict(project_id=pid, directory=str(directory.relative_to(campaign.root)),
+        outcome_sha256=campaign.artifacts.put_json(outcome),
+        operations_inventory_sha256=campaign.artifacts.put_json(inventory),
+        inventory_scope='project-and-shared-campaign-binding',
+        remote_operations=observation.get('remote_operations', []),
+        interruption_reason=observation.get('interruption_reason'),
+        attempt=_read(directory / 'manual-execution.json', {}),
+        checkpoint=str((directory / 'subject-execution.json').relative_to(campaign.root)))
+    campaign._save()
+    atomic(request_path, canonical(request))
+    from optimizer.control import ObservationUnavailable
+    raise ObservationUnavailable('Retained interrupted execution requires observation before review or more work')
 
 def _settle_manual_repairs(campaign, pid, record, review_id):
     """Mirror publication's project repair decisions, including paired probes."""
@@ -456,6 +494,9 @@ def _finish_linked_siblings(campaign, record, snapshot, request, request_path):
             row['outcome'] = campaign.execute(row['plan'], snapshot, directory,
                 remaining_seconds=campaign._remaining()).as_dict()
             campaign._save()
+        directory = (campaign.root / row['directory'] if row.get('directory')
+                     else campaign.root / 'waves' / pending['wave_id'] / pid)
+        _require_observed_execution(campaign, pid, row, directory, request, request_path)
     request['phase'] = 'reviewing'
     atomic(request_path, canonical(request))
     for pid, row in linked.items():
