@@ -1,5 +1,5 @@
 {% if curriculum_controls.available(campaign.id) %}
-<section class="control-panel" data-curriculum="{{ campaign.id }}"><h2>Curriculum assistance</h2>
+<section class="control-panel" data-curriculum="{{ campaign.id }}" data-curriculum-project="{{ project.id if project is defined else '' }}"><h2>Curriculum assistance</h2>
 {% if project is not defined or not project.merged %}
 <form data-curriculum-preview>
 {% if project is defined %}<input type="hidden" name="kind" value="restart"><input type="hidden" name="project_id" value="{{ project.id }}"><p>Describe the revised prompt. The curriculum will format a fresh project contract for review.</p>
@@ -8,7 +8,7 @@
 <label>Formatting allowance (seconds) <input name="format_seconds" type="number" min="1" step="1" required></label>
 <button type="submit">Review curriculum proposal</button></form>
 {% endif %}
-<p data-curriculum-status role="status"></p>
+<p data-curriculum-status role="status"></p><button type="button" data-curriculum-reconcile hidden>Reconcile original request</button>
 <div data-curriculum-proposals>{% for proposal in curriculum_controls.proposals(campaign.id) %}{% if project is not defined or proposal.project == project.id %}
 <article data-curriculum-proposal="{{ proposal.id }}"><h3>{{ proposal.kind }}{% if proposal.project %} · {{ proposal.project }}{% endif %} · {{ proposal.status }}</h3><p>{{ proposal.instructions }}</p><pre>{{ proposal.diff }}</pre>
 {% set retained = curriculum_controls.restart_request(campaign.id, proposal.id) if proposal.kind == 'restart' else none %}
