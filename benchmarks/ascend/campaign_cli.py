@@ -478,6 +478,15 @@ def adopt_campaign(root, control, objective, initial_memory, config, legacy_revi
         expected_identity["kdb_manifest"] = (manifests[0].fingerprint
             if isinstance(native["collection"], str)
             else {manifest.collection: manifest.fingerprint for manifest in manifests})
+    if native.get("adaptive_kdb", False):
+        from .phase1_knowledge import adaptive_knowledge_identity
+        from types import SimpleNamespace
+        expected_identity["adaptive_kdb"] = adaptive_knowledge_identity(SimpleNamespace(
+            kdb=Path(native["kdb"]), collection=native["collection"],
+            librarian_seconds=native.get("librarian_seconds", 90),
+            memory_kdb=Path(native["memory_kdb"]) if native.get("memory_kdb") else None,
+            memory_collection=native.get("memory_collection"),
+            memory_snapshot=Path(native["memory_snapshot"]) if native.get("memory_snapshot") else None))
     if identity != expected_identity:
         for key, value in expected_identity.items():
             if identity.get(key) != value:
