@@ -536,6 +536,9 @@ class CurriculumAgent:
                 + history[-1]["content"]
             )
         deadline = self.clock() + context.remaining_seconds
+        begin_selection = getattr(self.query_knowledge, "begin_selection", None)
+        if begin_selection is not None:
+            begin_selection(context)
         def check_remaining():
             remaining = deadline - self.clock()
             if remaining <= 0:
