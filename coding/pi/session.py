@@ -90,9 +90,12 @@ class RequestAccounting:
 
 class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
-                 budget=None, own_process_group=True):
+                 budget=None, own_process_group=True, system_prompt=SYSTEM,
+                 first_action_only=False, context_factory=ContextRecords):
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
+        self.system_prompt = system_prompt
+        self.first_action_only = first_action_only
         # Only canonical registered profiles are accepted.
         from benchmarks.a3_experiments import BackendModel
         from benchmarks.a3_model_profiles import load_a3_model_profile
@@ -113,7 +116,8 @@ class PiCodingSession:
                                            "limit": {"type": "integer", "minimum": 1, "maximum": 8192}},
                                           ["record"])
         self.schemas["edit_source"] = obj({"sha256": STRING, "old_text": STRING, "new_text": STRING})
-        self.context = ContextRecords()
+        self.context_factory = context_factory
+        self.context = self.context_factory()
         self.token = secrets.token_urlsafe(32)
         self.own_process_group = own_process_group
         self.stack = ExitStack()
@@ -146,6 +150,8 @@ class PiCodingSession:
                 return page
             self.mutations += 1
             if self.mutations != 1:
+                if self.first_action_only:
+                    raise ValueError("only the first queued host action is selected; this extra call was not executed")
                 self.pending = None
                 raise ValueError("only one host action is allowed per turn")
             if name == "edit_source":
@@ -227,8 +233,8 @@ class PiCodingSession:
                 "--thinking", "off" if self.gateway.provider == "deepseek" else "high",
                 "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "--no-themes", "--no-context-files", "--no-mcp", "--offline", "--no-approve",
-                "--extension", str(ROOT / "integrations/pi/host-actions.ts"),
-                "--system-prompt", SYSTEM]
+                "--extension", str(getattr(self, "extension_file", ROOT / "integrations/pi/host-actions.ts")),
+                "--system-prompt", self.system_prompt]
         self.rpc = self.stack.enter_context(PiRPC(argv, cwd=directory, env=env,
                                                  own_process_group=self.own_process_group))
 
@@ -248,7 +254,7 @@ class PiCodingSession:
         if source is not None and write_action is not None:
             self.allowed.add("edit_source")
         self.pending, self.mutations = None, 0
-        self.context = ContextRecords()
+        self.context = self.context_factory()
         self.context_reads = {}
         self.snapshot = self.context.snapshot({
             "host": context,
@@ -291,7 +297,7 @@ class PiCodingSession:
                 reason = "invalid original Pi tool arguments: " + str(error)
                 self.record("pi-action-rejected", {"error": reason, "allowed": sorted(self.allowed)})
                 raise ActionError(reason) from None
-            if self.mutations != 1 or self.pending is None:
+            if self.pending is None or (self.mutations != 1 and not self.first_action_only):
                 raise ActionError("Pi must select exactly one valid host action")
             if time.monotonic() >= self.deadline:
                 self.pending = None
@@ -299,7 +305,7 @@ class PiCodingSession:
             name, args = self.pending
             # Persist intent before returning it to the host that owns side effects.
             self.record("pi-action", {"id": uuid.uuid4().hex, "name": name, "arguments": args,
-                                      **ENGINE_IDENTITY})
+                                      "discarded_actions": self.mutations - 1, **ENGINE_IDENTITY})
             return name, args
         finally:
             # Stream records through the host callback, including on failed or

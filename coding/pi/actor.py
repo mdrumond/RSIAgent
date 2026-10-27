@@ -14,16 +14,6 @@ from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_pref
 from benchmarks.ascend.actor_control import actor_lease
 
 
-def _typed_contract(contract):
-    # The same task contract serves the legacy JSON driver and this typed driver.
-    return contract.replace(
-        "Respond with exactly one JSON object:",
-        "Call the corresponding declared typed tool. The following objects illustrate "
-        "action arguments; do not print them as JSON responses:",
-        1,
-    )
-
-
 
 def observation_context(value):
     if isinstance(value, str):
@@ -86,7 +76,7 @@ class PiActorDriver(DirectActorDriver):
         runtime_preflight()
         kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
         super().__init__(*args, max_seconds=max_seconds, **kwargs)
-        self.system_prompt = _typed_contract(self.system_prompt)
+        self.system_prompt = typed_contract(self.system_prompt)
 
     def with_trace(self, trace_event):
         return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
