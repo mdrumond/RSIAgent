@@ -1,4 +1,5 @@
 """Typed Pi tools for project review; the verifier host still admits decisions."""
+from contextlib import contextmanager
 import time
 
 from coding.pi.schema import STRING, INTEGER, obj
@@ -68,7 +69,21 @@ def session_factory(settings, provider, complete):
     if engine == 'completion':
         return None
 
+    @contextmanager
     def create(*, max_seconds):
-        return PiCodingSession(model=complete.model, schemas=SCHEMAS,
-            deadline=time.monotonic() + max_seconds, system_prompt=SYSTEM, first_action_only=True)
+        from benchmarks.a5kernels.phase1_live import InfrastructureFailure
+        from coding.pi.context import ContextLimitError
+        from coding.pi.rpc import PiCancelled, PiDeadlineError, PiError
+        try:
+            # CLI/env-file credentials remain private to the provider and host
+            # gateway. Never replace them with a possibly different ambient key.
+            environment = provider.coding_environment() if hasattr(provider, 'coding_environment') else None
+            with PiCodingSession(model=complete.model, schemas=SCHEMAS, environ=environment,
+                    deadline=time.monotonic() + max_seconds, system_prompt=SYSTEM,
+                    first_action_only=True) as session:
+                yield session
+        except (PiCancelled, PiDeadlineError) as error:
+            raise TimeoutError('Pi project review interrupted: ' + type(error).__name__) from None
+        except (PiError, ContextLimitError) as error:
+            raise InfrastructureFailure('Pi project review infrastructure failure: ' + str(error)) from None
     return create

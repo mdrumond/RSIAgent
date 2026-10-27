@@ -1,4 +1,5 @@
 """Production tool routing and real Pi argument exchanges with a fake provider."""
+from contextlib import nullcontext
 from types import SimpleNamespace
 import json
 import time
@@ -16,14 +17,15 @@ from test_pi_runtime import stream
 def test_production_defaults_pi_but_injected_transport_stays_compatible(monkeypatch):
     made = []
     monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiCodingSession',
-                        lambda **kwargs: made.append(kwargs) or kwargs)
+                        lambda **kwargs: made.append(kwargs) or nullcontext(kwargs))
     completion = SimpleNamespace(model='deepseek-flash')
     live = SimpleNamespace(_transport=openai_compatible_transport)
     assert session_factory({}, SimpleNamespace(_transport=object()), completion) is None
     assert session_factory({'verifier_engine': 'completion'}, live, completion) is None
     create = session_factory({}, live, completion)
     before = time.monotonic()
-    create(max_seconds=7)
+    with create(max_seconds=7):
+        pass
     assert made[0]['model'] == 'deepseek-flash'
     assert before + 7 <= made[0]['deadline'] <= time.monotonic() + 7
     with pytest.raises(ValueError):
@@ -60,11 +62,12 @@ def test_subject_composition_selects_configured_verifier_model(tmp_path, monkeyp
     from test_subject_runtime import bound
     made = []
     monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiCodingSession',
-                        lambda **kwargs: made.append(kwargs) or kwargs)
+                        lambda **kwargs: made.append(kwargs) or nullcontext(kwargs))
     campaign = build_subject_campaign({'verifier_engine': 'pi', 'verifier_model': 'deepseek-flash',
         'memory_verification': False}, target='a3', root=tmp_path,
         subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: bound(tmp_path))
-    campaign.verifier.session_factory(max_seconds=5)
+    with campaign.verifier.session_factory(max_seconds=5):
+        pass
     assert made[0]['model'] == 'deepseek-flash'
 
 
@@ -247,3 +250,113 @@ def test_admitted_runtime_config_preserves_verifier_route_and_retained_review(tm
     assert (resumed.verifier.session_factory is None) is legacy
     allocations = json.loads((root/'execution-allocations.json').read_text())
     assert allocations[-1]['allocation']['worker']['physical_device'] == 1
+
+
+@pytest.mark.parametrize('ambient', [None, 'wrong-ambient-key'])
+def test_real_pi_gateway_uses_private_provider_credential(monkeypatch, ambient):
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('Node22 and pinned Pi required')
+    if ambient is None:
+        monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
+    else:
+        monkeypatch.setenv('DEEPSEEK_API_KEY', ambient)
+    selected = next(p.backend_model for p in MODEL_IDENTITIES if p.backend_model.value == 'deepseek-flash')
+    private = 'configured-private-provider-key'
+    provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': private}, models=[selected])
+    calls = []
+    def http(*_, **options):
+        calls.append(options)
+        return stream('read_artifact', {'sha256': S})
+    monkeypatch.setattr('coding.pi.gateway.requests.post', http)
+    create = session_factory({}, provider, SimpleNamespace(model='deepseek-flash'))
+    with create(max_seconds=15) as session:
+        assert session.next_action({}, ['read_artifact']) == ('read_artifact', {'sha256': S})
+    assert calls[0]['headers']['Authorization'] == 'Bearer ' + private
+    assert private not in calls[0]['data'].decode()
+
+
+@pytest.mark.parametrize('failure,expected', [
+    ('provider', 'InfrastructureFailure'), ('context', 'InfrastructureFailure'),
+    ('cancelled', 'TimeoutError'), ('deadline', 'TimeoutError'),
+])
+def test_production_review_boundary_normalizes_pi_failures(monkeypatch, failure, expected):
+    from coding.pi.context import ContextLimitError
+    from coding.pi.rpc import PiProviderError, PiCancelled, PiDeadlineError
+    classes = {'provider': PiProviderError, 'context': ContextLimitError,
+               'cancelled': PiCancelled, 'deadline': PiDeadlineError}
+    class Failing:
+        def __init__(self, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def next_action(self, *args, **kwargs): raise classes[failure]('synthetic failure')
+    monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiCodingSession', Failing)
+    h = Harness([])
+    h.agent.session_factory = session_factory({'verifier_engine': 'pi'}, object(),
+                                             SimpleNamespace(model='deepseek-flash'))
+    with pytest.raises(Exception) as caught:
+        h.agent.review(request(), max_seconds=10)
+    assert type(caught.value).__name__ == expected
+    assert not any(event['kind'] == 'decision' for event in h.agent.last_trace)
+
+
+def test_real_pi_provider_outage_holds_rewrite_and_resume_can_publish(tmp_path, monkeypatch):
+    from dataclasses import asdict
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.ascend.memory_admission import MemoryAdmission
+    from benchmarks.ascend.subject_memory import SubjectMemory
+    from test_memory_admission import Evaluation
+    from test_project_verifier_agent import SOURCE, RESULT, LOG
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('Node22 and pinned Pi required')
+    selected = next(p.backend_model for p in MODEL_IDENTITIES if p.backend_model.value == 'deepseek-flash')
+    provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': 'private-test-key'}, models=[selected])
+    outage = [True]
+    actions = iter([*prerequisites(), decision(memory())])
+    class Unavailable:
+        status_code = 503
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def json(self): return {'error': {'message': 'temporary test outage', 'type': 'unavailable'}}
+    def http(*_, **options):
+        if outage[0]:
+            return Unavailable()
+        action = next(actions)
+        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
+        return stream(name, args)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', http)
+    artifacts = ContentAddressedArtifacts(tmp_path/'artifacts')
+    for data in (SOURCE, RESULT, LOG):
+        artifacts.put_bytes(data)
+    agent = ProjectVerifierAgent(None, lambda digest, **_: artifacts.read_bytes(digest),
+        query_knowledge=lambda *a, **k: {'memories': [], 'citations': []},
+        session_factory=session_factory({}, provider, SimpleNamespace(model='deepseek-flash')))
+    accepted = SubjectMemory(tmp_path/'memory', b'')
+    evaluator = Evaluation(['rewrite', 'rewrite', 'accept'])
+    gate = MemoryAdmission(tmp_path/'gate', accepted, evaluator, agent.review, max_seconds=60)
+    try:
+        gate.submit('draft', memory(), {}, asdict(request()), remaining_seconds=60)
+        gate.wait(remaining_seconds=15)
+        assert gate.poll(remaining_seconds=5) == []  # Future/result does not abort the campaign.
+        held = json.loads(gate._path('draft').read_bytes())
+        assert held['status'] == 'inconclusive'
+        assert held['error_type'] == 'InfrastructureFailure'
+        assert held['rewrites'] == 0
+        assert accepted.records() == []
+        assert any(e['kind'] == 'pi-provider' and e['payload']['status'] == 'provider_error'
+                   for e in agent.last_trace)
+        gate.close()
+        outage[0] = False
+        gate.start_session()
+        gate.wait(remaining_seconds=15)
+        assert gate.poll(remaining_seconds=5)[0]['outcome'] == 'accepted'
+        assert accepted.records()[0]['proposal'] == memory()
+    finally:
+        gate.close()
