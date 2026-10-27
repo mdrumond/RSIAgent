@@ -84,7 +84,7 @@ class SubjectExecutor:
     def __init__(self, graph_actor=None, optimizer_factory=None, *, clock=time.monotonic):
         self.graph_actor, self.optimizer_factory, self.clock = graph_actor, optimizer_factory, clock
 
-    def graph(self, request, *, target=None, artifacts=None, runtime=None, policy=None, allow_device_migration=False):
+    def graph(self, request, *, target=None, artifacts=None, runtime=None, policy=None, allow_device_migration=False, binding_root=None):
         """Execute AdaptiveProjectRequest without Actor-owned distillation.
 
         When target is supplied, artifacts contains its retained qualification;
@@ -170,7 +170,8 @@ class SubjectExecutor:
         except (ProjectInfrastructureError, TimeoutError, PiError, ProviderRejectionError) as error:
             from .arm_evidence import interrupted_outcome
             outcome = interrupted_outcome(root.parent, error, store, started_epoch=epoch,
-                elapsed_seconds=max(0, self.clock()-started), project_root=root)
+                elapsed_seconds=max(0, self.clock()-started), project_root=root,
+                binding_root=binding_root, project_id=request.spec.project_id if binding_root is not None else None)
             root.mkdir(parents=True, exist_ok=True)
             atomic(checkpoint, canonical(dict(identity=identity, outcome=outcome.as_dict())))
             return portable(outcome.as_dict())

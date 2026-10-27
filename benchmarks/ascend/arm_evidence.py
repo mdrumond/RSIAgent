@@ -34,7 +34,7 @@ def interruption_reason(error):
             for current in chain) else 'harness-error')
 
 
-def arm_evidence(directory, store, *, project_root=None):
+def arm_evidence(directory, store, *, project_root=None, binding_root=None, project_id=None):
     """Read only owned evidence paths; never dispatch or infer job completion."""
     directory = Path(directory)
     refs, source, missing, spans = {}, None, [], []
@@ -67,17 +67,30 @@ def arm_evidence(directory, store, *, project_root=None):
                 provider_ids.add(value.get('reservation_id', digest))
                 provider_seconds += value.get('seconds', 0)
                 spans.append(dict(value, stage='provider'))
-    binding = directory / 'runtime' / 'binding'
+    binding = Path(binding_root) if binding_root is not None else directory / 'runtime' / 'binding'
+    transport = binding / 'transport-state'
+    owned = None if project_id is None else {path.parent.name
+        for path in transport.glob('*/candidate.json')
+        if json.loads(path.read_bytes()).get('project_id') == project_id}
     operations = []
     for path in sorted((binding / 'transport-state').rglob('operation.json')):
+        if owned is not None and path.relative_to(transport).parts[0] not in owned:
+            continue
         record = json.loads(path.read_bytes())
         refs['operation:'+path.relative_to(binding).as_posix()] = store.put_bytes(path.read_bytes())
         operations.append(dict(handle=record.get('handle'), state=record.get('state'),
             stage=path.parent.name, expired=record.get('expired', False)))
     for path in sorted(binding.rglob('timing.jsonl')):
-        refs['timing:'+path.relative_to(binding).as_posix()] = store.put_bytes(path.read_bytes())
-        spans.extend(json.loads(line) for line in path.read_bytes().splitlines())
+        rows = [json.loads(line) for line in path.read_bytes().splitlines()]
+        if owned is not None:
+            rows = [row for row in rows if str(row.get('key', '')).split('/')[0] in owned]
+        if rows:
+            data = path.read_bytes() if owned is None else ''.join(json.dumps(row)+'\n' for row in rows).encode()
+            refs['timing:'+path.relative_to(binding).as_posix()] = store.put_bytes(data)
+            spans.extend(rows)
     for path in sorted((binding / 'environment-checks').rglob('report.json')):
+        if owned is not None:
+            continue  # Campaign environment probes are not project-owned operations.
         report = json.loads(path.read_bytes())
         refs['environment:'+path.relative_to(binding).as_posix()] = store.put_bytes(path.read_bytes())
         spans.append(dict(report, stage='environment'))
@@ -112,8 +125,9 @@ def timing_summary(spans, started_epoch, elapsed_seconds, provider_seconds=0):
         provider_recorded_seconds=provider_seconds)
 
 
-def interrupted_outcome(directory, error, store, *, started_epoch, elapsed_seconds, project_root=None):
-    refs, source, operations, missing, spans, provider_seconds = arm_evidence(directory, store, project_root=project_root)
+def interrupted_outcome(directory, error, store, *, started_epoch, elapsed_seconds, project_root=None, binding_root=None, project_id=None):
+    refs, source, operations, missing, spans, provider_seconds = arm_evidence(directory, store, project_root=project_root,
+        binding_root=binding_root, project_id=project_id)
     partial = getattr(error, 'partial_evidence', {})
     project = Path(project_root) if project_root is not None else Path(directory) / 'project'
     source_store = ContentAddressedArtifacts(project / 'artifacts')

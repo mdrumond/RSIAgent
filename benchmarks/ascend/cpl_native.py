@@ -320,6 +320,7 @@ class CplNativeCandidateBackend:
     def compile(self, plan, local_directory):
         self._require_plan(plan)
         key = plan.execution_id
+        _save(self.root / key / 'candidate.json', dict(project_id=plan.project_id))
         bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
         archive = self._workspace / (key+'.tar')
         self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')

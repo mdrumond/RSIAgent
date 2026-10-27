@@ -62,6 +62,7 @@ def test_cpl_compiles_executes_and_reuses_retained_handle_without_resubmit(tmp_p
     plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
     compilation = candidate.compile(plan, tmp_path/'bundle')
     receipt = candidate.execute_receipt(compilation)
+    assert json.loads((candidate.root / plan.execution_id / 'candidate.json').read_bytes()) == dict(project_id=plan.project_id)
     assert receipt.output == EXPECTED
     assert receipt.job_handle.startswith('remote:fixture:job:')
     assert candidate.compile(plan, tmp_path/'bundle') == compilation
