@@ -204,7 +204,6 @@ class AdaptivePhase1Coordinator:
                     self._assess_committed_memory(state)
                     return self._report(state)
                 return self._with_allocation(reconcile)
-
             return self._report(state)
         return self._with_allocation(lambda: self._run_allocated(wave_limit=wave_limit, approved_only=approved_only))
 
@@ -646,7 +645,11 @@ class AdaptivePhase1Coordinator:
             plan = self._read_json(self.root / "waves" / wave_id / "plan.json")
             wave = WaveSpec.from_mapping(plan["wave"])
             prior = self._memory_snapshot({**state, "memory_bytes_base64": previous})
+            publication = self._read_json(self.root / "waves" / wave_id / "published.json")
+            committed = {row["project_id"] for row in publication["commits"]}
             for project in wave.projects:
+                if project.spec.project_id not in committed:
+                    continue
                 path = self.root / "waves" / wave_id / "branches" / project.spec.project_id / "memory-delta.bin"
                 if not path.exists():
                     continue
