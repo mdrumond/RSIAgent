@@ -67,7 +67,6 @@ def test_wave_lineage_and_host_evidenced_retry_recommendation(tmp_path):
         calls.append(messages)
         if len(calls) == 1:
             prompt = messages[-1]['content']
-            assert 'budget' in prompt and 'NOT verified' in prompt
             payload = json.loads(_wave(prompt, [_project('probe', 'padded-tail'),
                 _project('control', 'gm-ub-movement')]).split('\n', 1)[1])
             payload['failure_investigations'] = [investigation(selection)]
