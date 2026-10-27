@@ -18,13 +18,16 @@ from .control import ControlError, ControlManager
 
 
 def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=None,
-               optimizer_launcher=None, curriculum_binder=None, curriculum_restart=None, curriculum_status=None):
+               optimizer_launcher=None, curriculum_binder=None, curriculum_restart=None,
+               curriculum_status=None, actor_launcher=None):
     app = Flask(__name__)
     store = DashboardStore(config_path, cache_path)
     controls = ControlManager(config_path, cache_path, **(
         {"runner": command_runner} if command_runner is not None else {}))
     app.extensions["dashboard_controls"] = controls
     csrf_token = secrets.token_urlsafe(32)
+    from .actor_controls import register_actor_controls
+    register_actor_controls(app, config_path, csrf_token, actor_launcher)
     from .optimizer import register_optimizer
     register_optimizer(app, config_path, csrf_token, optimizer_launcher)
     from .feedback import register_feedback

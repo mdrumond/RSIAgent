@@ -110,8 +110,10 @@ class OptimizationLoop:
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         try:
-            return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
-                             memory_snapshot=memory_snapshot, context=context)
+            from benchmarks.ascend.actor_control import ActorControl
+            with ActorControl(self.directory.parent).lease():
+                return self._run_owned(prepare_only=prepare_only, single_evaluation=single_evaluation,
+                                 memory_snapshot=memory_snapshot, context=context)
         finally:
             close = getattr(self.agent, "close", None)
             if close is not None:

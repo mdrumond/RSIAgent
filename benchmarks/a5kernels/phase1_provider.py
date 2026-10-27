@@ -411,6 +411,9 @@ class _ActorContinuation:
     deadline: float | None = None
 
 
+from benchmarks.ascend.actor_control import actor_lease
+
+
 class DirectActorDriver:
     """Run the existing restricted A5 action protocol over one direct profile."""
 
@@ -477,6 +480,7 @@ class DirectActorDriver:
                                 "stage": stage, "turn": turn, **payload})
         return self.provider.complete(profile, messages, attempt_observer=observe)
 
+    @actor_lease
     def __call__(
         self,
         instruction: str,
@@ -501,7 +505,8 @@ class DirectActorDriver:
         tokens = 0
         turn = conversation.turn
         ordinary_turns = 0
-        deadline = self.clock() + self.max_seconds
+        deadline = min(self.clock() + self.max_seconds,
+                       getattr(action_executor, 'deadline', float('inf')))
         while self.clock() < deadline:
             try:
                 conversation.boundary()

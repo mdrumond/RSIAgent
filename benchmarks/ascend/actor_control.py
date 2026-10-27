@@ -10,6 +10,7 @@ import hashlib
 import json
 from pathlib import Path
 import time
+from functools import wraps
 
 from optimizer.jobs import atomic, canonical
 
@@ -55,6 +56,25 @@ class ActorControl:
                        created=time.time(), consumed=None)
             state['messages'].append(row)
             return dict(row)
+
+    @contextmanager
+    def lease(self):
+        if self.root is None:
+            yield
+            return
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / '.actor-live.lock').open('a+b') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield
+
+    def live(self):
+        if self.root is None or not (self.root / '.actor-live.lock').exists():
+            return False
+        try:
+            with self.lease():
+                return False
+        except BlockingIOError:
+            return True
 
     def status(self):
         with self.transaction() as state:
@@ -137,6 +157,14 @@ class ActorConversation:
     def save(self, turn):
         self.turn = turn
         self.control.save(self.snapshot())
+
+
+def actor_lease(function):
+    @wraps(function)
+    def execute(self, instruction, **options):
+        with ActorControl(options.get('workspace')).lease():
+            return function(self, instruction, **options)
+    return execute
 
 
 def grant_elapsed(path, key, additional_seconds):
