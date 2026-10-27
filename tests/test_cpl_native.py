@@ -450,3 +450,54 @@ def test_real_launcher_kills_surviving_descendant_after_leader_exits(tmp_path):
         if pid is not None:
             try: os.kill(pid, signal.SIGKILL)
             except ProcessLookupError: pass
+
+
+@pytest.mark.parametrize('cancel_signal', ['SIGTERM', 'SIGINT'])
+def test_real_launcher_cancellation_kills_isolated_payload_group(tmp_path, cancel_signal):
+    import os
+    import signal
+    import sys
+    ready = tmp_path/'ready.json'
+    descendant = (
+        "import json,os,pathlib,signal,sys,time; "
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+        "signal.signal(signal.SIGINT,signal.SIG_IGN); "
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.getppid(),os.getpid()])); "
+        "time.sleep(60)"
+    )
+    parent = tmp_path/'parent.py'
+    parent.write_text("import signal,subprocess,sys,time\n"
+        "signal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+        "signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
+        + "subprocess.Popen([sys.executable,'-c'," + repr(descendant) + ",sys.argv[1]])\n"
+        + "time.sleep(60)\n")
+    candidate = backend(tmp_path, Remote())
+    candidate.run_remote([sys.executable, str(parent), str(ready)], key='cancelled-tree')
+    process = subprocess.Popen(('bash', str(candidate.root/'cancelled-tree/command.sh')),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    pids = []
+    try:
+        deadline = time.monotonic()+5
+        while not ready.exists() and time.monotonic()<deadline:
+            time.sleep(0.01)
+        assert ready.exists(), 'payload group did not become ready'
+        pids = json.loads(ready.read_text())
+        os.killpg(process.pid, getattr(signal,cancel_signal))
+        assert process.wait(timeout=2) == 124
+        deadline = time.monotonic()+1
+        for pid in pids:
+            status = Path(f'/proc/{pid}/stat')
+            while status.exists():
+                try: state = status.read_text().split(') ',1)[1].split()[0]
+                except FileNotFoundError: break
+                if state in ('X','Z'): break
+                assert time.monotonic()<deadline, 'cancelled payload remained alive'
+                time.sleep(0.01)
+    finally:
+        if not pids and ready.exists(): pids = json.loads(ready.read_text())
+        for pid in pids:
+            try: os.kill(pid,signal.SIGKILL)
+            except ProcessLookupError: pass
+        if process.poll() is None:
+            os.killpg(process.pid,signal.SIGKILL)
+        process.communicate(timeout=3)
