@@ -251,7 +251,7 @@ def test_foreign_renamed_failure_retry_keeps_authenticated_inputs_and_original_o
             wrong = executor.prepare(renamed)
             bound = replace(request, failure_context=None, inputs=wrong.inputs, oracle=wrong.expected)
         actor = ScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}',
-                               '{"run":{}}', '{"submit":{}}'])
+                               '{"run":{}}', '{"submit":{}}'], memory=bound.pre_wave_memory)
         return AdaptiveActorProjectExecutor(executor, actor, object())(bound)
     runner = AdaptivePhase1Coordinator(tmp_path/'consumer', 'Retry original case.', b'{}',
         CurriculumAgent(lambda _: pytest.fail('no new curriculum project')), execute, max_parallel=1, project_target=1)
