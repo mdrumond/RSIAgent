@@ -214,7 +214,7 @@ def test_collection_setup_consumes_shared_librarian_allowance(tmp_path, monkeypa
 
 def test_usefulness_lessons_have_independent_selection_budgets_and_resume_reuses_them(tmp_path):
     from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
+    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, curriculum_prompt
     from benchmarks.ascend.memory_usefulness import UsefulnessVerifier
     from test_a5_phase1_adaptive import _memory, _project, _result, _wave
     cfg, calls = config(tmp_path), []
@@ -231,14 +231,13 @@ def test_usefulness_lessons_have_independent_selection_budgets_and_resume_reuses
         if len(prompts) % 2 == 0:
             prompts.append(messages[-1]['content'])
             return json.dumps({'knowledge_query': {'query': 'pipeline', 'limit': 1}})
-        prompt = prompts[-1]
         prompts.append(None)
         if len(prompts) == 2:
             path = roots[0] / 'librarian-budget.json'
             state = json.loads(path.read_bytes())
             state['elapsed_seconds'] = cfg.librarian_seconds
             path.write_text(json.dumps(state))
-        return _wave(prompt, [_project('useful-copy', 'gm-ub-movement')])
+        return _wave(curriculum_prompt(contexts[-1]), [_project('useful-copy', 'gm-ub-movement')])
     curriculum = CurriculumAgent(author, query_knowledge=query)
     verifier = UsefulnessVerifier(tmp_path / 'assessments', curriculum,
         lambda request: _result(request.spec, True, 'host pass'),
