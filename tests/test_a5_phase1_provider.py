@@ -794,3 +794,46 @@ def test_single_model_provider_does_not_require_unrelated_credentials():
     assert provider.complete(direct_profile(selected), [{'role':'user', 'content':'test'}]).text == 'ok'
     with pytest.raises(ValueError, match='not configured'):
         provider.complete(direct_profile(MODEL_IDENTITIES[1]), [{'role':'user', 'content':'test'}])
+
+
+def test_bounded_provider_requests_shrink_http_time_and_do_not_dispatch_after_deadline():
+    now, calls = [0.0], []
+    def transport(**kwargs):
+        calls.append(kwargs['request'])
+        now[0] += 1
+        if len(calls) == 1:
+            raise PromptRejected()
+        return DirectCompletion('ok', 1)
+    def sleep(seconds):
+        now[0] += seconds
+    provider = DirectCompletionProvider(ENVIRONMENT, transport=transport, clock=lambda: now[0],
+        sleeper=sleep, invalid_prompt_backoff_seconds=1)
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    assert provider.complete(profile, [{'role': 'user', 'content': 'test'}], max_seconds=10).text == 'ok'
+    assert [call['timeout'] for call in calls] == [10, 8]
+    calls.clear()
+    with pytest.raises(TimeoutError):
+        provider.complete(profile, [], max_seconds=0)
+    assert calls == []
+    provider._sleep = lambda seconds: now.__setitem__(0, now[0]+20)
+    with pytest.raises(TimeoutError):
+        provider.complete(profile, [], max_seconds=10)
+    assert len(calls) == 1
+
+
+def test_bounded_transport_consumes_timeout_without_sending_api_payload_field(monkeypatch):
+    constructors, payloads = [], []
+    class OpenAI:
+        def __init__(self, **kwargs):
+            constructors.append(kwargs)
+            def create(**payload):
+                payloads.append(payload)
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='ok'))],
+                    usage=SimpleNamespace(completion_tokens=1))
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+    monkeypatch.setitem(sys.modules, 'openai', SimpleNamespace(OpenAI=OpenAI))
+    request = {'model': 'test', 'messages': [], 'timeout': 4}
+    openai_compatible_transport(base_url='https://provider.invalid', api_key='secret', request=request)
+    assert constructors[0]['timeout'] == 4
+    assert payloads == [{'model': 'test', 'messages': []}]
+    assert request['timeout'] == 4
