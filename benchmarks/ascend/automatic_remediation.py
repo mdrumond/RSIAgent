@@ -182,9 +182,18 @@ class AutomaticRemediation:
             if original['lifecycle'] == 'failed':
                 latest = next((r for r in reversed(self.feedback.lineage) if r['feedback_id'] == key), None)
                 if latest:
-                    self.feedback.lineage.append(dict(latest, status='investigating',
-                        reason='Original acceptance still fails after retry; investigate retained retry evidence.'))
-                    self.feedback.record([], state)
+                    update = dict(latest, status='investigating',
+                        reason='Original acceptance still fails after retry; investigate retained retry evidence.')
+                    state['failure_investigations'] = [row for row in state.get('failure_investigations', [])
+                        if row['feedback_id'] != key] + [update]
+                    atomic(self.runner.root / 'state.json', canonical(state))
+                    pending_path = self.runner.root / 'pending.json'
+                    if pending_path.exists():
+                        pending = json.loads(pending_path.read_bytes())
+                        pending['failure_investigations'] = [update if row['feedback_id'] == key else row
+                            for row in pending.get('failure_investigations', [])]
+                        atomic(pending_path, canonical(pending))
+                    self.feedback.record([update], state)
             self.save()
             self._assess_retry(directory)
 
