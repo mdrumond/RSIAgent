@@ -119,13 +119,31 @@ class FailureCurriculum:
         self.ids = {row['feedback_id'] for row in self.selection['selected']}
         return self.selection
 
+    def linked_retries(self, row, records=None):
+        """Linked observations are evidence for the original, never obligations."""
+        if records is None:
+            records = {record['feedback_id']: record for record in self.store.records()}
+        current = records.get(row['feedback_id'], row)
+        return [records[key] for key in current['investigation'].get('retries', []) if key in records]
+
+    def evidence_rows(self):
+        records = {record['feedback_id']: record for record in self.store.records()}
+        rows = self.selection['selected'] + self.selection['controls']
+        return rows + [retry for row in self.selection['selected']
+                       for retry in self.linked_retries(row, records)]
+
     def context(self, state):
         self.state = state
         from .context_files import ContextFiles
         self.context_files = ContextFiles(self.root / "curriculum" / "context")
+        records = {record['feedback_id']: record for record in self.store.records()}
+        linked = {row['feedback_id']: self.linked_retries(row, records)
+                  for row in self.selection['selected']}
         rows = []
-        for role in ('selected', 'controls'):
-            for row in self.selection[role]:
+        for role, entries in (('selected', self.selection['selected']),
+                              ('controls', self.selection['controls']),
+                              ('linked-retries', [retry for retries in linked.values() for retry in retries])):
+            for row in entries:
                 out = row['outcome']
                 rows.append(dict(feedback_id=row['feedback_id'], role=role,
                     category=out['category'], lifecycle=row.get('lifecycle'),
@@ -142,6 +160,7 @@ class FailureCurriculum:
         from .agent_presentation import _preview
         start = ((state.get('wave_index', 1)-1) * 8) % max(1, len(self.selection['selected']))
         chosen = [r for r in rows if r['role'] == 'selected'][start:start+8] + [r for r in rows if r['role'] == 'controls'][:2]
+        presentations = {row['feedback_id']: row for row in rows}
         manifest = []
         eligible = self.retry_eligible_pairs(state)
         latest = {row['feedback_id']: row for row in self.lineage}
@@ -150,6 +169,8 @@ class FailureCurriculum:
             investigation = latest.get(row['feedback_id'], row['investigation'])
             manifest.append(dict(feedback_id=row['feedback_id'], category=out['category'],
                 failure_cases_file=next(item['failure_cases_file'] for item in rows if item['feedback_id'] == row['feedback_id']),
+                linked_retries_file=self.context_files.put('linked-retries-' + row['feedback_id'],
+                    [presentations[retry['feedback_id']] for retry in linked[row['feedback_id']]]),
                 retry_eligible_pairs=eligible.get(row['feedback_id'], []),
                 status=investigation['status'], classification=investigation.get('classification') or out['result'].get('classification'),
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
@@ -183,23 +204,20 @@ class FailureCurriculum:
         digest = sha256
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('invalid feedback artifact page')
-        for row in self.selection['selected'] + self.selection['controls']:
+        records = self.evidence_rows()
+        for row in records:
             task = canonical(row['outcome']['task'])
             if sha(task) == digest:
                 return dict(sha256=digest, offset=offset, size=len(task),
                     text=task[offset:offset+limit].decode(errors='replace'),
                     next_offset=offset+limit if offset+limit < len(task) else None)
             try:
-                data = self.store.failure_artifact_bytes(row['feedback_id'], digest)
-            except (ValueError, FileNotFoundError):
+                return self.store.read_failure_artifact(row['feedback_id'], digest, offset, limit)
+            except FileNotFoundError:
                 pass
-            else:
-                return dict(sha256=digest, offset=offset, size=len(data),
-                    text=data[offset:offset+limit].decode(errors='replace'),
-                    next_offset=offset+limit if offset+limit < len(data) else None)
             for ref in row['outcome']['evidence'].values():
                 if ref['sha256'] == digest:
-                    return self.store.read_evidence(digest, offset=offset, limit=limit)
+                    return self.store.read_evidence(digest, offset=offset, limit=limit, records=records)
         raise ValueError('artifact is not in selected feedback')
 
     def admit(self, rows, wave, context):
@@ -253,19 +271,25 @@ class FailureCurriculum:
                 {'ready-to-retry', 'deferred'} for key in self.ids):
             raise ValueError('terminal feedback curriculum must recommend retry or explain deferral for every selected failure')
         if wave is not None:
+            records = {record['feedback_id']: record for record in self.store.records()}
             for project in wave.projects:
                 spec = project.spec
                 keys = [row['feedback_id'] for row in rows if row.get('project_id') == spec.project_id]
                 mode = getattr(spec, 'failure_mode', None)
                 if mode is not None and mode.value != 'none':
                     from .failure_handoff import FailureContext
-                    FailureContext(dict(root=str(self.store.root), feedback_ids=keys), spec).require_repair_evidence(spec)
+                    linked = [retry['feedback_id'] for selected in self.selection['selected']
+                        if selected['feedback_id'] in keys for retry in self.linked_retries(selected, records)]
+                    FailureContext(dict(root=str(self.store.root), feedback_ids=keys + linked), spec).require_repair_evidence(spec)
         return tuple(rows)
 
     def project_context(self, project_id):
         keys = list(dict.fromkeys(row['feedback_id'] for row in self.lineage
                                  if row.get('project_id') == project_id and row['feedback_id'] in self.ids))
-        return dict(root=str(self.store.root), feedback_ids=keys) if keys else None
+        records = {record['feedback_id']: record for record in self.store.records()}
+        linked = [retry['feedback_id'] for row in self.selection['selected']
+                  if row['feedback_id'] in keys for retry in self.linked_retries(row, records)]
+        return dict(root=str(self.store.root), feedback_ids=list(dict.fromkeys(keys + linked))) if keys else None
 
     def record(self, rows, state=None):
         if state is not None:
