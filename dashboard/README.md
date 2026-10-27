@@ -216,3 +216,20 @@ An ineligible project displays its missing gate;
 use actor feedback or a curriculum-reviewed restart to obtain the required
 evidence and project review. This control requires configured subject runtime
 settings and initial memory; it does not establish a successful usefulness trial.
+
+### Standalone knowledge questions
+
+Open **Knowledge** (`/knowledge`) to ask the librarian outside an actor session.
+Choose a configured subject campaign, enter a question and elapsed allowance,
+and submit. The asynchronous operation searches that campaign's configured
+reference KDB and current accepted memories, then asks its configured
+`librarian_model` (falling back to `curriculum_model`) to answer using the returned
+evidence. Binding, retrieval, and answer generation share the allowance.
+
+The answer includes source excerpts and exact citation identities. The host
+accepts only source indices present in retrieval results; no matching evidence
+returns an explicit empty-source result without generating an answer. Pending
+memory drafts stay outside the accepted catalog, and queries do not create or
+modify an actor conversation. Dashboard controls and matching server-owned
+runtime configuration must be enabled. This documents the configured execution
+path, not a claim that a live provider or device campaign was validated.
