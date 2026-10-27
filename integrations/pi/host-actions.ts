@@ -51,7 +51,18 @@ export default function (pi: ExtensionAPI) {
     }
     const exchanges: (typeof event.messages)[] = [];
     const pages = new Set<string>();
-    let bytes = Buffer.byteLength(JSON.stringify(snapshot));
+    const snapshotMessage = { role: "user" as const, content: JSON.stringify(snapshot),
+      timestamp: Date.now() };
+    // Provider messages wrap JSON text inside JSON strings. Double serialization
+    // conservatively covers argument/result escaping in the pinned SDK's chat
+    // and Responses projections. Include active schemas and the system prompt;
+    // reserve 8 KiB for provider envelopes and projection metadata as well.
+    const wireBound = (value: unknown) => Buffer.byteLength(JSON.stringify(JSON.stringify(value)));
+    const active = new Set(pi.getActiveTools());
+    const tools = pi.getAllTools().filter(tool => active.has(tool.name))
+      .map(({ name, description, parameters }) => ({ name, description, parameters }));
+    let bytes = wireBound({ system: ctx.getSystemPrompt(), tools }) + 8192
+      + Buffer.byteLength(JSON.stringify(snapshotMessage));
     for (let i = event.messages.length - 1; i > boundary; i--) {
       const message = event.messages[i];
       if (message.role !== "assistant" || message.stopReason !== "toolUse") continue;
@@ -64,16 +75,15 @@ export default function (pi: ExtensionAPI) {
           : c.name + JSON.stringify(c.arguments));
         if (keys.every(key => pages.has(key))) continue;
         const exchange = [message, ...results];
-        const size = Buffer.byteLength(JSON.stringify(exchange));
-        // Preserve the latest complete exchange as before. Older pages fit in a
-        // bounded window below the provider's separately enforced request cap.
-        if (exchanges.length && bytes + size > 32768) continue;
+        const size = wireBound(exchange);
+        // The current snapshot and latest complete exchange stay mandatory.
+        // Admit older exchanges only below the gateway's complete request cap.
+        if (exchanges.length && bytes + size > 49152) continue;
         exchanges.push(exchange);
         bytes += size;
         keys.forEach(key => pages.add(key));
       }
     }
-    return { messages: [{ role: "user" as const, content: JSON.stringify(snapshot),
-      timestamp: Date.now() }, ...exchanges.reverse().flat()] };
+    return { messages: [snapshotMessage, ...exchanges.reverse().flat()] };
   });
 }
