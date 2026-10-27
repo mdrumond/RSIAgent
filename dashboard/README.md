@@ -1,8 +1,8 @@
 # RSI campaign dashboard
 
-This directory is an independent viewer for retained Phase 1 and Phase 2
-campaign artifacts. Campaign controls are disabled unless explicitly configured,
-and the dashboard never imports campaign execution code. Copy
+This directory shows current subject campaigns alongside retained Phase 1 and
+Phase 2 artifacts. Campaign controls are disabled unless explicitly configured;
+new Phase 2 execution paths are retired. Copy
 `config.example.json`, point each root at a locally mounted or synchronized
 campaign directory, then run:
 
@@ -89,21 +89,23 @@ an 8 KiB prefix; they never fetch remote raw profiler trees.
 With controls enabled, **Import configured Phase 2 results** runs the historical
 importer against every Phase 2 campaign in this dashboard configuration. Select
 failures, a compatible fresh A3 destination preset, and an explicit project
-budget to start a Phase 1 investigation awaiting curriculum approval. Retry
-requires exactly one original target and a fresh Phase 2 preset with its updated
-reviewed Phase 1 memory. These explicit starts use the existing asynchronous
-operation queue; no campaigns start merely by viewing or importing feedback.
+budget to start a retained Phase 1 investigation awaiting curriculum approval.
+New Phase 2 launches and original-target retries are rejected before dispatch;
+use subject curriculum requests for new work. Phase 2 sampling, approval, and
+execution actions are unavailable, while historical proposals and results remain
+readable. Explicit Phase 1 investigations use the asynchronous operation queue;
+no campaigns start merely by viewing or importing feedback.
 Resolved results and deferred/infrastructure observations remain visible but
-are not selectable for kernel investigation. Every round/retry needs unused
-preset root/control directories, just like ordinary campaign starts.
+are not selectable for kernel investigation. Each Phase 1 investigation needs
+unused preset root/control directories, just like retained campaign starts.
 
 Set `controls.enabled` to `true` only for a loopback listener. The CLI enforces
 this boundary and accepts loopback IP literals or the exact `localhost` name;
 use an SSH tunnel for remote access. Each preset is a complete server-side A3
 launch definition; browser requests can select a preset
 but cannot supply paths, commands, environment variables, targets, or arbitrary
-arguments. The runner is invoked without a shell. Phase 2 presets additionally
-require `phase1_root` and `review`. Every controlled campaign and launch preset
+arguments. The runner is invoked without a shell. Retained Phase 2 configuration
+is readable but cannot authorize new launches. Every controlled campaign and launch preset
 must explicitly set `"target": "a3"`; other targets remain viewable but cannot
 be controlled.
 
@@ -166,6 +168,26 @@ from the beginning without duplicating displayed records. Downloads include
 complete retained records at download time. Partial trailing records appear
 only after their writer finishes the line. Interrupted writers are shown as
 stopped when the campaign execution lock is no longer held.
+
+Enable curriculum assistance with `controls.enabled: true` and add server-owned
+`config` (subject runtime settings JSON) and `initial_memory` paths to each
+subject campaign entry. The retained runtime/settings fingerprints must match.
+Formatting runs asynchronously under the explicit elapsed allowance entered in
+the form. The curriculum returns an executable contract and a diff; only approval
+changes future subjects or the unreserved project queue. Reserved wave contracts
+stay frozen. Project restarts additionally require a fresh execution allowance
+and dispatch the approved prompt through the durable actor-control service.
+Restart preview and approval require the subject interaction runtime (provided by the actor-controls change); installations without it retain read-only restart history and reject dispatch before provider work or approval changes.
+Role bindings are isolated from live campaign/admission workers. Existing
+operation polling, CSRF checks, and idempotency apply to previews and approvals.
+
+Approved restart proposals retain a Resume/reconcile action after a launch
+failure or dashboard interruption. The request uses the same durable identity
+and original elapsed allocation; queued/running requests are observed rather
+than launched again. Status continues polling after the dashboard operation
+finishes. Completed requests and uncertain executions requiring observation
+cannot be retried from that action. The editable future-work queue excludes
+projects already reserved into a wave, even if they have not started.
 
 Live-log cursors report resets per stream, preserving unaffected entries when
 one writer rotates or truncates its ledger. Complete records larger than 1 MiB
