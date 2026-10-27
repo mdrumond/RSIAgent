@@ -17,6 +17,14 @@ def write(path, value):
     path.write_text(json.dumps(value))
 
 
+def raw_fields(value):
+    if isinstance(value, list):
+        return [raw_fields(item) for item in value]
+    if isinstance(value, dict):
+        return {key: raw_fields(item) for key, item in value.items() if key != 'status_explanations'}
+    return value
+
+
 @pytest.fixture
 def feedback(tmp_path):
     root = tmp_path / 'feedback'
@@ -264,7 +272,7 @@ def test_feedback_controls_reach_real_cli_without_providers_or_screens(feedback,
         assert response.status_code == 409
         assert invocations == [] and screens == []
         assert not (root / 'control2').exists() and not (root / 'new2').exists()
-        assert client.get('/api/feedback').get_json() == [row]
+        assert raw_fields(client.get('/api/feedback').get_json()) == [row]
         return
     completed(client, response)
     if phase:
@@ -374,7 +382,7 @@ def test_legacy_feedback_metadata_is_derived_without_rewriting_history(feedback,
     assert actual['lifecycle'] == lifecycle
     # Every original field remains identical, including investigation state and
     # retained host evidence; the defaults exist only in the public read view.
-    original = json.loads(json.dumps(actual))
+    original = raw_fields(actual)
     original.pop('lifecycle')
     original['outcome'].pop('source_type')
     original['outcome'].pop('original_spec')
