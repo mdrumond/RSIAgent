@@ -13,6 +13,11 @@ host snapshot contains the authoritative observation. Use submit_review for a
 terminal accept/repair proposal; the host validates it before admission. Its
 fields follow the evidence instructions below. Use review_state.missing_required_artifacts
 for the exact artifact roles and SHA256 values still required before acceptance.
+Evidence arrays must contain only bare SHA256 strings copied from
+review_state.allowed_evidence. Put interpretation in reason, never in evidence.
+Memory citations must be exact objects from review_state.citations; use [] when
+that list is empty. Do not invent source-line citations. Snippet line numbers
+are 1-based; omit snippet text to let the host extract the exact observed lines.
 Use read_context to page context records if previews are insufficient.
 ''' + EVIDENCE_INSTRUCTIONS
 
@@ -20,26 +25,32 @@ def nullable(schema):
     return {'anyOf': [schema, {'type': 'null'}]}
 
 
-SNIPPET = obj({'sha256': STRING, 'start_line': INTEGER, 'end_line': INTEGER, 'text': STRING},
+SHA256 = {'type': 'string', 'pattern': '^[0-9a-f]{64}$',
+          'description': 'Exact bare SHA256 artifact identity returned by the host. No annotations or prose.'}
+LINE = {'type': 'integer', 'minimum': 1, 'description': '1-based source line number.'}
+EVIDENCE = {'type': 'array', 'minItems': 1, 'items': SHA256,
+            'description': 'Bare SHA256 identities of artifacts actually read; copy review_state.allowed_evidence.'}
+SNIPPET = obj({'sha256': SHA256, 'start_line': LINE, 'end_line': LINE, 'text': STRING},
               ['sha256', 'start_line', 'end_line'])
 MEMORY = obj({
     'operation': {'type': 'string', 'enum': ['create', 'append', 'merge']},
     'base_versions': {'type': 'array', 'items': obj({'memory_id': STRING, 'version': STRING})},
     **{key: STRING for key in ('summary', 'applicability', 'preconditions', 'expectations', 'limitations')},
     'before': nullable(SNIPPET), 'before_unavailable_reason': nullable(STRING),
-    'after': SNIPPET, 'evidence': {'type': 'array', 'items': STRING},
-    'citations': {'type': 'array', 'items': {'type': 'object'}},
+    'after': SNIPPET, 'evidence': EVIDENCE,
+    'citations': {'type': 'array', 'items': {'type': 'object'},
+                  'description': 'Exact KDB citation objects from review_state.citations, or [] if none were returned.'},
 })
 
 SCHEMAS = {
     'list_artifacts': obj({'offset': INTEGER, 'limit': INTEGER, 'prefix': STRING}, []),
-    'read_artifact': obj({'sha256': STRING, 'offset': INTEGER, 'limit': INTEGER}, ['sha256']),
+    'read_artifact': obj({'sha256': SHA256, 'offset': INTEGER, 'limit': INTEGER}, ['sha256']),
     'knowledge_query': obj({'query': STRING}),
     'request_check': obj({'hypothesis': STRING, 'check': {'type': 'object'}}),
     # Nested memory snippets and nullable repair/memory fields are validated by
     # the existing host contract, after original Pi arguments are validated.
     'submit_review': obj({'decision': {'type': 'string', 'enum': ['accept', 'repair']},
-        'reason': STRING, 'evidence': {'type': 'array', 'items': STRING},
+        'reason': STRING, 'evidence': EVIDENCE,
         'repair': nullable(obj({'instructions': STRING, 'expected_evidence': STRING})),
         'memory': nullable(MEMORY)}),
 }

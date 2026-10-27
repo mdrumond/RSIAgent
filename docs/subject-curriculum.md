@@ -136,7 +136,12 @@ identity, observed snippets, required evidence, citations and host correctness.
 Missing-evidence feedback names the exact outstanding roles and SHA256 values.
 If a verifier response emits multiple host tool calls, only its first queued
 action is selected; later calls receive explicit rejection and have no effects.
-The next host observation updates which evidence still needs reading.
+The next host observation updates which evidence still needs reading. Pi receives
+current review state, deduplicated retained artifact pages and the latest validation
+feedback instead of replaying every prior action. Evidence fields contain bare
+SHA256 values from the actually-read set; source snippet lines start at 1 and
+citations must be exact objects returned by KDB (or an empty list). Malformed
+reference formatting is reported separately from a valid but unread artifact.
 `verifier_model` continues to select the model, including `deepseek-flash`.
 
 `verifier_engine: "completion"` retains the JSON-completion adapter when needed;

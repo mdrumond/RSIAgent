@@ -404,3 +404,33 @@ def test_typed_tools_cannot_admit_late_action():
         h.agent.review(request(), max_seconds=5)
     assert session.closed
     assert not any(event['kind'] == 'decision' for event in h.agent.last_trace)
+
+
+def test_prose_evidence_is_a_format_error_not_a_missing_artifact_read():
+    bad = decision(memory())
+    bad['evidence'] = [f'actor-log {L}: compiled successfully']
+    h = Harness([*prerequisites(), bad, decision(memory())])
+    assert h.agent.review(request()) == decision(memory())
+    feedback = next(e['payload'] for e in h.agent.last_trace if e['kind'] == 'feedback')
+    assert feedback['missing_required_artifacts'] == []
+    assert set(feedback['allowed_evidence']) == {S, R, L}
+    assert feedback['allowed_citations'] == []
+    assert feedback['error_code'] == 'malformed-evidence'
+    assert [digest for digest, _ in h.reads].count(R) == 1
+    assert [digest for digest, _ in h.reads].count(L) == 1
+
+
+def test_typed_context_deduplicates_repeated_pages_and_keeps_current_feedback():
+    bad = decision(memory())
+    bad['evidence'] = [f'source artifact {S}']
+    h = Harness([])
+    session = TypedSession([*prerequisites(), bad, *[read(S)] * 30, decision(memory())])
+    h.agent.session_factory = lambda **_: session
+    assert h.agent.review(request()) == decision(memory())
+    sizes = [len(json.dumps(context).encode()) for context in session.contexts]
+    assert max(sizes) < 10000
+    assert all('history' not in context for context in session.contexts)
+    assert len(session.contexts[-1]['artifact_pages']) == 3
+    feedback = session.contexts[-1]['validation_feedback']
+    assert feedback['missing_required_artifacts'] == []
+    assert set(feedback['allowed_evidence']) == {S, R, L}

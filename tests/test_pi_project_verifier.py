@@ -175,3 +175,32 @@ def test_actor_still_rejects_multiple_queued_actions(monkeypatch):
         with pytest.raises(ActionError):
             session.next_action({}, ['read_artifact'])
         assert session.pending is None
+
+
+def test_real_pi_rejects_prose_evidence_then_corrects_without_context_growth(monkeypatch):
+    try:
+        runtime_preflight()
+    except RuntimeError:
+        pytest.skip('Node22 and pinned Pi required')
+    h = Harness([])
+    bad = decision(memory())
+    bad['evidence'] = [f'source {S} with observed result {R}']
+    actions = iter([*prerequisites(), bad, *[prerequisites()[0]] * 15, decision(memory())])
+    calls = []
+    def provider(*_, **options):
+        action = next(actions)
+        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
+        calls.append(json.loads(options['data']))
+        assert len(options['data']) < 20000
+        return stream(name, args, len(calls))
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    h.agent.session_factory = lambda **options: PiCodingSession(model='deepseek-flash', schemas=SCHEMAS,
+        environ={'DEEPSEEK_API_KEY': 'fake-provider-secret'}, system_prompt=SYSTEM,
+        deadline=time.monotonic()+options['max_seconds'], first_action_only=True)
+    assert h.agent.review(request(), max_seconds=30) == decision(memory())
+    assert len(calls) == 21
+    assert len([e for e in h.agent.last_trace if e['kind'] == 'decision']) == 1
+    submitted = [e['payload'] for e in h.agent.last_trace
+                 if e['kind'] == 'pi-action' and e['payload']['name'] == 'submit_review']
+    assert len(submitted) == 1
+    assert submitted[0]['arguments']['evidence'] == [R]

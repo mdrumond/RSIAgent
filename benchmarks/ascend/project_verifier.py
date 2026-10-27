@@ -18,6 +18,12 @@ import time
 _SHA = re.compile(r'[0-9a-f]{64}\Z')
 
 
+class EvidenceReferenceError(ValueError):
+    def __init__(self, code, message):
+        self.code = code
+        super().__init__(message)
+
+
 def _text(value, name):
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f'{name} must be nonempty text')
@@ -228,14 +234,15 @@ class ProjectVerifierAgent:
         messages = [{'role': 'system', 'content': SYSTEM},
                     {'role': 'user', 'content': json.dumps(context, sort_keys=True)}]
         self._record('request', dict(context, project=asdict(request)))
+        pages, tools, feedback_observation = {}, {}, None
         while True:
             missing = [dict(sha256=digest, roles=sorted(role for role, value in registry.items()
                        if value == digest)) for digest in sorted(required - read)]
-            state = dict(read_artifacts=sorted(read), missing_required_artifacts=missing,
+            state = dict(read_artifacts=sorted(read), allowed_evidence=sorted(read), missing_required_artifacts=missing,
                 observed_versions=sorted(versions), citations=citations, host_checks_passed=host_ok,
                 knowledge_queried=queried)
-            working = bounded_review_messages(messages, state)
             if session is None:
+                working = bounded_review_messages(messages, state)
                 response = self.complete(tuple(working), remaining_seconds=remaining())
             else:
                 allowed = ['list_artifacts', 'read_artifact', 'submit_review']
@@ -243,9 +250,16 @@ class ProjectVerifierAgent:
                     allowed.append('knowledge_query')
                 if self.request_check is not None:
                     allowed.append('request_check')
-                name, args = session.next_action(dict(project=context, review_state=state,
-                    history=working[2:]), allowed, record=self._record)
-                response = json.dumps(args if name == 'submit_review' else {name: args})
+                from coding.pi.session import ActionError
+                try:
+                    name, args = session.next_action(dict(project=context, review_state=state,
+                        artifact_pages=list(pages.values()), tool_observations=tools,
+                        validation_feedback=feedback_observation), allowed, record=self._record)
+                    response = json.dumps(args if name == 'submit_review' else {name: args})
+                except ActionError as error:
+                    # Invalid typed arguments have no host effects. Correct them
+                    # against current state, without replaying an ever-growing history.
+                    response = json.dumps({'invalid_typed_action': str(error)})
             remaining()
             self._record('response', response)
             messages.append({'role': 'assistant', 'content': response})
@@ -319,12 +333,25 @@ class ProjectVerifierAgent:
                     return value
                 remaining()
                 self._record('tool', {'action': value, 'observation': observation})
+                if session is not None:
+                    if 'read_artifact' in value:
+                        key = (observation['sha256'], observation['offset'])
+                        pages.pop(key, None)
+                        pages[key] = observation
+                        # Context retention, not a runtime stopping budget. Raw
+                        # evidence remains in the trace and can be paged again.
+                        while len(pages) > 8 or (len(pages) > 1 and
+                                len(json.dumps(list(pages.values())).encode()) > 12000):
+                            pages.pop(next(iter(pages)))
+                    else:
+                        tools[next(iter(value))] = observation
             except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-                observation = {'error': str(exc),
+                observation = {'error': str(exc), 'error_code': getattr(exc, 'code', 'invalid-review-action'),
                     'missing_required_artifacts': [dict(sha256=digest,
                         roles=sorted(role for role, value in registry.items() if value == digest))
                         for digest in sorted(required - read)],
                     'knowledge_query_required': not queried,
+                    'allowed_evidence': sorted(read), 'allowed_citations': citations,
                     'expected_top_level': [
                     ['list_artifacts'], ['read_artifact'], ['knowledge_query'], ['request_check'],
                     ['decision', 'reason', 'evidence', 'repair', 'memory']],
@@ -332,6 +359,13 @@ class ProjectVerifierAgent:
                                    'For snippets select observed sha256/start_line/end_line and omit text to extract exact code. '
                                    'For unread evidence, read the referenced artifact or remove that unsupported citation. '
                                    'Use only one permitted top-level key set.')}
+                if session is not None:
+                    observation.pop('expected_top_level', None)
+                    observation['correction'] = ('Use the declared typed tools. Evidence must be bare SHA256 '
+                        'strings from allowed_evidence, not descriptions. Citations must be exact '
+                        'allowed_citations objects or [] when none exist. Source snippet lines start at 1. '
+                        'Read only the missing required artifacts; do not reread evidence to fix its format.')
+                    feedback_observation = observation
                 self._record('feedback', observation)
             messages.append({'role': 'user', 'content': json.dumps(observation, sort_keys=True)})
 
@@ -392,9 +426,15 @@ class ProjectVerifierAgent:
 
     @staticmethod
     def _evidence(items, read):
-        if not isinstance(items, list) or not items or any(not isinstance(item, str) or item not in read for item in items):
-            raise ValueError('evidence must cite nonempty actually read artifact references; '
-                             f'unread references: {[item for item in items if item not in read] if isinstance(items, list) else items}')
+        if not isinstance(items, list) or not items:
+            raise EvidenceReferenceError('malformed-evidence',
+                'evidence must be a nonempty list of bare SHA256 artifact identities')
+        if any(not isinstance(item, str) or not _SHA.fullmatch(item) for item in items):
+            raise EvidenceReferenceError('malformed-evidence',
+                'malformed evidence reference: use bare SHA256 artifact identities, not prose')
+        if any(item not in read for item in items):
+            raise EvidenceReferenceError('unread-evidence', 'read cited artifacts before acceptance; '
+                             f'unread references: {[item for item in items if item not in read]}')
 
     def _snippet(self, snippet, read, remaining, observed):
         if not isinstance(snippet, dict) or set(snippet) not in ({'sha256', 'start_line', 'end_line'},

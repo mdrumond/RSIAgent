@@ -178,7 +178,9 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     from coding.pi import ENGINE_IDENTITY
     verifier_identity = dict(engine='pi' if verifier_sessions is not None else 'completion',
         model=verifier_complete.model, role='project-verifier',
-        runtime=ENGINE_IDENTITY if verifier_sessions is not None else None)
+        runtime=ENGINE_IDENTITY if verifier_sessions is not None else None,
+        context_policy='review-state-v1' if verifier_sessions is not None else 'bounded-messages-v1',
+        selection_policy='first-host-action-v1' if verifier_sessions is not None else 'json-action-v1')
     if verifier_identity_path.exists() and json.loads(verifier_identity_path.read_bytes()) != verifier_identity:
         raise ValueError('project verifier engine or model changed on resume')
     atomic(verifier_identity_path, canonical(verifier_identity))
