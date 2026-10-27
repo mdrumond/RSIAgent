@@ -407,28 +407,12 @@ def _execute(campaign, request, original, directory, request_path):
 
 def _require_observed_execution(campaign, pid, record, directory, request, request_path):
     """A retained interruption is not completion, even when execution returned."""
-    outcome = record.get('outcome') or {}
-    observation = outcome.get('observations') or {}
-    if observation.get('classification') != 'interrupted':
+    from .subject_campaign import retained_interruption
+    retained = retained_interruption(campaign, pid, record, directory)
+    if retained is None:
         return
     request['phase'] = 'executing'
-    # Standalone graph adapters may retain binding receipts outside the project
-    # directory. Keep that campaign inventory without claiming project ownership
-    # or inferring settlement from an empty outcome.remote_operations list.
-    inventory = []
-    paths = set(directory.rglob('operation.json')) | set((campaign.root / 'binding').rglob('operation.json'))
-    for path in sorted(paths):
-        raw = path.read_bytes()
-        inventory.append(dict(path=str(path.relative_to(campaign.root)),
-                              artifact_sha256=campaign.artifacts.put_bytes(raw)))
-    request['retained_execution'] = dict(project_id=pid, directory=str(directory.relative_to(campaign.root)),
-        outcome_sha256=campaign.artifacts.put_json(outcome),
-        operations_inventory_sha256=campaign.artifacts.put_json(inventory),
-        inventory_scope='project-and-shared-campaign-binding',
-        remote_operations=observation.get('remote_operations', []),
-        interruption_reason=observation.get('interruption_reason'),
-        attempt=_read(directory / 'manual-execution.json', {}),
-        checkpoint=str((directory / 'subject-execution.json').relative_to(campaign.root)))
+    request['retained_execution'] = retained
     campaign._save()
     atomic(request_path, canonical(request))
     from optimizer.control import ObservationUnavailable

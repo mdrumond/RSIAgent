@@ -27,6 +27,32 @@ def _effective_project(projects, project_id):
         project_id = record['superseded_by']
 
 
+def retained_interruption(campaign, pid, record, directory):
+    """Preserve partial evidence and shared transport receipts without settling it."""
+    outcome = record.get('outcome') or {}
+    observation = outcome.get('observations') or {}
+    if observation.get('classification') != 'interrupted':
+        return None
+    inventory = []
+    paths = set(directory.rglob('operation.json')) | set((campaign.root / 'binding').rglob('operation.json'))
+    for path in sorted(paths):
+        inventory.append(dict(path=str(path.relative_to(campaign.root)),
+            artifact_sha256=campaign.artifacts.put_bytes(path.read_bytes())))
+    attempt_path = directory / 'manual-execution.json'
+    return dict(project_id=pid, directory=str(directory.relative_to(campaign.root)),
+        outcome_sha256=campaign.artifacts.put_json(outcome),
+        operations_inventory_sha256=campaign.artifacts.put_json(inventory),
+        inventory_scope='project-and-shared-campaign-binding',
+        remote_operations=observation.get('remote_operations', []),
+        interruption_reason=observation.get('interruption_reason'),
+        attempt=json.loads(attempt_path.read_bytes()) if attempt_path.exists() else {},
+        checkpoint=str((directory / 'subject-execution.json').relative_to(campaign.root)))
+
+
+class ObservationRequired(RuntimeError):
+    """Retained remote work must be observed before dispatch or review."""
+
+
 class SubjectCampaign:
     def __init__(self, root, subjects, initial_memory, *, select_wave, execute, verifier,
                  complete, max_seconds=7200, memory_gate=None, index_memory=None,
@@ -241,7 +267,24 @@ class SubjectCampaign:
         self.state.update(pending=None, needs_decision=True)
         self._save()
 
+    def _require_observed_pending(self):
+        pending = self.state.get('pending')
+        retained = []
+        if pending:
+            effective = dict(_effective_project(self.state['projects'], pid) for pid in pending['projects'])
+            for pid, record in effective.items():
+                directory = self.root / record.get('directory', str(Path('waves') / pending['wave_id'] / pid))
+                evidence = retained_interruption(self, pid, record, directory)
+                if evidence is not None:
+                    retained.append(dict(evidence, memory_sha256=pending['memory_sha256']))
+        if retained:
+            self.state['observation_required'] = retained
+            self._save()
+            raise ObservationRequired('Retained interrupted execution requires observation before more work')
+        self.state.pop('observation_required', None)
+
     def _run_wave(self, pending):
+        self._require_observed_pending()
         for item in pending['items']:
             if (self.root / 'manual-pause.json').exists():
                 raise TimeoutError('manual interaction queued at campaign checkpoint')
@@ -257,6 +300,7 @@ class SubjectCampaign:
                 record['outcome'] = self.execute(item, self.artifacts.read_bytes(
                     pending['memory_sha256']), directory, remaining_seconds=self._remaining()).as_dict()
                 self._save()
+            self._require_observed_pending()
         # All linked probes and controls must finish before either is reviewed.
         for pid in pending['projects']:
             if (self.root / 'manual-pause.json').exists():
@@ -266,11 +310,13 @@ class SubjectCampaign:
         self._publish_wave(pending)
 
     def _run(self):
-        if self.memory_gate is not None and hasattr(self.memory_gate,'start_session'):
-            self.memory_gate.start_session()
         self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
         try:
+            self._require_observed_pending()
+            if self.memory_gate is not None and hasattr(self.memory_gate, 'start_session'):
+                self.memory_gate.start_session()
             while True:
+                self._require_observed_pending()
                 self._remaining()
                 if (self.root / 'manual-pause.json').exists():
                     raise TimeoutError('manual interaction queued at campaign checkpoint')
@@ -321,6 +367,11 @@ class SubjectCampaign:
                 self.state['pending'] = dict(wave_id=wave_id, subject=context['current_subject'],
                     memory_sha256=memory_sha, items=items, projects=[i['project_id'] for i in items])
                 self._save()
+        except ObservationRequired:
+            self.state['terminal'] = ('TIME_BUDGET_EXHAUSTED' if self.clock() >= self.budget.deadline
+                                      else 'OBSERVATION_REQUIRED')
+            self._save()
+            return self.report()
         except TimeoutError:
             self.state['terminal'] = ('TIME_BUDGET_EXHAUSTED' if self.clock() >= self.budget.deadline
                                       else 'REVIEW_PENDING')
@@ -330,7 +381,8 @@ class SubjectCampaign:
             try:
                 if self.memory_gate is not None:
                     self.memory_gate.close()
-                    self._settle_reviews()
+                    if not self.state.get('observation_required'):
+                        self._settle_reviews()
             finally:
                 self.budget.close()
 
