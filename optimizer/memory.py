@@ -248,6 +248,12 @@ def freeze_committed_phase1(root, initial_memory):
         plan = json.loads(files[f'waves/{wave_id}/plan.json'])
         for project in plan['wave']['projects']:
             branch = wave / 'branches' / project['spec']['project_id']
+            if not (branch / 'outcome.json').exists():
+                # Both publication readers above authenticated this skipped
+                # assignment and its exact retained interruption record.
+                relative = (branch / 'interruption.json').relative_to(root).as_posix()
+                files[relative] = _read(root, relative)
+                continue
             for name in ('outcome.json', 'memory-delta.bin', 'execution-evidence.bin'):
                 relative = (branch / name).relative_to(root).as_posix()
                 files[relative] = _read(root, relative)
