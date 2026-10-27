@@ -1,6 +1,7 @@
 """Optional production A3 librarian over pinned references and an immutable memory export."""
 from contextlib import ExitStack
 import asyncio
+import hashlib
 from pathlib import Path
 import sqlite3
 import time
@@ -164,8 +165,28 @@ class NativeAdaptiveKnowledge:
                                     admitted_artifacts=admitted)
 
     def begin_selection(self, context):
-        self.selection = (Path(self.config.root) / 'curriculum-librarian' /
-            f'{context.wave_index:03}-{context.pre_wave_memory_sha256}', context.objective,
+        # A normal wave and each lesson assessment can share a wave/prior pair.
+        # Bind the authored objective too; retries of the same selection reuse it.
+        selection_id = hashlib.sha256(canonical_bytes(dict(
+            objective=context.objective, wave_index=context.wave_index,
+            pre_wave_memory_sha256=context.pre_wave_memory_sha256,
+            coverage=[item.value for item in context.pre_wave_coverage],
+            prior_projects=[item.project_id for item in context.prior_outcomes]))).hexdigest()
+        parent = Path(self.config.root) / 'curriculum-librarian'
+        legacy = parent / f'{context.wave_index:03}-{context.pre_wave_memory_sha256}'
+        root = parent / f'{legacy.name}-{selection_id}'
+        old_budget = legacy / 'librarian-budget.json'
+        if old_budget.is_file():
+            # Old directories did not bind the objective. Conservatively inherit
+            # their spent allowance, including an interrupted active interval,
+            # once per selection. Subsequent selections own independent files.
+            root.mkdir(parents=True, exist_ok=True)
+            try:
+                with (root / 'librarian-budget.json').open('xb') as stream:
+                    stream.write(old_budget.read_bytes())
+            except FileExistsError:
+                pass
+        self.selection = (root, context.objective,
             dict(wave_index=context.wave_index, coverage=[item.value for item in context.pre_wave_coverage],
                  prior_projects=[item.project_id for item in context.prior_outcomes], **self.context()))
 
