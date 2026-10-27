@@ -493,3 +493,28 @@ def test_installed_restart_runtime_dispatches_through_default_production_callbac
         assert client.get(url).get_json()['request']['status'] == 'queued'
     finally:
         app.extensions['dashboard_controls'].close()
+
+
+def test_superseded_project_cannot_format_or_approve_another_restart(setup):
+    app, calls = application(setup, [dict(item=item('retry'), instruction='Inspect padding.')])
+    client = app.test_client()
+    try:
+        body = dict(campaign_id='research', kind='restart', project_id='original',
+                    instructions='Fix prompt', format_seconds=10)
+        proposal = settled(app, submit(client, 'curriculum-preview', body, 'p'))['result']
+        root = setup[1]
+        path = root / 'subject-campaign.json'
+        state = json.loads(path.read_bytes())
+        state['projects']['original']['superseded_by'] = 'already-restarted'
+        path.write_bytes(canonical(state))
+        assert submit(client, 'curriculum-preview', body, 'new').status_code == 409
+        assert submit(client, 'curriculum-approve', dict(campaign_id='research',
+            proposal_id=proposal['id'], additional_seconds=60), 'a').status_code == 409
+        service = app.extensions['dashboard_curriculum_controls']
+        with pytest.raises(ValueError, match='superseded'):
+            service.preview(body)
+        with pytest.raises(ValueError, match='superseded'):
+            service.approve(dict(campaign_id='research', proposal_id=proposal['id'], additional_seconds=60))
+        assert len(calls) == 1 and service.proposal(root, proposal['id'])['status'] == 'proposed'
+    finally:
+        app.extensions['dashboard_controls'].close()
