@@ -536,6 +536,13 @@ class AdaptiveActorProjectExecutor:
             raise RuntimeError("project time budget exhausted")
         max_seconds = min(self.max_seconds, remaining) if remaining is not None else self.max_seconds
         executor = self.executor
+        if request.failure_context is not None and request.failure_context.get('original_retry'):
+            from benchmarks.ascend.failure_handoff import original_retry_inputs
+            from benchmarks.ascend.phase2_feedback import FeedbackStore
+            inputs = original_retry_inputs(FeedbackStore(request.failure_context['root']),
+                request.failure_context['feedback_ids'][0], request.spec)
+            if inputs is not None:
+                executor = executor.bind_case(request.spec, inputs)
         if request.failure_context is not None and request.spec.failure_mode is not FailureMode.NONE:
             from benchmarks.ascend.failure_handoff import FailureContext
             failure = FailureContext(request.failure_context, request.spec)

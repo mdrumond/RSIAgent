@@ -104,7 +104,7 @@ class LiveWaveCoordinator:
         max_parallel: int,
         *, allow_semantic_failures: bool = False, allow_partial: bool = False,
         remaining_seconds: Callable[[], float] | None = None,
-        before_execute: Callable[[], None] | None = None,
+        before_execute: Callable[[], None] | None = None, inputs_by_project=None,
     ) -> None:
         if not isinstance(wave, WaveSpec):
             raise TypeError("wave must be a WaveSpec")
@@ -125,6 +125,7 @@ class LiveWaveCoordinator:
         self.allow_partial = allow_partial
         self.remaining_seconds = remaining_seconds
         self.before_execute = before_execute
+        self.inputs_by_project = inputs_by_project or {}
 
     def run(self) -> WaveConsolidation:
         self._ensure_plan()
@@ -203,7 +204,9 @@ class LiveWaveCoordinator:
         if self.remaining_seconds is not None and self.remaining_seconds() <= 0:
             self._interrupt(assignment, "deadline-exhausted", "Wave deadline reached before dispatch")
             raise TimeoutError("wave deadline reached before dispatch")
-        inputs = materialize_inputs(assignment.spec)
+        inputs = self.inputs_by_project.get(assignment.project_id)
+        if inputs is None:
+            inputs = materialize_inputs(assignment.spec)
         try:
             result = self.execute(WaveProjectRequest(
                 assignment=assignment,
@@ -309,6 +312,10 @@ class LiveWaveCoordinator:
             "wave": self.wave.as_dict(),
             "wave_fingerprint": self.wave.fingerprint,
         }
+        if self.inputs_by_project:
+            from .phase1_project_executor import _tensor_payload
+            expected["case_inputs"] = {key: {"tensors": [_tensor_payload(x) for x in inputs]}
+                                       for key, inputs in self.inputs_by_project.items()}
         path = self.root / "plan.json"
         if path.exists():
             if self._read_json(path) != expected:
