@@ -170,6 +170,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
     parser.add_argument("--model", choices=[i.backend_model.value for i in MODEL_IDENTITIES])
     parser.add_argument("--knowledge", choices=("with-kdb", "without-kdb"))
     parser.add_argument("--profiling", choices=("new", "without-profiling-guidance"))
+    parser.add_argument("--verify-memory-usefulness", action="store_true")
+    parser.add_argument("--usefulness-pair-seconds", type=float, default=600)
     parser.add_argument("--project-target", type=int)
     parser.add_argument("--max-projects", type=int, help="Deprecated metadata; does not limit execution")
     parser.add_argument("--max-seconds", type=float, default=7200)
@@ -198,6 +200,11 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             hashlib.sha256(guide).hexdigest(), config["cpl_skills_revision"],
             tuple(config.get("dtypes", ["float32"])), kdb, collection,
             curriculum_kdb=config.get("curriculum_kdb", False),
+            adaptive_kdb=config.get("adaptive_kdb", False),
+            librarian_seconds=config.get("librarian_seconds", 90),
+            memory_kdb=Path(config["memory_kdb"]) if config.get("memory_kdb") else None,
+            memory_collection=config.get("memory_collection"),
+            memory_snapshot=Path(config["memory_snapshot"]) if config.get("memory_snapshot") else None,
             environment_identity=config["environment_identity"],
             profiling_mode=args.profiling, compiler_version=config.get("compiler_version"),
         )
@@ -229,6 +236,8 @@ def main(argv=None, *, a5_main=None, native_builder=build_native_adaptive_phase1
             request_timing=first.request_timing, request_profile=first.request_profile,
             **({"project_workers": tuple(workers)} if parallel else {}),
             profiling_guidance=guidance,
+            usefulness_enabled=args.verify_memory_usefulness,
+            usefulness_pair_seconds=args.usefulness_pair_seconds,
         ), args.action)()
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
