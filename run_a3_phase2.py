@@ -265,7 +265,10 @@ def _report(root: Path) -> dict[str, object]:
 
 
 def main(argv=None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.command in {'run', 'resume', 'qualify'}:
+        parser.error('Ascend Phase 2 execution is retired; use run_ascend_subjects.py; historical report remains available')
     from run_a3_phase1 import _worker_settings, _runtime_preflight
     _worker_settings(args)
     status = 0
