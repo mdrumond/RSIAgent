@@ -28,8 +28,8 @@ export default function (pi: ExtensionAPI) {
           const result = await host(name, args, signal);
           return { content: [{ type: "text" as const, text: JSON.stringify(result) }],
             details: undefined, terminate: name !== "read_context" };
-        } catch {
-          return { content: [{ type: "text" as const, text: "Host rejected invalid, stale or disallowed arguments." }],
+        } catch (error) {
+          return { content: [{ type: "text" as const, text: error instanceof Error ? error.message : "Host tool request failed." }],
             details: undefined, isError: true, terminate: true };
         }
       },

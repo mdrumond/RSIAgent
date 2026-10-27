@@ -11,7 +11,7 @@ def obj(properties=None, required=None):
             "additionalProperties": False}
 
 
-def validate(value, schema):
+def validate(value, schema, path="arguments"):
     kind = schema.get("type")
     valid = {
         "object": isinstance(value, dict), "array": isinstance(value, list),
@@ -19,23 +19,23 @@ def validate(value, schema):
         "number": type(value) in (int, float), "boolean": type(value) is bool,
     }
     if kind and not valid[kind]:
-        raise ValueError("tool argument has wrong type")
+        raise ValueError(f"{path}: expected {kind}")
     if "enum" in schema and value not in schema["enum"]:
-        raise ValueError("tool argument is outside the allowed values")
+        raise ValueError(f"{path}: expected one of {schema['enum']}")
     if kind == "object":
         properties = schema.get("properties", {})
         if not set(schema.get("required", ())) <= value.keys():
-            raise ValueError("required tool argument is missing")
+            raise ValueError(f"{path}: missing required fields {sorted(set(schema['required']) - value.keys())}")
         if schema.get("additionalProperties") is False and not value.keys() <= properties.keys():
-            raise ValueError("unexpected tool argument")
+            raise ValueError(f"{path}: unexpected fields {sorted(value.keys() - properties.keys())}")
         for key, item in value.items():
             if key in properties:
-                validate(item, properties[key])
+                validate(item, properties[key], f"{path}.{key}")
     elif kind == "array":
         if len(value) > schema.get("maxItems", 100000):
             raise ValueError("too many tool arguments")
-        for item in value:
-            validate(item, schema.get("items", {}))
+        for index, item in enumerate(value):
+            validate(item, schema.get("items", {}), f"{path}[{index}]")
     elif kind in ("integer", "number"):
         if not schema.get("minimum", float("-inf")) <= value <= schema.get("maximum", float("inf")):
-            raise ValueError("tool argument is outside bounds")
+            raise ValueError(f"{path}: outside bounds [{schema.get('minimum')}, {schema.get('maximum')}]")

@@ -114,6 +114,7 @@ class Gateway:
                 if self.path not in ("/v1/chat/completions", "/v1/responses") or self.headers.get("Authorization") != "Bearer " + owner.token:
                     return self.error(403, "gateway access denied")
                 started = time.monotonic()
+                started_epoch = time.time()
                 try:
                     size = int(self.headers.get("Content-Length", "0"))
                     if not 0 < size <= 524288:
@@ -131,7 +132,11 @@ class Gateway:
                 except TimeoutError as exc:
                     owner.stop_reason = owner.stop_reason or "deadline"
                     return self.error(408, str(exc))
-                except (ValueError, TypeError, AttributeError):
+                except (ValueError, TypeError, AttributeError) as error:
+                    if "hard byte" in str(error):
+                        owner.stop_reason = "context-limit"
+                        owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes})
+                        return self.error(413, "request context exceeds the configured byte limit")
                     return self.error(400, "invalid smoke request")
                 row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}
                 owner.records.append(row)
@@ -195,6 +200,7 @@ class Gateway:
                         if row["usage"]:
                             owner.budget.settle(rid, row["usage"], owner.spec["rates"])
                         row["seconds"] = round(time.monotonic() - started, 3)
+                        row.update(started_epoch=started_epoch, ended_epoch=time.time())
                         owner.on_record("pi-provider", dict(row))
                         if owner.records_path:
                             owner.records_path.write_text(json.dumps(owner.records, indent=2))
