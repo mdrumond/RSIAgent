@@ -1,0 +1,8 @@
+{
+  "subjects": [
+    {"subject_id": "movement", "objective": "Reliable tensor movement, layouts and tail handling", "min_waves": 3},
+    {"subject_id": "arithmetic", "objective": "Elementwise composition and numerical correctness", "min_waves": 3},
+    {"subject_id": "reductions", "objective": "Reductions, synchronization and reusable failure repairs", "min_waves": 3},
+    {"subject_id": "optimization", "objective": "Measured kernel optimization with verified controls", "min_waves": 3}
+  ]
+}
