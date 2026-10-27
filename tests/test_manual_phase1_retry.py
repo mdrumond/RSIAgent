@@ -69,7 +69,8 @@ def test_manual_retry_executes_original_spec_with_reviewed_memory_and_links_life
     assert len(original['investigation']['retries']) == 1
 
 
-def test_phase1_feedback_start_pins_spec_and_skips_optimizer_goal(tmp_path):
+@pytest.mark.parametrize('phase', [1, 2])
+def test_phase1_feedback_start_pins_spec_and_skips_optimizer_goal(tmp_path, phase):
     from test_ascend_campaign_cli import start
     setup = tmp_path/'setup'
     setup.mkdir()
@@ -79,12 +80,22 @@ def test_phase1_feedback_start_pins_spec_and_skips_optimizer_goal(tmp_path):
     store = FeedbackStore(tmp_path/'feedback')
     store.import_phase1(tmp_path/'failed', target='a3', language='ascend-c')
     original = store.records()[0]
-    cli.main(['start', '--control', str(tmp_path/'manual-control'), '--root', str(tmp_path/'manual'),
-        '--target', 'a3', '--phase', '2', '--objective', 'Retry unchanged original',
+    arguments = ['start', '--control', str(tmp_path/'manual-control'), '--root', str(tmp_path/'manual'),
+        '--target', 'a3', '--phase', str(phase), '--objective', 'Retry unchanged original',
         '--config', prepared['config'], '--initial-memory', str(setup/'seed'),
         '--project-target', '1', '--phase1-root', str(tmp_path/'reviewed'), '--review', str(tmp_path/'review.json'),
-        '--feedback-root', str(store.root), '--retry-feedback-id', original['feedback_id']], screen=lambda *args: 'manual')
+        '--feedback-root', str(store.root), '--retry-feedback-id', original['feedback_id']]
+    screens = []
+    if phase == 2:
+        with pytest.raises(SystemExit) as error:
+            cli.main(arguments, screen=lambda *args: screens.append(args))
+        assert error.value.code == 2
+        assert not screens
+        assert not (tmp_path/'manual').exists() and not (tmp_path/'manual-control').exists()
+        return
+    cli.main(arguments, screen=lambda *args: 'manual')
     job = cli._read(tmp_path/'manual-control/job.json')
+    assert job['phase'] == 1
     assert job['phase1_original_retry'] is True
     assert job['retry_spec']['original_spec'] == original_spec
     assert not job.get('optimizer_goal') and not job.get('autonomous_goal')

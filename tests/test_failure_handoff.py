@@ -162,6 +162,7 @@ def test_coordinator_passes_frozen_case_to_project_adapter(tmp_path):
     feedback = FailureCurriculum(tmp_path, store.root, select_feedback(store.root, 'a3'))
     feedback.lineage = [dict(feedback_id=context['feedback_ids'][0], project_id=renamed.project_id)]
     coordinator = object.__new__(AdaptivePhase1Coordinator)
+    coordinator.root = tmp_path
     coordinator.failure_feedback = feedback
     coordinator.automatic_remediation = None
     coordinator._remaining_seconds = lambda: 60
