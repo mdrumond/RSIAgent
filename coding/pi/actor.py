@@ -35,15 +35,17 @@ class PiActorDriver(DirectActorDriver):
         messages = [{"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": instruction}]
         working = WorkingContext(messages)
+        from benchmarks.ascend.actor_control import ActorConversation, ActorStopped
+        conversation = ActorConversation(workspace, instruction, working, action_executor)
         for message in messages:
             self._trace("message", message)
         tokens = 0
-        turn = 0
+        turn = conversation.turn
         deadline = min(self.clock() + self.max_seconds,
                        getattr(action_executor, "deadline", float("inf")))
         latest = None
         history = []
-        source = None
+        source = getattr(action_executor, 'source', None)
         allowed = set(A5_SCHEMAS)
         knowledge = getattr(action_executor, "knowledge", None)
         query = getattr(action_executor, "query_knowledge", None)
@@ -65,6 +67,10 @@ class PiActorDriver(DirectActorDriver):
             if gateway is not None:
                 gateway.deadline = min(gateway.deadline, deadline)
             while self.clock() < deadline:
+                try:
+                    feedback = conversation.boundary()
+                except ActorStopped:
+                    return ActorOutcome('user-stopped', turn, tokens)
                 turn += 1
                 before = session.completion_tokens
                 def record(kind, payload):
@@ -79,6 +85,9 @@ class PiActorDriver(DirectActorDriver):
                         "recent_host_observations": history[-6:],
                         "remaining_seconds": max(0, deadline-self.clock()),
                         "coding": ENGINE_IDENTITY,
+                        "user_feedback": feedback,
+                        "retained_work_log": working.work_log,
+                        "retained_observations": working.recent[-6:],
                     }, allowed, record=record, source=source,
                        write_action=lambda s: ("write", {"slot": "kernel", "content": s}))
                     text = json.dumps({name: args})
@@ -90,6 +99,12 @@ class PiActorDriver(DirectActorDriver):
                 tokens += session.completion_tokens-before
                 recorder.response(text, stage="action", turn=turn)
                 self._trace("message", {"role": "assistant", "content": text})
+                working.append({'role': 'assistant', 'content': text})
+                if conversation.control.pending():
+                    working.append({'role': 'user', 'content':
+                        'The preceding proposed action was not executed because user input arrived.'})
+                    conversation.save(turn)
+                    continue
                 action = turn_parser(text)
                 if action is None:
                     latest = json.dumps({"host": {"event": "invalid-action"}})
@@ -107,6 +122,7 @@ class PiActorDriver(DirectActorDriver):
                                 source = args["content"]
                     self._trace("tool", {"name": action.kind, "status": "observed", "observation": latest})
                     if outcome.terminal:
+                        conversation.save(turn)
                         # Distillation receives bounded terminal evidence and the
                         # original contract, not a second coding continuation.
                         retained = messages + [{"role": "user", "content": latest}]
@@ -127,4 +143,5 @@ class PiActorDriver(DirectActorDriver):
                 recorder.observation(latest, turn=turn)
                 history.append(latest)
                 self._trace("message", {"role": "user", "content": latest})
+                conversation.save(turn)
         return ActorOutcome("time-budget-exhausted", turn, tokens)

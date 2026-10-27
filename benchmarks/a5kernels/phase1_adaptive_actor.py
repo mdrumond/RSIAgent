@@ -210,6 +210,12 @@ class _ProjectActions:
         with process_deadline(self.deadline):
             return self._execute_action(action)
 
+    def restore_source(self, source):
+        """Restore editable source only; verification authority must be rebuilt."""
+        result = self._write(TrialAction('write', {'content': source}))
+        if self.source != source:
+            raise ValueError(result.observation)
+
     def _execute_action(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
             raise TypeError("adaptive projects accept only TrialAction values")
