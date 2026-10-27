@@ -227,6 +227,9 @@ class SubjectCampaign:
             while True:
                 self._remaining()
                 self._settle_reviews()
+                if self.state['pending'] is None and self.scheduler.prioritize_projects():
+                    self.state.update(needs_decision=False, terminal=None)
+                    self._save()
                 if self.scheduler.is_complete() and not self.state['needs_decision']:
                     self.state['terminal'] = 'COMPLETE'
                     self._save()
@@ -258,8 +261,10 @@ class SubjectCampaign:
                     continue
                 snapshot = self.memory.snapshot()
                 wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
-                items = self.select_wave(context, snapshot, self.state['projects'],
-                                         remaining_seconds=self._remaining())
+                items = self.scheduler.claim_projects(wave_id)
+                if not items:
+                    items = self.select_wave(context, snapshot, self.state['projects'],
+                                             remaining_seconds=self._remaining())
                 if not items or len({i['project_id'] for i in items}) != len(items):
                     raise ValueError('wave must contain unique projects')
                 if set(i['project_id'] for i in items) & self.state['projects'].keys():

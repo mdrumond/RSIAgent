@@ -85,11 +85,12 @@ class SubjectScheduler:
         self.subjects = _subjects(subjects)
         self.identities = [row.as_dict() for row in self.subjects]
         self.index = {row.subject_id: i for i, row in enumerate(self.subjects)}
+        requested = self.identities
         with self._transaction() as state:
             if not state:
                 state.update(schema='ascend-subjects-v1', subjects=self.identities,
                              frontier=0, current=0, waves={}, repairs={}, reviews={}, decisions=[])
-            elif state.get('schema') != 'ascend-subjects-v1' or state.get('subjects') != self.identities:
+            elif state.get('schema') != 'ascend-subjects-v1' or requested not in (state.get('subjects'), state.get('original_subjects')):
                 raise ValueError('retained subject configuration changed')
 
     @contextmanager
@@ -97,8 +98,99 @@ class SubjectScheduler:
         with (self.root / '.subjects.lock').open('a+b') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             state = json.loads(self.path.read_bytes()) if self.path.exists() else {}
+            if state.get('subjects'):
+                self._bind(state['subjects'])
             yield state
             atomic(self.path, canonical(state))
+            if state.get('subjects'):
+                self._bind(state['subjects'])
+
+    def _bind(self, rows):
+        self.subjects = _subjects(rows)
+        self.identities = [row.as_dict() for row in self.subjects]
+        self.index = {row.subject_id: i for i, row in enumerate(self.subjects)}
+
+    def edit(self, kind, value, *, expected, proposal_id):
+        """Apply an approved edit without changing reached subjects or reserved waves."""
+        from .subject_memory import digest
+        with self._transaction() as state:
+            if proposal_id in state.get('edits', {}):
+                return state['edits'][proposal_id]
+            if digest(state) != expected:
+                raise ValueError('curriculum proposal is stale; preview again')
+            if kind == 'subjects':
+                rows = [row.as_dict() for row in _subjects(value)]
+                protected = min(len(self.subjects), state['frontier'] + 1)
+                if rows[:protected] != state['subjects'][:protected]:
+                    raise ValueError('active and reached subjects cannot be edited')
+                ids = {row['subject_id'] for row in rows}
+                if any(row['subject_id'] not in ids for row in state.get('project_queue', [])):
+                    raise ValueError('remove queued projects before removing their subject')
+                state.setdefault('original_subjects', state['subjects'])
+                state['subjects'] = rows
+                if state['current'] is None and state['frontier'] < len(rows):
+                    state['current'] = state['frontier']
+            elif kind == 'projects':
+                if any(row['subject_id'] not in self.index for row in value):
+                    raise ValueError('queued project names an unknown subject')
+                reserved = {row['item']['project_id'] for rows in state.get('claimed_projects', {}).values()
+                            for row in rows}
+                if any(row['item']['project_id'] in reserved for row in value):
+                    raise ValueError('project is already reserved for execution')
+                state['project_queue'] = value
+            else:
+                raise ValueError('unknown curriculum edit')
+            receipt = dict(proposal_id=proposal_id, revision=state.get('revision', 0) + 1)
+            state['revision'] = receipt['revision']
+            state.setdefault('edits', {})[proposal_id] = receipt
+            return receipt
+
+    def prioritize_projects(self):
+        """Visit approved reached-subject work only between immutable waves."""
+        with self._transaction() as state:
+            if any(row['status'] != 'completed' for row in state['waves'].values()):
+                return False
+            # Claiming removes queued plans before the campaign saves its pending
+            # wave. Resume that reservation before restoring the revisit's return
+            # subject, even when the now-empty queue would otherwise look done.
+            for wave_id, rows in state.get('claimed_projects', {}).items():
+                if rows and wave_id not in state['waves']:
+                    state['current'] = self.index[rows[0]['subject_id']]
+                    return True
+            queue = state.get('project_queue', [])
+            current = state['current']
+            current_id = self.subjects[current].subject_id if current is not None else None
+            if any(row['subject_id'] == current_id for row in queue):
+                return True
+            if 'queue_return' in state:
+                state['current'] = state.pop('queue_return')
+                current = state['current']
+            selected = next((self.index[row['subject_id']] for row in queue
+                             if self.index[row['subject_id']] <= state['frontier']), None)
+            if selected is None:
+                return False
+            state['queue_return'] = current
+            state['current'] = selected
+            state['decisions'].append(dict(action='revisit', subject_id=self.subjects[selected].subject_id,
+                reason='Execute approved queued projects', evidence=[row['item']['project_id'] for row in queue
+                    if row['subject_id'] == self.subjects[selected].subject_id]))
+            return True
+
+    def claim_projects(self, wave_id):
+        """Reserve a queued wave once; repeat after interruption returns the same plans."""
+        with self._transaction() as state:
+            claimed = state.setdefault('claimed_projects', {})
+            if wave_id in claimed:
+                return [row['item'] for row in claimed[wave_id]]
+            if state['current'] is None:
+                return []
+            subject_id = self.subjects[state['current']].subject_id
+            rows = [row for row in state.get('project_queue', []) if row['subject_id'] == subject_id]
+            if not rows:
+                return []
+            claimed[wave_id] = rows
+            state['project_queue'] = [row for row in state['project_queue'] if row['subject_id'] != subject_id]
+            return [row['item'] for row in rows]
 
     def state(self):
         with self._transaction() as state:
@@ -114,6 +206,8 @@ class SubjectScheduler:
         current = state['current']
         return dict(current_subject=None if current is None else self.identities[current],
                     subjects=self.identities,
+                    queued_projects=[dict(subject_id=row['subject_id'], project_id=row['item']['project_id'])
+                                     for row in state.get('project_queue', [])],
                     completed_waves={row.subject_id: sum(wave['status'] == 'completed' and
                         wave['subject_id'] == row.subject_id for wave in state['waves'].values())
                         for row in self.subjects},
@@ -124,7 +218,9 @@ class SubjectScheduler:
     def is_complete(self, state=None):
         state = self.state() if state is None else state
         return (state['frontier'] == len(self.subjects) and state['current'] is None
-                and not self._open_repairs(state)
+                and not state.get('project_queue') and not self._open_repairs(state)
+                and not any(rows and wave_id not in state['waves']
+                            for wave_id, rows in state.get('claimed_projects', {}).items())
                 and all(row['status'] != 'pending' for row in state['reviews'].values())
                 and all(row['status'] == 'completed' for row in state['waves'].values()))
 
@@ -223,6 +319,12 @@ class SubjectScheduler:
                 if target is None:
                     raise ValueError('no current subject to advance')
                 subject = self.subjects[target]
+                if any(row['subject_id'] == subject.subject_id for row in state.get('project_queue', [])):
+                    raise ValueError('subject has approved queued projects')
+                if any(wave_id not in state['waves'] and any(
+                        row['subject_id'] == subject.subject_id for row in rows)
+                        for wave_id, rows in state.get('claimed_projects', {}).items()):
+                    raise ValueError('subject has reserved projects awaiting a wave')
                 waves = [row for row in state['waves'].values() if row['subject_id'] == subject.subject_id]
                 if sum(row['status'] == 'completed' for row in waves) < subject.min_waves:
                     raise ValueError('subject minimum waves not complete')
