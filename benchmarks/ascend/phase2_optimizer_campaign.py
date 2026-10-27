@@ -228,13 +228,13 @@ class OptimizerPhase2Coordinator:
         return "tasks/" + task["task_id"] + "-" + sha(canonical(task))[:12]
 
     def _assess_committed(self, state):
-        if self.usefulness_verifier is None:
+        if self.usefulness_verifier is None or not getattr(self.usefulness_verifier, 'enabled', True):
             return
         with self.time.active():
             self._assess_committed_active(state)
 
     def _assess_committed_active(self, state):
-        if self.usefulness_verifier is None:
+        if self.usefulness_verifier is None or not getattr(self.usefulness_verifier, 'enabled', True):
             return
         for lesson in state["memory_entries"]:
             index = next(i for i, row in enumerate(state["attempts"])

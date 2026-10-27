@@ -461,3 +461,44 @@ def test_usefulness_work_consumes_parent_optimizer_allocation(tmp_path):
     coordinator.usefulness_verifier = SimpleNamespace(assess_lesson=assess)
     coordinator.run_attempt()
     assert coordinator.time.state['elapsed_seconds'] == 4
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_usefulness_reconstruction_is_opt_in_and_charges_only_enabled_replay(tmp_path, enabled):
+    from types import SimpleNamespace
+    from benchmarks.ascend.memory_usefulness import UsefulnessVerifier
+    build, calls, _, _ = setup(tmp_path, verdicts=(True, True),
+                               decisions=('retry-target', 'ready'))
+    assert build().resume()['status'] == 'READY'
+    assert len(calls) == 2
+    coordinator = build()
+    now, reconstructed, assessed = [0.0], [], []
+    coordinator.time.clock = lambda: now[0]
+    memory = coordinator._memory
+    def reconstruct(state):
+        reconstructed.append([row['attempt_id'] for row in state['attempts']])
+        now[0] += 3
+        return memory(state)
+    coordinator._memory = reconstruct
+    if enabled:
+        coordinator.usefulness_verifier = SimpleNamespace(enabled=True,
+            assess_lesson=lambda *args, **kwargs: assessed.append(args))
+    else:
+        # The production composition constructs this verifier even when the
+        # feature is disabled by default; it must not trigger historical IO.
+        coordinator.usefulness_verifier = UsefulnessVerifier(tmp_path/'assessments', None, None, None)
+    before = coordinator.time.state['elapsed_seconds']
+    assert coordinator.resume()['status'] == 'READY'
+    assert len(calls) == 2  # Retained terminal publication never dispatches an actor.
+    if enabled:
+        assert reconstructed == [[], [calls[0][0]]]
+        assert len(assessed) == 2
+        for assessment, original in zip(assessed, calls):
+            assert json.loads(assessment[1]) == original[2]['memory_snapshot']
+            assert assessment[2] == original[0]
+            assert assessment[0] not in json.loads(assessment[1])['memory_entries']
+        assert coordinator.time.state['elapsed_seconds'] == before + 6
+    else:
+        assert reconstructed == []
+        assert coordinator.time.state['elapsed_seconds'] == before
+        assert not (tmp_path/'assessments').exists()

@@ -437,3 +437,66 @@ def test_nested_original_retry_reads_parent_memory_artifacts_and_reviewed_seed(t
     # Retained retry replay observes its committed result without another actor.
     retry._phase1_retry(row, directory, state)
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize('ready_wave', [False, True])
+def test_failed_original_retry_checkpoint_survives_restart_until_new_ready_recommendation(tmp_path, ready_wave):
+    from optimizer.jobs import atomic, canonical
+    executions, stages = [], []
+    automatic = None
+    def complete(messages):
+        stages.append(messages)
+        if len(stages) == 1:
+            return _wave(messages[-1]['content'], [_project('original', 'gm-ub-movement')])
+        key = next(iter(automatic.feedback.ids))
+        row = dict(feedback_id=key, classification='learnable', reason='isolate movement',
+                   project_id='probe', control_project_id='control', hypothesis='alignment', observation='compare oracle')
+        if len(stages) == 2:
+            row['status'] = 'investigating'
+            proposal = json.loads(_wave(messages[-1]['content'], [_project('probe', 'padded-tail'),
+                _project('control', 'gm-ub-movement')]).split('\n', 1)[1])
+            proposal['failure_investigations'] = [row]
+            return 'DECISION: WAVE\n' + json.dumps(proposal)
+        if len(stages) == 3:
+            row['status'] = 'ready-to-retry'
+            if ready_wave:
+                proposal = json.loads(_wave(messages[-1]['content'], [_project('new-work', 'simd-vector')]).split('\n', 1)[1])
+                proposal['failure_investigations'] = [row]
+                return 'DECISION: WAVE\n' + json.dumps(proposal)
+            return 'DECISION: SATURATED\n' + json.dumps(dict(reason='retry original', failure_investigations=[row]))
+        raise RuntimeError('restart after failed original retry')
+    def execute(request):
+        executions.append(request.spec.project_id)
+        passed = request.spec.project_id != 'original' or executions.count('original') >= 3
+        return _result(request.spec, passed, 'host outcome')
+    def build(provider):
+        return AdaptivePhase1Coordinator(tmp_path/'run', 'Repair failures.', b'{}',
+            CurriculumAgent(provider), execute, max_parallel=1, project_target=1)
+    runner = build(complete)
+    automatic = AutomaticRemediation(runner, target='a3')
+    with pytest.raises(RuntimeError, match='restart after failed original retry'):
+        runner.run()
+    assert executions.count('original') == 2
+    state_path = runner.root/'state.json'
+    checkpoint = json.loads(state_path.read_bytes())
+    update, = checkpoint['failure_investigations']
+    assert update['status'] == 'investigating'
+    key = update['feedback_id']
+    # A fresh process replays the campaign checkpoint before selecting new work.
+    def defer(messages):
+        assert executions.count('original') == 2
+        return 'DECISION: SATURATED\n' + json.dumps(dict(reason='await another investigation',
+            failure_investigations=[dict(update, status='deferred', reason='await new evidence')]))
+    resumed = build(defer)
+    automatic = AutomaticRemediation(resumed, target='a3')
+    resumed.resume()
+    assert executions.count('original') == 2
+    # Explicitly publishing a new recommendation permits exactly one next retry.
+    state = json.loads(state_path.read_bytes())
+    state['terminal'] = None
+    state['failure_investigations'] = [dict(update, status='ready-to-retry', reason='new reviewed evidence')]
+    automatic.feedback.record(state['failure_investigations'], state)
+    atomic(state_path, canonical(state))
+    resumed.resume()
+    assert executions.count('original') == 3
+    assert next(row for row in automatic.store.records() if row['feedback_id'] == key)['lifecycle'] == 'fixed'
