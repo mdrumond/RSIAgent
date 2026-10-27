@@ -319,6 +319,17 @@ def compile_candidate(reference, candidate, directory, *, device='npu:0', arch, 
     return result
 
 
+def _comparison_metrics(value):
+    """Keep finite metrics numeric; label nonfinite diagnostics for strict JSON."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {key: _comparison_metrics(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_comparison_metrics(item) for item in value]
+    return value
+
+
 def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_count=1,
              benchmark=False, profile=False, cache_directory=None,
              profile_policy=None, diagnostic_only=False):
@@ -379,7 +390,7 @@ def evaluate(reference, candidate, directory, *, device='npu:0', arch, block_cou
                 from benchmarks.ascend.failure_cases import optimizer_failure
                 result['failure_case'] = optimizer_failure(prepared, row, actual, result['candidate_sha256'], exc)
                 result['failure_case'].update(block_count=block_count, arch=arch, device=device,
-                    metrics=getattr(exc, 'metrics', {}))
+                    metrics=_comparison_metrics(getattr(exc, 'metrics', {})))
             log = root / f'case-{i}' / 'compile.log'
             if log.is_file():
                 # The complete log remains an artifact; include bounded diagnostics
