@@ -244,8 +244,11 @@ class CplNativeCandidateBackend:
         body += "try: code=child.wait(timeout=max(0, " + repr(payload['expires_at']) + "-time.time()))\n"
         body += "except subprocess.TimeoutExpired:\n"
         body += " try: os.killpg(child.pid,signal.SIGTERM)\n except ProcessLookupError: pass\n"
-        body += " try: child.wait(timeout=10)\n except subprocess.TimeoutExpired:\n"
-        body += "  try: os.killpg(child.pid,signal.SIGKILL)\n  except ProcessLookupError: pass\n  child.wait()\n"
+        body += " grace=time.monotonic()+10\n while True:\n"
+        body += "  child.poll()\n  try: os.killpg(child.pid,0)\n  except ProcessLookupError: break\n"
+        body += "  if time.monotonic()>=grace:\n"
+        body += "   try: os.killpg(child.pid,signal.SIGKILL)\n   except ProcessLookupError: pass\n   break\n"
+        body += "  time.sleep(min(0.05,max(0,grace-time.monotonic())))\n child.wait()\n"
         body += " sys.exit(124)\nsys.exit(code if code>=0 else 128-code)\nCPL_PAYLOAD\n"
         if not script.exists():
             script.write_text(body)
