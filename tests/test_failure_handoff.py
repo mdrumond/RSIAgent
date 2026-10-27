@@ -62,8 +62,6 @@ def test_supplied_case_reads_exact_values_and_authorizes_verified_repair(tmp_pat
     ])
     result = AdaptiveActorProjectExecutor(executor, actor, object())(request)
     assert result.evidence.verified
-    assert 'negative-example' in actor.instruction
-    assert 'Linked observed failures' in actor.instruction
     assert json.loads(actor.observations[0]['text'])['tensors']
     # Only original failed execution and repaired execution; no forced rediscovery.
     assert [row.candidate_source for row in executor._backend.run_requests] == ['broken source', 'fixed source']

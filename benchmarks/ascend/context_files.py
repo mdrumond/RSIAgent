@@ -4,6 +4,7 @@ import re
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes
+from optimizer.jobs import atomic
 from .agent_presentation import artifact_page_presentation
 
 
@@ -18,10 +19,9 @@ class ContextFiles:
         digest = self.artifacts.put_bytes(data)
         filename = re.sub(r'[^a-zA-Z0-9_.-]', '-', name) + '-' + digest[:12] + '.json'
         path = self.root / filename
-        if path.exists() and path.read_bytes() != data:
-            raise ValueError('retained context file changed')
-        if not path.exists():
-            path.write_bytes(data)
+        # The named file is derived; authenticated CAS/input bytes are authoritative.
+        if not path.exists() or path.read_bytes() != data:
+            atomic(path, self.artifacts.read_bytes(digest))
         self.advertised.add(digest)
         return dict(filename=filename, sha256=digest, size_bytes=len(data),
                     read_artifact=dict(sha256=digest, offset=0, limit=8192))
