@@ -386,6 +386,11 @@ class FeedbackStore:
     @staticmethod
     def _identity(root, target, language, metadata=None):
         metadata = metadata or _read(root / 'campaign-identity.json', {})
+        if metadata.get('schema') == 'a5-phase1-production-identity-v1':
+            cell = metadata.get('cell', {})
+            if (isinstance(cell, dict) and cell.get('target') == 'a5'
+                    and cell.get('language') == 'catlass-dsl'):
+                metadata = dict(metadata, target=cell['target'], language=cell['language'])
         if (not target and metadata.get('schema') == 'ascend-native-adaptive-identity-v1'
                 and metadata.get('language') == 'ascend-c'):
             target = 'a3'
@@ -483,7 +488,8 @@ class FeedbackStore:
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
                 for candidate in state.get('history', []):
                     content = candidate.get('content', {})
-                    if not candidate.get('result') or content.get('status') == 'verified':
+                    if (candidate.get('tool') or not candidate.get('candidate_sha256')
+                            or not candidate.get('result') or content.get('status') == 'verified'):
                         continue
                     source = candidate.get('source')
                     if not source:
