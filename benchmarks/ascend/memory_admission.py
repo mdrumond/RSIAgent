@@ -12,7 +12,7 @@ from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from .project_verifier import ProjectReview
 from .subject_memory import StaleMemory, digest
 from .time_budget import AttemptTimeBudget
-from .memory_status import admission_assessment
+from .memory_status import admission_assessment, admission_report
 
 
 def treatment_snapshot(baseline, proposal, provenance, memory_id):
@@ -270,14 +270,7 @@ class MemoryAdmission:
 
     def report(self):
         """Expose held reviews without resolving scheduler work or restarting it."""
-        result = {}
-        for path in sorted(self.root.glob('*/job.json')):
-            job = json.loads(path.read_bytes())
-            result[job['review_id']] = dict(status=job['status'],
-                assessment=admission_assessment(job), error_type=job.get('error_type'),
-                reason=job.get('error') or ((job.get('evaluations') or [{}])[-1].get('reason')),
-                rewrites=job['rewrites'])
-        return result
+        return admission_report(self.root)
 
     def acknowledge(self, review_id):
         self.delivered.add(review_id)

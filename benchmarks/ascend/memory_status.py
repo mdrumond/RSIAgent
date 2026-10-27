@@ -3,6 +3,8 @@
 These fields are diagnostic only. They never authorize publication, retries or
 repair scheduling, and may be derived for legacy records without rewriting them.
 """
+import json
+from pathlib import Path
 
 
 def assessment(status, stage, reason_code):
@@ -60,3 +62,22 @@ def project_assessment(record):
     if review.get('memory') is None:
         return assessment('no-proposal', 'source-audit', 'no-memory-proposed')
     return assessment('eligible', 'source-audit', 'source-audit-passed')
+
+
+def admission_report(root):
+    """Read held and completed jobs without workers, leases or runtime setup."""
+    result = {}
+    for path in sorted(Path(root).glob('*/job.json')):
+        job = json.loads(path.read_bytes())
+        result[job['review_id']] = dict(status=job['status'],
+            assessment=admission_assessment(job), error_type=job.get('error_type'),
+            reason=job.get('error') or ((job.get('evaluations') or [{}])[-1].get('reason')),
+            rewrites=job['rewrites'])
+    return result
+
+
+def review_report(state, memory_reviews):
+    """Enrich legacy source records consistently for live and offline reports."""
+    projects = {key: dict(row, assessment=project_assessment(row))
+                for key, row in state.get('projects', {}).items()}
+    return dict(state, projects=projects, memory_verification=memory_reviews)

@@ -536,7 +536,9 @@ def main(argv=None, *, builder=build_subject_campaign):
     parser.add_argument('--max-seconds', type=float, default=7200)
     args = parser.parse_args(argv)
     if args.action == 'report':
+        from .memory_status import admission_report, review_report
         state = json.loads((args.root / 'subject-campaign.json').read_bytes())
+        state = review_report(state, admission_report(args.root / 'memory-reviews'))
         state['subjects'] = json.loads((args.root / 'subjects.json').read_bytes())
         print(json.dumps(state, sort_keys=True))
         return state

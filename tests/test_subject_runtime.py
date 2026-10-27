@@ -50,6 +50,42 @@ def test_report_needs_no_provider_configuration_or_runtime(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)['terminal'] == 'COMPLETE'
 
 
+def test_offline_report_explains_legacy_source_and_held_memory_without_side_effects(tmp_path, capsys, monkeypatch):
+    from benchmarks.ascend.memory_admission import MemoryAdmission
+    from benchmarks.ascend.subject_campaign import SubjectCampaign
+    from benchmarks.ascend.memory_status import admission_report, review_report
+    state = dict(projects={
+        'source': dict(review=dict(decision='repair', reason='Unsupported claim', memory=None)),
+        'eligible': dict(review=dict(decision='accept', memory={'summary': 'scoped lesson'}))})
+    (tmp_path / 'subject-campaign.json').write_text(json.dumps(state))
+    (tmp_path / 'subjects.json').write_text(json.dumps({'frontier': 1}))
+    reviews = tmp_path / 'memory-reviews'
+    directory = reviews / 'retained'
+    directory.mkdir(parents=True)
+    job = dict(review_id='eligible', status='inconclusive', rewrites=0, evaluations=[
+        dict(decision='inconclusive', reason='Environment probe queued', validity={'control': False},
+             arms={'control': dict(host_verified=False, observations=dict(
+                 classification='interrupted', error_type='ProjectInfrastructureError'))})])
+    (directory / 'job.json').write_text(json.dumps(job))
+    before = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
+    def forbidden(*args, **kwargs):
+        pytest.fail('report constructed an active campaign or worker')
+    monkeypatch.setattr(MemoryAdmission, '__init__', forbidden)
+    monkeypatch.setattr(SubjectCampaign, '__init__', forbidden)
+    result = main(['report', '--root', str(tmp_path)], builder=forbidden)
+    shared = review_report(state, admission_report(reviews))
+    assert result['projects'] == shared['projects']
+    assert result['memory_verification'] == shared['memory_verification']
+    assert result['projects']['source']['assessment']['status'] == 'needs-repair'
+    assert result['projects']['eligible']['assessment']['status'] == 'eligible'
+    held = result['memory_verification']['eligible']
+    assert held['status'] == 'inconclusive'
+    assert held['assessment']['status'] == 'infrastructure-blocked'
+    assert held['reason'] == job['evaluations'][0]['reason']
+    assert json.loads(capsys.readouterr().out) == result
+    assert {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()} == before
+
+
 def test_runtime_freezes_configuration_before_recomposing(tmp_path):
     calls = []
     def compose(settings, **options):

@@ -12,7 +12,7 @@ from .project_verifier import ProjectReview
 from .subjects import SubjectScheduler, SubjectCurriculumAgent
 from .subject_memory import SubjectMemory, StaleMemory
 from .time_budget import AttemptTimeBudget
-from .memory_status import assessment, project_assessment
+from .memory_status import assessment, project_assessment, review_report
 
 
 class SubjectCampaign:
@@ -42,12 +42,10 @@ class SubjectCampaign:
         return available
 
     def report(self):
-        projects = {key: dict(row, assessment=project_assessment(row))
-                    for key, row in self.state['projects'].items()}
         reviews = (self.memory_gate.report() if self.memory_gate is not None
                    and hasattr(self.memory_gate, 'report') else {})
-        return dict(self.state, projects=projects, subjects=self.scheduler.context(),
-                    accepted_memory=self.memory.records(), memory_verification=reviews)
+        return dict(review_report(self.state, reviews), subjects=self.scheduler.context(),
+                    accepted_memory=self.memory.records())
 
     def _decision_context(self):
         # Policy sees coverage and concise evidence, not repeated source/log bodies.
