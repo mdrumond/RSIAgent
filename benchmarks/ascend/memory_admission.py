@@ -12,6 +12,7 @@ from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from .project_verifier import ProjectReview
 from .subject_memory import StaleMemory, digest
 from .time_budget import AttemptTimeBudget
+from .memory_status import admission_assessment
 
 
 def treatment_snapshot(baseline, proposal, provenance, memory_id):
@@ -69,6 +70,7 @@ class MemoryAdmission:
         return self.root / digest(review_id) / 'job.json'
 
     def _save(self, job):
+        job['assessment'] = admission_assessment(job)
         path = self._path(job['review_id'])
         path.parent.mkdir(exist_ok=True)
         atomic(path, canonical(job))
@@ -196,7 +198,7 @@ class MemoryAdmission:
                 job['rewrites'] += 1
                 self._save(job)
         except (TimeoutError, OSError, InfrastructureFailure) as error:
-            job.update(status='inconclusive', error_type=type(error).__name__)
+            job.update(status='inconclusive', error_type=type(error).__name__, error=str(error))
             self._save(job)
         finally:
             budget.close()
@@ -259,9 +261,21 @@ class MemoryAdmission:
             if job['status'] in {'accepted', 'rejected'} and job['review_id'] not in self.delivered:
                 judgment = job['evaluations'][-1] if job['evaluations'] else {}
                 result.append(dict(review_id=job['review_id'], outcome=job['status'],
+                    assessment=admission_assessment(job),
                     judgment={key:judgment.get(key) for key in ('decision','reason','evidence','instructions','evaluation_id')},
                     rewrites=job['rewrites'], repair=job.get('project_repair'), provenance=job['provenance']))
         self._start()
+        return result
+
+    def report(self):
+        """Expose held reviews without resolving scheduler work or restarting it."""
+        result = {}
+        for path in sorted(self.root.glob('*/job.json')):
+            job = json.loads(path.read_bytes())
+            result[job['review_id']] = dict(status=job['status'],
+                assessment=admission_assessment(job), error_type=job.get('error_type'),
+                reason=job.get('error') or ((job.get('evaluations') or [{}])[-1].get('reason')),
+                rewrites=job['rewrites'])
         return result
 
     def acknowledge(self, review_id):

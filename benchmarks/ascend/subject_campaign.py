@@ -12,6 +12,7 @@ from .project_verifier import ProjectReview
 from .subjects import SubjectScheduler, SubjectCurriculumAgent
 from .subject_memory import SubjectMemory, StaleMemory
 from .time_budget import AttemptTimeBudget
+from .memory_status import assessment, project_assessment
 
 
 class SubjectCampaign:
@@ -41,7 +42,12 @@ class SubjectCampaign:
         return available
 
     def report(self):
-        return dict(self.state, subjects=self.scheduler.context(), accepted_memory=self.memory.records())
+        projects = {key: dict(row, assessment=project_assessment(row))
+                    for key, row in self.state['projects'].items()}
+        reviews = (self.memory_gate.report() if self.memory_gate is not None
+                   and hasattr(self.memory_gate, 'report') else {})
+        return dict(self.state, projects=projects, subjects=self.scheduler.context(),
+                    accepted_memory=self.memory.records(), memory_verification=reviews)
 
     def _decision_context(self):
         # Policy sees coverage and concise evidence, not repeated source/log bodies.
@@ -87,6 +93,7 @@ class SubjectCampaign:
             rows=self.state.setdefault('memory_reviews',{})
             if result['review_id'] not in rows:
                 rows[result['review_id']] = dict(outcome=result['outcome'], judgment=result.get('judgment'),
+                    assessment=result.get('assessment'),
                     rewrites=result.get('rewrites'), subject_id=result['provenance'].get('subject_id'),
                     sequence=max((row.get('sequence',0) for row in rows.values()),default=0)+1)
                 if result['outcome']=='rejected':
@@ -141,11 +148,16 @@ class SubjectCampaign:
         try:
             review = self.verifier.review(request, max_seconds=self._remaining(),
                 feedback=record.get('rewrite_feedback'))
+        except Exception as error:
+            record['assessment'] = dict(assessment('audit-incomplete', 'source-audit', 'review-interrupted'),
+                                        error_type=type(error).__name__, reason=str(error))
+            raise
         finally:
             record['verifier_trace'] = self.artifacts.put_json(self.verifier.last_trace)
             self._save()
         record.pop('rewrite_feedback', None)
         record['review'] = review
+        record['assessment'] = project_assessment(record)
         record['review_request'] = asdict(request)
         record['review_sha256'] = self.artifacts.put_json(review)
         self._save()
