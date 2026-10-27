@@ -162,8 +162,12 @@ def test_factory_caps_every_provider_call_by_local_pair_and_parent(tmp_path, ins
     class Provider:
         def complete(self, profile, messages, *, max_seconds):
             calls.append(max_seconds)
-            if 'memory usefulness verifier' in messages[0]['content']:
-                stage = json.loads(messages[-1]['content'])['stage']
+            try:
+                payload = json.loads(messages[-1]['content'])
+            except ValueError:
+                payload = {}
+            if 'stage' in payload:
+                stage = payload['stage']
                 now[0] += inspection_seconds if stage == 'inspect' else 0
                 return SimpleNamespace(text=stage)
             now[0] += 2
@@ -207,3 +211,102 @@ def test_semantic_failure_arms_retain_linkable_evidence(tmp_path):
         path = tmp_path / assessment['experiment_id'] / arm / 'evidence.json'
         assert path.read_bytes() == expected
         assert assessment['arms'][arm]['evidence_sha256'] == hashlib.sha256(expected).hexdigest()
+
+
+def test_shared_actor_contract_withholds_teaching_fields_without_changing_host_task(tmp_path):
+    from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
+    from benchmarks.ascend.memory_usefulness import actor_project
+    marker = 'privlesson'
+    authored = _project(marker + '-project', 'gm-ub-movement')
+    authored['hypothesis'] = 'Expected lesson: ' + marker
+    names = {}
+    for index, row in enumerate(authored['graph']['inputs']):
+        names[row['name']] = marker + 'i' + str(index)
+        row['name'] = names[row['name']]
+    for index, row in enumerate(authored['graph']['nodes']):
+        names[row['name']] = marker + 'n' + str(index)
+        row['name'] = names[row['name']]
+        row['operands'] = [names[name] for name in row['operands']]
+    authored['graph']['output'] = names[authored['graph']['output']]
+    spec = ProjectSpec.from_mapping(authored)
+    hidden = actor_project(spec)
+    original_inputs = materialize_inputs(spec)
+    assert evaluate_reference(spec, original_inputs).storage == evaluate_reference(hidden, original_inputs).storage
+    requests = []
+    def execute(request):
+        requests.append(request)
+        return _result(request.spec, True, 'host pass')
+    verifier = UsefulnessVerifier(tmp_path, CurriculumAgent(lambda messages: _wave(messages[-1]['content'], [authored])),
+        execute, lambda stage, evidence: stage, enabled=True)
+    lesson = {'claim': marker}
+    result = verifier.assess_lesson(lesson,
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'source')
+    assert result['outcome'] == 'both-succeeded'
+    assert requests[0].spec == requests[1].spec == hidden
+    assert all(marker not in json.dumps(request.spec.as_dict()) for request in requests)
+    frozen = json.loads((tmp_path / result['experiment_id'] / '0001.json').read_bytes())
+    assert frozen['curriculum_project'] == authored and frozen['project'] == hidden.as_dict()
+    assert requests[0].inputs == requests[1].inputs and requests[0].oracle == requests[1].oracle
+    assert requests[0].oracle.storage == evaluate_reference(spec, requests[0].inputs).storage
+    control = json.loads(requests[0].pre_wave_memory)
+    treatment = json.loads(requests[1].pre_wave_memory)
+    assert 'usefulness_lesson' not in control
+    assert treatment.pop('usefulness_lesson') == lesson
+    assert treatment == control
+
+
+@pytest.mark.parametrize('partial', [b'', b'{"kind": "arm-started",', b'null'])
+def test_partial_retained_event_does_not_block_resume_or_repeat_execution(tmp_path, partial):
+    def unexpected(*args):
+        pytest.fail('incomplete retained experiment must not dispatch work')
+    verifier = UsefulnessVerifier(tmp_path, None, unexpected, unexpected, enabled=True)
+    lesson, prior = {'claim': 'new'}, b'{}'
+    from benchmarks.ascend.memory_usefulness import digest
+    import hashlib
+    identifier = digest(dict(lesson_id=digest(lesson), source_id='retained',
+        prior_memory_sha256=hashlib.sha256(prior).hexdigest(), pair_seconds=600))
+    directory = tmp_path / identifier
+    directory.mkdir()
+    # Preserve a gap and malformed last event: next append must not overwrite either.
+    (directory/'0000.json').write_text(json.dumps(dict(kind='started')))
+    (directory/'0002.json').write_bytes(partial)
+    result = verifier.assess_lesson(lesson, prior, 'retained')
+    assert result['outcome'] == 'inconclusive'
+    assert result['unreadable_events'] == ['0002.json']
+    assert (directory/'0002.json').read_bytes() == partial
+    assert (directory/'0003.json').is_file()
+    assert verifier.assess_lesson(lesson, prior, 'retained') == result
+    assert len(list(directory.glob('[0-9]*.json'))) == 3
+
+
+@pytest.mark.parametrize('interpretation_failure', ['deadline', 'provider'])
+def test_completed_host_pair_survives_optional_interpretation_failure(tmp_path, interpretation_failure):
+    import hashlib
+    now, requests, stages = [0.0], [], []
+    def execute(request):
+        requests.append(request)
+        if len(requests) == 2 and interpretation_failure == 'deadline':
+            now[0] = 10
+        return _result(request.spec, len(requests) == 2, 'retained host verdict')
+    def verify(stage, evidence):
+        stages.append(stage)
+        if stage == 'interpret':
+            raise RuntimeError('provider unavailable')
+        return stage
+    verifier = UsefulnessVerifier(tmp_path, CurriculumAgent(lambda messages:
+        _wave(messages[-1]['content'], [_project('host-pair', 'gm-ub-movement')])),
+        execute, verify, enabled=True, clock=lambda: now[0], remaining_seconds=lambda: max(0, 10-now[0]))
+    result = verifier.assess_lesson({'claim': 'new'},
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'host-pair')
+    assert result['outcome'] == 'demonstrated-benefit'
+    assert result['arms']['control']['verified'] is False
+    assert result['arms']['treatment']['verified'] is True
+    assert result['interpretation_error']['error_type'] == ('TimeoutError' if interpretation_failure == 'deadline' else 'RuntimeError')
+    assert stages == (['inspect'] if interpretation_failure == 'deadline' else ['inspect', 'interpret'])
+    for arm in ('control', 'treatment'):
+        data = (tmp_path/result['experiment_id']/arm/'evidence.json').read_bytes()
+        assert hashlib.sha256(data).hexdigest() == result['arms'][arm]['evidence_sha256']
+    assert verifier.assess_lesson({'claim': 'new'},
+        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'host-pair') == result
+    assert len(requests) == 2
+    assert stages == (['inspect'] if interpretation_failure == 'deadline' else ['inspect', 'interpret'])

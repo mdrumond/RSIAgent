@@ -555,3 +555,44 @@ class KnowledgeDB:
             )
             for score, chunk_id, row in scored[:limit]
         ]
+
+    def ranked_candidates(self, collection: str, query: str, *, limit: int | None = 100,
+                          query_vector: Sequence[float], check_remaining: Callable[[], object] | None = None
+                          ) -> tuple[list[SearchHit], list[SearchHit]]:
+        """Separate cosine and local BM25 lanes; None retains full backfill order."""
+        manifest = self.manifest(collection)
+        if (self.embeddings.model, self.embeddings.revision) != (
+                manifest.embedding_model, manifest.embedding_revision):
+            raise ValueError("embedding backend does not match collection manifest")
+        table = self._fts_table_name(collection)
+        metadata = self.connection.execute(
+            "SELECT fts_table FROM collections WHERE name = ?", (collection,)
+        ).fetchone()
+        if metadata["fts_table"] != table:
+            raise RuntimeError(f"invalid FTS metadata for collection {collection!r}")
+        lexical_query = _fts_query(query)
+        lexical = [] if lexical_query is None else self.connection.execute(
+            f"SELECT c.chunk_id, bm25({table}) AS lexical_score FROM {table} "
+            f"CROSS JOIN chunks c ON c.rowid = {table}.rowid "
+            f"WHERE {table} MATCH ? AND c.collection = ? "
+            "ORDER BY lexical_score ASC, c.chunk_id ASC LIMIT ?",
+            (lexical_query, collection, -1 if limit is None else limit),
+        ).fetchall()
+        lexical_rank = {row["chunk_id"]: rank for rank, row in enumerate(lexical, 1)}
+        lexical_score = {row["chunk_id"]: row["lexical_score"] for row in lexical}
+        vector = _normalize(query_vector)
+        hits = []
+        for index, row in enumerate(self.connection.execute(
+                "SELECT * FROM chunks WHERE collection = ?", (collection,))):
+            if check_remaining is not None and index % 256 == 0:
+                check_remaining()
+            hits.append(SearchHit(
+            chunk_id=row["chunk_id"], path=row["path"], start_line=row["start_line"],
+            end_line=row["end_line"], text=row["text"],
+            score=_cosine(vector, json.loads(row["vector_json"])),
+            lexical_rank=lexical_rank.get(row["chunk_id"]),
+            lexical_score=lexical_score.get(row["chunk_id"]), vector_rank=None,
+            ))
+        hits.sort(key=lambda hit: (-hit.score, hit.chunk_id))
+        by_id = {hit.chunk_id: hit for hit in hits}
+        return hits if limit is None else hits[:limit], [by_id[row["chunk_id"]] for row in lexical]

@@ -307,6 +307,9 @@ def test_remote_backend_hydrates_authenticated_evidence_without_resubmission(tmp
                 shutil.copyfile(remote_result / 'compact.tar.gz', destination)
         def execute(self, directory, argv):
             self.executions += 1
+            # Keep the workload in its retained command's process group so
+            # exact-handle cancellation also reaches Python/compiler children.
+            assert 'timeout --foreground --signal=TERM' in argv[-1]
     transport = Transport()
     backend = RemoteBackend(store, job, config(tmp_path), transport=transport)
     directory = store.root / job / 'execution' / 'candidate'
@@ -359,6 +362,61 @@ def test_terminal_candidate_crash_without_archive_is_feedback_not_job_crash(tmp_
     assert result['status'] == 'error'
     assert 'no compact result' in result['error']
     assert {row['name'] for row in store.artifacts(job)} == {'candidate/transport.log', 'candidate/result.json'}
+
+
+@pytest.mark.parametrize('failure', ['bad-digest', 'missing-result', 'commit', 'result-marker'])
+def test_compact_import_failure_does_not_publish_result_and_can_retry(tmp_path, monkeypatch, failure):
+    import io
+    import shutil
+    import tarfile
+    from optimizer.jobs import JobStore, canonical, sha
+    from optimizer.worker import RemoteBackend
+    store = JobStore(tmp_path / 'jobs')
+    job = store.create('def forward(x): return x', 'forward', {}, {})['job_id']
+    compact = tmp_path / 'remote.tar.gz'
+    def publish(valid):
+        files = {'result.json': canonical({'status': 'verified'}), 'metrics.csv': b'metric,1'}
+        if not valid and failure == 'missing-result':
+            files.pop('result.json')
+        rows = [dict(path=name, sha256=sha(data), size=len(data)) for name, data in files.items()]
+        if not valid and failure == 'bad-digest':
+            rows[-1]['sha256'] = '0' * 64
+        with tarfile.open(compact, 'w:gz') as archive:
+            for name, data in [*files.items(), ('files.json', canonical(rows))]:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+    class Transport:
+        def transfer(self, action, source, destination):
+            if action == 'download':
+                shutil.copyfile(compact, destination)
+        def execute(self, directory, argv):
+            pass
+    backend = RemoteBackend(store, job, config(tmp_path), transport=Transport())
+    directory = store.root / job / 'execution' / 'candidate'
+    publish(False)
+    batch = store._event_batch
+    from optimizer import worker
+    original_atomic = worker.atomic
+    if failure == 'result-marker':
+        def fail_marker(path, data):
+            if path == directory / 'result.json':
+                raise OSError('interrupted after inventory commit')
+            return original_atomic(path, data)
+        monkeypatch.setattr(worker, 'atomic', fail_marker)
+    if failure == 'commit':
+        def fail(*args):
+            raise OSError('interrupted artifact commit')
+        monkeypatch.setattr(store, '_event_batch', fail)
+    with pytest.raises((ValueError, OSError)):
+        backend.evaluate('source', directory, block_count=1)
+    assert not (directory / 'result.json').exists()
+    assert len(store.artifacts(job)) == (2 if failure == 'result-marker' else 0)
+    monkeypatch.setattr(store, '_event_batch', batch)
+    monkeypatch.setattr(worker, 'atomic', original_atomic)
+    publish(True)
+    assert backend.evaluate('source', directory, block_count=1) == {'status': 'verified'}
+    assert len(store.artifacts(job)) == 2
 
 
 def test_profile_observation_loss_preserves_pending_and_history_on_retry(tmp_path):
@@ -499,3 +557,49 @@ def test_injected_worker_routes_stop_and_pins_transport_identity(tmp_path):
     settings['transport_identity'] = 'test-transport-v2'
     with pytest.raises(ValueError, match='changed on resume'):
         run_worker(store.root, key, settings, agent=agent, transport_factory=factory)
+
+
+def test_completed_remote_result_survives_interrupted_client_at_deadline(tmp_path):
+    expired = False
+    def run(argv, **kwargs):
+        nonlocal expired
+        expired = True
+        return SimpleNamespace(returncode=-15, interrupted=True, stderr='', stdout=(
+            'BZ_A3_REMOTE_HANDLE=remote:bz-a3-1:job:completed\n'
+            'CATLASS_VALIDATION_HANDLE=bz-a3-1:completed\n'
+            'CATLASS_VALIDATION_STATE=completed\n'))
+    transport = CheckedTransport(config(tmp_path), run=run, stopped=lambda: expired)
+    directory = tmp_path / 'op'
+    transport.execute(directory, ['true'])
+    assert json.loads((directory / 'transport.json').read_text())['state'] == 'completed'
+
+
+@pytest.mark.parametrize('boundary', ['deadline', 'stop', 'client-timeout', 'failed-cancel', 'unknown-dispatch'])
+def test_interrupted_observation_cancels_only_known_operation_at_real_stop(tmp_path, boundary):
+    import time
+    stopped = False
+    calls = []
+    transport = None
+    def run(argv, **kwargs):
+        nonlocal stopped
+        calls.append(argv)
+        if 'cancel' in argv:
+            return SimpleNamespace(returncode=1 if boundary == 'failed-cancel' else 0, stdout='', stderr='')
+        stopped = boundary != 'client-timeout'
+        if boundary == 'deadline':
+            transport.deadline = time.monotonic() - 1
+        output = '' if boundary == 'unknown-dispatch' else (
+            'BZ_A3_REMOTE_HANDLE=remote:bz-a3-1:job:deadline-test\n'
+            'CATLASS_VALIDATION_HANDLE=bz-a3-1:deadline-test\n')
+        return SimpleNamespace(returncode=-15, stdout=output, stderr='', interrupted=True)
+    transport = CheckedTransport(config(tmp_path), run=run,
+        stopped=lambda: stopped or time.monotonic() >= transport.deadline)
+    error = WorkerStopped if boundary in {'deadline', 'stop'} else ObservationUnavailable
+    with pytest.raises(error):
+        transport.execute(tmp_path / 'profile', ['true'])
+    cancelled = [argv for argv in calls if 'cancel' in argv]
+    assert bool(cancelled) == (boundary in {'deadline', 'stop', 'failed-cancel'})
+    if cancelled:
+        assert cancelled[0][-1] == 'remote:bz-a3-1:job:deadline-test'
+    state = json.loads((tmp_path / 'profile/transport.json').read_text())
+    assert (state['state'] == 'cancelled') == (boundary in {'deadline', 'stop'})

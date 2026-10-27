@@ -249,3 +249,188 @@ def test_distillation_infrastructure_failure_retains_summary_usage(tmp_path):
     outcome.continuation.working_context.recent.insert(0, {"role": "user", "content": "old repair" * 30})
     result = actor.distill(outcome)
     assert result.tokens >= 8
+
+
+def test_recorded_oversized_work_log_corrects_from_original_input():
+    profile = direct_profile(MODEL_IDENTITIES[1])
+    old_budget = ContextBudget(32 * 1024, 24 * 1024, 48 * 1024)
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 5000} for _ in range(8)]
+    working.work_log = "previous discoveries"
+    original = list(working.recent)
+    calls = []
+    def summarize(messages):
+        calls.append(messages)
+        assert request_bytes(profile.request(messages)) <= old_budget.target
+        # Nothing is folded before a replacement is accepted.
+        assert working.recent == original
+        return "x" * 6321 if len(calls) == 1 else "corrected log"
+    working.prepare(profile, old_budget, summarize)
+    assert len(calls) == 2
+    assert calls[1][:2] == calls[0]
+    assert "6321 UTF-8 bytes" in calls[1][-1]["content"]
+    assert "6144 UTF-8 bytes" in calls[1][-1]["content"]
+    assert working.work_log == "corrected log"
+    assert working.recent == original[len(json.loads(calls[0][1]["content"])["exchanges"]):]
+
+
+@pytest.mark.parametrize("invalid,measurement", [("", "0 UTF-8 bytes"),
+    (" " * 4, "4 UTF-8 bytes"), ("é" * 438, "876 UTF-8 bytes"),
+    (None, "non-text (UTF-8 size unavailable)")])
+def test_summary_correction_exhaustion_keeps_original_input(invalid, measurement):
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+    working.work_log = "old log"
+    original = working.messages()
+    calls = []
+    def summarize(messages):
+        calls.append(messages)
+        return invalid
+    with pytest.raises(ContextBudgetError, match="after 3 attempts") as error:
+        working.prepare(direct_profile(MODEL_IDENTITIES[0]), BUDGET, summarize)
+    assert measurement in str(error.value)
+    assert "875 UTF-8 bytes" in str(error.value)
+    assert len(calls) == 3
+    assert calls[1][:2] == calls[2][:2] == calls[0]
+    assert len(calls[1]) == len(calls[2]) == 3
+    assert working.messages() == original
+    assert all(request_bytes(direct_profile(MODEL_IDENTITIES[0]).request(call)) <= BUDGET.target for call in calls)
+
+
+def test_summary_limit_accepts_utf8_boundary_without_truncation():
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+    boundary = "é" * 437 + "x"
+    assert len(boundary.encode("utf-8")) == BUDGET.target // 4
+    working.prepare(direct_profile(MODEL_IDENTITIES[0]), BUDGET, lambda _: boundary)
+    assert working.work_log == boundary
+
+
+def test_deepseek_default_preserves_fixed_task_and_ordinary_turns():
+    from benchmarks.ascend.agent_context import DEFAULT_CONTEXT_BUDGETS
+    budget = DEFAULT_CONTEXT_BUDGETS["deepseek-flash"]
+    assert budget == DEFAULT_CONTEXT_BUDGETS["openai/gpt-5.6-sol"] == ContextBudget(131072, 81920, 196608)
+    profile = direct_profile(MODEL_IDENTITIES[1])
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "t" * 25863}])
+    for _ in range(20):
+        working.append({"role": "assistant", "content": "action" * 100})
+        working.append({"role": "user", "content": "host result" * 100})
+        working.prepare(profile, budget, lambda _: pytest.fail("ordinary turns must not compact repeatedly"))
+    assert working.fixed[1]["content"] == "t" * 25863
+
+
+@pytest.mark.parametrize("exhaust", [False, True])
+def test_compaction_correction_records_every_request_response_and_token(tmp_path, exhaust):
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    calls, events = [], []
+    def transport(**kw):
+        calls.append(kw["request"])
+        return DirectCompletion("x" * 1000 if exhaust or len(calls) == 1 else "accepted log", 7)
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    provider = DirectCompletionProvider(ENV, transport=transport,
+        context_budgets={profile.identity.backend_model.value: BUDGET})
+    actor = DirectActorDriver(provider, trace_event=lambda kind, payload: events.append((kind, payload)))
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+    if exhaust:
+        with pytest.raises(ContextBudgetError, match="after 3 attempts"):
+            actor._prepare_context(working, profile, _ProviderEvidenceRecorder(tmp_path / "actor"), turn=3)
+        assert len(calls) == 3
+    else:
+        _, tokens = actor._prepare_context(working, profile, _ProviderEvidenceRecorder(tmp_path / "actor"), turn=3)
+        assert tokens == 7 * len(calls)
+        assert len(calls) >= 2
+    rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert sum(row["role"] == "provider-request" for row in rows) == len(calls)
+    assert sum(row["role"] == "provider-response" for row in rows) == len(calls)
+    summaries = [payload for kind, payload in events if kind == "tool" and payload["name"] == "context-compaction"]
+    assert len(summaries) == len(calls)
+    assert sum(payload["completion_tokens"] for payload in summaries) == 7 * len(calls)
+
+
+def test_compaction_transport_failure_does_not_use_summary_correction():
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+    calls = []
+    def summarize(messages):
+        calls.append(messages)
+        raise TimeoutError()
+    with pytest.raises(TimeoutError):
+        working.prepare(direct_profile(MODEL_IDENTITIES[0]), BUDGET, summarize)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("exhaust", [False, True])
+def test_sdk_empty_compaction_is_corrected_and_retained(monkeypatch, tmp_path, exhaust):
+    import sys
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    calls, events = [], []
+    def create(**request):
+        calls.append(request)
+        text = "  " if exhaust or len(calls) == 1 else "accepted log"
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))],
+                               usage=SimpleNamespace(completion_tokens=5))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=lambda **_: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)))))
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    provider = DirectCompletionProvider(ENV, context_budgets={profile.identity.backend_model.value: BUDGET})
+    actor = DirectActorDriver(provider, trace_event=lambda kind, payload: events.append((kind, payload)))
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+    original = working.messages()
+    recorder = _ProviderEvidenceRecorder(tmp_path / "actor")
+    if exhaust:
+        with pytest.raises(ContextBudgetError, match="after 3 attempts.*2 UTF-8 bytes"):
+            actor._prepare_context(working, profile, recorder, turn=3)
+        assert len(calls) == 3 and working.messages() == original
+    else:
+        _, tokens = actor._prepare_context(working, profile, recorder, turn=3)
+        assert tokens == 5 * len(calls)
+        assert working.work_log == "accepted log"
+    assert "2 UTF-8 bytes" in calls[1]["messages"][-1]["content"]
+    rows = [json.loads(line)["payload"] for line in (tmp_path / "evidence.jsonl").read_text().splitlines()]
+    assert sum(row["role"] == "provider-request" for row in rows) == len(calls)
+    assert sum(row["role"] == "provider-response" for row in rows) == len(calls)
+    traces = [p for kind, p in events if kind == "tool" and p["name"] == "context-compaction"]
+    assert len(traces) == len(calls) and sum(p["completion_tokens"] for p in traces) == len(calls) * 5
+    empty_digest = next(row["sha256"] for row in rows if row["role"] == "provider-response")
+    assert recorder.artifacts.read_bytes(empty_digest) == b"  "
+
+
+@pytest.mark.parametrize("content,usage", [("", 5), ("  ", 5), (None, 5), ([], 5), ("", 0)])
+def test_sdk_empty_action_contract_still_rejects(monkeypatch, content, usage):
+    import sys
+    from types import SimpleNamespace
+    calls = []
+    def create(**request):
+        calls.append(request)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+                               usage=SimpleNamespace(completion_tokens=usage))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=lambda **_: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)))))
+    with pytest.raises(ValueError):
+        DirectCompletionProvider(ENV).complete(direct_profile(MODEL_IDENTITIES[0]),
+                                              [{"role": "user", "content": "act"}])
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("content,usage", [(None, 5), ([], 5), ("", 0)])
+def test_sdk_invalid_response_is_not_compaction_correction(monkeypatch, content, usage):
+    import sys
+    from types import SimpleNamespace
+    from benchmarks.a5kernels.phase1_provider import _ProviderEvidenceRecorder
+    calls = []
+    def create(**request):
+        calls.append(request)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+                               usage=SimpleNamespace(completion_tokens=usage))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=lambda **_: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)))))
+    profile = direct_profile(MODEL_IDENTITIES[0])
+    provider = DirectCompletionProvider(ENV, context_budgets={profile.identity.backend_model.value: BUDGET})
+    working = WorkingContext([{"role": "system", "content": "s"}, {"role": "user", "content": "task"}])
+    working.recent = [{"role": "user", "content": "x" * 900} for _ in range(8)]
+    with pytest.raises(ContextBudgetError, match="summarization failed"):
+        DirectActorDriver(provider)._prepare_context(working, profile, _ProviderEvidenceRecorder(None), turn=3)
+    assert len(calls) == 1

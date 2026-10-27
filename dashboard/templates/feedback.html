@@ -4,15 +4,16 @@
 {% if not controls.feedback.root %}<p>Configure <code>feedback_root</code> to view imported outcomes.</p>{% endif %}
 {% if controls.enabled and controls.feedback.root %}<section class="control-panel">
 <button data-action="import-feedback" data-subject="phase2">Import configured failures</button>
-<p>Use a fresh destination preset for each investigation or retry. Phase 1 starts awaiting curriculum approval. Retry uses a Phase 2 destination preset's reviewed memory to rerun the original Phase 1 specification or frozen optimizer suite.</p>
+<p>Use a fresh Phase 1 destination for an investigation. New Phase 2 launches and retries are retired; request new work through the subject curriculum. Historical results remain available below.</p>
+
 <form data-feedback-form>
-<label>Destination <select name="preset_id">{% for preset in controls.presets.values() %}{% if preset.target == 'a3' %}<option value="{{ preset.id }}">{{ preset.id }} (Phase {{ preset.phase }})</option>{% endif %}{% endfor %}</select></label>
+<label>Destination <select name="preset_id">{% for preset in controls.presets.values() %}{% if preset.target == 'a3' and preset.phase == 1 %}<option value="{{ preset.id }}">{{ preset.id }} (Phase {{ preset.phase }})</option>{% endif %}{% endfor %}</select></label>
 <label>Phase 1 project budget <input name="project_target" type="number" min="1" required></label>
-<button data-feedback-action="investigate">Investigate selected failures</button><button data-feedback-action="retry-feedback">Retry one selected original target</button>
+<button data-feedback-action="investigate">Investigate selected failures</button>
 {% endif %}
 {% for row in records %}{% set outcome = row.outcome %}{% set state = row.investigation %}
 <article class="card" id="{{ row.feedback_id }}">
-{% if controls.enabled and controls.feedback.root and state.status not in ['resolved', 'deferred'] and outcome.category not in ['interrupted', 'verified-success', 'verified-timing-unknown'] %}<label><input name="feedback_id" type="checkbox" value="{{ row.feedback_id }}"> {% if state.classification in ['infrastructure', 'provider'] %}Select for retry only; infrastructure/provider observations cannot enter kernel investigation.{% else %}Select failure{% endif %}</label>{% endif %}
+{% if controls.enabled and controls.feedback.root and state.status not in ['resolved', 'deferred'] and outcome.category not in ['interrupted', 'verified-success', 'verified-timing-unknown'] and state.classification not in ['infrastructure', 'provider'] %}<label><input name="feedback_id" type="checkbox" value="{{ row.feedback_id }}"> Select failure</label>{% endif %}
 <h2>{{ outcome.task.task_id or outcome.attempt_id }}</h2>
 <p><b>Lifecycle:</b> {{ row.lifecycle or "successful control" }} · <b>Source:</b> {{ outcome.source_type or "phase2" }}</p>
 <p>{{ outcome.target }} / {{ outcome.language }} · {{ outcome.category }} · original attempt {{ outcome.attempt_id }}{% if not outcome.completed %} (interrupted, not completed){% endif %}</p>

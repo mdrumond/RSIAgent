@@ -23,6 +23,12 @@ Declare KERNEL_TASK_TYPE_DEFAULT inside optimizer_kernel: KERNEL_TYPE_AIV_ONLY
 for pure vector/scalar work, KERNEL_TYPE_AIC_ONLY for pure Cube work, or the
 appropriate supported mixed type. Use only the supplied native contracts and
 guide/KDB evidence. Every frozen case must pass host verification before timing.
+Profiling analysis runs remotely; consume the supplied diagnostic digests, not raw
+report trees. Digests cover explicitly selected cases/groups, not the full suite.
+Missing metrics are unavailable, not zero. Keep canonical timing separate from
+diagnostic replay data; do not average unrelated kernel/pipe ratios. Full raw and
+normalized reports remain at the retained remote paths; read-artifact only accesses
+digests/evidence already retained locally, not arbitrary remote files.
 Summarize changes briefly; do not provide private chain-of-thought."""
 
 

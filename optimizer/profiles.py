@@ -127,11 +127,29 @@ def profile(fn, root, groups=None, *, identity=None):
                 if not item['available']:
                     item['reason'] = ('no group counters exported' if item['reports']
                                       else 'capture exported no supported summary CSV')
+                # Analyze on the worker. Full normalized rows remain beside raw
+                # reports; only requested counters and their actual kernel/row
+                # identities enter the portable digest. Never average ratios.
+                selector = (identity or {}).get('kernel_symbol')
+                digests = []
+                for report in item['reports']:
+                    metrics = [metric for metric in report['metrics']
+                               if metric['column'] in item['counter_columns']
+                               and (not selector or any(selector in str(value)
+                                    for value in metric['identity'].values()))]
+                    digests.append({key: report[key] for key in ('source', 'json', 'csv')} | {'metrics': metrics})
+                item['reports'] = digests
+                if selector and not any(metric['available'] for report in digests
+                                        for metric in report['metrics']):
+                    item['available'] = False
+                    item['reason'] = 'no requested counters for candidate kernel symbol'
             except Exception as exc:
                 item['reason'] = f'{type(exc).__name__}: {exc}'
         results.append(item)
     result = {'schema_version': 1, 'identity': identity or {}, 'diagnostic': True,
               'capabilities': capabilities, 'groups': results, 'raw_report_root': str(root),
-              'transfer_policy': 'compact CSV/JSON only; raw reports retained remotely'}
+              'warmup': 5, 'launch_count': 1,
+              'transfer_policy': 'digest only; raw and normalized reports retained remotely',
+              'analysis': 'requested-group per-row counters; no cross-row ratio averaging'}
     (root / 'profile.json').write_text(json.dumps(result, indent=2, allow_nan=False))
     return result

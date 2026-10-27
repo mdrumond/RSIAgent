@@ -173,11 +173,69 @@ def mismatch_summary(expected, observed):
             "samples": samples, "comparison": "exact differences, not host tolerance"}
 
 
+def _bounded_text(value, budget):
+    """Bound JSON wire bytes, including escaped Unicode, without splitting text."""
+    text = str(value)
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(canonical_bytes(text[:middle])) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low]
+
+
+def _subject_memory_index(value, result, artifacts):
+    # Accepted learning is guidance, never a substitute for current host evidence.
+    result.update(schema=value['schema'], presentation_only=True, memories=[])
+    result.pop('projects')
+    initial = value.get('initial_memory', '').encode('utf-8')
+    seed_preview = _bounded_text(value.get('initial_memory', ''), 512)
+    result.update(initial_memory_sha256=artifacts.put_bytes(initial),
+                  initial_memory_bytes=len(initial), initial_memory_preview=seed_preview,
+                  initial_memory_preview_truncated=seed_preview != value.get('initial_memory', ''))
+    records = value.get('memories', [])
+    result.update(memory_count=len(records), shown_count=0, omitted_count=len(records))
+    for record in records:
+        proposal = record['proposal']
+        document = artifacts.put_json(record)
+        row = dict(memory_id=record['memory_id'], version=document,
+                   memory_document_sha256=document, proposal_sha256=artifacts.put_json(proposal))
+        truncated = []
+        for field in ('summary', 'applicability', 'preconditions', 'expectations', 'limitations'):
+            original = proposal.get(field, '')
+            row[field] = _bounded_text(original, 512 if field == 'summary' else 256)
+            if row[field] != original:
+                truncated.append(field)
+        for field in ('before', 'after'):
+            snippet = proposal.get(field)
+            row[field] = None if snippet is None else {
+                key: snippet[key] for key in ('sha256', 'start_line', 'end_line')}
+            if snippet is not None and 'text' in snippet:
+                # Only complete, exact examples are inlined. Large examples stay linked.
+                if len(canonical_bytes(snippet['text'])) <= 512:
+                    row[field]['text'] = snippet['text']
+                else:
+                    truncated.append(field + '.text')
+        evidence = proposal.get('evidence', [])
+        row.update(evidence=evidence[:4], evidence_count=len(evidence),
+                   omitted_evidence_count=max(0, len(evidence) - 4), truncated_fields=truncated)
+        candidate = dict(result, memories=[*result['memories'], row],
+                         shown_count=result['shown_count'] + 1,
+                         omitted_count=result['omitted_count'] - 1)
+        if len(canonical_bytes(candidate)) > PAGE_BYTES:
+            break
+        result = candidate
+    return result
+
+
 def memory_presentation(raw, artifacts):
     """Index every original memory; show readable bounded lessons, not base64."""
     digest = artifacts.put_bytes(raw)
     result = {"sha256": digest, "bytes": len(raw), "projects": [],
-              "note": "Presentation only. Full immutable memories available via read-artifact."}
+              "note": "Presentation only. Full immutable memories available via read-artifact.",
+              "file_reader": {"action": "read_artifact", "hash_field": "sha256", "offset": 0, "limit": 8192}}
     try:
         value = json.loads(raw)
     except (ValueError, UnicodeDecodeError):
@@ -186,8 +244,19 @@ def memory_presentation(raw, artifacts):
     if isinstance(value, dict) and "usefulness_lesson" in value:
         result["usefulness_lesson"] = value["usefulness_lesson"]
     if isinstance(value, dict) and isinstance(value.get("memory_entries"), list):
-        result["memory_entries"] = [dict(sha256=artifacts.put_bytes(canonical_bytes(entry)),
-            lesson=_preview(entry)) for entry in value["memory_entries"]]
+        result["memory_entries"] = []
+        remaining = 8192
+        for entry in value["memory_entries"]:
+            content = canonical_bytes(entry)
+            row = dict(sha256=artifacts.put_bytes(content))
+            lesson = _preview(entry)
+            size = len(canonical_bytes(lesson))
+            if size <= remaining:
+                row["lesson"] = lesson
+                remaining -= size
+            result["memory_entries"].append(row)
+    if isinstance(value, dict) and value.get("schema") == "subject-memory-snapshot-v1":
+        return _subject_memory_index(value, result, artifacts)
     if not isinstance(value, dict) or "project_memory_base64" not in value:
         result["preview"] = _preview(value)
         if len(canonical_bytes(result)) > 8192:
@@ -213,7 +282,9 @@ def memory_presentation(raw, artifacts):
     optimizer_remaining = 8192
     for content, origin in entries:
         project = json.loads(content)
-        row = {"sha256": artifacts.put_bytes(content),
+        digest = artifacts.put_bytes(content)
+        row = {"sha256": digest, "size_bytes": len(content),
+               "filename": "project-memory-" + str(project.get("project_spec", {}).get("project_id", project.get("task_id", digest[:12]))) + ".json",
                "origin": origin,
                "project_id": project.get("project_spec", {}).get("project_id", project.get("task_id"))}
         if project.get("task_id"):

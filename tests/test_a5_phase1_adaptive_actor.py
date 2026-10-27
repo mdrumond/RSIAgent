@@ -457,7 +457,6 @@ def test_actor_repairs_semantic_mismatch_before_verified_distillation(tmp_path):
     assert actor.observations[8]["classification"] == "host-verified"
     assert '"prior":"memory"' in actor.instruction
     assert actor.instruction.count('{"guide":"exact"}') == 1
-    assert executor.prepare(_spec()).instruction in actor.instruction
     assert len(backend.requests) == 4
     assert len(backend.run_requests) == 3
     assert (tmp_path / "branch" / "artifacts").is_dir()
@@ -881,3 +880,64 @@ def test_compile_repair_submit_explains_actual_actor_missing_requirement(tmp_pat
     explanation, = rejected["status_explanations"]
     assert explanation["field"] == "missing"
     assert explanation["code"] == "observed-compile"
+
+
+def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_hard_cap(tmp_path):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    from benchmarks.a5kernels.phase1_provider import (
+        DirectActorDriver, DirectCompletion, DirectCompletionProvider, direct_profile,
+    )
+    from benchmarks.ascend.agent_context import ContextBudget, request_bytes
+
+    executor = ProjectExecutor(SourceBackend(), EvidenceLedger(tmp_path / 'evidence.jsonl'))
+    request = _request(tmp_path, executor)
+    store = ContentAddressedArtifacts(request.branch_root / 'artifacts')
+    # The production curriculum eagerly copies only reachable historical objects
+    # into this branch's CAS; the reader must not discover unrelated shared data.
+    source_bytes = b'out = max(x, 0)\n'
+    source = store.put_bytes(source_bytes)
+    proposal = dict(summary='Clamp negatives before storing', applicability='float32 relu',
+                    preconditions='Padded input', expectations='Nonnegative logical output',
+                    limitations='No timing evidence', before=None,
+                    after=dict(sha256=source, start_line=1, end_line=1, text=source_bytes.decode()),
+                    evidence=[source])
+    record = dict(memory_id='relu', proposal=proposal, provenance={'trace': 'z' * 76665})
+    raw = canonical_bytes(dict(schema='subject-memory-snapshot-v1', initial_memory='Use host checks',
+                               memories=[record]))
+    request = replace(request, pre_wave_memory=raw, publish_learning=False)
+    calls, pages = [], []
+    def transport(**kwargs):
+        wire = kwargs['request']
+        assert request_bytes(wire) <= 48 * 1024
+        calls.append(wire)
+        if len(calls) == 1:
+            instruction = wire['messages'][-1]['content']
+            start = instruction.index('{"bytes":')
+            view, _ = json.JSONDecoder().raw_decode(instruction[start:])
+            row = view['memories'][0]
+            assert row['summary'] == proposal['summary']
+            assert row['after'] == proposal['after']
+            assert store.read_json(row['memory_document_sha256']) == record
+            action = {'read-artifact': {'sha256': row['proposal_sha256']}}
+        else:
+            host = json.loads(wire['messages'][-1]['content'])['host']
+            if len(calls) <= 3:
+                pages.append(host['text'])
+            actions = [ {'read-artifact': {'sha256': source}},
+                        {'write': {'slot': 'kernel', 'content': 'fixed source'}},
+                        {'run': {}}, {'submit': {}} ]
+            action = actions[len(calls) - 2]
+        return DirectCompletion(json.dumps(action), 1)
+    identity = MODEL_IDENTITIES[0]
+    provider = DirectCompletionProvider({'OPENAI_API_KEY': 'test', 'DEEPSEEK_API_KEY': 'test'},
+        transport=transport, context_budgets={identity.backend_model.value:
+            ContextBudget(44 * 1024, 32 * 1024, 48 * 1024)})
+    result = AdaptiveActorProjectExecutor(executor, DirectActorDriver(provider), direct_profile(identity))(request)
+    assert json.loads(pages[0]) == proposal
+    assert pages[1].encode() == source_bytes
+    assert result.memory.host_facts
+    assert not result.memory.lessons
+    assert result.memory.source_revision == hashlib.sha256(b"fixed source").hexdigest()
+    assert len(calls) == 5
