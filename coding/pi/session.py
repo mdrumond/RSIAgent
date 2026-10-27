@@ -81,9 +81,10 @@ class RequestAccounting:
 
 class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
-                 budget=None, own_process_group=True):
+                 budget=None, own_process_group=True, system_prompt=SYSTEM):
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
+        self.system_prompt = system_prompt
         # Only canonical registered profiles are accepted.
         from benchmarks.a3_experiments import BackendModel
         from benchmarks.a3_model_profiles import load_a3_model_profile
@@ -218,7 +219,7 @@ class PiCodingSession:
                 "--no-builtin-tools", "--no-extensions", "--no-skills", "--no-prompt-templates",
                 "--no-themes", "--no-context-files", "--no-mcp", "--offline", "--no-approve",
                 "--extension", str(ROOT / "integrations/pi/host-actions.ts"),
-                "--system-prompt", SYSTEM]
+                "--system-prompt", self.system_prompt]
         self.rpc = self.stack.enter_context(PiRPC(argv, cwd=directory, env=env,
                                                  own_process_group=self.own_process_group))
 

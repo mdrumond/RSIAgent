@@ -128,3 +128,19 @@ The `memory-reviews` directory retains draft versions, paired execution evidence
 judgments, and rewrite feedback. Accepted memory provenance contains the matched
 evaluation identity and verifier trace hash. Full code and examples remain in
 content-addressed artifact storage; snippets preserve exact source lines.
+
+Project source audits and memory rewrites use the pinned Pi runtime for standard
+live providers. Pi selects typed artifact-list/read, knowledge-query, optional
+check, and review-submission tools; the Python host still validates artifact
+identity, observed snippets, required evidence, citations and host correctness.
+Missing-evidence feedback names the exact outstanding roles and SHA256 values.
+`verifier_model` continues to select the model, including `deepseek-flash`.
+
+`verifier_engine: "completion"` retains the JSON-completion adapter when needed;
+injected/scripted provider transports use that adapter by default. Explicit
+`verifier_engine: "pi"` also works with custom composition. The effective engine,
+model and Pi runtime identity are persisted in `project-verifier-runtime.json`;
+resume rejects a changed identity. Historical runtime directories without this
+file retain completion delivery rather than silently switching engines. New
+engine configurations require a new runtime directory. Pi does not change remote
+job queues, host verification, or the independent A/B publication gates.

@@ -326,3 +326,81 @@ def test_host_extraction_still_requires_observation_of_all_selected_bytes():
     result = h.agent.review(request())
     assert result['memory']['after']['text'] == SOURCE.decode()
     assert len([e for e in h.agent.last_trace if e['kind'] == 'feedback']) == 1
+
+
+def test_missing_evidence_feedback_names_exact_roles_and_digest():
+    h = Harness([read(S), read(R), decision(), read(L),
+                 {'knowledge_query': {'query': 'increment'}}, decision(memory())])
+    h.agent.review(request())
+    feedback = next(event['payload'] for event in h.agent.last_trace if event['kind'] == 'feedback')
+    assert feedback['missing_required_artifacts'] == [{'roles': ['actor-log'], 'sha256': L}]
+    assert feedback['knowledge_query_required'] is True
+
+
+class TypedSession:
+    def __init__(self, actions):
+        self.actions = iter(actions)
+        self.contexts = []
+        self.closed = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.closed = True
+
+    def next_action(self, context, allowed, record):
+        self.contexts.append(context)
+        action = next(self.actions)
+        name, args = (('submit_review', action) if 'decision' in action else next(iter(action.items())))
+        assert name in allowed
+        record('pi-action', {'name': name, 'arguments': args})
+        return name, args
+
+
+def test_typed_tools_preserve_gate_and_expose_missing_log_for_next_action():
+    h = Harness([])
+    session = TypedSession([read(S), read(R), decision(), read(L),
+        {'knowledge_query': {'query': 'increment'}}, decision(memory())])
+    h.agent.session_factory = lambda **_: session
+    result = h.agent.review(request())
+    assert result == decision(memory())
+    assert not h.calls  # Pi actions, not JSON completion requests.
+    assert session.closed
+    assert session.contexts[3]['review_state']['missing_required_artifacts'] == [
+        {'roles': ['actor-log'], 'sha256': L}]
+    assert [digest for digest, _ in h.reads[:3]] == [S, R, L]
+    assert h.queries[0][0] == {'query': 'increment'}
+
+
+def test_typed_tools_cannot_override_failed_host_and_close_on_cancellation():
+    from coding.pi.rpc import PiCancelled
+    h = Harness([])
+    session = TypedSession([*prerequisites(), decision(memory()), repair()])
+    h.agent.session_factory = lambda **_: session
+    assert h.agent.review(request(False)) == repair()
+    assert session.closed
+
+    class Cancelled(TypedSession):
+        def next_action(self, *args, **kwargs):
+            raise PiCancelled('cancelled')
+    session = Cancelled([])
+    h.agent.session_factory = lambda **_: session
+    with pytest.raises(PiCancelled):
+        h.agent.review(request())
+    assert session.closed
+
+
+def test_typed_tools_cannot_admit_late_action():
+    seconds = [0]
+    h = Harness([], clock=lambda: seconds[0])
+    class Late(TypedSession):
+        def next_action(self, *args, **kwargs):
+            seconds[0] = 6
+            return 'submit_review', decision()
+    session = Late([])
+    h.agent.session_factory = lambda **_: session
+    with pytest.raises(TimeoutError):
+        h.agent.review(request(), max_seconds=5)
+    assert session.closed
+    assert not any(event['kind'] == 'decision' for event in h.agent.last_trace)

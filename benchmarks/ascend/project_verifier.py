@@ -5,6 +5,7 @@ The verifier never writes active memory; publication belongs to its caller.
 """
 from __future__ import annotations
 
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from collections.abc import Mapping
 import hashlib
@@ -109,7 +110,9 @@ behavior and limitations. Explain why evidence supports the lesson, not just
 that the original project passed. A rewrite feedback request concerns memory:
 rewrite using the retained project evidence; request project repair if the
 underlying evidence is insufficient.
-Return only one action JSON object per reply. Never add API configuration keys such as type or response_format.
+'''
+
+ACTION_FORMAT = '''Return only one action JSON object per reply. Never add API configuration keys such as type or response_format.
 Return one JSON action per reply:
 {"list_artifacts":{"offset":0,"limit":20,"prefix":"optional role prefix"}}
 {"read_artifact":{"sha256":"...","offset":0,"limit":8192}}
@@ -123,7 +126,9 @@ or terminal {"decision":"accept"|"repair","reason":"...","evidence":["sha"],
 "before_unavailable_reason":null|"...",
 "after":{"sha256":"...","start_line":1,"end_line":2,"text":"exact lines"},
 "evidence":["sha"],"citations":[exact KDB citation objects]}}.
-Read the current source and supplied result/log artifacts before acceptance.
+'''
+
+EVIDENCE_INSTRUCTIONS = '''Read the current source and supplied result/log artifacts before acceptance.
 All snippets must be exact lines from artifacts actually read, including line
 endings. Prefer omitting the optional snippet text field: select sha256/start_line/
 end_line from source you have read, and the host will extract those exact lines.
@@ -142,6 +147,9 @@ the learning or the project yielded no reusable learning; explain that specific
 reason. Usefulness will be tested independently, so do not suppress useful
 verified examples merely because the API is familiar. Repair must have null memory.
 Evidence must reference actually read artifacts; no unsupported causal claims.'''
+
+REVIEW_INSTRUCTIONS = SYSTEM
+SYSTEM = REVIEW_INSTRUCTIONS + ACTION_FORMAT + EVIDENCE_INSTRUCTIONS
 
 
 def bounded_review_messages(messages, state, max_bytes=40000):
@@ -164,10 +172,11 @@ def bounded_review_messages(messages, state, max_bytes=40000):
 
 class ProjectVerifierAgent:
     def __init__(self, complete, read_artifact, *, query_knowledge=None,
-                 request_check=None, clock=time.monotonic, trace=None):
+                 request_check=None, clock=time.monotonic, trace=None, session_factory=None):
         self.complete, self.read_artifact = complete, read_artifact
         self.query_knowledge, self.request_check = query_knowledge, request_check
         self.clock, self.trace = clock, trace
+        self.session_factory = session_factory
         self.last_trace = []
 
     def _record(self, kind, payload):
@@ -190,6 +199,12 @@ class ProjectVerifierAgent:
                 raise TimeoutError('project verifier elapsed allocation exhausted')
             return seconds
 
+        with ExitStack() as stack:
+            session = (stack.enter_context(self.session_factory(max_seconds=remaining()))
+                       if self.session_factory is not None else None)
+            return self._review(request, remaining, feedback, session)
+
+    def _review(self, request, remaining, feedback, session):
         registry = dict(request.artifacts)
         if request.source_sha256 is not None:
             registry['source'] = request.source_sha256
@@ -214,10 +229,23 @@ class ProjectVerifierAgent:
                     {'role': 'user', 'content': json.dumps(context, sort_keys=True)}]
         self._record('request', dict(context, project=asdict(request)))
         while True:
-            working = bounded_review_messages(messages, dict(read_artifacts=sorted(read),
+            missing = [dict(sha256=digest, roles=sorted(role for role, value in registry.items()
+                       if value == digest)) for digest in sorted(required - read)]
+            state = dict(read_artifacts=sorted(read), missing_required_artifacts=missing,
                 observed_versions=sorted(versions), citations=citations, host_checks_passed=host_ok,
-                knowledge_queried=queried))
-            response = self.complete(tuple(working), remaining_seconds=remaining())
+                knowledge_queried=queried)
+            working = bounded_review_messages(messages, state)
+            if session is None:
+                response = self.complete(tuple(working), remaining_seconds=remaining())
+            else:
+                allowed = ['list_artifacts', 'read_artifact', 'submit_review']
+                if self.query_knowledge is not None:
+                    allowed.append('knowledge_query')
+                if self.request_check is not None:
+                    allowed.append('request_check')
+                name, args = session.next_action(dict(project=context, review_state=state,
+                    history=working[2:]), allowed, record=self._record)
+                response = json.dumps(args if name == 'submit_review' else {name: args})
             remaining()
             self._record('response', response)
             messages.append({'role': 'assistant', 'content': response})
@@ -292,7 +320,12 @@ class ProjectVerifierAgent:
                 remaining()
                 self._record('tool', {'action': value, 'observation': observation})
             except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
-                observation = {'error': str(exc), 'expected_top_level': [
+                observation = {'error': str(exc),
+                    'missing_required_artifacts': [dict(sha256=digest,
+                        roles=sorted(role for role, value in registry.items() if value == digest))
+                        for digest in sorted(required - read)],
+                    'knowledge_query_required': not queried,
+                    'expected_top_level': [
                     ['list_artifacts'], ['read_artifact'], ['knowledge_query'], ['request_check'],
                     ['decision', 'reason', 'evidence', 'repair', 'memory']],
                     'correction': ('Correct the reported validation error while preserving your evidence-based judgment. '
