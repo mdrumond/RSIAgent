@@ -505,3 +505,31 @@ def test_partial_wave_inventory_and_portable_packaging_preserve_interruption(ada
     (adaptive_campaign / branch / "interruption.json").write_text("{}")
     issues = inventory_campaign(adaptive_campaign)["issues"]
     assert "invalid-wave-publication" in {issue["kind"] for issue in issues}
+
+def test_remediation_checkpoint_restore_keeps_budget_and_pending_retry(campaign, tmp_path):
+    from benchmarks.ascend.automatic_remediation import FailureTimeBudget
+    budget_path = 'failure-budgets/failure.json'
+    remediation = dict(schema='automatic-remediation-v1', retry_feedback_ids=['previous'],
+        failures={'failure': dict(retries=[dict(root='/retained/original-retries/failure/retry-1',
+            feedback_ids=['previous'])], pending='retry-2', active_seconds=1200, remaining_seconds=600)})
+    files = {'remediation.json': remediation,
+        budget_path: dict(max_seconds=1800, elapsed_seconds=1200, active_since=None),
+        'original-retries/failure/retry-2/state.json': dict(completed_waves=[], pending='native-handle'),
+        'original-retries/failure/retry-2/plan.json': dict(original_project_id='unchanged')}
+    for relative, body in files.items():
+        write(campaign, relative, body)
+    memory = campaign/'original-retries/failure/retry-2/retry-memory.bin'
+    memory.write_bytes(b'frozen-updated-memory')
+    destination = tmp_path/'remediation.tar.gz'
+    assert package_campaign(campaign, destination)['complete']
+    restored = tmp_path/'restored'
+    with tarfile.open(destination) as archive:
+        for member in archive.getmembers():
+            if member.isfile() and member.name.startswith('campaign/'):
+                output = restored/member.name.removeprefix('campaign/')
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(archive.extractfile(member).read())
+    assert json.loads((restored/'remediation.json').read_bytes()) == remediation
+    assert FailureTimeBudget(restored/budget_path, 1800).remaining_seconds == 600
+    assert (restored/'original-retries/failure/retry-2/retry-memory.bin').read_bytes() == b'frozen-updated-memory'
+    assert json.loads((restored/'original-retries/failure/retry-2/state.json').read_bytes())['pending'] == 'native-handle'

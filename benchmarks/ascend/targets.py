@@ -10,6 +10,24 @@ from dataclasses import dataclass
 from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 
 
+METRIC_SWEEP_GUIDANCE = """
+Curriculum task selection is not an autotuning queue. Do not schedule separate
+projects or tasks that merely vary one parameter (a=1, a=2, a=4, ...) to collect
+the same metric. Request one bounded experiment covering the values through the
+route's existing supported sweep or batch fields. For ProjectSpec 1-D timing,
+use timing-sweep with timing_lengths listing the values and request-timing;
+profile_metric selects an available measurement, not an arbitrary parameter sweep.
+For executable optimizer tasks, group representative values in one submission's
+signatures within existing correctness-case bounds. Do not invent sweep fields.
+If the required sweep or metric is unavailable, explain the capability limit and
+defer that measurement or choose another meaningful question; do not simulate a
+sweep by scheduling a sequence of nearly identical tasks. Distinct correctness
+cases and genuine failure isolation remain valid controlled experiments, including
+shape or alignment changes. This rule governs curriculum selection, not legitimate
+internal optimizer candidate or tuning attempts.
+"""
+
+
 _A3_CAPABILITIES = (
     "gm-ub-movement", "simd-vector", "padded-tail", "vector-reduction",
     "vector-mask", "cube-tiling", "failure-repair", "timing-sweep", "profiling",
@@ -90,5 +108,5 @@ def a3_curriculum_policy(*, dtypes: tuple[str, ...] = ("float32",)) -> Curriculu
         "missing metrics are unavailable, not zero. Profile only available tools; "
         "never infer product support from another target. Measure final correct "
         "sources without debug instrumentation. Select diverse reusable lessons, "
-        "not repeated IDs or renamed hypotheses.",
+        "not repeated IDs or renamed hypotheses." + METRIC_SWEEP_GUIDANCE,
     )

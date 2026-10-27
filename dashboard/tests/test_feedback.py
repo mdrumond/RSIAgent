@@ -24,6 +24,8 @@ def feedback(tmp_path):
         verified=True, completed=True, category='verified-slow',
         result={'speedup': .4}, evidence={}), investigation=dict(
             status='open', classification=None, reason=None, projects=[], retries=[], evidence=[]))
+    row['outcome'].update(source_type='phase2', original_spec=row['outcome']['task'])
+    row['lifecycle'] = 'failed'
     write(root / (row['feedback_id'] + '.json'), row)
     presets = [dict(id=f'phase{phase}', phase=phase, target='a3',
                     root=str(tmp_path / f'new{phase}'), control=str(tmp_path / f'control{phase}'),
@@ -282,3 +284,39 @@ def test_feedback_destinations_and_actions_exclude_retired_phase2(feedback):
     controls = Controls(client.get('/feedback').get_data(as_text=True))
     assert controls.destinations == ['phase1']
     assert controls.actions == ['investigate']
+
+
+@pytest.mark.parametrize('status,category,lifecycle', [
+    ('open', 'verified-slow', 'failed'),
+    ('ready-to-retry', 'verified-slow', 'remediated'),
+    ('resolved', 'verified-slow', 'fixed'),
+    ('open', 'verified-success', None),
+    ('open', 'verified-timing-unknown', None),
+])
+def test_legacy_feedback_metadata_is_derived_without_rewriting_history(feedback, status, category, lifecycle):
+    client, app, config, row, calls = feedback
+    legacy = json.loads(json.dumps(row))
+    legacy.pop('lifecycle')
+    legacy['outcome'].pop('source_type')
+    legacy['outcome'].pop('original_spec')
+    legacy['outcome']['category'] = category
+    legacy['investigation']['status'] = status
+    path = config.parent / 'feedback' / (row['feedback_id'] + '.json')
+    write(path, legacy)
+    retained = path.read_bytes()
+    response = client.get('/api/feedback')
+    assert response.status_code == 200
+    actual, = response.get_json()
+    assert actual['outcome']['source_type'] == 'phase2'
+    assert actual['outcome']['original_spec'] == legacy['outcome']['task']
+    assert actual['lifecycle'] == lifecycle
+    # Every original field remains identical, including investigation state and
+    # retained host evidence; the defaults exist only in the public read view.
+    original = json.loads(json.dumps(actual))
+    original.pop('lifecycle')
+    original['outcome'].pop('source_type')
+    original['outcome'].pop('original_spec')
+    assert original == legacy
+    assert client.get('/feedback').status_code == 200
+    assert path.read_bytes() == retained
+    assert calls == []

@@ -17,7 +17,7 @@ import time
 
 from core.knowledge_presentation import compact_knowledge_result
 
-from .cases import validate_submission
+from .cases import validate_submission, normalize_job_submission
 from .jobs import canonical, sha
 from .memory import verify_snapshot
 from .control import ObservationUnavailable, WorkerStopped
@@ -97,16 +97,7 @@ class OptimizationLoop:
             self._save()
 
     def _spec(self, submission):
-        signature = submission['signature']
-        if isinstance(signature, dict) and 'signatures' in signature:
-            if set(signature) != {'signatures'}:
-                raise ValueError('signature envelope contains unexpected fields')
-            signatures = signature['signatures']
-        else:
-            # Preserve jobs created by the original CLI's list/single-case API.
-            signatures = signature if isinstance(signature, list) else [signature]
-        return validate_submission({k: submission[k] for k in ('source', 'entrypoint', 'init_args', 'init_kwargs')}
-                                   | {'signatures': signatures})
+        return normalize_job_submission(submission)
 
     def run(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
         try:
@@ -271,6 +262,7 @@ class OptimizationLoop:
             result = self._read(pending['evaluation'])
             value = score(baseline, result)
             history = {'candidate_sha256': pending['sha256'], 'result': pending['evaluation'],
+                       'source': self.state['candidate'],
                        'configuration_sha256': pending.get('configuration_sha256', pending['sha256']),
                        'block_count': pending['block_count'],
                        'content': result, 'speedup': value, 'summary': pending['summary']}
@@ -369,7 +361,8 @@ class OptimizationLoop:
         context['remaining_seconds'] = max(0, row['max_seconds'] - row['elapsed_seconds'])
         if self.agent.identity.get('coding_engine') == 'pi':
             context['knowledge_available'] = self.knowledge is not None
-        if self.single_evaluation or self.prepare_only:
+        if (self.single_evaluation or self.prepare_only or
+                any(item.get('content', {}).get('failure_case') for item in context.get('history', []))):
             # Keep every lesson addressable, but don't replay hundreds of full
             # entries or accumulated compiler/profiler logs on every turn.
             rows = context.get('memory_summary', [])
