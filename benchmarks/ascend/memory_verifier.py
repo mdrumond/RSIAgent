@@ -21,6 +21,7 @@ from .subject_execution import SubjectOutcome
 from .arm_evidence import arm_evidence, interrupted_outcome, timing_summary
 from .project_verifier import bounded_review_messages, artifact_preview, artifact_page
 from .time_budget import AttemptTimeBudget
+from .memory_status import evaluation_assessment
 
 
 def _hash(data):
@@ -428,6 +429,7 @@ class MemoryVerifier:
                                for role, digest in (row['outcome'] or {}).get('artifacts', {}).items()})
                 decision['artifacts']['proposal'] = identity['proposal_sha256']
                 decision['artifacts'].update(history_refs)
+                decision['assessment'] = evaluation_assessment(decision)
                 state['decision'] = decision
                 save()
                 return decision
@@ -441,6 +443,7 @@ class MemoryVerifier:
                                            for role, digest in (row['outcome'] or {}).get('artifacts', {}).items()})
                 decision['artifacts']['proposal'] = identity['proposal_sha256']
                 decision['artifacts'].update(history_refs)
+                decision['assessment'] = evaluation_assessment(decision)
                 state['decision'] = decision
                 save()
                 return decision

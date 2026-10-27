@@ -12,6 +12,7 @@ from benchmarks.a5kernels.phase1_live import InfrastructureFailure
 from .project_verifier import ProjectReview
 from .subject_memory import StaleMemory, digest
 from .time_budget import AttemptTimeBudget
+from .memory_status import admission_assessment, admission_report
 
 
 def treatment_snapshot(baseline, proposal, provenance, memory_id):
@@ -76,6 +77,7 @@ class MemoryAdmission:
             if manual is not None:
                 job.setdefault('status_before_override', job['status'])
                 job.update(status='accepted', manual_override=manual, admission=manual['admission'])
+            job['assessment'] = admission_assessment(job)
             atomic(path, canonical(job))
 
     def submit(self, review_id, proposal, provenance, request, *, remaining_seconds):
@@ -124,6 +126,7 @@ class MemoryAdmission:
                     return
                 job['status'] = 'evaluating'
                 job.pop('error_type', None)
+                job.pop('error', None)
                 self._save(job)
                 if job.get('manual_override'):
                     return
@@ -210,7 +213,7 @@ class MemoryAdmission:
                 job['rewrites'] += 1
                 self._save(job)
         except (TimeoutError, OSError, InfrastructureFailure) as error:
-            job.update(status='inconclusive', error_type=type(error).__name__)
+            job.update(status='inconclusive', error_type=type(error).__name__, error=str(error))
             self._save(job)
         finally:
             budget.close()
@@ -278,10 +281,15 @@ class MemoryAdmission:
             if job['status'] in {'accepted', 'rejected'} and delivery not in self.delivered:
                 judgment = job['evaluations'][-1] if job['evaluations'] else {}
                 result.append(dict(review_id=job['review_id'], delivery_id=delivery, manual_override=manual, outcome=job['status'],
+                    assessment=admission_assessment(job),
                     judgment={key:judgment.get(key) for key in ('decision','reason','evidence','instructions','evaluation_id')},
                     rewrites=job['rewrites'], repair=None if manual else job.get('project_repair'), provenance=job['provenance']))
         self._start()
         return result
+
+    def report(self):
+        """Expose held reviews without resolving scheduler work or restarting it."""
+        return admission_report(self.root, memory_root=self.memory.root)
 
     def acknowledge(self, review_id):
         self.delivered.add(review_id)

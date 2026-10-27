@@ -101,10 +101,27 @@ def test_counterbalanced_order_and_caller_frozen_task(tmp_path):
     assert len(h.calls) == 2
 
 
+def test_legacy_cached_judgment_is_not_rewritten_or_rerun_for_diagnostics(tmp_path):
+    from benchmarks.ascend.memory_status import evaluation_assessment
+    h = Harness()
+    result = evaluate(h, tmp_path)
+    path = tmp_path / 'evaluation.json'
+    state = json.loads(path.read_bytes())
+    state['decision'].pop('assessment')
+    path.write_text(json.dumps(state))
+    before = path.read_bytes()
+    cached = evaluate(h, tmp_path)
+    assert 'assessment' not in cached
+    assert evaluation_assessment(cached)['status'] == result['assessment']['status'] == 'accepted'
+    assert cached == state['decision'] and path.read_bytes() == before
+    assert len(h.calls) == 2 and len(h.selections) == 1
+
+
 def test_failed_treatment_cannot_be_accepted_and_weaker_logs_request_rewrite(tmp_path):
     h = Harness(treatment_passes=False)
     result = evaluate(h, tmp_path / 'failed')
     assert result['decision'] == 'rewrite' and result['instructions']
+    assert result['assessment']['status'] == 'needs-repair'
     assert h.judge_attempts == 2
     assert any(event['kind'] == 'feedback' for event in h.verifier.last_trace)
     other = Harness(misread=True)
@@ -115,6 +132,7 @@ def test_transport_failure_is_cached_and_resume_never_reenters_unknown_arm(tmp_p
     h = Harness(failure='treatment')
     first = evaluate(h, tmp_path)
     assert first['decision'] == 'inconclusive' and h.requests == []
+    assert first['assessment']['status'] == 'infrastructure-blocked'
     assert first['arms']['control'] is not None
     assert first['arms']['treatment']['observations']['interruption_reason'] == 'transport-unresolved'
     assert not first['arms']['treatment']['host_verified']
@@ -129,6 +147,9 @@ def test_invalid_status_cannot_support_benefit_even_if_host_flag_is_true(tmp_pat
     h = Harness(status=status)
     result = evaluate(h, tmp_path)
     assert result['decision'] == 'inconclusive'
+    assert result['assessment']['status'] == ('benefit-unproven' if status == 'time-budget-exhausted'
+                                             else 'infrastructure-blocked')
+    assert [row[0] for row in h.calls] == ['control']
     assert not any(result['validity'].values())
     assert h.requests == []
     expected = {digest for arm in result['arms'].values() for digest in arm['artifacts'].values()}
@@ -174,6 +195,7 @@ def test_late_judge_cannot_publish_acceptance_and_changed_memories_cannot_resume
     result = evaluate(h, tmp_path)
     assert result['decision'] == 'inconclusive'
     assert len(h.calls) == 2
+    assert result['assessment']['status'] == 'audit-incomplete'
     with pytest.raises(ValueError, match='identity changed'):
         h.verifier.evaluate({'summary': 'increment lesson'}, b'changed', b'new', tmp_path, remaining_seconds=60)
     assert len(h.calls) == 2
@@ -368,6 +390,7 @@ def test_abrupt_first_callback_stop_survives_resume_without_peer_dispatch(tmp_pa
     result = evaluate(h, tmp_path)
     assert result['decision'] == 'inconclusive' and result['validity'] == {'control': False}
     assert result['arms'] == {'control': None}
+    assert result['assessment']['status'] == 'benefit-unproven'
     assert len(h.calls) == 1 and not h.requests and not (tmp_path / 'treatment').exists()
 
 

@@ -37,6 +37,8 @@ def test_two_rewrites_then_reject_without_publishing(tmp_path):
         gate.wait(remaining_seconds=5)
         result=gate.poll(remaining_seconds=5)
         assert result[0]['outcome']=='rejected'
+        assert result[0]['assessment']['status']=='rejected'
+        assert gate.report()['p']['assessment']['reason_code']=='rewrite-opportunities-exhausted'
         assert len(rewrites)==2 and len(evaluation.calls)==3
         assert memory.records()==[]
         assert evaluation.calls[1][3]['task']==evaluation.calls[2][3]['task']=={'frozen':'task'}
@@ -94,6 +96,14 @@ def test_inconclusive_does_not_rewrite_or_admit(tmp_path):
         assert gate.poll(remaining_seconds=5)==[]
         job=json.loads(gate._path('p').read_bytes())
         assert job['status']=='inconclusive' and job['rewrites']==0
+        assert gate.report()['p']['assessment']['status']=='benefit-unproven'
+        # Legacy held records get diagnostics without changing cached decisions
+        # or triggering another evaluator callback from a reporting operation.
+        job.pop('assessment')
+        gate._path('p').write_text(json.dumps(job))
+        before = gate._path('p').read_bytes()
+        assert gate.report()['p']['assessment']['status']=='benefit-unproven'
+        assert gate._path('p').read_bytes()==before and len(evaluation.calls)==1
         assert memory.records()==[]
     finally:gate.close()
 
@@ -302,6 +312,8 @@ def test_rewrite_provider_outage_retains_inconclusive_job_for_resume(tmp_path):
         retained = json.loads(gate._path('p').read_bytes())
         assert retained['status'] == 'inconclusive'
         assert retained['error_type'] == 'InfrastructureFailure'
+        assert gate.report()['p']['assessment']['status'] == 'infrastructure-blocked'
+        assert gate.report()['p']['reason'] == retained['error'] == 'temporary provider outage'
         assert retained['rewrites'] == 0 and memory.records() == []
     finally:
         gate.close()
@@ -309,6 +321,10 @@ def test_rewrite_provider_outage_retains_inconclusive_job_for_resume(tmp_path):
     try:
         resumed.wait(remaining_seconds=5)
         assert resumed.poll(remaining_seconds=5)[0]['outcome'] == 'accepted'
+        shown = resumed.report()['p']
+        assert shown['assessment']['status'] == 'accepted'
+        assert shown['reason'] == 'observed transfer' and shown['error_type'] is None
+        assert 'error' not in json.loads(resumed._path('p').read_bytes())
         assert len(memory.records()) == 1
     finally:
         resumed.close()
