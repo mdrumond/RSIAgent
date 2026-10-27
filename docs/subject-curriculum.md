@@ -134,6 +134,9 @@ live providers. Pi selects typed artifact-list/read, knowledge-query, optional
 check, and review-submission tools; the Python host still validates artifact
 identity, observed snippets, required evidence, citations and host correctness.
 Missing-evidence feedback names the exact outstanding roles and SHA256 values.
+If a verifier response emits multiple host tool calls, only its first queued
+action is selected; later calls receive explicit rejection and have no effects.
+The next host observation updates which evidence still needs reading.
 `verifier_model` continues to select the model, including `deepseek-flash`.
 
 `verifier_engine: "completion"` retains the JSON-completion adapter when needed;

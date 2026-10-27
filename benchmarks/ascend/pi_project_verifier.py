@@ -6,7 +6,9 @@ from coding.pi.session import PiCodingSession
 from .project_verifier import REVIEW_INSTRUCTIONS, EVIDENCE_INSTRUCTIONS
 
 SYSTEM = REVIEW_INSTRUCTIONS + '''Use the declared typed tools, never print JSON action envelopes.
-Choose one host action per turn. The queued receipt is not execution: the next
+Choose one host action per turn. If multiple tools are emitted, only the first
+queued action is selected; extras are rejected without execution.
+The queued receipt is not execution: the next
 host snapshot contains the authoritative observation. Use submit_review for a
 terminal accept/repair proposal; the host validates it before admission. Its
 fields follow the evidence instructions below. Use review_state.missing_required_artifacts
@@ -57,5 +59,5 @@ def session_factory(settings, provider, complete):
 
     def create(*, max_seconds):
         return PiCodingSession(model=complete.model, schemas=SCHEMAS,
-            deadline=time.monotonic() + max_seconds, system_prompt=SYSTEM)
+            deadline=time.monotonic() + max_seconds, system_prompt=SYSTEM, first_action_only=True)
     return create

@@ -81,10 +81,12 @@ class RequestAccounting:
 
 class PiCodingSession:
     def __init__(self, *, model, schemas, environ=None, max_calls=40, deadline=None,
-                 budget=None, own_process_group=True, system_prompt=SYSTEM):
+                 budget=None, own_process_group=True, system_prompt=SYSTEM,
+                 first_action_only=False):
         self.executable = runtime_preflight()
         self.model = getattr(model, "value", model)
         self.system_prompt = system_prompt
+        self.first_action_only = first_action_only
         # Only canonical registered profiles are accepted.
         from benchmarks.a3_experiments import BackendModel
         from benchmarks.a3_model_profiles import load_a3_model_profile
@@ -138,6 +140,8 @@ class PiCodingSession:
                 return page
             self.mutations += 1
             if self.mutations != 1:
+                if self.first_action_only:
+                    raise ValueError("only the first queued host action is selected; this extra call was not executed")
                 self.pending = None
                 raise ValueError("only one host action is allowed per turn")
             if name == "edit_source":
@@ -282,7 +286,7 @@ class PiCodingSession:
                 reason = "invalid original Pi tool arguments: " + str(error)
                 self.record("pi-action-rejected", {"error": reason, "allowed": sorted(self.allowed)})
                 raise ActionError(reason) from None
-            if self.mutations != 1 or self.pending is None:
+            if self.pending is None or (self.mutations != 1 and not self.first_action_only):
                 raise ActionError("Pi must select exactly one valid host action")
             if time.monotonic() >= self.deadline:
                 self.pending = None
@@ -290,7 +294,7 @@ class PiCodingSession:
             name, args = self.pending
             # Persist intent before returning it to the host that owns side effects.
             self.record("pi-action", {"id": uuid.uuid4().hex, "name": name, "arguments": args,
-                                      **ENGINE_IDENTITY})
+                                      "discarded_actions": self.mutations - 1, **ENGINE_IDENTITY})
             return name, args
         finally:
             # Stream records through the host callback, including on failed or
