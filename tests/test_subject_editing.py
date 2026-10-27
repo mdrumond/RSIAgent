@@ -206,6 +206,101 @@ def test_campaign_services_approved_work_at_boundary_and_preserves_frontier(tmp_
         assert final['waves'][wave_id]['memory_snapshot_sha256'] == record['memory_snapshot_sha256']
 
 
+@pytest.mark.parametrize('when', ['earlier-subject', 'completed'])
+def test_interrupted_queue_claim_resumes_under_its_original_subject(tmp_path, when, monkeypatch):
+    from benchmarks.ascend.subject_campaign import SubjectCampaign
+    from benchmarks.ascend.subject_execution import SubjectOutcome
+    subjects = [Subject('first', 'Original subject', 1)]
+    if when == 'earlier-subject':
+        subjects.append(Subject('later', 'Later subject', 1))
+    executed, reviewed, selected = [], [], []
+
+    def approve():
+        rows = [dict(subject_id='first', item=item('requested'))]
+        service = SubjectEdits(tmp_path, campaign.scheduler, lambda *a, **k: json.dumps(rows))
+        service.approve(service.preview('projects', 'Revisit first', remaining_seconds=10)['id'])
+
+    def execute(plan, snapshot, directory, **options):
+        executed.append(plan['project_id'])
+        if when == 'earlier-subject' and plan['project_id'] == 'auto-later':
+            approve()
+        source = campaign.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True, source, {'source': source}, {}, campaign.artifacts.root)
+
+    class NoMemory:
+        last_trace = []
+        def review(self, request, **options):
+            reviewed.append(request.objective)
+            return dict(decision='accept', reason='Known result', evidence=[request.source_sha256],
+                        repair=None, memory=None)
+
+    def select(context, *args, **options):
+        selected.append(context['current_subject']['subject_id'])
+        return [item('auto-' + selected[-1])]
+
+    def decide(messages, **options):
+        context = json.loads(messages[1]['content'])
+        return json.dumps(dict(action='complete' if context['current_subject'] is None else 'advance',
+                               reason='Covered', evidence=['retained-wave']))
+
+    def build():
+        return SubjectCampaign(tmp_path, subjects, b'initial', execute=execute, verifier=NoMemory(),
+                               select_wave=select, complete=decide)
+
+    campaign = build()
+    if when == 'completed':
+        assert campaign.run()['terminal'] == 'COMPLETE'
+        approve()
+    claim = campaign.scheduler.claim_projects
+    def interrupted(wave_id):
+        plans = claim(wave_id)
+        if plans:
+            raise OSError('interrupted after durable claim, before pending save')
+        return plans
+    monkeypatch.setattr(campaign.scheduler, 'claim_projects', interrupted)
+    with pytest.raises(OSError, match='after durable claim'):
+        campaign.run()
+    assert campaign.state['pending'] is None
+    retained = campaign.scheduler.state()
+    assert retained['project_queue'] == []
+    assert retained['queue_return'] == (1 if when == 'earlier-subject' else None)
+    reservation = next(key for key in retained['claimed_projects'] if key not in retained['waves'])
+
+    # A fresh controller must execute the reservation, rather than finish early
+    # or attach it to the later subject after restoring queue_return.
+    campaign = build()
+    assert campaign.run()['terminal'] == 'COMPLETE'
+    assert executed == (['auto-first', 'auto-later', 'requested'] if when == 'earlier-subject'
+                        else ['auto-first', 'requested'])
+    assert selected == (['first', 'later'] if when == 'earlier-subject' else ['first'])
+    final = campaign.scheduler.state()
+    assert final['waves'][reservation]['subject_id'] == 'first'
+    assert final['waves'][reservation]['status'] == 'completed'
+    assert final['frontier'] == len(subjects) and final['current'] is None
+    assert 'queue_return' not in final
+    assert campaign.state['projects']['requested']['objective'] == 'Original subject'
+    assert json.loads(reviewed[-1])['subject'] == 'Original subject'
+
+
+def test_unstarted_claim_blocks_completion_and_advance(tmp_path):
+    from benchmarks.ascend.subject_memory import digest
+    scheduler = SubjectScheduler(tmp_path, [Subject('first', 'First', 1)])
+    scheduler.start_wave('completed', 'a' * 64)
+    scheduler.complete_wave('completed')
+    scheduler.decide(dict(action='advance', reason='Covered', evidence=['completed']))
+    scheduler.edit('projects', [dict(subject_id='first', item=item('requested'))],
+                   expected=digest(scheduler.state()), proposal_id='requested')
+    assert scheduler.prioritize_projects()
+    scheduler.claim_projects('reserved')
+    state = scheduler.state()
+    state['current'] = None
+    assert not scheduler.is_complete(state)
+    with pytest.raises(ValueError, match='reserved projects'):
+        scheduler.decide(dict(action='advance', reason='Covered', evidence=['completed']))
+    assert scheduler.prioritize_projects()
+    assert scheduler.context()['current_subject']['subject_id'] == 'first'
+
+
 def test_target_preview_rejects_missing_or_corrupt_qualification_before_mutation(tmp_path):
     from copy import deepcopy
     from test_ascend_phase2_targets import qualified, RUNTIME

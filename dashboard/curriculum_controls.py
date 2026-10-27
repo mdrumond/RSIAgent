@@ -1,6 +1,7 @@
 """Curriculum-authored previews and explicit approval through retained operations."""
 import json
 import hashlib
+from importlib.util import find_spec
 import math
 from pathlib import Path
 import re
@@ -22,6 +23,14 @@ class CurriculumControls:
     @property
     def enabled(self):
         return self.controls.enabled
+
+    @property
+    def restart_available(self):
+        return self.restart is not None or find_spec('benchmarks.ascend.subject_interaction') is not None
+
+    def require_restart(self):
+        if not self.restart_available:
+            raise ControlError('reviewed restarts require the subject interaction runtime')
 
     def available(self, campaign_id):
         try:
@@ -72,6 +81,8 @@ class CurriculumControls:
             return None
         accessor = self.status
         if accessor is None:
+            if find_spec('benchmarks.ascend.subject_interaction') is None:
+                return None
             from benchmarks.ascend.subject_interaction import request_status
             accessor = request_status
         request = accessor(self.config_path, campaign_id, request_id)
@@ -106,6 +117,7 @@ class CurriculumControls:
             raise ControlError('describe the requested change')
         self.seconds(payload, 'format_seconds')
         if payload['kind'] == 'restart':
+            self.require_restart()
             self.unmerged(root, payload.get('project_id'))
         return 'subject:' + entry['id']
 
@@ -115,11 +127,14 @@ class CurriculumControls:
             raise ControlError('confirmation does not match the requested proposal')
         proposal = self.proposal(root, payload.get('proposal_id'))
         if proposal['kind'] == 'restart':
+            self.require_restart()
             self.unmerged(root, proposal['project'])
             self.seconds(payload, 'additional_seconds')
         return 'subject:' + entry['id']
 
     def preview(self, payload):
+        if payload['kind'] == 'restart':
+            self.require_restart()
         started = time.monotonic()
         allowance = self.seconds(payload, 'format_seconds')
         with self.binder(self.config_path, payload['campaign_id'], max_seconds=allowance) as service:
@@ -153,8 +168,12 @@ class CurriculumControls:
 
     def approve(self, payload):
         _, root = self.entry(payload)
+        retained = self.proposal(root, payload['proposal_id'])
+        if retained['kind'] == 'restart':
+            self.require_restart()
         proposal = subject_editor(root).approve(payload['proposal_id'])
         if proposal['kind'] == 'restart':
+            self.require_restart()
             self.unmerged(root, proposal['project'])
             restart = self.restart
             if restart is None:

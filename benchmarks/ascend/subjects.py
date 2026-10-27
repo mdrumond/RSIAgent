@@ -150,6 +150,13 @@ class SubjectScheduler:
         with self._transaction() as state:
             if any(row['status'] != 'completed' for row in state['waves'].values()):
                 return False
+            # Claiming removes queued plans before the campaign saves its pending
+            # wave. Resume that reservation before restoring the revisit's return
+            # subject, even when the now-empty queue would otherwise look done.
+            for wave_id, rows in state.get('claimed_projects', {}).items():
+                if rows and wave_id not in state['waves']:
+                    state['current'] = self.index[rows[0]['subject_id']]
+                    return True
             queue = state.get('project_queue', [])
             current = state['current']
             current_id = self.subjects[current].subject_id if current is not None else None
@@ -212,6 +219,8 @@ class SubjectScheduler:
         state = self.state() if state is None else state
         return (state['frontier'] == len(self.subjects) and state['current'] is None
                 and not state.get('project_queue') and not self._open_repairs(state)
+                and not any(rows and wave_id not in state['waves']
+                            for wave_id, rows in state.get('claimed_projects', {}).items())
                 and all(row['status'] != 'pending' for row in state['reviews'].values())
                 and all(row['status'] == 'completed' for row in state['waves'].values()))
 
@@ -319,6 +328,10 @@ class SubjectScheduler:
                 subject = self.subjects[target]
                 if any(row['subject_id'] == subject.subject_id for row in state.get('project_queue', [])):
                     raise ValueError('subject has approved queued projects')
+                if any(wave_id not in state['waves'] and any(
+                        row['subject_id'] == subject.subject_id for row in rows)
+                        for wave_id, rows in state.get('claimed_projects', {}).items()):
+                    raise ValueError('subject has reserved projects awaiting a wave')
                 waves = [row for row in state['waves'].values() if row['subject_id'] == subject.subject_id]
                 if sum(row['status'] == 'completed' for row in waves) < subject.min_waves:
                     raise ValueError('subject minimum waves not complete')
