@@ -143,7 +143,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     root.mkdir(parents=True, exist_ok=True)
     from .runtime_allocation import admit_identity
     identity = admit_identity(root, dict(target=target, max_seconds=max_seconds,
-        settings_sha256=hashlib.sha256(canonical(settings)).hexdigest()),
+        settings_sha256=hashlib.sha256(canonical({key: value for key, value in settings.items()
+            if key != 'native_operation_root'})).hexdigest()),
         referenced_settings(settings, contents=True), previous=previous_runtime_configs)
     bound = compose(settings, target=target, root=root, initial_memory=initial_memory,
                     max_seconds=max_seconds)
