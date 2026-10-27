@@ -228,6 +228,20 @@ class JobStore:
                        stop_requested=False, status='queued', stage='queued')
         return self._update(job_id, 'resumed', change)
 
+    def continue_with_feedback(self, job_id, *, additional_seconds, key):
+        """A campaign lease owner reopens a settled job without changing inputs."""
+        self._budget(0, additional_seconds)
+        def change(row):
+            grants = row.setdefault('manual_grants', {})
+            if key in grants:
+                if grants[key] != additional_seconds:
+                    raise ValueError('manual grant key reused')
+                return
+            grants[key] = additional_seconds
+            row.update(max_seconds=row['max_seconds'] + additional_seconds,
+                       stop_requested=False, status='queued', stage='queued')
+        return self._update(job_id, 'manual-continuation', change)
+
     def retain_handle(self, job_id, handle, *, operation):
         def change(row):
             record = dict(handle=handle, operation=operation)

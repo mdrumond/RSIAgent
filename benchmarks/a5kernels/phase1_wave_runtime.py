@@ -33,6 +33,14 @@ OUTCOME_SCHEMA = "a5-phase1-live-wave-outcome-v1"
 PUBLICATION_SCHEMA = "a5-phase1-live-wave-publication-v1"
 
 
+class ProjectAdmissionTimeout(TimeoutError):
+    """Host admission expired before any Actor/provider/device dispatch.
+
+    Only the pre-dispatch admission boundary may raise this exception; timeouts
+    after dispatch retain the ordinary infrastructure uncertainty contract.
+    """
+
+
 class SemanticProjectFailure(RuntimeError):
     """A normally completed Actor attempt without host-verified current source.
 
