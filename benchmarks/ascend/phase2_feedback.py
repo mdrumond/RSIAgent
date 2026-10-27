@@ -34,6 +34,8 @@ def _observation_identity(outcome):
     identity['job_id' if job_id else 'source_root'] = job_id or outcome['source_root']
     if job_id and outcome.get('job_incarnation'):
         identity['job_incarnation'] = outcome['job_incarnation']
+    if outcome.get('terminal_snapshot'):
+        identity['terminal_snapshot'] = outcome['terminal_snapshot']
     return identity
 
 
@@ -464,7 +466,7 @@ class FeedbackStore:
                     classification=job['status'], speedup=best.get('speedup'),
                     result=best.get('content', {}))
                 evidence = {}
-                for role, ref in dict(baseline=state.get('baseline'), candidate=best.get('source'),
+                for role, ref in dict(baseline=state.get('baseline'), submission=state.get('spec'), candidate=best.get('source'),
                                       evaluation=best.get('result')).items():
                     if ref:
                         store.read_artifact(job['job_id'], ref['sha256'])
@@ -485,6 +487,10 @@ class FeedbackStore:
                     verified=bool(best), result=result, evidence=evidence,
                     category=_category(task, result),
                     interpretation='Observation, not verified reusable knowledge')
+                continuation = next((event['sha256'] for event in reversed(events)
+                                     if event['kind'] in {'resumed', 'manual-continuation', 'recovered'}), None)
+                if continuation:
+                    outcome['terminal_snapshot'] = continuation
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
                 historical_sources = None
                 for candidate in state.get('history', []):
@@ -517,6 +523,7 @@ class FeedbackStore:
                         source_sha256=candidate['candidate_sha256'], result=content)
                     failed = dict(outcome, attempt_id=job['job_id'] + ':candidate:' + identity,
                         verified=False, result=failed_result, evidence=refs, category=_category(task, failed_result))
+                    failed.pop('terminal_snapshot', None)
                     report['imported' if self._put(failed, report['warnings']) else 'existing'] += 1
                     self._retain_failure_cases(failed, self._optimizer_failure_case(content, refs))
             except (KeyError, TypeError, ValueError, OSError) as error:
@@ -552,7 +559,8 @@ class FeedbackStore:
         if original.get('source_type') == 'optimizer' and retry.get('source_type') == 'phase2':
             return FeedbackStore._optimizer_campaign_retry(original, retry)
         if (not retry.get('verified') or original.get('source_type') != retry.get('source_type')
-                or original.get('original_spec') != retry.get('original_spec')
+                or (original.get('source_type') != 'optimizer'
+                    and original.get('original_spec') != retry.get('original_spec'))
                 or original['target'] not in {'a3', 'a5'}
                 or original['target'] != retry.get('target')
                 or original['language'] != retry.get('language')
@@ -562,9 +570,14 @@ class FeedbackStore:
             if original['source_type'] == 'optimizer':
                 from optimizer.loop import score
                 def artifact(outcome, role):
+                    if role == 'submission' and role not in outcome['evidence']:
+                        return artifact(outcome, 'baseline')['manifest']['submission']
                     ref = outcome['evidence'][role]
                     return json.loads(JobStore(ref['job_root']).read_artifact(ref['job_id'], ref['sha256']))
                 baseline = artifact(original, 'baseline')
+                frozen = artifact(original, 'submission')
+                if frozen != artifact(retry, 'submission'):
+                    return False
                 binding = _baseline_identity(original)
                 if binding is None or _baseline_identity(retry) != binding:
                     return False
