@@ -122,7 +122,12 @@ class PiActorDriver(DirectActorDriver):
                     continue
                 action = turn_parser(text)
                 if action is None:
-                    host = {"event": "invalid-action"}
+                    host = {
+                        "event": "invalid-action",
+                        "description": "The response could not be parsed as an accepted action. No action was executed.",
+                        "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
+                        "allowed_actions": sorted(allowed),
+                    }
                     if action_error:
                         host["error"] = action_error
                     latest = json.dumps({"host": host})

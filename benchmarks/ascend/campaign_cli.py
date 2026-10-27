@@ -7,6 +7,7 @@ import hashlib
 import io
 import math
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 import os
 from pathlib import Path
 import re
@@ -846,12 +847,12 @@ def status(job):
         published = len(state.get("memory_entries", []))
     elapsed = max(time.time() - job["created"], 1) / 3600
     inventory = inventory_campaign(root, artifact_store=control / "reports", **_annex_options(job))
-    return {"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
+    return describe_statuses({"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
             "attempted": attempted,
             "verified": sum(o.get("verified") is True for o in outcomes),
             "published": published, "published_per_hour": published / elapsed,
             "artifact_pending": sum(r["status"] != "available" for r in inventory["remote_reports"]),
-            "worker": _read(control / "worker.json") if (control / "worker.json").exists() else None}
+            "worker": _read(control / "worker.json") if (control / "worker.json").exists() else None})
 
 
 def main(argv=None, *, screen=start_screen):

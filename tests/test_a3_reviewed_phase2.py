@@ -133,7 +133,15 @@ def test_module_cli_report_reads_retained_state_without_provider_binding(tmp_pat
               for path in tmp_path.rglob('*') if path.is_file()}
     assert main(['--target', 'a3', 'report', '--root', str(tmp_path)],
                 runner_factory=lambda args: pytest.fail('historical report composed a runner')) == 0
-    assert json.loads(capsys.readouterr().out) == {'state': state, 'records': [json.loads(terminal.read_bytes())]}
+    report = json.loads(capsys.readouterr().out)
+    state_explanation, = report['state']['terminal'].pop('status_explanations')
+    record, = report['records']
+    record_explanation, = record.pop('status_explanations')
+    assert report == {'state': state, 'records': [json.loads(terminal.read_bytes())]}
+    assert (state_explanation['field'], state_explanation['code']) == (
+        'status', state['terminal']['status'])
+    assert (record_explanation['field'], record_explanation['code']) == (
+        'status', record['status'])
     assert before == {path.relative_to(tmp_path): path.read_bytes()
                       for path in tmp_path.rglob('*') if path.is_file()}
 
