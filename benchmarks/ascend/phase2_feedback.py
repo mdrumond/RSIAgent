@@ -600,6 +600,25 @@ class FeedbackStore:
             outcome = json.loads(data)
             evidence = retry['evidence']['execution-evidence.bin']
             payload = Path(evidence['retained_path']).read_bytes()
+            original_ref = original['evidence'].get('execution-evidence.bin')
+            if original_ref:
+                original_payload = Path(original_ref['retained_path']).read_bytes()
+                if sha(original_payload) != original_ref['sha256']:
+                    return False
+                original_artifacts = json.loads(original_payload).get('artifacts', {})
+                if original_artifacts.get('inputs'):
+                    from benchmarks.a5kernels.evidence import canonical_bytes
+                    planned = plan.get('case_inputs', {}).get(retry['original_spec']['project_id'])
+                    if planned is None or sha(canonical_bytes(planned)) != original_artifacts['inputs']:
+                        return False
+                    actual_artifacts = json.loads(payload).get('artifacts', {})
+                    for role in ('inputs', 'expected'):
+                        digest = original_artifacts[role]
+                        if actual_artifacts.get(role) != digest:
+                            return False
+                        artifact = Path(evidence['retained_path']).parent / 'artifacts' / 'objects' / digest[:2] / digest[2:]
+                        if sha(artifact.read_bytes()) != digest:
+                            return False
             return (outcome.get('verified') is True
                     and outcome.get('wave_fingerprint') == plan['wave_fingerprint']
                     and outcome.get('project_id') == retry['original_spec']['project_id']

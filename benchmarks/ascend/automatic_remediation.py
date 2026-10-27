@@ -223,9 +223,18 @@ class AutomaticRemediation:
             snapshot = pending_path.read_bytes()
         else:
             pending_path.write_bytes(snapshot)
+        from .failure_handoff import original_retry_inputs
+        inputs = original_retry_inputs(self.store, row['feedback_id'], spec) if row.get('feedback_id') else None
+        retry_runner = copy(self.runner)
+        retry_runner.failure_feedback = None
+        if row.get('feedback_id'):
+            from types import SimpleNamespace
+            context = dict(root=str(self.store.root), feedback_ids=[row['feedback_id']], original_retry=True)
+            retry_runner.failure_feedback = SimpleNamespace(project_context=lambda project_id: context)
         wave = WaveSpec('original-retry', sha(snapshot), (), (WaveProject(spec),))
         live = LiveWaveCoordinator(directory / 'waves' / wave.wave_id, wave, snapshot,
-                                   self.runner._execute, 1, allow_semantic_failures=True)
+                                   retry_runner._execute, 1, allow_semantic_failures=True,
+                                   inputs_by_project={spec.project_id: inputs} if inputs is not None else None)
         result = live.resume()
         pending = dict(session=state['session'])
         blank = dict(state, prior_outcomes=[], failed_outcomes=[], memory_bytes_base64=[],
