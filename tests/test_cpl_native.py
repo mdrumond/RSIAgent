@@ -330,6 +330,35 @@ def test_deadline_exit_is_infrastructure_interruption_not_candidate_failure(tmp_
     assert json.loads(operation.read_text())['result']['returncode'] == 124
 
 
+def test_readonly_recovery_settles_disconnected_job_without_submission(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    remote.unavailable = True
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(['python', '-c', 'pass'], key='health/interrupted')
+    before = len([call for call in remote.calls if call[2] == 'run'])
+    candidate.recover_owned_operations()
+    record = json.loads((candidate.root/'health/interrupted/operation.json').read_text())
+    assert record['state'] == 'completed'
+    assert len([call for call in remote.calls if call[2] == 'run']) == before == 1
+    assert candidate.run_remote(['python', '-c', 'pass'], key='health/interrupted').returncode == 0
+
+
+def test_readonly_recovery_preserves_ambiguous_and_foreign_allocation_records(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote)
+    identity = dict(route=candidate.runtime_identity, workspace='/owned/task', arguments=[])
+    for name, row in {'ambiguous':dict(identity=identity, state='submitting'),
+            'foreign':dict(identity=dict(identity, route=dict(candidate.runtime_identity, physical_device=2)),
+                           state='running', handle='remote:fixture:job:other')}.items():
+        path = candidate.root/name/'operation.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(row))
+    candidate.recover_owned_operations()
+    assert not remote.calls
+    assert json.loads((candidate.root/'ambiguous/operation.json').read_text())['state']=='submitting'
+
+
 @pytest.mark.parametrize('deadline', [False, True])
 def test_real_launcher_distinguishes_deadline_escalation_from_normal_137(tmp_path, deadline):
     remote = Remote()
