@@ -42,6 +42,8 @@ def admission_assessment(job):
             return assessment('no-proposal', 'source-audit', 'no-memory-proposed')
         return assessment('rejected', 'usefulness', 'rewrite-opportunities-exhausted')
     if job.get('error_type'):
+        if job['error_type'] == 'InfrastructureFailure':
+            return assessment('infrastructure-blocked', 'admission', 'worker-infrastructure')
         return assessment('audit-incomplete', 'admission', 'worker-interrupted')
     if status in {'pending', 'evaluating'}:
         return assessment(status, 'admission', 'review-' + status)

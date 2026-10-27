@@ -116,6 +116,7 @@ class MemoryAdmission:
                 remaining()
                 job['status'] = 'evaluating'
                 job.pop('error_type', None)
+                job.pop('error', None)
                 self._save(job)
                 # Reconcile a concurrent accepted replacement before testing this draft.
                 if not self.memory.bases_current(job['proposal']):
