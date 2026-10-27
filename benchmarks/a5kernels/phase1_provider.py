@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from copy import deepcopy
+from copy import copy, deepcopy
 import json
 import logging
 import math
@@ -458,6 +458,17 @@ class DirectActorDriver:
         return type(self)(self.provider, max_turns=self.max_turns, max_seconds=self.max_seconds, clock=self.clock,
                           trace_event=trace_event, system_prompt=self.system_prompt)
 
+    def with_time_budget(self, seconds):
+        """Bind provider calls to one request without mutating a shared driver."""
+        from benchmarks.ascend.time_budget import deadline_after
+        if seconds <= 0:
+            raise TimeoutError("Actor provider time allowance exhausted")
+        driver = copy(self)
+        driver.max_seconds = min(self.max_seconds, seconds)
+        driver._provider_deadline = min(deadline_after(driver.max_seconds, clock=self.clock),
+                                        getattr(self, '_provider_deadline', float('inf')))
+        return driver
+
     def _prepare_context(self, working, profile, recorder, *, turn):
         tokens = 0
 
@@ -494,7 +505,17 @@ class DirectActorDriver:
             recorder.attempt(event, payload, stage=stage, turn=turn)
             self._trace("tool", {"name": "provider-attempt-" + event,
                                 "stage": stage, "turn": turn, **payload})
-        return self.provider.complete(profile, messages, attempt_observer=observe)
+        options = dict(attempt_observer=observe)
+        deadline = getattr(self, '_provider_deadline', None)
+        if deadline is not None:
+            remaining = deadline - self.clock()
+            if remaining <= 0:
+                raise TimeoutError("Actor provider time allowance exhausted")
+            # Production providers support HTTP/retry bounds. Injected providers
+            # retain their existing protocol and own their transport I/O limits.
+            if isinstance(self.provider, DirectCompletionProvider):
+                options['max_seconds'] = remaining
+        return self.provider.complete(profile, messages, **options)
 
     @actor_lease
     def __call__(

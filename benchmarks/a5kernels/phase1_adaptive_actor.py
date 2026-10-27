@@ -599,6 +599,10 @@ class AdaptiveActorProjectExecutor:
                 return outcome
             execute_action = _ObservedActions(actions, observe_action)
         try:
+            if not request.publish_learning:
+                from benchmarks.a5kernels.phase1_provider import DirectActorDriver
+                if isinstance(actor, DirectActorDriver):
+                    actor = actor.with_time_budget(actions.deadline - time.monotonic())
             outcome = actor(
                 opening, profile=self.profile, workspace=root / "actor",
                 context=artifacts.objects / memory_sha256[:2] / memory_sha256[2:],
