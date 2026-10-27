@@ -266,8 +266,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
                             artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
             frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
+            manual = Path(directory) / 'manual-execution.json'
+            attempt_id = json.loads(manual.read_bytes())['attempt_id'] if manual.exists() else item['project_id']
             return executor.optimizer(directory, item['task']['task'], frozen,
-                attempt_id=item['project_id'], remaining_seconds=remaining_seconds, artifacts=store)
+                attempt_id=attempt_id, remaining_seconds=remaining_seconds, artifacts=store)
         spec = ProjectSpec.from_mapping(item['spec'])
         envelope = json.loads(snapshot)
         branch_artifacts = ContentAddressedArtifacts(Path(directory) / 'artifacts')
@@ -438,6 +440,20 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign.review_retained = review_retained
     if 'check_environment' in bound:
         campaign.check_environment = bound['check_environment']
+    from .subject_editing import SubjectEdits, validate_project
+    def admit_edit(item):
+        observed_runtime = getattr(actor.executor, 'runtime_identity', None)
+        if item.get('task', {}).get('kind') == 'target' and observed_runtime is None:
+            raise ValueError('target approval requires an observed composed runtime')
+        validate_project(item, runtime=observed_runtime, policy=policy)
+        if item.get('task', {}).get('kind') == 'optimizer':
+            if target == 'a5' or optimizer_factory is None:
+                raise ValueError('optimizer projects are unavailable for this campaign runtime')
+        else:
+            policy.admit(ProjectSpec.from_mapping(item['spec']))
+        return item
+    campaign.curriculum_edits = SubjectEdits(root, campaign.scheduler, curriculum_complete,
+                                             validate_item=admit_edit, target_policy=policy)
     campaign.role_complete = role_complete
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)

@@ -62,6 +62,7 @@ class AdaptiveActionContext:
     source: str | None
     latest_execution: ProjectExecutionResult | None
     artifacts: ContentAddressedArtifacts
+    remaining_seconds: float | None = None
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -210,6 +211,12 @@ class _ProjectActions:
         with process_deadline(self.deadline):
             return self._execute_action(action)
 
+    def restore_source(self, source):
+        """Restore editable source only; verification authority must be rebuilt."""
+        result = self._write(TrialAction('write', {'content': source}))
+        if self.source != source:
+            raise ValueError(result.observation)
+
     def _execute_action(self, action: TrialAction) -> ActionOutcome:
         if not isinstance(action, TrialAction):
             raise TypeError("adaptive projects accept only TrialAction values")
@@ -347,6 +354,7 @@ class _ProjectActions:
     ) -> ActionOutcome:
         result = dependency(payload, AdaptiveActionContext(
             self.request, self.prepared, self.source, self.latest, self.artifacts,
+            max(0, self.deadline - time.monotonic()),
         ))
         if not isinstance(result, AdaptiveActionResult):
             raise TypeError("adaptive action dependency must return AdaptiveActionResult")
@@ -593,6 +601,13 @@ class AdaptiveActorProjectExecutor:
                 return outcome
             execute_action = _ObservedActions(actions, observe_action)
         try:
+            if not request.publish_learning:
+                from benchmarks.a5kernels.phase1_wave_runtime import ProjectAdmissionTimeout
+                if time.monotonic() >= actions.deadline:
+                    raise ProjectAdmissionTimeout("record-only project admission time budget exhausted")
+                from benchmarks.a5kernels.phase1_provider import DirectActorDriver
+                if isinstance(actor, DirectActorDriver):
+                    actor = actor.with_time_budget(actions.deadline - time.monotonic())
             outcome = actor(
                 opening, profile=self.profile, workspace=root / "actor",
                 context=artifacts.objects / memory_sha256[:2] / memory_sha256[2:],
@@ -704,7 +719,7 @@ class AdaptiveActorProjectExecutor:
             distillation = learned.distillation
             artifacts.put_bytes(learned.terminal_response.encode("utf-8"))
         else:
-            # Subject campaigns delegate learning to an independent verifier.
+            # Subject campaigns and usefulness arms delegate learning independently.
             # The factual result is still compatible with legacy wave readers.
             distillation = AgentDistillation(True, (), tuple(sorted(actions.admitted)))
         assert actions.source_sha256 is not None
