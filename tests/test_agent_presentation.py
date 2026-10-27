@@ -210,6 +210,20 @@ def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_pat
         reader.read_bytes("f" * 64)
 
 
+@pytest.mark.parametrize('adaptive', [False, True])
+def test_usefulness_treatment_keeps_lesson_and_prior_memories_visible(tmp_path, adaptive):
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    prior = {'memory_entries': [{'statement': 'prior optimizer insight'}]}
+    if adaptive:
+        prior = dict(initial_memory_base64=base64.b64encode(b'{}').decode(),
+                     project_memory_base64=[])
+    prior['usefulness_lesson'] = {'statement': 'new isolated insight'}
+    view = memory_presentation(json.dumps(prior).encode(), ContentAddressedArtifacts(tmp_path))
+    assert view['usefulness_lesson']['statement'] == 'new isolated insight'
+    if not adaptive:
+        assert view['memory_entries'][0]['lesson']['statement'] == 'prior optimizer insight'
+
+
 def test_subject_catalog_keeps_useful_lessons_and_exact_documents_within_one_page(tmp_path):
     store = ContentAddressedArtifacts(tmp_path)
     source = store.put_bytes(b'out = max(x, 0)\n')
@@ -265,3 +279,37 @@ def test_subject_unicode_and_long_examples_stay_bounded_and_readable_by_referenc
     assert reader.read_bytes(row['after']['sha256']) == code
     with pytest.raises(FileNotFoundError):
         reader.read_bytes(unrelated)
+
+
+@pytest.mark.parametrize('adaptive', [False, True])
+def test_many_optimizer_memories_share_preview_budget_and_keep_all_exact_references(tmp_path, adaptive):
+    entries = [dict(task_id=f'task-{index}', statement=('retained fact ' * 2000),
+                    source='exact source ' + str(index), interpretation='host observation')
+               for index in range(40)]
+    envelope = dict(memory_entries=entries)
+    if adaptive:
+        envelope.update(initial_memory_base64=base64.b64encode(b'{}').decode(), project_memory_base64=[])
+    raw = canonical_bytes(envelope)
+    store = ContentAddressedArtifacts(tmp_path)
+    view = memory_presentation(raw, store)
+    rows = view['memory_entries']
+    previews = [row['lesson'] for row in rows if 'lesson' in row]
+    assert 0 < len(previews) < len(entries)
+    assert sum(len(canonical_bytes(lesson)) for lesson in previews) <= 8192
+    assert len(rows) == len(entries)
+    assert store.read_bytes(view['sha256']) == raw
+    for row, entry in zip(rows, entries, strict=True):
+        assert store.read_bytes(row['sha256']) == canonical_bytes(entry)
+    # Even an omitted lesson remains fully readable through authenticated pages.
+    omitted = next(row for row in rows if 'lesson' not in row)
+    offset, pages = 0, []
+    while True:
+        page = artifact_page_presentation(dict(sha256=omitted['sha256'], offset=offset, limit=8192), store)
+        pages.append(page['text'])
+        offset = page['next_offset']
+        if offset is None:
+            break
+    assert canonical_bytes(json.loads(''.join(pages))) == store.read_bytes(omitted['sha256'])
+    store._path(omitted['sha256']).write_bytes(b'changed')
+    with pytest.raises(ValueError):
+        artifact_page_presentation(dict(sha256=omitted['sha256']), store)

@@ -1,0 +1,3 @@
+{% macro explain(record) -%}
+{% for item in status_details(record) %}<p class="status-explanation"><b>{{ item.field }}: {{ item.code }}</b> — {{ item.description }} <span>Next: {{ item.next_action }}</span></p>{% endfor %}
+{%- endmacro %}

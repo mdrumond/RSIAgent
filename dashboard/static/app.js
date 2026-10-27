@@ -1,3 +1,23 @@
+// Render descriptions outside retained JSON/source text, using text nodes only.
+window.renderStatusExplanations = function(container, payload) {
+  const rows = [];
+  function visit(value, path = '') {
+    if (!value || typeof value !== 'object') return;
+    for (const item of value.status_explanations || []) rows.push({item, path});
+    for (const [key, child] of Object.entries(value)) {
+      if (!['status_explanations', 'payload', 'source', 'submission', 'presentation'].includes(key)) visit(child, path ? `${path}.${key}` : key);
+    }
+  }
+  visit(payload);
+  const block = document.createElement('div'); block.className = 'status-explanations';
+  for (const {item, path} of rows) {
+    const p = document.createElement('p'); p.className = 'status-explanation';
+    p.textContent = `${path ? path + ': ' : ''}${item.code} — ${item.description} Next: ${item.next_action}`;
+    block.append(p);
+  }
+  container.append(block);
+};
+
 // Keep live status useful without reloading long code pages.
 if (document.querySelector('.status.running, .operation.running, .operation.queued')) setTimeout(() => location.reload(), 5000);
 
@@ -40,6 +60,7 @@ document.querySelectorAll('.trace-event[data-trace-url]').forEach(section => sec
     const payload = await response.json();
     try { output.textContent = JSON.stringify(JSON.parse(payload.text), null, 2); }
     catch { output.textContent = payload.text; }
+    window.renderStatusExplanations(section, payload.presentation || payload);
     section.dataset.loaded = 'true';
   } catch (error) {
     output.textContent = error.message;
@@ -148,4 +169,56 @@ document.querySelectorAll('.performance-view[data-performance-url]').forEach(sec
     section.querySelector('.bandwidth-note').textContent = 'Useful logical-I/O bandwidth is derived from declared bytes and launch-plus-synchronize latency. Actual MTE bandwidth: NA (no retained Memory capture).';
     section.querySelector('.performance-plots').hidden = false; status.remove(); section.dataset.loaded = 'true';
   } catch (error) { status.textContent = error.message; }
+}));
+
+
+// Failure-case bodies remain lazy and exact downloads remain available in full.
+document.querySelectorAll('[data-failure-cases-url]').forEach(section => section.addEventListener('toggle', async () => {
+  if (!section.open || section.dataset.loaded) return;
+  const status = section.querySelector('.failure-cases-status');
+  try {
+    const response = await fetch(section.dataset.failureCasesUrl);
+    if (!response.ok) throw Error(`Failing examples could not be read (${response.status}). Inspect the retained feedback record.`);
+    const cases = await response.json();
+    const container = section.querySelector('.failure-cases-content');
+    container.replaceChildren();
+    for (const item of cases) {
+      const article = document.createElement('article');
+      const description = document.createElement('p'); description.textContent = item.description;
+      const availability = document.createElement('p');
+      availability.textContent = item.availability?.complete ? 'The retained example is available. Its scope and comparison policy are recorded below.' : `Incomplete evidence: ${item.availability?.reason || 'The failing example is unavailable.'}`;
+      article.append(description, availability); window.renderStatusExplanations(article, item);
+      const metadata = document.createElement('pre');
+      const {artifacts, status_explanations, ...context} = item;
+      metadata.textContent = JSON.stringify(context, null, 2); article.append(metadata);
+      for (const [role, ref] of Object.entries(artifacts || {})) {
+        const detail = document.createElement('details'), summary = document.createElement('summary');
+        summary.textContent = `${role === 'observed' ? 'Actual output (observed)' : role} · SHA-256 ${ref.sha256}`;
+        const url = section.dataset.artifactBase + ref.sha256;
+        const download = document.createElement('a'); download.href = url + '/download'; download.textContent = 'Download exact complete artifact';
+        const pre = document.createElement('pre');
+        const more = document.createElement('button'); more.type = 'button'; more.textContent = 'Read next 8192 bytes'; more.hidden = true;
+        const note = document.createElement('p'); note.textContent = 'Text preview is paged. Download preserves exact bytes, including binary tensor data.';
+        detail.append(summary, download, note, pre, more);
+        let offset = 0, loaded = false, loading = false;
+        async function page() {
+          if (loading) return; loading = true; more.disabled = true;
+          try {
+            const response = await fetch(`${url}?offset=${offset}`);
+            if (!response.ok) throw Error(`Artifact unavailable or failed integrity verification (${response.status}). The example cannot be treated as complete.`);
+            const body = await response.json(); pre.textContent += body.text;
+            offset = body.next_offset ?? body.size; more.hidden = !body.has_more;
+            note.textContent = `Showing ${Math.min(offset, body.size)} of ${body.size} bytes as text. Download preserves exact complete bytes.`;
+            loaded = true;
+          } catch (error) { note.textContent = error.message; }
+          finally { loading = false; more.disabled = false; }
+        }
+        detail.addEventListener('toggle', () => {if (detail.open && !loaded) page();});
+        more.addEventListener('click', page); article.append(detail);
+      }
+      container.append(article);
+    }
+    status.textContent = cases.length ? 'Retained evidence belongs to the original observed failure; it is separate from reusable memory.' : 'No failing example was retained for this observation.';
+    section.dataset.loaded = 'true';
+  } catch (error) {status.textContent = error.message;}
 }));

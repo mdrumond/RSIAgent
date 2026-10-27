@@ -1403,7 +1403,8 @@ def test_terminal_proposal_summary_and_zero_project_approval(tmp_path):
                         command_runner=run).test_client()
     status = client.get("/api/status").get_json()
     proposal = status["controls"]["proposals"][0]
-    assert proposal["terminal"] == {"status": "SATURATED", "reason": "Coverage is complete."}
+    assert proposal["terminal"]["status"] == "SATURATED"
+    assert proposal["terminal"]["reason"] == "Coverage is complete."
     assert "private terminal reasoning" not in json.dumps(status)
     csrf = client.get("/api/csrf").get_json()["token"]
     response = client.post("/api/control/approve", json={"campaign_id": "phase1",
@@ -1431,6 +1432,54 @@ def test_background_failure_is_sanitized_and_visible(tmp_path):
     assert operation["status"] == "failed"
     assert "provider unavailable" in operation["error"]
     assert "SECRET_TOKEN" not in operation["error"]
+
+
+def test_usefulness_page_and_evidence_routes(campaign, tmp_path):
+    directory = tmp_path / 'phase1/memory-usefulness' / ('a' * 64)
+    write(directory / '0000.json', dict(kind='started', lesson={'claim': 'Tail insight'},
+        source_id='vector-add', lesson_id='b' * 64, arm_seconds=300))
+    write(directory / '0001.json', dict(kind='assessment', outcome='both-succeeded',
+        arms={'control': {'verified': True}, 'treatment': {'verified': True}}))
+    write(directory / 'control/evidence.json', {'verified': True})
+    app = create_app(campaign, tmp_path / 'cache.sqlite3', refresh_seconds=0)
+    try:
+        client = app.test_client()
+        body = client.get('/memory').get_data(as_text=True)
+        assert 'Tail insight' in body and 'both-succeeded' in body
+        assert client.get('/api/phase/1/usefulness').get_json()[0]['outcome'] == 'both-succeeded'
+        endpoint = '/api/phase/1/usefulness/' + 'a' * 64
+        assert client.get(endpoint + '/control').get_json()['text'] == '{"verified": true}'
+        assert client.get(endpoint + '/other').status_code == 404
+        assert client.get(endpoint + '/treatment').status_code == 404
+    finally:
+        app.extensions['dashboard_controls'].close()
+
+
+def test_explanations_are_visible_and_trace_bytes_remain_exact(campaign, tmp_path):
+    import hashlib
+    branch = tmp_path / 'phase1/waves/wave-001/branches/vector-add'
+    raw = b'{"classification":"host-verified","missing":["observed-host-mismatch"]}'
+    digest = hashlib.sha256(raw).hexdigest()
+    obj = branch / 'artifacts/objects' / digest[:2] / digest[2:]
+    obj.parent.mkdir(parents=True, exist_ok=True); obj.write_bytes(raw)
+    (branch / 'evidence.jsonl').write_text('\n'.join(json.dumps(row) for row in evidence_ledger_rows([
+        {'role': 'host-observation', 'sha256': digest, 'turn': 1}])) + '\n')
+    app = create_app(campaign, tmp_path / 'explained-cache', refresh_seconds=0)
+    try:
+        client = app.test_client()
+        detail = client.get('/phase/1/project/vector-add').text
+        index = client.get('/api/phase/1/project/vector-add/trace').json
+        event = next(row for row in index['events'] if row.get('sha256') == digest)
+        response = client.get(event['payload_url']).json
+        assert response['text'].encode() == raw
+        assert response['sha256'] == digest and response['size'] == len(raw)
+        explanations = response['presentation']['status_explanations']
+        assert any(row['code'] == 'observed-host-mismatch' for row in explanations)
+        assert client.get(event['download_url']).data == raw
+        campaign_view = client.get('/api/status').json['campaigns'][0]
+        assert campaign_view['status_explanations'] and campaign_view['worker']['status_explanations']
+    finally:
+        app.extensions['dashboard_controls'].close()
 
 
 @pytest.mark.parametrize('action', ['start', 'sample', 'approve', 'reject', 'run-approved', 'extend'])
