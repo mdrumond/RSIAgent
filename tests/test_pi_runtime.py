@@ -29,6 +29,27 @@ def stream(tool, args, index=0, finish='tool_calls'):
     return Response()
 
 
+def responses_stream(tool, args, index=0):
+    class Response:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def iter_lines(self):
+            reasoning = {'type':'reasoning','id':f'rs_{index}','summary':[], 'encrypted_content':'opaque'}
+            call = {'type':'function_call', 'id':f'fc_{index}', 'call_id':f'call_{index}','name':tool,
+                    'arguments':json.dumps(args), 'status':'completed'}
+            events = [{'type':'response.created','response':{'id':f'resp_{index}'}}]
+            for i, item in enumerate([reasoning, call]):
+                events += [{'type':'response.output_item.added','output_index':i,'item':item},
+                           {'type':'response.output_item.done','output_index':i,'item':item}]
+            events.append({'type':'response.completed','response':{'id':f'resp_{index}','status':'completed',
+                'output':[reasoning,call],'usage':{'input_tokens':100,'output_tokens':40,
+                'input_tokens_details':{'cached_tokens':20},'output_tokens_details':{'reasoning_tokens':30}}}})
+            for event in events:
+                yield b'data: '+json.dumps(event).encode(); yield b''
+    return Response()
+
+
 def session(**kwargs):
     try:
         runtime_preflight()
@@ -132,6 +153,70 @@ def test_real_pi_reads_admitted_large_guide_with_complete_exchange(monkeypatch):
         assert pi.completion_tokens == 20
 
 
+def test_real_pi_retains_instruction_pages_and_source_until_next_host_turn(monkeypatch):
+    instruction = 'Instruction body. ' * 600
+    source = 'kernel source;\n' * 160
+    requests, refs = [], {}
+    def pages(request):
+        return [json.loads(message['content']) for message in request['messages'] if message['role'] == 'tool']
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        index = len(requests)
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        if index == 0:
+            packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+            refs.update({key: packet['context']['host'][key]['record'] for key in ['instruction', 'source']})
+        reads = [(refs.get('instruction'), 0), (refs.get('instruction'), 8192), (refs.get('source'), 0)]
+        if index < 3:
+            record, offset = reads[index]
+            return stream('read_context', dict(record=record, offset=offset, limit=8192), index)
+        if index in (3, 4):
+            retained = pages(request)
+            assert len(retained) == 3
+            assert {(row['record'], row['offset']) for row in retained} == set(reads)
+            assert ''.join(row['text'] for row in sorted(retained, key=lambda row: row['offset'])
+                           if row['record'] == refs['instruction']) == instruction
+            assert next(row['text'] for row in retained if row['record'] == refs['source']) == source
+            calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
+            assert calls == {m['tool_call_id'] for m in request['messages'] if m['role'] == 'tool'}
+            if index == 3:
+                return stream('read_context', dict(limit=8192, offset=0, record=refs['instruction']), index)
+        if index == 5:
+            assert not pages(request)
+        return stream('write', {'source': 'kernel'}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'instruction': instruction, 'source': source}, ['write']) == ('write', {'source': 'kernel'})
+        assert pi.next_action({'task': 'New authoritative task'}, ['write']) == ('write', {'source': 'kernel'})
+    assert len(requests) == 6
+
+
+def test_real_pi_many_context_pages_keep_requests_bounded_and_exchanges_complete(monkeypatch):
+    requests = []
+    guide = 'Guide page contents. ' * 10000
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        index = len(requests)
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        packet = json.loads(next(m['content'] for m in request['messages'] if m['role'] == 'user'))
+        calls = {call['id'] for m in request['messages'] for call in m.get('tool_calls', [])}
+        results = [m for m in request['messages'] if m['role'] == 'tool']
+        assert calls == {m['tool_call_id'] for m in results}
+        if index:
+            assert any(json.loads(m['content'])['offset'] == (index-1)*4096 for m in results)
+        if index == 10:
+            assert 1 < len(results) < 10
+            return stream('write', {'source': 'bounded kernel'}, index)
+        return stream('read_context', {'record': packet['context']['host']['guide']['record'],
+                                      'offset': index*4096, 'limit': 4096}, index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action({'guide': guide}, ['write']) == ('write', {'source': 'bounded kernel'})
+    assert len(requests) == 11
+
+
 def test_credential_in_context_is_rejected_before_provider(monkeypatch):
     monkeypatch.setattr('coding.pi.gateway.requests.post', lambda *a, **kw: pytest.fail('paid request'))
     with session() as pi:
@@ -179,25 +264,8 @@ def test_openai_responses_uses_registered_profile_and_counts_subsets(monkeypatch
     try: runtime_preflight()
     except RuntimeError: pytest.skip('Pi runtime unavailable')
     captured = []
-    class Response:
-        status_code = 200
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def iter_lines(self):
-            reasoning = {'type':'reasoning','id':'rs_0','summary':[], 'encrypted_content':'opaque'}
-            call = {'type':'function_call', 'id':'fc_0', 'call_id':'call_0','name':'write',
-                    'arguments':json.dumps({'source':'kernel'}), 'status':'completed'}
-            events = [{'type':'response.created','response':{'id':'resp_0'}}]
-            for i, item in enumerate([reasoning, call]):
-                events += [{'type':'response.output_item.added','output_index':i,'item':item},
-                           {'type':'response.output_item.done','output_index':i,'item':item}]
-            events.append({'type':'response.completed','response':{'id':'resp_0','status':'completed',
-                'output':[reasoning,call],'usage':{'input_tokens':100,'output_tokens':40,
-                'input_tokens_details':{'cached_tokens':20},'output_tokens_details':{'reasoning_tokens':30}}}})
-            for event in events:
-                yield b'data: '+json.dumps(event).encode(); yield b''
     def provider(*_, **kwargs):
-        captured.append(json.loads(kwargs['data'])); return Response()
+        captured.append(json.loads(kwargs['data'])); return responses_stream('write', {'source':'kernel'})
     monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
     with PiCodingSession(model='openai/gpt-5.6-sol', schemas={'write':obj({'source':STRING})},
                          environ={'OPENAI_API_KEY':'fake'}, deadline=time.monotonic()+30) as pi:
@@ -388,3 +456,63 @@ def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_pat
     assert feedback['event'] == 'invalid-action'
     assert feedback['allowed_actions'] == sorted(requests[1][1])
     assert 'submit' in feedback['allowed_actions']
+
+
+def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
+    requests = []
+    context = {'guide': 'Page contents. ' * 2000,
+               'quoted': {f'field-{index}': '\\"' * 240 for index in range(16)}}
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        assert len(kwargs['data']) <= 49152
+        snapshot = json.loads(next(row['content'] for row in request['messages'] if row['role'] == 'user'))
+        assert snapshot['context']['host']['quoted'] == context['quoted']
+        index = len(requests) - 1
+        retained = [json.loads(row['content']) for row in request['messages'] if row['role'] == 'tool']
+        if index:
+            assert any(row['offset'] == (index - 1) * 7400 for row in retained)
+        if index == 2:
+            assert [row['offset'] for row in retained] == [7400]
+            calls = {call['id'] for row in request['messages'] for call in row.get('tool_calls', [])}
+            assert calls == {row['tool_call_id'] for row in request['messages'] if row['role'] == 'tool'}
+            return stream('write', {'source': 'selected after bounded paging'}, index)
+        return stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
+                                          offset=index * 7400, limit=7400), index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with session() as pi:
+        assert pi.next_action(context, ['write']) == ('write', {'source': 'selected after bounded paging'})
+    assert len(requests) == 3
+
+
+def test_real_pi_openai_large_snapshot_retains_multiple_pages_within_configured_cap(monkeypatch):
+    try: runtime_preflight()
+    except RuntimeError: pytest.skip('Pi runtime unavailable')
+    requests = []
+    context = {'guide': 'paged-content-' * 2000,
+               'fields': {f'field-{index}': 'retained-' * 100 for index in range(64)}}
+    def provider(*_, **kwargs):
+        request = json.loads(kwargs['data'])
+        requests.append(request)
+        assert len(kwargs['data']) <= 196608
+        user = next(row for row in request['input'] if row.get('role') == 'user')
+        text = user['content'] if isinstance(user['content'], str) else user['content'][0]['text']
+        snapshot = json.loads(text)
+        assert len(text.encode()) > 49152
+        assert snapshot['context']['host']['fields'] == context['fields']
+        index = len(requests) - 1
+        retained = [json.loads(row['output']) for row in request['input']
+                    if row.get('type') == 'function_call_output']
+        assert [row['offset'] for row in retained] == [offset * 4096 for offset in range(index)]
+        calls = {row['call_id'] for row in request['input'] if row.get('type') == 'function_call'}
+        assert calls == {row['call_id'] for row in request['input']
+                         if row.get('type') == 'function_call_output'}
+        if index == 2:
+            return responses_stream('write', {'source': 'selected with both pages'}, index)
+        return responses_stream('read_context', dict(record=snapshot['context']['host']['guide']['record'],
+                                offset=index * 4096, limit=4096), index)
+    monkeypatch.setattr('coding.pi.gateway.requests.post', provider)
+    with PiCodingSession(model='openai/gpt-5.6-sol', schemas={'write': obj({'source': STRING})},
+                         environ={'OPENAI_API_KEY': 'fake-provider-secret'}, deadline=time.monotonic()+30) as pi:
+        assert pi.next_action(context, ['write']) == ('write', {'source': 'selected with both pages'})
+    assert len(requests) == 3
