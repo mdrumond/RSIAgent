@@ -496,7 +496,10 @@ def test_failed_original_retry_checkpoint_survives_restart_until_new_ready_recom
     state = json.loads(state_path.read_bytes())
     state['terminal'] = None
     state['failure_investigations'] = [dict(update, status='ready-to-retry', reason='new reviewed evidence')]
-    automatic.feedback.record(state['failure_investigations'], state)
+    from benchmarks.ascend.failure_curriculum import FailureCurriculum, select_feedback
+    review = FailureCurriculum(resumed.root, automatic.store.root,
+        select_feedback(automatic.store.root, 'a3', [key]))
+    review.record(state['failure_investigations'], state)
     atomic(state_path, canonical(state))
     resumed.resume()
     assert executions.count('original') == 3
