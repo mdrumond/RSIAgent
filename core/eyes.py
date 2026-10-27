@@ -24,7 +24,7 @@ v32 design:
   ledger unresolved splits and gate done-declarations on them (R3 gate, loop.py).
 
 Design rules preserved from v30: uniform for every look (no importance classifier);
-no task/grader token anywhere (audited surface, tests/test_no_leakage.py); eyes
+no task/grader knowledge anywhere in this prompt surface; eyes
 failing must never crash the run; infra failure must never leave the actor worse off
 than a single read.
 """

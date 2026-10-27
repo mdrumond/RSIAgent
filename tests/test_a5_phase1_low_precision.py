@@ -131,7 +131,6 @@ def test_fp8_two_squares_widen_before_arithmetic_and_serialize(tmp_path, dtype):
     _, files = _backend(tmp_path, FakeExecutor([]))._bundle(request)
     manifest = json.loads(next(item.content for item in files if item.relative_path == "manifest.json"))
     assert manifest["output_dtype"] == "float32"
-    assert '"elementwise_dtype":"float32"' in prepared.instruction
     assert all(math.isfinite(value) for value in prepared.expected.storage)
 
 

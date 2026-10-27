@@ -129,7 +129,7 @@ def test_missing_cas_and_publication_are_explicit(campaign):
 
 
 @pytest.fixture
-def adaptive_campaign(tmp_path):
+def adaptive_campaign(tmp_path, request):
     from dataclasses import replace
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -141,13 +141,17 @@ def adaptive_campaign(tmp_path):
     root.mkdir()
     (root / "initial-memory.bin").write_bytes(SEED)
     count = 0
+    partial = getattr(request, "param", False)
     def complete(messages):
         nonlocal count
         count += 1
         spec = _project(f"project-{count}", "gm-ub-movement")
         spec["learning_focus"] = ["pipe-mte2" if count == 1 else "pipe-mte3"]
-        return _wave(messages[-1]["content"], [spec])
+        specs = [spec, _project("offline", "simd-vector")] if partial else [spec]
+        return _wave(messages[-1]["content"], specs)
     def execute(request):
+        if request.spec.project_id == "offline":
+            raise OSError("retained remote observation unavailable")
         objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
         source = objects.put_bytes(b"source")
         host = objects.put_bytes(b"host verification")
@@ -158,7 +162,7 @@ def adaptive_campaign(tmp_path):
             lessons=(), no_new_knowledge=True, admitted_artifact_sha256=(annex,),
             artifact_store="artifacts"))
     AdaptivePhase1Coordinator(root, "Learn pipes", SEED, CurriculumAgent(complete),
-                             execute, max_parallel=1, project_target=2).run()
+                             execute, max_parallel=1, project_target=2, allow_partial=partial).run()
     assert inventory_campaign(root)["complete"]
     return root
 
@@ -484,3 +488,48 @@ def test_closed_failure_wave_is_complete_only_with_authenticated_evidence(campai
             package_campaign(campaign, target)
     else:
         assert package_campaign(campaign, target)["package_kind"] == "complete"
+
+
+@pytest.mark.parametrize("adaptive_campaign", [True], indirect=True)
+def test_partial_wave_inventory_and_portable_packaging_preserve_interruption(adaptive_campaign, tmp_path):
+    branch = "waves/wave-001/branches/offline"
+    assert not (adaptive_campaign / branch / "outcome.json").exists()
+    retained = (adaptive_campaign / branch / "interruption.json").read_bytes()
+    assert inventory_campaign(adaptive_campaign)["complete"]
+    package = tmp_path / "partial.tar.gz"
+    assert package_campaign(adaptive_campaign, package)["complete"]
+    with tarfile.open(package) as archive:
+        assert archive.extractfile("campaign/" + branch + "/interruption.json").read() == retained
+        archive.extractall(tmp_path / "reloaded", filter="data")
+    assert inventory_campaign(tmp_path / "reloaded/campaign")["complete"]
+    (adaptive_campaign / branch / "interruption.json").write_text("{}")
+    issues = inventory_campaign(adaptive_campaign)["issues"]
+    assert "invalid-wave-publication" in {issue["kind"] for issue in issues}
+
+def test_remediation_checkpoint_restore_keeps_budget_and_pending_retry(campaign, tmp_path):
+    from benchmarks.ascend.automatic_remediation import FailureTimeBudget
+    budget_path = 'failure-budgets/failure.json'
+    remediation = dict(schema='automatic-remediation-v1', retry_feedback_ids=['previous'],
+        failures={'failure': dict(retries=[dict(root='/retained/original-retries/failure/retry-1',
+            feedback_ids=['previous'])], pending='retry-2', active_seconds=1200, remaining_seconds=600)})
+    files = {'remediation.json': remediation,
+        budget_path: dict(max_seconds=1800, elapsed_seconds=1200, active_since=None),
+        'original-retries/failure/retry-2/state.json': dict(completed_waves=[], pending='native-handle'),
+        'original-retries/failure/retry-2/plan.json': dict(original_project_id='unchanged')}
+    for relative, body in files.items():
+        write(campaign, relative, body)
+    memory = campaign/'original-retries/failure/retry-2/retry-memory.bin'
+    memory.write_bytes(b'frozen-updated-memory')
+    destination = tmp_path/'remediation.tar.gz'
+    assert package_campaign(campaign, destination)['complete']
+    restored = tmp_path/'restored'
+    with tarfile.open(destination) as archive:
+        for member in archive.getmembers():
+            if member.isfile() and member.name.startswith('campaign/'):
+                output = restored/member.name.removeprefix('campaign/')
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(archive.extractfile(member).read())
+    assert json.loads((restored/'remediation.json').read_bytes()) == remediation
+    assert FailureTimeBudget(restored/budget_path, 1800).remaining_seconds == 600
+    assert (restored/'original-retries/failure/retry-2/retry-memory.bin').read_bytes() == b'frozen-updated-memory'
+    assert json.loads((restored/'original-retries/failure/retry-2/state.json').read_bytes())['pending'] == 'native-handle'

@@ -15,8 +15,9 @@ from core.verifier_runtime import (
 )
 
 
+@pytest.mark.parametrize("with_memory", [False, True])
 @pytest.mark.parametrize("outcome", ["blocked", "blocked_disk_full", "infra", "complete"])
-def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, outcome):
+def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, outcome, with_memory):
     repo = Path(__file__).resolve().parents[1]
     benchmark = tmp_path / "benchmark"
     benchmark.mkdir()
@@ -29,6 +30,12 @@ def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("benchmarks.osworld.runtime._install_paths", lambda: None)
 
+    public_instruction = f"Public task input for {tmp_path.name}"
+    private_gold = f"private-gold-{tmp_path}"
+    private_evaluator = f"private-evaluator-{tmp_path}"
+    task_config = SimpleNamespace(instruction=public_instruction, user_config=None,
+        evaluator={'gold': private_gold, 'function': private_evaluator})
+
     class Desktop:
         provider = SimpleNamespace(container=SimpleNamespace(id="retained-container"))
         controller = SimpleNamespace(http_server="http://retained-controller")
@@ -37,8 +44,8 @@ def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, 
         evaluations = 0
         candidate = b"exact candidate and live Verifier checkpoint"
 
-        def reset(self, **_kwargs):
-            pass
+        def reset(self, *, task_config):
+            self.reset_config = task_config
 
         def close(self):
             self.closed = True
@@ -55,8 +62,7 @@ def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, 
             "prepare_checkpointable_docker_provider": lambda _mode: None},
         "task_loader": {
             "resolve_task_json_path": lambda **_kwargs: "synthetic-public-task",
-            "load_task_config": lambda *_args, **_kwargs: SimpleNamespace(
-                instruction="public synthetic instruction", user_config=None)},
+            "load_task_config": lambda *_args, **_kwargs: task_config},
         "desktop_env": {"__path__": []},
         "desktop_env.desktop_env": {"DesktopEnv": lambda **_kwargs: desktop},
     }
@@ -70,16 +76,31 @@ def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, 
     state = main.__globals__
     state["RSIAGENT_ROOT"] = tmp_path
     state["VM"] = lambda environment: environment
-    state["load_config"] = lambda _path: Config(
-        model="synthetic-actor", verifier_execution_mode="rollback_mirror",
-        verifier_persist_scratch=True, actor_evaluator_isolation=False)
+    memory = tmp_path / 'memory'
+    memory.mkdir()
+    memory_file = memory / f'lesson-{tmp_path.name}.txt'
+    memory_file.write_bytes(b'allowed learned memory')
+    cfg = Config(model="synthetic-actor", verifier_execution_mode="rollback_mirror",
+        verifier_persist_scratch=True, actor_evaluator_isolation=False,
+        env_memory_dir=str(memory) if with_memory else '')
+    state["load_config"] = lambda _path: cfg
+    pushes, preambles = [], []
+    def push_memory(vm, path):
+        pushes.append((vm, path))
+        return True
+    permitted_extra = f"Allowed memory inventory token {tmp_path}"
+    def memory_preamble(inventory):
+        preambles.append(inventory)
+        return permitted_extra
+    monkeypatch.setattr('explore.commit.push_memory', push_memory)
+    monkeypatch.setattr('explore.charter.memory_preamble', memory_preamble)
     state["configure_associated_benchmark_lock"] = lambda *_args, **_kwargs: None
     state["provider_counts"] = lambda: {}
     state["reset_provider_counts"] = lambda: None
     calls = []
 
-    def attempt(instruction, vm, cfg, sink, **_kwargs):
-        calls.append(instruction)
+    def attempt(instruction, vm, config, sink, **kwargs):
+        calls.append((instruction, config, kwargs))
         assert vm is desktop and vm.candidate is not None
         if outcome.startswith("blocked"):
             if outcome == "blocked_disk_full":
@@ -102,7 +123,14 @@ def test_task_runner_preserves_only_blocked_verification(monkeypatch, tmp_path, 
     else:
         main()
 
-    assert calls == ["public synthetic instruction"]
+    assert desktop.reset_config is task_config
+    assert desktop.reset_config.evaluator == {'gold': private_gold, 'function': private_evaluator}
+    assert calls == [(public_instruction, cfg, {
+        'opening_extra': permitted_extra if with_memory else '', 'ask_user': None})]
+    config_data = json.dumps(vars(calls[0][1]), default=str)
+    assert private_gold not in config_data and private_evaluator not in config_data
+    assert pushes == ([(desktop, str(memory))] if with_memory else [])
+    assert preambles == ([f"  {memory_file.stat().st_size:>7}  {memory_file.name}"] if with_memory else [])
     root = tmp_path / "results/task_unit/seed17"
     if outcome.startswith("blocked"):
         assert desktop.closed is False

@@ -32,3 +32,16 @@ or performance on any particular target. The dedicated
 `Ascend/triton-ascend-kernels` repository supplies kernel implementations with
 host wrappers, benchmarks, tests and best-practice documentation; the
 Triton-Ascend compiler repository supplements this with tutorials.
+
+## Optional documentation allowlists
+
+A source may supply `files`, a nonempty list of `{ "path": "...", "sha256":
+"..." }` entries. Acquisition requires every entry to match a selected UTF-8
+Git blob at the pinned revision. Only these files enter the inventory; remaining
+text is recorded as `outside-source-allowlist`. Missing paths, wrong hashes, and
+duplicates fail acquisition, including on offline resume. Omit `files` to retain
+the historical whole-source selection.
+
+`sanitizer-sources.json` uses this facility for the official English msSanitizer
+guides. See [sanitizer KDB setup](../../docs/sanitizer-kdb.md) for publication,
+new-campaign selection, and diagnostic limitations.

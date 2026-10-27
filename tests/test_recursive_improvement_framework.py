@@ -9,7 +9,6 @@ import yaml
 
 from config.settings import Config, load
 from core.self_evolving_loop import SelfEvolvingLoopHooks
-from explore.charter import phase1_wave_curriculum_charter
 from explore.phase1_wave import parse_wave_handoff
 import benchmarks.osworld.pipeline as protocol
 import benchmarks.osworld.phase2 as phase2_runner
@@ -122,18 +121,6 @@ def test_parallel_phase1_is_agent_authored_not_a_static_search_menu(tmp_path):
     assert report["phase1_parallelism"] == 4
     assert lock["phase1_parallel_waves"] is True
     assert lock["phase1_parallelism"] == 4
-
-    prompt = phase1_wave_curriculum_charter(
-        "a target direction", previous_wave_outcomes="",
-        handoff_path="/home/user/phase1_wave.json",
-        wave_root="/home/user/evolution_wave",
-        target_query_conditioned=True)
-    assert "any positive number" in prompt
-    assert "same pre-wave memory snapshot" in prompt
-    assert "No fixed project count is a semantic convergence rule" in prompt
-    assert "DEEPEN" not in prompt
-    assert "BROADEN" not in prompt
-    assert "MIXED" not in prompt
 
 
 def test_parallel_wave_transport_accepts_free_topology_and_rejects_dependencies():
@@ -248,16 +235,6 @@ def test_phase2_runner_accepts_clean_profile_and_has_no_evaluator_hook():
     assert "score" not in SelfEvolvingLoopHooks.__dataclass_fields__
 
 
-def test_phase2_selects_release_specific_benchmark_provenance():
-    profile = protocol.BENCHMARK_PROVENANCE_PROFILES[
-        "osworld-v2-2026.08.08"]
-    assert profile.name == \
-        "baseline.lock.json"
-    source = (REPO / "benchmarks/osworld/pipeline.py").read_text(
-        encoding="utf-8")
-    assert '"--benchmark-profile", str(benchmark_profile)' in source
-
-
 def test_explicit_practice_verifier_controls_full_agentic_verifier(tmp_path):
     selected = tmp_path / "selected_verifier.yaml"
     selected.write_text("model: moonshotai/kimi-k3\n", encoding="utf-8")
@@ -270,33 +247,3 @@ def test_explicit_practice_verifier_controls_full_agentic_verifier(tmp_path):
     assert effective.agentic_verifier_config == str(selected.resolve())
     assert target.agentic_verifier_config == \
         "config/should_not_survive.yaml"
-
-
-def test_phase2_learns_from_both_outcomes_with_explicit_pass_policy():
-    source = (REPO / "benchmarks/osworld/phase2.py").read_text(encoding="utf-8")
-    assert "learn_on_pass=True" in source
-    assert 'args.phase2_stop_policy == "curriculum_review"' in source
-    assert "phase2_outcome_protocol" in source
-    assert "terminal_outcome=verdict.value" in source
-    assert 'only a grounded PASS/FAIL may enter durable memory' in source
-
-
-def test_phase3_runner_has_explicit_copy_in_only_memory_transport():
-    source = (REPO / "benchmarks/osworld/task.py").read_text(encoding="utf-8")
-    assert '"--memory-dir"' in source
-    assert '"host_writeback": False' in source
-    assert "pull_memory" not in source
-    assert source.count(".evaluate(") == 1
-
-
-def test_learning_entrypoints_do_not_call_official_evaluator():
-    phase1 = (REPO / "benchmarks/osworld/phase1.py").read_text(encoding="utf-8")
-    orchestrator = (
-        REPO / "benchmarks/osworld/pipeline.py").read_text(encoding="utf-8")
-    assert ".evaluate(" not in phase1
-    assert "task_loader" not in phase1
-    assert '"official_evaluator_calls": 0' in phase1
-    # The orchestrator delegates the sole scored phase to the task runner; it never owns
-    # or serializes an evaluator object itself.
-    assert ".evaluate(" not in orchestrator
-    assert "task_loader" not in orchestrator

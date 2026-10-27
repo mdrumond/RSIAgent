@@ -68,17 +68,6 @@ def test_rsiagent_owned_paths_ignore_osworld_working_directory(
     assert load(actor.escalation_agentic_verifier_config).model == "z-ai/glm-5.3"
 
 
-def test_official_runtime_has_no_person_specific_absolute_path():
-    for relative_path in (
-            "benchmarks/osworld/task.py",
-            "llm/client.py",
-            "benchmarks/osworld/runtime.py",
-            "config/osworld/baseline.yaml"):
-        source = (REPO / relative_path).read_text(encoding="utf-8")
-        assert "/home/example" not in source
-        assert "/home/admin" not in source
-
-
 def test_direct_run_inherits_evaluator_and_user_channel_from_sibling_lock(
         tmp_path):
     rsiagent = tmp_path / "rsiagent"

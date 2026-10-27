@@ -15,7 +15,7 @@ import time
 import re
 from typing import Callable, Mapping, Sequence
 
-from benchmarks.ascend.targets import CurriculumPolicy
+from benchmarks.ascend.targets import CurriculumPolicy, METRIC_SWEEP_GUIDANCE
 
 from benchmarks.a5kernels.evidence import canonical_digest
 from benchmarks.a5kernels.phase1_curriculum import (
@@ -199,6 +199,8 @@ class CurriculumContext:
     curriculum_memory: tuple[Mapping[str, object], ...] = ()
     phase2_feedback: tuple[Mapping[str, object], ...] = ()
     remaining_seconds: float = 3600
+    context_files: tuple[Mapping[str, object], ...] = ()
+    artifact_reader: Callable | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -398,6 +400,7 @@ def curriculum_prompt(
         "pre_wave_coverage": [item.value for item in context.pre_wave_coverage],
         "prior_outcomes": [item.prompt_dict() for item in context.prior_outcomes],
         "curriculum_memory": list(context.curriculum_memory),
+        "context_files": list(context.context_files),
         "bounded_project_grammar": (
             _grammar() if target_policy is None else target_policy.grammar(_grammar())
         ),
@@ -411,6 +414,9 @@ def curriculum_prompt(
             item.value for item in unavailable_capabilities
         ]
     instructions = (
+        'Detailed context_files are optional, authenticated files: request '
+        '{"read_artifact":{"sha256":"advertised hash","offset":0,"limit":8192}} '
+        'for a bounded page before deciding. Short summaries are not the full evidence. '
         "Choose DECISION: WAVE for useful experiments informed by prior outcomes. "
         "Use curriculum_memory to avoid repeating low-yield or failed strategies. "
         "A failed attempt is not kernel knowledge or a permanent operation ban: "
@@ -438,7 +444,19 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
-    guidance = ASCEND_EXPERIMENT_GUIDANCE if target_policy is None else target_policy.guidance
+    if context.phase2_feedback:
+        instructions += (
+            "First review eligible original failures against current memory. When an "
+            "applicable cause/repair lesson and host-backed probe/control exist, recommend "
+            "the original retry next unless a concrete execution blocker remains. "
+            "Do not express that retry as a new WAVE project: novelty applies to new projects. "
+            "If no further learning project is needed, return DECISION: SATURATED with "
+            "failure_investigations containing status=ready-to-retry and the existing linked "
+            "project_id/control_project_id. SATURATED ends this learning selection so the host "
+            "can retry the original; it does not mean the original is fixed.\n"
+        )
+    guidance = (ASCEND_EXPERIMENT_GUIDANCE + METRIC_SWEEP_GUIDANCE
+                if target_policy is None else target_policy.guidance)
     return instructions + guidance + "\n" + json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
@@ -536,6 +554,9 @@ class CurriculumAgent:
                 + history[-1]["content"]
             )
         deadline = self.clock() + context.remaining_seconds
+        begin_selection = getattr(self.query_knowledge, "begin_selection", None)
+        if begin_selection is not None:
+            begin_selection(context)
         def check_remaining():
             remaining = deadline - self.clock()
             if remaining <= 0:
@@ -553,7 +574,8 @@ class CurriculumAgent:
             # Keep old selections for audit/resume, but do not resend redundant
             # historical contexts. Include all corrections within this selection.
             wire = [system, *history[selection_start:]]
-            completion = self._complete(tuple(dict(item) for item in wire))
+            from benchmarks.ascend.context_files import context_wire
+            completion = self._complete(tuple(context_wire(wire)))
             if not isinstance(completion, str):
                 raise TypeError("curriculum completion must be text")
             history.append({"role": "assistant", "content": completion})
@@ -571,14 +593,24 @@ class CurriculumAgent:
                         if not isinstance(payload, dict) or set(payload) - {"query", "limit"}:
                             raise ValueError("knowledge_query accepts query and optional limit")
                         action = KnowledgeQuery(payload.get("query"), payload.get("limit", 5))
-                if action is None and self.failure_feedback is not None and completion.lstrip().startswith('{'):
+                if (action is None and (context.artifact_reader is not None or self.failure_feedback is not None)
+                        and completion.lstrip().startswith('{')):
                     request = json.loads(completion)
                     if not isinstance(request, dict) or set(request) != {'read_artifact'}:
                         raise ValueError('expected one read_artifact request')
                     try:
-                        page = self.failure_feedback.read(**request['read_artifact'])
+                        payload = request['read_artifact']
+                        try:
+                            if context.artifact_reader is None:
+                                raise ValueError('no context reader')
+                            page = context.artifact_reader(**payload)
+                        except ValueError:
+                            if self.failure_feedback is None:
+                                raise
+                            page = self.failure_feedback.read(**payload)
                     except (OSError, ValueError, TypeError) as error:
                         page = {'error': str(error)}
+                    page = dict(page, event='artifact-page')
                     history.append({'role': 'user', 'content': json.dumps(page, sort_keys=True)})
                     continue
                 if action is None:

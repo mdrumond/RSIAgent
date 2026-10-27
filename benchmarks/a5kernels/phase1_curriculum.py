@@ -466,18 +466,20 @@ class WaveConsolidation:
 
 def consolidate_wave(
     wave: WaveSpec, outcomes: Sequence[ProjectOutcome], *, allow_semantic_failures: bool = False,
+    allow_partial: bool = False,
 ) -> WaveConsolidation:
-    """Validate a complete barrier, then describe atomic authored-order commits."""
+    """Validate assignment identities and describe authored-order verified commits."""
 
     if not isinstance(wave, WaveSpec):
         raise ValueError("consolidation requires a WaveSpec")
     rows = tuple(outcomes)
     expected = tuple(item.spec.project_id for item in wave.projects)
     if (
-        len(rows) != len(expected)
+        (not allow_partial and len(rows) != len(expected))
         or any(not isinstance(item, ProjectOutcome) for item in rows)
         or len({item.project_id for item in rows}) != len(rows)
-        or {item.project_id for item in rows} != set(expected)
+        or not {item.project_id for item in rows} <= set(expected)
+        or (not allow_partial and {item.project_id for item in rows} != set(expected))
     ):
         raise ValueError("memory publication requires a complete wave")
     by_id = {item.project_id: item for item in rows}
@@ -485,10 +487,10 @@ def consolidate_wave(
     if any(
         by_id[project_id].wave_fingerprint != assignments[project_id].wave_fingerprint
         or by_id[project_id].authored_ordinal != assignments[project_id].authored_ordinal
-        for project_id in expected
+        for project_id in by_id
     ):
         raise ValueError("project outcomes must match the current wave assignments")
-    if not allow_semantic_failures and any(not by_id[project_id].verified for project_id in expected):
+    if not (allow_semantic_failures or allow_partial) and any(not item.verified for item in rows):
         raise ValueError("every project must be verified before memory publication")
     commits = tuple(
         ConsolidationCommit(
@@ -497,7 +499,7 @@ def consolidate_wave(
         )
         for commit_ordinal, (authored_ordinal, project_id) in enumerate(
             ((ordinal, project_id) for ordinal, project_id in enumerate(expected, 1)
-             if by_id[project_id].verified), 1
+             if project_id in by_id and by_id[project_id].verified), 1
         )
     )
     return WaveConsolidation(wave.wave_id, wave.pre_wave_memory_sha256, commits)

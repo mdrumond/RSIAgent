@@ -515,7 +515,8 @@ def _optimizer_projects(root, state):
             "verified": row.get("verified") is True,
             "classification": result.get("classification", "unknown"),
             "spec": task, "performance": [], "optimizer_results": measured,
-            "memory": {"actions": [], "facts": [], "lessons": result.get("lessons", []),
+            "memory": {"actions": [], "facts": [], "lessons": [*result.get("lessons", []), *[entry for entry in state.get("memory_entries", [])
+                           if entry.get("attempt_id") == row["attempt_id"]]],
                        "interpretations": []},
             "revisions": revisions, "source": revisions[-1]["source"] if revisions else "",
             "transitions": [{"from": a["sha256"], "to": b["sha256"], "diff": "".join(
@@ -524,7 +525,7 @@ def _optimizer_projects(root, state):
     return projects
 
 
-def _campaign(entry):
+def _load_campaign(entry):
     root = Path(entry["root"])
     if not root.is_dir():
         raise FileNotFoundError(f"campaign root unavailable: {root}")
@@ -610,6 +611,11 @@ def _campaign(entry):
             "stats": {"attempted": len(projects),
                       "verified": sum(project["verified"] for project in projects),
                       "published": published}, "projects": projects, "planned": planned}
+
+
+def _campaign(entry):
+    from .usefulness import enrich
+    return enrich(_load_campaign(entry))
 
 
 class DashboardStore:

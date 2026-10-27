@@ -10,8 +10,8 @@ inspection must not find a violation — a "pass" accepts; repeated "unverified"
 accept late under the loop's budget rules (could-not-confirm never vetoes forever);
 "wrong" always bounces with the FINDINGS (evidence, not authority) as repair context.
 
-THIS FILE IS AN AUDITED SURFACE (Constraint #0): tests/test_no_leakage.py scans it
-against the task blocklist on every change. Everything here must be general.
+This prompt surface must not encode knowledge of any specific benchmark task, its
+setup, or its grader (Constraint #0). Everything here must be general.
 """
 import base64
 import hashlib

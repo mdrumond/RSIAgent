@@ -85,8 +85,9 @@ def test_failed_project_unblocks_slots_without_dispatch_until_recovered():
     assert NativeProjectPool([execute])("next") == "next"
 
 
-@pytest.mark.parametrize("explicit_device, expected", [(None, 2), (7, 7)])
-def test_public_campaign_build_controller_keeps_adaptive_phase2_serial(tmp_path, monkeypatch, explicit_device, expected):
+@pytest.mark.parametrize("explicit_device, expected", [(None, 2), (3, 3)])
+@pytest.mark.parametrize("original_retry", [False, True])
+def test_public_campaign_build_controller_keeps_reviewed_retries_serial(tmp_path, monkeypatch, explicit_device, expected, original_retry):
     import hashlib
     from types import SimpleNamespace
     from benchmarks.ascend import campaign_cli, phase1_cli
@@ -99,7 +100,7 @@ def test_public_campaign_build_controller_keeps_adaptive_phase2_serial(tmp_path,
     runtime = dict(guide=str(guide), target="a3", arch="arch", execution_profile="bz-a3-1",
         cpl_skills_revision="a" * 40, cpl_remote="/tools/cpl-remote",
         validation_wrapper="/checked/catlass-validation.sh", remote_workspace="/owned",
-        physical_devices=[2, 5], environment_identity=dict(cann_version="cann", profiler_version="msprof"))
+        physical_devices=[2, 3], environment_identity=dict(cann_version="cann", profiler_version="msprof"))
     if explicit_device is not None:
         runtime["physical_device"] = explicit_device
     runtime_path = tmp_path / "native.json"
@@ -126,6 +127,7 @@ def test_public_campaign_build_controller_keeps_adaptive_phase2_serial(tmp_path,
     (phase1_root / "initial-memory.bin").write_bytes(b"")
     phase1 = campaign_cli.build_controller(job)
     assert isinstance(phase1.execute_project, NativeProjectPool)
+    assert [actor.executor._backend.transport._device for actor in phase1.execute_project.actors.queue] == [2, 3]
     source = json.loads((phase1_root / "campaign-identity.json").read_bytes())
     snapshot = reviewed_snapshot()
     snapshot.destination = SimpleNamespace(source_identity=source)
@@ -134,13 +136,50 @@ def test_public_campaign_build_controller_keeps_adaptive_phase2_serial(tmp_path,
     phase2_root.mkdir()
     (phase2_root / "initial-memory.bin").write_bytes(b"")
     measurement_bindings.clear()
-    phase2 = campaign_cli.build_controller({**job, "phase": 2, "root": str(phase2_root)})
+    reviewed_job = {**job, "phase": 1 if original_retry else 2, "root": str(phase2_root)}
+    if original_retry:
+        from benchmarks.ascend.phase2_feedback import FeedbackStore
+        from benchmarks.ascend.manual_retry import ManualPhase1Retry
+        from test_generic_failure_feedback import phase1 as failed_campaign
+        from test_a5_phase1_adaptive import _project, _result
+        original_spec = _project('original', 'gm-ub-movement')
+        failed_campaign(tmp_path/'failed', spec=original_spec)
+        feedback = FeedbackStore(tmp_path/'feedback')
+        feedback.import_phase1(tmp_path/'failed', target='a3', language='ascend-c')
+        original, = feedback.records()
+        selection = json.dumps(dict(selected=[original])).encode()
+        (phase2_root/'phase2-feedback.json').write_bytes(selection)
+        reviewed_job.update(phase1_original_retry=True, phase2_max_seconds=30,
+            feedback_root=str(feedback.root), feedback_selection_sha256=hashlib.sha256(selection).hexdigest())
+    phase2 = campaign_cli.build_controller(reviewed_job)
+    if original_retry:
+        assert isinstance(phase2, ManualPhase1Retry)
+        retry = phase2
+        phase2 = retry.runner
+        assert retry.row['outcome']['original_spec'] == original_spec
     assert isinstance(phase2, AdaptivePhase2Coordinator)
+    assert phase2.snapshot is snapshot
     assert phase2.max_parallel == 1
     transport = phase2.execute_project.executor._backend.transport
     assert transport._device == expected
     assert transport._state_root == phase2_root / "transport-state"
     assert measurement_bindings == [(expected, expected, phase2_root / "measurements")]
+
+    if original_retry:
+        requests = []
+        def execute(request):
+            requests.append(request)
+            return _result(request.spec, True, 'host acceptance')
+        phase2.execute_project = execute
+        assert retry.resume()['status'] == 'FIXED'
+        request, = requests
+        assert request.spec.as_dict() == original_spec
+        envelope = json.loads(request.pre_wave_memory)
+        import base64
+        reviewed = json.loads(base64.b64decode(envelope['initial_memory_base64']))
+        assert reviewed['snapshot_id'] == snapshot.snapshot_id
+        assert reviewed['phase1_memory'] == list(snapshot.memory_entries())
+        assert envelope['project_memory_base64'] == []
 
 
 def test_semantic_project_failure_does_not_stop_the_pool():
@@ -180,12 +219,16 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
             self.first = True
             transports.append(self)
         def compile(self, plan, directory):
+            if plan.project_id == "sum-three":
+                return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
             if self.first and first_run:
                 self.first = False
                 barrier.wait(timeout=5)  # Fails if the CLI silently remains serial.
             assert f"device-{self.device}" in str(directory)
             return CandidateCompilation(plan, "b" * 64, "compiled", "", "a" * 64)
         def execute_receipt(self, compiled):
+            if compiled.plan.project_id == "sum-three":
+                return ExecutionReceipt(0, tuple(sum(xs) for xs in zip(*(t.values for t in compiled.plan.inputs))))
             if interrupt and first_run and compiled.plan.project_id == "copy-1":
                 raise OSError("temporary host failure")
             return ExecutionReceipt(0, compiled.plan.inputs[0].values, "synchronized")
@@ -248,25 +291,22 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
         "--project-target", "2", "--max-projects", "2"]
     deps = dict(transport_factory=Transport, provider_transport=provider, measurement_factory=Measurement,
         environment_loader=lambda **kwargs: dict(OPENAI_API_KEY="fake", DEEPSEEK_API_KEY="fake"))
+    main(args, **deps)
     if interrupt:
-        with pytest.raises(RuntimeError, match="failed before verification"):
-            main(args, **deps)
-        sibling = root / "waves/wave-001/branches/copy-0"
-        preserved = {p: p.read_bytes() for p in sibling.rglob("*") if p.is_file()}
-        assert (sibling / "outcome.json").exists()
-        first_run = False
-        main(["resume" if arg == "run" else arg for arg in args], **deps)
-        assert preserved == {p: p.read_bytes() for p in preserved}
-    else:
-        main(args, **deps)
+        report = json.loads(capsys.readouterr().out)
+        assert report["status"] == "WAVE_CLOSED"
+        assert report["published_projects"] == ["copy-0"]
+        assert report["wave_results"][-1]["status"] == "partial"
+    environment_reports = list(root.glob("environment-checks/*/*/report.json"))
+    assert environment_reports and all(json.loads(p.read_text())["status"] == "passed" for p in environment_reports)
     assert {transport.device for transport in transports} == {2, 5}
     assert len({transport.state for transport in transports}) == 2
     assert all("native-workers" in str(transport.state) for transport in transports)
-    assert len(openings) == (3 if interrupt else 2)
+    assert len(openings) == 2
     # Both projects see exactly the same production context and pre-wave memory.
     assert openings[0].split("\nPre-wave memory (immutable, readable index): ")[1] == openings[1].split(
         "\nPre-wave memory (immutable, readable index): ")[1]
-    for project in ("copy-0", "copy-1"):
+    for project in (("copy-0",) if interrupt else ("copy-0", "copy-1")):
         rows = [row for row in measurements if row[0] == project]
         assert {row[2] for row in rows} == {"timing", "profile"}
         assert len({row[1] for row in rows}) == 1
@@ -278,7 +318,7 @@ def test_parallel_cli_isolates_devices_measurements_and_preserves_resume(tmp_pat
     assert list(json.loads(publication.read_bytes())["commits"])[0]["project_id"] == "copy-0"
     main(["resume" if arg == "run" else arg for arg in args], **deps)
     assert before == {p: p.read_bytes() for p in before}
-    assert len(openings) == (3 if interrupt else 2)
+    assert len(openings) == 2
 
 
 def test_phase2_rejects_parallel_workers_before_opening_state(tmp_path):
