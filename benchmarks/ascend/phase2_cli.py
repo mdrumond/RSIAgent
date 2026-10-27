@@ -2,6 +2,7 @@
 
 import argparse
 import json
+from .status_descriptions import describe_statuses
 from pathlib import Path
 import time
 from types import SimpleNamespace
@@ -68,7 +69,7 @@ def main(argv=None, *, runner_factory=native_runner, sleeper=time.sleep):
     state = args.root / 'state.json'
     result = dict(state=json.loads(state.read_bytes()) if state.is_file() else None,
                   records=[json.loads(path.read_bytes()) for path in sorted(args.root.rglob('terminal.json'))])
-    print(json.dumps(result, sort_keys=True))
+    print(json.dumps(describe_statuses(result), sort_keys=True))
     return 0
 
 

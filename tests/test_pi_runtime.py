@@ -506,6 +506,37 @@ def test_real_pi_actor_waits_for_submit_acceptance(monkeypatch, tmp_path):
     assert len(calls) == 4
 
 
+def test_actor_invalid_action_feedback_reaches_next_request(monkeypatch, tmp_path):
+    import coding.pi.actor as actor_module
+    from benchmarks.a5kernels.trial import ActionOutcome, parse_trial_action
+    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, direct_profile
+    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
+    monkeypatch.setattr(actor_module, 'runtime_preflight', lambda: None)
+    requests = []
+    class FakeSession:
+        completion_tokens = 0
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def next_action(self, payload, allowed, **kwargs):
+            requests.append((payload, set(allowed)))
+            return ('not-an-action', {}) if len(requests) == 1 else ('submit', {})
+    monkeypatch.setattr(actor_module.PiActorDriver, '_new_session', lambda *args: FakeSession())
+    driver = actor_module.PiActorDriver(DirectCompletionProvider(
+        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}), max_seconds=10)
+    executed = []
+    def execute(action):
+        executed.append(action.kind)
+        return ActionOutcome('{}', True, 'passed')
+    outcome = driver('task', profile=direct_profile(next(iter(MODEL_IDENTITIES))),
+                     workspace=tmp_path, context=None,
+                     turn_parser=parse_trial_action, action_executor=execute)
+    assert outcome.status == 'passed' and executed == ['submit']
+    feedback = json.loads(requests[1][0]['latest_host_observation'])['host']
+    assert feedback['event'] == 'invalid-action'
+    assert feedback['allowed_actions'] == sorted(requests[1][1])
+    assert 'submit' in feedback['allowed_actions']
+
+
 def test_real_pi_escaped_snapshot_trims_older_pages_under_gateway_request_cap(monkeypatch):
     requests = []
     context = {'guide': 'Page contents. ' * 2000,

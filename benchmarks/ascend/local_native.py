@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 from statistics import median
+import signal
 import sys
 
 from benchmarks.a3kernels.candidate import CandidateCompilation, _parse_output
@@ -14,6 +15,16 @@ from benchmarks.a3kernels.profiling import parse_timing_output
 from benchmarks.a5kernels.evidence import canonical_bytes, canonical_digest
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from benchmarks.ascend.execution import LocalProcessRunner, local_environment, local_identity
+
+
+def _failed_process_detail(result):
+    detail = f"Native process failed with exit code {result.returncode}"
+    if result.returncode < 0:
+        try:
+            detail += f" (terminated by {signal.Signals(-result.returncode).name})"
+        except ValueError:
+            detail += f" (terminated by signal {-result.returncode})"
+    return detail + f".\nstdout:\n{result.stdout or '(empty)'}\nstderr:\n{result.stderr or '(empty)'}"
 
 
 class LocalNativeCandidateBackend:
@@ -60,7 +71,7 @@ class LocalNativeCandidateBackend:
             kind = ("NativeCompileError" if "A3CANDIDATE_COMPILE_FAILED=1" in result.stdout.splitlines()
                     else "NativeHostError")
             return FailedEvidence.create(plan, stage="compile", error_type=kind,
-                                         detail=result.stderr or result.stdout or "native compilation failed")
+                                         detail=_failed_process_detail(result))
         library = directory / "a3_candidate.so"
         digest = hashlib.sha256(library.read_bytes()).hexdigest()
         if [line for line in result.stdout.splitlines() if line.startswith("A3CANDIDATE_COMPILED=")] != ["A3CANDIDATE_COMPILED=" + digest]:
@@ -77,7 +88,7 @@ class LocalNativeCandidateBackend:
             directory / "execution", cwd=directory, env=local_environment(self.config))
         if result.returncode:
             return FailedEvidence.create(plan, stage="execute", error_type="NativeRuntimeError",
-                detail=result.stderr or result.stdout or "native launch failed")
+                detail=_failed_process_detail(result))
         return ExecutionReceipt(exit_code=0, output=_parse_output(result.stdout, plan.padded_length),
             stdout=result.stdout, stderr=result.stderr, job_handle="local:" + plan.execution_id,
             metadata=(("library_sha256", compilation.library_sha256), ("candidate_directory", str(directory))))
