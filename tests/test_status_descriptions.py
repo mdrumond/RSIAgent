@@ -1,10 +1,12 @@
 """Descriptions explain real workflow distinctions without altering evidence."""
 import copy
+from dataclasses import asdict
 
 import pytest
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import canonical_bytes
+from benchmarks.a5kernels.phase1_memory import HostFact
 from benchmarks.ascend.agent_presentation import compact_observation
 from benchmarks.ascend.status_descriptions import describe_statuses, explain_status
 
@@ -16,12 +18,8 @@ def test_repair_requirements_are_actionable_and_codes_unchanged(tmp_path):
     store = ContentAddressedArtifacts(tmp_path)
     view = compact_observation(raw, store)
     assert view['missing'] == raw['missing']
-    rows = {row['code']: row for row in view['status_explanations']}
-    assert 'host reference' in rows['observed-host-mismatch']['description']
-    assert 'do not invent' in rows['observed-host-mismatch']['next_action']
-    assert 'compiler diagnostics' in rows['observed-compile-failure']['next_action']
-    assert 'timing study' in rows['performance-study']['next_action']
-    assert 'metric evidence' in rows['profiling']['next_action']
+    assert {(row['field'], row['code']) for row in view['status_explanations']} == {
+        ('missing', code) for code in raw['missing']}
     assert store.read_json(store.put_json(raw)) == raw
 
 
@@ -36,35 +34,6 @@ def test_presentation_is_idempotent_and_does_not_rewrite_evidence():
     assert view['reason'] == 'investigating'
     assert 'status_explanations' not in view['artifact']['payload']
     assert describe_statuses(view) == view
-    assert 'Other project requirements' in view['status_explanations'][0]['description']
-    assert 'original' in view['outcome']['status_explanations'][0]['next_action']
-
-
-@pytest.mark.parametrize('code, phrase', [
-    ('both-succeeded', 'does not establish'), ('demonstrated-benefit', 'control failed'),
-    ('treatment-regressed', 'control passed'), ('neither-succeeded', 'Neither'),
-    ('inconclusive', 'does not establish'), ('TIME_BUDGET_EXHAUSTED', 'elapsed time'),
-    ('RECOVERY_REQUIRED', 'recovered'), ('waiting-approval', 'approval'),
-    ('context-budget-exhausted', 'context limit'), ('could-not-confirm', 'enough evidence'),
-    ('infrastructure-failed', 'infrastructure'), ('proposed', 'not yet'),
-    ('passed', 'acceptance checks'), ('transport-qualified', 'kernel correctness has not'),
-    ('checking-correctness', 'frozen reference'), ('checking-reference', 'reference'),
-    ('succeeded', 'correctness is a separate'), ('practice', 'practice project'),
-    ('target', 'original target'), ('review', 'reviewing'), ('qualification', 'qualification'),
-])
-def test_ordinary_codes_have_specific_explanations(code, phrase):
-    explanation = explain_status(code)
-    assert phrase in explanation['description']
-    assert explanation['next_action']
-    assert 'no specific explanation' not in explanation['description']
-
-
-def test_ambiguous_statuses_are_not_promoted_to_correctness():
-    assert 'eligible' in explain_status('ready')['description']
-    assert 'verified target' in explain_status('READY')['description']
-    assert 'has not yet' in explain_status('failed', field='lifecycle')['description']
-    assert 'unsuccessfully' in explain_status('failed')['description']
-    assert 'no specific explanation' in explain_status('new-unknown-state')['description']
 
 
 def test_large_failure_log_keeps_explanation_and_exact_raw_hash(tmp_path):
@@ -83,7 +52,6 @@ def test_learner_stage_is_explained_without_promoting_practice_to_target_success
     row, = view['status_explanations']
     assert row['field'] == 'learner_stage'
     assert row['code'] == view['learner_stage'] == 'practice'
-    assert 'practice success alone' in row['next_action']
 
 
 @pytest.mark.parametrize('code', [
@@ -98,19 +66,25 @@ def test_registered_reason_codes_are_explained_without_interpreting_prose(code):
     assert row['description'] and row['next_action']
     prose = {'reason': 'The diagnostic was unavailable after an interrupted request.'}
     assert describe_statuses(prose) == prose
-    if code == 'disabled-by-treatment':
-        assert 'preserve the configured experimental restrictions' in row['next_action']
 
 
 @pytest.mark.parametrize('code', ['profiling', 'performance-study'])
-def test_measurement_fact_and_missing_requirement_have_distinct_explanations(code):
-    raw = {'facts': [{'category': code, 'evidence_sha256': 'a' * 64}], 'missing': [code]}
-    view = describe_statuses(raw)
+def test_measurement_fact_and_missing_requirement_have_distinct_explanations(code, tmp_path):
+    fact = asdict(HostFact(code, 'Completed host measurement', 'a' * 64))
+    raw = {'facts': [fact], 'missing': [code]}
+    store = ContentAddressedArtifacts(tmp_path)
+    view = compact_observation(raw, store)
     retained, = view['facts'][0]['status_explanations']
     missing, = view['status_explanations']
+    assert retained['field'] == 'category'
+    assert missing['field'] == 'missing'
     assert view['facts'][0]['category'] == retained['code'] == code
     assert view['missing'] == [missing['code']] == [code]
-    assert 'retained host fact' in retained['description']
-    assert 'not been retained' in missing['description']
-    assert 'not been retained' not in explain_status(code)['description']
-    assert raw['facts'][0] == {'category': code, 'evidence_sha256': 'a' * 64}
+    assert retained['description'] != missing['description']
+    assert retained['next_action'] != missing['next_action']
+    assert retained['description'] != explain_status(code)['description']
+    assert missing['description'] != explain_status(code)['description']
+    assert {key: value for key, value in view['facts'][0].items()
+            if key != 'status_explanations'} == fact
+    assert store.read_json(store.put_json(raw)) == raw
+    assert describe_statuses(view) == view

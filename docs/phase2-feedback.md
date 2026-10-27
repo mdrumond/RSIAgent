@@ -17,6 +17,25 @@ python run_ascend_campaign.py feedback-phase2 --feedback-root /data/feedback \
   --dashboard-config /data/dashboard.json
 ```
 
+The generic `feedback` command also imports retained Phase 1 campaigns and
+terminal standalone optimizer jobs:
+
+```sh
+python run_ascend_campaign.py feedback --source-type phase1 \
+  --feedback-root /data/feedback --source-root /data/old-phase1
+python run_ascend_campaign.py feedback --source-type optimizer \
+  --feedback-root /data/feedback --dashboard-config /data/dashboard.json
+```
+
+`--dashboard-config` selects the matching `campaigns[].phase` for Phase 1/2,
+or the configured `optimizer.root` for standalone jobs. `feedback-phase2`
+remains an alias with Phase 2 as its default source type. Importing never starts
+an Actor or accepts memory. The remediation curriculum receives a hash-linked
+failure-case manifest for each selected observation, including observations
+outside its detailed page. It can page that manifest and the exact authenticated
+input, expected-result, observed-result and diagnostic artifacts without making
+unselected observations readable.
+
 Imports scan retained optimizer states, including nested goal directories, and
 deduplicate retained optimizer job/attempt identities. Restored campaigns retain
 their existing feedback IDs and investigation state, including older path-keyed

@@ -680,3 +680,90 @@ def test_missing_retry_justification_is_corrected_before_wave_execution(tmp_path
     decision, _ = agent.select(context, remaining_projects=1)
     assert len(calls) == 2
     assert decision.failure_investigations[0]['retry_skip_reason']
+
+
+def test_linked_failed_retry_is_readable_without_becoming_an_obligation(tmp_path):
+    from test_curriculum_context_files import read_all
+    store, selection, feedback = setup(tmp_path)
+    original = selection['selected'][0]['feedback_id']
+    campaign(tmp_path/'retry', result=dict(verified=False, summary='new diagnostic',
+        result=dict(status='compile-error')))
+    campaign(tmp_path/'unrelated', task=dict(task_id='private', submission=dict(source='private')))
+    store.import_campaign(tmp_path/'retry')
+    store.import_campaign(tmp_path/'unrelated')
+    records = store.records()
+    retry = next(row for row in records if row['outcome']['source_root'] == str((tmp_path/'retry').resolve()))
+    private = next(row for row in records if row['outcome']['source_root'] == str((tmp_path/'unrelated').resolve()))
+    store.link_original_retry(original, retry['feedback_id'])
+    feedback.selection['selected'] = [next(row for row in store.records() if row['feedback_id'] == original)]
+    feedback.lineage = [dict(feedback_id=original, project_id='new-probe', status='investigating')]
+    context = feedback.context({})
+    assert feedback.ids == {original}
+    linked = read_all(feedback.read, context[-1]['selected'][0]['linked_retries_file'])
+    assert [row['feedback_id'] for row in linked] == [retry['feedback_id']]
+    assert linked[0]['category'] == 'compile-failure'
+    assert read_all(feedback.read, linked[0]['failure_cases_file']) == store.failure_cases(retry['feedback_id'])
+    ref = next(iter(retry['outcome']['evidence'].values()))
+    assert feedback.read(ref['sha256'])['text']
+    assert feedback.project_context('new-probe')['feedback_ids'] == [original, retry['feedback_id']]
+    with pytest.raises(ValueError, match='not in selected'):
+        feedback.read(sha(canonical(private['outcome']['task'])))
+
+
+def test_multiple_originals_snapshot_linked_evidence_once_per_operation(tmp_path, monkeypatch):
+    from test_curriculum_context_files import read_all
+    store = FeedbackStore(tmp_path/'feedback')
+    originals, retries = [], {}
+    for index in range(3):
+        task = dict(task_id=f'original-{index}', submission=dict(source=f'reference-{index}'))
+        root = tmp_path/f'original-{index}'
+        campaign(root, task=task)
+        store.import_campaign(root)
+        original = next(row for row in store.records() if row['outcome']['source_root'] == str(root.resolve()))
+        originals.append(original)
+        retries[original['feedback_id']] = []
+        for attempt in range(2):
+            root = tmp_path/f'retry-{index}-{attempt}'
+            campaign(root, task=task, baseline=dict(suite_sha256=f'suite-{index}-{attempt}',
+                manifest=dict(policy=dict(name='host-policy'))))
+            store.import_campaign(root)
+            retry = next(row for row in store.records() if row['outcome']['source_root'] == str(root.resolve()))
+            store.link_original_retry(original['feedback_id'], retry['feedback_id'])
+            retries[original['feedback_id']].append(retry)
+    feedback = FailureCurriculum(tmp_path/'curriculum', store.root, dict(selected=originals, controls=[]))
+    feedback.lineage = [dict(feedback_id=row['feedback_id'], project_id=f'probe-{index}', status='investigating')
+                        for index, row in enumerate(originals)]
+    enumeration = []
+    records = feedback.store.records
+    def counted_records():
+        enumeration.append(True)
+        return records()
+    monkeypatch.setattr(feedback.store, 'records', counted_records)
+    context = feedback.context({})
+    assert len(enumeration) == 1
+    assert feedback.ids == {row['feedback_id'] for row in originals}
+    for row in context[-1]['selected']:
+        linked = read_all(feedback.read, row['linked_retries_file'])
+        assert [item['feedback_id'] for item in linked] == [item['feedback_id'] for item in retries[row['feedback_id']]]
+        for item in linked:
+            assert read_all(feedback.read, item['failure_cases_file']) == store.failure_cases(item['feedback_id'])
+    assert len(enumeration) == 1
+    retry = retries[originals[-1]['feedback_id']][-1]
+    digest = retry['outcome']['evidence']['baseline']['sha256']
+    assert json.loads(feedback.read(digest)['text'])['suite_sha256'] == 'suite-2-1'
+    assert len(enumeration) == 2  # One snapshot, including evidence resolution.
+    assert feedback.project_context('probe-2')['feedback_ids'] == [originals[-1]['feedback_id'],
+        *(item['feedback_id'] for item in retries[originals[-1]['feedback_id']])]
+    assert len(enumeration) == 3
+    # A newly linked attempt is visible to the next operation without refresh/cache invalidation.
+    extra = retries[originals[0]['feedback_id']][0]
+    store.link_original_retry(originals[-1]['feedback_id'], extra['feedback_id'])
+    assert feedback.project_context('probe-2')['feedback_ids'][-1] == extra['feedback_id']
+    assert len(enumeration) == 4
+    context = feedback.context({})
+    assert len(enumeration) == 5
+    manifest = context[-1]['selected'][-1]['linked_retries_file']
+    assert read_all(feedback.read, manifest)[-1]['feedback_id'] == extra['feedback_id']
+    with pytest.raises(ValueError, match='not in selected'):
+        feedback.read('f'*64)
+    assert len(enumeration) == 6
