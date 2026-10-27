@@ -51,24 +51,63 @@ class CplNativeCandidateBackend:
         self.runtime_identity = dict(target=target, runtime=runtime, profile=profile,
                                      physical_device=physical_device, logical_device=0)
 
+    def _pending(self, message, reason='transport-unresolved'):
+        error = _PendingObservation(message)
+        stopped = getattr(self.remaining_seconds, 'stop_requested', lambda: False)()
+        error.interruption_reason = 'operator-stop' if stopped else reason
+        return error
+
+    def _timed(self, stage, callback, *, key=None):
+        started, epoch = self.clock(), self.wall_clock()
+        try:
+            return callback()
+        finally:
+            elapsed = max(0, self.clock()-started)
+            self.root.mkdir(parents=True, exist_ok=True)
+            with (self.root / 'timing.jsonl').open('a') as out:
+                out.write(json.dumps(dict(stage=stage, key=key, started_epoch=epoch,
+                    ended_epoch=epoch+elapsed, elapsed_seconds=elapsed))+'\n')
+
     def _allowance(self):
         remaining = self.timeout if self.remaining_seconds is None else min(self.timeout, self.remaining_seconds())
         if not math.isfinite(remaining) or remaining <= 0:
-            raise _PendingObservation('CPL native elapsed allocation exhausted')
+            raise self._pending('CPL native elapsed allocation exhausted', 'deadline-exhausted')
         return remaining
 
     def _call(self, arguments, *, seconds):
+        completed = None
         try:
             completed = self._run((self._cpl, '--json', *arguments), text=True,
                                  capture_output=True, check=False, timeout=max(.001, seconds))
             value = json.loads(completed.stdout)
         except (subprocess.TimeoutExpired, OSError, ValueError) as error:
-            raise _PendingObservation('CPL command outcome unavailable; inspect retained state before retry') from error
+            pending = self._pending('CPL command outcome unavailable; inspect retained state before retry')
+            if completed is not None:
+                pending.transport_diagnostic = dict(returncode=completed.returncode,
+                    stdout=completed.stdout[-8192:], stderr=completed.stderr[-8192:])
+            raise pending from error
         if not isinstance(value, dict):
             raise ProjectInfrastructureError('CPL response must be an object')
         return value
 
     def _operation(self, key, arguments, *, kind, expires_at=None):
+        stage = key.rsplit('/', 1)[-1]
+        if stage not in {'upload', 'compile', 'execute'}:
+            stage = 'transport'
+        try:
+            return self._timed(stage, lambda: self._operation_inner(key, arguments,
+                kind=kind, expires_at=expires_at), key=key)
+        except _PendingObservation as error:
+            path = self.root / key / 'operation.json'
+            diagnostic = getattr(error, 'transport_diagnostic', None)
+            if diagnostic is not None and path.exists():
+                record = json.loads(path.read_text())
+                record['observation_failure'] = diagnostic
+                _save(path, record)
+            # CLI failure is diagnostic evidence, not proof of remote termination.
+            raise
+
+    def _operation_inner(self, key, arguments, *, kind, expires_at=None):
         """Never submit again after an uncertain submission or observable handle."""
         path = self.root / key / 'operation.json'
         identity = dict(route=self.runtime_identity, workspace=str(self._workspace), arguments=list(arguments))
@@ -88,13 +127,16 @@ class CplNativeCandidateBackend:
                     self.remaining_seconds is not None and self.remaining_seconds() <= 0)
 
         def recover_expiry():
+            return self._timed('cleanup', recover_expiry_inner)
+
+        def recover_expiry_inner():
             # Execution stops at expiry; allow only bounded observation/cleanup.
             # A failed compiler may already have exited before the final poll.
             cleanup_deadline = self.clock() + min(30, self.timeout)
             def cleanup_call(arguments):
                 seconds = cleanup_deadline-self.clock()
                 if seconds <= 0:
-                    raise _PendingObservation('CPL expiry observation unavailable; retained handle '+str(record.get('handle')))
+                    raise self._pending('CPL expiry observation unavailable; retained handle '+str(record.get('handle')), 'deadline-exhausted')
                 return self._call(arguments, seconds=seconds)
             if kind == 'job' and record.get('handle') and record['state'] not in terminal:
                 observed = cleanup_call(('observe', record['handle']))
@@ -116,14 +158,14 @@ class CplNativeCandidateBackend:
                 return self._finish_operation(path, record, dict(state=record['state'], handle=record.get('handle')), kind)
             record['expired'] = True
             _save(path, record)
-            raise _PendingObservation('CPL elapsed allocation expired; retained handle '+str(record.get('handle')))
+            raise self._pending('CPL elapsed allocation expired; retained handle '+str(record.get('handle')), 'deadline-exhausted')
 
         if expired():
             return recover_expiry()
         deadline = self.clock() + min(self._allowance(), record['expires_at']-self.wall_clock())
         if not record.get('handle'):
             if record['state'] != 'new':
-                raise _PendingObservation('CPL submission outcome is ambiguous; do not resubmit')
+                raise self._pending('CPL submission outcome is ambiguous; do not resubmit')
             record['state'] = 'submitting'
             _save(path, record)
             value = self._call(arguments, seconds=max(.001, deadline-self.clock()))
@@ -140,7 +182,7 @@ class CplNativeCandidateBackend:
             if expired():
                 return recover_expiry()
             if not record.get('handle') or self.clock() >= deadline:
-                raise _PendingObservation('CPL operation pending; retain and observe '+str(record.get('handle')))
+                raise self._pending('CPL operation pending; retain and observe '+str(record.get('handle')))
             try:
                 value = self._call(('observe', record['handle'], '--wait', '--timeout',
                                     str(max(1, min(30, int(deadline-self.clock()))))),
@@ -156,13 +198,16 @@ class CplNativeCandidateBackend:
         return self._finish_operation(path, record, value, kind)
 
     def _finish_operation(self, path, record, value, kind):
+        return self._timed('cleanup', lambda: self._collect_operation(path, record, value, kind))
+
+    def _collect_operation(self, path, record, value, kind):
         # Result collection cannot dispatch work or extend its frozen expiry.
         # Checkpoint each stream so a disconnect never loses compiler feedback.
         deadline = self.clock() + min(30, self.timeout)
         def collect(arguments):
             seconds = deadline-self.clock()
             if seconds <= 0:
-                raise _PendingObservation('CPL terminal result collection pending; retained handle '+str(record.get('handle')))
+                raise self._pending('CPL terminal result collection pending; retained handle '+str(record.get('handle')))
             return self._call(arguments, seconds=seconds)
         if kind == 'transfer':
             if value.get('state') != 'completed':
@@ -170,7 +215,7 @@ class CplNativeCandidateBackend:
             result = value
         else:
             if value.get('state') == 'cancelled':
-                raise _PendingObservation('CPL elapsed allocation expired; retained cancelled handle '+str(record.get('handle')))
+                raise self._pending('CPL elapsed allocation expired; retained cancelled handle '+str(record.get('handle')), 'deadline-exhausted')
             result = record.setdefault('terminal_result', dict(handle=record.get('handle')))
             if 'returncode' not in result:
                 if type(value.get('exit')) is not int:
@@ -263,7 +308,7 @@ class CplNativeCandidateBackend:
         if (value['returncode'] == 124 or
                 value['returncode'] == 137 and payload.get('launcher') != 'process-group-v1'
                 and self.wall_clock() >= payload['expires_at']):
-            raise _PendingObservation('CPL command execution allocation expired; retained handle '+value['handle'])
+            raise self._pending('CPL command execution allocation expired; retained handle '+value['handle'], 'deadline-exhausted')
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
         result.job_handle = value['handle']
         return result
@@ -275,6 +320,7 @@ class CplNativeCandidateBackend:
     def compile(self, plan, local_directory):
         self._require_plan(plan)
         key = plan.execution_id
+        _save(self.root / key / 'candidate.json', dict(project_id=plan.project_id))
         bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
         archive = self._workspace / (key+'.tar')
         self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')

@@ -220,6 +220,52 @@ def test_optimizer_reconstruction_uses_new_attempt_memory_without_recreating_job
         reconstructed.optimizer(**{**options, 'task': changed_task}, memory_snapshot=current, attempt_id='third')
 
 
+def test_actor_interruption_exposes_host_partial_state_for_arm_collection(tmp_path):
+    from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+    execution, actor = graph_actor(tmp_path, [
+        '{"write":{"slot":"kernel","content":"fixed source"}}', '{"compile":{}}'])
+    def interrupted(_request):raise ProjectInfrastructureError('observe retained compile')
+    execution.executor._backend.compile = interrupted
+    request = _request(tmp_path, execution.executor)
+    outcome = SubjectExecutor(execution).graph(request)
+    assert not outcome.host_verified
+    assert outcome.observations['interruption_reason'] == 'transport-unresolved'
+    partial = outcome.observations['evidence']
+    assert SubjectExecutor(execution).graph(request).as_dict() == outcome.as_dict()
+    assert partial['source_sha256'] == sha(b'fixed source')
+    assert partial['actions'] == ['write', 'compile']
+    assert partial['source_sha256'] in partial['admitted_artifact_sha256']
+
+
+@pytest.mark.parametrize('kind', ['provider', 'cancelled', 'operator-stop', 'provider-rejection'])
+def test_graph_checkpoints_actual_pi_provider_and_cancel_exceptions(tmp_path, kind):
+    from coding.pi.rpc import PiProviderError, PiCancelled
+    from benchmarks.a5kernels.phase1_provider import ProviderRejectionError
+    from benchmarks.ascend.retrospective_runtime import _CheckedActor
+    execution, actor = graph_actor(tmp_path, [
+        '{"write":{"slot":"kernel","content":"fixed source"}}', '{"compile":{}}'])
+    error = (PiProviderError('provider failed') if kind=='provider' else
+             ProviderRejectionError(code='rate_limit', status_code=429, request_id='fixture')
+             if kind=='provider-rejection' else PiCancelled('provider aborted'))
+    def interrupted(request):raise error
+    execution.executor._backend.compile = interrupted
+    request = _request(tmp_path, execution.executor)
+    def remaining():return 30
+    remaining.stop_requested=lambda:kind=='operator-stop'
+    class Check:
+        def __call__(self):pass
+        def invalidate(self):pass
+    wrapped = _CheckedActor(execution, Check(), remaining)
+    adapter = SubjectExecutor(wrapped)
+    outcome = adapter.graph(request)
+    expected = ('operator-stop' if kind=='operator-stop' else 'cancelled' if kind=='cancelled'
+                else 'provider-failure')
+    assert outcome.observations['interruption_reason']==expected
+    assert not outcome.host_verified and outcome.source_sha256==sha(b'fixed source')
+    assert outcome.observations['evidence']['actions']==['write','compile']
+    assert adapter.graph(request).as_dict()==outcome.as_dict()
+
+
 def test_completed_graph_recovers_original_allocation_without_rewriting_checkpoint(tmp_path):
     execution, actor = graph_actor(tmp_path, [
         '{"write":{"slot":"kernel","content":"fixed source"}}', '{"run":{}}', '{"submit":{}}'])
@@ -242,3 +288,48 @@ def test_completed_graph_recovers_original_allocation_without_rewriting_checkpoi
     fresh = replace(request, branch_root=tmp_path/'fresh')
     adapter.graph(fresh, allow_device_migration=True)
     assert json.loads((fresh.branch_root/'subject-execution.json').read_bytes())['identity']['runtime']['device'] == '2'
+
+
+@pytest.mark.parametrize('allocation', ['', 'allocations/runtime-namespace'])
+def test_campaign_interruption_retains_only_project_owned_transport_evidence(tmp_path, allocation):
+    from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+    campaign = tmp_path / 'campaign'
+    directory = campaign / 'waves' / 'wave-1' / 'project-1'
+    execution, _ = graph_actor(tmp_path, [])
+    request = replace(_request(tmp_path, execution.executor), branch_root=directory)
+    binding = campaign / 'binding'
+    transport = binding / 'transport-state' / allocation
+    for key, project in [('owned', request.spec.project_id), ('sibling', 'unrelated-project')]:
+        candidate = transport / key
+        operation = candidate / 'compile' / 'operation.json'
+        operation.parent.mkdir(parents=True)
+        (candidate / 'candidate.json').write_text(json.dumps(dict(project_id=project)))
+        operation.write_text(json.dumps(dict(handle='remote:fixture:job:'+key, state='unknown',
+            observation_failure=dict(stderr=key+' compiler diagnostic'))))
+    # A separate runtime can reuse the same execution key for another project.
+    foreign = binding / 'transport-state' / 'allocations' / 'foreign-namespace'
+    operation = foreign / 'owned' / 'compile' / 'operation.json'
+    operation.parent.mkdir(parents=True)
+    (operation.parent.parent / 'candidate.json').write_text(json.dumps(dict(project_id='foreign-project')))
+    operation.write_text(json.dumps(dict(handle='remote:fixture:job:foreign', state='unknown')))
+    import time
+    epoch = time.time()
+    (transport / 'timing.jsonl').write_text(''.join(json.dumps(dict(stage='compile',
+        key=key+'/compile', started_epoch=epoch-1, ended_epoch=epoch+1))+'\n'
+        for key in ['owned', 'sibling']))
+    (foreign / 'timing.jsonl').write_text(json.dumps(dict(stage='foreign-compile',
+        key='owned/compile', started_epoch=epoch-1, ended_epoch=epoch+1))+'\n')
+    def interrupted(request):
+        raise ProjectInfrastructureError('compile observation unavailable')
+    # Keep a real composed executor while replacing only the Actor boundary.
+    class Actor:
+        executor = execution.executor
+        def __call__(self, request):return interrupted(request)
+    outcome = SubjectExecutor(Actor()).graph(request, binding_root=binding)
+    assert [row['handle'] for row in outcome.observations['remote_operations']] == ['remote:fixture:job:owned']
+    assert set(outcome.observations['timing']['by_stage_seconds']) == {'compile'}
+    assert outcome.observations['timing']['by_stage_seconds']['compile'] > 0
+    retained = [outcome.read_artifact(digest) for digest in outcome.artifacts.values()]
+    assert any(b'owned compiler diagnostic' in data for data in retained)
+    assert all(b'sibling' not in data and b'foreign' not in data for data in retained)
+    assert SubjectExecutor(Actor()).graph(request, binding_root=binding).as_dict() == outcome.as_dict()

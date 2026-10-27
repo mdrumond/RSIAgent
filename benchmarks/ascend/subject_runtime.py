@@ -269,7 +269,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             target_contract = None
         recovery = item.get('recovery')
         if recovery is None:
-            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True)
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
+                binding_root=root / 'binding')
         if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
                 or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
             raise ValueError('recovery requires a reason and retained artifact references')
@@ -282,7 +283,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         previous = actor.immutable_context
         actor.immutable_context = previous + b'\nOriginal failure context (not learned memory; read full registry by SHA): ' + canonical(preview)
         try:
-            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True)
+            return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
+                binding_root=root / 'binding')
         finally:
             actor.immutable_context = previous
 
