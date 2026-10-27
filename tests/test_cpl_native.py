@@ -374,7 +374,7 @@ def test_expired_legacy_137_is_held_without_rewriting_or_resubmitting(tmp_path, 
     assert candidate.run_remote(argv, key='retained').returncode == 137
     script = (directory/'command.sh').read_bytes()
     payload = (directory/'command.json').read_bytes()
-    now[0] = 1020.0
+    now[0] = 2000.0
     if legacy:
         with pytest.raises(_PendingObservation, match='execution allocation expired'):
             candidate.run_remote(argv, key='retained')
