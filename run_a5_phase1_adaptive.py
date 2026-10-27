@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+from benchmarks.ascend.status_descriptions import describe_statuses
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -40,7 +41,7 @@ def main(
     if not isinstance(coordinator, AdaptivePhase1Coordinator):
         raise TypeError("adaptive factory must return AdaptivePhase1Coordinator")
     result = getattr(coordinator, args.command)()
-    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    print(json.dumps(describe_statuses(result), sort_keys=True, separators=(",", ":")))
     return 0
 
 

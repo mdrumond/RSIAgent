@@ -7,6 +7,7 @@ from pathlib import Path
 
 from optimizer.jobs import JobStore, atomic, canonical, sha
 from .phase2_feedback import FeedbackStore
+from .status_descriptions import describe_statuses
 
 
 GUIDANCE = '''Investigate the supplied Phase 1, Phase 2 and optimizer observations, which are failures or
@@ -175,7 +176,8 @@ class FailureCurriculum:
                 reason=(investigation.get('reason') or out['result'].get('summary') or '')[:256],
                 task_sha256=sha(canonical(out['task'])),
                 evidence={role: ref['sha256'] for role, ref in out['evidence'].items()}))
-        return (*(_preview(row) for row in chosen), {'role': 'selection-index', 'selected': manifest})
+        return tuple(describe_statuses(row) for row in
+                     (*(_preview(row) for row in chosen), {'role': 'selection-index', 'selected': manifest}))
 
     def retry_eligible_pairs(self, state):
         """Only committed linked probe/control evidence makes an original eligible."""

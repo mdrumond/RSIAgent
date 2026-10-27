@@ -398,7 +398,9 @@ class OptimizationLoop:
                 if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
                     record = self._artifact('context-' + key, context[key])
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
-        value = self._action(stage, lambda: self.agent.complete(stage, context, self._record))
+        from benchmarks.ascend.status_descriptions import describe_statuses
+        presentation = describe_statuses(context)
+        value = self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
         if value is not None and control.pending():
             # A redirection arriving in flight supersedes this unexecuted action.
             self.state.pop('model_action', None)
