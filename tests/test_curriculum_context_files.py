@@ -207,3 +207,17 @@ def test_context_files_uses_authenticated_snapshot_without_seed_directory_lookup
     runner.snapshot = SimpleNamespace(verify=lambda:None, memory_entries=lambda:[entry])
     refs, reader = runner._context_files(runner._load_state())
     assert read_all(reader, refs[0]) == entry
+
+
+def test_partial_named_context_copy_is_atomically_healed_from_authenticated_value(tmp_path):
+    files = ContextFiles(tmp_path/'context')
+    value = dict(observed=[1, 2, 3])
+    ref = files.put('observed', value)
+    (files.root/ref['filename']).write_bytes(b'{"observed":')
+    resumed = ContextFiles(files.root)
+    assert resumed.put('observed', value) == ref
+    assert (files.root/ref['filename']).read_bytes() == canonical(value)
+    assert read_all(resumed.read, ref) == value
+    resumed.artifacts._path(ref['sha256']).write_bytes(b'corrupt authoritative data')
+    with pytest.raises(RuntimeError, match='collision'):
+        resumed.put('observed', value)

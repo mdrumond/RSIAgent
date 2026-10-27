@@ -136,11 +136,11 @@ class FeedbackStore:
         }.get(record['investigation']['status'], 'failed')
         return record
 
-    def read_evidence(self, digest, offset=0, limit=8192):
+    def read_evidence(self, digest, offset=0, limit=8192, *, records=None):
         """Authenticate a locally retained linked artifact, then return one text page."""
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 8192:
             raise ValueError('evidence page requires nonnegative offset and limit 1..8192')
-        refs = [ref for record in self.records() for ref in record['outcome']['evidence'].values()
+        refs = [ref for record in (self.records() if records is None else records) for ref in record['outcome']['evidence'].values()
                 if ref['sha256'] == digest]
         for ref in refs:
             try:
@@ -390,6 +390,11 @@ class FeedbackStore:
     @staticmethod
     def _identity(root, target, language, metadata=None):
         metadata = metadata or _read(root / 'campaign-identity.json', {})
+        if metadata.get('schema') == 'a5-phase1-production-identity-v1':
+            cell = metadata.get('cell', {})
+            if (isinstance(cell, dict) and cell.get('target') == 'a5'
+                    and cell.get('language') == 'catlass-dsl'):
+                metadata = dict(metadata, target=cell['target'], language=cell['language'])
         if (not target and metadata.get('schema') == 'ascend-native-adaptive-identity-v1'
                 and metadata.get('language') == 'ascend-c'):
             target = 'a3'
@@ -488,7 +493,8 @@ class FeedbackStore:
                 report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
                 for candidate in state.get('history', []):
                     content = candidate.get('content', {})
-                    if not candidate.get('result') or content.get('status') == 'verified':
+                    if (candidate.get('tool') or not candidate.get('candidate_sha256')
+                            or not candidate.get('result') or content.get('status') == 'verified'):
                         continue
                     source = candidate.get('source')
                     if not source:

@@ -28,7 +28,11 @@ class FailureTimeBudget:
         with self.lock:
             if self.timer:
                 return self.timer.elapsed + max(0, self.clock() - self.timer.started)
-            return json.loads(self.path.read_bytes())['elapsed_seconds'] if self.path.exists() else 0
+            if not self.path.exists():
+                return 0
+            state = json.loads(self.path.read_bytes())
+            return state['elapsed_seconds'] + (max(0, time.time() - state['active_since'])
+                if state.get('active_since') is not None else 0)
 
     @property
     def remaining_seconds(self):
@@ -155,6 +159,8 @@ class AutomaticRemediation:
                 self.save()
             directory = self.runner.root / 'original-retries' / key / obligation['pending']
             with self.budgets[key].active():
+                if self.budgets[key].expired or self.runner._remaining_seconds() <= 0:
+                    continue
                 if row['outcome']['source_type'] == 'phase1':
                     self._phase1_retry(row, directory, state)
                 elif self.retry_external:
@@ -245,6 +251,14 @@ def optimizer_retry_adapter(runner, store, config):
     from optimizer.memory import freeze_committed_phase1
 
     def retry(row, directory, seconds):
+        clock = getattr(runner, 'clock', time.monotonic)
+        deadline = clock() + seconds
+        def remaining():
+            value = deadline - clock()
+            if value <= 0:
+                from optimizer.control import WorkerStopped
+                raise WorkerStopped('Original retry elapsed-time budget exhausted')
+            return value
         memory_path = directory / 'seed-memory.json'
         directory.mkdir(parents=True, exist_ok=True)
         if memory_path.exists():
@@ -252,14 +266,27 @@ def optimizer_retry_adapter(runner, store, config):
         else:
             memory = freeze_committed_phase1(runner.root, runner.initial_memory)
             atomic(memory_path, canonical(memory))
+        allocation_path = directory / 'retry-allocation.json'
+        if allocation_path.exists():
+            allocation = json.loads(allocation_path.read_bytes())['seconds']
+        else:
+            from optimizer.jobs import JobStore
+            jobs = JobStore(directory / 'jobs')
+            retained = jobs.list()
+            allocation = (jobs.submission(retained[0]['job_id'])['max_seconds']
+                          if retained else max(1, int(remaining())))
+            atomic(allocation_path, canonical(dict(seconds=allocation)))
         expected = retry_spec(dict(selected=[row]), 'a3')
         task = expected['task']
         if row['outcome']['source_type'] == 'optimizer':
             from optimizer.cases import normalize_job_submission
             task = dict(task, submission=normalize_job_submission(task['submission']))
-        bound = dict(config, phase2_attempt_seconds=max(1, int(seconds)), max_cases=expected['max_cases'])
+        bound = dict(config, phase2_attempt_seconds=allocation, max_cases=expected['max_cases'])
+        remaining()
         executor = OptimizerTaskExecutor(directory, task, memory, bound, expected_baseline=expected)
+        executor.set_remaining_seconds(remaining())
         executor.prepare()
+        executor.set_remaining_seconds(remaining())
         result = executor.attempt('original-retry', memory_snapshot=memory)
         attempt = dict(attempt_id='original-retry', task=row['outcome']['task'], result=result,
                        execution_directory='', kind='target')
@@ -272,4 +299,10 @@ def optimizer_retry_adapter(runner, store, config):
         from .phase2_feedback import _category
         outcome['category'] = _category(outcome['task'], result)
         store._put(outcome, report['warnings'])
+        refs = {}
+        source = outcome['evidence'].get('candidate')
+        if source:
+            refs['source'] = dict(source, retained_path=str(
+                executor.store.artifact_path(executor.job_id, source['sha256'])))
+        store._retain_failure_cases(outcome, store._optimizer_failure_case(result.get('result', {}), refs))
     return retry

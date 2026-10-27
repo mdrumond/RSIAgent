@@ -43,12 +43,11 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
         CurriculumAgent(complete), execute, max_parallel=1, project_target=1)
     automatic = AutomaticRemediation(runner, target='a3')
     from types import SimpleNamespace
-    assessments = []
+    assessments, ordinary_assessments = [], []
     def assess(memory, prior, source_id):
-        # The integrated coordinator also assesses ordinary remedial lessons;
-        # this regression checks the post-link original-retry assessment only.
         if not source_id.startswith('original-retries/'):
-            return
+            ordinary_assessments.append(source_id)
+            return []
         linked = next(row for row in automatic.store.records() if
             row['outcome']['attempt_id'] == 'original' and row['outcome']['source_root'] == str(runner.root.resolve()))
         assert linked['lifecycle'] == 'fixed'
@@ -61,6 +60,7 @@ def test_failed_project_remedial_wave_then_original_retry_beyond_target(tmp_path
                     r['outcome']['source_root'] == str(runner.root.resolve()) and
                     r['outcome']['attempt_id'] == 'original')
     assert original['lifecycle'] == 'fixed'
+    assert {'wave-002/probe', 'wave-002/control'} <= set(ordinary_assessments)
     assert [r.spec.project_id for r in executions].count('original') == 2
     retries = [r for r in executions if 'original-retries' in str(r.branch_root)]
     assert retries[0].spec == executions[0].spec
@@ -136,7 +136,8 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
 
 
 @pytest.mark.parametrize("standalone", [False, "envelope", "list", "single"])
-def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone):
+@pytest.mark.parametrize("failed_retry", [False, True])
+def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone, failed_retry):
     from types import SimpleNamespace
     from tests.test_a3_reviewed_phase2 import native_source
     from tests.test_phase2_optimizer_execution import Agent, Backend, candidate, snapshot
@@ -151,16 +152,22 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
     task = dict(task_id='original', submission=dict(source='def forward(a): return a',
         entrypoint='forward', signatures=[dict(args=[dict(shape=[8], dtype='float32')])]))
     class FrozenBackend(Backend):
-        def __init__(self, latency):
+        def __init__(self, latency, failed=False):
             super().__init__()
-            self.latency = latency
+            self.latency, self.failed = latency, failed
         def prepare(self, spec, directory):
             value = super().prepare(spec, directory)
             value.update(suite_sha256='a'*64, manifest=dict(policy=dict(rtol=.001), submission=spec))
             value['cases'][0]['timing']['torch']['latency_us'] = self.latency
             return value
         def evaluate(self, source, directory, **kwargs):
-            return dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
+            result = dict(super().evaluate(source, directory, **kwargs), suite_sha256='a'*64)
+            if self.failed:
+                result.update(status='incorrect', failure_case=dict(schema='failure-case-v1',
+                    classification='host-mismatch', description='retry returned zero',
+                    inputs={'x': [1]}, expected={'output': [1]}, observed={'output': [0]},
+                    diagnostics={'index': 0}, policy={'exact': True}))
+            return result
     config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path/'validation.sh'), max_cases=2)
     original_dir = tmp_path/'external'
     first = OptimizerTaskExecutor(original_dir, task, snapshot(), config,
@@ -184,21 +191,77 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         row['outcome'].update(source_type='optimizer', original_spec=original,
             task=dict(task_id='original', submission=original))
         atomic(store.root / (row['feedback_id'] + '.json'), canonical(row))
-    received = []
+    received, children, now = [], [], [0]
     def factory(directory, task, memory, bound, **kwargs):
         received.append(memory)
         assert type(bound['phase2_attempt_seconds']) is int and bound['phase2_attempt_seconds'] == 30
         assert bound['max_cases'] == 2
-        return OptimizerTaskExecutor(directory, task, memory, bound,
-            agent=Agent([candidate('good')]), backend=FrozenBackend(12), **kwargs)
+        backend = FrozenBackend(12, failed=failed_retry)
+        backend.interrupt = not children
+        child = OptimizerTaskExecutor(directory, task, memory, bound,
+            agent=Agent([candidate('good')]), backend=backend, **kwargs)
+        prepare = child.prepare
+        def charged_prepare():
+            value = prepare()
+            now[0] += 2
+            return value
+        child.prepare = charged_prepare
+        children.append(child)
+        return child
     monkeypatch.setattr('benchmarks.ascend.phase2_optimizer_execution.OptimizerTaskExecutor', factory)
-    runner = SimpleNamespace(root=source, initial_memory=b'')
+    runner = SimpleNamespace(root=source, initial_memory=b'', clock=lambda: now[0])
     retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
-    retry(row, tmp_path/'retried', 30.75)
+    from optimizer.control import ObservationUnavailable, WorkerStopped
+    with pytest.raises(ObservationUnavailable):
+        retry(row, tmp_path/'retried', 30.75)
+    # Older retained children have no allocation receipt; recover their immutable submission.
+    (tmp_path/'retried/retry-allocation.json').unlink()
+    retry(row, tmp_path/'retried', 20.5)
+    assert children[1].job_id == children[0].job_id
+    assert children[1]._backend.prepares == 0
+    assert children[1]._agent.contexts == []
+    assert len(children[1]._backend.evaluations) == 1
+    import time
+    assert 0 < children[1].deadline - time.monotonic() <= 18.5
     retried = next(r for r in store.records() if r['feedback_id'] != row['feedback_id'])
-    assert store.link_original_retry(row['feedback_id'], retried['feedback_id'])['lifecycle'] == 'fixed'
+    linked = store.link_original_retry(row['feedback_id'], retried['feedback_id'])
+    assert linked['lifecycle'] == ('failed' if failed_retry else 'fixed')
+    if failed_retry:
+        from benchmarks.ascend.failure_curriculum import FailureCurriculum
+        from test_curriculum_context_files import read_all
+        case, = store.failure_cases(retried['feedback_id'])
+        assert case['availability']['complete']
+        feedback = FailureCurriculum(source, store.root, dict(selected=[linked], controls=[]))
+        index = feedback.context({})[-1]
+        retry_manifest, = read_all(feedback.read, index['selected'][0]['linked_retries_file'])
+        retained_case, = read_all(feedback.read, retry_manifest['failure_cases_file'])
+        assert retained_case['artifacts'] == case['artifacts']
+        for role, expected_value in dict(source='good', inputs={'x': [1]}, expected={'output': [1]},
+                                         observed={'output': [0]}, diagnostics={'index': 0}).items():
+            assert json.loads(feedback.read(case['artifacts'][role]['sha256'])['text']) == expected_value
     assert received[0]['phase'] == 'committed-phase1'
     assert len(received[0]['memory_entries']) == 1
+    # The same pending child survives a lower parent allowance and changed memory.
+    monkeypatch.setattr('optimizer.memory.freeze_committed_phase1', lambda *args: pytest.fail('snapshot refrozen'))
+    retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
+    retry(row, tmp_path/'retried', 12.5)
+    assert children[1].job_id == children[0].job_id
+    assert received[1] == received[0]
+    assert children[1]._backend.prepares == 0
+    assert children[2].job_id == children[0].job_id
+    assert children[2]._backend.evaluations == []
+    assert children[2]._agent.contexts == []
+    # Export time belongs to this retry, so exhausted setup cannot dispatch.
+    now = [0]
+    runner.clock = lambda: now[0]
+    def slow_export(*args):
+        now[0] += 40
+        return received[0]
+    monkeypatch.setattr('optimizer.memory.freeze_committed_phase1', slow_export)
+    slow_retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
+    with pytest.raises(WorkerStopped, match='elapsed-time'):
+        slow_retry(row, tmp_path/'setup-expired', 30.75)
+    assert len(children) == 3
 
 
 def test_original_retry_propagates_only_remaining_failure_seconds(tmp_path):
@@ -278,3 +341,92 @@ def test_selection_uses_failure_allowance_and_discards_late_wave(tmp_path, late_
     assert runner.run()['status'] == 'STALLED'
     assert len(prompts) == 2 and not executed
     assert next(iter(automatic.state['failures'].values()))['remaining_seconds'] == 0
+
+
+def test_interrupted_failure_clock_excludes_expired_obligation(tmp_path, monkeypatch):
+    from test_generic_failure_feedback import phase1
+    phase1(tmp_path/'source')
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: pytest.fail('expired dispatch'), max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', seconds=10,
+        sources=[dict(type='phase1', root=str(tmp_path/'source'))])
+    state = runner._load_state()
+    automatic.refresh(state)
+    budget = next(iter(automatic.budgets.values()))
+    budget.path.parent.mkdir(parents=True, exist_ok=True)
+    budget.path.write_text(json.dumps(dict(max_seconds=10, elapsed_seconds=2, active_since=100)))
+    monkeypatch.setattr('time.time', lambda: 109)
+    assert not automatic.refresh(state)
+    assert next(iter(automatic.state['failures'].values()))['remaining_seconds'] == 0
+
+
+def test_retry_rechecks_recovered_clock_inside_active(tmp_path, monkeypatch):
+    from test_generic_failure_feedback import phase1
+    phase1(tmp_path/'source')
+    runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}',
+        CurriculumAgent(lambda _: ''), lambda _: None, max_parallel=1, project_target=1)
+    automatic = AutomaticRemediation(runner, target='a3', seconds=10,
+        sources=[dict(type='phase1', root=str(tmp_path/'source'))])
+    state = runner._load_state()
+    automatic.refresh(state)
+    key = next(iter(automatic.budgets))
+    automatic.store.update_investigation(key, status='ready-to-retry', evidence=['probe'])
+    automatic.refresh(state)
+    budget = automatic.budgets[key]
+    budget.path.parent.mkdir(parents=True, exist_ok=True)
+    budget.path.write_text(json.dumps(dict(max_seconds=10, elapsed_seconds=2, active_since=100)))
+    wall = iter([107, 109])
+    monkeypatch.setattr('time.time', lambda: next(wall, 109))
+    automatic._phase1_retry = lambda *args: pytest.fail('expired dispatch')
+    automatic.retry_ready(state)
+    assert automatic.state['failures'][key]['retries'] == []
+
+
+@pytest.mark.parametrize('reviewed', [False, True])
+def test_nested_original_retry_reads_parent_memory_artifacts_and_reviewed_seed(tmp_path, reviewed):
+    import base64
+    import shutil
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
+    from benchmarks.ascend.agent_presentation import MemoryArtifactReader
+    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from tests.test_a5_phase2_adaptive_memory import _source
+    source_root, source, review, memory = _source(tmp_path/'history')
+    parent = tmp_path/'parent'
+    initial = b'{}'
+    entries = [base64.b64encode(canonical_bytes(memory)).decode()]
+    if reviewed:
+        snapshot = admit_adaptive_snapshot(source_root, b'', review, source, parent)
+        initial = canonical_bytes(dict(schema='ascend-phase2-curriculum-seed-v1',
+            snapshot_id=snapshot.snapshot_id, phase1_memory=[memory]))
+        entries = []
+    requests = []
+    def execute(request):
+        requests.append(request)
+        assert request.memory_root == parent
+        assert request.branch_root.is_relative_to(parent/'original-retries')
+        current = ContentAddressedArtifacts(request.branch_root/'artifacts')
+        reader = MemoryArtifactReader(request, current)
+        assert reader.read_bytes(memory['source_revision']) == b'actual candidate source'
+        evidence = memory['host_facts'][0]['evidence_sha256']
+        assert json.loads(reader.read_bytes(evidence))['host'] == 'verified'
+        assert not current._path(evidence).exists()
+        with pytest.raises(FileNotFoundError):
+            reader.read_bytes('f'*64)
+        return _result(request.spec, True, 'host pass')
+    runner = AdaptivePhase1Coordinator(parent, 'Retry original.', initial,
+        CurriculumAgent(lambda _: ''), execute, max_parallel=1, project_target=1)
+    state = runner._load_state()
+    state['memory_bytes_base64'] = entries
+    if not reviewed:
+        shutil.copytree(source_root/'waves', parent/'waves', dirs_exist_ok=True)
+    retry = object.__new__(AutomaticRemediation)
+    retry.runner, retry.target, retry.store = runner, 'a5', FeedbackStore(tmp_path/'feedback')
+    row = dict(outcome=dict(original_spec=_project('original', 'gm-ub-movement')))
+    directory = parent/'original-retries'/'failure'/'retry-1'
+    retry._phase1_retry(row, directory, state)
+    assert len(requests) == 1
+    # Retained retry replay observes its committed result without another actor.
+    retry._phase1_retry(row, directory, state)
+    assert len(requests) == 1
