@@ -143,7 +143,7 @@ def build_controller(job):
         model = (options["profile"].identity if job["target"] == "a3" else options["cell"].model)
         if model.backend_model.value != job["model"]:
             raise ValueError("configured model label differs from selected provider")
-        if job["phase"] == 2:
+        if job["phase"] == 2 or job.get("phase1_original_retry"):
             snapshot = _snapshot(job, options)
             if job["target"] == "a3":
                 source = snapshot.destination.source_identity
@@ -177,7 +177,7 @@ def build_controller(job):
                     if key not in {"schema", "runtime_budget"} and current.get(key) != value:
                         raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
-        if job.get('feedback_root') and job['phase'] == 1:
+        if job.get('feedback_root') and job['phase'] == 1 and not job.get('phase1_original_retry'):
             from .failure_curriculum import FailureCurriculum
             data = (Path(job['root']) / 'phase2-feedback.json').read_bytes()
             if hashlib.sha256(data).hexdigest() != job['feedback_selection_sha256']:
@@ -185,7 +185,7 @@ def build_controller(job):
             feedback = FailureCurriculum(job['root'], job['feedback_root'], json.loads(data))
             coordinator.failure_feedback = feedback
             coordinator.curriculum.failure_feedback = feedback
-        if job['phase'] == 1 and settings.get('automatic_remediation', False):
+        if job['phase'] == 1 and settings.get('automatic_remediation', False) and not job.get('phase1_original_retry'):
             from .automatic_remediation import AutomaticRemediation, optimizer_retry_adapter
             from optimizer.worker import load_config
             automatic = AutomaticRemediation(coordinator, target=job['target'],
@@ -966,8 +966,10 @@ def main(argv=None, *, screen=start_screen):
             parser.error("Phase 2 and practice budgets must be finite positive seconds")
         if (args.failure_id or args.retry_feedback_id) and not args.feedback_root:
             parser.error('feedback selection requires --feedback-root')
-        if (args.phase == 1 and args.retry_feedback_id) or (args.phase == 2 and args.failure_id):
-            parser.error('failure IDs are Phase 1; retry-feedback-id is Phase 2')
+        if args.retry_feedback_id and (args.failure_id or args.approval_mode or args.project_target != 1):
+            parser.error('original retry requires one project, no failure IDs and no approval mode')
+        if args.retry_feedback_id and (args.phase1_root is None or args.review is None):
+            parser.error('original retry requires --phase1-root and --review')
         if args.phase == 2 and args.feedback_root and not args.retry_feedback_id:
             parser.error('Phase 2 feedback requires --retry-feedback-id')
         if args.retry_feedback_id and args.target_goal:
@@ -1012,8 +1014,8 @@ def main(argv=None, *, screen=start_screen):
                     original = selection['selected'][0]['outcome'].get('original_spec')
                     ProjectSpec.from_mapping(original)
                     retry = dict(source_type='phase1', original_spec=original)
-                else:
-                    retry = retry_spec(selection, args.target) if args.retry_feedback_id else None
+                elif args.retry_feedback_id:
+                    parser.error('only original Phase 1 project retries are supported; Phase 2 launches remain retired')
             except (ValueError, KeyError, OSError) as error:
                 parser.error(str(error))
         control.mkdir(parents=True, exist_ok=False)
@@ -1043,7 +1045,7 @@ def main(argv=None, *, screen=start_screen):
             if retry:
                 public.update(retry_feedback_id=args.retry_feedback_id, retry_spec=retry)
                 if retry.get('source_type') == 'phase1':
-                    public['phase1_original_retry'] = True
+                    public.update(phase1_original_retry=True, phase2_max_seconds=args.phase2_max_seconds)
                     public.pop('optimizer_goal', None)
                     public.pop('autonomous_goal', None)
         _write(root / "campaign-run.json", public)
