@@ -107,6 +107,7 @@ class AdaptiveProjectRequest:
     publish_learning: bool = True
     failure_context: Mapping[str, object] | None = None
     actor_memory_delivery: str = "indexed"
+    initial_source: str | None = None
 
 
 @dataclass(frozen=True)

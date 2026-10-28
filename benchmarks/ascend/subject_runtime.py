@@ -335,6 +335,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
                 or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
             raise ValueError('recovery requires a reason and retained artifact references')
+        if 'before-source' in recovery['artifacts']:
+            request = replace(request, initial_source=store.read_bytes(recovery['artifacts']['before-source']).decode('utf-8'))
         for digest in set(recovery['artifacts'].values()):
             branch_artifacts.put_bytes(store.read_bytes(digest))
         registry = branch_artifacts.put_bytes(canonical(recovery))

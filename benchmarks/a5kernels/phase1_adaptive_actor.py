@@ -595,6 +595,8 @@ class AdaptiveActorProjectExecutor:
         if actions.failure_context is not None:
             from benchmarks.ascend.failure_handoff import FailureArtifactReader
             actions.read_artifacts = FailureArtifactReader(actions.read_artifacts, actions.failure_context)
+        if request.initial_source is not None:
+            actions.restore_source(request.initial_source)
         repair_protocol = ''
         if request.spec.failure_mode is not FailureMode.NONE:
             repair_protocol = (
