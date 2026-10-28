@@ -254,6 +254,63 @@ def freeze_reference(prepared, directory):
     return manifest
 
 
+def load_reference(directory, device):
+    """Authenticate a trusted frozen bundle before torch deserialization."""
+    import torch
+    root = Path(directory)
+    manifest = json.loads((root / 'manifest.json').read_text())
+    if manifest['policy'] != POLICY:
+        raise ValueError('baseline comparison policy differs')
+    if hashlib.sha256((root / 'reference.py').read_bytes()).hexdigest() != manifest['source_sha256']:
+        raise ValueError('baseline source digest differs')
+    if digest(manifest['cases']) != manifest['suite_sha256']:
+        raise ValueError('baseline suite digest differs')
+    payload = (root / 'baseline.pt').read_bytes()
+    if hashlib.sha256(payload).hexdigest() != manifest['baseline_sha256']:
+        raise ValueError('baseline tensor digest differs')
+    import io
+    frozen = torch.load(io.BytesIO(payload), map_location=device, weights_only=False)
+    spec = manifest['submission']
+    if hashlib.sha256(spec['source'].encode()).hexdigest() != manifest['source_sha256']:
+        raise ValueError('baseline submission source differs')
+    namespace = {'__name__': 'optimizer_frozen_reference', 'torch': torch}
+    # Initialization is reproducible; retained weights replace initialized state.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(manifest['seed'])
+        exec(compile(spec['source'], '<frozen-reference>', 'exec'), namespace)
+        model = namespace[spec['entrypoint']]
+        if isinstance(model, type):
+            model = model(*spec.get('init_args', []), **spec.get('init_kwargs', {})).to(device).eval()
+            model.load_state_dict(frozen['state_dict'], strict=True)
+            model.requires_grad_(False)
+    prepared = PreparedReference(spec, model, frozen['cases'], manifest)
+    validate_reference(prepared)
+    return prepared
+
+
+def validate_reference(prepared):
+    """Apply the frozen-suite contract equally to direct and serialized callers."""
+    manifest = prepared.manifest
+    if manifest['policy'] != POLICY:
+        raise ValueError('baseline comparison policy differs')
+    if hashlib.sha256(prepared.spec['source'].encode()).hexdigest() != manifest['source_sha256']:
+        raise ValueError('baseline submission source differs')
+    if digest(manifest['cases']) != manifest['suite_sha256']:
+        raise ValueError('baseline suite digest differs')
+    if _model_state(prepared.model) != manifest['state']:
+        raise ValueError('baseline model state differs')
+    if len(prepared.cases) != len(manifest['cases']):
+        raise ValueError('baseline case count differs')
+    for row, expected in zip(prepared.cases, manifest['cases']):
+        if row['case'] != {k: v for k, v in expected.items() if k not in ('inputs', 'outputs')}:
+            raise ValueError('baseline case identity differs')
+        if _input_state(row['args'], row['kwargs']) != expected['inputs']:
+            raise ValueError('baseline inputs differ')
+        outputs = {p: _tensor_identity(x) if x is not None else None for p, x in _leaves(row['output'])}
+        if outputs != expected['outputs']:
+            raise ValueError('baseline outputs differ')
+
+
 def main(argv=None):
     import argparse
     parser = argparse.ArgumentParser(description="Freeze a deterministic Torch reference in a worker")

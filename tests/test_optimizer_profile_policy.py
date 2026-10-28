@@ -120,7 +120,8 @@ def test_remote_reference_profile_selects_one_and_binds_suite_identity(tmp_path,
     prepared = suite()
     monkeypatch.setitem(sys.modules, 'torch_npu', SimpleNamespace())
     monkeypatch.setattr(torch, 'npu', SimpleNamespace(set_device=lambda device: None), raising=False)
-    monkeypatch.setattr(native, 'load_reference', lambda *a: prepared)
+    from optimizer import reference
+    monkeypatch.setattr(reference, 'load_reference', lambda *a: prepared)
     calls = []
     monkeypatch.setattr(profiles, 'profile', lambda fn, directory, **kwargs: calls.append(kwargs) or {'groups': []})
     result = execute({'operation': 'profile', 'directory': str(tmp_path), 'baseline': '/frozen'})
