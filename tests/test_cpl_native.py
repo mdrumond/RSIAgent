@@ -22,7 +22,9 @@ class Remote:
     def __call__(self, argv, **options):
         self.calls.append(argv)
         action = argv[2]
-        if action == 'upload':
+        if action == 'capabilities':
+            value = dict(state='available', target='fixture', backend='remote-agent', capabilities=dict(upload=True))
+        elif action == 'upload':
             value = dict(state='completed', target='fixture', exit=0)
         elif action == 'run':
             handle = 'remote:fixture:job:'+str(len(self.jobs)+1)
@@ -94,6 +96,8 @@ def test_ambiguous_submission_is_never_repeated(tmp_path):
     calls = []
     def disconnected(argv, **options):
         calls.append(argv)
+        if argv[2] == 'capabilities':
+            return Remote()(argv, **options)
         if argv[2] == 'upload':
             return subprocess.CompletedProcess(argv, 0, '{"state":"completed"}', '')
         raise subprocess.TimeoutExpired(argv, 1)
@@ -680,6 +684,8 @@ def test_ambiguous_immutable_upload_is_quarantined_but_execution_stays_blocking(
     from benchmarks.ascend.runtime_allocation import unsettled_operations
     remote = Remote()
     def lost_upload(argv, **options):
+        if argv[2] == 'capabilities':
+            return remote(argv, **options)
         remote.calls.append(argv)
         raise subprocess.TimeoutExpired(argv, 1)
     candidate = backend(tmp_path, lost_upload)
@@ -690,7 +696,7 @@ def test_ambiguous_immutable_upload_is_quarantined_but_execution_stays_blocking(
     assert unsettled_operations(candidate.root) == []
     record = json.loads((candidate.root/plan.execution_id/'upload/operation.json').read_text())
     assert record['state'] == 'quarantined'
-    assert len(remote.calls) == 1
+    assert len([call for call in remote.calls if call[2] == 'upload']) == 1
     with pytest.raises(_PendingObservation):
         candidate.run_remote(('true',), key='compile')
     assert len(unsettled_operations(candidate.root)) == 1
@@ -743,3 +749,76 @@ def test_terminal_looking_submission_without_job_handle_remains_blocking(tmp_pat
     with pytest.raises(_PendingObservation, match='ambiguous'):
         candidate.run_remote(('true',), key='compile')
     assert len(calls) == 1
+
+
+def test_failed_upload_recovery_does_not_block_next_environment_admission(tmp_path, monkeypatch):
+    from test_environment_admission import setup
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    remote = Remote()
+    handle = 'remote:fixture:transfer:failed-copy'
+    def transfer(argv, **options):
+        if argv[2] == 'upload':
+            remote.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='queued', handle=handle)), '')
+        return remote(argv, **options)
+    candidate = backend(tmp_path, transfer)
+    remote.unavailable = True
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    with pytest.raises(_PendingObservation):
+        candidate.compile(plan, tmp_path/'bundle')
+    remote.exit_code = 1
+    admission, health, probes, _ = setup(tmp_path/'environment', monkeypatch)
+    admission.transports = (candidate,)
+    admission.pending_root = tmp_path
+    admission(lambda:100)
+    record = json.loads((candidate.root/plan.execution_id/'upload/operation.json').read_text())
+    assert record['state'] == 'failed' and record['terminal_failure']['handle'] == handle
+    assert 'result' not in record and unsettled_operations(tmp_path) == []
+    observations = len([call for call in remote.calls if call[2] == 'observe'])
+    admission(lambda:100)
+    assert len([call for call in remote.calls if call[2] == 'observe']) == observations
+    assert health == [11,11] and probes == ['probe']
+    remote.exit_code = 0
+    assert candidate.run_remote(('true',), key='independent').returncode == 0
+
+
+def test_ssh_upload_uses_bounded_sync_copy_and_caches_public_capabilities(tmp_path):
+    from dataclasses import replace
+    remote = Remote()
+    def ssh(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'capabilities':
+            value = json.loads(result.stdout)
+            value['backend'] = 'ssh'
+            result.stdout = json.dumps(value)
+        elif argv[2] == 'upload':
+            assert '--receipt-file' not in argv and '--no-wait' not in argv
+            assert 0 < options['timeout'] <= 600
+        elif argv[2] == 'run':
+            assert '--receipt-file' in argv
+        return result
+    candidate = backend(tmp_path, ssh)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    assert candidate.compile(plan, tmp_path/'bundle').library_sha256 == 'b'*64
+    assert candidate.compile(replace(plan, source=plan.source+'\n'), tmp_path/'next').library_sha256 == 'b'*64
+    assert len([call for call in remote.calls if call[2] == 'capabilities']) == 1
+    assert len([call for call in remote.calls if call[2] == 'upload']) == 2
+
+
+def test_interrupted_ssh_copy_quarantines_only_its_immutable_destination(tmp_path):
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    calls = []
+    def ssh(argv, **options):
+        calls.append(argv)
+        if argv[2] == 'capabilities':
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(target='fixture', state='available',
+                backend='ssh', capabilities=dict(upload=True))), '')
+        assert argv[2] == 'upload' and '--receipt-file' not in argv and '--no-wait' not in argv
+        raise subprocess.TimeoutExpired(argv, options['timeout'])
+    candidate = backend(tmp_path, ssh)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    for _ in range(2):
+        with pytest.raises(_PendingObservation):
+            candidate.compile(plan, tmp_path/'bundle')
+    assert unsettled_operations(candidate.root) == []
+    assert len([call for call in calls if call[2] == 'upload']) == 1

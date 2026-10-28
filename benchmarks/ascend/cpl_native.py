@@ -49,6 +49,7 @@ class CplNativeCandidateBackend:
         self.root, self.timeout = Path(state_directory), timeout
         self.remaining_seconds, self._run, self.clock = remaining_seconds, process_runner, clock
         self.wall_clock = wall_clock
+        self._capabilities = None
         self.submission_reserve = submission_reserve_seconds
         self.cleanup_reserve = cleanup_reserve_seconds
         if min(self.submission_reserve, self.cleanup_reserve) < 0:
@@ -182,11 +183,15 @@ class CplNativeCandidateBackend:
                 raise self._pending('CPL submission outcome is ambiguous; do not resubmit')
             if deadline-self.clock() < self.submission_reserve:
                 raise self._pending('CPL submission not started: insufficient elapsed allocation', 'deadline-exhausted')
-            record['state'] = 'submitting'
-            _save(path, record)
             submitted_arguments = (*arguments, '--receipt-file', str(receipt.resolve()))
             if kind == 'transfer':
-                submitted_arguments += ('--no-wait',)
+                capabilities = self._upload_capabilities(seconds=deadline-self.clock())
+                submitted_arguments = (submitted_arguments + ('--no-wait',)
+                    if capabilities['backend'] == 'remote-agent' else arguments)
+            if deadline-self.clock() < self.submission_reserve:
+                raise self._pending('CPL submission not started: insufficient elapsed allocation', 'deadline-exhausted')
+            record['state'] = 'submitting'
+            _save(path, record)
             try:
                 value = self._call(submitted_arguments, seconds=max(.001, deadline-self.clock()))
             except _PendingObservation:
@@ -249,6 +254,8 @@ class CplNativeCandidateBackend:
             return self._call(arguments, seconds=seconds)
         if kind == 'transfer':
             if value.get('state') != 'completed':
+                record['terminal_failure'] = value
+                _save(path, record)
                 raise ProjectInfrastructureError('CPL upload did not complete')
             result = value
         else:
@@ -283,7 +290,8 @@ class CplNativeCandidateBackend:
         deadline = self.clock() + min(seconds, self.timeout)
         for path in Path(getattr(self, 'recovery_root', self.root)).rglob('operation.json'):
             record = json.loads(path.read_text())
-            if ('result' in record or record.get('state') in ('new', 'cancelled', 'quarantined')):
+            if ('result' in record or record.get('state') in ('new', 'cancelled', 'quarantined')
+                    or record.get('state') == 'failed' and record.get('terminal_failure')):
                 continue
             identity = record.get('identity', {})
             if identity.get('route') != self.runtime_identity or identity.get('workspace') != str(self._workspace):
@@ -304,6 +312,10 @@ class CplNativeCandidateBackend:
                 raise ProjectInfrastructureError('CPL observation returned a foreign handle')
             record['state'] = observed.get('state')
             _save(path, record)
+            if kind == 'transfer' and record['state'] == 'failed':
+                record['terminal_failure'] = observed
+                _save(path, record)
+                continue
             if record['state'] in ('completed', 'failed'):
                 # Explicit read-only recovery has its own bounded allocation; it
                 # never extends the frozen execution deadline or submits work.
@@ -313,6 +325,15 @@ class CplNativeCandidateBackend:
                                            collection_expires_at=self.wall_clock()+max(0, left))
                 except _PendingObservation:
                     continue  # Terminal work cannot occupy a device; incomplete logs remain retained.
+
+    def _upload_capabilities(self, *, seconds):
+        if self._capabilities is None:
+            value = self._call(('capabilities', self.target), seconds=seconds)
+            if (value.get('target') != self.target or value.get('backend') not in ('ssh', 'remote-agent')
+                    or value.get('state') != 'available' or not value.get('capabilities', {}).get('upload')):
+                raise ProjectInfrastructureError('CPL target does not advertise a supported upload backend')
+            self._capabilities = value
+        return self._capabilities
 
     def _restore_receipt(self, path, record, receipt, kind):
         if record.get('handle') or not receipt.exists():
