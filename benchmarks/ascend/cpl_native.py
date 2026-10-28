@@ -144,7 +144,9 @@ class CplNativeCandidateBackend:
         def recover_expiry_inner():
             # Execution stops at expiry; allow only bounded observation/cleanup.
             # A failed compiler may already have exited before the final poll.
-            cleanup_deadline = self.clock() + max(0, record['expires_at']-self.wall_clock())
+            record.setdefault('cleanup_expires_at', min(record['expires_at'], self.wall_clock()+45))
+            _save(path, record)
+            cleanup_deadline = self.clock() + max(0, record['cleanup_expires_at']-self.wall_clock())
             def cleanup_call(arguments):
                 seconds = cleanup_deadline-self.clock()
                 if seconds <= 0:
@@ -227,8 +229,11 @@ class CplNativeCandidateBackend:
     def _collect_operation(self, path, record, value, kind, *, collection_expires_at=None):
         # Result collection cannot dispatch work or extend its frozen expiry.
         # Checkpoint each stream so a disconnect never loses compiler feedback.
+        if collection_expires_at is None:
+            record.setdefault('cleanup_expires_at', min(record['expires_at'], self.wall_clock()+45))
+            _save(path, record)
         deadline = self.clock() + max(0, (collection_expires_at if collection_expires_at is not None
-            else record['expires_at'])-self.wall_clock())
+            else record['cleanup_expires_at'])-self.wall_clock())
         def collect(arguments):
             seconds = deadline-self.clock()
             if collection_expires_at is None and self.remaining_seconds is not None:

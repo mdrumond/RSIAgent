@@ -709,3 +709,22 @@ def test_explicit_readonly_recovery_quarantines_legacy_unknown_upload(tmp_path):
     candidate.recover_owned_operations()
     assert unsettled_operations(candidate.root) == []
     assert candidate._run.calls == []
+
+
+def test_terminal_cleanup_deadline_is_frozen_across_resume(tmp_path):
+    now = [1000.]
+    remote = Remote()
+    def slow_logs(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'logs':
+            assert options['timeout'] <= 45
+            now[0] += 46
+        return result
+    candidate = backend(tmp_path, slow_logs, clock=lambda:now[0], wall_clock=lambda:now[0])
+    for _ in range(2):
+        with pytest.raises(_PendingObservation, match='terminal result collection pending'):
+            candidate.run_remote(('true',), key='compile')
+    record = json.loads((candidate.root/'compile/operation.json').read_text())
+    assert record['cleanup_expires_at'] == 1045
+    assert len([call for call in remote.calls if call[2] == 'logs']) == 1
+    assert len([call for call in remote.calls if call[2] == 'run']) == 1
