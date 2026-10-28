@@ -141,6 +141,12 @@ class NativeAdaptiveKnowledge:
         return dict(target=self.config.target, arch=self.config.arch,
                     environment=self.config.environment_identity or {})
 
+    def reference_query(self, action, *, root, role, task, context, check_remaining):
+        """Search for one explicit caller without borrowing curriculum state."""
+        results, details = self._search(action, Path(root), role, task,
+            dict(context, **self.context()), check_remaining)
+        return _Results(results, details)
+
     def actor_query(self, payload, context):
         if set(payload) - {'query', 'limit'}:
             raise ValueError('knowledge action fields must be query and optional limit')
