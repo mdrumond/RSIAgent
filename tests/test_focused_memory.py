@@ -289,3 +289,22 @@ def test_corrupted_cached_witness_cannot_support_admission(tmp_path):
     h.calls.clear()
     result=h.run(tmp_path/'probe-1')
     assert result['decision']=='inconclusive' and not h.calls
+
+
+def test_initialized_source_is_editable_but_has_no_verification_authority(tmp_path):
+    from dataclasses import replace
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    from test_a5_phase1_adaptive_actor import SourceBackend, ScriptedActor, _request
+    executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'evidence.jsonl'))
+    class SeededActor(ScriptedActor):
+        def __call__(self, *args, **kwargs):
+            actions=kwargs['action_executor']
+            assert actions.source=='fixed source' and actions.latest is None
+            assert actions.latest_source_sha256 is None
+            return super().__call__(*args,**kwargs)
+    actor=SeededActor(['{"compile":{}}','{"run":{}}','{"submit":{}}'])
+    request=replace(_request(tmp_path,executor),initial_source='fixed source',publish_learning=False)
+    result=AdaptiveActorProjectExecutor(executor,actor,object())(request)
+    assert result.evidence.verified and not actor.distill_calls

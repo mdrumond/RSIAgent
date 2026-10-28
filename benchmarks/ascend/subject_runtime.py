@@ -2,7 +2,7 @@
 import argparse
 from copy import copy
 from contextlib import redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import io
 import json
