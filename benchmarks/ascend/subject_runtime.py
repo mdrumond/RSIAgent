@@ -590,6 +590,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         for record in json.loads(snapshot)['memories']:
             for digest in memory_artifacts(record):
                 child.artifacts.put_bytes(store.read_bytes(digest))
+        for digest in set(item.get('recovery', {}).get('artifacts', {}).values()):
+            child.artifacts.put_bytes(store.read_bytes(digest))
         return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
 
     def replay_memory_source(request, source_sha256, directory, *, remaining_seconds):
@@ -624,7 +626,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             from .focused_memory import FocusedMemoryVerifier
             judge_type = lambda complete, select, execute, **kw: FocusedMemoryVerifier(
                 complete, select, replay_memory_source, execute, store.read_bytes,
-                measure_pair=bound.get('measure_memory_pair'), **kw)
+                measure_pair=bound.get('measure_memory_pair'), witness_cache=root / 'memory-replay-witnesses', **kw)
         else:
             judge_type = MemoryVerifier
         judge = judge_type(role_complete('memory_verifier'), select_trial, execute_trial_arm,

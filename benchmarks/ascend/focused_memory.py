@@ -57,21 +57,23 @@ def workload_identity(spec):
 
 class FocusedMemoryVerifier(MemoryVerifier):
     mode = 'focused'
+    protocol = 'focused-adaptation-v1'
 
     def __init__(self, complete, select_trial, replay_source, execute_transfer, read_artifact, *,
                  model_identity, runtime_identity, max_seconds=1800, arm_seconds=600,
-                 measure_pair=None, clock=time.monotonic, wall_clock=time.time):
+                 measure_pair=None, witness_cache=None, clock=time.monotonic, wall_clock=time.time):
         super().__init__(complete, select_trial, execute_transfer, model_identity=model_identity,
             runtime_identity=runtime_identity, max_seconds=max_seconds, arm_seconds=arm_seconds,
             clock=clock, wall_clock=wall_clock)
         self.replay_source, self.read_artifact, self.measure_pair = replay_source, read_artifact, measure_pair
+        self.witness_cache = Path(witness_cache) if witness_cache is not None else None
 
     def evaluate(self, proposal, baseline_bytes, treatment_bytes, directory, *, remaining_seconds,
                  source_request, task=None, sequence=0, check_remaining=None, **unused):
         parent = self.clock() + _seconds(remaining_seconds)
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        identity = json.loads(canonical(dict(mode=self.mode, proposal=proposal,
+        identity = json.loads(canonical(dict(mode=self.mode, protocol=self.protocol, proposal=proposal,
             baseline_sha256=_hash(baseline_bytes), treatment_sha256=_hash(treatment_bytes),
             source_request=source_request, model=self.model, runtime=self.runtime,
             max_seconds=self.seconds, arm_seconds=self.arm_seconds, sequence=sequence,
@@ -105,7 +107,7 @@ class FocusedMemoryVerifier(MemoryVerifier):
                     raise TimeoutError('focused admission elapsed allocation exhausted')
                 return cap
 
-            def execute(name, callback):
+            def execute_stage(name, callback):
                 if name in state['stages']:
                     return state['stages'][name]
                 started, epoch = self.clock(), self.wall_clock()
@@ -143,6 +145,39 @@ class FocusedMemoryVerifier(MemoryVerifier):
                 remaining()
                 return stage
 
+            def execute(name, callback):
+                if name not in {'control', 'treatment'} or self.witness_cache is None:
+                    return execute_stage(name, callback)
+                source = proposal['before' if name == 'control' else 'after']['sha256']
+                witness_identity = dict(protocol=self.protocol, source=source,
+                    request=source_request, runtime=self.runtime)
+                cache = self.witness_cache / _hash(canonical(witness_identity))
+                cache.mkdir(parents=True, exist_ok=True)
+                with self._lock(cache):
+                    witness = cache / 'witness.json'
+                    if name not in state['stages'] and witness.exists():
+                        retained = json.loads(witness.read_bytes())
+                        if retained['identity'] != witness_identity:
+                            raise ValueError('replay witness identity changed')
+                        row = retained['stage']
+                        cached_store = ContentAddressedArtifacts(cache / 'artifacts')
+                        for digest in row['outcome']['artifacts'].values():
+                            if store.put_bytes(cached_store.read_bytes(digest)) != digest:
+                                raise ValueError('replay witness bytes changed')
+                        stage = dict(row, reused=True, elapsed_seconds=0,
+                                     started_epoch=self.wall_clock(), ended_epoch=self.wall_clock())
+                        state['stages'][name] = stage
+                        state['trace'].append(dict(kind='replay-witness-reused', stage=name))
+                        save()
+                        return stage
+                    stage = execute_stage(name, callback)
+                    if stage['status'] == 'completed':
+                        cached_store = ContentAddressedArtifacts(cache / 'artifacts')
+                        for digest in stage['outcome']['artifacts'].values():
+                            cached_store.put_bytes(store.read_bytes(digest))
+                        atomic(witness, canonical(dict(identity=witness_identity, stage=stage)))
+                    return stage
+
             try:
                 remaining()
                 before, after = proposal.get('before'), proposal.get('after')
@@ -170,6 +205,13 @@ class FocusedMemoryVerifier(MemoryVerifier):
                         related = ProjectSpec.from_mapping(selected['spec'])
                         if workload_identity(original) == workload_identity(related):
                             raise ValueError('transfer must change the source workload contract')
+                        # Original broken source is task scaffolding, not a delivered lesson.
+                        # The repaired source and advice remain available only through KDB.
+                        selected = {key:value for key,value in selected.items() if key != 'recovery'}
+                        selected['recovery'] = dict(reason=(
+                            'Adapt this retained broken implementation to the frozen related workload; '
+                            'use the original and related host contracts for correctness.'),
+                            artifacts={'before-source': before['sha256']})
                         state['task'] = json.loads(canonical(selected))
                         save()
                     callbacks = [
@@ -204,7 +246,7 @@ class FocusedMemoryVerifier(MemoryVerifier):
                     error_type=type(error).__name__, error=str(error))
             finally:
                 budget.close()
-            decision.update(mode=self.mode, evaluation_id=_hash(canonical(identity)), trial_task=state['task'],
+            decision.update(mode=self.mode, protocol=self.protocol, evaluation_id=_hash(canonical(identity)), trial_task=state['task'],
                 evidence_stages={name: dict(status=row['status'], host_verified=(row.get('outcome') or {}).get('host_verified'),
                                            elapsed_seconds=row.get('elapsed_seconds'))
                                  for name, row in state['stages'].items()},

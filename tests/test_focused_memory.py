@@ -233,3 +233,59 @@ def test_completed_measurement_survives_process_loss_before_judgment(tmp_path):
     assert result['decision'] == 'accept' and result['claim_kind'] == 'performance'
     assert h.calls == calls and h.calls.count('measure-pair') == 1
     assert result['evidence_stages']['measurement']['status'] == 'completed'
+
+
+def test_adaptation_seed_contains_only_original_broken_source(tmp_path):
+    h=Harness(tmp_path)
+    observed=[]
+    original=h.verifier.execute_arm
+    def transfer(task,*args,**kwargs):
+        observed.append(task)
+        assert task['recovery']['artifacts']=={'before-source':h.before}
+        assert h.after not in task['recovery']['artifacts'].values()
+        return original(task,*args,**kwargs)
+    h.verifier.execute_arm=transfer
+    result=h.run(tmp_path/'evaluation')
+    assert result['decision']=='accept' and result['protocol']=='focused-adaptation-v1'
+    assert observed[0]==result['trial_task']
+
+
+def test_retry_reuses_authenticated_source_witnesses_but_runs_new_adaptation(tmp_path):
+    h=Harness(tmp_path,fail='transfer')
+    h.verifier.witness_cache=tmp_path/'witnesses'
+    first=h.run(tmp_path/'probe-0')
+    assert first['decision']=='inconclusive' and h.calls==['control','treatment','transfer']
+    h.calls.clear();h.fail=None
+    second=h.run(tmp_path/'probe-1')
+    assert second['decision']=='accept' and h.calls==['transfer']
+    assert second['evidence_stages']['control']['elapsed_seconds']==0
+    for role in ['control','treatment']:
+        outcome=second['arms'][role]
+        artifacts=ContentAddressedArtifacts(tmp_path/'probe-1/artifacts')
+        assert all(artifacts.read_bytes(digest) for digest in outcome['artifacts'].values())
+
+
+@pytest.mark.parametrize('change',['device','contract','source'])
+def test_changed_replay_identity_requires_new_witnesses(tmp_path,change):
+    h=Harness(tmp_path)
+    h.verifier.witness_cache=tmp_path/'witnesses'
+    assert h.run(tmp_path/'probe-0')['decision']=='accept'
+    h.calls.clear()
+    if change=='device':h.verifier.runtime={'device':'1'}
+    elif change=='contract':h.request['artifacts']['extra-contract']=h.store.put_json({'oracle':'changed'})
+    else:
+        h.before=h.store.put_bytes(b'different broken source')
+        h.proposal['before']['sha256']=h.before
+    assert h.run(tmp_path/'probe-1')['decision']=='accept'
+    assert h.calls==['control','treatment','transfer'] if change!='source' else h.calls==['control','transfer']
+
+
+def test_corrupted_cached_witness_cannot_support_admission(tmp_path):
+    h=Harness(tmp_path)
+    h.verifier.witness_cache=tmp_path/'witnesses'
+    assert h.run(tmp_path/'probe-0')['decision']=='accept'
+    for artifact in (tmp_path/'witnesses').glob('*/artifacts/**/*'):
+        if artifact.is_file():artifact.write_bytes(b'corrupt')
+    h.calls.clear()
+    result=h.run(tmp_path/'probe-1')
+    assert result['decision']=='inconclusive' and not h.calls
