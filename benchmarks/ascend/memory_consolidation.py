@@ -80,7 +80,10 @@ class MemoryConsolidator:
         return {key: row[key] for key in ('id', 'proposal', 'base') if key in row}
 
     def compare(self, left, right, read_artifact, *, remaining):
-        identity = digest(dict(schema="memory-relation-v1", left=left, right=right))
+        # Relations are symmetric. Freeze prompt orientation as well as identity
+        # so reversed discovery cannot spend provider time on a second verdict.
+        left, right = sorted((left, right), key=lambda row: (row['id'], digest(row)))
+        identity = digest(dict(schema="memory-relation-symmetric-v2", left=left, right=right))
         cache = self.cache_root / (identity + ".json") if self.cache_root is not None else None
         if cache is not None and cache.exists():
             return json.loads(cache.read_bytes())

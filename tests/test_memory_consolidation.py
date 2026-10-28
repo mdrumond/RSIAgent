@@ -271,3 +271,27 @@ def test_structured_citations_deduplicate_by_json_identity_and_preserve_variants
     result['proposal']['citations'][1]['chunk']['lines'].append(9)
     assert rows == original
     assert result['provenance']['consolidation']['members'] == original
+
+
+def test_reversed_pair_reuses_canonical_prompt_and_cached_judgment(tmp_path):
+    from copy import deepcopy
+    artifacts = {}
+    a, b = [candidate(name, artifacts) for name in ['a', 'b']]
+    a['provenance']['request'] = {'artifacts': {'historical-result': 'retained'}}
+    original = deepcopy([a, b])
+    provider = Provider()
+    agent = MemoryConsolidator(provider, cache_root=tmp_path/'cache')
+    first = agent.compare(b, a, lambda sha, **kw: artifacts[sha], remaining=lambda: 10)
+    assert provider.contexts[0]['left']['id'] == 'a'
+    assert provider.contexts[0]['right']['id'] == 'b'
+    calls_after_first = len(agent.last_trace)
+    second = agent.compare(a, b, lambda sha, **kw: artifacts[sha], remaining=lambda: 10)
+    assert second == first
+    assert len(provider.contexts) == 1
+    assert len(agent.last_trace) == calls_after_first
+    assert [a, b] == original
+    memory = SubjectMemory(tmp_path/'memory')
+    result = agent.prepare(b, [a, b], memory=memory,
+        read_artifact=lambda sha, **kw: artifacts[sha], max_seconds=10)
+    assert result['provenance']['consolidation']['members'] == [b, a]
+    assert len(provider.contexts) == 1
