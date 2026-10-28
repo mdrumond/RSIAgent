@@ -69,8 +69,11 @@ def arm_evidence(directory, store, *, project_root=None, binding_root=None, proj
                 spans.append(dict(value, stage='provider'))
     binding = Path(binding_root) if binding_root is not None else directory / 'runtime' / 'binding'
     transport = binding / 'transport-state'
+    reports = sorted((binding / 'environment-checks').rglob('report.json'))
+    probe_ids = {worker.get('execution_id') for path in reports
+        for worker in json.loads(path.read_bytes()).get('workers', [])}
     shared = {path.parent for path in transport.rglob('candidate.json')
-        if str(json.loads(path.read_bytes()).get('project_id', '')).startswith('environment-')}
+        if path.parent.name in probe_ids}
     owned = None if project_id is None else {path.parent
         for path in transport.rglob('candidate.json')
         if json.loads(path.read_bytes()).get('project_id') == project_id}
@@ -91,7 +94,7 @@ def arm_evidence(directory, store, *, project_root=None, binding_root=None, proj
             data = path.read_bytes() if owned is None else ''.join(json.dumps(row)+'\n' for row in rows).encode()
             refs['timing:'+path.relative_to(binding).as_posix()] = store.put_bytes(data)
             spans.extend(rows)
-    for path in sorted((binding / 'environment-checks').rglob('report.json')):
+    for path in reports:
         report = json.loads(path.read_bytes())
         refs['environment:'+path.relative_to(binding).as_posix()] = store.put_bytes(path.read_bytes())
         spans.append(dict(report, stage='environment'))
