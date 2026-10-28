@@ -16,6 +16,7 @@ from .memory_verifier import MemoryVerifier, _hash, _seconds, _inconclusive
 from .memory_status import evaluation_assessment
 from .subject_execution import SubjectOutcome
 from .time_budget import AttemptTimeBudget
+from .environment_admission import native_reservation
 
 
 def paired_measurements(report, runtime, source_request, before, after):
@@ -154,7 +155,7 @@ class FocusedMemoryVerifier(MemoryVerifier):
                     request=source_request, runtime=self.runtime, binding=self.replay_binding)
                 cache = self.witness_cache / _hash(canonical(witness_identity))
                 cache.mkdir(parents=True, exist_ok=True)
-                with self._lock(cache):
+                with native_reservation(cache, remaining):
                     witness = cache / 'witness.json'
                     if name not in state['stages'] and witness.exists():
                         retained = json.loads(witness.read_bytes())
