@@ -41,6 +41,17 @@ def discover(anchor, candidates):
 
 
 
+def _unique_json(items):
+    """Preserve first-seen JSON values, including structured KDB citations."""
+    seen, result = set(), []
+    for item in items:
+        identity = canonical(item)
+        if identity not in seen:
+            seen.add(identity)
+            result.append(deepcopy(item))
+    return result
+
+
 def _artifacts(row):
     proposal = row['proposal']
     return set(proposal['evidence']) | {proposal[role]['sha256'] for role in ('before', 'after')
@@ -189,9 +200,9 @@ class MemoryConsolidator:
         for field in FIELDS:
             proposal[field] = '\n\n'.join(f"[{row['id']}]\n{row['proposal'][field]}" for row in selected)
         for field in ('evidence', 'citations'):
-            proposal[field] = list(dict.fromkeys(item for row in selected for item in row['proposal'][field]))
-        proposal['evidence'] = list(dict.fromkeys([*proposal['evidence'],
-            *(sha for row in selected for sha in sorted(_artifacts(row)))]))
+            proposal[field] = _unique_json(item for row in selected for item in row['proposal'][field])
+        proposal['evidence'] = _unique_json([*proposal['evidence'],
+            *(sha for row in selected for sha in sorted(_artifacts(row)))])
         # Before/after remain the primary runnable example. All other examples,
         # their exact claims and source identities remain durable provenance.
         lineage = [deepcopy(row) for row in selected]

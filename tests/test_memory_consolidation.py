@@ -249,3 +249,25 @@ def test_reconsolidation_targets_only_current_versions_after_prior_update(tmp_pa
     assert memory.read(old_a['version'])['proposal'] == a['proposal']
     if prior_operation == 'merge':
         assert memory.read(old_b['version'])['proposal'] == b['proposal']
+
+
+def test_structured_citations_deduplicate_by_json_identity_and_preserve_variants(tmp_path):
+    from copy import deepcopy
+    artifacts = {}
+    rows = [candidate(name, artifacts) for name in ['a', 'b']]
+    citation = dict(collection='ops-math-7a9a19c3d2a8', path='math/cdist/op_kernel/arch35/cdist_reduce_hl.h',
+        start_line=1, end_line=80, chunk_hash='24e1dc26c5957d4f17e7e75f6b771b7c05db493648b1438408f7d04fd5652cef',
+        repository='https://gitcode.com/cann/ops-math.git', revision='64322f6487162c0934ec0364af57ed2f51175a03',
+        source_sha256='a23214348e000d23fff4400d67989f1e007098b3c8ee496e1b24438df7783717', reference_exposed=False)
+    changed = dict(citation, end_line=96)
+    nested = dict(collection={'name': 'subject-memory', 'revision': 'v1'},
+                  document={'path': 'memory.json'}, chunk={'lines': [1, 8], 'hash': 'chunk-a'})
+    rows[0]['proposal']['citations'] = [citation, nested]
+    rows[1]['proposal']['citations'] = [dict(reversed(list(citation.items()))), changed, deepcopy(nested)]
+    original = deepcopy(rows)
+    result = prepare(tmp_path, rows, artifacts)
+    assert result['proposal']['citations'] == [citation, nested, changed]
+    assert rows == original
+    result['proposal']['citations'][1]['chunk']['lines'].append(9)
+    assert rows == original
+    assert result['provenance']['consolidation']['members'] == original
