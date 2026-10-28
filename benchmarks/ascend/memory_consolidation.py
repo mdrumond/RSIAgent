@@ -178,7 +178,10 @@ class MemoryConsolidator:
         proposal = deepcopy(anchor['proposal'])
         bases = {}
         for row in selected:
-            for base in [*row['proposal']['base_versions'], *([row['base']] if 'base' in row else [])]:
+            # Accepted proposals retain historical consumed bases as lineage.
+            # Replacement targets the current accepted version exclusively.
+            replacements = [row['base']] if 'base' in row else row['proposal']['base_versions']
+            for base in replacements:
                 if base['memory_id'] in bases and bases[base['memory_id']] != base:
                     raise ValueError('inconsistent replacement bases')
                 bases[base['memory_id']] = base

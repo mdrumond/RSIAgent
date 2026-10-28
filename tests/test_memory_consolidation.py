@@ -215,3 +215,37 @@ def test_relation_provider_does_not_receive_unrelated_producer_manifest(tmp_path
     assert sent['required_artifacts'] == sorted(artifacts)
     assert len(json.dumps(sent)) < 5000
     assert result['provenance']['consolidation']['members'][0]['provenance'] == rows[0]['provenance']
+
+
+@pytest.mark.parametrize('prior_operation', ['append', 'merge'])
+def test_reconsolidation_targets_only_current_versions_after_prior_update(tmp_path, prior_operation):
+    from copy import deepcopy
+    from benchmarks.ascend.subject_memory import digest
+    artifacts = {}
+    a, b, c = [candidate(name, artifacts) for name in ['a', 'b', 'c']]
+    memory = SubjectMemory(tmp_path/'memory')
+    old_a = memory.accept('a', a['proposal'], a['provenance'])
+    old_b = memory.accept('b', b['proposal'], b['provenance'])
+    update = deepcopy(a['proposal'])
+    historical = [old_a, old_b] if prior_operation == 'merge' else [old_a]
+    update.update(operation=prior_operation, base_versions=historical, limitations='updated tested scope')
+    current_a = memory.accept('updated-a', update, a['provenance'])
+    if prior_operation == 'merge':
+        other = memory.accept('c', c['proposal'], c['provenance'])
+    else:
+        other = old_b
+    result = prepare(tmp_path, [a], artifacts, memory=memory)
+    expected = {base['memory_id']: base['version'] for base in [current_a, other]}
+    assert {base['memory_id']: base['version'] for base in result['proposal']['base_versions']} == expected
+    lineage_a = next(row for row in result['provenance']['consolidation']['members'] if row['id'] == 'a')
+    assert lineage_a['proposal']['base_versions'] == historical
+    assert lineage_a['base'] == current_a
+    calls = []
+    gate = SimpleNamespace(memory=memory, submit=lambda *args, **kw: calls.append((args, kw)))
+    identity = submit_consolidation(gate, result, {}, remaining_seconds=30)
+    assert calls[0][0][0] == identity
+    final = memory.accept(identity, result['proposal'], result['provenance'])
+    assert [digest(row) for row in memory.records()] == [final['version']]
+    assert memory.read(old_a['version'])['proposal'] == a['proposal']
+    if prior_operation == 'merge':
+        assert memory.read(old_b['version'])['proposal'] == b['proposal']
