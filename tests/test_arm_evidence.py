@@ -125,6 +125,13 @@ def test_actual_environment_report_contributes_timestamped_span(tmp_path, monkey
     class Transport:
         runtime_identity = {'physical_device':0}
         def compile(self, plan, root):
+            candidate=binding/'transport-state'/plan.execution_id
+            candidate.mkdir(parents=True)
+            (candidate/'candidate.json').write_text(json.dumps(dict(project_id=plan.project_id)))
+            operation=candidate/'compile/operation.json';operation.parent.mkdir()
+            operation.write_text(json.dumps(dict(state='completed',handle='remote:fixture:job:probe-compile')))
+            (candidate.parent/'timing.jsonl').write_text(json.dumps(dict(key=plan.execution_id+'/compile',
+                stage='compile',started_epoch=100,ended_epoch=102))+'\n')
             now[0] += 2
             return SimpleNamespace(plan=plan, library_sha256='b'*64, stdout='', stderr='')
         def execute_receipt(self, compilation):
@@ -135,9 +142,11 @@ def test_actual_environment_report_contributes_timestamped_span(tmp_path, monkey
         target='fixture', arch='fixture', execution_profile='gz-a3'), [Transport()])
     check(1, lambda:10-now[0])
     outcome = interrupted_outcome(arm, TimeoutError('deadline'),
-        ContentAddressedArtifacts(tmp_path/'destination'), started_epoch=100, elapsed_seconds=10)
+        ContentAddressedArtifacts(tmp_path/'destination'), started_epoch=100, elapsed_seconds=10,project_id='source-project')
     timing = outcome.observations['timing']
     assert timing['by_stage_seconds']['environment'] == 5
+    assert timing['by_stage_seconds']['compile'] == 2
+    assert outcome.observations['remote_operations'][0]['handle']=='remote:fixture:job:probe-compile'
     assert timing['attributed_seconds'] == 5 and timing['unattributed_seconds'] == 5
     report_ref = next(v for k,v in outcome.artifacts.items() if k.startswith('environment:'))
     report = json.loads(outcome.read_artifact(report_ref))
@@ -167,7 +176,7 @@ def test_project_timing_includes_shared_health_and_environment_but_not_other_act
     arm=tmp_path/'arm'
     binding=arm/'runtime/binding'
     transport=binding/'transport-state'
-    for name,project in [('one','my-project'),('probe','environment-known-good'),('other','other-project')]:
+    for name,project in [('one','my-project'),('probe','sum-three'),('other','other-project')]:
         root=transport/name
         root.mkdir(parents=True)
         (root/'candidate.json').write_text(json.dumps(dict(project_id=project)))
@@ -178,7 +187,7 @@ def test_project_timing_includes_shared_health_and_environment_but_not_other_act
     (transport/'timing.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in rows))
     report=binding/'environment-checks/wave-001/a/report.json'
     report.parent.mkdir(parents=True)
-    report.write_text(json.dumps(dict(status='passed',started_epoch=100,ended_epoch=102)))
+    report.write_text(json.dumps(dict(status='passed',started_epoch=100,ended_epoch=102,workers=[dict(execution_id='probe')])))
     outcome=interrupted_outcome(arm,TimeoutError('deadline'),ContentAddressedArtifacts(tmp_path/'out'),
         project_id='my-project',started_epoch=100,elapsed_seconds=10)
     timing=outcome.observations['timing']
