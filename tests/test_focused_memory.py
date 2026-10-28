@@ -88,7 +88,7 @@ def test_replays_retained_sources_then_single_transfer_and_reuses_terminal_resul
     result = h.run(tmp_path / 'evaluation')
     assert result['decision'] == 'accept' and result['claim_kind'] == 'repair'
     assert h.calls == ['control', 'treatment', 'transfer']
-    assert result['evidence_stages']['control'] == dict(status='completed', host_verified=False)
+    assert result['evidence_stages']['control'] == dict(status='completed', host_verified=False, elapsed_seconds=1)
     assert all(result['validity'].values())
     assert result == h.run(tmp_path / 'evaluation', task=result['trial_task'])
     assert h.calls == ['control', 'treatment', 'transfer']
@@ -197,3 +197,39 @@ def test_runtime_route_replays_full_source_against_retained_contract(tmp_path):
         assert json.loads(result.read_artifact(result.artifacts['result:replay']))['classification'] == 'host-verified'
     finally:
         campaign.memory_gate.close()
+
+
+@pytest.mark.parametrize('metadata', [
+    {'capabilities': ['gm-ub-movement', 'failure-repair'], 'failure_mode': 'compile'},
+    {'capabilities': ['gm-ub-movement', 'failure-repair'], 'failure_mode': 'host-mismatch'},
+    {'learning_focus': ['sync-correctness']},
+])
+def test_metadata_only_variation_cannot_turn_source_replay_into_transfer(tmp_path, metadata):
+    h = Harness(tmp_path, same_task=True)
+    original = _project('source', 'gm-ub-movement')
+    original.update(metadata)
+    h.request['artifacts']['contract'] = h.store.put_json(original)
+    result = h.run(tmp_path / 'evaluation')
+    assert result['decision'] == 'inconclusive' and h.calls == []
+    assert 'transfer must change' in result['error']
+
+
+def test_completed_measurement_survives_process_loss_before_judgment(tmp_path):
+    class ProcessLost(BaseException):
+        pass
+    h = Harness(tmp_path, before_passes=True, performance=True, measure=True)
+    complete = h.verifier.judge.complete
+    def lose_process(*args, **kw):
+        raise ProcessLost()
+    h.verifier.judge.complete = lose_process
+    directory = tmp_path / 'evaluation'
+    with pytest.raises(ProcessLost):
+        h.run(directory)
+    saved = json.loads((directory / 'evaluation.json').read_bytes())
+    assert saved['stages']['measurement']['status'] == 'completed' and 'decision' not in saved
+    calls = h.calls.copy()
+    h.verifier.judge.complete = complete
+    result = h.run(directory)
+    assert result['decision'] == 'accept' and result['claim_kind'] == 'performance'
+    assert h.calls == calls and h.calls.count('measure-pair') == 1
+    assert result['evidence_stages']['measurement']['status'] == 'completed'

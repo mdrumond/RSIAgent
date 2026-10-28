@@ -6,6 +6,7 @@ Timing evidence is optional, but performance claims cannot pass without it.
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 import time
 
 from optimizer.jobs import atomic, canonical
@@ -33,6 +34,25 @@ def paired_measurements(report, runtime, source_request, before, after):
                 or any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in pair.values())):
             raise ValueError('paired device durations must be finite positive microseconds')
     return report
+
+
+def workload_identity(spec):
+    """Compare actual host semantics with input seeds independent of teaching metadata."""
+    from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
+    from benchmarks.a5kernels.phase1_project_executor import _tensor_payload, _expected_payload
+    from .memory_usefulness import actor_project
+    normalized = actor_project(spec)
+    value = normalized.as_dict()
+    semantics = {key: value[key] for key in ('dtype', 'block_count', 'padding_multiple', 'shape', 'graph')}
+    semantics['padded_tail'] = 'padded-tail' in value['capabilities']
+    # Ordinary materialization hashes the entire spec, including hypothesis and
+    # failure tags. Those incidental seed changes are not a new transfer task.
+    inputs = materialize_inputs(SimpleNamespace(as_dict=lambda: semantics,
+        graph=normalized.graph, capabilities=normalized.capabilities,
+        dtype=normalized.dtype, padding_multiple=normalized.padding_multiple))
+    return _hash(canonical(dict(semantics=semantics,
+        inputs=[_tensor_payload(item) for item in inputs],
+        oracle=_expected_payload(evaluate_reference(normalized, inputs)))))
 
 
 class FocusedMemoryVerifier(MemoryVerifier):
@@ -88,12 +108,12 @@ class FocusedMemoryVerifier(MemoryVerifier):
             def execute(name, callback):
                 if name in state['stages']:
                     return state['stages'][name]
-                stage = dict(status='started', outcome=None)
+                started, epoch = self.clock(), self.wall_clock()
+                stage = dict(status='started', outcome=None, started_epoch=epoch)
                 state['stages'][name] = stage
                 save()  # A lost callback may still own remote work: never dispatch twice.
                 stage_dir = directory / name
                 stage_dir.mkdir(exist_ok=True)
-                started, epoch = self.clock(), self.wall_clock()
                 allowance = min(self.arm_seconds, remaining())
                 try:
                     outcome = callback(stage_dir, allowance)
@@ -117,6 +137,7 @@ class FocusedMemoryVerifier(MemoryVerifier):
                     outcome = interrupted_outcome(stage_dir, error, store, started_epoch=epoch,
                         elapsed_seconds=max(0, self.clock()-started))
                     stage.update(status='interrupted', outcome=outcome.as_dict(), error_type=type(error).__name__)
+                stage.update(elapsed_seconds=max(0, self.clock()-started), ended_epoch=self.wall_clock())
                 state['trace'].append(dict(kind='focused-stage', stage=name, **stage))
                 save()
                 remaining()
@@ -142,13 +163,12 @@ class FocusedMemoryVerifier(MemoryVerifier):
                         if not isinstance(selected, dict) or not selected:
                             raise ValueError('freeze a nonempty related transfer task')
                         from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-                        from .memory_usefulness import actor_project
                         contracts = source_request['artifacts']
                         contract_sha = contracts.get('contract', contracts.get('evidence:project-contract'))
                         contract = json.loads(self.read_artifact(contract_sha))
                         original = ProjectSpec.from_mapping(contract.get('spec', contract))
                         related = ProjectSpec.from_mapping(selected['spec'])
-                        if actor_project(original).as_dict() == actor_project(related).as_dict():
+                        if workload_identity(original) == workload_identity(related):
                             raise ValueError('transfer must change the source workload contract')
                         state['task'] = json.loads(canonical(selected))
                         save()
@@ -162,10 +182,12 @@ class FocusedMemoryVerifier(MemoryVerifier):
                         if name == 'treatment' and not state['stages'][name]['outcome']['host_verified']:
                             break
                     stages = state['stages']
-                    if set(stages) != {'control', 'treatment', 'transfer'} or any(row['status'] != 'completed' for row in stages.values()):
+                    required_stages = {'control', 'treatment', 'transfer'}
+                    if not required_stages <= stages.keys() or any(stages[name]['status'] != 'completed' for name in required_stages):
                         decision = _inconclusive('Focused replay or transfer is incomplete, invalid, or failed; inspect retained stage evidence.')
                     else:
-                        arms = {name: SubjectOutcome(**row['outcome'], artifact_root=store.root) for name, row in stages.items()}
+                        arms = {name: SubjectOutcome(**stages[name]['outcome'], artifact_root=store.root)
+                                for name in ('control', 'treatment', 'transfer')}
                         if self.measure_pair is not None:
                             measured = execute('measurement', lambda d, s: self._measure(
                                 source_request, before['sha256'], after['sha256'], d, s))
@@ -183,7 +205,8 @@ class FocusedMemoryVerifier(MemoryVerifier):
             finally:
                 budget.close()
             decision.update(mode=self.mode, evaluation_id=_hash(canonical(identity)), trial_task=state['task'],
-                evidence_stages={name: dict(status=row['status'], host_verified=(row.get('outcome') or {}).get('host_verified'))
+                evidence_stages={name: dict(status=row['status'], host_verified=(row.get('outcome') or {}).get('host_verified'),
+                                           elapsed_seconds=row.get('elapsed_seconds'))
                                  for name, row in state['stages'].items()},
                 validity={name: row['status'] == 'completed' for name, row in state['stages'].items()},
                 arms={name: row.get('outcome') for name, row in state['stages'].items()}, artifacts=refs)
