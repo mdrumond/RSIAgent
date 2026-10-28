@@ -182,7 +182,7 @@ def recover_campaign_operations(root, transports, *, seconds=30, remaining=lambd
             break
         owner = CplNativeCandidateBackend(cpl_remote=client._cpl, target=route['target'],
             runtime=route['runtime'], profile=route['profile'], physical_device=route['physical_device'],
-            remote_workspace=identity['workspace'], state_directory=path.parent,
+            remote_workspace=identity['workspace'], registry_workspace=client.registry_workspace, state_directory=path.parent,
             process_runner=client._run, timeout=left)
         if owner.runtime_identity != route:
             raise ProjectInfrastructureError('retained owning binding identity changed')
