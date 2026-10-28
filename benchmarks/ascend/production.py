@@ -494,12 +494,14 @@ class NativeProjectBackend:
         if isinstance(result, FailedEvidence):
             if native_infrastructure_failure(result):
                 raise ProjectInfrastructureError(result.detail)
-            digest = self._retain(result.attestation_payload())
-            return CompileObservation(False, digest, result.detail, None)
+            details = result.attestation_payload()
+            digest = self._retain(details)
+            return CompileObservation(False, digest, result.detail, None, details)
         self._compilations[plan.execution_id] = result
-        digest = self._retain({"stage": "compile", "stdout": result.stdout,
-                               "stderr": result.stderr, "library_sha256": result.library_sha256})
-        return CompileObservation(True, digest, result.stdout or "native compilation completed", plan.execution_id)
+        details = {"stage": "compile", "stdout": result.stdout,
+                   "stderr": result.stderr, "library_sha256": result.library_sha256}
+        digest = self._retain(details)
+        return CompileObservation(True, digest, result.stdout or "native compilation completed", plan.execution_id, details)
 
     def run(self, request, compilation):
         plan = self.plan(request)

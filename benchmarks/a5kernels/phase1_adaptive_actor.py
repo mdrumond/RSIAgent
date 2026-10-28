@@ -57,6 +57,19 @@ class AdaptiveActorDriver(Protocol):
     ) -> ActorOutcome: ...
 
 
+
+def compiler_diagnostic_preview(text, limit=2048):
+    """Keep the first actual error and nearby lines ahead of warning boilerplate."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= limit:
+        return text
+    match = re.search(r'(?im)^.*(?:fatal error:|\berror:|undefined reference|Traceback \(most recent call last\)).*$', text)
+    if match is None:
+        return encoded[:limit].decode('utf-8', errors='ignore')
+    start = match.start()
+    return text[start:].encode('utf-8')[:limit].decode('utf-8', errors='ignore')
+
+
 @dataclass(frozen=True)
 class AdaptiveActionContext:
     request: AdaptiveProjectRequest
@@ -207,6 +220,7 @@ class _ProjectActions:
         self.host_facts: list[HostFact] = []
         self.observed_failures: dict[FailureMode, int] = {}
         self.latest_run_at: int | None = None
+        self.last_compile_source_sha256: str | None = None
         self.failure_context = None
         if request.failure_context is not None:
             from benchmarks.ascend.failure_handoff import FailureContext
@@ -292,6 +306,7 @@ class _ProjectActions:
     def _compile(self) -> ActionOutcome:
         if self.source is None:
             return self._observation({"error": "write candidate source first"})
+        repeated_source = self.last_compile_source_sha256 == self.source_sha256
         result: ProjectCompileResult = self.executor.compile(
             self.request.spec, self.source
         )
@@ -301,6 +316,9 @@ class _ProjectActions:
         if digest != result.artifact_sha256:
             raise ValueError("compile artifact hash does not match its payload")
         self.admitted[digest] = "compile"
+        self.last_compile_source_sha256 = self.source_sha256
+        diagnostic_sha = self.artifacts.put_bytes(result.observation.diagnostic.encode("utf-8"))
+        self.admitted[diagnostic_sha] = "compile-diagnostics"
         if not result.observation.passed:
             self.observed_failures[FailureMode.COMPILE] = len(self.actions)
             retain_phase1_failure(self.artifacts, self.request.spec, self.source_sha256,
@@ -311,8 +329,9 @@ class _ProjectActions:
                 self.prepared.expected.dtype)
         return self._observation({
             "event": "host-compile", "source_sha256": self.source_sha256,
-            "passed": result.observation.passed,
-            "diagnostic": result.observation.diagnostic,
+            "passed": result.observation.passed, "repeated_source": repeated_source,
+            "diagnostic": compiler_diagnostic_preview(result.observation.diagnostic),
+            "diagnostics_artifact": {"sha256": diagnostic_sha, "bytes": len(result.observation.diagnostic.encode("utf-8"))},
             "artifact": {"sha256": digest, "payload": result.artifact},
         })
 
