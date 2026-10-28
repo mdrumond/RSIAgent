@@ -114,3 +114,58 @@ def test_dict_output_paths_do_not_collide():
     outputs = prepared.manifest['cases'][0]['outputs']
     assert len(outputs) == 3
     assert len({row['sha256'] for row in outputs.values()}) == 3
+
+
+def test_frozen_module_load_preserves_state_layout_and_nested_outputs(tmp_path, monkeypatch):
+    from optimizer import reference
+    submission = spec(
+        "class Model(torch.nn.Module):\n def __init__(self):\n  super().__init__(); self.weight = torch.nn.Parameter(torch.randn(2, 3))\n def forward(self, x): return {'a': x + self.weight, 'b': (x * 2, None)}",
+        "Model")
+    submission['signatures'][0]['args'][0].update(shape=[2, 3], strides=[1, 2])
+    prepared = prepare_reference(submission, max_cases=1)
+    freeze_reference(prepared, tmp_path)
+    monkeypatch.setattr(reference, 'generate_cases', lambda *a, **k: pytest.fail('regenerated cases'))
+    monkeypatch.setattr(reference, 'materialize_case', lambda *a, **k: pytest.fail('regenerated tensors'))
+    loaded = reference.load_reference(tmp_path, 'cpu')
+    reference.validate_reference(loaded)
+    assert loaded.manifest['suite_sha256'] == prepared.manifest['suite_sha256']
+    assert torch.equal(loaded.model.weight, prepared.model.weight)
+    assert loaded.cases[0]['args'][0].stride() == (1, 2)
+    assert torch.equal(loaded.cases[0]['args'][0], prepared.cases[0]['args'][0])
+    compare_outputs(prepared.cases[0]['output'], loaded.cases[0]['output'], non_compute=True)
+    compare_outputs(loaded.cases[0]['output'], loaded.invoke(*loaded.cases[0]['args']), non_compute=True)
+
+
+@pytest.mark.parametrize('corruption', ['source', 'suite', 'tensors', 'policy'])
+def test_frozen_load_rejects_corruption_before_deserialization(tmp_path, monkeypatch, corruption):
+    from optimizer.reference import load_reference
+    prepared = prepare_reference(spec('def kernel(x): return x + 1'), max_cases=1)
+    freeze_reference(prepared, tmp_path)
+    if corruption == 'source':
+        (tmp_path / 'reference.py').write_text('def kernel(x): return x')
+    elif corruption == 'tensors':
+        (tmp_path / 'baseline.pt').write_bytes(b'corrupt')
+    else:
+        path = tmp_path / 'manifest.json'
+        manifest = json.loads(path.read_text())
+        manifest['suite_sha256' if corruption == 'suite' else 'policy'] = 'changed'
+        path.write_text(json.dumps(manifest))
+    monkeypatch.setattr(torch, 'load', lambda *a, **k: pytest.fail('deserialized corrupt bundle'))
+    with pytest.raises(ValueError):
+        load_reference(tmp_path, 'cpu')
+
+
+@pytest.mark.parametrize('mutation', ['policy', 'source', 'state'])
+def test_reference_validation_rejects_changed_workload(mutation):
+    from optimizer.reference import validate_reference
+    prepared = prepare_reference(spec(
+        "class Model(torch.nn.Module):\n def __init__(self):\n  super().__init__(); self.register_buffer('weight', torch.ones(4))\n def forward(self, x): return x + self.weight",
+        'Model'), max_cases=1)
+    if mutation == 'policy':
+        prepared.manifest['policy'] = {}
+    elif mutation == 'source':
+        prepared.spec['source'] += '\n'
+    else:
+        prepared.model.weight.zero_()
+    with pytest.raises(ValueError):
+        validate_reference(prepared)

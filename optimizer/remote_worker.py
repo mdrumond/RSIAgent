@@ -12,8 +12,8 @@ def execute(request):
     import torch
     import torch_npu
     from .measurement import benchmark
-    from .native import compile_candidate, describe_case, evaluate, load_reference
-    from .reference import freeze_reference, prepare_reference
+    from .native import compile_candidate, describe_case, evaluate
+    from .reference import freeze_reference, load_reference, prepare_reference
     from .profiles import profile
     torch.npu.set_device('npu:0')
     directory = Path(request['directory'])
