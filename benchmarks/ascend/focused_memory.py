@@ -61,19 +61,20 @@ class FocusedMemoryVerifier(MemoryVerifier):
 
     def __init__(self, complete, select_trial, replay_source, execute_transfer, read_artifact, *,
                  model_identity, runtime_identity, max_seconds=1800, arm_seconds=600,
-                 measure_pair=None, witness_cache=None, clock=time.monotonic, wall_clock=time.time):
+                 measure_pair=None, witness_cache=None, replay_binding=None, clock=time.monotonic, wall_clock=time.time):
         super().__init__(complete, select_trial, execute_transfer, model_identity=model_identity,
             runtime_identity=runtime_identity, max_seconds=max_seconds, arm_seconds=arm_seconds,
             clock=clock, wall_clock=wall_clock)
         self.replay_source, self.read_artifact, self.measure_pair = replay_source, read_artifact, measure_pair
         self.witness_cache = Path(witness_cache) if witness_cache is not None else None
+        self.replay_binding = json.loads(canonical(replay_binding or {}))
 
     def evaluate(self, proposal, baseline_bytes, treatment_bytes, directory, *, remaining_seconds,
                  source_request, task=None, sequence=0, check_remaining=None, **unused):
         parent = self.clock() + _seconds(remaining_seconds)
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
-        identity = json.loads(canonical(dict(mode=self.mode, protocol=self.protocol, proposal=proposal,
+        identity = json.loads(canonical(dict(mode=self.mode, protocol=self.protocol, replay_binding=self.replay_binding, proposal=proposal,
             baseline_sha256=_hash(baseline_bytes), treatment_sha256=_hash(treatment_bytes),
             source_request=source_request, model=self.model, runtime=self.runtime,
             max_seconds=self.seconds, arm_seconds=self.arm_seconds, sequence=sequence,
@@ -150,7 +151,7 @@ class FocusedMemoryVerifier(MemoryVerifier):
                     return execute_stage(name, callback)
                 source = proposal['before' if name == 'control' else 'after']['sha256']
                 witness_identity = dict(protocol=self.protocol, source=source,
-                    request=source_request, runtime=self.runtime)
+                    request=source_request, runtime=self.runtime, binding=self.replay_binding)
                 cache = self.witness_cache / _hash(canonical(witness_identity))
                 cache.mkdir(parents=True, exist_ok=True)
                 with self._lock(cache):

@@ -308,3 +308,13 @@ def test_initialized_source_is_editable_but_has_no_verification_authority(tmp_pa
     request=replace(_request(tmp_path,executor),initial_source='fixed source',publish_learning=False)
     result=AdaptiveActorProjectExecutor(executor,actor,object())(request)
     assert result.evidence.verified and not actor.distill_calls
+
+
+@pytest.mark.parametrize('binding', [dict(transport_target='another-host'),dict(torch_npu='another-version'),dict(authorization='changed')])
+def test_changed_replay_binding_invalidates_witnesses(tmp_path,binding):
+    h=Harness(tmp_path)
+    h.verifier.witness_cache=tmp_path/'witnesses'
+    assert h.run(tmp_path/'probe-0')['decision']=='accept'
+    h.calls.clear();h.verifier.replay_binding=binding
+    assert h.run(tmp_path/'probe-1')['decision']=='accept'
+    assert h.calls==['control','treatment','transfer']

@@ -628,7 +628,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             from .focused_memory import FocusedMemoryVerifier
             judge_type = lambda complete, select, execute, **kw: FocusedMemoryVerifier(
                 complete, select, replay_memory_source, execute, store.read_bytes,
-                measure_pair=bound.get('measure_memory_pair'), witness_cache=root / 'memory-replay-witnesses', **kw)
+                measure_pair=bound.get('measure_memory_pair'), witness_cache=root / 'memory-replay-witnesses',
+                replay_binding=dict(semantic_configs=identity['referenced_semantic_sha256'],
+                    settings_sha256=identity['settings_sha256'],
+                    routes=[transport.runtime_identity for transport in bound.get('transports', ())]), **kw)
         else:
             judge_type = MemoryVerifier
         judge = judge_type(role_complete('memory_verifier'), select_trial, execute_trial_arm,
