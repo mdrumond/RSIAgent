@@ -30,7 +30,8 @@ class CplNativeCandidateBackend:
 
     def __init__(self, *, cpl_remote, target, runtime, remote_workspace, physical_device,
                  state_directory, profile='bz-a3-1', timeout=600, remaining_seconds=None, registry_workspace=None,
-                 process_runner=subprocess.run, clock=time.monotonic, wall_clock=time.time):
+                 process_runner=subprocess.run, clock=time.monotonic, wall_clock=time.time,
+                 submission_reserve_seconds=30, cleanup_reserve_seconds=45):
         workspace = PurePosixPath(remote_workspace)
         if not workspace.is_absolute() or '..' in workspace.parts:
             raise ValueError('remote_workspace must be an absolute registry task workspace')
@@ -48,6 +49,10 @@ class CplNativeCandidateBackend:
         self.root, self.timeout = Path(state_directory), timeout
         self.remaining_seconds, self._run, self.clock = remaining_seconds, process_runner, clock
         self.wall_clock = wall_clock
+        self.submission_reserve = submission_reserve_seconds
+        self.cleanup_reserve = cleanup_reserve_seconds
+        if min(self.submission_reserve, self.cleanup_reserve) < 0:
+            raise ValueError('elapsed reserves must be nonnegative')
         self.runtime_identity = dict(target=target, runtime=runtime, profile=profile,
                                      physical_device=physical_device, logical_device=0)
 
@@ -121,9 +126,16 @@ class CplNativeCandidateBackend:
                 raise ProjectInfrastructureError('retained operation lacks frozen elapsed expiry; inspect its handle')
             record['expires_at'] = expires_at if expires_at is not None else self.wall_clock()+self._allowance()
         terminal = ('completed', 'failed', 'cancelled')
+        receipt = path.with_name('submission-receipt.json')
+        self._restore_receipt(path, record, receipt, kind)
+        if record.get('state') != 'new' and not record.get('handle'):
+            self._quarantine_upload(path, record)
+        if record.get('state') == 'quarantined':
+            raise self._pending('CPL upload namespace quarantined; do not resubmit')
+        work_expiry = record['expires_at'] - self.cleanup_reserve
 
         def expired():
-            return (self.wall_clock() >= record['expires_at'] or
+            return (self.wall_clock() >= work_expiry or
                     self.remaining_seconds is not None and self.remaining_seconds() <= 0)
 
         def recover_expiry():
@@ -132,7 +144,7 @@ class CplNativeCandidateBackend:
         def recover_expiry_inner():
             # Execution stops at expiry; allow only bounded observation/cleanup.
             # A failed compiler may already have exited before the final poll.
-            cleanup_deadline = self.clock() + min(30, self.timeout)
+            cleanup_deadline = self.clock() + max(0, record['expires_at']-self.wall_clock())
             def cleanup_call(arguments):
                 seconds = cleanup_deadline-self.clock()
                 if seconds <= 0:
@@ -162,13 +174,24 @@ class CplNativeCandidateBackend:
 
         if expired():
             return recover_expiry()
-        deadline = self.clock() + min(self._allowance(), record['expires_at']-self.wall_clock())
+        deadline = self.clock() + min(self._allowance(), work_expiry-self.wall_clock())
         if not record.get('handle'):
             if record['state'] != 'new':
                 raise self._pending('CPL submission outcome is ambiguous; do not resubmit')
+            if deadline-self.clock() < self.submission_reserve:
+                raise self._pending('CPL submission not started: insufficient elapsed allocation', 'deadline-exhausted')
             record['state'] = 'submitting'
             _save(path, record)
-            value = self._call(arguments, seconds=max(.001, deadline-self.clock()))
+            submitted_arguments = (*arguments, '--receipt-file', str(receipt.resolve()))
+            if kind == 'transfer':
+                submitted_arguments += ('--no-wait',)
+            try:
+                value = self._call(submitted_arguments, seconds=max(.001, deadline-self.clock()))
+            except _PendingObservation:
+                self._restore_receipt(path, record, receipt, kind)
+                if not record.get('handle'):
+                    self._quarantine_upload(path, record)
+                raise
             handle = value.get('handle')
             if handle is not None:
                 if not isinstance(handle, str) or not handle.startswith(f'remote:{self.target}:{kind}:'):
@@ -197,15 +220,19 @@ class CplNativeCandidateBackend:
             _save(path, record)
         return self._finish_operation(path, record, value, kind)
 
-    def _finish_operation(self, path, record, value, kind):
-        return self._timed('cleanup', lambda: self._collect_operation(path, record, value, kind))
+    def _finish_operation(self, path, record, value, kind, *, collection_expires_at=None):
+        return self._timed('cleanup', lambda: self._collect_operation(
+            path, record, value, kind, collection_expires_at=collection_expires_at))
 
-    def _collect_operation(self, path, record, value, kind):
+    def _collect_operation(self, path, record, value, kind, *, collection_expires_at=None):
         # Result collection cannot dispatch work or extend its frozen expiry.
         # Checkpoint each stream so a disconnect never loses compiler feedback.
-        deadline = self.clock() + min(30, self.timeout)
+        deadline = self.clock() + max(0, (collection_expires_at if collection_expires_at is not None
+            else record['expires_at'])-self.wall_clock())
         def collect(arguments):
             seconds = deadline-self.clock()
+            if collection_expires_at is None and self.remaining_seconds is not None:
+                seconds = min(seconds, self.remaining_seconds())
             if seconds <= 0:
                 raise self._pending('CPL terminal result collection pending; retained handle '+str(record.get('handle')))
             return self._call(arguments, seconds=seconds)
@@ -217,11 +244,7 @@ class CplNativeCandidateBackend:
             if value.get('state') == 'cancelled':
                 raise self._pending('CPL elapsed allocation expired; retained cancelled handle '+str(record.get('handle')), 'deadline-exhausted')
             result = record.setdefault('terminal_result', dict(handle=record.get('handle')))
-            if 'returncode' not in result:
-                if type(value.get('exit')) is not int:
-                    value = collect(('result', record['handle']))
-                if value.get('handle') != record.get('handle') or type(value.get('exit')) is not int:
-                    raise ProjectInfrastructureError('CPL terminal result lacks its authenticated exit status')
+            if type(value.get('exit')) is int:
                 result['returncode'] = value['exit']
                 _save(path, record)
             for stream in ('stdout', 'stderr'):
@@ -232,6 +255,14 @@ class CplNativeCandidateBackend:
                     raise ProjectInfrastructureError('CPL logs returned a foreign or invalid result')
                 result[stream] = logs['content']
                 _save(path, record)
+            if 'returncode' not in result:
+                value = collect(('result', record['handle']))
+                if value.get('handle') != record.get('handle'):
+                    raise ProjectInfrastructureError('CPL result returned a foreign handle')
+                if type(value.get('exit')) is not int:
+                    raise self._pending('CPL terminal result lacks its authenticated exit status')
+                result['returncode'] = value['exit']
+                _save(path, record)
         record['result'] = result
         _save(path, record)
         return result
@@ -241,14 +272,17 @@ class CplNativeCandidateBackend:
         deadline = self.clock() + min(seconds, self.timeout)
         for path in Path(getattr(self, 'recovery_root', self.root)).rglob('operation.json'):
             record = json.loads(path.read_text())
-            if ('result' in record or record.get('state') in ('new', 'completed', 'failed', 'cancelled')):
+            if ('result' in record or record.get('state') in ('new', 'cancelled', 'quarantined')):
                 continue
             identity = record.get('identity', {})
             if identity.get('route') != self.runtime_identity or identity.get('workspace') != str(self._workspace):
                 continue
+            kind = 'transfer' if identity.get('arguments', [None])[0:1] == ['upload'] else 'job'
+            self._restore_receipt(path, record, path.with_name('submission-receipt.json'), kind)
             handle = record.get('handle')
             if not handle:
-                continue  # Ambiguous submissions must remain blocked, never resubmitted.
+                self._quarantine_upload(path, record)
+                continue  # Unknown execution must remain blocked, never resubmitted.
             if not any(handle.startswith(f'remote:{self.target}:{kind}:') for kind in ('job', 'transfer')):
                 raise ProjectInfrastructureError('retained CPL operation has a foreign handle')
             remaining = min(deadline-self.clock(), remaining_seconds() if remaining_seconds else float("inf"))
@@ -259,6 +293,45 @@ class CplNativeCandidateBackend:
                 raise ProjectInfrastructureError('CPL observation returned a foreign handle')
             record['state'] = observed.get('state')
             _save(path, record)
+            if record['state'] in ('completed', 'failed'):
+                # Explicit read-only recovery has its own bounded allocation; it
+                # never extends the frozen execution deadline or submits work.
+                left = min(deadline-self.clock(), remaining_seconds() if remaining_seconds else float('inf'))
+                try:
+                    self._finish_operation(path, record, observed, kind,
+                                           collection_expires_at=self.wall_clock()+max(0, left))
+                except _PendingObservation:
+                    continue  # Terminal work cannot occupy a device; incomplete logs remain retained.
+
+    def _restore_receipt(self, path, record, receipt, kind):
+        if record.get('handle') or not receipt.exists():
+            return
+        try:
+            value = json.loads(receipt.read_text())
+        except (ValueError, OSError) as error:
+            raise ProjectInfrastructureError('invalid CPL submission receipt') from error
+        expected_operation = 'upload' if kind == 'transfer' else 'run'
+        handle = value.get('handle')
+        if (not isinstance(handle, str) or not handle.startswith(f'remote:{self.target}:{kind}:')
+                or value.get('target') != self.target or value.get('operation') != expected_operation
+                or kind == 'job' and value.get('runtime') != self.runtime):
+            raise ProjectInfrastructureError('CPL submission receipt belongs to a foreign operation')
+        record.update(handle=handle, state=value.get('state'))
+        _save(path, record)
+
+    def _quarantine_upload(self, path, record):
+        # Only immutable, candidate-specific archive uploads have no execution side effects.
+        arguments = record['identity'].get('arguments', [])
+        candidate = path.parent.parent.name
+        if (record.get('handle') or len(candidate) != 64
+                or any(c not in '0123456789abcdef' for c in candidate)
+                or arguments[:2] != ['upload', self.target]
+                or len(arguments) != 4
+                or arguments[-1] != self._wire_path(self._workspace / (candidate+'.tar'))):
+            return
+        record.update(state='quarantined', quarantine=dict(kind='isolated-upload',
+            destination=arguments[-1], workspace=str(self._workspace)))
+        _save(path, record)
 
     def _wire_path(self, path):
         selected = PurePosixPath(path)
@@ -273,7 +346,8 @@ class CplNativeCandidateBackend:
         script = directory / 'command.sh'
         command = directory / 'command.json'
         payload = json.loads(command.read_text()) if command.exists() else dict(
-            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance(),
+            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance()-self.cleanup_reserve,
+            allocation_expires_at=self.wall_clock()+self._allowance(),
             launcher='process-group-v1')
         if payload['argv'] != [str(arg) for arg in argv]:
             raise ProjectInfrastructureError('retained CPL command changed')
@@ -304,7 +378,7 @@ class CplNativeCandidateBackend:
             script.write_text(body)
         arguments = ('run', self.target, '--runtime', self.runtime,
                      '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
-        value = self._operation(key, arguments, kind='job', expires_at=payload['expires_at'])
+        value = self._operation(key, arguments, kind='job', expires_at=payload.get('allocation_expires_at', payload['expires_at']))
         if (value['returncode'] == 124 or
                 value['returncode'] == 137 and payload.get('launcher') != 'process-group-v1'
                 and self.wall_clock() >= payload['expires_at']):
