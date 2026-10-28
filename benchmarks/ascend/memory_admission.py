@@ -97,12 +97,17 @@ class MemoryAdmission:
             return
         if self.future is not None:
             return
-        for path in sorted(self.root.glob('*/job.json')):
+        pending = []
+        for path in self.root.glob('*/job.json'):
             job = json.loads(path.read_bytes())
             if job['status'] == 'pending':
-                self.active = job['review_id']
-                self.future = self.pool.submit(self._work, job)
-                return
+                # Retained retry directories are hashes, not submission order.
+                # Legacy jobs without a sequence retain stable path ordering.
+                pending.append((job.get('sequence', float('inf')), str(path), job))
+        if pending:
+            _, _, job = min(pending, key=lambda row: row[:2])
+            self.active = job['review_id']
+            self.future = self.pool.submit(self._work, job)
 
     def _work(self, job):
         directory = self._path(job['review_id']).parent
