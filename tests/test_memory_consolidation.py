@@ -27,6 +27,7 @@ class Provider:
         context = json.loads(messages[1]['content'])
         read = {json.loads(message['content'])['sha256'] for message in messages[2:]
                 if message['role'] == 'user' and 'sha256' in json.loads(message['content'])}
+        read.update(item['sha256'] for item in context.get('prefetched_artifacts', []))
         missing = set(context['required_artifacts']) - read
         if missing:
             return json.dumps(dict(read_artifact=dict(sha256=sorted(missing)[0])))
@@ -102,7 +103,7 @@ def test_unread_evidence_cannot_pass_and_deadline_is_enforced(tmp_path):
     def provider(messages, **kw):
         tick[0] += 1
         return json.dumps(dict(relation='equivalent', reason='unsupported', evidence=list(artifacts)))
-    agent = MemoryConsolidator(provider, clock=lambda: tick[0])
+    agent = MemoryConsolidator(provider, clock=lambda: tick[0], prefetch_bytes=0)
     result = agent.prepare(rows[0], rows, memory=SubjectMemory(tmp_path/'memory'),
                       read_artifact=lambda sha, **kw: artifacts[sha], max_seconds=3)
     assert result['proposal'] is None
@@ -116,7 +117,7 @@ def test_artifact_hash_mismatch_never_reaches_decision(tmp_path):
     def provider(messages, **kw):
         tick[0] += 1
         return json.dumps(dict(read_artifact=dict(sha256=rows[0]['proposal']['evidence'][0])))
-    agent = MemoryConsolidator(provider, clock=lambda: tick[0])
+    agent = MemoryConsolidator(provider, clock=lambda: tick[0], prefetch_bytes=0)
     result = agent.prepare(rows[0], rows, memory=SubjectMemory(tmp_path/'memory'),
                       read_artifact=lambda sha, **kw: b'changed', max_seconds=3)
     assert result['proposal'] is None
@@ -295,3 +296,55 @@ def test_reversed_pair_reuses_canonical_prompt_and_cached_judgment(tmp_path):
         read_artifact=lambda sha, **kw: artifacts[sha], max_seconds=10)
     assert result['provenance']['consolidation']['members'] == [b, a]
     assert len(provider.contexts) == 1
+
+
+def test_small_raw_bundle_allows_first_request_terminal_judgment(tmp_path):
+    artifacts = {}
+    a, b = [candidate(name, artifacts) for name in ['a', 'b']]
+    requests = []
+    def provider(messages, **kw):
+        requests.append(messages)
+        context = json.loads(messages[1]['content'])
+        raw = {item['sha256']: item['text'].encode('utf-8') for item in context['prefetched_artifacts']}
+        assert raw == artifacts
+        return json.dumps(dict(relation='equivalent', reason='raw examples match', evidence=sorted(raw)))
+    result = MemoryConsolidator(provider).compare(a, b, lambda sha, **kw: artifacts[sha], remaining=lambda: 10)
+    assert result['relation'] == 'equivalent'
+    assert len(requests) == 1
+
+
+def test_large_artifact_keeps_paging_and_terminal_feedback_identifies_unread_offsets(tmp_path):
+    data = b'x' * 9000
+    artifacts = {}
+    a, b = [candidate(name, artifacts) for name in ['a', 'b']]
+    sha = hashlib.sha256(data).hexdigest()
+    artifacts[sha] = data
+    b['proposal']['evidence'].append(sha)
+    requests = []
+    def provider(messages, **kw):
+        requests.append(messages)
+        if len(requests) == 1:
+            context = json.loads(messages[1]['content'])
+            assert sha not in [item['sha256'] for item in context['prefetched_artifacts']]
+            return json.dumps(dict(read_artifact=dict(sha256=sha, offset=0, limit=8192)))
+        if len(requests) == 2:
+            return json.dumps(dict(relation='variants', reason='premature', evidence=sorted(artifacts)))
+        if len(requests) == 3:
+            feedback = json.loads(messages[-1]['content'])
+            assert feedback['missing_artifacts'] == [dict(sha256=sha, next_offset=8192)]
+            return json.dumps(dict(read_artifact=dict(sha256=sha, offset=8192, limit=8192)))
+        return json.dumps(dict(relation='variants', reason='all raw evidence read', evidence=sorted(artifacts)))
+    result = MemoryConsolidator(provider, prefetch_bytes=100).compare(a, b,
+        lambda sha, **kw: artifacts[sha], remaining=lambda: 10)
+    assert result['relation'] == 'variants'
+    assert len(requests) == 4
+
+
+def test_prefetched_hash_mismatch_fails_before_provider_call():
+    artifacts = {}
+    a, b = [candidate(name, artifacts) for name in ['a', 'b']]
+    calls = []
+    agent = MemoryConsolidator(lambda *args, **kw: calls.append(args))
+    with pytest.raises(ValueError, match='artifact bytes do not match'):
+        agent.compare(a, b, lambda sha, **kw: b'wrong', remaining=lambda: 10)
+    assert calls == []
