@@ -172,23 +172,28 @@ def test_shared_scope_keeps_owned_recovery_and_foreign_trial_blocking(tmp_path, 
     assert recovered == ['owned','owned'] and health == [1] and probes == ['probe']
 
 
-@pytest.mark.parametrize('state', ['running','completed'])
-def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, monkeypatch, state):
+@pytest.mark.parametrize('state,initial_state', [('running','queued'),('completed','queued'),('completed','failed')])
+def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, monkeypatch, state, initial_state):
     import subprocess
     from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
     root = tmp_path/'campaign'
     calls = []
     def client(argv, **kwargs):
         calls.append(argv)
-        assert argv[2:] == ('observe','remote:fixture:job:trial')
-        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state=state,handle=argv[3])),'')
+        assert argv[3]=='remote:fixture:job:trial'
+        if argv[2]=='observe':
+            value=dict(state=state,handle=argv[3],exit=0 if state=='completed' else None)
+        else:
+            assert argv[2]=='logs'
+            value=dict(handle=argv[3],content='retained diagnostics')
+        return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
     foreground = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
         remote_workspace='/owned/foreground',physical_device=0,state_directory=root/'foreground',process_runner=client)
     trial = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
         remote_workspace='/owned/trial',physical_device=0,state_directory=root/'trial/runtime/transport')
     journal = trial.root/'measurement/operation.json'
     journal.parent.mkdir(parents=True)
-    journal.write_text(json.dumps(dict(state='queued',handle='remote:fixture:job:trial',
+    journal.write_text(json.dumps(dict(state=initial_state,handle='remote:fixture:job:trial',
         identity=dict(route=trial.runtime_identity,workspace=str(trial._workspace),arguments=[]))))
     admission, health, probes, _ = setup(root/'foreground',monkeypatch)
     admission.transports = (foreground,)
@@ -200,7 +205,8 @@ def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, 
     else:
         admission(lambda:100)
         assert health == [0] and probes == ['probe']
-    assert len(calls) == 1 and json.loads(journal.read_text())['state'] == state
+    assert len(calls)==(1 if state=='running' else 3) and json.loads(journal.read_text())['state']==state
+    if state=='completed':assert json.loads(journal.read_text())['result']['returncode']==0
     from benchmarks.ascend.runtime_allocation import unsettled_operations
     assert bool(unsettled_operations(root)) == (state == 'running')
 
@@ -212,10 +218,12 @@ def test_owned_and_trial_recovery_share_remaining_elapsed_allocation(tmp_path, m
     monkeypatch.setattr(module.time,'monotonic',lambda:now[0])
     root = tmp_path/'campaign'
     def client(argv, **kwargs):
+        if argv[2]=='logs':
+            return subprocess.CompletedProcess(argv,0,json.dumps(dict(handle=argv[3],content='diagnostics')),'')
         assert argv[2] == 'observe'
         observations.append((argv[3],kwargs['timeout']))
         now[0] += 2 if argv[3].endswith(':owned') else 3
-        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state='completed',handle=argv[3])),'')
+        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state='completed',handle=argv[3],exit=0)),'')
     foreground = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
         remote_workspace='/owned/foreground',physical_device=0,state_directory=root/'foreground',
         process_runner=client,clock=lambda:now[0])
