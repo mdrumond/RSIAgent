@@ -161,3 +161,26 @@ def test_actual_pi_error_arm_is_invalid_and_never_starts_peer(tmp_path, kind):
     assert result['arms']['control']['observations']['interruption_reason']==expected
     assert evaluate(h, tmp_path)==result and calls==['control']
     assert not h.requests and not (tmp_path/'treatment').exists()
+
+
+def test_project_timing_includes_shared_health_and_environment_but_not_other_actor(tmp_path):
+    arm=tmp_path/'arm'
+    binding=arm/'runtime/binding'
+    transport=binding/'transport-state'
+    for name,project in [('one','my-project'),('probe','environment-known-good'),('other','other-project')]:
+        root=transport/name
+        root.mkdir(parents=True)
+        (root/'candidate.json').write_text(json.dumps(dict(project_id=project)))
+    rows=[dict(key='one/compile',stage='compile',started_epoch=102,ended_epoch=104),
+          dict(key='probe/compile',stage='compile',started_epoch=100,ended_epoch=102),
+          dict(key='health/a',stage='health',started_epoch=100,ended_epoch=101),
+          dict(key='other/compile',stage='compile',started_epoch=100,ended_epoch=110)]
+    (transport/'timing.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in rows))
+    report=binding/'environment-checks/wave-001/a/report.json'
+    report.parent.mkdir(parents=True)
+    report.write_text(json.dumps(dict(status='passed',started_epoch=100,ended_epoch=102)))
+    outcome=interrupted_outcome(arm,TimeoutError('deadline'),ContentAddressedArtifacts(tmp_path/'out'),
+        project_id='my-project',started_epoch=100,elapsed_seconds=10)
+    timing=outcome.observations['timing']
+    assert timing['attributed_seconds']==4 and timing['unattributed_seconds']==6
+    assert timing['by_stage_seconds']==dict(compile=4,health=1,environment=2)

@@ -40,7 +40,7 @@ def test_cache_shared_across_arms_but_health_is_fresh(tmp_path,monkeypatch):
 def test_expiry_force_device_and_dependency_changes_require_probe(tmp_path,monkeypatch):
     now=[1000]
     admission,health,probes,transport=setup(tmp_path,monkeypatch,clock=lambda:now[0])
-    admission(lambda:100);now[0]+=900;admission(lambda:100);admission(lambda:100,force=True)
+    admission(lambda:100);now[0]+=1800;admission(lambda:100);admission(lambda:100,force=True)
     transport.runtime_identity['physical_device']=2;admission(lambda:100)
     admission.dependencies['extra_dependency']='changed';admission(lambda:100)
     assert len(probes)==5 and len(health)==5
@@ -64,7 +64,7 @@ def test_fresh_health_uses_physical_device_and_rejects_busy_or_forbidden(tmp_pat
     def run(argv,**kwargs):
         calls.append(argv);return SimpleNamespace(returncode=0,stdout=json.dumps({'queries':q,'compiler':'pinned','versions':{},'toolkit':None}),job_handle='remote:t:job:health')
     t=SimpleNamespace(runtime_identity={'target':'gz-a3','physical_device':2},run_remote=run)
-    module.fresh_health(t,tmp_path,allowed_devices=[0,1,2],health_workspace='/owned/incoming');assert calls[-1][-1]=='2'
+    module.fresh_health(t,tmp_path,allowed_devices=[0,1,2],health_workspace='/owned/incoming');assert calls[-1][-2:] == ['2','full']
     q['proc-mem']['text']='PID:123'
     with pytest.raises(ProjectInfrastructureError,match='idle'):module.fresh_health(t,tmp_path,allowed_devices=[0,1,2],health_workspace='/owned/incoming')
     t.runtime_identity['physical_device']=3
@@ -235,3 +235,53 @@ def test_owned_and_trial_recovery_share_remaining_elapsed_allocation(tmp_path, m
     assert 0 < observations[1][1] <= 3
     assert observations[1][1] == pytest.approx(3,abs=.01)
     assert now[0] == 5 and not health and not probes
+
+
+def test_lease_skips_toolchain_discovery_but_keeps_fresh_health(tmp_path, monkeypatch):
+    admission, health, probes, transport = setup(tmp_path, monkeypatch)
+    calls = []
+    original = module.fresh_health
+    def record(*args, **kwargs):
+        calls.append(kwargs.get('cached_identity'))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, 'fresh_health', record)
+    admission(lambda:100)
+    admission(lambda:100)
+    assert calls[0] is None and calls[1]['soc_version'] == 255
+    admission(lambda:100, force=True)
+    assert calls[2] is None and len(probes) == 2 and len(health) == 3
+
+
+def test_lease_keeps_raw_health_and_marks_reused_identity(tmp_path):
+    queries = {kind:{'exit':0,'text':text} for kind,text in {
+        'health':'Health Status : OK','ecc':'Errors : 0','memory':'HBM',
+        'usages':'HBM Usage Rate(%) : 0','proc-mem':'No process in device',
+        'board':'Chip Name : Ascend910\nNPU Name : 9362'}.items()}
+    calls=[]
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps(dict(queries=queries)), job_handle='remote:t:job:health')
+    transport=SimpleNamespace(runtime_identity={'physical_device':0},run_remote=run)
+    identity=dict(compiler='pinned',versions={},toolkit='cann',soc_version=255,arch='dav-2201')
+    actual,path=module.fresh_health(transport,tmp_path,health_workspace='/owned/incoming',cached_identity=identity)
+    assert calls[0][-1]=='device' and actual['soc_version']==255
+    raw=json.loads(__import__('pathlib').Path(path).read_text())
+    assert 'soc_version' not in raw and raw['identity_source']=='lease'
+    assert raw['queries']==queries and raw['leased_identity']==identity
+
+
+def test_dynamic_health_script_executes_only_bounded_device_queries(monkeypatch, capsys):
+    import subprocess
+    import sys
+    calls=[]
+    def run(argv, **kwargs):
+        calls.append((argv,kwargs))
+        return SimpleNamespace(returncode=0, stdout='device report')
+    monkeypatch.setattr(subprocess,'run',run)
+    monkeypatch.setattr(sys,'argv',['health','2','device'])
+    exec(compile(module._HEALTH,'health-query','exec'), {})
+    report=json.loads(capsys.readouterr().out)
+    assert len(calls)==6
+    assert {call[0][3] for call in calls}=={'health','ecc','memory','usages','proc-mem','board'}
+    assert all(argv[-3:]==['2','-c','0'] and options['timeout']==4 for argv,options in calls)
+    assert report['soc_version'] is None and report['compiler'] is None

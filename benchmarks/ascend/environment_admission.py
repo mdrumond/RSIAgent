@@ -52,9 +52,11 @@ def native_reservation(root, remaining):
 
 _HEALTH = r'''
 import importlib.metadata,json,os,pathlib,shutil,subprocess,sys
-soc_query=subprocess.run([sys.executable,'-c','import torch_npu; print(torch_npu.npu.get_soc_version())'],capture_output=True,text=True,timeout=15)
-soc=int(soc_query.stdout.strip()) if soc_query.returncode==0 and soc_query.stdout.strip().isdigit() else None
-# This adapter's native host driver implements the dav2201 runtime binding.
+full=sys.argv[2]=='full'
+soc=None
+if full:
+ soc_query=subprocess.run([sys.executable,'-c','import torch_npu; print(torch_npu.npu.get_soc_version())'],capture_output=True,text=True,timeout=15)
+ soc=int(soc_query.stdout.strip()) if soc_query.returncode==0 and soc_query.stdout.strip().isdigit() else None
 arch='dav-2201' if soc==255 else None
 rows={}
 for kind in ['health','ecc','memory','usages','proc-mem','board']:
@@ -62,25 +64,28 @@ for kind in ['health','ecc','memory','usages','proc-mem','board']:
   r=subprocess.run(['npu-smi','info','-t',kind,'-i',sys.argv[1],'-c','0'],capture_output=True,text=True,timeout=4)
   rows[kind]={'exit':r.returncode,'text':r.stdout[:10000]}
  except subprocess.TimeoutExpired: rows[kind]={'exit':None,'text':'timeout'}
-compiler=shutil.which('bisheng')
-r=subprocess.run([compiler,'--version'],capture_output=True,text=True,timeout=5) if compiler else None
+compiler=r=packages=None
 versions={}
-for name in ['torch','torch-npu']:
- try: versions[name]=importlib.metadata.version(name)
- except importlib.metadata.PackageNotFoundError: versions[name]=None
-home=os.environ.get('ASCEND_HOME_PATH')
-candidates=[]
-for value in [compiler,home,os.environ.get('ASCEND_TOOLKIT_HOME')]:
- if value:
-  path=pathlib.Path(value).resolve()
-  candidates.extend([path,*path.parents])
-query=next((p/'query_pkg_version.sh' for p in candidates if (p/'query_pkg_version.sh').is_file()),None)
-packages=subprocess.run(['bash',str(query)],capture_output=True,text=True,timeout=8) if query else None
+if full:
+ compiler=shutil.which('bisheng')
+ r=subprocess.run([compiler,'--version'],capture_output=True,text=True,timeout=5) if compiler else None
+ versions={}
+ for name in ['torch','torch-npu']:
+  try: versions[name]=importlib.metadata.version(name)
+  except importlib.metadata.PackageNotFoundError: versions[name]=None
+ home=os.environ.get('ASCEND_HOME_PATH')
+ candidates=[]
+ for value in [compiler,home,os.environ.get('ASCEND_TOOLKIT_HOME')]:
+  if value:
+   path=pathlib.Path(value).resolve()
+   candidates.extend([path,*path.parents])
+ query=next((p/'query_pkg_version.sh' for p in candidates if (p/'query_pkg_version.sh').is_file()),None)
+ packages=subprocess.run(['bash',str(query)],capture_output=True,text=True,timeout=8) if query else None
 print(json.dumps({'queries':rows,'compiler':r.stdout if r and r.returncode==0 else None,'versions':versions,'toolkit':packages.stdout if packages and packages.returncode==0 else None,'soc_version':soc,'arch':arch}))
 '''
 
 
-def fresh_health(transport, root, *, allowed_devices=None, health_workspace=None):
+def fresh_health(transport, root, *, allowed_devices=None, health_workspace=None, cached_identity=None):
     if (not isinstance(health_workspace, str) or not Path(health_workspace).is_absolute()
             or '..' in Path(health_workspace).parts):
         raise ProjectInfrastructureError('configure an existing absolute health_workspace for readonly device checks')
@@ -96,15 +101,18 @@ def fresh_health(transport, root, *, allowed_devices=None, health_workspace=None
     device = identity['physical_device']
     if not permitted_devices([device], allowed_devices):
         raise ProjectInfrastructureError('physical device is outside campaign permissions')
-    result = transport.run_remote(['python', '-c', _HEALTH, str(device)],
+    result = transport.run_remote(['python', '-c', _HEALTH, str(device), 'full' if cached_identity is None else 'device'],
                                   key='health/' + uuid.uuid4().hex,
                                   cwd=health_workspace)
     if result.returncode:
         raise ProjectInfrastructureError('bounded device health query failed')
     report = json.loads(result.stdout)
+    leased = {key: cached_identity.get(key) for key in ('compiler','versions','toolkit','soc_version','arch')} if cached_identity is not None else {}
     path = Path(root) / 'device-health' / (uuid.uuid4().hex + '.json')
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic(path, canonical(dict(report, handle=result.job_handle, runtime=identity, epoch=time.time())))
+    atomic(path, canonical(dict(report, handle=result.job_handle, runtime=identity, epoch=time.time(),
+                                identity_source='lease' if leased else 'fresh', leased_identity=leased)))
+    report = dict(report, **leased)
     q = report['queries']
     if any(q.get(k, {}).get('exit') != 0 for k in ['health','ecc','memory','usages','proc-mem','board']):
         raise ProjectInfrastructureError('device health query unavailable')
@@ -167,7 +175,7 @@ def recover_campaign_operations(root, transports, *, seconds=30, remaining=lambd
         identity = record.get('identity', {})
         route = identity.get('route', {})
         client = clients.get(route.get('target'))
-        if client is None or not record.get('handle'):
+        if client is None:
             continue
         left = min(deadline-time.monotonic(), remaining())
         if left <= 0:
@@ -214,26 +222,31 @@ class EnvironmentAdmission:
                 raise TimeoutError('native recovery elapsed allocation exhausted')
             if unsettled_operations(self.pending_root):
                 raise ProjectInfrastructureError('unsettled native work prevents environment admission')
-            for transport in self.transports:
-                # Fresh health runs even on a known-good probe cache hit.
-                health, path = fresh_health(transport, self.root,
-                    allowed_devices=self.dependencies.get('allowed_devices'),
-                    health_workspace=self.dependencies.get('health_workspace'))
-                verify_dependencies(health, self.dependencies)
-                health_paths.append(path)
-                identities.append(dict(runtime=transport.runtime_identity, health=health))
             probe = smoke_plan(target=self.check.config.target, arch=self.check.config.arch,
                                profile=self.check.config.execution_profile)
-            key = hashlib.sha256(canonical(dict(workers=identities, dependencies=self.dependencies,
+            routes = [transport.runtime_identity for transport in self.transports]
+            key = hashlib.sha256(canonical(dict(schema=2, workers=routes, dependencies=self.dependencies,
                                                probe=probe.source_fingerprint))).hexdigest()
             self.keys.add(key)
             path = self.cache / (key + '.json')
             cached = json.loads(path.read_bytes()) if path.exists() else None
             now = self.clock()
             evidence = Path(cached['probe']) if cached else None
-            valid_evidence = (evidence is not None and evidence.is_file()
-                and hashlib.sha256(evidence.read_bytes()).hexdigest() == cached.get('probe_sha256'))
-            if not force and valid_evidence and 0 <= now - cached['verified_epoch'] < 900:
+            valid = (not force and evidence is not None and evidence.is_file()
+                and hashlib.sha256(evidence.read_bytes()).hexdigest() == cached.get('probe_sha256')
+                and 0 <= now - cached['verified_epoch'] < 1800
+                and len(cached.get('identities', [])) == len(routes))
+            for index, transport in enumerate(self.transports):
+                previous = cached['identities'][index]['health'] if valid else None
+                health, health_path = fresh_health(transport, self.root,
+                    allowed_devices=self.dependencies.get('allowed_devices'),
+                    health_workspace=self.dependencies.get('health_workspace'), cached_identity=previous)
+                verify_dependencies(health, self.dependencies)
+                if previous is not None and health != previous:
+                    raise ProjectInfrastructureError('device identity changed during environment lease')
+                health_paths.append(health_path)
+                identities.append(dict(runtime=transport.runtime_identity, health=health))
+            if valid:
                 report = dict(status='reused', probe=cached['probe'], health=health_paths,
                               verified_epoch=cached['verified_epoch'], epoch=now)
             else:
@@ -241,8 +254,7 @@ class EnvironmentAdmission:
                 probe_path = str(self.check.last_report.resolve())
                 report = dict(status='passed', probe=probe_path, health=health_paths,
                               probe_sha256=hashlib.sha256(Path(probe_path).read_bytes()).hexdigest(),
-                              routes=[transport.runtime_identity for transport in self.transports],
-                              verified_epoch=self.clock())
+                              routes=routes, identities=identities, verified_epoch=self.clock())
                 atomic(path, canonical(report))
             atomic(self.root / 'environment-admission.json', canonical(report))
         except Exception:
