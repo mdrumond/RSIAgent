@@ -137,6 +137,11 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds, n
 def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                            max_seconds=7200, compose=compose_production, previous_runtime_configs=None):
     subjects = tuple(subjects)
+    admission_mode = settings.get('memory_admission_mode', 'paired')
+    if admission_mode not in {'paired', 'focused'}:
+        raise ValueError('memory_admission_mode must be paired or focused')
+    if admission_mode == 'focused' and settings.get('actor_memory_delivery', 'indexed') != 'kdb-only':
+        raise ValueError('focused admission requires kdb-only Actor memory delivery')
     memory_delivery = settings.get('actor_memory_delivery', 'indexed')
     if memory_delivery not in {'indexed', 'kdb-only'}:
         raise ValueError('actor_memory_delivery must be indexed or kdb-only')
@@ -587,11 +592,42 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 child.artifacts.put_bytes(store.read_bytes(digest))
         return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
 
+    def replay_memory_source(request, source_sha256, directory, *, remaining_seconds):
+        """Replay full retained source against its source project's host contract."""
+        from .execution import process_deadline
+        item = plans.get(request['project_id'])
+        if item is not None:
+            spec = ProjectSpec.from_mapping(item['spec'])
+        else:
+            spec = ProjectSpec.from_mapping(store.read_json(request['artifacts']['contract']))
+        if spec.project_id != request['project_id']:
+            raise ValueError('retained replay contract project differs from source review')
+        policy.admit(spec)
+        source = store.read_bytes(source_sha256)
+        with process_deadline(time.monotonic() + remaining_seconds):
+            result = actor.executor.execute(spec, source.decode('utf-8'))
+        branch = ContentAddressedArtifacts(Path(directory) / 'artifacts')
+        refs = {name: branch.put_json(value) for name, value in result.artifacts.items()}
+        refs['source'] = branch.put_bytes(source)
+        observations = dict(classification=result.evidence.classification.value,
+            detail=result.evidence.detail, contract_sha256=branch.put_json(spec.as_dict()))
+        refs['result:replay'] = branch.put_json(observations)
+        from .subject_execution import SubjectOutcome
+        return SubjectOutcome(result.evidence.verified, source_sha256, refs, observations, branch.root)
+
+    campaign.replay_memory_source = replay_memory_source
     campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
     if settings.get('memory_verification', True):
         from .memory_admission import MemoryAdmission
         from .memory_verifier import MemoryVerifier
-        judge = MemoryVerifier(role_complete('memory_verifier'), select_trial, execute_trial_arm,
+        if admission_mode == 'focused':
+            from .focused_memory import FocusedMemoryVerifier
+            judge_type = lambda complete, select, execute, **kw: FocusedMemoryVerifier(
+                complete, select, replay_memory_source, execute, store.read_bytes,
+                measure_pair=bound.get('measure_memory_pair'), **kw)
+        else:
+            judge_type = MemoryVerifier
+        judge = judge_type(role_complete('memory_verifier'), select_trial, execute_trial_arm,
             model_identity=campaign.model_identity, runtime_identity=campaign.runtime_identity,
             max_seconds=settings.get('memory_trial_seconds', 1800),
             arm_seconds=settings.get('memory_arm_seconds', 600))
