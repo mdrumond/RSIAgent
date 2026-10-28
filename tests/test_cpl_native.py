@@ -728,3 +728,18 @@ def test_terminal_cleanup_deadline_is_frozen_across_resume(tmp_path):
     assert record['cleanup_expires_at'] == 1045
     assert len([call for call in remote.calls if call[2] == 'logs']) == 1
     assert len([call for call in remote.calls if call[2] == 'run']) == 1
+
+
+def test_terminal_looking_submission_without_job_handle_remains_blocking(tmp_path):
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    calls = []
+    def missing(argv, **options):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, json.dumps(dict(state='failed', exit=None)), '')
+    candidate = backend(tmp_path, missing)
+    with pytest.raises(_PendingObservation, match='retained handle'):
+        candidate.run_remote(('true',), key='compile')
+    assert len(unsettled_operations(candidate.root)) == 1
+    with pytest.raises(_PendingObservation, match='ambiguous'):
+        candidate.run_remote(('true',), key='compile')
+    assert len(calls) == 1

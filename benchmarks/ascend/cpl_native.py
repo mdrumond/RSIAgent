@@ -195,6 +195,11 @@ class CplNativeCandidateBackend:
                     self._quarantine_upload(path, record)
                 raise
             handle = value.get('handle')
+            if kind == 'job' and handle is None:
+                self._restore_receipt(path, record, receipt, kind)
+                if not record.get('handle'):
+                    raise self._pending('CPL job submission lacks a retained handle; do not resubmit')
+                handle = record['handle']
             if handle is not None:
                 if not isinstance(handle, str) or not handle.startswith(f'remote:{self.target}:{kind}:'):
                     raise ProjectInfrastructureError('CPL returned a foreign retained handle')
