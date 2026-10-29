@@ -2,7 +2,7 @@
 import argparse
 from copy import copy
 from contextlib import redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import hashlib
 import io
 import json
@@ -335,6 +335,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         if (not isinstance(recovery, dict) or set(recovery) != {'reason', 'artifacts'}
                 or not isinstance(recovery['reason'], str) or not isinstance(recovery['artifacts'], dict)):
             raise ValueError('recovery requires a reason and retained artifact references')
+        if 'before-source' in recovery['artifacts']:
+            request = replace(request, initial_source=store.read_bytes(recovery['artifacts']['before-source']).decode('utf-8'))
         for digest in set(recovery['artifacts'].values()):
             branch_artifacts.put_bytes(store.read_bytes(digest))
         registry = branch_artifacts.put_bytes(canonical(recovery))
@@ -590,6 +592,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         for record in json.loads(snapshot)['memories']:
             for digest in memory_artifacts(record):
                 child.artifacts.put_bytes(store.read_bytes(digest))
+        for digest in set(item.get('recovery', {}).get('artifacts', {}).values()):
+            child.artifacts.put_bytes(store.read_bytes(digest))
         return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
 
     def replay_memory_source(request, source_sha256, directory, *, remaining_seconds):
@@ -624,7 +628,10 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             from .focused_memory import FocusedMemoryVerifier
             judge_type = lambda complete, select, execute, **kw: FocusedMemoryVerifier(
                 complete, select, replay_memory_source, execute, store.read_bytes,
-                measure_pair=bound.get('measure_memory_pair'), **kw)
+                measure_pair=bound.get('measure_memory_pair'), witness_cache=root / 'memory-replay-witnesses',
+                replay_binding=dict(semantic_configs=identity['referenced_semantic_sha256'],
+                    settings_sha256=identity['settings_sha256'],
+                    routes=[transport.runtime_identity for transport in bound.get('transports', ())]), **kw)
         else:
             judge_type = MemoryVerifier
         judge = judge_type(role_complete('memory_verifier'), select_trial, execute_trial_arm,
