@@ -31,13 +31,25 @@ def test_hanging_provider_is_terminated_on_stop_or_remaining_budget(stop):
     before = set(multiprocessing.active_children())
     records = []
     started = time.monotonic()
-    agent = BoundedAgent(Agent(), deadline=started+.3,
-                         stopped=lambda: stop and time.monotonic() > started+.1)
+    now, stop_requested = [started], [False]
+    deadline = started+60
+    # Exercise cancellation during a request, regardless of supervisor startup
+    # latency. The real clock is only a watchdog for a broken test handshake.
+    def record(kind, data):
+        records.append((kind, data))
+        if kind == 'request':
+            if stop:
+                stop_requested[0] = True
+            else:
+                now[0] = deadline+1
+    agent = BoundedAgent(Agent(), deadline=deadline, clock=lambda: now[0],
+                         stopped=lambda: stop_requested[0] or time.monotonic()-started > 5)
     with pytest.raises(WorkerStopped):
-        agent.complete('optimize', {'hang': True}, lambda *row: records.append(row))
-    assert time.monotonic() - started < 2
+        agent.complete('optimize', {'hang': True}, record)
+    assert time.monotonic() - started < 10
     assert set(multiprocessing.active_children()) == before
-    assert records[0][0] == 'request'
+    assert [row[0] for row in records] == ['request']
+    assert stop_requested[0] == stop
 
 
 def test_child_keeps_agent_state_between_host_actions():
@@ -67,9 +79,11 @@ def test_stop_kills_provider_descendants(tmp_path):
             record('child', {'pid': child.pid})
             time.sleep(30)
     started, descendants = time.monotonic(), []
-    agent = BoundedAgent(Spawning(), deadline=started+5, stopped=lambda: time.monotonic()-started > .3)
+    agent = BoundedAgent(Spawning(), deadline=started+60,
+                         stopped=lambda: bool(descendants) or time.monotonic()-started > 5)
     with pytest.raises(WorkerStopped):
         agent.complete('optimize', {}, lambda kind,data: descendants.append(data['pid']))
+    assert time.monotonic()-started < 10
     assert descendants
     for pid in descendants:
         stat = Path(f'/proc/{pid}/stat')
