@@ -64,7 +64,11 @@ def parse_trial_action(text: str) -> TrialAction | None:
         return None
     if not isinstance(value, dict) or len(value) != 1:
         return None
-    kind, payload = next(iter(value.items()))
+    return trial_action(*next(iter(value.items())))
+
+
+def trial_action(kind: str, payload: object) -> TrialAction | None:
+    """Validate a structured action without a JSON serialization round trip."""
     if kind in _EMPTY_ACTIONS:
         return TrialAction(kind, {}) if payload == {} else None
     if not isinstance(payload, dict):
@@ -232,19 +236,28 @@ class CoreAttemptDriver:
         )
 
 
-_SYSTEM_PROMPT = """You develop one A5 kernel. Respond with exactly one JSON object:
+_JSON_ACTION_CONTRACT = """Respond with exactly one JSON object:
 {"propose":{"text":"..."}}, {"write":{"slot":"kernel","content":"..."}},
 {"compile":{}}, {"run":{}}, {"query-knowledge":{"query":"...","limit":5}},
 {"request-profile":{}}, {"request-timing":{}}, {"request-debug":{}},
 {"request-sanitizer":{"tool":"memcheck"}}, or {"submit":{}}.
-Adaptive projects also support {"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}.
-Read full retained evidence in byte pages (maximum 8192 bytes); follow next_offset.
+Adaptive projects also support {"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}."""
+_TYPED_ACTION_CONTRACT = "Select one declared typed host tool."
+_KERNEL_INSTRUCTIONS = """Read full retained evidence in byte pages (maximum 8192 bytes); follow next_offset.
 UTF-8 pages contain readable text, not base64; binary pages return metadata only.
 Diagnostic actions are bound by adaptive projects; sanitizer tool can also be racecheck,
 initcheck, or synccheck. Diagnostic observations never establish correctness or timing.
 You cannot choose paths or commands and cannot report a score or authoritative result.
 Compile checks source with the host compiler only; it never launches the kernel or
 establishes runtime or numerical correctness."""
+
+
+def actor_system_prompt(kernel="A5", *, typed=False):
+    contract = _TYPED_ACTION_CONTRACT if typed else _JSON_ACTION_CONTRACT
+    return f"You develop one {kernel} kernel. {contract}\n{_KERNEL_INSTRUCTIONS}"
+
+
+_SYSTEM_PROMPT = actor_system_prompt()
 
 _ACTION_NUDGE = """Respond with exactly one supported JSON action: propose, write,
 compile, run, query-knowledge, request-profile, request-timing, request-debug,

@@ -246,12 +246,15 @@ class A3Completion:
     text: str
     completion_tokens: int
     provenance: Mapping[str, Any]
+    selected_action: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _validate_completion_values(
             self.text, self.completion_tokens, label="completion"
         )
         object.__setattr__(self, "provenance", _deep_freeze(self.provenance))
+        if self.selected_action is not None:
+            object.__setattr__(self, "selected_action", _deep_freeze(self.selected_action))
 
     def as_dict(self) -> dict[str, Any]:
         return {
