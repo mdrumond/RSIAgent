@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 from dataclasses import replace
+from contextvars import ContextVar
 from pathlib import Path
 import time
 
@@ -15,6 +16,9 @@ from .phase1_cli import load_native_config
 from .subject_runtime import compose_production
 from .wave_environment import NativeWaveEnvironmentCheck
 from .environment_admission import EnvironmentAdmission, native_reservation
+
+
+_verifier_execution = ContextVar('native_verifier_execution', default=False)
 
 
 def _allocation_error(message, remaining):
@@ -34,11 +38,17 @@ class _CheckedExecutor:
         return _CheckedExecutor(self._executor.bind_case(*args, **kwargs), self._check)
 
     def _call(self, name, *args, **kwargs):
-        with self._check.reserve():
-            self._check()
-            # A candidate failure does not establish a broken environment.
-            # Fresh health remains mandatory at the next dispatch.
-            return getattr(self._executor, name)(*args, **kwargs)
+        # Verifier checks own a process deadline, independently of the campaign
+        # Actor allocation. Keep this role through synthetic preparation leases.
+        token = _verifier_execution.set(current_worker() is None)
+        try:
+            with self._check.reserve():
+                self._check()
+                # A candidate failure does not establish a broken environment.
+                # Fresh health remains mandatory at the next dispatch.
+                return getattr(self._executor, name)(*args, **kwargs)
+        finally:
+            _verifier_execution.reset(token)
 
     def execute(self, *args, **kwargs):
         return self._call('execute', *args, **kwargs)
@@ -101,6 +111,8 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     def remaining():
         if stop is not None and stop.exists():
             return 0
+        if _verifier_execution.get():
+            return max(0, min(max_seconds, _deadline.get() - time.monotonic()))
         budget, worker = current_budget(), current_worker()
         if budget is not None and (worker.remaining() if worker is not None else budget.remaining()) <= 0:
             return 0
@@ -140,7 +152,7 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
         with preparation('device health, runtime admission and known-good probe'):
             with native_reservation(operation_root, remaining):
                 prepare_until_ready(lambda: admission(remaining, force=force),
-                    stopped=remaining.stop_requested)
+                    stopped=remaining.stop_requested, remaining=remaining)
     ensure_environment.invalidate = admission.invalidate
     ensure_environment.reserve = lambda: native_reservation(operation_root, remaining)
     actor = bound['actor']

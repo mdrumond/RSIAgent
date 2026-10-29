@@ -233,7 +233,7 @@ def dispatch_actor(callback, name, seconds, *args, **kwargs):
             return callback(*args, **kwargs)
 
 
-def prepare_until_ready(callback, *, stopped=lambda: False, sleep=time.sleep):
+def prepare_until_ready(callback, *, stopped=lambda: False, sleep=time.sleep, remaining=None):
     """Retry only identified transient admission failures; never relax checks."""
     from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
     transient = {'device is not idle', 'device health query unavailable',
@@ -242,8 +242,9 @@ def prepare_until_ready(callback, *, stopped=lambda: False, sleep=time.sleep):
     while True:
         if stopped(): raise TimeoutError('operator stopped preparation')
         worker, budget = current_worker(), current_budget()
-        remaining = worker.remaining() if worker is not None else budget.remaining() if budget is not None else float('inf')
-        if remaining <= 0:
+        available = (remaining() if remaining is not None else worker.remaining() if worker is not None
+                     else budget.remaining() if budget is not None else float('inf'))
+        if available <= 0:
             error = TimeoutError('actor work allocation exhausted during preparation')
             error.interruption_reason = 'deadline-exhausted'
             raise error

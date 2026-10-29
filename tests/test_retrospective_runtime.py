@@ -286,3 +286,66 @@ def test_candidate_failure_retains_environment_lease(tmp_path, monkeypatch, erro
     executor._executor.execute=lambda *args:'host-verified'
     assert executor.execute('repaired candidate')=='host-verified'
     assert calls.count('probe-compile')==1
+
+
+def test_verifier_device_check_owns_deadline_after_actor_exhaustion(tmp_path, monkeypatch):
+    from benchmarks.ascend.actor_time import ActorWorkBudget
+    from benchmarks.ascend.execution import process_deadline
+    now = [0.]
+    bound, calls = compose(tmp_path, monkeypatch, now=now)
+    budget = ActorWorkBudget(tmp_path/'actor-time.json', 10, clock=lambda: now[0])
+    allowances = []
+    def execute(*args):
+        allowances.append(bound['transport'].remaining_seconds())
+        now[0] += 2
+        return 'verified'
+    bound['actor'].executor._executor.execute = execute
+    with budget.bind():
+        with budget.actor('actor', 10) as worker, worker.scope(work=True):
+            now[0] += 10
+        assert budget.remaining() == 0
+        with process_deadline(now[0]+20):
+            assert bound['actor'].executor.execute('variant') == 'verified'
+        assert budget.remaining() == 0
+        with process_deadline(now[0]):
+            with pytest.raises(TimeoutError):
+                bound['actor'].executor.execute('late variant')
+        (tmp_path/'STOP').touch()
+        with process_deadline(now[0]+20):
+            with pytest.raises(TimeoutError) as stopped:
+                bound['actor'].executor.execute('stopped variant')
+        assert stopped.value.interruption_reason == 'operator-stop'
+    assert allowances == [16]
+    assert calls == ['probe-compile', 'probe-execute']
+
+
+def test_verifier_preflight_retries_use_own_deadline_and_actor_zero_stays_blocked(tmp_path, monkeypatch):
+    from benchmarks.ascend.actor_time import ActorWorkBudget
+    from benchmarks.ascend.execution import process_deadline
+    now, observed = [0.], []
+    class Admission:
+        def __init__(self, *args, **kwargs): pass
+        def invalidate(self): pass
+        def __call__(self, remaining, **kwargs):
+            observed.append(remaining())
+            now[0] += 2
+            raise ProjectInfrastructureError('device health query unavailable')
+    monkeypatch.setattr(runtime, 'EnvironmentAdmission', Admission)
+    # Avoid real retry sleeps; only deterministic admission work advances time.
+    original = runtime.prepare_until_ready
+    monkeypatch.setattr(runtime, 'prepare_until_ready', lambda *a, **kw: original(*a, **kw, sleep=lambda _: None))
+    bound, calls = compose(tmp_path, monkeypatch, now=now)
+    budget = ActorWorkBudget(tmp_path/'actor-time.json', 10, clock=lambda: now[0])
+    with budget.bind():
+        with budget.actor('actor', 10) as worker, worker.scope(work=True):
+            now[0] += 10
+            with process_deadline(now[0]+50):
+                with pytest.raises(TimeoutError):
+                    bound['actor'].executor.execute('actor candidate')
+            assert observed == []
+        with process_deadline(now[0]+3):
+            with pytest.raises(TimeoutError):
+                bound['actor'].executor.execute('verifier variant')
+        assert budget.remaining() == 0
+    assert observed == [3, 1]
+    assert calls == []
