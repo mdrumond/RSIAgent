@@ -286,6 +286,49 @@ def test_first_resume_after_active_allocation_crash_publishes_retained_siblings(
     assert recovery.resume() == report
 
 
+@pytest.mark.parametrize('close_method', ['run', 'finalize_pending_wave'])
+def test_legacy_partial_finalization_cannot_refund_unknown_interrupted_spend(tmp_path, close_method):
+    def select(messages):
+        return _wave(messages[-1]['content'], [_project('good', 'gm-ub-movement'),
+                                              _project('offline', 'simd-vector')])
+    def execute(request):
+        if request.spec.project_id == 'offline':
+            raise OSError('lost observation')
+        return _result(request.spec, True, 'host pass')
+    strict = AdaptivePhase1Coordinator(tmp_path, 'Recover', SEED, CurriculumAgent(select), execute,
+        max_parallel=1, project_target=2, max_seconds=100, clock=lambda: 0)
+    proposal = strict.propose_wave()
+    strict.approve_wave(proposal, ['good', 'offline'])
+    with pytest.raises(RuntimeError, match='failed before verification'):
+        strict.run_approved_wave()
+    # Pre-Actor-budget campaigns retained only state.json's active marker.
+    # There is no Actor ledger that could identify this interval as setup.
+    (tmp_path/'actor-time.json').unlink()
+    state_path = tmp_path/'state.json'
+    state = json.loads(state_path.read_bytes())
+    state.pop('timing', None)
+    state.update(allocation_active=True, elapsed_seconds=3)
+    state_path.write_text(json.dumps(state))
+    retained = {path.relative_to(tmp_path): path.read_bytes()
+                for path in (tmp_path/'waves/wave-001/branches/good').rglob('*') if path.is_file()}
+    def forbidden(*args):
+        pytest.fail('legacy finalization or exhausted continuation dispatched new work')
+    recovery = AdaptivePhase1Coordinator(tmp_path, 'Recover', SEED, CurriculumAgent(forbidden), forbidden,
+        max_parallel=1, project_target=2, max_seconds=100, clock=lambda: 0, allow_partial=True)
+    report = getattr(recovery, close_method)()
+    assert report['published_projects'] == ['good'] and report['failed_projects'] == 1
+    assert report['elapsed_seconds'] == 100 and report['remaining_seconds'] == 0
+    state = json.loads(state_path.read_bytes())
+    assert not state['allocation_active'] and state['allocation_interrupted']
+    assert not (tmp_path/'pending.json').exists()
+    assert recovery.continue_campaign(3)['remaining_seconds'] == 0
+    continued = recovery.resume()
+    assert continued['status'] == 'TIME_BUDGET_EXHAUSTED'
+    assert continued['elapsed_seconds'] == 100 and continued['remaining_seconds'] == 0
+    assert json.loads((tmp_path/'actor-time.json').read_bytes())['elapsed_seconds'] == 100
+    assert all((tmp_path/path).read_bytes() == data for path, data in retained.items())
+
+
 def test_automatic_remediation_keeps_infrastructure_partial_boundary(tmp_path):
     from benchmarks.ascend.automatic_remediation import AutomaticRemediation
     selected, executed = [], []

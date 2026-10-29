@@ -419,6 +419,9 @@ class AdaptivePhase1Coordinator:
     def _finalize_pending_wave(self):
         state = self._load_state()
         if state.get("allocation_active"):
+            if not (self.root / "actor-time.json").exists():
+                # Legacy interrupted work has no ledger proving free setup.
+                state["elapsed_seconds"] = max(self.max_seconds, state["elapsed_seconds"])
             state.update(allocation_active=False, allocation_interrupted=True)
             self._atomic_json(self.root / "state.json", state)
         pending = self._load_pending(state)
