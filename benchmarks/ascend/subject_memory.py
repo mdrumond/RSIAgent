@@ -13,22 +13,39 @@ def digest(value):
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def actor_memory_identity(branch_root):
+    root = Path(branch_root).resolve()
+    marker = root / 'manual-execution.json'
+    if marker.exists():
+        attempt_id = json.loads(marker.read_bytes())['attempt_id']
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError('manual actor memory identity requires its retained attempt_id')
+        return str(root) + '#attempt=' + attempt_id
+    return str(root)
+
+
 class StaleMemory(ValueError):
     pass
 
 
 class SubjectMemory:
-    def __init__(self, root, initial_memory=b'', *, index=None):
+    def __init__(self, root, initial_memory=b'', *, index=None, ledger=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.initial = initial_memory.decode('utf-8')
-        self.index = index
+        self.index, self.ledger = index, ledger
         with self.transaction() as state:
             identity = hashlib.sha256(initial_memory).hexdigest()
             if not state:
                 state.update(schema='subject-memory-v1', initial_sha256=identity, active={}, admissions={})
             elif state['initial_sha256'] != identity:
                 raise ValueError('initial memory changed')
+            if self.ledger is not None:
+                for version in state['active'].values():
+                    record = self.read(version)
+                    if self.ledger.status(version) is None and self.index is not None:
+                        self.index(version, record)
+                    self.ledger.bootstrap(record)
 
     @contextmanager
     def transaction(self):
@@ -40,11 +57,17 @@ class SubjectMemory:
             atomic(path, canonical(state))
 
     def records(self):
+        if self.ledger is not None:
+            return self.ledger.records()
         with self.transaction() as state:
-            return [self.read(version) for version in state['active'].values()]
+            return [self.read(version) for version in state['active'].values()
+                    if self.ledger is None or self.ledger.available(version)]
 
     def read(self, version):
-        record = json.loads((self.root / 'versions' / (version + '.json')).read_bytes())
+        path = self.root / 'versions' / (version + '.json')
+        if not path.exists() and self.ledger is not None:
+            return self.ledger.record(version)
+        record = json.loads(path.read_bytes())
         if digest(record) != version:
             raise ValueError('memory version content changed')
         return record
@@ -54,6 +77,8 @@ class SubjectMemory:
                               memories=self.records()))
 
     def bases_current(self, proposal):
+        if self.ledger is not None:
+            return self.ledger.bases_current(proposal['base_versions'])
         with self.transaction() as state:
             return all(state['active'].get(row['memory_id']) == row['version']
                        for row in proposal['base_versions'])
@@ -66,11 +91,28 @@ class SubjectMemory:
             bases = proposal['base_versions']
             if len({row['memory_id'] for row in bases}) != len(bases):
                 raise ValueError('memory bases must identify distinct memories')
-            if any(state['active'].get(row['memory_id']) != row['version'] for row in bases):
-                raise StaleMemory('memory replacement base changed; reconcile and reevaluate')
-            memory_id = bases[0]['memory_id'] if bases else review_id
+            memory_id = (bases[0]['memory_id'] if bases else
+                         digest(dict(memory_root=str(self.root.resolve()), review_id=review_id))
+                         if self.ledger is not None else review_id)
             record = dict(memory_id=memory_id, proposal=proposal, provenance=provenance)
             version = digest(record)
+            if self.ledger is not None:
+                try:
+                    published = self.ledger.record(version)
+                except KeyError:
+                    published = None
+                if published is not None:
+                    if published != record:
+                        raise ValueError('published memory receipt differs from proposed content')
+                    # The shared transaction can survive a failed local receipt write.
+                    # Recover only its receipt, never republish an old global head.
+                    state['admissions'][review_id] = dict(memory_id=memory_id, version=version)
+                    return state['admissions'][review_id]
+            if not (self.ledger.bases_current(bases) if self.ledger is not None else all(
+                    state['active'].get(row['memory_id']) == row['version'] for row in bases)):
+                raise StaleMemory('memory replacement base changed; reconcile and reevaluate')
+            expected_statuses = ({base['version']: self.ledger.status(base['version']) for base in bases}
+                                 if self.ledger is not None else None)
             directory = self.root / 'versions'
             directory.mkdir(exist_ok=True)
             atomic(directory / (version + '.json'), canonical(record))
@@ -78,8 +120,10 @@ class SubjectMemory:
                 self.index(version, record)
             if check_remaining is not None:
                 check_remaining()
+            if self.ledger is not None:
+                self.ledger.publish(record, expected_statuses=expected_statuses)
             for row in bases:
-                state['active'].pop(row['memory_id'])
+                state['active'].pop(row['memory_id'], None)
             state['active'][memory_id] = version
             state['admissions'][review_id] = dict(memory_id=memory_id, version=version)
             return state['admissions'][review_id]

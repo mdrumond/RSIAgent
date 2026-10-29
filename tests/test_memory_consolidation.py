@@ -161,6 +161,7 @@ def test_published_kdb_view_excludes_old_versions_and_exposes_variant_sources(tm
     for value in artifacts.values():
         store.put_bytes(value)
     knowledge = SubjectKnowledge(tmp_path, store, lambda: memory)
+    memory = SubjectMemory(tmp_path/'memory', ledger=knowledge.ledger)
     response = knowledge.query({'query': 'padded copy'}, remaining_seconds=10)
     assert len(response['memories']) == 1
     hit = response['memories'][0]
