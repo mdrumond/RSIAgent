@@ -95,7 +95,8 @@ class OptimizerTaskExecutor:
         from .actor_time import current_worker, live_deadline, WorkDeadline, actor_clock
         worker = current_worker()
         if worker is not None:
-            # Reference setup is uncharged but each operation remains bounded.
+            # Reference setup is uncharged in aggregate. CheckedTransport freezes
+            # a persisted allowance for each preparation operation before dispatch.
             backend.deadline = (live_deadline(float('inf')) if worker.working else
                 WorkDeadline(lambda: config.get('transport_timeout_seconds', 600)))
         elif self.deadline is not None:

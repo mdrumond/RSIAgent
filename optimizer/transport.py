@@ -1,6 +1,6 @@
 """Checked retained operations. An uncertain dispatch is never replayed."""
 from contextlib import contextmanager
-from benchmarks.ascend.actor_time import preparing
+from benchmarks.ascend.actor_time import current_worker, preparing
 import fcntl
 import json
 import math
@@ -44,15 +44,41 @@ class CheckedTransport:
         self.client_timeout = float(config.get('transport_timeout_seconds', CLIENT_TIMEOUT))
         if not math.isfinite(self.client_timeout) or self.client_timeout <= 0:
             raise ValueError('transport_timeout_seconds must be finite and positive')
+        self._operation_deadline = float('inf')
+
+    @contextmanager
+    def _preparation_operation(self, path):
+        # Preparation is unlimited in aggregate, not per observable operation.
+        # The sidecar survives restart without rewriting legacy handle evidence.
+        previous = self._operation_deadline
+        worker = current_worker()
+        if (worker is not None and not worker.working) or path.exists():
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            if not path.exists():
+                allowance = float(self.config.get('transport_timeout_seconds', 600))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                atomic(path, canonical(dict(deadline=time.monotonic()+allowance, boot_id=boot)))
+            record = json.loads(path.read_text())
+            self._operation_deadline = (record['deadline'] if record['boot_id'] == boot else float('-inf'))
+        try:
+            yield
+        finally:
+            self._operation_deadline = previous
+
+    def _check_operation(self):
+        if time.monotonic() >= self._operation_deadline:
+            raise ObservationUnavailable('preparation operation elapsed allocation expired; retain existing handle')
 
     def _invoke(self, argv, *, cleanup=False, **kwargs):
+        if not cleanup:
+            self._check_operation()
         if self.run is not None:
             return self.run(argv, capture_output=True, text=True, **kwargs)
         # Files avoid pipe-buffer deadlocks while polling Stop. Kill only this
         # local client's private process group, never assume its remote job died.
         limit = time.monotonic() + (CANCEL_TIMEOUT if cleanup else self.client_timeout)
         if not cleanup:
-            limit = min(limit, self.deadline)
+            limit = min(limit, self.deadline, self._operation_deadline)
         with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
             process = subprocess.Popen(argv, stdout=stdout, stderr=stderr,
                                        start_new_session=True, **kwargs)
@@ -104,6 +130,11 @@ class CheckedTransport:
 
     @preparing('optimizer file transfer')
     def transfer(self, action, source, destination):
+        local = Path(source if action == 'upload' else destination)
+        with self._preparation_operation(local.with_name(local.name+'.'+action+'.deadline.json')):
+            return self._transfer(action, source, destination)
+
+    def _transfer(self, action, source, destination):
         # Transfer sentinels also prevent duplicate uncertain submission.
         local = Path(source if action == 'upload' else destination)
         marker = local.with_name(local.name + '.' + action + '.json')
@@ -113,6 +144,7 @@ class CheckedTransport:
         if state and not state.get('handle'):
             raise ObservationUnavailable('uncertain transfer; inspect ' + str(marker))
         if not state:
+            self._check_operation()
             atomic(marker, canonical({'state': 'dispatching'}))
             result = self._invoke([self.config['cpl_remote'], '--json', action,
                                    self.config['target'], str(source), str(destination)])
@@ -132,6 +164,7 @@ class CheckedTransport:
                 raise ObservationUnavailable('transfer returned no handle')
             if self.stopped():
                 raise WorkerStopped('stopped while observing transfer')
+            self._check_operation()
             result = self._invoke([self.config['cpl_remote'], '--json', 'observe', state['handle'],
                                    '--wait', '--timeout', '5'])
             atomic(local.with_name(local.name + '.' + action + '.observe.log'), (result.stdout + result.stderr).encode())
@@ -153,6 +186,10 @@ class CheckedTransport:
             os.replace(staging, local)
 
     def execute(self, directory, argv):
+        with self._preparation_operation(Path(directory)/'preparation-deadline.json'):
+            return self._execute(directory, argv)
+
+    def _execute(self, directory, argv):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / 'transport.json'
@@ -166,6 +203,7 @@ class CheckedTransport:
                 if state.get('native_handle'):
                     self.cancel_pending(directory)
                 raise WorkerStopped('user requested stop')
+            self._check_operation()
             command = [self.config['validation_wrapper'], '--profile', self.config['profile']]
             if state.get('handle'):
                 observer = str(Path(self.config['validation_wrapper']).parent / 'bz-a3' / 'run.sh')
