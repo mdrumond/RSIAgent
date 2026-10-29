@@ -9,7 +9,7 @@ from benchmarks.ascend.feedback import FeedbackStore
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumContext
 from optimizer.jobs import canonical, sha
-from test_feedback import campaign, write
+from test_ascend_feedback import campaign, write
 from test_a5_phase1_adaptive import _project, _wave, _result
 
 
