@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "run_name": "example_task_080",
-  "study_design": "target_conditioned_adaptation",
+  "study_design": "target_conditioned_exploration",
   "task_release": "osworld-v2-2026.08.08",
   "phase1": {
     "distribution_file": "config/target_queries/task_080.md",
@@ -16,18 +16,6 @@
     "actor_config": "config/roles/actor.yaml",
     "verifier_config": "config/roles/practice_verifier.yaml",
     "verifier_control_config": "config/roles/target.yaml",
-    "curriculum_config": "config/roles/curriculum.yaml",
-    "memory_config": "config/roles/actor.yaml"
-  },
-  "phase2": {
-    "stop_policy": "curriculum_review",
-    "development_tasks": [
-      "task_080"
-    ],
-    "seed": 83080,
-    "target_config": "config/roles/target.yaml",
-    "practice_actor_config": "config/roles/actor.yaml",
-    "practice_verifier_config": "config/roles/verifier.yaml",
     "curriculum_config": "config/roles/curriculum.yaml",
     "memory_config": "config/roles/actor.yaml"
   },

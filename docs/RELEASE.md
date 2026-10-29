@@ -8,9 +8,10 @@ configuration set per benchmark.
 
 The root exposes `run_osworld.py` and `run_ale.py`. OSWorld's phase runners,
 pipeline, task execution, and evaluator corrections live in `benchmarks/osworld/`.
-The directory reorganization preserves the existing batch arguments, phase
-ordering, configuration values, and runtime behavior; internal subprocesses use
-Python module entrypoints.
+Desktop RSI now runs broad exploration followed directly by frozen-memory
+evaluation. OSWorld protocol version 2 and ALE protocol version 3 reject the
+previous three-stage configurations. Internal subprocesses use Python module
+entrypoints.
 
 ## Provenance
 
@@ -29,8 +30,8 @@ no longer exist; it is not the current runtime's file inventory.
 ## Maintained behavior
 
 The current model profiles, reasoning settings, Verifier isolation, memory
-commit protocol, Phase 1 wave ordering, and Phase 2 `curriculum_review` policy are
-preserved. The merged infrastructure fixes remain in the shared runtime.
+commit protocol and Phase 1 wave ordering are preserved. Target-conditioned
+deep-practice execution and historical application support have been removed. The merged infrastructure fixes remain in the shared runtime.
 
 ALE adds a longer VM checkpoint timeout and permits verified Phase 1 branches
 to release idle guests before ordered memory commits. It retains their Actor

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Orchestrate the three leakage-separated recursive-improvement phases.
+"""Orchestrate exploration followed by frozen-memory evaluation.
 
 Each invocation executes exactly one phase. This is intentional: official scores
 created in Phase 3 cannot flow into a later learning phase in the same protocol
@@ -23,9 +23,8 @@ from typing import Any
 
 from config.benchmark_runtime import configure_user_simulator
 from config.runtime_paths import resolve_root, resolve_osworld_root
-from core.self_evolving_loop import DEFAULT_PHASE2_STOP_POLICY, Phase2StopPolicy
 from explore.practice_loop import _atomic_install_memory, _manifest, _read_memory_tree
-from explore.target_learning import _memory_tree_sha256
+from explore.memory_hash import memory_tree_sha256
 
 
 RSIAGENT_ROOT = resolve_root()
@@ -42,7 +41,6 @@ BENCHMARK_PROVENANCE_PROFILES = {
 _SAFE_NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 _ACK = {
     "phase1": "RUN-RECURSIVE-IMPROVEMENT-PHASE1",
-    "phase2": "RUN-RECURSIVE-IMPROVEMENT-PHASE2",
     "phase3": "RUN-RECURSIVE-IMPROVEMENT-PHASE3",
 }
 
@@ -118,8 +116,10 @@ def _task_list(value: Any, *, label: str,
 
 def load_protocol(path: Path) -> dict[str, Any]:
     spec = _read_object(path)
-    if spec.get("schema_version") != 1:
-        raise ProtocolError("protocol schema_version must be 1")
+    if spec.get("schema_version") != 2:
+        raise ProtocolError("protocol schema_version must be 2; start a fresh exploration/evaluation run")
+    if "phase2" in spec:
+        raise ProtocolError("unsupported protocol stage")
     task_release = spec.get("task_release")
     if task_release not in TASK_RELEASES:
         raise ProtocolError(
@@ -128,12 +128,12 @@ def load_protocol(path: Path) -> dict[str, Any]:
     valid_tasks = frozenset(TASKS) - TASK_RELEASES[task_release]
     study_design = spec.get("study_design", "held_out_generalization")
     if study_design not in {
-            "held_out_generalization", "target_conditioned_adaptation"}:
+            "held_out_generalization", "target_conditioned_exploration"}:
         raise ProtocolError(
             "study_design must be held_out_generalization or "
-            "target_conditioned_adaptation")
+            "target_conditioned_exploration")
     run_root = _safe_run_root(spec.get("run_name"))
-    for phase in ("phase1", "phase2", "phase3"):
+    for phase in ("phase1", "phase3"):
         if not isinstance(spec.get(phase), dict):
             raise ProtocolError(f"protocol lacks object {phase}")
 
@@ -163,21 +163,9 @@ def load_protocol(path: Path) -> dict[str, Any]:
     if not distribution_text.strip():
         raise ProtocolError("Phase-1 distribution description is empty")
 
-    development = _task_list(
-        spec["phase2"].get("development_tasks"),
-        label="phase2.development_tasks", valid_tasks=valid_tasks)
     held_out = _task_list(
         spec["phase3"].get("held_out_tasks"),
         label="phase3.held_out_tasks", valid_tasks=valid_tasks)
-    overlap = sorted(set(development) & set(held_out))
-    if overlap and study_design == "held_out_generalization":
-        raise ProtocolError(
-            "development and held-out task sets overlap: " + ", ".join(overlap))
-    if (study_design == "target_conditioned_adaptation"
-            and set(development) != set(held_out)):
-        raise ProtocolError(
-            "target-conditioned development_tasks and held_out_tasks must name "
-            "the same target set")
     named_held_out = sorted(
         task for task in held_out if task.lower() in distribution_text.lower())
     if named_held_out and study_design == "held_out_generalization":
@@ -189,9 +177,6 @@ def load_protocol(path: Path) -> dict[str, Any]:
         "phase1": ("actor_config", "verifier_config",
                    "verifier_control_config", "curriculum_config",
                    "memory_config"),
-        "phase2": ("target_config", "practice_actor_config",
-                   "practice_verifier_config", "curriculum_config",
-                   "memory_config"),
         "phase3": ("config", "benchmark_lock"),
     }
     resolved_configs: dict[str, dict[str, Path]] = {}
@@ -201,25 +186,16 @@ def load_protocol(path: Path) -> dict[str, Any]:
                 spec[phase].get(field), label=f"{phase}.{field}")
             for field in fields
         }
-    for phase in ("phase2", "phase3"):
-        seed = spec[phase].get("seed")
-        if type(seed) is not int or seed < 0:
-            raise ProtocolError(f"{phase}.seed must be nonnegative")
-    try:
-        stop_policy = Phase2StopPolicy(
-            spec["phase2"].get("stop_policy", DEFAULT_PHASE2_STOP_POLICY))
-    except (ValueError, TypeError) as exc:
-        raise ProtocolError(
-            "phase2.stop_policy must be verifier_pass or curriculum_review") from exc
+    seed = spec["phase3"].get("seed")
+    if type(seed) is not int or seed < 0:
+        raise ProtocolError("phase3.seed must be nonnegative")
 
     spec["_resolved"] = {
         "protocol_path": path,
         "run_root": run_root,
         "distribution": distribution,
-        "development_tasks": development,
         "held_out_tasks": held_out,
         "study_design": study_design,
-        "phase2_stop_policy": stop_policy.value,
         "configs": resolved_configs,
     }
     return spec
@@ -232,7 +208,7 @@ def _memory_record(path: Path) -> dict[str, Any]:
         "path": str(path.resolve()),
         "files": len(memory),
         "bytes": sum(len(data) for data in memory.values()),
-        "tree_sha256": _memory_tree_sha256(memory),
+        "tree_sha256": memory_tree_sha256(memory),
         "manifest_sha256": hashlib.sha256(json.dumps(
             manifest, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")).hexdigest(),
@@ -332,8 +308,7 @@ def _run(command: list[str], *, run_root: Path, phase: str,
 
 def _ensure_no_later_phase(run_root: Path, phase: str) -> None:
     later = {
-        "phase1": ("phase2", "phase3"),
-        "phase2": ("phase3",),
+        "phase1": ("phase3",),
         "phase3": (),
     }[phase]
     present = [name for name in later if (run_root / name).exists()]
@@ -416,7 +391,7 @@ def execute_phase1(spec: dict[str, Any], *, resume_completed_boundary=False) -> 
             "--parallel-waves", "--max-parallel",
             str(spec["phase1"]["parallelism"]),
         ]
-    if resolved["study_design"] == "target_conditioned_adaptation":
+    if resolved["study_design"] == "target_conditioned_exploration":
         command.insert(-2, "--target-query-conditioned")
     if resume_completed_boundary:
         command.insert(-2, "--resume-completed-boundary")
@@ -429,133 +404,32 @@ def execute_phase1(spec: dict[str, Any], *, resume_completed_boundary=False) -> 
     return result
 
 
-def execute_phase2(spec: dict[str, Any]) -> dict[str, Any]:
-    resolved = spec["_resolved"]
-    run_root: Path = resolved["run_root"]
-    _ensure_no_later_phase(run_root, "phase2")
-    phase1_result = _read_object(run_root / "phase1/result.json")
-    if phase1_result.get("status") not in {"saturated", "budget_exhausted"}:
-        raise ProtocolError("Phase 1 is not transition-ready")
-    tasks = resolved["development_tasks"]
-    if not tasks:
-        raise ProtocolError(
-            "Phase 2 needs a precommitted nonempty development task set")
-    memory_path = Path(phase1_result["memory_frozen_path"]).resolve(strict=True)
-    initial_record = _memory_record(memory_path)
-    cfg = resolved["configs"]["phase2"]
-    stop_policy = resolved["phase2_stop_policy"]
-    benchmark_profile = BENCHMARK_PROVENANCE_PROFILES[
-        spec["task_release"]].resolve(strict=True)
-    task_results = []
-    for position, task in enumerate(tasks):
-        seed = int(spec["phase2"]["seed"]) + position
-        result_path = (run_root / "phase2" / task
-                       / f"attempt_{seed:04d}" / "result.json")
-        if not result_path.is_file():
-            command = [
-                sys.executable, "-m", "benchmarks.osworld.phase2", task,
-                 "--protocol-run", spec["run_name"],
-                "--seed", str(seed), "--initial-memory", str(memory_path),
-                "--phase2-stop-policy", stop_policy,
-                "--target-config", str(cfg["target_config"]),
-                "--practice-actor-config", str(cfg["practice_actor_config"]),
-                "--practice-verifier-config", str(cfg["practice_verifier_config"]),
-                "--curriculum-config", str(cfg["curriculum_config"]),
-                "--memory-config", str(cfg["memory_config"]),
-                "--benchmark-profile", str(benchmark_profile),
-                "--execute", "RUN-PHASE2-FAILURE-CONDITIONED-PRACTICE",
-            ]
-            environment = dict(os.environ)
-            _configure_release_environment(spec, environment=environment)
-            _run(command, run_root=run_root, phase="phase2", task=task,
-                 environment=environment)
-        result = _read_object(result_path)
-        _validate_phase2_terminal(result, stop_policy=stop_policy, task=task)
-        if (result.get("official_evaluator_calls") != 0
-                or result.get("official_evaluator_feedback_entered_learning")
-                is not False):
-            raise ProtocolError(f"Phase-2 grader boundary failed for {task}")
-        if result.get("initial_memory_tree_sha256") != \
-                _memory_record(memory_path)["tree_sha256"]:
-            raise ProtocolError(f"Phase-2 memory lineage mismatch for {task}")
-        memory_path = Path(result["final_memory_path"]).resolve(strict=True)
-        if _memory_record(memory_path)["tree_sha256"] != \
-                result.get("final_memory_tree_sha256"):
-            raise ProtocolError(f"Phase-2 final memory mismatch for {task}")
-        task_results.append({
-            "task": task,
-            "seed": seed,
-            "status": result.get("status"),
-            "stop_policy": result["phase2_stop_policy"],
-            "verdict": result.get("target_verifier_verdict"),
-            "evolutions": result.get("evolutions"),
-            "practice_projects": result.get("practice_projects"),
-            "memory_tree_sha256": result.get("final_memory_tree_sha256"),
-        })
-
-    frozen = run_root / "phase2/memory_frozen"
-    if frozen.exists():
-        existing = _memory_record(frozen)
-        source = _memory_record(memory_path)
-        if existing["tree_sha256"] != source["tree_sha256"]:
-            raise ProtocolError("existing Phase-2 frozen memory conflicts")
-    else:
-        _atomic_install_memory(
-            str(frozen), _read_memory_tree(str(memory_path)))
-    payload = {
-        "schema_version": 1,
-        "phase": "outcome_grounded_targeted_practice",
-        "phase2_stop_policy": stop_policy,
-        "status": "complete",
-        "development_tasks": list(tasks),
-        "task_results": task_results,
-        "memory_before": initial_record,
-        "memory_frozen": _memory_record(frozen),
-        "official_evaluator_calls": 0,
-        "official_evaluator_feedback_entered_learning": False,
-    }
-    _write_json_atomic(run_root / "phase2/result.json", payload)
-    return payload
-
-
-def _validate_phase2_terminal(
-        result: dict[str, Any], *, stop_policy: str, task: str) -> None:
-    """Validate new and cached results before advancing to another task/phase."""
-    if result.get("phase2_stop_policy") != stop_policy:
-        raise ProtocolError(
-            f"Phase-2 stopping policy is absent or differs for {task}; "
-            "use a new lineage rather than reuse an unlabelled/different policy")
-    status = result.get("status")
-    verdict = result.get("target_verifier_verdict")
-    allowed = {"verifier_pass", "curriculum_stalled_final_target_test"}
-    if stop_policy == Phase2StopPolicy.CURRICULUM_REVIEW.value:
-        allowed |= {"verifier_pass_curriculum_ready", "verifier_pass_curriculum_stalled"}
-    if status not in allowed or verdict not in {"PASS", "FAIL"}:
-        raise ProtocolError(
-            f"Phase-2 target {task} is not transition-ready: {status!r}, {verdict!r}")
-    if status.startswith("verifier_pass") and verdict != "PASS":
-        raise ProtocolError(f"Phase-2 PASS termination lacks a Verifier PASS for {task}")
-
-
 def execute_phase3(spec: dict[str, Any]) -> dict[str, Any]:
     resolved = spec["_resolved"]
     target_conditioned = (
-        resolved["study_design"] == "target_conditioned_adaptation")
+        resolved["study_design"] == "target_conditioned_exploration")
     run_root: Path = resolved["run_root"]
-    phase2 = _read_object(run_root / "phase2/result.json")
-    if phase2.get("status") != "complete":
-        raise ProtocolError("Phase 2 is not complete")
+    phase1 = _read_object(run_root / "phase1/result.json")
+    if phase1.get("status") not in {"saturated", "budget_exhausted"}:
+        raise ProtocolError("Phase 1 is not transition-ready")
+    if phase1.get("official_evaluator_calls") != 0:
+        raise ProtocolError("Phase 1 recorded an evaluator call")
     tasks = resolved["held_out_tasks"]
     if not tasks:
         raise ProtocolError("Phase 3 needs a precommitted held-out task set")
-    source = Path(phase2["memory_frozen"]["path"]).resolve(strict=True)
+    source = Path(phase1["memory_frozen_path"])
+    if source.is_symlink():
+        raise ProtocolError("Phase-1 frozen memory may not be a symlink")
+    source = source.resolve(strict=True)
+    if _memory_record(source)["tree_sha256"] != phase1.get("memory_tree_sha256"):
+        raise ProtocolError("Phase-1 frozen memory changed after publication")
     phase3_root = run_root / "phase3"
     frozen = phase3_root / "memory_frozen"
     if not frozen.exists():
         _atomic_install_memory(str(frozen), _read_memory_tree(str(source)))
     frozen_record = _memory_record(frozen)
-    if frozen_record["tree_sha256"] != phase2["memory_frozen"]["tree_sha256"]:
-        raise ProtocolError("Phase-3 memory does not match the Phase-2 freeze")
+    if frozen_record["tree_sha256"] != phase1["memory_tree_sha256"]:
+        raise ProtocolError("Phase-3 memory does not match the Phase-1 freeze")
     _write_json_atomic(phase3_root / "memory_lock.json", {
         "schema_version": 1,
         **frozen_record,
@@ -637,16 +511,11 @@ def preflight(spec: dict[str, Any], phase: str) -> dict[str, Any]:
         for name, values in resolved["configs"].items()
     }
     blockers = []
-    if phase == "phase2":
-        if not resolved["development_tasks"]:
-            blockers.append("phase2.development_tasks is empty")
-        if not (resolved["run_root"] / "phase1/result.json").is_file():
-            blockers.append("Phase 1 result is not present")
-    elif phase == "phase3":
+    if phase == "phase3":
         if not resolved["held_out_tasks"]:
             blockers.append("phase3.held_out_tasks is empty")
-        if not (resolved["run_root"] / "phase2/result.json").is_file():
-            blockers.append("Phase 2 result is not present")
+        if not (resolved["run_root"] / "phase1/result.json").is_file():
+            blockers.append("Phase 1 result is not present")
     # A preflight must not leave this study's user route in the process for a
     # later study. Execution passes its own environment to each child instead.
     release_environment = _configure_release_environment(
@@ -665,18 +534,13 @@ def preflight(spec: dict[str, Any], phase: str) -> dict[str, Any]:
         "phase1_parallel_waves": spec["phase1"].get(
             "parallel_waves", False),
         "phase1_parallelism": spec["phase1"].get("parallelism", 1),
-        "phase2_stop_policy": resolved["phase2_stop_policy"],
-        "development_tasks": list(resolved["development_tasks"]),
         "held_out_tasks": list(resolved["held_out_tasks"]),
         "study_design": resolved["study_design"],
-        "task_split_disjoint": not bool(
-            set(resolved["development_tasks"])
-            & set(resolved["held_out_tasks"])),
         "distribution_file": str(resolved["distribution"]),
         "distribution_sha256": _sha256(resolved["distribution"]),
         "official_grader_available_in_phase": phase == "phase3",
-        "memory_mutable_in_phase": phase in {"phase1", "phase2"},
-        "curriculum_enabled_in_phase": phase in {"phase1", "phase2"},
+        "memory_mutable_in_phase": phase == "phase1",
+        "curriculum_enabled_in_phase": phase == "phase1",
         "configs": configs[phase],
     }
 
@@ -684,8 +548,8 @@ def preflight(spec: dict[str, Any], phase: str) -> dict[str, Any]:
 def _protocol_lock(spec: dict[str, Any], source_bytes: bytes) -> dict[str, Any]:
     resolved = spec["_resolved"]
     return {
-        "schema_version": 1,
-        "kind": "recursive_self_improvement_protocol_lock",
+        "schema_version": 2,
+        "kind": "exploration_evaluation_protocol_lock",
         "protocol_sha256": hashlib.sha256(source_bytes).hexdigest(),
         "task_release": spec["task_release"],
         "run_name": spec["run_name"],
@@ -696,8 +560,6 @@ def _protocol_lock(spec: dict[str, Any], source_bytes: bytes) -> dict[str, Any]:
         "phase1_parallel_waves": spec["phase1"].get(
             "parallel_waves", False),
         "phase1_parallelism": spec["phase1"].get("parallelism", 1),
-        "phase2_stop_policy": resolved["phase2_stop_policy"],
-        "development_tasks": list(resolved["development_tasks"]),
         "held_out_tasks": list(resolved["held_out_tasks"]),
         "held_out_environment_families": list(
             spec["phase3"].get("held_out_environment_families") or []),
@@ -713,7 +575,6 @@ def _protocol_lock(spec: dict[str, Any], source_bytes: bytes) -> dict[str, Any]:
         },
         "boundaries": {
             "official_evaluator_calls_phase1": 0,
-            "official_evaluator_calls_phase2": 0,
             "official_evaluator_phase3_only_after_agent_handoff": True,
             "phase3_memory_writeback": False,
             "learning_after_phase3_begins": False,
@@ -724,7 +585,7 @@ def _protocol_lock(spec: dict[str, Any], source_bytes: bytes) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--protocol", required=True)
-    parser.add_argument("--phase", choices=("phase1", "phase2", "phase3"),
+    parser.add_argument("--phase", choices=("phase1", "phase3"),
                         required=True)
     parser.add_argument("--resume-completed-boundary", action="store_true")
     action = parser.add_mutually_exclusive_group(required=True)
@@ -766,7 +627,6 @@ def main(argv: list[str] | None = None) -> int:
                   protocol_sha256=hashlib.sha256(source_bytes).hexdigest())
     runner = {
         "phase1": execute_phase1,
-        "phase2": execute_phase2,
         "phase3": execute_phase3,
     }[args.phase]
     result = (runner(spec, resume_completed_boundary=True)

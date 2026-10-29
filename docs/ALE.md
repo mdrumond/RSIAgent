@@ -67,7 +67,9 @@ new machine.
 
 The official evaluator is available only to the outer ALE host. The learning
 worker receives public instructions and owned sandbox handles, with no grader
-objects. Phase 3 consumes immutable learned memory. Phase 1 branches keep their
+objects. Phase 1 learning feeds its authenticated immutable memory directly to
+Phase 3 evaluation; no target-practice stage runs between them. Protocol version
+3 rejects older worker specifications before creating outputs. Phase 1 branches keep their
 Actor contexts after releasing idle guests and replay saved candidates for
 ordered memory consolidation.
 

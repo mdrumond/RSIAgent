@@ -1,4 +1,4 @@
-"""Phase-2 memory transport + commit gates (host side).
+"""Memory transport and commit gates (host side).
 
 The agent's MEMORY is a directory it fully owns in the guest (~/.memory). This
 module only MOVES it (sync in/out), ARCHIVES it (journal), and legality-scans

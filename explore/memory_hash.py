@@ -51,3 +51,9 @@ def tree_sha256(hashes: Mapping[str, str]) -> str:
             raise MemoryStateError("invalid tree-hash mapping")
         normalized[rel] = str(digest)
     return canonical_sha256(dict(sorted(normalized.items())))
+
+
+def memory_tree_sha256(files: Mapping[str, bytes]) -> str:
+    """Canonical root digest for an in-memory file tree."""
+    return tree_sha256({name: hashlib.sha256(data).hexdigest()
+                        for name, data in sorted(files.items())})

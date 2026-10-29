@@ -72,13 +72,12 @@ def build_plan(name, arm, *, tasks=None, osworld_root=None):
                 )
             )
             spec["phase1"]["distribution_file"] = str(folder / task / "direction.md")
-            spec["phase2"]["development_tasks"] = [task]
             spec["phase3"]["held_out_tasks"] = [task]
             job.update(protocol=spec, direction=instruction)
             job["result_paths"].append(
                 str(ROOT / "results/recursive_improvement" / spec["run_name"])
             )
-            for phase in ("phase1", "phase2", "phase3"):
+            for phase in ("phase1", "phase3"):
                 job["commands"].append(
                     [
                         sys.executable,

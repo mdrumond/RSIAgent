@@ -24,7 +24,7 @@ def test_entrypoint_help_without_benchmark_installations(tmp_path):
         ["run_osworld.py"],
         ["run_ale.py"],
         *[["-m", "benchmarks.osworld." + name]
-          for name in ("task", "phase1", "phase2", "pipeline")],
+          for name in ("task", "phase1", "pipeline")],
     ]
     for command in commands:
         result = subprocess.run(
@@ -52,14 +52,12 @@ def test_rsi_plan_preserves_latest_protocol_and_public_direction():
         job["protocol"]["phase1"]["project_budget"]
         == reference["phase1"]["project_budget"]
     )
-    assert job["protocol"]["phase2"] == reference["phase2"]
     assert (
         job["direction"]
         == (batch.ROOT / "config/target_queries/task_080.md").read_text()
     )
     assert [cmd[cmd.index("--phase") + 1] for cmd in job["commands"]] == [
         "phase1",
-        "phase2",
         "phase3",
     ]
 

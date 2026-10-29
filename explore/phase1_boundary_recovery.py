@@ -46,7 +46,7 @@ def validate_boundary(lineage: Path, target: str, *, project_budget,
     }
     _require(all(state.get(k) == v for k, v in expected.items()),
              "protocol fields drifted")
-    _require(not any((lineage.parent / p).exists() for p in ("phase2", "phase3")),
+    _require(not any((lineage.parent / p).exists() for p in ("phase3",)),
              "a later phase already exists")
     memory = _manifest(_read_memory_tree(str(lineage / "memory")))
     _require(memory == state.get("memory_manifest"), "canonical memory drifted")

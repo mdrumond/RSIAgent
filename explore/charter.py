@@ -1,9 +1,8 @@
-"""P2 prompt surfaces — THE audited practice charter (+ refuter / curation).
+"""Practice prompts for broad exploration, independent verification, and memory.
 
-Constraint #0-P2: general principles + public app metadata ONLY (domain names
+Content boundary: general principles + public app metadata ONLY (domain names
 are firewall-rule-2 legal: the benchmark's public app list = known subjects).
-No task tokens, no benchmark-infra hosts. Audited by tests/test_p2_firewall.py;
-every change logged in docs/PROMPTLOG.md.
+No task tokens or benchmark-infrastructure hosts belong in these shared prompts.
 """
 
 
@@ -36,209 +35,6 @@ useful and unread memory. You decide what to retrieve and how to use it.]
 """
 
 
-_CURRICULUM_APP_LINE_CAD = """- FIRST LINE exactly "APP: freecad" or "APP: kicad" (one app per session —
-     the machine is provisioned for exactly one)."""
-
-_CURRICULUM_APP_LINE_OFFICE_WEB = """- FIRST LINE "FOCUS: office" or "FOCUS: web" or "FOCUS: mixed" — ADVISORY
-     only: both domains are installed every session and the agent may follow
-     your focus, mix domains, or pivot mid-session as it judges best (the
-     domains evolve together; your job is guidance, not gating)."""
-
-_CURRICULUM_APP_LINE_E3 = """- FIRST LINE "FOCUS: <one or two of: webapps / git / office / media / cad /
-     desktop-files>" — ADVISORY only: the agent may follow, mix, or pivot as it
-     judges best (the domains evolve together; your job is allocation guidance,
-     not gating). YOU decide each session's focus from your notebook: weight
-     the terrain where the agent's verified gaps are largest, drop terrain
-     that has gone dry, escalate drills where it is stuck. NOTE: "cad" is only
-     available on sessions where a CAD app is provisioned — if you want a CAD
-     session next, say so on the FOCUS line ("FOCUS: cad (freecad)" or
-     "FOCUS: cad (kicad)") and the machine will be prepared."""
-
-_CURRICULUM_ORGANS_E3 = """
-METHOD CLASSES worth teaching wherever they fit — generic capabilities, your
-judgment where and how to drill them (they matter across ALL the domains):
-- Before driving any application's GUI, find where its REAL state lives —
-  a config file, a database, an API the app itself serves — and learn to read
-  and write it there, verifying through the app afterwards.
-- In web work: identity and session discipline — do the work inside the same
-  authenticated context it started in, and prove the server agrees (its own
-  state channel), not just the page you can see.
-- Deliver work in EXACTLY the requested shape, at exactly the requested place,
-  on exactly the requested surface — and LEAVE THAT SURFACE LIVE at the end
-  (a finished form still open, a served page still serving); work delivered
-  somewhere else, in another shape, or on a closed surface is work not done.
-- Treat explicit prohibitions, orderings, and precedence statements in any
-  request as hard rules that outrank optimization.
-- For work with random outcomes: verify across REPEATED FRESH runs before
-  calling it done — a single success proves very little.
-- When an interface detects or blocks automation, notice quickly and switch
-  channel instead of grinding.
-- Distractions run on machines (miners, popups, background noise): triage them
-  in minutes, never let them eat the session."""
-
-
-def unified_curriculum_pass_charter(
-    target: str,
-    verifier_orientation: str,
-    verifier_report: str,
-    route_history: str = "",
-    curriculum_notes: str = "",
-    handoff_path: str = "~/curriculum_route.md",
-    notes_path: str = "~/curriculum_notes.md",
-) -> str:
-    """Persistent Curriculum prompt for auditing terminal evidence sufficiency.
-
-    The Curriculum does not inspect or certify the candidate. It decides whether a
-    local Verifier PASS supplies enough coherent evidence to end the higher-level
-    search, or whether that same Verifier must investigate an identified gap.
-    """
-    if not target.strip():
-        raise ValueError("target must contain the immutable north-star query")
-    if not verifier_report.strip():
-        raise ValueError("verifier_report must contain the complete PASS report")
-    orientation = (
-        verifier_orientation.strip()
-        or "(the Verifier authored no separate orientation report)"
-    )
-    history = route_history.strip() or "(no earlier outer-loop routes)"
-    notes = curriculum_notes.strip() or "(empty — this is the first routing turn)"
-    return f"""CURRICULUM AGENT — PERSISTENT TERMINAL-TRANSITION REVIEW.
-
-You are the one persistent Curriculum Agent for this target lineage. Your context
-continues across target reports, revisions, retries, and any practice projects. You
-are the high-level search controller, not the solver and not the local verifier.
-
-IMMUTABLE NORTH-STAR TARGET — verbatim:
----
-{target.strip()}
----
-
-TARGET VERIFIER AGENT ORIENTATION REPORT — verbatim:
----
-{orientation}
----
-
-LATEST LOCAL VERIFIER AGENT PASS REPORT — verbatim:
----
-{verifier_report.strip()}
----
-
-The persistent target Verifier Agent has committed PASS for the unchanged current
-candidate. PASS is necessary for submission, but the outer search does not terminate
-until you authorize HANDOFF. You cannot inspect the candidate, change PASS to FAIL,
-repair anything, or independently certify correctness. You have no access to the
-environment, Actor-private trajectory, official evaluator, hidden checks, score,
-graded answer, or evaluator feedback.
-
-Choose the next high-level search action:
-
-- HANDOFF when the Verifier's report, considered against the authoritative target
-  and its own orientation, supplies coherent affirmative support for every material
-  requirement and resolves material contradictions in its cited evidence.
-- VERIFY_MORE when a material requirement is unsupported or omitted, the report's
-  conclusion conflicts with its cited evidence, or the cited evidence would equally
-  support a nearby materially incorrect candidate. Name the unresolved evidential
-  concern; the same persistent Verifier Agent will decide how to investigate it on
-  the unchanged candidate.
-
-Use your judgment. There is no checklist, score threshold, mandatory second pass,
-fixed review count, or presumption that VERIFY_MORE is preferable. Do not prescribe
-a tool, command, repair, target answer, or practice project. A PASS cannot directly
-become REVISE or EVOLVE: only a later Verifier FAIL opens those routes.
-
-PRIOR OUTER-LOOP ROUTE RECORD:
----
-{history}
----
-
-YOUR PRIVATE SEARCH NOTES:
----
-{notes}
----
-
-Write your complete routing handoff to {handoff_path}. Include exactly one standalone
-line outside quoted examples or code fences: ROUTE: HANDOFF or ROUTE: VERIFY_MORE.
-Explain your evidence and uncertainty however you judge useful. You may update
-{notes_path} as a private recovery copy; neither file is shown to the Actor Agent or
-Verifier Agent except that a VERIFY_MORE report is delivered verbatim to the same
-Verifier Agent. Declare done only when the routing handoff is complete."""
-
-
-def unified_curriculum_route_charter(
-    target: str,
-    verifier_report: str,
-    route_history: str = "",
-    curriculum_notes: str = "",
-    handoff_path: str = "~/curriculum_route.md",
-    notes_path: str = "~/curriculum_notes.md",
-) -> str:
-    """Persistent Curriculum Agent prompt for routing a target-local FAIL.
-
-    The Verifier owns only observed correctness. The Curriculum owns only the
-    higher-level choice between continuing the current target attempt and entering
-    capability search. Neither role receives a benchmark evaluator or score.
-    """
-    if not target.strip():
-        raise ValueError("target must contain the immutable north-star query")
-    if not verifier_report.strip():
-        raise ValueError("verifier_report must contain the complete FAIL report")
-    history = route_history.strip() or "(no earlier target-failure routes)"
-    notes = curriculum_notes.strip() or "(empty — this is the first routing turn)"
-    return f"""CURRICULUM AGENT — PERSISTENT OUTER-LOOP ROUTING.
-
-You are the one persistent Curriculum Agent for this target lineage. Your context
-continues across target failures, target retries, and any practice projects. You are
-the high-level search controller, not the solver and not the grader.
-
-IMMUTABLE NORTH-STAR TARGET — verbatim:
----
-{target.strip()}
----
-
-LOCAL VERIFIER AGENT REPORT — verbatim:
----
-{verifier_report.strip()}
----
-
-The persistent target Verifier Agent has already committed FAIL. That local verdict
-is authoritative for the current candidate: you cannot change it to PASS or submit
-the candidate. You have no access to the candidate, Actor-private trajectory,
-official evaluator, hidden checks, score, graded answer, or evaluator feedback.
-Treat the report as observed evidence, not as a guaranteed causal diagnosis.
-
-Choose the next high-level search action:
-
-- REVISE returns the complete Verifier report to the same Actor Agent in the same
-  target environment and context for local repair.
-- EVOLVE first lets that Actor Agent learn from the complete report, then suspends
-  the target attempt and enters the existing Curriculum Agent -> (Actor Agent ->
-  Verifier Agent) practice pipeline. A fresh target Actor Agent later retries with
-  the resulting durable memory; the target Verifier Agent remains persistent.
-
-Use your judgment about which action has greater expected information or capability
-value now. There is no fixed retry count, failure taxonomy, checklist, threshold, or
-mandatory evolution. Do not solve the task, prescribe a repair, author a practice
-project, or invent missing Verifier evidence in this routing phase. If you choose
-EVOLVE, this same context will next receive the Actor Agent's learning diagnosis and
-will freely design the practice search.
-
-PRIOR OUTER-LOOP ROUTE RECORD:
----
-{history}
----
-
-YOUR PRIVATE SEARCH NOTES:
----
-{notes}
----
-
-Write your complete routing handoff to {handoff_path}. Include exactly one standalone
-line outside quoted examples or code fences: ROUTE: REVISE or ROUTE: EVOLVE. Explain
-your evidence and uncertainty however you judge useful. You may update
-{notes_path} as a private recovery copy; neither file is shown to the Actor Agent or
-Verifier Agent. Declare done only when the routing handoff is complete."""
-
-
 def self_evolving_curriculum_charter(
     target_direction: str,
     project_history: str = "",
@@ -247,268 +43,108 @@ def self_evolving_curriculum_charter(
     handoff_path: str = "~/project_next.md",
     notes_path: str = "~/curriculum_notes.md",
     project_root: str = "/home/user/evolution_project",
-    target_gated: bool = False,
-    unified_retry: bool = False,
     phase1_exploration: bool = False,
     phase1_target_conditioned: bool = False,
-    phase2_outcome: bool = False,
-    curriculum_memory_access: str = "read_only",
 ) -> str:
-    """Persistent Curriculum Agent prompt for outer-loop meta-search.
-
-    ``target_direction`` is inserted verbatim. In target-gated mode, the
-    Curriculum also receives the completed Q0 Verifier report and same-Actor
-    learning diagnosis as role-owned evidence, but never an evaluator, score,
-    hidden answer, or harness-authored grade. In unified-retry mode, it instead
-    continues after its own EVOLVE route with the target Verifier Agent's FAIL
-    report and returns control to that target loop at READY_FOR_RETRY. In
-    Phase-2-outcome mode, it chooses only the next learning experience after a
-    grounded target PASS or FAIL; it never edits or adjudicates durable memory.
-    """
+    """Persistent Curriculum prompt for broad exploration and reusable practice."""
     if not target_direction.strip():
-        raise ValueError("target_direction must contain the north-star task")
-    if curriculum_memory_access not in {"read_only", "none"}:
-        raise ValueError("unknown Curriculum memory access mode")
-    if curriculum_memory_access == "none" and not phase2_outcome:
-        raise ValueError("Curriculum memory ablation requires Phase 2")
-    if (
-        sum(
-            bool(value)
-            for value in (
-                target_gated,
-                unified_retry,
-                phase1_exploration,
-                phase2_outcome,
-            )
-        )
-        > 1
-    ):
-        raise ValueError(
-            "target_gated, unified_retry, phase1_exploration, and "
-            "phase2_outcome are mutually exclusive"
-        )
-    if phase1_target_conditioned and not phase1_exploration:
-        raise ValueError("phase1_target_conditioned requires phase1_exploration")
+        raise ValueError('target_direction must contain the north-star task')
+    if phase1_target_conditioned and (not phase1_exploration):
+        raise ValueError('phase1_target_conditioned requires phase1_exploration')
     target_conditioned_phase1 = bool(phase1_exploration and phase1_target_conditioned)
-    history = project_history.strip() or "(no projects have completed yet)"
-    outcome = latest_outcome.strip() or "(no project outcome yet)"
-    notes = curriculum_notes.strip() or "(empty — this is the first search turn)"
+    history = project_history.strip() or '(no projects have completed yet)'
+    outcome = latest_outcome.strip() or '(no project outcome yet)'
+    notes = curriculum_notes.strip() or '(empty — this is the first search turn)'
     if phase1_exploration:
-        decision_lines = "DECISION: PROJECT\nDECISION: SATURATED\nDECISION: STALLED"
-    elif phase2_outcome:
-        decision_lines = (
-            "DECISION: PROJECT\nDECISION: READY_FOR_TARGET\nDECISION: STALLED"
-        )
-    elif unified_retry:
-        decision_lines = (
-            "DECISION: PROJECT\nDECISION: READY_FOR_RETRY\nDECISION: STALLED"
-        )
-    elif target_gated:
-        decision_lines = (
-            "DECISION: PROJECT\nDECISION: READY_FOR_TARGET_TEST\nDECISION: STALLED"
-        )
+        decision_lines = 'DECISION: PROJECT\nDECISION: SATURATED\nDECISION: STALLED'
     else:
-        decision_lines = "DECISION: PROJECT\nDECISION: CONVERGED\nDECISION: STALLED"
+        decision_lines = 'DECISION: PROJECT\nDECISION: CONVERGED\nDECISION: STALLED'
     convergence_contract = (
-        "SATURATED is an evidence-based phase transition, not a claim that the "
-        "environment distribution has been exhausted. Use it only when your "
-        "accumulated project evidence indicates broad useful coverage, recent "
-        "projects have little marginal reusable learning value, fresh Actor Agent "
-        "contexts demonstrate transfer on meaningfully different projects, and no "
-        "important recurring gap currently suggests a higher-value experiment. "
-        "Consider whether accumulated memory is beginning to distract or mislead. "
-        "The external orchestrator may also end this phase after a precommitted "
-        "complete-project compute budget; that is neither success nor failure and "
-        "is not an invitation to optimize for episode count. Use STALLED only when "
-        "you cannot identify a productive next hypothesis."
-        if phase1_exploration
-        else "You cannot certify that the target is solved and you do not approve or "
-        "reject memory. READY_FOR_TARGET means only that no additional learning "
-        "experience currently has greater expected value than returning control "
-        "to the unchanged target lifecycle. After a grounded PASS with no new "
-        "project, the outer protocol may freeze the Actor-owned memory; after any "
-        "new project, a fresh Actor Agent must attempt the unchanged target. Use "
-        "STALLED only when you cannot identify a productive next hypothesis; it "
-        "is not a correctness judgment. No action is tied to a fixed project or "
-        "turn count."
-        if phase2_outcome
-        else "You cannot certify that the north-star target is solved. READY_FOR_RETRY "
-        "means only that you judge the current durable memory ready for a fresh "
-        "Actor Agent to retry the unchanged target in a clean environment. The "
-        "persistent target Verifier Agent—not you—will investigate that candidate "
-        "and may PASS or FAIL. PASS submits; after FAIL, you again choose REVISE "
-        "or EVOLVE. Use "
-        "READY_FOR_RETRY when current practice evidence justifies that falsifiable "
-        "transfer attempt; use STALLED only when you have no productive new "
-        "curriculum hypothesis. Neither decision is tied to a fixed number of "
-        "projects or turns."
-        if unified_retry
-        else "You cannot certify convergence. READY_FOR_TARGET_TEST means only that "
-        "you judge the current frozen memory ready to be tested by a fresh Actor "
-        "Agent on the immutable north-star target in a clean target environment. "
-        "The harness will run that target probe and a fresh Verifier Agent will "
-        "return PASS or FAIL. Only its PASS can produce TARGET_CONVERGED. A FAIL "
-        "returns as new evidence and the search continues. Use "
-        "READY_FOR_TARGET_TEST when current evidence justifies that falsifiable "
-        "test; use STALLED only when you have no productive new curriculum "
-        "hypothesis. Neither decision is tied to a fixed number of projects or "
-        "turns."
-        if target_gated
-        else "Use CONVERGED only when the accumulated evidence supports transferable "
-        "capability in the north-star direction. Use STALLED only when you have "
-        "no productive new curriculum hypothesis; explain the evidence after the "
-        "decision line. Neither decision is tied to a fixed number of projects "
-        "or turns."
+        'SATURATED is an evidence-based phase transition, not a claim that the '
+        'environment distribution has been exhausted. Use it only when your accumulated'
+        ' project evidence indicates broad useful coverage, recent projects have little'
+        ' marginal reusable learning value, fresh Actor Agent contexts demonstrate '
+        'transfer on meaningfully different projects, and no important recurring gap '
+        'currently suggests a higher-value experiment. Consider whether accumulated '
+        'memory is beginning to distract or mislead. The external orchestrator may also'
+        ' end this phase after a precommitted complete-project compute budget; that is '
+        'neither success nor failure and is not an invitation to optimize for episode '
+        'count. Use STALLED only when you cannot identify a productive next hypothesis.'
+    ) if phase1_exploration else (
+        'Use CONVERGED only when the accumulated evidence supports transferable '
+        'capability in the north-star direction. Use STALLED only when you have no '
+        'productive new curriculum hypothesis; explain the evidence after the decision '
+        'line. Neither decision is tied to a fixed number of projects or turns.'
     )
     seed_contract = (
-        "The exact target query below is the search direction for this Phase-1 "
-        "lineage. It supplies no solution, demonstration, expected artifact, "
-        "official evaluator, hidden check, grade, score, or graded-answer "
-        "trajectory. Do not seek, reconstruct, or simulate sealed evaluation "
-        "material. Derive diverse prerequisite, variant, contrast, and stress-case "
-        "projects from the query; this phase explores the capability neighborhood "
-        "rather than attempting the unchanged target, whose first diagnostic "
-        "attempt is reserved for Phase 2."
-        if target_conditioned_phase1
-        else "The distribution description below is the only task-distribution seed. "
-        "It may name environments, applications, capability families, and allowed "
-        "training surfaces, but it supplies no held-out evaluation instance, "
-        "solution, demonstration, expected artifact, official evaluator, hidden "
-        "check, grade, score, or graded-answer trajectory. Do not seek, reconstruct, "
-        "or simulate sealed evaluation material. Choose diverse seed projects that "
-        "create reusable environment knowledge and expose uncertain capabilities; "
-        "do not optimize a hidden benchmark task."
-        if phase1_exploration
-        else "The immutable target query, its complete grounded Verifier Agent PASS or "
-        "FAIL report, and the same target Actor Agent's learning diagnosis are the "
-        "target-specific evidence available to you. The Actor Agent has already "
-        "decided what that experience should change in durable memory. You have "
-        "not been given the official evaluator, hidden checks, graded solution, "
-        "score, or evaluator trajectory. Do not seek, reconstruct, or simulate "
-        "sealed evaluation material. For PROJECT, choose a prerequisite, variant, "
-        "contrast, or stress case that can be expressed entirely beneath "
-        f"{project_root}."
-        if phase2_outcome
-        else "The immutable target query, the persistent target Verifier Agent's "
-        "complete FAIL report, your committed EVOLVE routing handoff, and the same "
-        "target Actor Agent's terminal learning diagnosis are the disclosed "
-        "target-specific evidence available "
-        "to you. They contain no official evaluator score or hidden answer. You "
-        "have not been given the official evaluator, hidden checks, graded solution, "
-        "score, or evaluator trajectory. Do not seek, reconstruct, or simulate "
-        "sealed evaluation material. The exact target setup is reserved for the "
-        "outer target loop after READY_FOR_RETRY. For PROJECT, choose a prerequisite, "
-        "variant, contrast, or stress case that can be expressed "
-        f"entirely beneath {project_root}."
-        if unified_retry
-        else "The immutable target query and its completed Q0 learning outcome are "
-        "the disclosed target-specific evidence available to you. Q0 contains "
-        "the fresh Verifier Agent's terminal report and the same Actor Agent's "
-        "learning diagnosis; neither is an official evaluator score or a hidden "
-        "answer. You have not been given the official evaluator, hidden checks, "
-        "graded solution, score, or evaluator trajectory. Do not seek, "
-        "reconstruct, or simulate sealed evaluation material. The exact target "
-        "setup is reserved for READY_FOR_TARGET_TEST. For PROJECT, choose a "
-        "prerequisite, variant, contrast, or stress case that can be expressed "
-        f"entirely beneath {project_root}."
-        if target_gated
-        else "This direction is the only target-specific seed. You have not been "
-        "given a solution, demonstration, expected artifact, official evaluator, "
-        "hidden check, grade, score, or graded-answer trajectory. Do not seek, "
-        "reconstruct, or simulate sealed evaluation material. You may select the "
-        "north-star task itself as a project, or select prerequisites, variants, "
-        "contrasts, and stress cases, using your judgment about which experience "
-        "now has the greatest learning or information\nvalue."
+        'The exact target query below is the search direction for this Phase-1 lineage.'
+        ' It supplies no solution, demonstration, expected artifact, official '
+        'evaluator, hidden check, grade, score, or graded-answer trajectory. Do not '
+        'seek, reconstruct, or simulate sealed evaluation material. Derive diverse '
+        'prerequisite, variant, contrast, and stress-case projects from the query; this'
+        ' phase explores the capability neighborhood rather than attempting the '
+        'unchanged target, whose first diagnostic attempt is reserved for frozen-memory'
+        ' evaluation.'
+    ) if target_conditioned_phase1 else (
+        'The distribution description below is the only task-distribution seed. It may '
+        'name environments, applications, capability families, and allowed training '
+        'surfaces, but it supplies no held-out evaluation instance, solution, '
+        'demonstration, expected artifact, official evaluator, hidden check, grade, '
+        'score, or graded-answer trajectory. Do not seek, reconstruct, or simulate '
+        'sealed evaluation material. Choose diverse seed projects that create reusable '
+        'environment knowledge and expose uncertain capabilities; do not optimize a '
+        'hidden benchmark task.'
+    ) if phase1_exploration else (
+        'This direction is the only target-specific seed. You have not been given a '
+        'solution, demonstration, expected artifact, official evaluator, hidden check, '
+        'grade, score, or graded-answer trajectory. Do not seek, reconstruct, or '
+        'simulate sealed evaluation material. You may select the north-star task itself'
+        ' as a project, or select prerequisites, variants, contrasts, and stress cases,'
+        ' using your judgment about which experience now has the greatest learning or '
+        'information\nvalue.'
     )
     search_contract = (
-        "Search proactively around the exact query. Balance breadth, depth, "
-        "contrast, and transfer according to accumulated evidence; do not wait "
-        "for the Phase-2 target failure and do not assume its cause in advance."
-        if target_conditioned_phase1
-        else "Search proactively across the allowed distribution. Balance breadth, "
-        "depth, contrast, and blind transfer according to the evidence accumulated "
-        "so far; do not wait for a benchmark failure and do not infer one."
-        if phase1_exploration
-        else (
-            "Use the target outcome, the Actor-owned durable memory, and every later "
-            if curriculum_memory_access == "read_only"
-            else "Use the target outcome, the Actor learning diagnosis, and every later "
-        )
-        + "practice outcome to decide which experience has greatest expected "
-        "learning or information value. After PASS, do not create practice by "
-        "default: choose PROJECT only when a contrast or stress case can test an "
-        "important uncertain or overgeneralized hypothesis. After FAIL, prefer "
-        "practice that discriminates among plausible capability gaps. You choose "
-        "the next experience, not memory wording and not target correctness."
-        if phase2_outcome
-        else "Use the triggering FAIL evidence, your EVOLVE decision, and every practice "
-        "outcome to revise the "
-        "bottleneck hypothesis and decide which experience has greatest information "
-        "value. You decide when memory is ready for a falsifiable fresh target retry; "
-        "you do not decide that the target passed."
-        if unified_retry
-        else "Use Q0 and every later outcome to revise the bottleneck hypothesis and "
-        "decide which practice experience—or fresh target test—has greatest "
-        "information value. You decide when the memory is ready for a falsifiable "
-        "target test; you do not decide that it passed."
-        if target_gated
-        else "Decide convergence from demonstrated transfer by fresh Actor Agent "
-        "contexts, not from one success."
-    )
-    direction_label = (
-        "TARGET QUERY — exact natural-language Phase-1 search direction"
-        if target_conditioned_phase1
-        else "TARGET TASK DISTRIBUTION — allowed exploration scope, verbatim"
-        if phase1_exploration
-        else "PHASE-2 TARGET QUERY — exact natural-language learning direction"
-        if phase2_outcome
-        else "NORTH-STAR TARGET DIRECTION — exact natural-language search input"
-    )
+        'Search proactively around the exact query. Balance breadth, depth, contrast, '
+        'and transfer according to accumulated evidence; do not wait for a target '
+        'failure and do not assume its cause in advance.'
+    ) if target_conditioned_phase1 else (
+        'Search proactively across the allowed distribution. Balance breadth, depth, '
+        'contrast, and blind transfer according to the evidence accumulated so far; do '
+        'not wait for a benchmark failure and do not infer one.'
+    ) if phase1_exploration else 'Decide convergence from demonstrated transfer by fresh Actor Agent contexts, not from one success.'
+    direction_label = 'TARGET QUERY — exact natural-language Phase-1 search direction' if target_conditioned_phase1 else 'TARGET TASK DISTRIBUTION — allowed exploration scope, verbatim' if phase1_exploration else 'NORTH-STAR TARGET DIRECTION — exact natural-language search input'
     requirement_contract = (
-        "Keep every learning project relevant to the target query while making "
-        "the project's own literal requirements precise. Vary applications, "
-        "artifacts, conditions, and failure modes when that tests a reusable "
-        "capability implied by the query. Do not reproduce the unchanged target "
-        "as a Phase-1 project. State what must be true; the Actor Agent discovers "
-        "how its submitted programs operate the machine."
-        if target_conditioned_phase1
-        else "Keep every learning project within the allowed distribution while "
-        "making its own literal requirements precise. Vary named applications, "
-        "native editable state, behavior, rendered output, interface, workflow, "
-        "or provenance only when doing so tests a useful capability inside that "
-        "scope. Do not prescribe or advertise an implementation channel or "
-        "backend unless that interface or workflow is itself the capability being "
-        "tested. State what must be true; the Actor Agent discovers how its "
-        "submitted programs operate the machine."
-        if phase1_exploration
-        else "Preserve the north-star's literal requirements when choosing a learning "
-        "project; do not weaken or silently add requirements concerning a named "
-        "application, native editable state, behavior, rendered output, interface, "
-        "workflow, or provenance. Do\nnot prescribe or advertise an implementation "
-        "channel or backend unless that interface or workflow is itself the "
-        "capability being tested. State what must be true; the Actor Agent "
-        "discovers how its submitted programs operate the machine."
+        'Keep every learning project relevant to the target query while making the '
+        "project's own literal requirements precise. Vary applications, artifacts, "
+        'conditions, and failure modes when that tests a reusable capability implied by'
+        ' the query. Do not reproduce the unchanged target as a Phase-1 project. State '
+        'what must be true; the Actor Agent discovers how its submitted programs '
+        'operate the machine.'
+    ) if target_conditioned_phase1 else (
+        'Keep every learning project within the allowed distribution while making its '
+        'own literal requirements precise. Vary named applications, native editable '
+        'state, behavior, rendered output, interface, workflow, or provenance only when'
+        ' doing so tests a useful capability inside that scope. Do not prescribe or '
+        'advertise an implementation channel or backend unless that interface or '
+        'workflow is itself the capability being tested. State what must be true; the '
+        'Actor Agent discovers how its submitted programs operate the machine.'
+    ) if phase1_exploration else (
+        "Preserve the north-star's literal requirements when choosing a learning "
+        'project; do not weaken or silently add requirements concerning a named '
+        'application, native editable state, behavior, rendered output, interface, '
+        'workflow, or provenance. Do\nnot prescribe or advertise an implementation '
+        'channel or backend unless that interface or workflow is itself the capability '
+        'being tested. State what must be true; the Actor Agent discovers how its '
+        'submitted programs operate the machine.'
     )
     memory_contract = (
-        "CURRENT ACTOR-OWNED DURABLE MEMORY is available at ~/.memory as a "
-        "disposable evidence copy. Inspect whichever files you judge relevant to "
-        "understand what the Actor Agent retained and which uncertainty should be "
-        "tested next. Do not edit, rewrite, approve, reject, or grade the memory; "
-        "the Actor Agent exclusively owns its contents and any changes you make "
-        "to this guest copy are discarded. Use memory only as evidence for "
-        "selecting the next experience."
-        if phase1_exploration or phase2_outcome
-        else ""
-    )
-    if phase2_outcome and curriculum_memory_access == "none":
-        memory_contract = (
-            "ACTOR-OWNED DURABLE MEMORY FILES are not exposed to Curriculum "
-            "in this run. Your ~/.memory directory is empty. Use the supplied "
-            "target and practice outcomes, Verifier reports, and Actor learning "
-            "diagnoses to select the next experience. Do not attempt to obtain "
-            "Actor memory files elsewhere. The Actor retains its own memory "
-            "and remains its exclusive author; your stopping authority is unchanged."
-        )
+        'CURRENT ACTOR-OWNED DURABLE MEMORY is available at ~/.memory as a disposable '
+        'evidence copy. Inspect whichever files you judge relevant to understand what '
+        'the Actor Agent retained and which uncertainty should be tested next. Do not '
+        'edit, rewrite, approve, reject, or grade the memory; the Actor Agent '
+        'exclusively owns its contents and any changes you make to this guest copy are '
+        'discarded. Use memory only as evidence for selecting the next experience.'
+    ) if phase1_exploration else ''
     return f"""CURRICULUM AGENT — PERSISTENT OUTER-LOOP META-SEARCH.
 
 You are the Curriculum Agent for one self-evolving lineage. Your context persists
@@ -638,95 +274,6 @@ during project work. After the Verifier returns PASS or FAIL, this same Actor
 Agent context receives separate memory-distillation and reconciliation phases with
 the complete report. There is no prescribed turn count within this work phase.
 Declare done only after the handoff represents the state you choose to submit."""
-
-
-def self_evolving_target_actor_charter(
-    target: str,
-    memory_listing: str = "",
-    handoff_path: str = "~/actor_handoff.md",
-    candidate_outputs: tuple[str, ...] = (
-        "/home/user/Desktop/OSWorld.mp4",
-        "/home/user/Desktop/OSWorld/",
-    ),
-) -> str:
-    """Fresh Actor prompt for the immutable target bootstrap or retest."""
-    if not target.strip():
-        raise ValueError("target must contain the immutable target query")
-    if not candidate_outputs or any(
-        not isinstance(path, str) or not path.startswith("/")
-        for path in candidate_outputs
-    ):
-        raise ValueError("candidate_outputs must contain absolute paths")
-    listing = memory_listing.strip() or "(no durable memory files yet)"
-    if candidate_outputs == (
-        "/home/user/Desktop/OSWorld.mp4",
-        "/home/user/Desktop/OSWorld/",
-    ):
-        replay_scope = (
-            "Only /home/user/Desktop/OSWorld.mp4 and the complete\n"
-            "/home/user/Desktop/OSWorld/ directory are carried across the "
-            "clean reset into\nVerifier inspection."
-        )
-        named_outputs = "those named outputs"
-    else:
-        replay_scope = (
-            "Only the following target-owned output path(s) are carried across "
-            "the clean reset into Verifier inspection:\n"
-            + "\n".join(f"- {path}" for path in candidate_outputs)
-        )
-        named_outputs = "the named output path(s)"
-    return f"""ACTOR AGENT — IMMUTABLE NORTH-STAR TARGET ATTEMPT.
-
-You are a fresh Actor Agent context. The normal task-visible target environment
-has already been initialized: use only the instruction, live desktop, supplied
-inputs, references, task-visible guidance, and generic tools available there. You
-have not been given an evaluator, score, hidden grading material, worked solution,
-or a prior target trajectory.
-
-DURABLE MEMORY FILES:
----
-{listing}
----
-
-IMMUTABLE TARGET QUERY — authoritative and verbatim:
----
-{target.strip()}
----
-
-Your durable memory is available at ~/.memory. It may be useful, wrong, outdated,
-or irrelevant, so decide what to inspect and verify it against the live target.
-For an empty-memory bootstrap there may be nothing to inspect.
-
-Code is your control channel, not a reinterpretation of the target: every action
-you take is a submitted program, and those programs may inspect and operate the
-machine or automate a required application. Choose the implementation yourself.
-Whatever method you choose, the candidate must satisfy the target's literal
-requirements, including any named-application, native-editable-state, behavior,
-rendered-output, workflow, or provenance requirement.
-
-TARGET REPLAY BOUNDARY:
-{replay_scope} Keep every generated dependency needed to verify or reopen
-the submission self-contained within {named_outputs}. The supplied inputs are
-recreated separately by the normal target setup. This boundary does not prescribe
-how you solve the task or whether either output is required beyond the target's
-own wording.
-
-Make one complete attempt using your own judgment. You choose the strategy,
-investigation, amount of work, and when your best candidate is ready. This phase
-does not repair against a Verifier verdict: its purpose is to expose the current
-capability frontier honestly.
-
-When you decide to stop target work, write one complete lossless handoff to
-{handoff_path}. Put STATUS: SUBMIT on its first non-empty line, then freely record
-what you delivered, where relevant artifacts are, what changed, and any uncertainty
-or unresolved state the Verifier Agent should investigate. SUBMIT is neutral: it
-claims neither success nor failure and applies equally to complete, partial, or
-blocked work.
-
-Do not update durable memory during target work. If this attempt fails, this same
-Actor Agent context will later receive the complete Verifier report and may learn
-from it. There is no prescribed turn count. Declare done only after the handoff
-represents the candidate you choose to submit."""
 
 
 def agent_harness_verifier_orientation_charter(
@@ -1031,32 +578,6 @@ also approve that substitute, keep investigating through a distinguishing channe
 {decision_contract}"""
 
 
-def self_evolving_target_verifier_charter(
-    target: str,
-    report_path: str = "~/verifier_report.md",
-    actor_execution_path: str = "/home/user/.practice_actor_execution",
-) -> str:
-    """Fresh Verifier prompt for an immutable target attempt."""
-    base = self_evolving_verifier_charter(
-        target,
-        report_path=report_path,
-        project_root=(
-            "the live target environment and the exact input and deliverable "
-            "paths named by the immutable target"
-        ),
-        actor_execution_path=actor_execution_path,
-    )
-    return base.replace(
-        "VERIFIER AGENT — INDEPENDENT PROJECT VERIFICATION.",
-        "VERIFIER AGENT — INDEPENDENT IMMUTABLE-TARGET VERIFICATION.",
-        1,
-    ).replace(
-        "ORIGINAL PROJECT — authoritative requirements, verbatim:",
-        "IMMUTABLE TARGET QUERY — authoritative requirements, verbatim:",
-        1,
-    )
-
-
 def self_evolving_verifier_charter(
     project: str,
     report_path: str = "~/verifier_report.md",
@@ -1283,7 +804,7 @@ def phase1_wave_curriculum_charter(
         "The exact target query is disclosed only as a search direction. Derive "
         "diverse prerequisite, variant, contrast, and stress projects around its "
         "capability neighborhood. Do not reproduce or attempt the unchanged target "
-        "in Phase 1; its first exact attempt is reserved for Phase 2."
+        "in Phase 1; its first exact attempt is reserved for frozen-memory evaluation."
         if target_query_conditioned
         else "The description is the allowed target distribution. Search proactively "
         "within it without reconstructing or optimizing any hidden benchmark task."

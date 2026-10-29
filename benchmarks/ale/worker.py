@@ -66,6 +66,12 @@ def main():
     parser.add_argument("spec")
     args = parser.parse_args()
     spec = json.loads(Path(args.spec).read_text())
+    if spec.get("schema_version") != 3:
+        raise ValueError("Unsupported ALE worker protocol; start a fresh run")
+    if spec.get("phase") not in ("baseline", "phase1", "phase3"):
+        raise ValueError("Unknown ALE phase: " + str(spec.get("phase")))
+    if spec["phase"] == "phase3":
+        verify_memory(spec["input_memory"])
     root = Path(spec["work_dir"])
     root.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
@@ -78,14 +84,12 @@ def main():
         root / "worker-result.json", {"status": "running", "safe_to_grade": False}
     )
     try:
-        if spec["phase"] not in ("baseline", "phase1", "phase2", "phase3"):
-            raise ValueError("Unknown ALE phase: " + str(spec["phase"]))
         if spec["phase"] in ("baseline", "phase3"):
             result = evaluation(spec)
         else:
-            from .learning import phase1, phase2
+            from .learning import phase1
 
-            result = (phase1 if spec["phase"] == "phase1" else phase2)(spec)
+            result = phase1(spec)
             result["safe_to_grade"] = False
         from llm.client import provider_counts
 

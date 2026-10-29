@@ -35,7 +35,6 @@ jobs:
           python run_ale.py --help
           python -m benchmarks.osworld.task --help
           python -m benchmarks.osworld.phase1 --help
-          python -m benchmarks.osworld.phase2 --help
           python -m benchmarks.osworld.pipeline --help
           python tools/smoke_osworld.py --help
           python run_osworld.py --dry-run > /tmp/osworld-batch.json

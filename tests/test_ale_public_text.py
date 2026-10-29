@@ -181,7 +181,7 @@ def test_host_binding_reaches_worker_phase1_hooks_without_entering_any_model_pro
     work.mkdir()
     spec = tmp_path / "worker-spec.json"
     spec.write_text(json.dumps({
-        "phase": "phase1",
+        "schema_version": 3, "phase": "phase1",
         "work_dir": str(work), "practice_sandboxes": [{}], "reset_endpoint": "unused",
         "corpus": str(corpus), "instruction": instruction, "audit_public_task": public_task,
     }))
@@ -207,75 +207,6 @@ def test_host_accepts_both_existing_card_identity_fields(tmp_path, identity):
                                 "taskPrompt": "Public task."}, "Issued task.", [])
 
 
-def test_phase2_target_learning_and_curriculum_receive_bound_audit(tmp_path, monkeypatch):
-    from dataclasses import replace
-    from benchmarks.ale import host, learning
-    from benchmarks.ale.protocol import memory_record
-    from core import loop
-    from explore import target_learning, unified_evolution
-    from explore.practice_loop import _atomic_install_memory
-
-    prompt = "Fit Kaplan-Meier, log-rank and Cox proportional hazards analyses."
-    instruction = "Analyze the cohort."
-    audit, _ = make_audit(tmp_path, prompt, instruction)
-    public_task = host.public_task_audit(
-        TASK, {"task_id": TASK, "taskPrompt": prompt}, instruction, [ROOT + "/input"]
-    )
-    initial = tmp_path / "initial"
-    _atomic_install_memory(str(initial), {"seed.md": b"initial lesson"})
-    work = tmp_path / "phase2"
-    work.mkdir()
-    seen = []
-
-    class Pool:
-        vms = [SimpleNamespace(is_windows=False, home="/home/user")]
-        def __init__(self, *args, **kwargs): pass
-        def acquire(self):
-            return SimpleNamespace(close=lambda: None), SimpleNamespace()
-        def close(self): pass
-
-    monkeypatch.setattr(learning, "CleanPool", Pool)
-    real_hooks = learning.hooks_for
-    def hooks(pool, corpus, binding):
-        # Preserve the actual Audit/hooks construction; replace only VM upload.
-        return replace(real_hooks(pool, corpus, binding), push_memory=lambda *a: True)
-    monkeypatch.setattr(learning, "hooks_for", hooks)
-
-    def actor(direction, vm, cfg, sink, **kwargs):
-        assert direction == instruction and prompt not in cfg.system_extra
-        history = [{"role": "assistant", "content": prompt}]
-        return loop.LoopResult(status="done", verifier_route="HANDOFF",
-                               verifier_report="VERDICT: PASS\nAll rows checked"), history
-    monkeypatch.setattr(loop, "run_with_resume", actor)
-
-    def learn(**kwargs):
-        assert kwargs["target"] == instruction
-        bound = kwargs["hooks"]
-        assert bound.audit_transcripts(work, authorized_instruction=instruction) == []
-        assert bound.audit_transcripts(work)
-        assert bound.audit_text(FOREIGN, authorized_instruction=instruction)
-        seen.append("target-learning")
-        return kwargs["before_memory"], "Ready for review", kwargs["actor_history"]
-    monkeypatch.setattr(target_learning, "_promote_learning", learn)
-
-    def evolve(vm, root, direction, report, diagnosis, memory, *configs, **kwargs):
-        assert direction == instruction and all(prompt not in cfg.system_extra for cfg in configs)
-        assert kwargs["hooks"].audit_text(prompt, authorized_instruction=instruction) == []
-        assert kwargs["hooks"].audit_text(prompt)
-        seen.append("curriculum")
-        destination = Path(root) / "memory"
-        _atomic_install_memory(str(destination), memory)
-        return SimpleNamespace(status="ready_for_retry", memory_dir=str(destination),
-                               projects=0, reason="No further practice")
-    monkeypatch.setattr(unified_evolution, "evolve_until_ready", evolve)
-    result = learning.phase2({
-        "work_dir": str(work), "input_memory": memory_record(initial), "sandbox": {},
-        "practice_sandboxes": [{}], "reset_endpoint": "unused", "corpus": str(audit.path),
-        "instruction": instruction, "audit_public_task": public_task,
-    })
-    assert seen == ["target-learning", "curriculum"]
-    assert result["target_cycles"] == 1 and result["learning_updates"] == 1
-    assert result["transition_ready"] and result["official_evaluator_calls"] == 0
 
 
 def test_old_unbound_and_unaffected_text_keep_their_results(tmp_path):

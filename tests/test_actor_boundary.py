@@ -1,5 +1,4 @@
 """Pre-Actor evaluator-source isolation validity boundary."""
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -64,12 +63,3 @@ def test_detected_evaluator_is_quarantined_and_boundary_is_rechecked():
     assert "desktop_env.task_base" in vm.calls[0][1]
     assert "/root/.rsiagent_actor_evaluator_quarantine" in vm.calls[1][1]
     assert all(call[2] == 0 for call in vm.calls)
-
-
-def test_self_evolving_runner_isolates_before_s0_and_orientation():
-    source = (Path(__file__).resolve().parents[1] /
-              "benchmarks/osworld/phase2.py").read_text(encoding="utf-8")
-    isolation = source.index("quarantine_actor_visible_evaluators(vm)")
-    surface_s0 = source.index("baseline = _snapshot", isolation)
-    orientation = source.index("def verifier_orient(", surface_s0)
-    assert isolation < surface_s0 < orientation

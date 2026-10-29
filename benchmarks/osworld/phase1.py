@@ -188,7 +188,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--target-query-conditioned", action="store_true",
         help=("derive diverse Phase-1 exploration from the supplied exact query; "
-              "the unchanged target itself remains reserved for Phase 2"))
+              "the unchanged target itself remains reserved for frozen-memory evaluation"))
     parser.add_argument("--project-budget", type=int, default=8)
     parser.add_argument("--checkpoints", default="0,2,4,8")
     parser.add_argument(
@@ -244,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": "ready",
         "phase": "distribution_guided_capability_exploration",
         "study_design": (
-            "target_conditioned_adaptation" if args.target_query_conditioned
+            "target_conditioned_exploration" if args.target_query_conditioned
             else "held_out_generalization"),
         "result_root": str(root),
         "project_budget": args.project_budget,
@@ -322,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         _read_memory_tree,
         evolve_practice,
     )
-    from explore.target_learning import _memory_tree_sha256
+    from explore.memory_hash import memory_tree_sha256
 
     def vm_factory():
         desktop = DesktopEnv(
@@ -378,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": 1,
         "phase": "distribution_guided_capability_exploration",
         "study_design": (
-            "target_conditioned_adaptation" if args.target_query_conditioned
+            "target_conditioned_exploration" if args.target_query_conditioned
             else "held_out_generalization"),
         "status": result.status,
         "projects": result.projects,
@@ -390,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         "memory_files": len(memory),
         "memory_bytes": sum(len(data) for data in memory.values()),
         "memory_manifest": _manifest(memory),
-        "memory_tree_sha256": _memory_tree_sha256(memory),
+        "memory_tree_sha256": memory_tree_sha256(memory),
         "memory_frozen_path": str(frozen),
         "official_evaluator_calls": 0,
     }
