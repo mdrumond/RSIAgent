@@ -1470,3 +1470,23 @@ def test_unsupported_campaign_configuration_rejected_before_cache_writes(tmp_pat
         create_app(config, cache)
     assert not cache.parent.exists()
     assert not (tmp_path / "old-run").exists()
+
+
+def test_removed_phase_routes_cannot_serve_cached_history(tmp_path):
+    config = tmp_path / "dashboard.json"
+    write(config, {"campaigns": []})
+    cache = tmp_path / "dashboard.sqlite"
+    store = DashboardStore(config, cache)
+    store._save({"campaigns": [{"phase": 2, "projects": []}], "stale": False})
+    with store._db() as db:
+        db.execute("INSERT INTO trace_indexes VALUES(?,?,?)", (2, "old", '{"events":[]}'))
+    assert store.cached()["campaigns"] == []
+    app = create_app(config, cache)
+    try:
+        client = app.test_client()
+        for path in ("/phase/2", "/phase/2/project/old",
+                     "/api/phase/2/project/old/trace", "/api/phase/2/project/old/performance",
+                     "/api/phase/2/project/old/trace/event", "/api/phase/2/project/old/trace/event/download"):
+            assert client.get(path).status_code == 404
+    finally:
+        app.extensions["dashboard_controls"].close()

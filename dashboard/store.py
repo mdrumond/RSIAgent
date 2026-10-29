@@ -542,7 +542,9 @@ class DashboardStore:
     def cached(self):
         with self._db() as db:
             row = db.execute("SELECT body FROM snapshots WHERE id=1").fetchone()
-        return json.loads(row[0]) if row else {"generated_at": None, "stale": True, "campaigns": []}
+        view = json.loads(row[0]) if row else {"generated_at": None, "stale": True, "campaigns": []}
+        view["campaigns"] = [entry for entry in view["campaigns"] if entry.get("phase") == 1]
+        return view
 
     def performance(self, project):
         return _performance(project)
