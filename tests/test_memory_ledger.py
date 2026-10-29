@@ -187,3 +187,77 @@ def test_frequently_accessed_unknown_memory_is_hot_without_rewrite(tmp_path):
     stats = ledger.stats('lesson', version)
     assert stats['hot'] and not stats['reviewed_hot'] and not stats['needs_rewrite']
     assert stats['accesses'] == 10 and stats['exposures'] == stats['unknown'] == 1
+
+
+def test_second_campaign_discovers_and_replaces_shared_catalog(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.ascend.subject_knowledge import SubjectKnowledge
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from test_a5_knowledge import FakeEmbeddings
+    service, first, store, kdb = setup(tmp_path/'first')
+    original = first.accept('lesson', proposal(store), {})
+    second = SubjectMemory(tmp_path/'second/memory', ledger=MemoryLedger.for_kdb(kdb))
+    other = SubjectKnowledge(tmp_path/'second', ContentAddressedArtifacts(tmp_path/'second/artifacts'),
+        lambda: second, paths=SimpleNamespace(kdb=kdb), embeddings=FakeEmbeddings(),
+        reference_query=lambda *args, **kwargs: ())
+    assert [digest(row) for row in second.records()] == [original['version']]
+    assert second.read(original['version']) == first.read(original['version'])
+    found = other.query({'query':'vector'}, remaining_seconds=60)
+    assert [row['version'] for row in found['memories']] == [original['version']]
+    service.ledger.transition(original['version'], 'quarantined', event_id='conflict', reason='New contradictory execution', evidence=[EVIDENCE])
+    assert first.records() == second.records() == []
+    fixed = second.accept('correction', dict(proposal(store), operation='append', base_versions=[original], summary='Corrected claim'), {})
+    assert [digest(row) for row in first.records()] == [fixed['version']]
+    assert first.read(fixed['version']) == second.read(fixed['version'])
+    assert not service.ledger.available(original['version'])
+    from benchmarks.ascend.subject_memory import StaleMemory
+    with pytest.raises(StaleMemory):
+        first.accept('stale', dict(proposal(store), operation='append', base_versions=[original]), {})
+
+
+def test_concurrent_cross_campaign_replacements_compare_global_heads_atomically(tmp_path):
+    from threading import Barrier
+    from benchmarks.ascend.subject_memory import StaleMemory
+    ledger = MemoryLedger(tmp_path/'ledger.sqlite3')
+    first = SubjectMemory(tmp_path/'a', ledger=ledger)
+    base = first.accept('lesson', record()['proposal'], {})
+    barrier = Barrier(2)
+    first.index = lambda *args: barrier.wait(timeout=10)
+    second = SubjectMemory(tmp_path/'b', ledger=MemoryLedger(ledger.path), index=first.index)
+    def replace(pair):
+        memory, summary = pair
+        try:
+            return memory.accept(summary, dict(record()['proposal'], base_versions=[base], summary=summary), {})
+        except StaleMemory:
+            return 'stale'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(replace, [(first,'one'),(second,'two')]))
+    assert results.count('stale') == 1
+    winner = next(result for result in results if isinstance(result, dict))
+    assert [digest(row) for row in ledger.records()] == [winner['version']]
+    assert not ledger.bases_current([base])
+
+
+def test_retired_global_base_requires_new_source_review_resolution(tmp_path):
+    ledger = MemoryLedger(tmp_path/'ledger.sqlite3')
+    first = SubjectMemory(tmp_path/'a', ledger=ledger)
+    base = first.accept('lesson', record()['proposal'], {})
+    ledger.transition(base['version'], 'retired', event_id='retirement', reason='Unsupported old claim', evidence=[EVIDENCE])
+    second = SubjectMemory(tmp_path/'b', ledger=MemoryLedger(ledger.path))
+    changed = dict(record()['proposal'], base_versions=[base], summary='Corrected supported claim')
+    with pytest.raises(ValueError, match='source-reviewed resolving evidence'):
+        second.accept('correction', changed, {})
+    correction = second.accept('correction', changed, dict(retirement_resolutions=[dict(
+        tombstone_id='retirement', evidence=['f'*64], reason='New project resolves old counterexample')]))
+    assert [digest(row) for row in first.records()] == [correction['version']]
+    assert ledger.retired()[0]['version'] == base['version'] and not ledger.available(base['version'])
+
+
+def test_lifecycle_change_during_indexing_rejects_publication(tmp_path):
+    from benchmarks.ascend.subject_memory import StaleMemory
+    ledger = MemoryLedger(tmp_path/'ledger.sqlite3'); memory = SubjectMemory(tmp_path/'memory', ledger=ledger)
+    base = memory.accept('lesson', record()['proposal'], {})
+    memory.index = lambda *args: ledger.transition(base['version'], 'quarantined', event_id='conflict', reason='New evidence', evidence=[EVIDENCE])
+    with pytest.raises(StaleMemory, match='lifecycle changed'):
+        memory.accept('correction', dict(record()['proposal'], base_versions=[base], summary='New version'), {})
+    assert ledger.status(base['version']) == 'quarantined' and ledger.records() == []

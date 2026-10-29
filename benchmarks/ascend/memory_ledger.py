@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 import sqlite3
 
-from .subject_memory import digest
+from .subject_memory import digest, StaleMemory
 
 
 def _json(value):
@@ -33,6 +33,8 @@ class MemoryLedger:
                 CREATE TABLE IF NOT EXISTS memory_versions (
                     version TEXT PRIMARY KEY, memory_id TEXT NOT NULL,
                     record TEXT NOT NULL, status TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS memory_heads (
+                    memory_id TEXT PRIMARY KEY, version TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS memory_lineage (
                     child TEXT NOT NULL, parent TEXT NOT NULL,
                     PRIMARY KEY(child,parent));
@@ -71,23 +73,83 @@ class MemoryLedger:
         finally:
             db.close()
 
-    def publish(self, record):
-        """Register a source-approved version and its explicit supersession edges."""
+    def _insert_record(self, db, record, status):
         from .subject_knowledge import memory_artifacts
         version = digest(record)
+        db.execute('INSERT INTO memory_versions VALUES (?,?,?,?)',
+                   (version, record['memory_id'], _json(record), status))
+        db.executemany('INSERT INTO memory_artifacts VALUES (?,?)',
+                       [(version, sha) for sha in {version, *memory_artifacts(record)}])
+        for base in record['proposal'].get('base_versions', []):
+            db.execute('INSERT INTO memory_lineage VALUES (?,?)', (version, base['version']))
+        return version
+
+    def bootstrap(self, record):
+        """Register an existing accepted local head without overriding shared history."""
+        version = digest(record)
+        with self._transaction() as db:
+            if db.execute('SELECT 1 FROM memory_versions WHERE version=?', (version,)).fetchone():
+                return version
+            head = db.execute('SELECT version FROM memory_heads WHERE memory_id=?', (record['memory_id'],)).fetchone()
+            self._insert_record(db, record, 'superseded' if head else 'active')
+            if head is None:
+                db.execute('INSERT INTO memory_heads VALUES (?,?)', (record['memory_id'], version))
+        return version
+
+    @staticmethod
+    def _bases_current(db, bases):
+        return all(db.execute('SELECT 1 FROM memory_heads WHERE memory_id=? AND version=?',
+                              (base['memory_id'], base['version'])).fetchone() for base in bases)
+
+    def bases_current(self, bases):
+        with self._transaction() as db:
+            return self._bases_current(db, bases)
+
+    def records(self):
+        with self._transaction() as db:
+            rows = db.execute("SELECT v.record FROM memory_heads h JOIN memory_versions v USING(version) "
+                              "WHERE v.status='active' ORDER BY h.memory_id").fetchall()
+        return [json.loads(row['record']) for row in rows]
+
+    def publish(self, record, *, expected_statuses=None):
+        """Compare all shared heads and publish one replacement atomically."""
+        version = digest(record)
+        bases = record['proposal'].get('base_versions', [])
+        if len({base['memory_id'] for base in bases}) != len(bases):
+            raise ValueError('memory bases must identify distinct memories')
         with self._transaction() as db:
             previous = db.execute('SELECT record FROM memory_versions WHERE version=?', (version,)).fetchone()
             if previous:
                 if previous['record'] != _json(record):
                     raise ValueError('immutable memory record changed')
                 return version
-            db.execute('INSERT INTO memory_versions VALUES (?,?,?,?)',
-                       (version, record['memory_id'], _json(record), 'active'))
-            db.executemany('INSERT INTO memory_artifacts VALUES (?,?)',
-                           [(version, sha) for sha in {version, *memory_artifacts(record)}])
-            for base in record['proposal'].get('base_versions', []):
-                db.execute('INSERT INTO memory_lineage VALUES (?,?)', (version, base['version']))
+            if not self._bases_current(db, bases):
+                raise StaleMemory('shared memory replacement base changed; reconcile source review')
+            if record['memory_id'] not in {base['memory_id'] for base in bases} and db.execute(
+                    'SELECT 1 FROM memory_heads WHERE memory_id=?', (record['memory_id'],)).fetchone():
+                raise StaleMemory('shared memory identity already exists; propose an explicit replacement')
+            resolutions = {row['tombstone_id']: row for row in record['provenance'].get('retirement_resolutions', [])}
+            for base in bases:
+                status = db.execute('SELECT status FROM memory_versions WHERE version=?', (base['version'],)).fetchone()
+                if status is None or status['status'] not in {'active', 'quarantined', 'retired'}:
+                    raise StaleMemory('shared memory base is no longer current')
+                if expected_statuses is not None and status['status'] != expected_statuses[base['version']]:
+                    raise StaleMemory('shared memory lifecycle changed during publication; repeat source review')
+                if status['status'] == 'retired':
+                    events = db.execute('SELECT event FROM memory_lifecycle WHERE version=?', (base['version'],)).fetchall()
+                    for row in events:
+                        event = json.loads(row['event'])
+                        if event['status'] != 'retired':
+                            continue
+                        resolution = resolutions.get(event['event_id'])
+                        if (not resolution or not resolution.get('reason') or not
+                                set(_evidence(resolution['evidence'])) - set(event['evidence'])):
+                            raise ValueError('retired memory replacement requires new source-reviewed resolving evidence')
+            self._insert_record(db, record, 'active')
+            for base in bases:
+                db.execute('DELETE FROM memory_heads WHERE memory_id=?', (base['memory_id'],))
                 db.execute("UPDATE memory_versions SET status='superseded' WHERE version=? AND status='active'", (base['version'],))
+            db.execute('INSERT INTO memory_heads VALUES (?,?)', (record['memory_id'], version))
         return version
 
     def replacements(self, version):
@@ -213,7 +275,8 @@ class MemoryLedger:
                 raise KeyError(version)
             if expected_status is not None and row['status'] != expected_status:
                 raise ValueError('memory lifecycle changed; reconcile current version')
-            if row['status'] == 'superseded' and status == 'active':
+            if status == 'active' and not db.execute(
+                    'SELECT 1 FROM memory_heads WHERE version=?', (version,)).fetchone():
                 raise ValueError('superseded memory cannot become the current version again')
             db.execute('INSERT INTO memory_lifecycle VALUES (?,?,?)', (event_id, version, _json(event)))
             db.execute('UPDATE memory_versions SET status=? WHERE version=?', (status, version))
