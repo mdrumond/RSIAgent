@@ -22,7 +22,9 @@ class Remote:
     def __call__(self, argv, **options):
         self.calls.append(argv)
         action = argv[2]
-        if action == 'upload':
+        if action == 'capabilities':
+            value = dict(state='available', target='fixture', backend='remote-agent', capabilities=dict(upload=True))
+        elif action == 'upload':
             value = dict(state='completed', target='fixture', exit=0)
         elif action == 'run':
             handle = 'remote:fixture:job:'+str(len(self.jobs)+1)
@@ -51,6 +53,8 @@ class Remote:
 
 
 def backend(tmp_path, remote, **kwargs):
+    kwargs.setdefault('submission_reserve_seconds', 0)
+    kwargs.setdefault('cleanup_reserve_seconds', 0)
     return CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote', target='fixture', runtime='named-runtime',
         remote_workspace='/owned/task', physical_device=11, state_directory=tmp_path/'transport',
         process_runner=remote, **kwargs)
@@ -92,6 +96,8 @@ def test_ambiguous_submission_is_never_repeated(tmp_path):
     calls = []
     def disconnected(argv, **options):
         calls.append(argv)
+        if argv[2] == 'capabilities':
+            return Remote()(argv, **options)
         if argv[2] == 'upload':
             return subprocess.CompletedProcess(argv, 0, '{"state":"completed"}', '')
         raise subprocess.TimeoutExpired(argv, 1)
@@ -148,7 +154,7 @@ def test_remote_agent_uses_relative_transfer_and_cwd_with_absolute_payloads(tmp_
     compilation = candidate.compile(smoke_plan(target='discovered-a3', arch='discovered-arch'), tmp_path/'bundle')
     assert compilation.library_sha256 == 'b'*64
     upload = next(call for call in remote.calls if call[2] == 'upload')
-    assert upload[-1].startswith('task/')
+    assert upload[5].startswith('task/')
     submit = next(call for call in remote.calls if call[2] == 'run')
     assert submit[submit.index('--cwd')+1] == 'task'
     assert '/owned/task/candidates/' in Path(submit[submit.index('--file')+1]).read_text()
@@ -167,7 +173,7 @@ def test_queue_expiry_cancels_owned_handle_without_resubmitting(tmp_path):
             remote.calls.append(argv)
             return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='cancelled', handle=argv[3])), '')
         return remote(argv, **options)
-    candidate = backend(tmp_path, delayed, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
+    candidate = backend(tmp_path, delayed, timeout=60, cleanup_reserve_seconds=50, clock=lambda: now[0], wall_clock=lambda: now[0])
     plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
     for _ in range(2):
         with pytest.raises(_PendingObservation, match='elapsed allocation expired'):
@@ -234,7 +240,7 @@ def test_compile_error_returned_when_terminal_poll_crosses_deadline(tmp_path):
                 'A3CANDIDATE_COMPILE_FAILED=1' if stream == 'stdout' else
                 "candidate.cpp: error: no matching function for call to 'Mul'")))
         return result
-    candidate = backend(tmp_path, compiler_error, timeout=10,
+    candidate = backend(tmp_path, compiler_error, timeout=60, cleanup_reserve_seconds=50,
                         clock=lambda: now[0], wall_clock=lambda: now[0])
     result = candidate.compile(smoke_plan(target='discovered-a3', arch='discovered-arch'), tmp_path/'bundle')
     assert result.error_type == 'NativeCompileError'
@@ -252,6 +258,7 @@ def test_expired_retained_job_is_observed_before_cancellation(tmp_path):
         candidate.run_remote(('false',), key='compile')
     now[0] += 20
     remote.exit_code = 1
+    candidate.recover_owned_operations()
     result = candidate.run_remote(('false',), key='compile')
     assert result.returncode == 1
     assert len([call for call in remote.calls if call[2] == 'run']) == 1
@@ -275,6 +282,7 @@ def test_terminal_streams_resume_after_elapsed_parent_and_log_disconnect(tmp_pat
     record = json.loads((candidate.root/'compile/operation.json').read_text())
     assert record['terminal_result']['returncode'] == 0
     assert 'stdout' in record['terminal_result']
+    candidate.recover_owned_operations()
     result = candidate.run_remote(('true',), key='compile')
     assert result.returncode == 0
     assert len([c for c in remote.calls if c[2] == 'run']) == 1
@@ -288,7 +296,7 @@ def test_expiry_observation_rejects_foreign_handle_without_cancelling(tmp_path):
     candidate = backend(tmp_path, remote, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
     with pytest.raises(_PendingObservation):
         candidate.run_remote(('true',), key='compile')
-    now[0] += 20
+    now[0] += 5
     def foreign(argv, **options):
         return subprocess.CompletedProcess(argv, 0, json.dumps(dict(handle='remote:other:job:1', state='failed', exit=1)), '')
     candidate._run = foreign
@@ -422,7 +430,8 @@ def test_real_launcher_distinguishes_deadline_escalation_from_normal_137(tmp_pat
         remote.jobs[handle] = result.stdout
         remote.exit_code = result.returncode
         return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='completed', handle=handle, exit=result.returncode)), '')
-    candidate = backend(tmp_path, launch, timeout=1 if deadline else 10)
+    candidate = backend(tmp_path, launch, timeout=46 if deadline else 10,
+                        cleanup_reserve_seconds=45 if deadline else 0)
     marker = tmp_path/'started'
     command = ('python', '-c',
         'import signal,time,pathlib,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
@@ -588,3 +597,228 @@ def test_pending_measurement_binds_replay_before_submission_and_recovers_same_ha
     measurement_runs = [call for call in remote.calls if call[2]=='run'
         and 'native_measurement_driver.py' in Path(call[call.index('--file')+1]).read_text()]
     assert len(measurement_runs) == 1
+
+
+def test_short_remaining_allocation_does_not_start_upload(tmp_path):
+    remote = Remote()
+    candidate = backend(tmp_path, remote, remaining_seconds=lambda: .37,
+                        submission_reserve_seconds=30, cleanup_reserve_seconds=45)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    with pytest.raises(_PendingObservation) as error:
+        candidate.compile(plan, tmp_path/'bundle')
+    assert error.value.interruption_reason == 'deadline-exhausted'
+    assert remote.calls == []
+    path = candidate.root/plan.execution_id/'upload/operation.json'
+    assert not path.exists() or json.loads(path.read_text())['state'] == 'new'
+
+
+@pytest.mark.parametrize('operation', ['run', 'upload'])
+def test_submission_receipt_survives_cli_loss_and_never_resubmits(tmp_path, operation):
+    remote = Remote()
+    lost = [False]
+    handle = 'remote:fixture:'+('job' if operation == 'run' else 'transfer')+':receipt'
+    def submitted(argv, **options):
+        if argv[2] == operation and not lost[0]:
+            lost[0] = True
+            remote.calls.append(argv)
+            receipt = dict(target='fixture', operation=operation, state='queued', handle=handle)
+            if operation == 'run':
+                receipt['runtime'] = 'named-runtime'
+                remote.jobs[handle] = 'diagnostic'
+            Path(argv[argv.index('--receipt-file')+1]).write_text(json.dumps(receipt))
+            if operation == 'upload':
+                assert '--no-wait' in argv
+            raise subprocess.TimeoutExpired(argv, 1)
+        return remote(argv, **options)
+    candidate = backend(tmp_path, submitted)
+    def execute():
+        return candidate.run_remote(('true',), key='compile') if operation == 'run' else candidate._operation(
+            'upload', ('upload', 'fixture', '/local/archive', '/owned/task/archive'), kind='transfer')
+    with pytest.raises(_PendingObservation):
+        execute()
+    result = execute()
+    assert result.get('state') == 'completed' if isinstance(result, dict) else result.returncode == 0
+    assert len([call for call in remote.calls if call[2] == operation]) == 1
+    assert {call[3] for call in remote.calls if call[2] == 'observe'} == {handle}
+
+
+@pytest.mark.parametrize('change', ['foreign-target', 'foreign-runtime', 'malformed'])
+def test_invalid_submission_receipt_cannot_authenticate_a_job(tmp_path, change):
+    remote = Remote()
+    def disconnected(argv, **options):
+        path = Path(argv[argv.index('--receipt-file')+1])
+        receipt = dict(target='fixture', operation='run', runtime='named-runtime',
+                       state='queued', handle='remote:fixture:job:owned')
+        if change == 'foreign-target': receipt['target'] = 'other'
+        if change == 'foreign-runtime': receipt['runtime'] = 'other'
+        path.write_text('{' if change == 'malformed' else json.dumps(receipt))
+        remote.calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, 1)
+    candidate = backend(tmp_path, disconnected)
+    for _ in range(2):
+        with pytest.raises(ProjectInfrastructureError, match='receipt'):
+            candidate.run_remote(('true',), key='compile')
+    assert len(remote.calls) == 1
+
+
+def test_missing_exit_preserves_diagnostics_without_candidate_failure(tmp_path):
+    remote = Remote()
+    def no_exit(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] in ('observe', 'result'):
+            result.returncode = 1  # A valid terminal JSON response survives CLI nonzero.
+            result.stdout = json.dumps(dict(handle=argv[3], state='failed', exit=None))
+        return result
+    candidate = backend(tmp_path, no_exit)
+    with pytest.raises(_PendingObservation, match='authenticated exit'):
+        candidate.run_remote(('true',), key='compile')
+    record = json.loads((candidate.root/'compile/operation.json').read_text())
+    assert record['terminal_result']['stdout']
+    assert record['terminal_result']['stderr'] == ''
+    assert 'returncode' not in record['terminal_result'] and 'result' not in record
+    candidate.recover_owned_operations()
+    assert len([call for call in remote.calls if call[2] == 'run']) == 1
+
+
+def test_ambiguous_immutable_upload_is_quarantined_but_execution_stays_blocking(tmp_path):
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    remote = Remote()
+    def lost_upload(argv, **options):
+        if argv[2] == 'capabilities':
+            return remote(argv, **options)
+        remote.calls.append(argv)
+        raise subprocess.TimeoutExpired(argv, 1)
+    candidate = backend(tmp_path, lost_upload)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    for _ in range(2):
+        with pytest.raises(_PendingObservation):
+            candidate.compile(plan, tmp_path/'bundle')
+    assert unsettled_operations(candidate.root) == []
+    record = json.loads((candidate.root/plan.execution_id/'upload/operation.json').read_text())
+    assert record['state'] == 'quarantined'
+    assert len([call for call in remote.calls if call[2] == 'upload']) == 1
+    with pytest.raises(_PendingObservation):
+        candidate.run_remote(('true',), key='compile')
+    assert len(unsettled_operations(candidate.root)) == 1
+
+
+def test_explicit_readonly_recovery_quarantines_legacy_unknown_upload(tmp_path):
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    candidate = backend(tmp_path, Remote())
+    key = 'a'*64
+    path = candidate.root/key/'upload/operation.json'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(dict(state='submitting', expires_at=0, identity=dict(
+        route=candidate.runtime_identity, workspace='/owned/task',
+        arguments=['upload', 'fixture', '/local/archive', '/owned/task/'+key+'.tar']))))
+    assert len(unsettled_operations(candidate.root)) == 1
+    candidate.recover_owned_operations()
+    assert unsettled_operations(candidate.root) == []
+    assert candidate._run.calls == []
+
+
+def test_terminal_cleanup_deadline_is_frozen_across_resume(tmp_path):
+    now = [1000.]
+    remote = Remote()
+    def slow_logs(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'logs':
+            assert options['timeout'] <= 45
+            now[0] += 46
+        return result
+    candidate = backend(tmp_path, slow_logs, clock=lambda:now[0], wall_clock=lambda:now[0])
+    for _ in range(2):
+        with pytest.raises(_PendingObservation, match='terminal result collection pending'):
+            candidate.run_remote(('true',), key='compile')
+    record = json.loads((candidate.root/'compile/operation.json').read_text())
+    assert record['cleanup_expires_at'] == 1045
+    assert len([call for call in remote.calls if call[2] == 'logs']) == 1
+    assert len([call for call in remote.calls if call[2] == 'run']) == 1
+
+
+def test_terminal_looking_submission_without_job_handle_remains_blocking(tmp_path):
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    calls = []
+    def missing(argv, **options):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 1, json.dumps(dict(state='failed', exit=None)), '')
+    candidate = backend(tmp_path, missing)
+    with pytest.raises(_PendingObservation, match='retained handle'):
+        candidate.run_remote(('true',), key='compile')
+    assert len(unsettled_operations(candidate.root)) == 1
+    with pytest.raises(_PendingObservation, match='ambiguous'):
+        candidate.run_remote(('true',), key='compile')
+    assert len(calls) == 1
+
+
+def test_failed_upload_recovery_does_not_block_next_environment_admission(tmp_path, monkeypatch):
+    from test_environment_admission import setup
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    remote = Remote()
+    handle = 'remote:fixture:transfer:failed-copy'
+    def transfer(argv, **options):
+        if argv[2] == 'upload':
+            remote.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='queued', handle=handle)), '')
+        return remote(argv, **options)
+    candidate = backend(tmp_path, transfer)
+    remote.unavailable = True
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    with pytest.raises(_PendingObservation):
+        candidate.compile(plan, tmp_path/'bundle')
+    remote.exit_code = 1
+    admission, health, probes, _ = setup(tmp_path/'environment', monkeypatch)
+    admission.transports = (candidate,)
+    admission.pending_root = tmp_path
+    admission(lambda:100)
+    record = json.loads((candidate.root/plan.execution_id/'upload/operation.json').read_text())
+    assert record['state'] == 'failed' and record['terminal_failure']['handle'] == handle
+    assert 'result' not in record and unsettled_operations(tmp_path) == []
+    observations = len([call for call in remote.calls if call[2] == 'observe'])
+    admission(lambda:100)
+    assert len([call for call in remote.calls if call[2] == 'observe']) == observations
+    assert health == [11,11] and probes == ['probe']
+    remote.exit_code = 0
+    assert candidate.run_remote(('true',), key='independent').returncode == 0
+
+
+def test_ssh_upload_uses_bounded_sync_copy_and_caches_public_capabilities(tmp_path):
+    from dataclasses import replace
+    remote = Remote()
+    def ssh(argv, **options):
+        result = remote(argv, **options)
+        if argv[2] == 'capabilities':
+            value = json.loads(result.stdout)
+            value['backend'] = 'ssh'
+            result.stdout = json.dumps(value)
+        elif argv[2] == 'upload':
+            assert '--receipt-file' not in argv and '--no-wait' not in argv
+            assert 0 < options['timeout'] <= 600
+        elif argv[2] == 'run':
+            assert '--receipt-file' in argv
+        return result
+    candidate = backend(tmp_path, ssh)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    assert candidate.compile(plan, tmp_path/'bundle').library_sha256 == 'b'*64
+    assert candidate.compile(replace(plan, source=plan.source+'\n'), tmp_path/'next').library_sha256 == 'b'*64
+    assert len([call for call in remote.calls if call[2] == 'capabilities']) == 1
+    assert len([call for call in remote.calls if call[2] == 'upload']) == 2
+
+
+def test_interrupted_ssh_copy_quarantines_only_its_immutable_destination(tmp_path):
+    from benchmarks.ascend.runtime_allocation import unsettled_operations
+    calls = []
+    def ssh(argv, **options):
+        calls.append(argv)
+        if argv[2] == 'capabilities':
+            return subprocess.CompletedProcess(argv, 0, json.dumps(dict(target='fixture', state='available',
+                backend='ssh', capabilities=dict(upload=True))), '')
+        assert argv[2] == 'upload' and '--receipt-file' not in argv and '--no-wait' not in argv
+        raise subprocess.TimeoutExpired(argv, options['timeout'])
+    candidate = backend(tmp_path, ssh)
+    plan = smoke_plan(target='discovered-a3', arch='discovered-arch')
+    for _ in range(2):
+        with pytest.raises(_PendingObservation):
+            candidate.compile(plan, tmp_path/'bundle')
+    assert unsettled_operations(candidate.root) == []
+    assert len([call for call in calls if call[2] == 'upload']) == 1

@@ -180,8 +180,15 @@ def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, 
     calls = []
     def client(argv, **kwargs):
         calls.append(argv)
-        assert argv[2:] == ('observe','remote:fixture:job:trial')
-        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state=state,handle=argv[3])),'')
+        assert argv[3] == 'remote:fixture:job:trial'
+        if argv[2] == 'observe':
+            value = dict(state=state, handle=argv[3])
+        elif argv[2] == 'logs':
+            value = dict(handle=argv[3], content=argv[argv.index('--stream')+1]+' diagnostics')
+        else:
+            assert argv[2] == 'result'
+            value = dict(handle=argv[3], exit=0)
+        return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
     foreground = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
         remote_workspace='/owned/foreground',physical_device=0,state_directory=root/'foreground',process_runner=client)
     trial = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
@@ -200,7 +207,15 @@ def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, 
     else:
         admission(lambda:100)
         assert health == [0] and probes == ['probe']
-    assert len(calls) == 1 and json.loads(journal.read_text())['state'] == state
+    retained = json.loads(journal.read_text())
+    assert retained['state'] == state
+    if state == 'running':
+        assert [call[2] for call in calls] == ['observe']
+        assert 'result' not in retained
+    else:
+        assert [call[2] for call in calls] == ['observe', 'logs', 'logs', 'result']
+        assert retained['result'] == dict(handle='remote:fixture:job:trial', returncode=0,
+            stdout='stdout diagnostics', stderr='stderr diagnostics')
     from benchmarks.ascend.runtime_allocation import unsettled_operations
     assert bool(unsettled_operations(root)) == (state == 'running')
 
@@ -208,14 +223,20 @@ def test_foreground_observes_owning_trial_handle_without_resubmitting(tmp_path, 
 def test_owned_and_trial_recovery_share_remaining_elapsed_allocation(tmp_path, monkeypatch):
     import subprocess
     from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
-    now, observations = [0.0], []
+    now, observations, collections = [0.0], [], []
     monkeypatch.setattr(module.time,'monotonic',lambda:now[0])
     root = tmp_path/'campaign'
     def client(argv, **kwargs):
-        assert argv[2] == 'observe'
-        observations.append((argv[3],kwargs['timeout']))
-        now[0] += 2 if argv[3].endswith(':owned') else 3
-        return subprocess.CompletedProcess(argv,0,json.dumps(dict(state='completed',handle=argv[3])),'')
+        if argv[2] == 'logs':
+            collections.append((argv[3], argv[argv.index('--stream')+1], kwargs['timeout']))
+            now[0] += .5
+            value = dict(handle=argv[3], content='retained diagnostics')
+        else:
+            assert argv[2] == 'observe'
+            observations.append((argv[3],kwargs['timeout']))
+            now[0] += 2
+            value = dict(state='completed', handle=argv[3], exit=0)
+        return subprocess.CompletedProcess(argv,0,json.dumps(value),'')
     foreground = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote',target='fixture',runtime='named',
         remote_workspace='/owned/foreground',physical_device=0,state_directory=root/'foreground',
         process_runner=client,clock=lambda:now[0])
@@ -232,6 +253,13 @@ def test_owned_and_trial_recovery_share_remaining_elapsed_allocation(tmp_path, m
         admission(lambda:max(0,5-now[0]))
     assert [handle for handle, _ in observations] == ['remote:fixture:job:owned','remote:fixture:job:trial']
     assert observations[0][1] == 5
-    assert 0 < observations[1][1] <= 3
-    assert observations[1][1] == pytest.approx(3,abs=.01)
+    assert 0 < observations[1][1] <= 2
+    assert observations[1][1] == pytest.approx(2,abs=.01)
+    assert [(handle, stream) for handle, stream, _ in collections] == [
+        ('remote:fixture:job:owned', 'stdout'), ('remote:fixture:job:owned', 'stderr')]
+    assert [seconds for _, _, seconds in collections] == pytest.approx([3, 2.5], abs=.01)
+    owned = json.loads((foreground.root/'operation.json').read_text())
+    assert owned['result']['stdout'] == owned['result']['stderr'] == 'retained diagnostics'
+    trial = json.loads((root/'trial/runtime/operation.json').read_text())
+    assert trial['state'] == 'completed' and 'result' not in trial
     assert now[0] == 5 and not health and not probes

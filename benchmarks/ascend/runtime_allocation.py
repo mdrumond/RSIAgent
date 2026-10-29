@@ -26,6 +26,15 @@ def unsettled_operations(root):
     pending = []
     for path in root.rglob('operation.json'):
         row = json.loads(path.read_bytes())
+        identity = row.get('identity', {})
+        arguments = identity.get('arguments', [])
+        quarantine = row.get('quarantine', {})
+        if (row.get('state') == 'quarantined' and not row.get('handle')
+                and quarantine.get('kind') == 'isolated-upload'
+                and len(arguments) == 4 and arguments[:1] == ['upload']
+                and quarantine.get('destination') == arguments[-1]
+                and quarantine.get('workspace') == identity.get('workspace')):
+            continue
         if 'result' in row or row.get('state') in TERMINAL:
             continue
         if row.get('handle') and observed.get(row['handle']) in TERMINAL:
