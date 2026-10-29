@@ -1496,3 +1496,15 @@ def test_retired_phase2_mutations_refuse_before_runner_or_campaign_changes(tmp_p
         assert Buttons(client.get('/').get_data(as_text=True)).actions == []
     finally:
         app.extensions['dashboard_controls'].close()
+
+
+def test_live_preparation_clock_reports_stage_without_spending_work(campaign, tmp_path, monkeypatch):
+    from dashboard import store as module
+    monkeypatch.setattr(module.time, 'time', lambda: 1100)
+    write(tmp_path/'phase1/actor-time.json', dict(policy='actor-work-v1',max_seconds=10,
+        elapsed_seconds=3,preparation_seconds=20,wall_seconds=23,observed_epoch=100,
+        active_since=None,actors={'writer':dict(state='preparing',reason='candidate upload')}))
+    view = DashboardStore(campaign, tmp_path/'cache.sqlite3').refresh()['campaigns'][0]
+    assert view['time_budget']['remaining_seconds'] == 7
+    assert view['time_budget']['preparation_seconds'] == 1020
+    assert view['time_budget']['stages'] == [dict(state='preparing',reason='candidate upload')]

@@ -303,29 +303,30 @@ def test_retry_dispatch_stops_when_campaign_time_is_spent(tmp_path, initially_ex
     assert sum(len(row['retries']) for row in automatic.state['failures'].values()) == len(dispatched)
 
 
-@pytest.mark.parametrize("late_decision", ["wave", "invalid"])
-def test_selection_uses_failure_allowance_and_discards_late_wave(tmp_path, late_decision):
+@pytest.mark.parametrize("first_decision", ["wave", "invalid"])
+def test_selection_does_not_spend_failure_actor_allowance(tmp_path, first_decision):
     from test_generic_failure_feedback import phase1
     phase1(tmp_path/'source', spec=_project('failed', 'gm-ub-movement'))
     now, prompts, executed = [0.0], [], []
     def complete(messages):
         prompts.append(messages)
         prompt = messages[1]['content']
-        if len(prompts) == 1:
-            supplied = json.loads(prompt.rsplit('\n', 1)[-1])
-            assert 0 < supplied['remaining_seconds'] <= 5
-            now[0] += 6
-            return (_wave(prompt, [_project('must-not-run', 'gm-ub-movement')])
-                    if late_decision == 'wave' else '{invalid')
-        return 'DECISION: STALLED\n{"reason":"No eligible work remains."}'
+        supplied = json.loads(prompt.rsplit('\n', 1)[-1])
+        assert supplied['remaining_seconds'] > 5
+        now[0] += 6
+        if len(prompts) == 1 and first_decision == 'invalid':
+            return '{invalid'
+        return _wave(prompt, [_project('planned', 'gm-ub-movement')])
     runner = AdaptivePhase1Coordinator(tmp_path/'run', 'Bounded.', b'{}', CurriculumAgent(complete, clock=lambda:now[0]),
         lambda request:executed.append(request), max_parallel=1, project_target=1,
         max_seconds=100, clock=lambda:now[0])
     automatic = AutomaticRemediation(runner, target='a3', seconds=5,
         sources=[dict(type='phase1', root=str(tmp_path/'source'))])
-    assert runner.run()['status'] == 'STALLED'
-    assert len(prompts) == 2 and not executed
-    assert next(iter(automatic.state['failures'].values()))['remaining_seconds'] == 0
+    automatic.refresh(runner._load_state())
+    runner.propose_wave()
+    assert len(prompts) == (1 if first_decision == 'wave' else 2) and not executed
+    assert next(iter(automatic.budgets.values())).remaining_seconds == 5
+    assert runner.report()['elapsed_seconds'] == 0
 
 
 def test_interrupted_failure_clock_excludes_expired_obligation(tmp_path, monkeypatch):

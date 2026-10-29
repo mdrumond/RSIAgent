@@ -305,18 +305,22 @@ def test_expiry_observation_rejects_foreign_handle_without_cancelling(tmp_path):
     assert not any(c[2] == 'cancel' for c in remote.calls)
 
 
-def test_terminal_collection_uses_one_bounded_read_only_allocation(tmp_path):
+@pytest.mark.parametrize('log_seconds', [11, 46])
+def test_terminal_collection_has_own_bounded_read_only_allocation(tmp_path, log_seconds):
     now = [1000.]
     remote = Remote()
     def slow_logs(argv, **options):
         result = remote(argv, **options)
         if argv[2] == 'logs':
-            now[0] += 11
+            now[0] += log_seconds
         return result
     candidate = backend(tmp_path, slow_logs, timeout=10, clock=lambda: now[0], wall_clock=lambda: now[0])
-    with pytest.raises(_PendingObservation, match='terminal result collection pending'):
-        candidate.run_remote(('true',), key='compile')
-    assert len([c for c in remote.calls if c[2] == 'logs']) == 1
+    if log_seconds > 45:
+        with pytest.raises(_PendingObservation, match='terminal result collection pending'):
+            candidate.run_remote(('true',), key='compile')
+    else:
+        assert candidate.run_remote(('true',), key='compile').returncode == 0
+    assert len([c for c in remote.calls if c[2] == 'logs']) == (1 if log_seconds > 45 else 2)
     assert not any(c[2] == 'cancel' for c in remote.calls)
 
 

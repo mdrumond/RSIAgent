@@ -10,6 +10,7 @@ from coding.pi.rpc import PiCancelled
 
 from .cpl_native import CplNativeCandidateBackend, CplNativeMeasurements
 from .execution import _deadline, process_deadline
+from .actor_time import current_budget, preparation, preparation_active, prepare_until_ready
 from .phase1_cli import load_native_config
 from .subject_runtime import compose_production
 from .wave_environment import NativeWaveEnvironmentCheck
@@ -64,20 +65,15 @@ class _CheckedActor:
             seconds = min(seconds, request.remaining_seconds)
         if seconds <= 0:
             raise _allocation_error('native project elapsed allocation exhausted before dispatch', self._remaining)
-        deadline = time.monotonic() + seconds
-        with process_deadline(deadline):
-            self._check()
-            remaining = min(self._remaining(), deadline - time.monotonic())
-            if remaining <= 0:
-                raise _allocation_error('native project elapsed allocation exhausted during environment check', self._remaining)
-            try:
-                result = self._wrapped(replace(request, remaining_seconds=remaining))
-            except Exception as error:
-                if (isinstance(error, (PiCancelled, TimeoutError)) and self._remaining.stop_requested()
-                        and not getattr(error, 'interruption_reason', None)):
-                    error.interruption_reason = 'operator-stop'
-                raise
-            return result
+        self._check()
+        remaining = min(seconds, self._remaining())
+        try:
+            return self._wrapped(replace(request, remaining_seconds=remaining))
+        except Exception as error:
+            if (isinstance(error, (PiCancelled, TimeoutError)) and self._remaining.stop_requested()
+                    and not getattr(error, 'interruption_reason', None)):
+                error.interruption_reason = 'operator-stop'
+            raise
 
 
 def compose_cpl_production(settings, *, target, root, initial_memory, max_seconds):
@@ -100,13 +96,16 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     for field in ('transport_target', 'runtime'):
         if not native.get(field):
             raise ValueError('native CPL configuration requires ' + field)
-    deadline = time.monotonic() + max_seconds
     stop = Path(settings['stop_file']) if settings.get('stop_file') else None
     transports = []
     def remaining():
         if stop is not None and stop.exists():
             return 0
-        return max(0, min(deadline, _deadline.get()) - time.monotonic())
+        if preparation_active():
+            return float('inf')
+        budget = current_budget()
+        return max(0, min(budget.remaining() if budget else max_seconds,
+                          _deadline.get() - time.monotonic()))
     remaining.stop_requested = lambda: stop is not None and stop.exists()
     def transport_factory(**kwargs):
         kwargs.pop('validation_wrapper', None)
@@ -136,8 +135,10 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     def ensure_environment(*, force=False):
         if remaining() <= 0:
             raise _allocation_error('native environment allocation exhausted or campaign stopped', remaining)
-        with native_reservation(operation_root, remaining):
-            admission(remaining, force=force)
+        with preparation('device health, runtime admission and known-good probe'):
+            with native_reservation(operation_root, remaining):
+                prepare_until_ready(lambda: admission(remaining, force=force),
+                    stopped=remaining.stop_requested)
     ensure_environment.invalidate = admission.invalidate
     ensure_environment.reserve = lambda: native_reservation(operation_root, remaining)
     actor = bound['actor']

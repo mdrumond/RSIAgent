@@ -1,6 +1,7 @@
 {% extends "base.html" %}{% block body %}
 <a href="{{ url_for('index') }}">← Campaigns</a><div class="eyebrow">SUBJECT CAMPAIGN · {{ campaign.target }}</div><h1>{{ campaign.name }}</h1>
 <p>{{ campaign.terminal or 'In progress' }} · {{ campaign.stats.verified }} verified · {{ campaign.stats.published }} published</p>
+{% include 'actor_budget.html' %}
 <h2>Subjects</h2><ol>{% for subject in campaign.subjects %}<li><b>{{ subject.subject_id }}</b> — {{ subject.objective }}</li>{% endfor %}</ol>
 <h2>Editable project queue</h2><pre>{{ campaign.project_queue|tojson(indent=2) }}</pre>
 <p>Queued projects can be changed with the curriculum. Projects already reserved for a wave retain their frozen contracts; use actor feedback or a reviewed restart.</p>

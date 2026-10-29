@@ -11,6 +11,7 @@ import uuid
 
 from optimizer.jobs import atomic, canonical
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+from .actor_time import preparation
 from .runtime_allocation import permitted_devices, unsettled_operations
 
 _RESERVATIONS = {}
@@ -24,22 +25,25 @@ def native_reservation(root, remaining):
     root.mkdir(parents=True, exist_ok=True)
     with _RESERVATIONS_LOCK:
         lock, state = _RESERVATIONS.setdefault(str(root), (threading.RLock(), threading.local()))
-    if not lock.acquire(timeout=max(0, remaining())):
-        raise TimeoutError('native admission reservation allocation exhausted')
+    with preparation('native worker admission'):
+        while not lock.acquire(timeout=.1):
+            if remaining() <= 0:
+                raise TimeoutError('native admission reservation allocation exhausted')
     try:
         if getattr(state, 'active', False):
             yield
             return
         with (root / '.native-admission.lock').open('a') as stream:
-            while True:
-                try:
-                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    seconds = remaining()
-                    if seconds <= 0:
-                        raise TimeoutError('native admission reservation allocation exhausted')
-                    time.sleep(min(.05, seconds))
+            with preparation('native device reservation'):
+                while True:
+                    try:
+                        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        seconds = remaining()
+                        if seconds <= 0:
+                            raise TimeoutError('native admission reservation allocation exhausted')
+                        time.sleep(min(.05, seconds))
             state.active = True
             try:
                 yield

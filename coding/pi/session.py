@@ -264,7 +264,9 @@ class PiCodingSession:
             "source_sha256": hashlib.sha256(source.encode()).hexdigest() if source is not None else None,
         }, target=16384 if self.gateway.provider == "deepseek" else 65536)
         try:
-            self._start()
+            from benchmarks.ascend.actor_time import preparation
+            with preparation('Pi worker startup'):
+                self._start()
             start = len(self.rpc.events)
             self.rpc.timeout = max(.1, self.deadline - time.monotonic())
             try:

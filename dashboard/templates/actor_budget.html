@@ -1,0 +1,6 @@
+{% if campaign.time_budget %}
+<p>{{ 'Actor work' if campaign.time_budget.policy == 'actor-work-v1' else 'Active time' }}: {{ campaign.time_budget.elapsed_seconds|round(1) }} / {{ campaign.time_budget.seconds }} seconds; remaining {{ ([0, campaign.time_budget.seconds - campaign.time_budget.elapsed_seconds]|max)|round(1) }} seconds.
+{% if campaign.time_budget.policy == 'actor-work-v1' %}Preparation: {{ campaign.time_budget.preparation_seconds|round(1) }} seconds; wall time: {{ campaign.time_budget.wall_seconds|round(1) }} seconds.{% endif %}
+{% if campaign.time_budget.practice_seconds is defined and campaign.time_budget.practice_seconds is not none %}Practice: {{ campaign.time_budget.practice_seconds|round(1) }} seconds.{% endif %}</p>
+{% for stage in campaign.time_budget.stages or [] %}<p>{{ stage.state }}{% if stage.reason %}: {{ stage.reason }}{% endif %}</p>{% endfor %}
+{% endif %}

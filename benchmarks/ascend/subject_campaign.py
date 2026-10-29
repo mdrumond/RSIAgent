@@ -11,7 +11,7 @@ from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from .project_verifier import ProjectReview
 from .subjects import SubjectScheduler, SubjectCurriculumAgent
 from .subject_memory import SubjectMemory, StaleMemory
-from .time_budget import AttemptTimeBudget
+from .actor_time import ActorWorkBudget, dispatch_actor
 from .memory_status import assessment, project_assessment, review_report
 
 
@@ -94,7 +94,7 @@ class SubjectCampaign:
         return available
 
     def report(self):
-        return dict(review_report(self.state), subjects=self.scheduler.context(),
+        return dict(review_report(self.state), timing=self.budget.report() if hasattr(self, 'budget') else None, subjects=self.scheduler.context(),
                     accepted_memory=self.memory.records(),
                     memory_maintenance=self.memory_maintenance.report() if self.memory_maintenance else None)
 
@@ -172,7 +172,7 @@ class SubjectCampaign:
         if self.memory_maintenance is not None:
             request = self.memory_maintenance.prepare(request, record.get('repairs', []))
         try:
-            review = self.verifier.review(request, max_seconds=self._remaining(),
+            review = self.verifier.review(request, max_seconds=self.seconds,
                 feedback=record.get('rewrite_feedback'))
         except Exception as error:
             record['assessment'] = dict(assessment('audit-incomplete', 'source-audit', 'review-interrupted'),
@@ -198,52 +198,13 @@ class SubjectCampaign:
                       if not self.state['projects'][pid].get('superseded_by')
                       and self.state['projects'][pid]['review']['decision'] == 'accept'
                       and not self.state['projects'][pid].get('manual_review_id')
+                      and not self.state['projects'][pid].get('partial_published')
                       and self.state['projects'][pid]['review']['memory'] is not None]
             pending['review_ids'] = review_ids
             self._save()
         self.scheduler.complete_wave(pending['wave_id'], review_ids)
-        subject = pending['subject']['subject_id']
         for pid in pending['projects']:
-            record = self.state['projects'][pid]
-            if record.get('superseded_by'):
-                self.scheduler.supersede_review(pid, dict(record['cancellation'],
-                    replacement_project=record['superseded_by']))
-                continue
-            review = record['review']
-            if record.get('manual_review_id'):
-                self.scheduler.supersede_review(pid, dict(request_id=record['manual_request'],
-                    replacement_review=record['manual_review_id']))
-                continue
-            evidence = [record['review_sha256']]
-            if review['decision'] == 'repair':
-                if pid in review_ids:
-                    self.scheduler.resolve_review(pid, 'rejected')
-                self.scheduler.add_repair(pid, subject, pid, review['reason'], evidence)
-                continue
-            if self.memory_maintenance is not None and review['memory'] is None:
-                try:
-                    self.memory_maintenance.validate_resolution(record)
-                except StaleMemory as error:
-                    return self._refresh_publication(pid, record, pending, error)
-            if review['memory'] is None:
-                if self.memory_maintenance is not None:
-                    self.memory_maintenance.resolve(pid, record)
-                if pid in review_ids:
-                    self.scheduler.resolve_review(pid, 'accepted')
-                continue
-            provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
-                review_sha256=record['review_sha256'], request=record['review_request'],
-                observed_retirements=[row['tombstone_id'] for row in record['review_request'].get('retired_memories', [])],
-                memory_maintenance_revisions=self.memory_maintenance.revisions(record) if self.memory_maintenance else [],
-                retirement_resolutions=[dict(tombstone_id=row['tombstone_id'], evidence=row['evidence'], reason=row['reason'])
-                    for row in review.get('retirement_checks', []) if row['relation'] == 'reconciles'])
-            try:
-                self.memory.accept(pid, review['memory'], provenance)
-            except StaleMemory as error:
-                return self._refresh_publication(pid, record, pending, error)
-            self.scheduler.resolve_review(pid, 'accepted')
-            if self.memory_maintenance is not None:
-                self.memory_maintenance.resolve(pid, record)
+            self._publish_project(pid, pending, review_ids)
         linked_repairs = {}
         effective = dict(_effective_project(self.state['projects'], pid) for pid in pending['projects'])
         for record in effective.values():
@@ -262,14 +223,60 @@ class SubjectCampaign:
         self.state.update(pending=None, needs_decision=True)
         self._save()
 
-    def _refresh_publication(self, pid, record, pending, error):
+    def _publish_project(self, pid, pending, review_ids):
+        subject = pending['subject']['subject_id']
+        record = self.state['projects'][pid]
+        if record.get('partial_published'):
+            return
+        review_id = record.get('partial_review_id', pid)
+        if record.get('superseded_by'):
+            self.scheduler.supersede_review(pid, dict(record['cancellation'],
+                replacement_project=record['superseded_by']))
+            return
+        review = record['review']
+        if record.get('manual_review_id'):
+            self.scheduler.supersede_review(pid, dict(request_id=record['manual_request'],
+                replacement_review=record['manual_review_id']))
+            return
+        evidence = [record['review_sha256']]
+        if review['decision'] == 'repair':
+            if pid in review_ids:
+                self.scheduler.resolve_review(review_id, 'rejected')
+            self.scheduler.add_repair(pid, subject, pid, review['reason'], evidence)
+            return
+        if self.memory_maintenance is not None and review['memory'] is None:
+            try:
+                self.memory_maintenance.validate_resolution(record)
+            except StaleMemory as error:
+                return self._refresh_publication(pid, record, pending, error, review_ids)
+        if review['memory'] is None:
+            if self.memory_maintenance is not None:
+                self.memory_maintenance.resolve(pid, record)
+            if pid in review_ids:
+                self.scheduler.resolve_review(review_id, 'accepted')
+            return
+        provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
+            review_sha256=record['review_sha256'], request=record['review_request'],
+            observed_retirements=[row['tombstone_id'] for row in record['review_request'].get('retired_memories', [])],
+            memory_maintenance_revisions=self.memory_maintenance.revisions(record) if self.memory_maintenance else [],
+            retirement_resolutions=[dict(tombstone_id=row['tombstone_id'], evidence=row['evidence'], reason=row['reason'])
+                for row in review.get('retirement_checks', []) if row['relation'] == 'reconciles'])
+        try:
+            self.memory.accept(pid, review['memory'], provenance)
+        except StaleMemory as error:
+            return self._refresh_publication(pid, record, pending, error, review_ids)
+        self.scheduler.resolve_review(review_id, 'accepted')
+        if self.memory_maintenance is not None:
+            self.memory_maintenance.resolve(pid, record)
+
+    def _refresh_publication(self, pid, record, pending, error, review_ids):
         record.setdefault('prior_reviews', []).append(record['review'])
         record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=record['review']['memory'],
             current_memories=self.memory.records())
         record['review'] = None
         self._save()
         self._review(pid, record)
-        return self._publish_wave(pending)
+        return self._publish_project(pid, pending, review_ids)
 
     def _require_observed_pending(self):
         pending = self.state.get('pending')
@@ -287,12 +294,35 @@ class SubjectCampaign:
             raise ObservationRequired('Retained interrupted execution requires observation before more work')
         self.state.pop('observation_required', None)
 
+    def _salvage_completed(self, pending):
+        # Independent evidence can be accepted without declaring the wave complete.
+        rows = {}
+        for item in pending['items']:
+            pid, record = _effective_project(self.state['projects'], item['project_id'])
+            rows[pid] = record or dict(repairs=item.get('repairs', []))
+        for pid, record in rows.items():
+            if 'outcome' not in record or record.get('partial_published') or record.get('manual_review_id'):
+                continue
+            linked = set(record.get('repairs', []))
+            if any(linked.intersection(row.get('repairs', [])) and 'outcome' not in row
+                   for row in rows.values()):
+                continue  # Preserve ordinary probe/control evidence requirements.
+            self._review(pid, record)
+            review_ids = []
+            if record['review']['decision'] == 'accept' and record['review']['memory'] is not None:
+                record['partial_review_id'] = pid + '-partial-' + pending['wave_id']
+                self.scheduler.register_manual_review(record['partial_review_id'], pending['subject']['subject_id'])
+                review_ids = [pid]
+                self._save()
+            self._publish_project(pid, pending, review_ids)
+            record['partial_published'] = True
+            self._save()
+
     def _run_wave(self, pending):
         self._require_observed_pending()
         for item in pending['items']:
             if (self.root / 'manual-pause.json').exists():
                 raise TimeoutError('manual interaction queued at campaign checkpoint')
-            self._remaining()
             pid = item['project_id']
             record = self.state['projects'].setdefault(pid, dict(
                 objective=pending['subject']['objective'], repairs=item.get('repairs', []),
@@ -300,8 +330,11 @@ class SubjectCampaign:
             if record.get('superseded_by'):
                 continue
             if 'outcome' not in record:
+                if self.budget.remaining() <= 0:
+                    self._salvage_completed(pending)
+                    self._remaining()
                 directory = self.root / 'waves' / pending['wave_id'] / pid
-                record['outcome'] = self.execute(item, self.artifacts.read_bytes(
+                record['outcome'] = dispatch_actor(self.execute, pid, self._remaining(), item, self.artifacts.read_bytes(
                     pending['memory_sha256']), directory, remaining_seconds=self._remaining()).as_dict()
                 self._save()
             self._require_observed_pending()
@@ -314,12 +347,15 @@ class SubjectCampaign:
         self._publish_wave(pending)
 
     def _run(self):
-        self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
+        self.budget = ActorWorkBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
+        with self.budget.bind():
+            return self._run_budgeted()
+
+    def _run_budgeted(self):
         try:
             self._require_observed_pending()
             while True:
                 self._require_observed_pending()
-                self._remaining()
                 if (self.root / 'manual-pause.json').exists():
                     raise TimeoutError('manual interaction queued at campaign checkpoint')
                 maintenance_repair = None
@@ -345,7 +381,7 @@ class SubjectCampaign:
                     # within the same elapsed allocation, never an attempt-count limit.
                     try:
                         self.policy.decide(self.scheduler, memory_context=self._decision_context(),
-                            remaining_seconds=self._remaining())
+                            remaining_seconds=self.seconds)
                     except (ValueError, KeyError) as error:
                         self.state['decision_error'] = str(error)
                         self._save()
@@ -357,6 +393,7 @@ class SubjectCampaign:
                 context = self.scheduler.context()
                 if context['current_subject'] is None:
                     raise RuntimeError('unfinished obligations require a curriculum revisit')
+                self._remaining()  # New projects require work time; progression/review do not.
                 snapshot = self.memory.snapshot()
                 wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
                 if maintenance_repair:
@@ -365,7 +402,7 @@ class SubjectCampaign:
                 items = [] if maintenance_repair else self.scheduler.claim_projects(wave_id)
                 if not items:
                     items = self.select_wave(context, snapshot, self.state['projects'],
-                                             remaining_seconds=self._remaining())
+                                             remaining_seconds=self.seconds)
                 if maintenance_repair and any(maintenance_repair['repair_id'] not in item.get('repairs', []) for item in items):
                     self.state['decision_error'] = 'Every imposed memory-maintenance project must address its selected repair obligation'
                     self._save()

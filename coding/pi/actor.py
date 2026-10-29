@@ -1,3 +1,4 @@
+from benchmarks.ascend.actor_time import actor_work, live_deadline
 """Pi action driver, retaining the existing noncoding terminal distillation."""
 import json
 import hashlib
@@ -87,6 +88,7 @@ class PiActorDriver(DirectActorDriver):
             environ=self.provider.coding_environment(), deadline=self.clock() + self.max_seconds)
 
     @actor_lease
+    @actor_work
     def __call__(self, instruction, *, profile, workspace, context, turn_parser, action_executor):
         # The legacy pilot uses a closed OpenRouter profile. It must be migrated
         # explicitly by its composition, rather than silently changing provider.
@@ -100,8 +102,8 @@ class PiActorDriver(DirectActorDriver):
             self._trace("message", message)
         tokens = 0
         turn = conversation.turn
-        deadline = min(self.clock() + self.max_seconds,
-                       getattr(action_executor, "deadline", float("inf")))
+        deadline = live_deadline(min(self.clock() + self.max_seconds,
+                       getattr(action_executor, "deadline", float("inf"))))
         contract = task_contract(action_executor)
         latest = None
         history = []
@@ -122,10 +124,10 @@ class PiActorDriver(DirectActorDriver):
         if getattr(getattr(action_executor, "request_diagnostic", None), "__name__", "") == "disabled_diagnostic_action":
             allowed -= {"request-debug", "request-sanitizer"}
         with self._new_session(profile) as session:
-            session.deadline = min(getattr(session, "deadline", float("inf")), deadline)
+            session.deadline = live_deadline(min(getattr(session, "deadline", float("inf")), deadline))
             gateway = getattr(session, "gateway", None)
             if gateway is not None:
-                gateway.deadline = min(gateway.deadline, deadline)
+                gateway.deadline = live_deadline(min(gateway.deadline, deadline))
             while self.clock() < deadline:
                 try:
                     feedback = conversation.boundary()

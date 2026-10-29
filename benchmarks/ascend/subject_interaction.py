@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+from .actor_time import dispatch_actor
 from .subject_memory import StaleMemory
 import math
 import os
@@ -234,7 +235,7 @@ def run_request(config_path, campaign_id, identifier, *, builder=build_campaign)
         budget, campaign = None, None
         try:
             _, original, directory = _project(root, request['project_id'], identifier)
-            from .time_budget import AttemptTimeBudget
+            from .actor_time import ActorWorkBudget
             elapsed = root / 'elapsed.json'
             identity = _read(root / 'subject-runtime.json', {})
             original_seconds = identity.get('max_seconds', row.get('max_seconds', 7200))
@@ -243,12 +244,13 @@ def run_request(config_path, campaign_id, identifier, *, builder=build_campaign)
             if _read(elapsed).get('active_since') is not None:
                 # The campaign lease proves its old host interval is no longer
                 # active. Recover its charged wall time through the budget API.
-                AttemptTimeBudget(elapsed, original_seconds).close()
+                ActorWorkBudget(elapsed, original_seconds).close()
             grant_elapsed(elapsed, identifier, request['additional_seconds'])
-            budget = AttemptTimeBudget(elapsed, original_seconds)
+            budget = ActorWorkBudget(elapsed, original_seconds)
             campaign = builder(row, root)
             campaign.budget = budget
-            result = _execute(campaign, request, original, directory, path)
+            with budget.bind():
+                result = _execute(campaign, request, original, directory, path)
             request.update(status='succeeded', result=result, finished=time.time())
         except Exception as error:
             request.update(status='observation-required' if request.get('phase') == 'executing' else 'failed',
@@ -362,7 +364,7 @@ def _execute(campaign, request, original, directory, request_path):
     if 'outcome' not in record:
         request['phase'] = 'executing'
         atomic(request_path, canonical(request))
-        record['outcome'] = campaign.execute(item, snapshot, directory,
+        record['outcome'] = dispatch_actor(campaign.execute, pid, campaign._remaining(), item, snapshot, directory,
             remaining_seconds=campaign._remaining()).as_dict()
     campaign._save()
     _require_observed_execution(campaign, pid, record, directory, request, request_path)
@@ -491,7 +493,7 @@ def _finish_linked_siblings(campaign, record, snapshot, request, request_path):
             atomic(request_path, canonical(request))
             directory = (campaign.root / row['directory'] if row.get('directory')
                          else campaign.root / 'waves' / pending['wave_id'] / pid)
-            row['outcome'] = campaign.execute(row['plan'], snapshot, directory,
+            row['outcome'] = dispatch_actor(campaign.execute, pid, campaign._remaining(), row['plan'], snapshot, directory,
                 remaining_seconds=campaign._remaining()).as_dict()
             campaign._save()
         directory = (campaign.root / row['directory'] if row.get('directory')

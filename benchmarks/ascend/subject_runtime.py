@@ -482,6 +482,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         available()
         return items
 
+    execute.manages_actor_time = True
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
         max_seconds=max_seconds, index_memory=knowledge.index, memory_ledger=knowledge.ledger)

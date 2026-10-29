@@ -613,12 +613,29 @@ def _load_campaign(entry):
                       "published": published}, "projects": projects, "planned": planned}
 
 
+def actor_time(root):
+    """Project a persisted live preparation/work clock without owning its lease."""
+    clock = next((value for name in ('actor-time.json', 'elapsed.json')
+        if (value := _json(Path(root) / name, {})).get('policy') == 'actor-work-v1'), None)
+    if clock is None: return None
+    delta = max(0, time.time()-clock.get('observed_epoch', time.time()))
+    active = [row for row in clock.get('actors', {}).values() if row.get('state') in {'working','preparing','ready'}]
+    elapsed = clock['elapsed_seconds'] + (max(0, time.time()-clock['active_since']) if clock.get('active_since') else 0)
+    return dict(clock, seconds=clock['max_seconds'], elapsed_seconds=elapsed,
+        remaining_seconds=max(0, clock['max_seconds']-elapsed),
+        preparation_seconds=clock.get('preparation_seconds', 0)+(delta if any(row['state']=='preparing' for row in active) else 0),
+        wall_seconds=clock.get('wall_seconds', 0)+(delta if active else 0), stages=active)
+
+
 def _campaign(entry):
     campaign = _load_campaign(entry)
     root = Path(campaign['root'])
     state = _json(root / 'state.json', {})
     clock = _json(root / 'time-budget.json', {})
-    if clock:
+    work = actor_time(root)
+    if work is not None:
+        campaign['time_budget'] = work
+    elif clock:
         campaign['time_budget'] = dict(seconds=clock.get('identity', {}).get('max_seconds'),
             elapsed_seconds=clock.get('elapsed_seconds', 0), practice_seconds=clock.get('practice_seconds'))
     elif 'max_seconds' in state and 'elapsed_seconds' in state:

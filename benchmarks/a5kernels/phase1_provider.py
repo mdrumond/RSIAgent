@@ -1,6 +1,7 @@
 """Direct, closed provider routes for the A5 Phase 1 experiment cells."""
 
 from __future__ import annotations
+from benchmarks.ascend.actor_time import actor_work, live_deadline
 
 from dataclasses import dataclass, replace
 from copy import copy, deepcopy
@@ -465,8 +466,8 @@ class DirectActorDriver:
             raise TimeoutError("Actor provider time allowance exhausted")
         driver = copy(self)
         driver.max_seconds = min(self.max_seconds, seconds)
-        driver._provider_deadline = min(deadline_after(driver.max_seconds, clock=self.clock),
-                                        getattr(self, '_provider_deadline', float('inf')))
+        driver._provider_deadline = live_deadline(min(deadline_after(driver.max_seconds, clock=self.clock),
+                                        getattr(self, '_provider_deadline', float('inf'))))
         return driver
 
     def _prepare_context(self, working, profile, recorder, *, turn):
@@ -518,6 +519,7 @@ class DirectActorDriver:
         return self.provider.complete(profile, messages, **options)
 
     @actor_lease
+    @actor_work
     def __call__(
         self,
         instruction: str,
@@ -542,8 +544,8 @@ class DirectActorDriver:
         tokens = 0
         turn = conversation.turn
         ordinary_turns = 0
-        deadline = min(self.clock() + self.max_seconds,
-                       getattr(action_executor, 'deadline', float('inf')))
+        deadline = live_deadline(min(self.clock() + self.max_seconds,
+                       getattr(action_executor, 'deadline', float('inf'))))
         while self.clock() < deadline:
             try:
                 conversation.boundary()
@@ -628,6 +630,14 @@ class DirectActorDriver:
         """Resume the exact terminal Actor history after all host work completes."""
 
         continuation = outcome.continuation
+        from benchmarks.ascend.actor_time import WorkDeadline
+        if isinstance(getattr(continuation, 'deadline', None), WorkDeadline):
+            # Memory writing is a separate role, not a continuation of Actor time.
+            writer = copy(self)
+            writer._provider_deadline = self.clock() + self.max_seconds
+            return writer.distill(replace(outcome, continuation=replace(continuation,
+                deadline=writer._provider_deadline)), admitted_artifacts=admitted_artifacts,
+                host_summaries=host_summaries)
         if (not isinstance(continuation, _ActorContinuation)
                 or outcome.distillation is not None):
             raise ValueError("Actor outcome is not awaiting terminal distillation")

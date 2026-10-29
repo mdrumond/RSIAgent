@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import hashlib
@@ -149,7 +150,7 @@ class LiveWaveCoordinator:
             thread_name_prefix=f"a5-{self.wave.wave_id}",
         ) as pool:
             futures = {
-                pool.submit(self._execute_one, assignment): assignment
+                pool.submit(copy_context().run, self._execute_one, assignment): assignment
                 for assignment in pending
             }
             for future in as_completed(futures):
@@ -226,9 +227,6 @@ class LiveWaveCoordinator:
                 EvidenceClassification.ACTOR_UNVERIFIED, exc.summary), payload)
         if not isinstance(result, WaveProjectResult):
             raise TypeError("project executor must return WaveProjectResult")
-        if self.remaining_seconds is not None and self.remaining_seconds() <= 0:
-            self._interrupt(assignment, "deadline-exhausted", "Project completed after the wave deadline")
-            raise TimeoutError("project completed after wave deadline")
         delta_sha256 = hashlib.sha256(result.memory_delta).hexdigest()
         evidence_sha256 = hashlib.sha256(result.evidence_payload).hexdigest()
         # Invalidate the previous generation first.  A crash after this point is

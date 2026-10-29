@@ -281,10 +281,18 @@ source cannot redefine correctness. See [reference contracts](docs/optimizer-ref
 
 ### Budgets, stop and resume
 
-Ascend runtime stopping budgets use elapsed seconds. Compilation, model calls,
-verification and nested work consume the enclosing allocation; resume preserves
-time already spent. Attempts, tool calls, tokens and spend are telemetry, while
-frozen case bounds and per-request limits remain enforced.
+Phase 1 and subject memory-acceptance `max_seconds` limits measure **Actor work**:
+reasoning, context/KDB exploration, code changes, candidate compilation/execution,
+diagnostics and profiling, including waiting for candidate jobs. Input preparation,
+transfers, worker admission, health checks, known-good environment probes and
+migration/recovery do not spend that allocation, initially or between actions.
+Curriculum decisions, verification and memory writing run outside the Actor clock.
+Preparation has no aggregate deadline; individual operations remain bounded and
+cancellable. Transient busy-device/query failures wait for readiness without
+relaxing health checks; configuration mismatches and unresolved execution remain
+visible blockers. Reports separate work, preparation and wall time. Parallel work
+uses the union of active Actor intervals, and resume preserves charged time and
+explicit grants. Attempts, tool calls, tokens and spend remain telemetry.
 
 Optimizer lifecycle controls are explicit:
 

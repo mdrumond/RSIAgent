@@ -142,6 +142,7 @@ class NativeProjectWorker:
 
 
 class NativeProjectPool:
+    manages_actor_time = True
     """Exclusive slots; quarantine uncertain workers without poisoning healthy peers."""
 
     def __init__(self, actors):
@@ -160,25 +161,19 @@ class NativeProjectPool:
             ProjectAdmissionTimeout, SemanticProjectFailure,
         )
         import time
-        seconds = getattr(request, "remaining_seconds", None)
-        deadline = time.monotonic() + seconds if seconds is not None else float("inf")
-        with self.condition:
-            while self.actors.empty():
-                if not self.live:
-                    raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("project allocation exhausted while waiting for a healthy worker")
-                self.condition.wait(timeout=min(remaining, .1))
-            actor = self.actors.get_nowait()
+        if getattr(request, 'remaining_seconds', None) is not None and request.remaining_seconds <= 0:
+            raise TimeoutError('actor work allocation exhausted before worker admission')
+        from .actor_time import preparation
+        with preparation('waiting for a native worker'):
+            with self.condition:
+                while self.actors.empty():
+                    if not self.live:
+                        raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
+                    self.condition.wait(timeout=.1)
+                actor = self.actors.get_nowait()
         reusable = True
         called = False
         try:
-            if seconds is not None:
-                remaining = max(0, deadline - time.monotonic())
-                if remaining <= 0:
-                    raise TimeoutError("project allocation exhausted before dispatch")
-                request = replace(request, remaining_seconds=remaining)
             called = True
             return actor(request)
         except (SemanticProjectFailure, ProjectAdmissionTimeout):

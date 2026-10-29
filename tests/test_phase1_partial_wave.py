@@ -39,7 +39,7 @@ def test_partial_wave_publishes_only_finalized_siblings_and_reopens_without_exec
         LiveWaveCoordinator(tmp_path, spec, MEMORY, execute, 1).resume()
 
 
-def test_deadline_excludes_late_completion_and_never_executes_queued_project(tmp_path):
+def test_deadline_preserves_completed_evidence_and_never_executes_queued_project(tmp_path):
     now = [0]
     seen = []
     def execute(request):
@@ -50,9 +50,10 @@ def test_deadline_excludes_late_completion_and_never_executes_queued_project(tmp
         return wave_result(name.encode())
     runner = LiveWaveCoordinator(tmp_path, wave('good', 'late', 'queued'), MEMORY,
         execute, 1, allow_partial=True, remaining_seconds=lambda: 10-now[0])
-    assert [c.project_id for c in runner.run().commits] == ['good']
+    assert [c.project_id for c in runner.run().commits] == ['good', 'late']
     assert seen == ['good', 'late']
-    for name in ['late', 'queued']:
+    assert (tmp_path/'branches'/'late'/'outcome.json').exists()
+    for name in ['queued']:
         assert not (tmp_path/'branches'/name/'outcome.json').exists()
         record = json.loads((tmp_path/'branches'/name/'interruption.json').read_bytes())
         assert record['classification'] == 'deadline-exhausted'
@@ -278,9 +279,9 @@ def test_first_resume_after_active_allocation_crash_publishes_retained_siblings(
         max_parallel=1, project_target=2, max_seconds=100, clock=lambda: 0, allow_partial=True)
     report = recovery.resume()
     assert report['published_projects'] == ['good'] and report['failed_projects'] == 1
-    assert report['status'] == 'TIME_BUDGET_EXHAUSTED' and report['remaining_seconds'] == 0
-    assert report['elapsed_seconds'] == 100 and not (tmp_path/'pending.json').exists()
-    assert report['wave_results'][-1]['closure_reason'] == 'deadline'
+    assert report['status'] == 'WAVE_CLOSED' and report['remaining_seconds'] == 97
+    assert report['elapsed_seconds'] == 3 and not (tmp_path/'pending.json').exists()
+    assert report['wave_results'][-1]['closure_reason'] == 'recovery'
     assert all((tmp_path/path).read_bytes() == data for path, data in retained.items())
     assert recovery.resume() == report
 

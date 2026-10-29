@@ -79,7 +79,7 @@ def coordinator(root, events, clock=lambda: 0):
         max_parallel=1, project_target=1, max_seconds=20, clock=clock)
 
 
-def test_environment_rejection_blocks_curriculum_and_charges_elapsed(tmp_path):
+def test_environment_rejection_blocks_curriculum_without_charging_actor_time(tmp_path):
     events = [];now = [0]
     c = coordinator(tmp_path, events, lambda: now[0])
     def failed(index, remaining):
@@ -88,8 +88,8 @@ def test_environment_rejection_blocks_curriculum_and_charges_elapsed(tmp_path):
         raise ProjectInfrastructureError('runtime setup failed')
     c.environment_check = failed
     with pytest.raises(ProjectInfrastructureError):c.propose_wave()
-    assert events == [('check', 1, 20)]
-    assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 7
+    assert events == [('check', 1, float('inf'))]
+    assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 0
     assert not (tmp_path/'pending.json').exists()
 
 
@@ -159,7 +159,7 @@ def test_legacy_remote_calls_and_poll_waits_share_remaining_allocation(tmp_path)
     assert transport._call == old_call and transport._timeout == old_timeout and transport._sleep == old_sleep
 
 
-def test_curriculum_receives_only_time_remaining_after_environment_probe(tmp_path):
+def test_curriculum_and_actor_keep_allocation_after_environment_probe(tmp_path):
     now = [0];budgets = []
     def select(messages):
         context = json.loads(messages[-1]['content'].rsplit('\n', 1)[-1])
@@ -168,12 +168,12 @@ def test_curriculum_receives_only_time_remaining_after_environment_probe(tmp_pat
     c = AdaptivePhase1Coordinator(tmp_path, 'learn', SEED, CurriculumAgent(select),
         lambda request: None, max_parallel=1, project_target=1, max_seconds=100, clock=lambda: now[0])
     def check(index, remaining):
-        assert remaining() == 100
+        assert remaining() == float('inf')
         now[0] += 80
     c.environment_check = check
     c.propose_wave()
-    assert budgets == [20]
-    assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 80
+    assert budgets == [100]
+    assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 0
 
 
 
@@ -199,7 +199,7 @@ def test_original_retry_live_work_is_gated_but_completed_publication_replay_is_p
     automatic.refresh(state)
     def check(index, remaining):
         events.append('check')
-        assert remaining() == 100
+        assert remaining() == float('inf')
         now[0] += 7
         if failed:
             raise ProjectInfrastructureError('environment unavailable')
@@ -214,7 +214,7 @@ def test_original_retry_live_work_is_gated_but_completed_publication_replay_is_p
     else:
         runner._with_allocation(retry)
         assert events == ['check', 'actor']
-        assert 0 < requests[0].remaining_seconds <= 93
+        assert requests[0].remaining_seconds == 100
         directory = requests[0].branch_root.parents[3]
         row = automatic.feedback.selection['selected'][0]
         runner.environment_check = lambda *args: pytest.fail('completed retry must not probe')

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from benchmarks.ascend.actor_time import actor_attempt, live_deadline
 from dataclasses import asdict, dataclass, field, replace
 import json
 import hashlib
@@ -211,7 +212,7 @@ class _ProjectActions:
         self.observe_knowledge_read, self.actor_role = observe_knowledge_read, actor_role
         self.max_actions = max_actions
         from benchmarks.ascend.time_budget import deadline_after
-        self.deadline = deadline_after(max_seconds)
+        self.deadline = live_deadline(deadline_after(max_seconds))
         self.max_source_bytes = max_source_bytes
         self.query_knowledge = query_knowledge
         self.request_profile = request_profile
@@ -522,6 +523,7 @@ class _ObservedActions:
 
 
 class AdaptiveActorProjectExecutor:
+    manages_actor_time = True
     """Drive bounded candidate repair, then emit only distilled verified memory."""
 
     def __init__(
@@ -579,6 +581,7 @@ class AdaptiveActorProjectExecutor:
         )):
             raise TypeError("adaptive action dependencies must be callable")
 
+    @actor_attempt
     def __call__(self, request: AdaptiveProjectRequest) -> AdaptiveProjectResult:
         if not isinstance(request, AdaptiveProjectRequest):
             raise TypeError("request must be AdaptiveProjectRequest")
@@ -624,14 +627,14 @@ class AdaptiveActorProjectExecutor:
         memory_sha256 = artifacts.put_bytes(presented_memory)
         actions = _ProjectActions(
             executor, request, prepared, artifacts,
-            max_actions=self.max_actions, max_seconds=max(0.001, max_seconds-(time.monotonic()-started)), max_source_bytes=self.max_source_bytes,
+            max_actions=self.max_actions, max_seconds=max_seconds, max_source_bytes=self.max_source_bytes,
             query_knowledge=self.query_knowledge,
             request_profile=self.request_profile,
             request_timing=self.request_timing,
             request_diagnostic=self.request_diagnostic,
             observe_knowledge_read=self.observe_knowledge_read, actor_role=self.actor_role,
         )
-        actions.deadline = min(actions.deadline, started+max_seconds)
+        actions.deadline = live_deadline(min(actions.deadline, started+max_seconds))
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader
         withheld = set()
         if request.actor_memory_delivery == "kdb-only":

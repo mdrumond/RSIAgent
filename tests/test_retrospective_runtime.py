@@ -73,12 +73,12 @@ def compose(tmp_path, monkeypatch, *, stderr='', now=None, stopped=False, device
     return bound, calls
 
 
-def test_gate_precedes_actor_charges_elapsed_and_preserves_configured_route(tmp_path, monkeypatch):
+def test_gate_precedes_actor_without_charging_setup_and_preserves_configured_route(tmp_path, monkeypatch):
     now = [0.0]
     bound, calls = compose(tmp_path, monkeypatch, now=now)
     result = bound['actor'](request(tmp_path))
-    assert calls == ['probe-compile', 'probe-execute', ('actor', 26)]
-    assert result.remaining_seconds == 26
+    assert calls == ['probe-compile', 'probe-execute', ('actor', 30)]
+    assert result.remaining_seconds == 30
     options = bound['transport'].options
     assert options['target'] == 'registry-target' and options['runtime'] == 'named-runtime'
     assert options['physical_device'] == 3 and 'validation_wrapper' not in options

@@ -27,6 +27,9 @@ class FailureTimeBudget:
     def elapsed_seconds(self):
         with self.lock:
             if self.timer:
+                from .actor_time import ActorWorkBudget
+                if isinstance(self.timer, ActorWorkBudget):
+                    return self.seconds-self.timer.remaining()
                 return self.timer.elapsed + max(0, self.clock() - self.timer.started)
             if not self.path.exists():
                 return 0
@@ -45,12 +48,15 @@ class FailureTimeBudget:
     @contextmanager
     def active(self):
         from .time_budget import AttemptTimeBudget
+        from .actor_time import ActorWorkBudget, current_budget, linked_work_budget
         with self.lock:
             if self.timer is None:
-                self.timer = AttemptTimeBudget(self.path, self.seconds, clock=self.clock)
+                timer = ActorWorkBudget if current_budget() is not None else AttemptTimeBudget
+                self.timer = timer(self.path, self.seconds, clock=self.clock)
             self.depth += 1
         try:
-            yield
+            with linked_work_budget(self.timer) if isinstance(self.timer, ActorWorkBudget) else ExitStack():
+                yield
         finally:
             with self.lock:
                 self.depth -= 1

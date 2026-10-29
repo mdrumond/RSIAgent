@@ -13,6 +13,7 @@ from benchmarks.a3kernels.native_measurements import NativeMeasurementBackend
 from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt, FailedEvidence, attest
 from benchmarks.a3kernels.profiling import parse_timing_output
+from .actor_time import preparation, current_budget
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend, _COMPILE_SCRIPT, _EXECUTE_SCRIPT, _PendingObservation
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 
@@ -98,7 +99,7 @@ class CplNativeCandidateBackend:
 
     def _operation(self, key, arguments, *, kind, expires_at=None):
         stage = key.rsplit('/', 1)[-1]
-        if stage not in {'upload', 'compile', 'execute'}:
+        if stage not in {'upload', 'stage', 'compile', 'execute'}:
             stage = 'transport'
         try:
             return self._timed(stage, lambda: self._operation_inner(key, arguments,
@@ -145,7 +146,7 @@ class CplNativeCandidateBackend:
         def recover_expiry_inner():
             # Execution stops at expiry; allow only bounded observation/cleanup.
             # A failed compiler may already have exited before the final poll.
-            record.setdefault('cleanup_expires_at', min(record['expires_at'], self.wall_clock()+45))
+            record.setdefault('cleanup_expires_at', self.wall_clock()+45)
             _save(path, record)
             cleanup_deadline = self.clock() + max(0, record['cleanup_expires_at']-self.wall_clock())
             def cleanup_call(arguments):
@@ -234,21 +235,20 @@ class CplNativeCandidateBackend:
         return self._finish_operation(path, record, value, kind)
 
     def _finish_operation(self, path, record, value, kind, *, collection_expires_at=None):
-        return self._timed('cleanup', lambda: self._collect_operation(
-            path, record, value, kind, collection_expires_at=collection_expires_at))
+        with preparation('collect terminal logs and authenticated result'):
+            return self._timed('cleanup', lambda: self._collect_operation(
+                path, record, value, kind, collection_expires_at=collection_expires_at))
 
     def _collect_operation(self, path, record, value, kind, *, collection_expires_at=None):
         # Result collection cannot dispatch work or extend its frozen expiry.
         # Checkpoint each stream so a disconnect never loses compiler feedback.
         if collection_expires_at is None:
-            record.setdefault('cleanup_expires_at', min(record['expires_at'], self.wall_clock()+45))
+            record.setdefault('cleanup_expires_at', self.wall_clock()+45)
             _save(path, record)
         deadline = self.clock() + max(0, (collection_expires_at if collection_expires_at is not None
             else record['cleanup_expires_at'])-self.wall_clock())
         def collect(arguments):
             seconds = deadline-self.clock()
-            if collection_expires_at is None and self.remaining_seconds is not None:
-                seconds = min(seconds, self.remaining_seconds())
             if seconds <= 0:
                 raise self._pending('CPL terminal result collection pending; retained handle '+str(record.get('handle')))
             return self._call(arguments, seconds=seconds)
@@ -427,9 +427,16 @@ class CplNativeCandidateBackend:
         self._require_plan(plan)
         key = plan.execution_id
         _save(self.root / key / 'candidate.json', dict(project_id=plan.project_id))
-        bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
-        archive = self._workspace / (key+'.tar')
-        self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')
+        with preparation('candidate bundle, upload and staging'):
+            bundle = self.build_bundle(plan, self.root / 'bundles' / (key+'.tar'))
+            archive = self._workspace / (key+'.tar')
+            self._operation(key+'/upload', ('upload', self.target, str(bundle.path.resolve()), self._wire_path(archive)), kind='transfer')
+            if current_budget() is not None:
+                staging = _COMPILE_SCRIPT.split("printf 'A3REMOTE_STAGE=compile", 1)[0]
+                staged = self.run_remote(('bash', '-c', staging, 'rsi-native', str(archive),
+                    str(self.remote_candidate_directory(plan)), bundle.sha256, key, plan.source_fingerprint), key=key+'/stage')
+                if staged.returncode:
+                    raise ProjectInfrastructureError(staged.stderr or staged.stdout or 'candidate staging failed')
         result = self.run_remote(('bash', '-c', _COMPILE_SCRIPT, 'rsi-native', str(archive),
             str(self.remote_candidate_directory(plan)), bundle.sha256, key, plan.source_fingerprint), key=key+'/compile')
         if result.returncode:

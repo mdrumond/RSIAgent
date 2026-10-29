@@ -204,7 +204,7 @@ class AdaptivePhase1Coordinator:
         if state.get("project_target", self.project_target) != self.project_target:
             raise ValueError("use continue_campaign to change the retained project target")
         if (self.allow_partial and pending is not None and
-                (state["terminal"] is not None or state["elapsed_seconds"] >= self.max_seconds)):
+                (state.get("allocation_active") or state["terminal"] is not None or state["elapsed_seconds"] >= self.max_seconds)):
             return self.finalize_pending_wave()
         if (self.automatic_remediation is None and (state["terminal"] is not None or len(state["prior_outcomes"]) >= self.project_target
                 or (self.allow_partial and pending is None and self._partial_closed(state)))):
@@ -226,28 +226,28 @@ class AdaptivePhase1Coordinator:
     def _run_allocation(self, operation):
         self._checked_environment = None
         state = self._load_state()
-        if state.get("allocation_active"):
-            # Exclusive ownership proves the previous interval has no owner.
-            state["elapsed_seconds"] = max(self.max_seconds, state["elapsed_seconds"])
-            state["allocation_active"] = False
-            state["allocation_interrupted"] = True
-            self._atomic_json(self.root / "state.json", state)
-        started = self.clock()
-        self._deadline = started + max(0, self.max_seconds - state["elapsed_seconds"])
-        # An unobserved interruption reserves the whole remaining allocation.
-        state["allocation_active"] = True
-        self._atomic_json(self.root / "state.json", state)
+        from benchmarks.ascend.actor_time import ActorWorkBudget
+        path = self.root / "actor-time.json"
+        if not path.exists():
+            self._atomic_json(path, dict(max_seconds=self.max_seconds,
+                elapsed_seconds=state.get("elapsed_seconds", 0)))
+        self.budget = ActorWorkBudget(path, self.max_seconds, clock=self.clock)
+        self.budget.elapsed = max(self.budget.elapsed, state.get("elapsed_seconds", 0))
+        self._deadline = self.budget.deadline
         try:
-            result = operation()
+            with self.budget.bind():
+                result = operation()
         finally:
-            # Reload after publication; exceptions retain the exact pending wave.
+            self.budget.close()
             current = self._read_json(self.root / "state.json")
-            current["elapsed_seconds"] += max(0, self.clock() - started)
+            current["elapsed_seconds"] = self.budget.elapsed
             current["allocation_active"] = False
+            current["timing"] = self.budget.report()
             self._atomic_json(self.root / "state.json", current)
             self._deadline = None
         result["elapsed_seconds"] = current["elapsed_seconds"]
-        result["remaining_seconds"] = max(0, self.max_seconds-current["elapsed_seconds"])
+        result["remaining_seconds"] = self.budget.remaining()
+        result["timing"] = self.budget.report()
         return result
 
     def _remaining_seconds(self):
@@ -413,8 +413,7 @@ class AdaptivePhase1Coordinator:
     def _finalize_pending_wave(self):
         state = self._load_state()
         if state.get("allocation_active"):
-            state.update(elapsed_seconds=max(self.max_seconds, state["elapsed_seconds"]),
-                         allocation_active=False, allocation_interrupted=True)
+            state.update(allocation_active=False, allocation_interrupted=True)
             self._atomic_json(self.root / "state.json", state)
         pending = self._load_pending(state)
         if pending is None:
@@ -639,7 +638,8 @@ class AdaptivePhase1Coordinator:
             failure = FailureContext(failure_context, request.assignment.spec)
             failure.require_repair_evidence(request.assignment.spec)
             inputs, oracle = failure.inputs, failure.expected
-        result = self.execute_project(AdaptiveProjectRequest(
+        from benchmarks.ascend.actor_time import dispatch_actor
+        result = dispatch_actor(self.execute_project, str(request.branch_root), self._remaining_seconds(), AdaptiveProjectRequest(
             request.assignment.spec,
             request.assignment.authored_ordinal,
             request.pre_wave_memory,
@@ -724,13 +724,15 @@ class AdaptivePhase1Coordinator:
     def _check_environment(self, state, *, remaining_seconds=None):
         token = (state["wave_index"], getattr(self, "_deadline", None))
         if self.environment_check is not None and self._checked_environment != token:
-            allowance = (lambda: min(self._remaining_seconds(), remaining_seconds())) if remaining_seconds else self._remaining_seconds
-            self.environment_check(state["wave_index"], allowance)
+            allowance = lambda: float("inf")
+            from benchmarks.ascend.actor_time import preparation, prepare_until_ready
+            with preparation('Phase 1 environment admission'):
+                prepare_until_ready(lambda: self.environment_check(state["wave_index"], allowance))
             self._checked_environment = token
 
     def _select(self, context, *args, **kwargs):
         self._check_environment(self._load_state())
-        context = replace(context, remaining_seconds=min(context.remaining_seconds, self._remaining_seconds()))
+        context = replace(context, remaining_seconds=self.max_seconds)
         try:
             return self.curriculum.select(context, *args, **kwargs)
         except CurriculumSelectionError as error:
