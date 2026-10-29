@@ -53,7 +53,17 @@ SCHEMAS = {
     'submit_review': obj({'decision': {'type': 'string', 'enum': ['accept', 'repair']},
         'reason': STRING, 'evidence': EVIDENCE,
         'repair': nullable(obj({'instructions': STRING, 'expected_evidence': STRING})),
-        'memory': nullable(MEMORY)}),
+        'memory': nullable(MEMORY),
+        'memory_judgments': {'type': 'array', 'items': obj({'exposure_id': STRING,
+            'usefulness': {'type':'string','enum':['useful','not-useful','unknown']},
+            'correctness': {'type':'string','enum':['supported','contradicted','unknown']},
+            'investigate': {'type':'boolean'}, 'reason': STRING, 'evidence': {'type':'array','items':SHA256}})},
+        'memory_resolutions': {'type': 'array', 'items': obj({'repair_id': STRING,
+            'action': {'type':'string','enum':['replace','restore','retire']},
+            'reason':STRING, 'evidence':EVIDENCE})},
+        'retirement_checks': {'type':'array','items':obj({'tombstone_id':STRING,
+            'relation':{'type':'string','enum':['unrelated','duplicate','reconciles']},
+            'reason':STRING, 'evidence':{'type':'array','items':SHA256}})}}),
 }
 
 

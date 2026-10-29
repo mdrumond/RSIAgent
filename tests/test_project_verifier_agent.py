@@ -41,12 +41,12 @@ def memory(operation='create', bases=None):
 
 
 def decision(proposal=None):
-    return dict(decision='accept', reason='Independent cases and source agree',
+    return dict(memory_judgments=[], memory_resolutions=[], retirement_checks=[], decision='accept', reason='Independent cases and source agree',
                 evidence=[R], repair=None, memory=proposal)
 
 
 def repair():
-    return dict(decision='repair', reason='A constant special case is not sufficient', evidence=[R],
+    return dict(memory_judgments=[], memory_resolutions=[], retirement_checks=[], decision='repair', reason='A constant special case is not sufficient', evidence=[R],
                 repair=dict(instructions='Test another input distribution',
                             expected_evidence='Host-validated output for negative inputs'), memory=None)
 
