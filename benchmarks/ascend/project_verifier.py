@@ -413,11 +413,16 @@ class ReviewState:
     def missing_required(self):
         missing = self.required - self.read
         missing |= {digest for digest in self.complete_required if self.missing_ranges(digest)}
-        return [dict(sha256=digest, roles=self.roles(digest),
-            complete_read_required=digest in self.complete_required,
-            missing_ranges=self.missing_ranges(digest),
-            next_read=dict(sha256=digest, offset=self.missing_ranges(digest)[0]['offset'],
-                           limit=2048 if self.native else 8192)) for digest in sorted(missing)]
+        rows = []
+        for digest in sorted(missing):
+            row = dict(sha256=digest, roles=self.roles(digest))
+            if digest in self.complete_required:
+                gaps = self.missing_ranges(digest)
+                row.update(complete_read_required=True, missing_ranges=gaps,
+                    next_read=dict(sha256=digest, offset=gaps[0]['offset'],
+                                   limit=2048 if self.native else 8192))
+            rows.append(row)
+        return rows
 
     def readable_preview(self):
         return sorted(set(artifact_preview(self.registry).values()))
