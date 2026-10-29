@@ -95,11 +95,40 @@ def test_multiple_reads_keep_full_audit_but_only_latest_page_on_wire(tmp_path):
     assert sum(bool(row.get('text')) for row in audit) == 2
     assert session.turns == 3
 
+def test_read_audit_survives_provider_interruption_and_deadline_expiry(tmp_path):
+    files = ContextFiles(tmp_path/'context')
+    observed = {'expected': [3, 7], 'observed': [0, 0]}
+    ref = files.put('observed-case', observed)
+    calls = []
 
+    def complete(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            return json.dumps({'read_artifact': ref['read_artifact']})
+        raise OSError('provider disconnected')
 
+    context = CurriculumContext('Learn.', 1, 'a'*64, (), (),
+        context_files=(ref,), artifact_reader=files.read)
+    with pytest.raises(OSError, match='provider disconnected'):
+        CurriculumAgent(complete).select(context)
+    pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
+    assert len(calls) == 2 and len(pages) == 1
+    assert json.loads(pages[0]['text']) == observed
 
+    now = [0]
 
+    def read_and_expire(**payload):
+        page = files.read(**payload)
+        now[0] += 1
+        return page
 
+    agent = CurriculumAgent(
+        lambda _: json.dumps({'read_artifact': ref['read_artifact']}),
+        clock=lambda: now[0])
+    with pytest.raises(ValueError, match='budget exhausted'):
+        agent.select(replace(context, remaining_seconds=.5, artifact_reader=read_and_expire))
+    pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
+    assert len(pages) == 2 and pages[1] == pages[0]
 
 
 def test_large_context_indexes_every_memory_without_inlining_all_references(tmp_path):
