@@ -56,11 +56,12 @@ class A3Actor:
         try:
             name, args = self.session.next_action(state, allowed, source=source, record=self.record,
                 write_action=(lambda s: ("write_source", {"source": s})) if "write_source" in allowed else None)
-            text = json.dumps({"action": name, **args})
+            selected = {"action": name, **args}
+            text = json.dumps(selected)
         except ActionError:
-            text = "{}"  # Existing host records/charges invalid actions.
+            text, selected = "{}", {}  # Existing host records invalid actions.
         return A3Completion(text, self.session.completion_tokens-before,
-                            {"profile_sha256": profile.fingerprint, **ENGINE_IDENTITY})
+                            {"profile_sha256": profile.fingerprint, **ENGINE_IDENTITY}, selected_action=selected)
 
     def close(self):
         self.session.close()

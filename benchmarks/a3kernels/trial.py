@@ -94,7 +94,12 @@ def parse_action(text: str) -> Action:
         value = json.loads(text)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("action must be one JSON object") from exc
-    if not isinstance(value, dict) or type(value.get("action")) is not str:
+    return action_from_mapping(value)
+
+
+def action_from_mapping(value) -> Action:
+    """Apply the host action contract to already structured model output."""
+    if not isinstance(value, Mapping) or type(value.get("action")) is not str:
         raise ValueError("action must select a registered action")
     kind = value["action"]
     if kind not in _ACTION_FIELDS:
@@ -125,7 +130,7 @@ def parse_action(text: str) -> Action:
         if (
             type(value["interpretation"]) is not str
             or not value["interpretation"].strip()
-            or not isinstance(supports, list)
+            or not isinstance(supports, (list, tuple))
             or any(type(item) is not str for item in supports)
         ):
             raise ValueError("submit action requires interpretation and supports")
@@ -320,7 +325,8 @@ class A3TrialLoop:
             try:
                 if completion.provenance.get("profile_sha256") != self.profile.fingerprint:
                     raise ValueError("completion provenance does not match the cell model")
-                action = parse_action(completion.text)
+                action = (action_from_mapping(completion.selected_action)
+                          if completion.selected_action is not None else parse_action(completion.text))
                 state = self._trial_state(
                     source, compilation, verified, profile_result, rewrite_source,
                     compile_attempt_id, run_attempt_id,

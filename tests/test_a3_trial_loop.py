@@ -202,6 +202,8 @@ def _run(
             raise action
         if callable(action):
             action = action(context)
+        if isinstance(action, A3Completion):
+            return action
         return A3Completion(
             action, completion_tokens,
             {"profile_sha256": profile.fingerprint},
@@ -1532,3 +1534,21 @@ def test_completion_provenance_cannot_switch_the_cell_model(tmp_path):
     result = loop.run()
     assert result.status == "budget-exhausted"
     assert result.failures == ("completion provenance does not match the cell model",)
+
+
+def test_structured_completion_bypasses_text_parser_and_keeps_host_validation(tmp_path, monkeypatch):
+    profile = load_a3_model_profile(_cell().backend_model)
+    selections = [
+        {"action": "compile"},  # Rejected while source is required.
+        {"action": "write_source", "source": SOURCE},
+        {"action": "compile"}, {"action": "run"},
+        {"action": "submit", "interpretation": "host result passed", "supports": []},
+    ]
+    completions = [A3Completion(json.dumps(value), 1, {"profile_sha256": profile.fingerprint},
+                               selected_action=value) for value in selections]
+    monkeypatch.setattr('benchmarks.a3kernels.trial.parse_action',
+                        lambda _: pytest.fail('structured completion must not be reparsed'))
+    result, prompts, journal = _run(tmp_path, completions)
+    assert result.status == 'passed' and result.verified.passed
+    assert len(result.failures) == 1
+    assert len(prompts) == 5 and len(journal.read()) == 1

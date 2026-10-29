@@ -1,17 +1,15 @@
 """Pi action driver, retaining the existing noncoding terminal distillation."""
 import json
 import hashlib
-import re
+from contextlib import contextmanager
 
 from benchmarks.a5kernels.phase1_provider import (
-    DirectActorDriver, _ActorContinuation, _ProviderEvidenceRecorder,
+    DirectActorDriver, _ActorSelection,
 )
-from benchmarks.a5kernels.trial import ActorOutcome
-from benchmarks.ascend.agent_context import WorkingContext
+from benchmarks.a5kernels.trial import actor_system_prompt, trial_action
 from .rpc import PiDeadlineError
 from .adapters import A5_SCHEMAS
 from .session import PiCodingSession, ENGINE_IDENTITY, ActionError, runtime_preflight
-from benchmarks.ascend.actor_control import actor_lease
 
 
 
@@ -61,161 +59,107 @@ def task_contract(executor):
     }
 
 
-def typed_contract(prompt):
-    """Replace the registered JSON wire protocol without changing legacy callers."""
-    return re.sub(r"Respond with exactly one JSON object:.*?(?=You cannot choose paths)",
-        "Select one declared typed host tool. Read artifacts with read-artifact using its "
-        "sha256 and returned next_offset; pages are UTF-8 text, at most 8192 bytes. "
-        "Diagnostic observations never establish correctness or timing.\n", prompt, flags=re.S)
-
-
 class PiActorDriver(DirectActorDriver):
     session_factory = PiCodingSession
 
-    def __init__(self, *args, max_seconds=3600, **kwargs):
+    def __init__(self, *args, max_seconds=3600, system_prompt=None, **kwargs):
         runtime_preflight()
-        kwargs.pop("max_turns", None)  # Legacy count limits no longer bound execution.
-        super().__init__(*args, max_seconds=max_seconds, **kwargs)
-        self.system_prompt = typed_contract(self.system_prompt)
-
-    def with_trace(self, trace_event):
-        return type(self)(self.provider, max_seconds=self.max_seconds, clock=self.clock,
-                          trace_event=trace_event, system_prompt=self.system_prompt)
+        kwargs.pop("max_turns", None)
+        super().__init__(*args, max_seconds=max_seconds,
+                         system_prompt=system_prompt or actor_system_prompt(typed=True), **kwargs)
 
     def _new_session(self, profile):
         return self.session_factory(model=profile.identity.backend_model.value, schemas=A5_SCHEMAS,
             environ=self.provider.coding_environment(), deadline=self.clock() + self.max_seconds)
 
-    @actor_lease
-    def __call__(self, instruction, *, profile, workspace, context, turn_parser, action_executor):
-        # The legacy pilot uses a closed OpenRouter profile. It must be migrated
-        # explicitly by its composition, rather than silently changing provider.
-        recorder = _ProviderEvidenceRecorder(workspace)
-        messages = [{"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": instruction}]
-        working = WorkingContext(messages)
-        from benchmarks.ascend.actor_control import ActorConversation, ActorStopped
-        conversation = ActorConversation(workspace, instruction, working, action_executor)
-        for message in messages:
-            self._trace("message", message)
-        tokens = 0
-        turn = conversation.turn
-        deadline = min(self.clock() + self.max_seconds,
-                       getattr(action_executor, "deadline", float("inf")))
-        contract = task_contract(action_executor)
-        latest = None
-        history = []
-        source = getattr(action_executor, 'source', None)
-        allowed = set(A5_SCHEMAS)
-        knowledge = getattr(action_executor, "knowledge", None)
-        query = getattr(action_executor, "query_knowledge", None)
-        if ((knowledge is not None and not knowledge.enabled)
-                or getattr(query, "__name__", "") == "disabled_knowledge_action"):
-            allowed.discard("query-knowledge")
-        if getattr(action_executor, "profiling_guidance", None) is False:
-            allowed.discard("request-profile")
-        profile_action = getattr(action_executor, "request_profile", None)
-        if getattr(profile_action, "__name__", "") == "disabled_profile_action":
-            allowed.discard("request-profile")
-        if getattr(getattr(action_executor, "request_timing", None), "__name__", "") == "disabled_profile_action":
-            allowed.discard("request-timing")
-        if getattr(getattr(action_executor, "request_diagnostic", None), "__name__", "") == "disabled_diagnostic_action":
-            allowed -= {"request-debug", "request-sanitizer"}
+    @contextmanager
+    def _action_session(self, profile, action_executor, deadline):
         with self._new_session(profile) as session:
             session.deadline = min(getattr(session, "deadline", float("inf")), deadline)
             gateway = getattr(session, "gateway", None)
             if gateway is not None:
                 gateway.deadline = min(gateway.deadline, deadline)
-            while self.clock() < deadline:
-                try:
-                    feedback = conversation.boundary()
-                except ActorStopped:
-                    return ActorOutcome('user-stopped', turn, tokens)
-                turn += 1
-                before = session.completion_tokens
-                action_error = None
-                def record(kind, payload):
-                    self._trace("tool", {"name": kind, "turn": turn, **payload})
-                    if recorder.enabled:
-                        digest = recorder.artifacts.put_json(payload)
-                        recorder._append(kind, digest, turn=turn)
-                try:
-                    name, args = session.next_action({
-                        "instruction": instruction, "contract": typed_contract(self.system_prompt),
-                        "task_contract": contract,
-                        "latest_host_observation": observation_context(latest), "source": source,
-                        "recent_host_observations": history[-6:],
-                        "remaining_seconds": max(0, deadline-self.clock()),
-                        "coding": ENGINE_IDENTITY,
-                        "user_feedback": feedback,
-                        "retained_work_log": working.work_log,
-                        "retained_observations": working.recent[-6:],
-                    }, allowed, record=record, source=source,
-                       write_action=lambda s: ("write", {"slot": "kernel", "content": s}))
-                    text = json.dumps({name: args})
-                except PiDeadlineError:
-                    tokens += session.completion_tokens-before
-                    break
-                except ActionError as exc:
-                    action_error = str(exc)[:500]
-                    text = "{}"
-                tokens += session.completion_tokens-before
-                recorder.response(text, stage="action", turn=turn)
-                self._trace("message", {"role": "assistant", "content": text})
-                working.append({'role': 'assistant', 'content': text})
-                if conversation.control.pending():
-                    working.append({'role': 'user', 'content':
-                        'The preceding proposed action was not executed because user input arrived.'})
-                    conversation.save(turn)
-                    continue
-                action = turn_parser(text)
-                if action is None:
-                    host = {
-                        "event": "invalid-action",
-                        "description": "The response could not be parsed as an accepted action. No action was executed.",
-                        "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
-                        "allowed_actions": sorted(getattr(session, "allowed", allowed)),
-                        "reason": action_error or "Selected action does not match the host protocol",
-                    }
-                    if action_error:
-                        host["error"] = action_error
-                    latest = json.dumps({"host": host})
-                else:
-                    if hasattr(action_executor, "action_event_turn"):
-                        action_executor.action_event_turn = turn
-                    outcome = action_executor(action)
-                    latest = outcome.observation
-                    working.append({"role": "user", "content": latest})
-                    if action.kind == "write":
-                        actual = getattr(action_executor, "source", None)
-                        if isinstance(actual, str):
-                            source = actual
-                        else:
-                            host = json.loads(latest).get("host", {})
-                            if host.get("event") == "written":
-                                source = args["content"]
-                    self._trace("tool", {"name": action.kind, "status": "observed", "observation": latest})
-                    if outcome.terminal:
-                        conversation.save(turn)
-                        # Distillation receives bounded terminal evidence and the
-                        # original contract, not a second coding continuation.
-                        retained = messages + [{"role": "user", "content": latest}]
-                        ceiling = self.provider.context_budget(profile).target // 4
-                        if len(instruction.encode()) > ceiling:
-                            retained[1] = {"role": "user", "content":
-                                "Task SHA256: " + hashlib.sha256(instruction.encode()).hexdigest()
-                                + "\nTask preview (terminal distillation uses the admitted host evidence):\n"
-                                + instruction.encode()[:ceiling//2].decode(errors="ignore")}
-                            working.fixed = retained[:2]
-                        working.recent = retained[2:]
-                        self._trace("terminal", {"status": outcome.status,
-                                                "admitted_artifacts": dict(outcome.admitted_artifacts)})
-                        return ActorOutcome(outcome.status, turn, tokens,
-                            admitted_artifacts=dict(outcome.admitted_artifacts),
-                            continuation=_ActorContinuation(profile, tuple(retained), recorder,
-                                                            working, turn, deadline))
-                recorder.observation(latest, turn=turn)
-                history.append(latest)
-                self._trace("message", {"role": "user", "content": latest})
-                conversation.save(turn)
-        return ActorOutcome("time-budget-exhausted", turn, tokens)
+            session.host_source = getattr(action_executor, "source", None)
+            yield session
+
+    @staticmethod
+    def _allowed_actions(executor):
+        allowed = set(A5_SCHEMAS)
+        knowledge = getattr(executor, "knowledge", None)
+        query = getattr(executor, "query_knowledge", None)
+        if ((knowledge is not None and not knowledge.enabled)
+                or getattr(query, "__name__", "") == "disabled_knowledge_action"):
+            allowed.discard("query-knowledge")
+        if getattr(executor, "profiling_guidance", None) is False:
+            allowed.discard("request-profile")
+        for attribute, actions, disabled in (
+            ("request_profile", {"request-profile"}, "disabled_profile_action"),
+            ("request_timing", {"request-timing"}, "disabled_profile_action"),
+            ("request_diagnostic", {"request-debug", "request-sanitizer"}, "disabled_diagnostic_action"),
+        ):
+            if getattr(getattr(executor, attribute, None), "__name__", "") == disabled:
+                allowed -= actions
+        return allowed
+
+    def _select_action(self, session, *, working, profile, recorder, turn,
+                       feedback, action_executor, turn_parser, deadline):
+        allowed = self._allowed_actions(action_executor)
+        def record(kind, payload):
+            self._trace("tool", {"name": kind, "turn": turn, **payload})
+            if recorder.enabled:
+                digest = recorder.artifacts.put_json(payload)
+                recorder._append(kind, digest, turn=turn)
+        before = session.completion_tokens
+        error = None
+        recent = working.recent[-6:]
+        latest = next((row["content"] for row in reversed(recent) if row["role"] == "user"), None)
+        try:
+            name, args = session.next_action({
+                "instruction": working.fixed[1]["content"], "contract": self.system_prompt,
+                "task_contract": task_contract(action_executor),
+                "latest_host_observation": observation_context(latest),
+                "source": session.host_source,
+                "recent_exchanges": recent[:-1] if recent and recent[-1]["role"] == "user" else recent,
+                "remaining_seconds": max(0, deadline-self.clock()), "coding": ENGINE_IDENTITY,
+                "user_feedback": feedback, "retained_work_log": working.work_log,
+            }, allowed, record=record, source=session.host_source,
+                write_action=lambda source: ("write", {"slot": "kernel", "content": source}))
+            action = trial_action(name, args) if name in allowed else None
+            text = json.dumps({name: args})  # Evidence representation, never reparsed for dispatch.
+        except PiDeadlineError:
+            return _ActorSelection(None, "", session.completion_tokens-before, exhausted=True)
+        except ActionError as exc:
+            error, action, text = str(exc)[:500], None, "{}"
+        invalid = None
+        if action is None:
+            host = {"event": "invalid-action",
+                "description": "No accepted action was selected. No action was executed.",
+                "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
+                "allowed_actions": sorted(getattr(session, "allowed", allowed)),
+                "reason": error or "Selected action does not match the host protocol"}
+            if error:
+                host["error"] = error
+            invalid = json.dumps({"host": host})
+        return _ActorSelection(action, text, session.completion_tokens-before, invalid)
+
+    def _observed_action(self, session, action, observation, action_executor):
+        if action.kind == "write":
+            actual = getattr(action_executor, "source", None)
+            host = observation_context(observation)
+            if isinstance(actual, str):
+                session.host_source = actual
+            elif isinstance(host, dict) and host.get("host", {}).get("event") == "written":
+                session.host_source = action.payload["content"]
+
+    def _terminal_context(self, working, profile):
+        # Distill bounded terminal evidence rather than another coding continuation.
+        retained = [*working.fixed, working.recent[-1]]
+        instruction = retained[1]["content"]
+        ceiling = self.provider.context_budget(profile).target // 4
+        if len(instruction.encode()) > ceiling:
+            retained[1] = {"role": "user", "content":
+                "Task SHA256: " + hashlib.sha256(instruction.encode()).hexdigest()
+                + "\nTask preview (terminal distillation uses the admitted host evidence):\n"
+                + instruction.encode()[:ceiling//2].decode(errors="ignore")}
+        working.fixed, working.recent = retained[:2], retained[2:]
+        return retained
