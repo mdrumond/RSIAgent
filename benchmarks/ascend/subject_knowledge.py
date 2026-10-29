@@ -9,6 +9,7 @@ import time
 
 from optimizer.jobs import atomic, canonical
 from .subject_memory import digest as memory_digest
+from .memory_ledger import MemoryLedger
 
 
 def memory_artifacts(record):
@@ -27,13 +28,15 @@ class SubjectKnowledge:
     """Use the live accepted catalog for review and frozen records for Actors.
 
     ``memory_getter`` returns the campaign's SubjectMemory after composition.
-    Frozen snapshots, including pending treatment proposals, are indexed solely
-    inside their branch namespace, never into the accepted/reference database.
+    Frozen snapshots are indexed solely inside their branch namespace,
+    with withdrawn versions excluded from actor retrieval.
     """
     def __init__(self, root, store, memory_getter, *, paths=None, embeddings=None,
                  reference_query=None, contextual_reference_query=None, clock=time.monotonic):
         self.root, self.store, self.memory_getter = Path(root), store, memory_getter
         self.database_path, self.embeddings = getattr(paths, 'kdb', None), embeddings
+        self.ledger = (MemoryLedger.for_kdb(self.database_path) if self.database_path is not None
+                       else MemoryLedger(self.root / 'memory-ledger.sqlite3'))
         self.reference_query, self.clock = reference_query, clock
         self.contextual_reference_query = contextual_reference_query
         if self.database_path is not None and self.reference_query is None and contextual_reference_query is None:
@@ -74,6 +77,8 @@ class SubjectKnowledge:
             # Freeze the original record before adding query-only version and
             # artifact fields. Its full document is exactly the versioned bytes.
             version = memory_digest(record)
+            if not self.ledger.available(version):
+                continue
             documents[version] = canonical(record)
             memory = dict(record, version=version, artifacts=dict(record.get('artifacts', {})))
             memory['artifacts'].update({str(i): digest
@@ -99,6 +104,8 @@ class SubjectKnowledge:
                     for record in frozen_records:
                         check_remaining()
                         version = memory_digest(record)
+                        if version not in documents:
+                            continue
                         source = directory / version / 'memory.json'
                         source.parent.mkdir(exist_ok=True)
                         atomic(source, canonical(record))
@@ -158,6 +165,16 @@ class SubjectKnowledge:
                         raise ValueError('memory artifact bytes differ from their identity')
                     retain(content)
         observation = knowledge_presentation(action.query, selected, retain)
+        for memory in result['memories']:
+            if 'subject-memory-' + memory['version'] not in collections:
+                continue
+            event_id = context.access_event_id
+            if not event_id:
+                raise ValueError('Actor memory delivery requires a durable host access event')
+            self.ledger.access(event_id + ':' + memory['version'], memory_id=memory['memory_id'],
+                version=memory['version'], campaign_id=str(self.root.resolve()),
+                project_id=context.request.spec.project_id, actor_id=context.actor_id,
+                actor_role=context.actor_role)
         return AdaptiveActionResult(observation,
             citations=tuple(Citation.from_mapping(hit['citation']) for hit in selected),
             admitted_artifacts=admitted)

@@ -56,12 +56,12 @@ class ObservationRequired(RuntimeError):
 
 class SubjectCampaign:
     def __init__(self, root, subjects, initial_memory, *, select_wave, execute, verifier,
-                 complete, max_seconds=7200, index_memory=None,
+                 complete, max_seconds=7200, index_memory=None, memory_ledger=None,
                  clock=time.monotonic):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.scheduler = SubjectScheduler(self.root, subjects)
-        self.memory = SubjectMemory(self.root / 'memory', initial_memory, index=index_memory)
+        self.memory = SubjectMemory(self.root / 'memory', initial_memory, index=index_memory, ledger=memory_ledger)
         self.artifacts = ContentAddressedArtifacts(self.root / 'artifacts')
         self.select_wave, self.execute, self.verifier = select_wave, execute, verifier
         self.policy = SubjectCurriculumAgent(complete)

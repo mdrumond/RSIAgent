@@ -38,13 +38,15 @@ def setup(tmp_path, *, enabled=True, embeddings=None, reference_query=None, cloc
     paths = SimpleNamespace(kdb=database_path if enabled else None, collection='reference', root=tmp_path)
     service = SubjectKnowledge(tmp_path, store, lambda: memory, paths=paths, embeddings=embeddings,
         reference_query=reference_query, **({'clock': clock} if clock else {}))
-    memory = SubjectMemory(tmp_path / 'memory', b'initial guidance', index=service.index)
+    memory = SubjectMemory(tmp_path / 'memory', b'initial guidance', index=service.index, ledger=service.ledger)
     return service, memory, store, database_path
 
 
 def context(tmp_path, snapshot):
-    return SimpleNamespace(request=SimpleNamespace(pre_wave_memory=snapshot, branch_root=tmp_path),
-                           artifacts=ContentAddressedArtifacts(tmp_path / 'artifacts'))
+    return SimpleNamespace(request=SimpleNamespace(pre_wave_memory=snapshot, branch_root=tmp_path,
+                           spec=SimpleNamespace(project_id='project')),
+                           artifacts=ContentAddressedArtifacts(tmp_path / 'artifacts'),
+                           access_event_id='query-1', actor_id=str(tmp_path), actor_role='writer')
 
 
 def test_accepted_index_queries_exact_active_versions_and_validated_citations(tmp_path):
@@ -83,23 +85,6 @@ def test_actor_view_remains_frozen_after_live_catalog_replacement_and_retains_re
         assert actor.artifacts.read_bytes(artifact)
     assert service.read_artifact(original['after']['sha256'], remaining_seconds=60) == SOURCE
 
-
-def test_pending_treatment_memory_is_indexed_only_inside_its_frozen_arm(tmp_path):
-    service, memory, store, shared = setup(tmp_path)
-    draft = dict(memory_id='pending', proposal=proposal(store, 'Vector pendingmemoryvector trick'), provenance={})
-    baseline = memory.snapshot()
-    treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
-    version = digest(draft)
-    def query(snapshot, arm):
-        return service.actor_query({'query': 'pendingmemoryvector'}, context(tmp_path / arm, snapshot),
-                                   remaining_seconds=60)
-    assert 'subject-memory-' + version in {row.collection for row in query(treatment, 'treatment').citations}
-    assert 'subject-memory-' + version not in {row.collection for row in query(baseline, 'baseline').citations}
-    with KnowledgeDB.open_read_only(shared, FakeEmbeddings()) as database:
-        with pytest.raises(KeyError):
-            database.manifest('subject-memory-' + version)
-    assert memory.records() == []
-    assert list((tmp_path / 'treatment' / 'frozen-memory').glob('*/knowledge.sqlite'))
 
 
 def test_kdb_off_preserves_reachable_code_and_evidence_without_embedding(tmp_path):

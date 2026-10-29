@@ -18,17 +18,20 @@ class StaleMemory(ValueError):
 
 
 class SubjectMemory:
-    def __init__(self, root, initial_memory=b'', *, index=None):
+    def __init__(self, root, initial_memory=b'', *, index=None, ledger=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.initial = initial_memory.decode('utf-8')
-        self.index = index
+        self.index, self.ledger = index, ledger
         with self.transaction() as state:
             identity = hashlib.sha256(initial_memory).hexdigest()
             if not state:
                 state.update(schema='subject-memory-v1', initial_sha256=identity, active={}, admissions={})
             elif state['initial_sha256'] != identity:
                 raise ValueError('initial memory changed')
+            if self.ledger is not None:
+                for version in state['active'].values():
+                    self.ledger.publish(self.read(version))
 
     @contextmanager
     def transaction(self):
@@ -41,7 +44,8 @@ class SubjectMemory:
 
     def records(self):
         with self.transaction() as state:
-            return [self.read(version) for version in state['active'].values()]
+            return [self.read(version) for version in state['active'].values()
+                    if self.ledger is None or self.ledger.available(version)]
 
     def read(self, version):
         record = json.loads((self.root / 'versions' / (version + '.json')).read_bytes())
@@ -78,6 +82,8 @@ class SubjectMemory:
                 self.index(version, record)
             if check_remaining is not None:
                 check_remaining()
+            if self.ledger is not None:
+                self.ledger.publish(record)
             for row in bases:
                 state['active'].pop(row['memory_id'])
             state['active'][memory_id] = version

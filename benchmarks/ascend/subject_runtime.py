@@ -469,7 +469,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
 
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
-        max_seconds=max_seconds, index_memory=knowledge.index)
+        max_seconds=max_seconds, index_memory=knowledge.index, memory_ledger=knowledge.ledger)
     def review_retained(item, request, **options):
         if item.get('project_id') != request.project_id or 'spec' not in item:
             raise ValueError('retained review requires its original graph project')

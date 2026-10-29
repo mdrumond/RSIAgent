@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 import json
+import hashlib
 import time
 from pathlib import Path
 import re
@@ -78,6 +79,9 @@ class AdaptiveActionContext:
     latest_execution: ProjectExecutionResult | None
     artifacts: ContentAddressedArtifacts
     remaining_seconds: float | None = None
+    access_event_id: str | None = None
+    actor_id: str = "writer"
+    actor_role: str = "writer"
 
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -395,6 +399,9 @@ class _ProjectActions:
         result = dependency(payload, AdaptiveActionContext(
             self.request, self.prepared, self.source, self.latest, self.artifacts,
             max(0, self.deadline - time.monotonic()),
+            access_event_id=hashlib.sha256(canonical_bytes(dict(
+                branch=str(self.request.branch_root.resolve()), ordinal=len(self.actions), payload=dict(payload)))).hexdigest(),
+            actor_id=str(self.request.branch_root.resolve()),
         ))
         if not isinstance(result, AdaptiveActionResult):
             raise TypeError("adaptive action dependency must return AdaptiveActionResult")
