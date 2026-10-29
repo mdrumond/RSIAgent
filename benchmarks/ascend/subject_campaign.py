@@ -220,6 +220,11 @@ class SubjectCampaign:
                     self.scheduler.resolve_review(pid, 'rejected')
                 self.scheduler.add_repair(pid, subject, pid, review['reason'], evidence)
                 continue
+            if self.memory_maintenance is not None and review['memory'] is None:
+                try:
+                    self.memory_maintenance.validate_resolution(record)
+                except StaleMemory as error:
+                    return self._refresh_publication(pid, record, pending, error)
             if review['memory'] is None:
                 if self.memory_maintenance is not None:
                     self.memory_maintenance.resolve(pid, record)
@@ -228,18 +233,14 @@ class SubjectCampaign:
                 continue
             provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
                 review_sha256=record['review_sha256'], request=record['review_request'],
+                observed_retirements=[row['tombstone_id'] for row in record['review_request'].get('retired_memories', [])],
+                memory_maintenance_revisions=self.memory_maintenance.revisions(record) if self.memory_maintenance else [],
                 retirement_resolutions=[dict(tombstone_id=row['tombstone_id'], evidence=row['evidence'], reason=row['reason'])
                     for row in review.get('retirement_checks', []) if row['relation'] == 'reconciles'])
             try:
                 self.memory.accept(pid, review['memory'], provenance)
             except StaleMemory as error:
-                record.setdefault('prior_reviews', []).append(review)
-                record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'],
-                    current_memories=self.memory.records())
-                record['review'] = None
-                self._save()
-                self._review(pid, record)
-                return self._publish_wave(pending)
+                return self._refresh_publication(pid, record, pending, error)
             self.scheduler.resolve_review(pid, 'accepted')
             if self.memory_maintenance is not None:
                 self.memory_maintenance.resolve(pid, record)
@@ -260,6 +261,15 @@ class SubjectCampaign:
             self.state['waves'].append(pending['wave_id'])
         self.state.update(pending=None, needs_decision=True)
         self._save()
+
+    def _refresh_publication(self, pid, record, pending, error):
+        record.setdefault('prior_reviews', []).append(record['review'])
+        record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=record['review']['memory'],
+            current_memories=self.memory.records())
+        record['review'] = None
+        self._save()
+        self._review(pid, record)
+        return self._publish_wave(pending)
 
     def _require_observed_pending(self):
         pending = self.state.get('pending')

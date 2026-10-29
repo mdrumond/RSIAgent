@@ -146,3 +146,16 @@ def test_confirm_is_only_for_active_investigations():
     repair['kind']='rewrite'
     with pytest.raises(ValueError,match='only an active investigation'):
         validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})
+
+
+@pytest.mark.parametrize('action',['confirm','restore'])
+def test_confirm_or_restore_cannot_also_publish_a_replacement_of_its_base(action):
+    repair=dict(repair_id='r',memory_id='lesson',version=D,document_sha256=D,evidence=[L],
+                kind='investigate' if action=='confirm' else 'correct',status='active' if action=='confirm' else 'quarantined')
+    req=replace(request(),memory_repairs=(repair,))
+    value=decision(dict(memory(),operation='append',base_versions=[dict(memory_id='lesson',version=D)]))
+    value['memory_resolutions']=[dict(repair_id='r',action=action,reason='Verified conclusion',evidence=[R])]
+    with pytest.raises(ValueError,match='cannot also supersede'):
+        validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})
+    value['memory']=None
+    validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})

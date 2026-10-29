@@ -278,7 +278,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 allowance = min(allowance, campaign._remaining())
             return knowledge.actor_query(payload, context, remaining_seconds=allowance)
         actor.query_knowledge = actor_knowledge
-        actor.observe_knowledge_read = knowledge.actor_read
+    actor.observe_knowledge_read = knowledge.actor_read
     actor.prepare_memory = knowledge.actor_snapshot
     actor.observe_memory_delivery = knowledge.actor_delivery
 
@@ -342,7 +342,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         if maintenance is not None:
             assigned = dict(maintenance['artifacts'])
             request = replace(request, memory_maintenance_artifacts=tuple(assigned.values()))
-            recovery = dict(reason=maintenance['reason'] + ' Claim under review: ' + json.dumps(maintenance['claim']),
+            recovery = dict(reason=maintenance['reason'] + ' Current concerns: ' + json.dumps(maintenance.get('concerns', [])) + ' Claim under review: ' + json.dumps(maintenance['claim']),
                 artifacts={**assigned, **(recovery or {}).get('artifacts', {})})
         if recovery is None:
             return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,

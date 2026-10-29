@@ -57,6 +57,9 @@ def validate_memory_review(value, request, read, evidence, fully_read):
             raise ValueError('read the disputed memory before resolving its repair')
         if not row['reason'].strip() or not project_evidence.intersection(row['evidence']):
             raise ValueError('memory resolution requires independent evidence and a reason')
+        base = {'memory_id': repair['memory_id'], 'version': repair['version']}
+        if row['action'] in {'confirm', 'restore'} and value['memory'] is not None and base in value['memory']['base_versions']:
+            raise ValueError('confirm/restore cannot also supersede the repaired version; use replace')
         if row['action'] == 'replace':
             memory = value['memory']
             base = {'memory_id': repair['memory_id'], 'version': repair['version']}

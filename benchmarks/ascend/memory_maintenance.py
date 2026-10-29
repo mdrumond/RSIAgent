@@ -7,7 +7,7 @@ from pathlib import Path
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 
 from optimizer.jobs import canonical
-from .subject_memory import digest
+from .subject_memory import digest, StaleMemory
 
 
 class MemoryMaintenance:
@@ -84,6 +84,7 @@ class MemoryMaintenance:
                 row['evidence'])
 
     def prepare(self, request, repair_ids=()):
+        self._apply_pending()
         def document(row):
             record = row.pop('record', None) or self.ledger.record(row['version'])
             from .subject_knowledge import memory_artifacts
@@ -102,8 +103,8 @@ class MemoryMaintenance:
         for obligation in self.obligations():
             if obligation['repair_id'] not in repair_ids:
                 continue
-            evidence = self.counterevidence(obligation)
-            repairs.append(document(dict(obligation, evidence=sorted(evidence))))
+            info = self.episode_info(obligation)
+            repairs.append(document(dict(obligation, **info)))
         # All retired claim metadata is visible; exact documents/evidence are paged by hash.
         retired = [document(dict(row)) for row in self.ledger.retired()]
         artifacts = dict(request.artifacts)
@@ -195,17 +196,38 @@ class MemoryMaintenance:
             reason='Memory maintenance precedes ordinary curriculum work', evidence=row['evidence']))
         return dict(local, memory_context=self.repair_context(row))
 
-    def counterevidence(self, obligation):
+    def episode_info(self, obligation):
         with sqlite3.connect(self.ledger.path) as db:
-            triggers = db.execute('SELECT trigger_id FROM memory_maintenance_triggers WHERE repair_id=?',
-                                  (obligation['repair_id'],)).fetchall()
+            triggers = db.execute('''SELECT t.trigger_id FROM memory_maintenance_triggers t
+                JOIN memory_maintenance m USING(repair_id) WHERE m.version=? AND m.resolution IS NULL
+                ORDER BY t.trigger_id''', (obligation['version'],)).fetchall()
             assessments = [db.execute('SELECT payload FROM memory_maintenance_reviews WHERE exposure_id=?',
                            (trigger[0].split(':',1)[1],)).fetchone() for trigger in triggers]
-        evidence = set(obligation['evidence'])
+            rows = db.execute('SELECT payload FROM memory_maintenance WHERE version=? AND resolution IS NULL',
+                              (obligation['version'],)).fetchall()
+        evidence = {sha for row in rows for sha in json.loads(row[0])['evidence']}
+        concerns = []
         for assessment in assessments:
             if assessment:
-                evidence.update(json.loads(assessment[0])['judgment']['evidence'])
-        return sorted(evidence)
+                judgment = json.loads(assessment[0])['judgment']
+                evidence.update(judgment['evidence'])
+                concerns.append(dict(reason=judgment['reason'], evidence=judgment['evidence']))
+        return dict(evidence=sorted(evidence), concerns=concerns, episode_revision=digest([row[0] for row in triggers]))
+
+    def revisions(self, record):
+        selected = {row['repair_id'] for row in record['review'].get('memory_resolutions', [])}
+        return list({row['version']:dict(version=row['version'], revision=row['episode_revision'])
+                     for row in record.get('review_request', {}).get('memory_repairs', [])
+                     if row['repair_id'] in selected}.values())
+
+    def validate_resolution(self, record):
+        open_ids = {row['repair_id'] for row in self.obligations()}
+        open_versions = {row['version'] for row in record.get('review_request', {}).get('memory_repairs', [])
+                         if row['repair_id'] in open_ids}
+        revisions = [row for row in self.revisions(record) if row['version'] in open_versions]
+        with sqlite3.connect(self.ledger.path) as db:
+            self.ledger.assert_maintenance_revisions(db, revisions)
+        return revisions
 
     def repair_context(self, obligation):
         record = self.ledger.record(obligation['version'])
@@ -213,11 +235,12 @@ class MemoryMaintenance:
         document = self.campaign.artifacts.put_bytes(canonical(record))
         artifacts = {'disputed-memory': document}
         artifacts.update({'memory-evidence:' + str(i):sha for i,sha in enumerate(sorted(memory_artifacts(record)))})
-        artifacts.update({'counterevidence:' + str(i):sha for i,sha in enumerate(self.counterevidence(obligation))})
+        artifacts.update({'counterevidence:' + str(i):sha for i,sha in enumerate(self.episode_info(obligation)['evidence'])})
         for sha in artifacts.values():
             self.read_artifact(sha, remaining_seconds=float('inf'))
         return dict(reason='Assigned untrusted memory maintenance; investigate the claim rather than treating it as guidance. ' + obligation['reason'],
             memory_id=record['memory_id'], version=obligation['version'],
+            concerns=self.episode_info(obligation)['concerns'],
             claim={key:record['proposal'][key] for key in ('summary','applicability','preconditions','expectations','limitations')},
             artifacts=artifacts)
 
@@ -225,14 +248,24 @@ class MemoryMaintenance:
         """Only explicit reviewed resolutions close obligations after publication."""
         if record['review']['decision'] != 'accept':
             return
+        try:
+            revisions = self.validate_resolution(record)
+        except StaleMemory:
+            return False  # New evidence after publication remains an imposed open project.
         obligations = {row['repair_id']: row for row in self.obligations(open_only=False)}
         for resolution in record['review'].get('memory_resolutions', []):
             row = obligations[resolution['repair_id']]
             outcome = dict(resolution, project_id=project_id, evidence=sorted(set(resolution['evidence'])))
+            row_revisions = [item for item in revisions if item['version'] == row['version']]
             with sqlite3.connect(self.ledger.path) as db:
                 settled = db.execute('SELECT resolution FROM memory_maintenance WHERE repair_id=?', (row['repair_id'],)).fetchone()[0]
                 if settled:
                     continue
+            # Global lifecycle evidence must outlive the origin before the
+            # transition becomes visible to other campaigns.
+            self.retain(record['review_sha256'])
+            for sha in resolution['evidence']:
+                self.retain(sha)
             status = self.ledger.status(row['version'])
             if resolution['action'] == 'replace':
                 if not self.ledger.replacements(row['version']):
@@ -248,11 +281,20 @@ class MemoryMaintenance:
                 if not receipt and resolution['action'] == 'restore' and (status != 'quarantined' or self.ledger.replacements(row['version'])):
                     raise ValueError('only a quarantined current version may be restored')
                 wanted = 'retired' if resolution['action'] == 'retire' else 'active'
-                self.ledger.transition(row['version'], wanted, event_id=event_id,
-                    reason=resolution['reason'], evidence=resolution['evidence'], expected_status=reviewed['status'])
-            for sha in resolution['evidence']:
-                self.retain(sha)
+                try:
+                    self.ledger.transition(row['version'], wanted, event_id=event_id,
+                        reason=resolution['reason'], evidence=resolution['evidence'], expected_status=reviewed['status'],
+                        maintenance_revisions=row_revisions)
+                except StaleMemory:
+                    return False
             with sqlite3.connect(self.ledger.path) as db:
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    self.ledger.assert_maintenance_revisions(db, row_revisions)
+                except StaleMemory:
+                    return False
+                if resolution['action'] == 'confirm' and not db.execute("SELECT 1 FROM memory_heads h JOIN memory_versions v USING(version) WHERE h.version=? AND v.status='active'", (row['version'],)).fetchone():
+                    return False
                 # An explicit correction of this version also settles older maintenance
                 # reasons for the same bytes; the replacement starts fresh counters.
                 if resolution['action'] in {'replace', 'retire'}:

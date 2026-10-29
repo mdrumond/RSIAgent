@@ -289,7 +289,8 @@ class SubjectKnowledge:
 
     def optimizer_observer(self, directory):
         """Observe actual optimizer prompt/read delivery without changing its contract."""
-        actor_id = str(Path(directory).resolve())
+        from .subject_memory import actor_memory_identity
+        actor_id = actor_memory_identity(directory)
         def observe(kind, snapshot, payload, event_id):
             records = {i:entry for i,entry in enumerate(snapshot['memory_entries'])
                        if isinstance(entry, dict) and {'memory_id','proposal','provenance'} <= entry.keys()}
@@ -316,7 +317,7 @@ class SubjectKnowledge:
                 return payload['result']
             for index in set(chosen) - unavailable:
                 record = records[index]
-                self.ledger.access(kind + ':' + event_id + ':' + memory_digest(record),
+                self.ledger.access(kind + ':' + actor_id + ':' + event_id + ':' + memory_digest(record),
                     memory_id=record['memory_id'], version=memory_digest(record), campaign_id=str(self.root.resolve()),
                     project_id=Path(directory).name, actor_id=actor_id, actor_role='optimizer')
             return payload if kind == 'presentation' else payload['result']

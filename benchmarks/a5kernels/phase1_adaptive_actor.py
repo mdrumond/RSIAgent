@@ -219,6 +219,8 @@ class _ProjectActions:
         self.request_diagnostic = request_diagnostic
         self.actions: list[str] = []
         self.action_event_namespace = uuid.uuid4().hex
+        from benchmarks.ascend.subject_memory import actor_memory_identity
+        self.actor_identity = actor_memory_identity(request.branch_root)
         self.action_event_turn = None
         self.metered_actions = 0
         self.source: str | None = None
@@ -405,10 +407,10 @@ class _ProjectActions:
         return AdaptiveActionContext(self.request, self.prepared, self.source, self.latest, self.artifacts,
             max(0, self.deadline - time.monotonic()),
             access_event_id=hashlib.sha256(canonical_bytes(dict(
-                branch=str(self.request.branch_root.resolve()),
+                branch=self.actor_identity,
                 namespace=self.action_event_namespace if self.action_event_turn is None else 'conversation',
                 ordinal=len(self.actions) if self.action_event_turn is None else self.action_event_turn, payload=dict(payload)))).hexdigest(),
-            actor_id=str(self.request.branch_root.resolve()), actor_role=self.actor_role)
+            actor_id=self.actor_identity, actor_role=self.actor_role)
 
     def _dependency(
         self, dependency: ActionDependency, payload: Mapping[str, object],

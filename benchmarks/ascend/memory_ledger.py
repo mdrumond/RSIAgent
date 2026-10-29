@@ -111,6 +111,19 @@ class MemoryLedger:
                               "WHERE v.status='active' ORDER BY h.memory_id").fetchall()
         return [json.loads(row['record']) for row in rows]
 
+    @staticmethod
+    def assert_maintenance_revisions(db, revisions):
+        for expected in revisions:
+            for pending in db.execute('SELECT payload FROM memory_maintenance_reviews WHERE applied=0'):
+                payload = json.loads(pending[0])
+                if payload['exposure']['version'] == expected['version']:
+                    raise StaleMemory('memory counterevidence changed; apply the pending assessment and refresh source review')
+            triggers = [row[0] for row in db.execute('''SELECT t.trigger_id FROM memory_maintenance_triggers t
+                JOIN memory_maintenance m USING(repair_id) WHERE m.version=? AND m.resolution IS NULL
+                ORDER BY t.trigger_id''', (expected['version'],))]
+            if digest(triggers) != expected['revision']:
+                raise StaleMemory('memory counterevidence changed; refresh source review before publication or resolution')
+
     def publish(self, record, *, expected_statuses=None):
         """Compare all shared heads and publish one replacement atomically."""
         version = digest(record)
@@ -123,6 +136,12 @@ class MemoryLedger:
                 if previous['record'] != _json(record):
                     raise ValueError('immutable memory record changed')
                 return version
+            self.assert_maintenance_revisions(db, record['provenance'].get('memory_maintenance_revisions', []))
+            if 'observed_retirements' in record['provenance']:
+                current = sorted(row['event_id'] for row in db.execute('SELECT event_id,event FROM memory_lifecycle')
+                                 if json.loads(row['event'])['status'] == 'retired')
+                if current != sorted(record['provenance']['observed_retirements']):
+                    raise StaleMemory('memory retirement history changed; refresh source review before publication')
             if not self._bases_current(db, bases):
                 raise StaleMemory('shared memory replacement base changed; reconcile source review')
             if record['memory_id'] not in {base['memory_id'] for base in bases} and db.execute(
@@ -258,7 +277,7 @@ class MemoryLedger:
         return dict(aggregate(rows), by_actor={key: dict(actor_id=items[0]['actor_id'], actor_role=items[0]['actor_role'],
             campaign_id=items[0]['campaign_id'], **aggregate(items)) for key, items in by_actor.items()})
 
-    def transition(self, version, status, *, event_id, reason, evidence, expected_status=None):
+    def transition(self, version, status, *, event_id, reason, evidence, expected_status=None, maintenance_revisions=()):
         if status not in {'active', 'quarantined', 'retired'} or not isinstance(reason, str) or not reason.strip():
             raise ValueError('invalid memory lifecycle transition')
         evidence = _evidence(evidence)
@@ -273,6 +292,7 @@ class MemoryLedger:
                 if old['event'] != _json(event):
                     raise ValueError('memory lifecycle event reused')
                 return event
+            self.assert_maintenance_revisions(db, maintenance_revisions)
             row = db.execute('SELECT status FROM memory_versions WHERE version=?', (version,)).fetchone()
             if row is None:
                 raise KeyError(version)

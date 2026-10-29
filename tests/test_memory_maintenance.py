@@ -27,9 +27,9 @@ def seed(campaign):
 
 
 def observe(campaign, ledger, base, *, project_id='consumer', number=0,
-            usefulness='not-useful', correctness='contradicted', investigate=False):
+            usefulness='not-useful', correctness='contradicted', investigate=False, result_bytes=b'new host result\n'):
     source = campaign.artifacts.put_bytes(b'new source\n')
-    result = campaign.artifacts.put_bytes(b'new host result\n')
+    result = campaign.artifacts.put_bytes(result_bytes)
     exposure = ledger.access('access-' + str(number), **base, campaign_id=str(campaign.root.resolve()),
         project_id=project_id, actor_id=project_id, actor_role='writer')
     review = dict(decision='accept', memory=None, memory_judgments=[dict(exposure_id=exposure,
@@ -458,3 +458,167 @@ def test_cross_campaign_author_and_actor_can_read_only_assigned_disputed_context
     assert calls==['read']
     assert ledger.status(base['version'])=='quarantined'
     assert ledger.stats(base['memory_id'])['accesses']==1  # only the original ordinary actor exposure
+
+
+def test_manual_execution_episode_gets_new_exposure_but_resume_replays_it(tmp_path):
+    from test_actor_compiler_diagnostics import actions
+    from test_a5_phase1_adaptive_actor import SourceBackend
+    from benchmarks.ascend.subject_knowledge import SubjectKnowledge
+    ledger=MemoryLedger(tmp_path/'campaign/memory-ledger.sqlite3')
+    campaign,_=setup(tmp_path,ledger=ledger);base=seed(campaign)
+    knowledge=SubjectKnowledge(campaign.root,campaign.artifacts,lambda:campaign.memory)
+    original=actions(tmp_path/'actor',SourceBackend());original.action_event_turn=43
+    first=original._action_context({'opening_memory':'same'})
+    presentation={'memories':[base]}
+    knowledge.actor_delivery(presentation,first)
+    project=first.request.spec.project_id
+    old=ledger.exposures(str(campaign.root.resolve()),project)[0]
+    ledger.judge(old['exposure_id'],usefulness='unknown',correctness='unknown',reason='Initial project interrupted',evidence=[])
+    marker=original.request.branch_root/'manual-execution.json'
+    marker.parent.mkdir(parents=True,exist_ok=True);marker.write_text(json.dumps({'attempt_id':'continued-attempt'}))
+    resumed=actions(tmp_path/'actor',SourceBackend());resumed.action_event_turn=43
+    second=resumed._action_context({'opening_memory':'same'})
+    assert second.actor_id!=first.actor_id and second.access_event_id!=first.access_event_id
+    knowledge.actor_delivery(presentation,second)
+    again=actions(tmp_path/'actor',SourceBackend());again.action_event_turn=43
+    replay=again._action_context({'opening_memory':'same'})
+    assert replay.actor_id==second.actor_id and replay.access_event_id==second.access_event_id
+    knowledge.actor_delivery(presentation,replay)
+    source=campaign.artifacts.put_bytes(b'continued source\n');result=campaign.artifacts.put_bytes(b'continued conflicting result\n')
+    request=campaign.memory_maintenance.prepare(ProjectReview(project,source,True,{'source':source,'result':result}))
+    assert len(request.memory_exposures)==1 and request.memory_exposures[0]['actor_id']==second.actor_id
+    judgment=dict(exposure_id=request.memory_exposures[0]['exposure_id'],usefulness='not-useful',correctness='contradicted',
+                  investigate=False,reason='Continuation found a counterexample',evidence=[result])
+    review=dict(decision='accept',memory=None,memory_judgments=[judgment],memory_resolutions=[],retirement_checks=[])
+    record=dict(objective='learn tails',review=review,review_request=asdict(request),review_sha256=campaign.artifacts.put_json(review))
+    campaign.memory_maintenance.observe(project,record)
+    assert ledger.status(base['version'])=='quarantined'
+    rows=ledger.exposures(str(campaign.root.resolve()),project)
+    assert len(rows)==2 and sum(row['accesses'] for row in rows)==2
+    assert next(row for row in rows if row['actor_id']==first.actor_id)['judgment']['correctness']=='unknown'
+    assert campaign.memory_maintenance.prepare(ProjectReview(project,source,True,{'source':source})).memory_exposures==()
+
+
+def test_indexed_without_reference_kdb_counts_reads_and_blocks_stale_memory(tmp_path):
+    from dataclasses import replace
+    from test_subject_runtime import bound
+    from benchmarks.ascend.subject_runtime import build_subject_campaign
+    from test_actor_compiler_diagnostics import actions,host
+    from test_a5_phase1_adaptive_actor import SourceBackend
+    binding=bound(tmp_path)
+    campaign=build_subject_campaign({},target='a3',root=tmp_path/'campaign',subjects=[Subject('s','learn tails')],
+        initial_memory=b'',compose=lambda *a,**kw:binding)
+    base=seed(campaign)
+    current=actions(tmp_path/'actor',SourceBackend())
+    current.request=replace(current.request,pre_wave_memory=campaign.memory.snapshot())
+    callback=binding['actor'].observe_knowledge_read
+    assert callback.__self__.database_path is None
+    current.observe_knowledge_read=callback
+    source=campaign.memory.read(base['version'])['proposal']['after']['sha256']
+    current.artifacts.put_bytes(campaign.artifacts.read_bytes(source))
+    assert host(current,'read-artifact',sha256=source)['text']=='old source\n'
+    ledger=campaign.memory_maintenance.ledger
+    assert ledger.stats(base['memory_id'])['accesses']==1
+    ledger.transition(base['version'],'quarantined',event_id='conflict',reason='Counterexample',evidence=['e'*64])
+    assert 'withdrawn' in host(current,'read-artifact',sha256=source)['error']
+    assert ledger.stats(base['memory_id'])['accesses']==1
+
+
+def test_new_counterevidence_during_indexing_aborts_global_publication(tmp_path):
+    from benchmarks.ascend.subject_memory import StaleMemory
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    ledger.access('access-1', **base, campaign_id=str(campaign.root.resolve()),
+        project_id='second-consumer', actor_id='second-consumer', actor_role='writer')
+    first=observe(campaign,ledger,base)
+    repair=campaign.memory_maintenance.prioritize()
+    source=campaign.artifacts.put_bytes(b'corrected source\n')
+    request=campaign.memory_maintenance.prepare(ProjectReview('fix',source,True,{'source':source}),[repair['repair_id']])
+    corrected=dict(proposal(source),operation='append',base_versions=[base])
+    review=dict(decision='accept',memory=corrected,memory_resolutions=[dict(repair_id=repair['repair_id'],
+        action='replace',reason='Corrected example',evidence=[source])])
+    record=dict(review=review,review_request=asdict(request),review_sha256=campaign.artifacts.put_json(review))
+    provenance=dict(memory_maintenance_revisions=campaign.memory_maintenance.validate_resolution(record))
+    index=campaign.memory.index
+    def interrupted_by_new_evidence(version,value):
+        index(version,value)
+        observe(campaign,ledger,base,project_id='second-consumer',number=1,result_bytes=b'second distinct failure\n')
+    campaign.memory.index=interrupted_by_new_evidence
+    with pytest.raises(StaleMemory,match='counterevidence changed'):
+        campaign.memory.accept('fix',corrected,provenance)
+    assert ledger.status(base['version'])=='quarantined' and ledger.replacements(base['version'])==[]
+    fresh=campaign.memory_maintenance.prepare(ProjectReview('fix',source,True,{'source':source}),[repair['repair_id']])
+    assert fresh.memory_repairs[0]['episode_revision']!=request.memory_repairs[0]['episode_revision']
+    assert len(fresh.memory_repairs[0]['concerns'])==2
+    assert first['review']['memory_judgments'][0]['evidence'][0] in fresh.memory_repairs[0]['evidence']
+    assert campaign.artifacts.put_bytes(b'second distinct failure\n') in fresh.memory_repairs[0]['evidence']
+    assert campaign.memory_maintenance.resolve('fix',record) is False
+    assert campaign.memory_maintenance.obligations()
+
+
+def test_counterevidence_revision_refreshes_source_review_instead_of_publishing_cached_decision(tmp_path):
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    ledger.access('access-1',**base,campaign_id=str(campaign.root.resolve()),project_id='late',actor_id='late',actor_role='writer')
+    observe(campaign,ledger,base)
+    repair=campaign.memory_maintenance.prioritize()
+    source=campaign.artifacts.put_bytes(b'candidate correction\n')
+    request=campaign.memory_maintenance.prepare(ProjectReview('fix',source,True,{'source':source}),[repair['repair_id']])
+    proposal_before=dict(proposal(source),operation='append',base_versions=[base])
+    review=dict(decision='accept',memory=proposal_before,memory_judgments=[],retirement_checks=[],
+        memory_resolutions=[dict(repair_id=repair['repair_id'],action='replace',reason='Initial correction',evidence=[source])])
+    record=dict(objective='learn tails',repairs=[repair['repair_id']],review=review,review_request=asdict(request),
+        review_sha256=campaign.artifacts.put_json(review),outcome=dict(host_verified=True,source_sha256=source,
+        artifacts={'source':source},observations={}))
+    campaign.state['projects']['fix']=record
+    observe(campaign,ledger,base,project_id='late',number=1,result_bytes=b'new distinct counterexample\n')
+    calls=[]
+    class Reviewer:
+        last_trace=[]
+        def review(self,request,**kwargs):
+            calls.append(request)
+            assert len(request.memory_repairs[0]['concerns'])==2
+            return dict(decision='repair',reason='New case needs a project',memory=None,
+                evidence=[source],repair={'instructions':'Test the new case','expected_evidence':'Correct output'},
+                memory_judgments=[],memory_resolutions=[],retirement_checks=[])
+    campaign.verifier=Reviewer();campaign.budget=SimpleNamespace(deadline=campaign.clock()+30)
+    campaign.scheduler.start_wave('wave','a'*64)
+    campaign._publish_wave(dict(wave_id='wave',subject={'subject_id':'s'},projects=['fix']))
+    assert len(calls)==1
+    assert ledger.replacements(base['version'])==[] and ledger.status(base['version'])=='quarantined'
+    assert campaign.memory_maintenance.obligations()
+
+
+def test_retirement_between_source_review_and_publication_requires_new_review(tmp_path):
+    from benchmarks.ascend.subject_memory import StaleMemory
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    source=campaign.artifacts.put_bytes(b'new source\n')
+    request=campaign.memory_maintenance.prepare(ProjectReview('new',source,True,{'source':source}))
+    assert request.retired_memories==()
+    ledger.transition(base['version'],'retired',event_id='new-retirement',reason='New contradictory evidence',evidence=[source])
+    with pytest.raises(StaleMemory,match='retirement history changed'):
+        campaign.memory.accept('new',proposal(source),{'observed_retirements':[]})
+    refreshed=campaign.memory_maintenance.prepare(ProjectReview('new',source,True,{'source':source}))
+    assert [row['tombstone_id'] for row in refreshed.retired_memories]==['new-retirement']
+    assert ledger.records()==[]
+
+
+def test_retirement_commit_retains_new_proof_before_origin_disappears(tmp_path,monkeypatch):
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    observe(campaign,ledger,base)
+    repair=campaign.memory_maintenance.prioritize()
+    proof=campaign.artifacts.put_bytes(b'new retirement-only independent evidence\n')
+    request=campaign.memory_maintenance.prepare(ProjectReview('retire',proof,True,{'source':proof}),[repair['repair_id']])
+    review=dict(decision='accept',memory=None,memory_resolutions=[dict(repair_id=repair['repair_id'],
+        action='retire',reason='Retired after new independent proof',evidence=[proof])])
+    record=dict(review=review,review_request=asdict(request),review_sha256=campaign.artifacts.put_json(review))
+    transition=ledger.transition
+    def interrupted(*args,**kwargs):
+        transition(*args,**kwargs)
+        raise KeyboardInterrupt('origin lost immediately after retirement commit')
+    monkeypatch.setattr(ledger,'transition',interrupted)
+    with pytest.raises(KeyboardInterrupt):campaign.memory_maintenance.resolve('retire',record)
+    campaign.artifacts.root.rename(campaign.root/'offline-origin')
+    other,_=setup(tmp_path,ledger=ledger,name='other')
+    src=other.artifacts.put_bytes(b'next project\n')
+    prepared=other.memory_maintenance.prepare(ProjectReview('next',src,True,{'source':src}))
+    assert prepared.retired_memories[0]['evidence']==[proof]
+    assert other.memory_maintenance.read_artifact(proof,remaining_seconds=1)==b'new retirement-only independent evidence\n'
