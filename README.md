@@ -55,22 +55,13 @@ host owns compilation, execution, numerical checks, timing and profiling.
 
 An independent project verifier reads source and retained execution evidence,
 can request additional host checks, and can send even a numerically passing
-project back for repair. Project acceptance and memory usefulness are separate:
-new memory remains a draft until its own admission process finishes.
-
-For memory admission, a verifier selects and freezes a small transfer task. Fresh
-control and treatment Actors receive the same task; their memory differs only by
-the proposal being tested. Execution order is counterbalanced across comparisons.
-The judge examines outcomes and logs, can request a targeted follow-up, and can
-accept, request a rewrite, reject or remain inconclusive. Incomplete or
-infrastructure-failed arms cannot establish benefit. Acceptance publishes a new
-immutable memory version for later waves; it does not change an in-progress
-Actor's snapshot. Other waves may continue using older accepted memory while
-admission runs.
+project back for repair. Source-approved reusable memories publish immediately as
+immutable KDB versions, with their supporting code and evidence. There is no
+separate memory A/B admission experiment.
 
 Subjects can also carry a host-qualified target or an optimizer task. These reuse
 their existing correctness contracts. See [subject configuration and memory
-admission](docs/subject-curriculum.md) for the complete workflow and defaults.
+publication](docs/subject-curriculum.md) for the complete workflow and defaults.
 
 | Target binding | Implemented execution |
 | --- | --- |
@@ -116,13 +107,7 @@ flowchart TD
     Host --> Evidence[Retained code, logs and observations]
     Evidence --> ProjectVerifier[Independent project verifier]
     ProjectVerifier -->|repair| Curriculum
-    ProjectVerifier --> Draft[Draft memory]
-    Draft --> Trial[Fresh matched control / treatment Actors]
-    Trial --> Host
-    Trial --> Admission[Memory usefulness judgment]
-    Evidence --> Admission
-    Admission -->|accepted version| Memory
-    Admission -->|rewrite or follow-up| Draft
+    ProjectVerifier -->|source-approved version| Memory
     Evidence --> Reports[Reports and dashboard]
 ```
 
@@ -283,10 +268,9 @@ the VM host has capacity.
 | `optimizer.reference.load_reference` / `validate_reference` | Authenticate frozen bundles and validate retained workload integrity; existing native entrypoints remain compatible |
 | `OptimizationLoop` backend `prepare/evaluate/profile` | Frozen suite preparation, factual candidate evaluation and separate diagnostics; retained operations must be idempotent |
 | `SubjectExecutor` | Graph and optimizer execution adapters returning host observations and artifact references |
-| Project verifier and memory admission | Independent source/outcome review, repair requests and accepted-version publication |
+| Project verifier and memory publication | Independent source/outcome review, repair requests and accepted-version publication |
 | KnowledgeAgent and artifact readers | Selected-collection, citation-validated retrieval and admitted evidence reads |
 | `python -m optimizer` | Job discovery, creation, inspection, events, stop and explicit budget extension |
-| `python -m benchmarks.ascend.experiment_manifest export` | Readable local index of a completed memory comparison, referencing retained evidence |
 
 Reference source is trusted workload code executed inside an isolated worker,
 not sandboxed Python. The host chooses the cases and comparison policy; candidate
@@ -325,28 +309,14 @@ collections and Actors retrieve against their frozen active-version view.
 Drafts do not enter ordinary accepted-memory retrieval. Reference-exposed
 benchmark material must remain labeled as such.
 
-Inspect `subject-campaign.json`, project outcomes, `memory-reviews/`, accepted
+Inspect `subject-campaign.json`, project outcomes, accepted
 memory and their content-addressed evidence together. Optimizer jobs retain
 immutable submissions, event chains, source and operation results. Missing metrics
 and unavailable diagnostics are explicit. Budget exhaustion does not erase an earlier correct candidate or prove useful memory.
 Full profiler trees may remain on the execution host; compact records point to
 retained evidence rather than inventing missing reports.
 
-The compact memory-trial manifest provides a readable local index of a completed
-comparison, including an inconclusive judgment:
 
-```bash
-python -m benchmarks.ascend.experiment_manifest export \
-  --trial /private/subject-run/memory-reviews/REVIEW/revision-0 \
-  --output /private/trial-inspection
-```
-
-It writes `manifest.json`, readable control/treatment memory snapshots and
-`task.json` when a task was selected. Evidence paths point back to original
-records; keep the export and trial directories in their relative locations.
-The manifest summarizes order, allocations, model/runtime and judgment using
-existing identities, with no new hashes. See the
-[export guide](docs/memory-trial-manifest.md) for required records and output details.
 
 ### Dashboard
 
@@ -413,12 +383,12 @@ Figure and reporting provenance are documented in the [paper guide](docs/PAPER.m
 
 | Topic | Guide |
 | --- | --- |
-| Current Ascend learning and memory admission | [Subject curriculum](docs/subject-curriculum.md) |
+| Current Ascend learning and memory publication | [Subject curriculum](docs/subject-curriculum.md) |
 | Historical phase compatibility | [Phase 2 retirement](docs/phase2-retirement.md) · [Phase 1 launcher](docs/ascend-campaigns.md) |
 | Runtime and coding setup | [Local execution](docs/local-kernel-execution.md) · [Pi](docs/PI_CODING_RUNTIME.md) · [Target configuration](docs/ascend-target-launcher.md) |
 | Optimizer contracts | [Jobs](docs/optimizer.md) · [Reference](docs/optimizer-reference.md) · [Native ABI](docs/optimizer-native.md) · [Worker](docs/optimizer-worker.md) |
 | Knowledge retrieval | [Expanded reference KDB](docs/expanded-kdb.md) · [Adaptive librarian](docs/knowledge/adaptive-librarian.md) |
-| Evidence and observation | [Memory-trial manifest](docs/memory-trial-manifest.md) · [Optimizer artifacts](docs/OPTIMIZER_ARTIFACTS.md) · [Dashboard](dashboard/README.md) |
+| Evidence and observation | [Optimizer artifacts](docs/OPTIMIZER_ARTIFACTS.md) · [Dashboard](dashboard/README.md) |
 | Desktop integration | [Quickstart](docs/desktop-quickstart.md) · [Architecture](docs/ARCHITECTURE.md) · [OSWorld operations](docs/OPERATIONS.md) · [ALE](docs/ALE.md) |
 | Research and development | [Paper](docs/PAPER.md) · [Contributing](docs/CONTRIBUTING.md) · [Third-party attribution](docs/THIRD_PARTY.md) |
 

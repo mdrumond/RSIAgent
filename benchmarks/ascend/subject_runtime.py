@@ -137,11 +137,11 @@ def compose_production(settings, *, target, root, initial_memory, max_seconds, n
 def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                            max_seconds=7200, compose=compose_production, previous_runtime_configs=None):
     subjects = tuple(subjects)
-    admission_mode = settings.get('memory_admission_mode', 'paired')
-    if admission_mode not in {'paired', 'focused'}:
-        raise ValueError('memory_admission_mode must be paired or focused')
-    if admission_mode == 'focused' and settings.get('actor_memory_delivery', 'indexed') != 'kdb-only':
-        raise ValueError('focused admission requires kdb-only Actor memory delivery')
+    obsolete = {'memory_admission_mode', 'memory_verification', 'memory_review_seconds',
+                'memory_trial_seconds', 'memory_arm_seconds', 'memory_verifier_model',
+                'verify_memory_usefulness', 'usefulness_pair_seconds'} & settings.keys()
+    if obsolete:
+        raise ValueError('Removed memory A/B settings: ' + ', '.join(sorted(obsolete)))
     memory_delivery = settings.get('actor_memory_delivery', 'indexed')
     if memory_delivery not in {'indexed', 'kdb-only'}:
         raise ValueError('actor_memory_delivery must be indexed or kdb-only')
@@ -503,150 +503,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign.model_identity = profile.identity.as_dict()
     campaign.runtime_identity = getattr(actor.executor, 'runtime_identity', None)
 
-    def select_trial(proposal, *, remaining_seconds, probe_request=None, prior_task=None, history=()):
-        lesson = {key: str(proposal.get(key, ''))[:1024] for key in
-                  ('summary', 'applicability', 'preconditions', 'expectations', 'limitations')}
-        lesson['proposal_sha256'] = store.put_bytes(canonical(proposal))
-        lesson['source_examples'] = {key: {field: value for field, value in proposal[key].items() if field != 'text'}
-                                     for key in ('before', 'after') if proposal.get(key) is not None}
-        followup = ''
-        selection_artifacts = {}
-        if probe_request is not None:
-            selection_artifacts['history'] = store.put_bytes(canonical(history))
-            for index, row in enumerate(history):
-                selection_artifacts.update({f'history:{index}:{role}':sha for role,sha in row.get('artifacts',{}).items()})
-            followup = '\nDiscriminate this unresolved evidence question using a different workload contract: ' + json.dumps(dict(
-                request=probe_request, prior_task=prior_task,
-                history_sha256=selection_artifacts['history'], history_count=len(history),
-                history=[dict(decision=row.get('decision'), reason=str(row.get('reason', ''))[:1024],
-                              task=row.get('trial_task')) for row in history[-8:]]))
-            followup += '\nUse the question only to choose inputs/operations/preconditions. Keep all implementation advice out of both arms task/hypothesis.'
-            followup += '\nRead full history with JSON {"read_artifact":{"sha256":"...","offset":0}} before authoring the ordinary DECISION: WAVE response. History contains hashes of admitted prior artifacts, which may also be read.'
-        context = dict(current_subject=dict(subject_id='memory-transfer', task=None, objective=(
-            'Author exactly ONE SMALL transfer project that could benefit from this proposed lesson. '
-            'Use different inputs/extents from its source project. Freeze ordinary host acceptance. '
-            'Do not include lesson advice, code snippets or solution strategy in the task/hypothesis. '
-            'Proposed lesson for selecting the workload only: ' + json.dumps(lesson) + followup)), repairs=[])
-        context['selection_artifacts'] = selection_artifacts
-        return select_wave(context, campaign.memory.snapshot(), {}, remaining_seconds=remaining_seconds,
-                           project_limit=1)[0]
 
-    def execute_trial_arm(item, snapshot, directory, *, remaining_seconds):
-        """Fresh production session and isolated compilation workspace per arm."""
-        deadline = time.monotonic() + remaining_seconds
-        def available():
-            seconds = deadline - time.monotonic()
-            if seconds <= 0:
-                raise TimeoutError('trial arm elapsed allocation exhausted before execution')
-            return seconds
-        from .runtime_allocation import configuration
-        current_semantics = {role: configuration(raw)[0] for role, raw in referenced_settings(settings, contents=True).items()}
-        if current_semantics != identity['referenced_semantic_sha256']:
-            raise ValueError('referenced runtime settings changed before trial composition')
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        selection = argparse.ArgumentParser(add_help=False)
-        selection.add_argument('--worker-config'); selection.add_argument('--config')
-        arguments = list(settings.get('phase1_arguments', []))
-        options, _ = selection.parse_known_args(arguments)
-        base = options.worker_config or (options.config if target == 'a3' else None)
-        worker = json.loads(Path(base).read_bytes()) if base else {}
-        field = 'workspace' if worker.get('execution') == 'local' else 'remote_workspace'
-        if not worker.get(field):
-            raise ValueError('trial arms require a configured execution workspace')
-        arm_id = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()
-        worker[field] = str(Path(worker[field]) / 'subject-trials' / arm_id)
-        worker.pop('physical_devices', None)
-        if campaign.runtime_identity is not None:
-            worker['physical_device'] = int(campaign.runtime_identity['device'])
-        for key in ('cache_directory', 'compile_cache_directory'):
-            if key in worker:
-                worker[key] = str(Path(worker[field]) / key)
-        path = directory / 'worker.json'
-        atomic(path, canonical(worker)); path.chmod(0o600)
-        filtered, skip = [], False
-        for argument in arguments:
-            if skip:
-                skip = False
-            elif argument == '--worker-config':
-                skip = True
-            elif not argument.startswith('--worker-config='):
-                filtered.append(argument)
-        arm_settings = dict(settings, memory_verification=False, phase1_arguments=[*filtered, '--worker-config', str(path)])
-        if bound.get('environment_check_cache'):
-            arm_settings['environment_check_cache'] = bound['environment_check_cache']
-        if bound.get('native_operation_root'):
-            arm_settings['native_operation_root'] = bound['native_operation_root']
-        if optimizer_config is not None:
-            arm_settings['optimizer_worker_config'] = dict(optimizer_config, **{field: worker[field]})
-            for key in ('cache_directory', 'compile_cache_directory'):
-                if key in arm_settings['optimizer_worker_config']:
-                    arm_settings['optimizer_worker_config'][key] = str(Path(worker[field]) / key)
-        retained = directory / 'runtime' / 'subject-runtime.json'
-        allocation = json.loads(retained.read_bytes())['max_seconds'] if retained.exists() else remaining_seconds
-        from .execution import process_deadline
-        with process_deadline(deadline):
-            child = build_subject_campaign(arm_settings, target=target, root=directory / 'runtime',
-                subjects=subjects, initial_memory=initial_memory, max_seconds=allocation, compose=compose)
-        available()
-        for record in json.loads(snapshot)['memories']:
-            for digest in memory_artifacts(record):
-                child.artifacts.put_bytes(store.read_bytes(digest))
-        for digest in set(item.get('recovery', {}).get('artifacts', {}).values()):
-            child.artifacts.put_bytes(store.read_bytes(digest))
-        return child.execute(item, snapshot, directory / 'project', remaining_seconds=available())
-
-    def replay_memory_source(request, source_sha256, directory, *, remaining_seconds):
-        """Replay full retained source against its source project's host contract."""
-        from .execution import process_deadline
-        item = plans.get(request['project_id'])
-        if item is not None:
-            spec = ProjectSpec.from_mapping(item['spec'])
-        else:
-            spec = ProjectSpec.from_mapping(store.read_json(request['artifacts']['contract']))
-        if spec.project_id != request['project_id']:
-            raise ValueError('retained replay contract project differs from source review')
-        policy.admit(spec)
-        source = store.read_bytes(source_sha256)
-        with process_deadline(time.monotonic() + remaining_seconds):
-            result = actor.executor.execute(spec, source.decode('utf-8'))
-        branch = ContentAddressedArtifacts(Path(directory) / 'artifacts')
-        refs = {name: branch.put_json(value) for name, value in result.artifacts.items()}
-        refs['source'] = branch.put_bytes(source)
-        observations = dict(classification=result.evidence.classification.value,
-            detail=result.evidence.detail, contract_sha256=branch.put_json(spec.as_dict()))
-        refs['result:replay'] = branch.put_json(observations)
-        from .subject_execution import SubjectOutcome
-        return SubjectOutcome(result.evidence.verified, source_sha256, refs, observations, branch.root)
-
-    campaign.replay_memory_source = replay_memory_source
-    campaign.select_trial, campaign.execute_trial_arm = select_trial, execute_trial_arm
-    if settings.get('memory_verification', True):
-        from .memory_admission import MemoryAdmission
-        from .memory_verifier import MemoryVerifier
-        if admission_mode == 'focused':
-            from .focused_memory import FocusedMemoryVerifier
-            judge_type = lambda complete, select, execute, **kw: FocusedMemoryVerifier(
-                complete, select, replay_memory_source, execute, store.read_bytes,
-                measure_pair=bound.get('measure_memory_pair'), witness_cache=root / 'memory-replay-witnesses',
-                replay_binding=dict(semantic_configs=identity['referenced_semantic_sha256'],
-                    settings_sha256=identity['settings_sha256'],
-                    routes=[transport.runtime_identity for transport in bound.get('transports', ())]), **kw)
-        else:
-            judge_type = MemoryVerifier
-        judge = judge_type(role_complete('memory_verifier'), select_trial, execute_trial_arm,
-            model_identity=campaign.model_identity, runtime_identity=campaign.runtime_identity,
-            max_seconds=settings.get('memory_trial_seconds', 1800),
-            arm_seconds=settings.get('memory_arm_seconds', 600))
-        rewrite_agent = RuntimeVerifier(verifier_complete, knowledge.read_artifact,
-            query_knowledge=knowledge.query, session_factory=verifier_sessions)
-        def rewrite(request, *, feedback, max_seconds):
-            try:
-                return rewrite_agent.review(request, feedback=feedback, max_seconds=max_seconds)
-            finally:
-                store.put_json(rewrite_agent.last_trace)
-        campaign.memory_gate = MemoryAdmission(root / 'memory-reviews', campaign.memory, judge, rewrite,
-            max_seconds=settings.get('memory_review_seconds', 3600), parent_remaining=campaign._remaining)
     return campaign
 
 
@@ -661,9 +518,9 @@ def main(argv=None, *, builder=build_subject_campaign):
     parser.add_argument('--max-seconds', type=float, default=7200)
     args = parser.parse_args(argv)
     if args.action == 'report':
-        from .memory_status import admission_report, review_report
+        from .memory_status import review_report
         state = json.loads((args.root / 'subject-campaign.json').read_bytes())
-        state = review_report(state, admission_report(args.root / 'memory-reviews', memory_root=args.root / 'memory'))
+        state = review_report(state)
         state['subjects'] = json.loads((args.root / 'subjects.json').read_bytes())
         print(json.dumps(state, sort_keys=True))
         return state
@@ -672,11 +529,6 @@ def main(argv=None, *, builder=build_subject_campaign):
     campaign = builder(json.loads(args.config.read_bytes()), target=args.target, root=args.root,
         subjects=load_subjects(args.subjects), initial_memory=args.initial_memory.read_bytes(),
         max_seconds=args.max_seconds)
-    try:
-        result = getattr(campaign, args.action)()
-    finally:
-        gate = getattr(campaign, 'memory_gate', None)
-        if gate is not None:
-            gate.close()
+    result = getattr(campaign, args.action)()
     print(json.dumps(result, sort_keys=True))
     return result

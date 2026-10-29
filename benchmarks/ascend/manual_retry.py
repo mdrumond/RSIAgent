@@ -16,9 +16,6 @@ class ManualPhase1Retry:
         self.store = FeedbackStore(job['feedback_root'])
         self.time = Phase2TimeBudget(self.root, job['phase2_max_seconds'])
         runner._remaining_seconds = lambda: self.time.remaining
-        verifier = getattr(runner, 'usefulness_verifier', None)
-        if verifier is not None:
-            verifier.remaining_seconds = runner._remaining_seconds
         # Reuse the same original-spec execution and evidence import as automatic remediation.
         self.retry = object.__new__(AutomaticRemediation)
         self.retry.runner, self.retry.target, self.retry.store = runner, job['target'], self.store
@@ -39,7 +36,6 @@ class ManualPhase1Retry:
                 raise ValueError('Original retry did not retain a committed observation')
             for row in records:
                 self.store.link_original_retry(self.row['feedback_id'], row['feedback_id'])
-            self.retry._assess_retry(self.root)
         return self.report()
 
     def report(self):

@@ -134,42 +134,6 @@ def test_native_worker_merge_distinguishes_product_from_route(tmp_path, worker, 
     assert merged['target'] == 'a3-product' and merged['transport_target'] == expected
 
 
-def test_full_native_worker_arm_copies_keep_registered_route_and_isolation(tmp_path, monkeypatch):
-    from benchmarks.ascend import subject_runtime
-    from benchmarks.ascend.subjects import Subject
-    from test_subject_runtime import bound
-    native = dict(target='a3-product', transport_target='registry-target', runtime='py312-torch',
-        arch='dav-2201', execution_profile='gz-a3', physical_device=3,
-        guide='retained-guide', cpl_skills_revision='a'*40, cpl_remote='/skill/cpl-remote',
-        validation_wrapper='/unused', remote_workspace='/owned/run',
-        environment_identity={'cann_version':'pinned','profiler_version':'unavailable'})
-    path = tmp_path/'native.json'; path.write_text(json.dumps(native))
-    routes = []
-    def compose(settings, **options):
-        import argparse
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.add_argument('--config'); parser.add_argument('--worker-config')
-        arguments, _ = parser.parse_known_args(settings['phase1_arguments'])
-        merged = runtime.load_native_config(arguments.config, arguments.worker_config)
-        routes.append(merged)
-        if len(routes) > 1:
-            assert settings['environment_check_cache'] == str(tmp_path/'shared-probes')
-            assert settings['native_operation_root'] == str(tmp_path/'campaign')
-        return dict(bound(options['root']), environment_check_cache=str(tmp_path/'shared-probes'),
-                    native_operation_root=str(tmp_path/'campaign'))
-    class Execution:
-        def __init__(self, *args): pass
-        def graph(self, request, **kwargs): return request
-    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
-    campaign = subject_runtime.build_subject_campaign({'phase1_arguments':['--config',str(path)]},
-        target='a3',root=tmp_path/'campaign',subjects=[Subject('s','copies')],initial_memory=b'',compose=compose)
-    item = dict(project_id='transfer', spec=_project('transfer','gm-ub-movement'))
-    for arm in ['control','treatment']:
-        campaign.execute_trial_arm(item,campaign.memory.snapshot(),tmp_path/arm,remaining_seconds=60)
-    assert [row['transport_target'] for row in routes] == ['registry-target']*3
-    assert [row['target'] for row in routes] == ['a3-product']*3
-    assert routes[1]['remote_workspace'] != routes[2]['remote_workspace']
-    assert routes[1]['runtime'] == routes[2]['runtime'] == 'py312-torch'
 
 
 @pytest.mark.parametrize('error_name, expected', [('PiCancelled','operator-stop'),('PiDeadlineError','operator-stop'),('PiProviderError',None)])
@@ -203,7 +167,7 @@ def test_changed_device_has_distinct_retained_namespace_and_preserves_old_record
 def test_background_trial_pending_operation_blocks_foreground_until_settled(tmp_path, monkeypatch):
     binding = tmp_path/'foreground'
     bound, calls = compose(binding, monkeypatch, operation_root=tmp_path)
-    journal = tmp_path/'memory-reviews/trial/control/runtime/transport/operation.json'
+    journal = tmp_path/'projects/other/runtime/transport/operation.json'
     journal.parent.mkdir(parents=True)
     journal.write_text(json.dumps(dict(state='queued', handle='remote:registry-target:job:trial')))
     with pytest.raises(ProjectInfrastructureError, match='unsettled'):
@@ -221,7 +185,7 @@ def test_measurement_callbacks_readmit_after_last_correctness_run(tmp_path, monk
     bound, calls = compose(tmp_path/'foreground', monkeypatch, operation_root=tmp_path)
     bound['actor'].executor.execute('correctness')
     before = list(calls)
-    pending = tmp_path/'memory-reviews/trial/runtime/operation.json'
+    pending = tmp_path/'projects/other/runtime/operation.json'
     pending.parent.mkdir(parents=True)
     pending.write_text(json.dumps(dict(state='queued',handle='remote:registry-target:job:trial')))
     callback = getattr(bound['actor'],name)

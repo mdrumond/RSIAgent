@@ -55,10 +55,8 @@ def test_subject_campaign_recomposes_after_permitted_device_only_migration(tmp_p
     kwargs=dict(target='a3',root=root,subjects=[Subject('s','copies')],initial_memory=b'',
                 compose=lambda settings,**options:bound(options['root']))
     first = build_subject_campaign(settings,**kwargs)
-    first.memory_gate.close()
     path.write_bytes(raw(1))
     second = build_subject_campaign(settings,**kwargs)
-    second.memory_gate.close()
     assert json.loads((root/'execution-allocations.json').read_bytes())[-1]['allocation']['config']['physical_device']==1
 
 
@@ -77,10 +75,8 @@ def test_shared_admission_scope_preserves_existing_experiment_identity(tmp_path)
     options = dict(target='a3', root=tmp_path/'campaign', subjects=[Subject('s','copies')],
         initial_memory=b'', compose=lambda settings, **kwargs:bound(kwargs['root']))
     first = build_subject_campaign({}, **options)
-    first.memory_gate.close()
     before = (options['root']/'subject-runtime.json').read_bytes()
     resumed = build_subject_campaign({'native_operation_root':str(options['root'])}, **options)
-    resumed.memory_gate.close()
     assert (options['root']/'subject-runtime.json').read_bytes() == before
 
 

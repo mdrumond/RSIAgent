@@ -69,7 +69,7 @@ def test_subject_composition_selects_configured_verifier_model(tmp_path, monkeyp
     monkeypatch.setattr('benchmarks.ascend.pi_project_verifier.PiReviewSession',
                         lambda **kwargs: made.append(kwargs) or nullcontext(kwargs))
     campaign = build_subject_campaign({'verifier_engine': 'pi', 'verifier_model': 'deepseek-flash',
-        'memory_verification': False}, target='a3', root=tmp_path,
+        }, target='a3', root=tmp_path,
         subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: bound(tmp_path))
     with campaign.verifier.session_factory(max_seconds=5):
         pass
@@ -88,15 +88,15 @@ def test_verifier_engine_is_pinned_and_legacy_resume_keeps_completion(tmp_path):
         return result
     options = dict(target='a3', root=tmp_path, subjects=[Subject('s', 'copies')],
                    initial_memory=b'', compose=compose)
-    campaign = build_subject_campaign({'memory_verification': False}, **options)
+    campaign = build_subject_campaign({}, **options)
     assert campaign.verifier.session_factory is None
     identity = tmp_path/'project-verifier-runtime.json'
     assert json.loads(identity.read_text())['engine'] == 'completion'
     live[0] = True
     with pytest.raises(ValueError, match='project verifier engine or model changed'):
-        build_subject_campaign({'memory_verification': False}, **options)
+        build_subject_campaign({}, **options)
     identity.unlink()  # Simulate a checkpoint written before engine metadata existed.
-    legacy = build_subject_campaign({'memory_verification': False}, **options)
+    legacy = build_subject_campaign({}, **options)
     assert legacy.verifier.session_factory is None
     assert json.loads(identity.read_text())['engine'] == 'completion'
 
@@ -109,7 +109,7 @@ def test_new_live_composition_pins_pi_engine(tmp_path):
         result = bound(tmp_path)
         result['provider'] = SimpleNamespace(_transport=openai_compatible_transport)
         return result
-    campaign = build_subject_campaign({'memory_verification': False}, target='a3', root=tmp_path,
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path,
         subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
     assert campaign.verifier.session_factory is not None
     identity = json.loads((tmp_path/'project-verifier-runtime.json').read_text())
@@ -230,7 +230,7 @@ def test_admitted_runtime_config_preserves_verifier_route_and_retained_review(tm
     import hashlib
     native = tmp_path/'native.json'
     native.write_text(json.dumps({'physical_device': 0, 'workspace': 'retained', 'compiler': 'pin'}))
-    settings = {'phase1_arguments': ['--worker-config', str(native)], 'memory_verification': False}
+    settings = {'phase1_arguments': ['--worker-config', str(native)]}
     root = tmp_path/'run'
     root.mkdir()
     if legacy:
@@ -317,63 +317,6 @@ def test_production_review_boundary_normalizes_pi_failures(monkeypatch, failure,
     assert not any(event['kind'] == 'decision' for event in h.agent.last_trace)
 
 
-def test_real_pi_provider_outage_holds_rewrite_and_resume_can_publish(tmp_path, monkeypatch):
-    from dataclasses import asdict
-    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    from benchmarks.ascend.memory_admission import MemoryAdmission
-    from benchmarks.ascend.subject_memory import SubjectMemory
-    from test_memory_admission import Evaluation
-    from test_project_verifier_agent import SOURCE, RESULT, LOG
-    try:
-        runtime_preflight()
-    except RuntimeError:
-        pytest.skip('Node22 and pinned Pi required')
-    selected = next(p.backend_model for p in MODEL_IDENTITIES if p.backend_model.value == 'deepseek-flash')
-    provider = DirectCompletionProvider({'DEEPSEEK_API_KEY': 'private-test-key'}, models=[selected])
-    outage = [True]
-    actions = iter([*prerequisites(), decision(memory())])
-    class Unavailable:
-        status_code = 503
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-        def json(self): return {'error': {'message': 'temporary test outage', 'type': 'unavailable'}}
-    def http(*_, **options):
-        if outage[0]:
-            return Unavailable()
-        action = next(actions)
-        name, args = ('submit_review', action) if 'decision' in action else next(iter(action.items()))
-        return stream(name, args)
-    monkeypatch.setattr('coding.pi.gateway.requests.post', http)
-    artifacts = ContentAddressedArtifacts(tmp_path/'artifacts')
-    for data in (SOURCE, RESULT, LOG):
-        artifacts.put_bytes(data)
-    agent = ProjectVerifierAgent(None, lambda digest, **_: artifacts.read_bytes(digest),
-        query_knowledge=lambda *a, **k: {'memories': [], 'citations': []},
-        session_factory=session_factory({}, provider, SimpleNamespace(model='deepseek-flash')))
-    accepted = SubjectMemory(tmp_path/'memory', b'')
-    evaluator = Evaluation(['rewrite', 'rewrite', 'accept'])
-    gate = MemoryAdmission(tmp_path/'gate', accepted, evaluator, agent.review, max_seconds=60)
-    try:
-        gate.submit('draft', memory(), {}, asdict(request()), remaining_seconds=60)
-        gate.wait(remaining_seconds=15)
-        assert gate.poll(remaining_seconds=5) == []  # Future/result does not abort the campaign.
-        held = json.loads(gate._path('draft').read_bytes())
-        assert held['status'] == 'inconclusive'
-        assert held['error_type'] == 'InfrastructureFailure'
-        assert held['rewrites'] == 0
-        assert accepted.records() == []
-        assert any(e['kind'] == 'pi-provider' and e['payload']['status'] == 'provider_error'
-                   for e in agent.last_trace)
-        gate.close()
-        outage[0] = False
-        gate.start_session()
-        gate.wait(remaining_seconds=15)
-        assert gate.poll(remaining_seconds=5)[0]['outcome'] == 'accepted'
-        assert accepted.records()[0]['proposal'] == memory()
-    finally:
-        gate.close()
 
 
 def test_real_pi_pages_aggregate_feedback_then_executes_required_reads(monkeypatch):

@@ -47,7 +47,3 @@ can request subsequent pages. Each read revalidates the complete artifact hash.
 Reads allow at most 65536 bytes per page and cannot access another collection or
 an artifact absent from the selected snapshot. The snapshot and database can be
 transferred to fresh consumers without producer directories.
-
-For paired evaluation, `snapshot.direct_documents()` returns the complete
-searchable document bundle for a direct-memory treatment. Use exactly that
-snapshot for retrieval, and keep held-out answers out of both treatments.

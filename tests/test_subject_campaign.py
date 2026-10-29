@@ -178,35 +178,6 @@ def test_second_controller_cannot_start_while_original_work_is_active(tmp_path):
     assert not (tmp_path/'elapsed.json').exists()
 
 
-def test_late_memory_rejection_reaches_curriculum_before_completion(tmp_path):
-    class Review:
-        last_trace=[]
-        def review(self,req,**kw):return dict(decision='accept',reason='verified',
-            evidence=[req.source_sha256],repair=None,memory=proposal(req.source_sha256))
-    class LateGate:
-        pending=[]
-        def submit(self,review_id,*a,**kw):self.pending.append(review_id)
-        def poll(self,**kw):
-            if c.scheduler.context()['current_subject'] is not None or not self.pending:return []
-            pid=self.pending.pop(0)
-            return [dict(review_id=pid,outcome='rejected' if pid=='first' else 'accepted',
-                judgment=dict(reason='memory ignored'),rewrites=2,provenance=dict(subject_id='s'))]
-        def wait(self,**kw):pass
-        def close(self):pass
-    actions=iter([dict(action='advance'),dict(action='revisit',subject_id='s'),dict(action='advance')])
-    contexts=[]
-    def decide(messages,**kw):
-        contexts.append(json.loads(messages[1]['content']))
-        return json.dumps(dict(next(actions),reason='review coverage',evidence=['retained']))
-    def execute(*a,**kw):
-        sha=c.artifacts.put_bytes(b'source\n')
-        return SubjectOutcome(True,sha,{'source':sha},{},c.artifacts.root)
-    c=SubjectCampaign(tmp_path,[Subject('s','s',1)],b'',
-        select_wave=lambda *a,**kw:[dict(project_id='first' if not c.state['waves'] else 'revisit')],
-        execute=execute,verifier=Review(),complete=decide,memory_gate=LateGate())
-    assert c.run()['terminal']=='COMPLETE'
-    assert len(c.state['waves'])==2
-    assert contexts[1]['memory']['memory_reviews']['first']['judgment']['reason']=='memory ignored'
 
 
 def test_progression_context_preserves_coverage_without_repeating_large_sources(tmp_path):
@@ -246,11 +217,7 @@ def test_verifier_receives_frozen_individual_contract_for_subject_control(tmp_pa
 @pytest.mark.parametrize('interrupted_at', [0, 1])
 def test_interrupted_execution_holds_automatic_wave_and_resume(tmp_path, interrupted_at):
     now = [0.0]
-    calls, reviews, gate_calls = [], [], []
-    class Gate:
-        def start_session(self): gate_calls.append('start')
-        def poll(self, **kw): gate_calls.append('poll'); return []
-        def close(self): gate_calls.append('close')
+    calls, reviews = [], []
     class NoReview:
         def review(self, *args, **kw): reviews.append(args); raise AssertionError('unsettled wave reviewed')
     def execute(item, memory, directory, **kw):
@@ -267,7 +234,7 @@ def test_interrupted_execution_holds_automatic_wave_and_resume(tmp_path, interru
     c = SubjectCampaign(tmp_path, [Subject('s', 'subject', 1)], b'initial',
         select_wave=lambda *a, **kw: [dict(project_id=p) for p in ['one', 'two', 'three']],
         execute=execute, verifier=NoReview(), complete=lambda *a, **kw: None,
-        memory_gate=Gate(), max_seconds=100, clock=lambda: now[0])
+        max_seconds=100, clock=lambda: now[0])
     first = c.run()
     assert first['terminal'] == 'OBSERVATION_REQUIRED'
     assert calls == ['one', 'two'][:interrupted_at + 1]
@@ -278,9 +245,7 @@ def test_interrupted_execution_holds_automatic_wave_and_resume(tmp_path, interru
     inventory = json.loads(c.artifacts.read_bytes(retained['operations_inventory_sha256']))
     assert json.loads(c.artifacts.read_bytes(inventory[0]['artifact_sha256']))['handle'] == 'remote:target:job:retained'
     before = json.loads((tmp_path / 'elapsed.json').read_bytes())
-    gate_calls.clear()
     assert c.resume()['terminal'] == 'OBSERVATION_REQUIRED'
-    assert gate_calls == ['close']  # No background A/B polling/session or project work on resume.
     assert calls == ['one', 'two'][:interrupted_at + 1] and not reviews
     after = json.loads((tmp_path / 'elapsed.json').read_bytes())
     assert after['max_seconds'] == before['max_seconds'] == 100
@@ -325,3 +290,27 @@ def test_interrupted_wave_at_elapsed_deadline_keeps_partial_outcome(tmp_path):
     assert report['observation_required'][0]['project_id'] == 'p'
     assert c.resume()['terminal'] == 'TIME_BUDGET_EXHAUSTED'
     assert json.loads((tmp_path / 'elapsed.json').read_bytes())['elapsed_seconds'] == 10
+
+
+def test_source_approved_memory_publishes_before_curriculum_advance(tmp_path):
+    events = []
+    class Approved:
+        last_trace = []
+        def review(self, request, **options):
+            events.append('source-review')
+            return dict(decision='accept', reason='evidence supports lesson',
+                evidence=[request.source_sha256], repair=None, memory=proposal(request.source_sha256))
+    def execute(item, snapshot, directory, **options):
+        events.append('execute')
+        sha = campaign.artifacts.put_bytes(b'source\n')
+        return SubjectOutcome(True, sha, {'source': sha}, {}, campaign.artifacts.root)
+    def advance(*args, **options):
+        assert len(campaign.memory.records()) == 1
+        assert events == ['execute', 'source-review', 'index']
+        return json.dumps(dict(action='advance', reason='lesson published', evidence=['p']))
+    campaign = SubjectCampaign(tmp_path, [Subject('s','learn',1)], b'',
+        select_wave=lambda *a, **kw:[dict(project_id='p')], execute=execute,
+        verifier=Approved(), complete=advance, index_memory=lambda *a: events.append('index'))
+    assert campaign.run()['terminal'] == 'COMPLETE'
+    assert events == ['execute', 'source-review', 'index']
+    assert not (tmp_path/'memory-reviews').exists()

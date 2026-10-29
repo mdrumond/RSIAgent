@@ -10,8 +10,6 @@ class ReviewContextRecords(ContextRecords):
         ('host', 'project', 'rewrite_feedback', 'prior_draft'),
         ('host', 'project', 'rewrite_feedback', 'retained_lessons'),
         ('host', 'project', 'rewrite_feedback', 'previous_proposal'),
-        ('host', 'project', 'rewrite_feedback', 'usefulness', 'arms'),
-        ('host', 'project', 'rewrite_feedback', 'usefulness', 'evidence'),
         ('host', 'tool_observations'),
         ('host', 'validation_feedback', 'allowed_citations'),
         ('host', 'validation_feedback', 'allowed_evidence'),

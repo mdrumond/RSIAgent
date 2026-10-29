@@ -50,40 +50,6 @@ def test_report_needs_no_provider_configuration_or_runtime(tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)['terminal'] == 'COMPLETE'
 
 
-def test_offline_report_explains_legacy_source_and_held_memory_without_side_effects(tmp_path, capsys, monkeypatch):
-    from benchmarks.ascend.memory_admission import MemoryAdmission
-    from benchmarks.ascend.subject_campaign import SubjectCampaign
-    from benchmarks.ascend.memory_status import admission_report, review_report
-    state = dict(projects={
-        'source': dict(review=dict(decision='repair', reason='Unsupported claim', memory=None)),
-        'eligible': dict(review=dict(decision='accept', memory={'summary': 'scoped lesson'}))})
-    (tmp_path / 'subject-campaign.json').write_text(json.dumps(state))
-    (tmp_path / 'subjects.json').write_text(json.dumps({'frontier': 1}))
-    reviews = tmp_path / 'memory-reviews'
-    directory = reviews / 'retained'
-    directory.mkdir(parents=True)
-    job = dict(review_id='eligible', status='inconclusive', rewrites=0, evaluations=[
-        dict(decision='inconclusive', reason='Environment probe queued', validity={'control': False},
-             arms={'control': dict(host_verified=False, observations=dict(
-                 classification='interrupted', error_type='ProjectInfrastructureError'))})])
-    (directory / 'job.json').write_text(json.dumps(job))
-    before = {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()}
-    def forbidden(*args, **kwargs):
-        pytest.fail('report constructed an active campaign or worker')
-    monkeypatch.setattr(MemoryAdmission, '__init__', forbidden)
-    monkeypatch.setattr(SubjectCampaign, '__init__', forbidden)
-    result = main(['report', '--root', str(tmp_path)], builder=forbidden)
-    shared = review_report(state, admission_report(reviews))
-    assert result['projects'] == shared['projects']
-    assert result['memory_verification'] == shared['memory_verification']
-    assert result['projects']['source']['assessment']['status'] == 'needs-repair'
-    assert result['projects']['eligible']['assessment']['status'] == 'eligible'
-    held = result['memory_verification']['eligible']
-    assert held['status'] == 'inconclusive'
-    assert held['assessment']['status'] == 'infrastructure-blocked'
-    assert held['reason'] == job['evaluations'][0]['reason']
-    assert json.loads(capsys.readouterr().out) == result
-    assert {path: path.read_bytes() for path in tmp_path.rglob('*') if path.is_file()} == before
 
 
 def test_runtime_freezes_configuration_before_recomposing(tmp_path):
@@ -189,35 +155,6 @@ def test_project_plan_ordinal_survives_other_projects_and_rejects_plan_change(tm
                          tmp_path / 'first', remaining_seconds=30)
 
 
-def test_trial_arms_get_fresh_bindings_and_isolated_worker_workspaces(tmp_path, monkeypatch):
-    from benchmarks.ascend import subject_runtime
-    from test_a5_phase1_adaptive import _project
-    worker = tmp_path / 'worker.json'
-    worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path / 'device'), physical_device=0)))
-    composed = []
-    def compose(settings, **options):
-        composed.append((settings, options))
-        return bound(options['root'])
-    class Execution:
-        def __init__(self, *args):
-            pass
-        def graph(self, request, **kwargs):
-            return request
-    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
-    campaign = build_subject_campaign({'phase1_arguments': ['--worker-config', str(worker)]}, target='a3',
-        root=tmp_path / 'campaign', subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
-    item = dict(project_id='transfer', spec=_project('transfer', 'gm-ub-movement'))
-    snapshot = campaign.memory.snapshot()
-    a = campaign.execute_trial_arm(item, snapshot, tmp_path / 'a', remaining_seconds=60)
-    b = campaign.execute_trial_arm(item, snapshot, tmp_path / 'b', remaining_seconds=60)
-    replay = campaign.execute_trial_arm(item, snapshot, tmp_path / 'a', remaining_seconds=30)
-    assert len(composed) == 4
-    assert a.branch_root != b.branch_root and replay.branch_root == a.branch_root
-    workers = [json.loads((tmp_path / arm / 'worker.json').read_bytes()) for arm in ('a', 'b')]
-    assert workers[0]['workspace'] != workers[1]['workspace']
-    assert workers[0]['physical_device'] == workers[1]['physical_device'] == 0
-    assert a.pre_wave_memory == b.pre_wave_memory == snapshot
-    assert composed[-1][1]['max_seconds'] == 60  # resume keeps the admitted allocation identity
 
 
 def test_a5_catlass_optimizer_is_rejected_before_composition(tmp_path):
@@ -254,33 +191,6 @@ def test_wave_author_gets_reused_id_feedback_without_changing_frozen_context(tmp
     assert [row['role'] for row in requests[1][-2:]] == ['assistant', 'user']
 
 
-def test_arm_composition_consumes_allocation_and_late_preflight_never_starts_actor(tmp_path, monkeypatch):
-    from benchmarks.ascend import subject_runtime
-    from test_a5_phase1_adaptive import _project
-    now, requests = [0.0], []
-    monkeypatch.setattr(subject_runtime.time, 'monotonic', lambda: now[0])
-    worker = tmp_path / 'worker.json'
-    worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path / 'device'), physical_device=0)))
-    parent = tmp_path / 'parent'
-    def compose(settings, **options):
-        if options['root'] != parent:
-            now[0] += 4
-        return bound(options['root'])
-    class Execution:
-        def __init__(self, *args):
-            pass
-        def graph(self, request, **kwargs):
-            requests.append(request)
-            return request
-    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
-    campaign = build_subject_campaign({'phase1_arguments': ['--worker-config', str(worker)]}, target='a3',
-        root=parent, subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
-    item = dict(project_id='transfer', spec=_project('transfer', 'gm-ub-movement'))
-    campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'valid', remaining_seconds=10)
-    assert requests[0].remaining_seconds == 6
-    with pytest.raises(TimeoutError):
-        campaign.execute_trial_arm(item, campaign.memory.snapshot(), tmp_path / 'late', remaining_seconds=3)
-    assert len(requests) == 1
 
 
 @pytest.mark.parametrize('kind', ['config', 'worker-config', 'optimizer_worker_config'])
@@ -446,67 +356,8 @@ def test_generation_retrieval_pins_snapshot_and_bounds_full_code_results(tmp_pat
     assert page['search_details']['snapshot_sha256'] == payloads[0]['pre_wave_memory_sha256']
 
 
-def test_transfer_selection_bounds_rich_proposal_with_readable_exact_identity(tmp_path):
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
-    from benchmarks.ascend.agent_context import ContextBudget, request_bytes
-    from test_a5_phase1_adaptive import _project, _wave
-    from optimizer.jobs import canonical
-    requests, contexts = [], []
-    profile = direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value == 'deepseek-flash'))
-    def transport(**options):
-        requests.append(options['request'])
-        context = selection_context(options['request']['messages'])
-        contexts.append(context)
-        return DirectCompletion(_wave(json.dumps(context), [_project('transfer', 'gm-ub-movement')]), 1)
-    provider = DirectCompletionProvider({profile.identity.credential_env: 'fixture-only'},
-        models=[profile.identity.backend_model], transport=transport,
-        context_budgets={'deepseek-flash': ContextBudget(40000, 32768, 49152)})
-    binding = bound(tmp_path)
-    binding.update(provider=provider, profile=profile)
-    campaign = build_subject_campaign({}, target='a3', root=tmp_path/'run',
-        subjects=[Subject('s', 'copies')], initial_memory=b'', compose=lambda *a, **k: binding)
-    proposed = memory()
-    proposed['after']['text'] = 'kernel source\n' * 10000
-    proposed['before'] = dict(proposed['after'])
-    item = campaign.select_trial(proposed, remaining_seconds=60)
-    assert item['project_id'] == 'transfer'
-    assert request_bytes(requests[0]) < 49152
-    # The model receives workload semantics while full code remains immutable in CAS.
-    objective = contexts[0]['objective']
-    lesson = json.JSONDecoder().raw_decode(objective.split('Proposed lesson for selecting the workload only: ', 1)[1])[0]
-    assert lesson['summary'] == proposed['summary']
-    assert lesson['preconditions'] == proposed['preconditions']
-    assert lesson['applicability'] == proposed['applicability']
-    assert campaign.artifacts.read_bytes(lesson['proposal_sha256']) == canonical(proposed)
-    assert lesson['source_examples']['after']['sha256'] == proposed['after']['sha256']
 
 
-def test_followup_selector_reads_retained_history_and_authors_neutral_contract(tmp_path):
-    from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider, DirectCompletion
-    from test_a5_phase1_adaptive import _project, _wave
-    profile=direct_profile(next(row for row in MODEL_IDENTITIES if row.backend_model.value=='deepseek-flash'))
-    observed=[]
-    def transport(**options):
-        messages=options['request']['messages'];context=selection_context(messages)
-        details=json.JSONDecoder().raw_decode(context['objective'].split('different workload contract: ',1)[1])[0]
-        reads=[json.loads(m['content'])for m in messages[2:]if m['role']=='user'and m['content'].startswith('{')]
-        if not reads:
-            return DirectCompletion(json.dumps({'read_artifact':{'sha256':details['history_sha256']}}),1)
-        retained=json.loads(reads[0]['text']);observed.append(retained)
-        if len(reads)==1:
-            return DirectCompletion(json.dumps({'read_artifact':{'sha256':retained[0]['artifacts']['log:actor']}}),1)
-        assert reads[-1]['text']=='earlier unfavorable Actor evidence'
-        return DirectCompletion(_wave(json.dumps(context),[_project('fresh-transfer','gm-ub-movement')]),1)
-    provider=DirectCompletionProvider({profile.identity.credential_env:'fixture-only'},
-        models=[profile.identity.backend_model],transport=transport)
-    binding=bound(tmp_path);binding.update(provider=provider,profile=profile)
-    campaign=build_subject_campaign({},target='a3',root=tmp_path/'run',subjects=[Subject('s','copies')],
-        initial_memory=b'',compose=lambda *a,**k:binding)
-    log=campaign.artifacts.put_bytes(b'earlier unfavorable Actor evidence')
-    history=[dict(decision='inconclusive',reason='tail untested',trial_task={'inputs':[32]},artifacts={'log:actor':log})]
-    item=campaign.select_trial(memory(),remaining_seconds=60,
-        probe_request={'question':'Does an odd extent change the evidence?'},prior_task={'inputs':[32]},history=history)
-    assert item['project_id']=='fresh-transfer'and observed[-1]==history
 
 
 def test_retained_review_registers_original_plan_without_actor_execution(tmp_path, monkeypatch):
@@ -558,3 +409,16 @@ def test_recovery_context_is_readable_and_restored_without_changing_memory(tmp_p
     registry = ContentAddressedArtifacts(tmp_path/'retry/artifacts').read_json(preview['registry_sha256'])
     assert registry['artifacts'] == references
     assert not campaign.memory.records()
+
+
+@pytest.mark.parametrize('setting', [
+    'memory_admission_mode', 'memory_verification', 'memory_review_seconds',
+    'memory_trial_seconds', 'memory_arm_seconds', 'memory_verifier_model',
+    'verify_memory_usefulness', 'usefulness_pair_seconds',
+])
+def test_removed_memory_ab_settings_fail_before_runtime_or_disk_work(tmp_path, setting):
+    with pytest.raises(ValueError, match='Removed memory A/B settings'):
+        build_subject_campaign({setting: False}, target='a3', root=tmp_path/'new',
+            subjects=[Subject('s','copies')], initial_memory=b'',
+            compose=lambda *args, **kwargs: pytest.fail('obsolete configuration composed a runtime'))
+    assert not (tmp_path/'new').exists()

@@ -212,54 +212,6 @@ def test_collection_setup_consumes_shared_librarian_allowance(tmp_path, monkeypa
         gates[0].database.connection.execute('SELECT 1')
 
 
-def test_usefulness_lessons_have_independent_selection_budgets_and_resume_reuses_them(tmp_path):
-    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, curriculum_prompt
-    from benchmarks.ascend.memory_usefulness import UsefulnessVerifier
-    from test_a5_phase1_adaptive import _memory, _project, _result, _wave
-    cfg, calls = config(tmp_path), []
-    knowledge = NativeAdaptiveKnowledge(cfg, Embeddings(), completion(calls))
-    contexts, roots, prompts = [], [], []
-    def begin(context):
-        knowledge.begin_selection(context)
-        contexts.append(context)
-        roots.append(knowledge.selection[0])
-    def query(action, *, check_remaining=None):
-        return knowledge.curriculum_query(action, check_remaining=check_remaining)
-    query.begin_selection = begin
-    def author(messages):
-        if len(prompts) % 2 == 0:
-            prompts.append(messages[-1]['content'])
-            return json.dumps({'knowledge_query': {'query': 'pipeline', 'limit': 1}})
-        prompts.append(None)
-        if len(prompts) == 2:
-            path = roots[0] / 'librarian-budget.json'
-            state = json.loads(path.read_bytes())
-            state['elapsed_seconds'] = cfg.librarian_seconds
-            path.write_text(json.dumps(state))
-        return _wave(curriculum_prompt(contexts[-1]), [_project('useful-copy', 'gm-ub-movement')])
-    curriculum = CurriculumAgent(author, query_knowledge=query)
-    verifier = UsefulnessVerifier(tmp_path / 'assessments', curriculum,
-        lambda request: _result(request.spec, True, 'host pass'),
-        lambda stage, evidence: stage, enabled=True)
-    memory = _memory(ProjectSpec.from_mapping(_project('source', 'gm-ub-movement')))
-    memory = replace(memory, lessons=(memory.lessons[0], replace(memory.lessons[0], claim='Another lesson')))
-    outcomes = verifier.assess_memory(memory,
-        b'{"initial_memory_base64":"e30=","project_memory_base64":[]}', 'phase1/source')
-    assert [row['outcome'] for row in outcomes] == ['both-succeeded', 'both-succeeded']
-    assert len(calls) == 2 and len(set(roots)) == 2
-    assert contexts[0].wave_index == contexts[1].wave_index == 1
-    assert contexts[0].pre_wave_memory_sha256 == contexts[1].pre_wave_memory_sha256
-    assert all((root / 'librarian-budget.json').is_file() for root in roots)
-    path = roots[0] / 'librarian-budget.json'
-    state = json.loads(path.read_bytes())
-    state['elapsed_seconds'] = cfg.librarian_seconds
-    path.write_text(json.dumps(state))
-    knowledge.begin_selection(replace(contexts[0], remaining_seconds=10))
-    assert knowledge.selection[0] == roots[0]
-    resumed = knowledge.curriculum_query(KnowledgeQuery('pipeline', 1))
-    assert resumed == () and resumed.search_details['status'] == 'insufficient'
-    assert len(calls) == 2
 
 
 @pytest.mark.parametrize('spent,interrupted', [(30, False), (90, False), (30, True)])

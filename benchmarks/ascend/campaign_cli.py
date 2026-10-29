@@ -108,6 +108,9 @@ def _composed_target_runtime(actor, declared):
 
 
 def _validate_remediation_settings(settings, *, phase, target, approval):
+    obsolete = {'verify_memory_usefulness', 'usefulness_pair_seconds'} & settings.keys()
+    if obsolete:
+        raise ValueError('Removed memory A/B settings: ' + ', '.join(sorted(obsolete)))
     if phase != 1 or not settings.get('automatic_remediation'):
         return
     if approval:
@@ -163,10 +166,6 @@ def build_controller(job):
             phase=f"phase{job['phase']}", round_id=job["round_id"],
             model=job["model"], source_manifest_sha256=job["source_manifest_sha256"],
         )
-        # Campaign settings opt into record-only verification without changing CLI defaults.
-        if settings.get("verify_memory_usefulness"):
-            options["usefulness_enabled"] = True
-            options["usefulness_pair_seconds"] = settings.get("usefulness_pair_seconds", 600)
         built = (build_native_adaptive_phase1 if job["target"] == "a3"
                  else build_adaptive_phase1)(**options)
         if job["phase"] == 2 and job["target"] == "a3":
@@ -223,7 +222,6 @@ def build_controller(job):
                 goal = TargetContract.from_mapping(job["target_goal"])
                 artifacts = ContentAddressedArtifacts(Path(job["target_artifact_store"]))
                 runtime = _composed_target_runtime(coordinator.execute_project, settings["target_runtime"])
-            usefulness_verifier = getattr(coordinator, "usefulness_verifier", None)
             coordinator = TargetDrivenPhase2Coordinator(
                 job["root"], job["objective"], snapshot,
                 TargetCurriculumAgent(coordinator.curriculum._complete,
@@ -236,9 +234,6 @@ def build_controller(job):
                 available_tools=_target_available_tools(coordinator.execute_project),
                 trace_hook=coordinator.trace_hook,
             )
-            if usefulness_verifier is not None:
-                coordinator.usefulness_verifier = usefulness_verifier
-                usefulness_verifier.remaining_seconds = coordinator._remaining_seconds
         captured.append(coordinator)
         # The old CLI calls run() after composing. Capture without executing it.
         return type("Deferred", (), {"run": lambda self: {"deferred": True}})()
@@ -307,7 +302,7 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
         max_practice_seconds=job["practice_max_seconds"],
         feedback_root=job.get('feedback_root', settings.get("phase2_feedback_root")),
         fixed_task=retry['task'] if retry else None,
-        usefulness_verifier=getattr(composed, 'usefulness_verifier', None))
+        )
 
 
 def _approval_path(job):

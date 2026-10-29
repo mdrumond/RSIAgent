@@ -176,48 +176,6 @@ def test_curriculum_receives_only_time_remaining_after_environment_probe(tmp_pat
     assert json.loads((tmp_path/'state.json').read_text())['elapsed_seconds'] == 80
 
 
-@pytest.mark.parametrize('failed', [False, True])
-def test_usefulness_live_work_is_gated_but_retained_assessment_replay_is_probe_free(tmp_path, failed):
-    from benchmarks.ascend.production import compose_adaptive_controller
-    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-    from tests.test_a5_phase1_adaptive import _memory
-    events, requests, now = [], [], [0.0]
-    def complete(profile, messages, **kwargs):
-        events.append('provider')
-        try:
-            stage = json.loads(messages[-1]['content']).get('stage')
-        except ValueError:
-            stage = None
-        return SimpleNamespace(text=stage or _wave(messages[-1]['content'], [_project('paired', 'gm-ub-movement')]))
-    def execute(request):
-        events.append('actor')
-        requests.append(request)
-        return _result(request.spec, True, 'host pass')
-    _, runner = compose_adaptive_controller(root=tmp_path, objective='Learn', initial_memory=b'{}',
-        executor=None, actor=None, profile=None, provider=SimpleNamespace(complete=complete), immutable_context=None,
-        max_parallel=1, project_target=1, max_seconds=100, project_actor=execute, usefulness_enabled=True)
-    runner.clock = lambda: now[0]
-    def check(index, remaining):
-        events.append('check')
-        assert remaining() == 100
-        now[0] += 7
-        if failed:
-            raise ProjectInfrastructureError('environment unavailable')
-    runner.environment_check = check
-    memory = _memory(ProjectSpec.from_mapping(_project('source', 'gm-ub-movement')))
-    def assess():
-        return runner.usefulness_verifier.assess_memory(memory, b'{}', 'source')[0]
-    result = runner._with_allocation(assess)
-    assert result['outcome'] == ('inconclusive' if failed else 'both-succeeded')
-    assert events[0] == 'check'
-    if failed:
-        assert events == ['check'] and requests == []
-    else:
-        assert len(requests) == 2 and all(0 < request.remaining_seconds <= 93 for request in requests)
-    before = list(events)
-    runner.environment_check = lambda *args: pytest.fail('retained assessment must not probe')
-    assert runner._with_allocation(assess)['experiment_id'] == result['experiment_id']
-    assert events == before
 
 
 @pytest.mark.parametrize('failed', [False, True])

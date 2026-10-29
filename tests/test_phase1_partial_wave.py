@@ -168,25 +168,6 @@ def test_closed_partial_wave_requires_explicit_next_proposal(tmp_path):
     assert executed.count('offline') == 1 and len(calls) == 2
 
 
-def test_partial_usefulness_only_assesses_published_memory_not_unfinalized_delta(tmp_path):
-    assessed = []
-    def select(messages):
-        return _wave(messages[-1]['content'], [_project('good', 'gm-ub-movement'),
-                                              _project('offline', 'simd-vector')])
-    def execute(request):
-        if request.spec.project_id == 'offline':
-            # A process can disappear after staging a delta but before outcome.
-            (request.branch_root / 'memory-delta.bin').write_bytes(b'unfinalized delta')
-            raise OSError('lost before terminal outcome')
-        return _result(request.spec, True, 'host pass')
-    runner = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
-        max_parallel=1, project_target=2, allow_partial=True)
-    runner.usefulness_verifier = SimpleNamespace(enabled=True,
-        assess_memory=lambda memory, prior, source: assessed.append(source))
-    report = runner.run()
-    assert report['status'] == 'WAVE_CLOSED' and report['published_projects'] == ['good']
-    assert assessed == ['wave-001/good']
-    assert not (tmp_path / 'waves/wave-001/branches/offline/outcome.json').exists()
 
 
 def test_project_admission_timeout_does_not_quarantine_a_healthy_worker():
@@ -349,53 +330,3 @@ def test_settled_semantic_partial_enters_remediation_without_manual_resume(tmp_p
     assert report['status'] == 'SATURATED' and report['published_projects'] == ['good']
     assert len(automatic.store.records()) == 2
     assert next(row for row in automatic.store.records() if row['outcome']['attempt_id'] == 'bad')['lifecycle'] == 'failed'
-
-
-def test_partial_assessment_replays_actual_wave_memory_across_explicit_continuation(tmp_path, monkeypatch):
-    selected, executed, assessed, expected = [], [], [], {}
-    unpublished = tmp_path/'waves/wave-001/branches/offline/memory-delta.bin'
-    def select(messages):
-        selected.append(messages)
-        specs = ([_project('good', 'gm-ub-movement'), _project('offline', 'simd-vector')]
-                 if len(selected) == 1 else [_project('fresh', 'padded-tail'),
-                                              _project('last', 'simd-vector')])
-        return _wave(messages[-1]['content'], specs)
-    def execute(request):
-        executed.append(request.spec.project_id)
-        expected[request.spec.project_id] = request.pre_wave_memory
-        if request.spec.project_id == 'offline':
-            unpublished.write_bytes(b'unfinalized delta must never be read')
-            raise OSError('lost before terminal outcome')
-        return _result(request.spec, True, 'host pass')
-    def assess(memory, prior, source):
-        assert memory.project_spec.project_id != 'offline'
-        assert prior == expected[memory.project_spec.project_id]
-        assessed.append((source, prior))
-    def build(target):
-        runner = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select), execute,
-            max_parallel=1, project_target=target, max_seconds=100, clock=lambda: 0, allow_partial=True)
-        runner.usefulness_verifier = SimpleNamespace(enabled=True, assess_memory=assess)
-        read = runner._read_json
-        def checked_read(path):
-            assert path != unpublished, 'unpublished memory must not be inspected or assessed'
-            return read(path)
-        monkeypatch.setattr(runner, '_read_json', checked_read)
-        return runner
-    runner = build(2)
-    first = runner.run()
-    assert first['status'] == 'WAVE_CLOSED' and first['published_projects'] == ['good']
-    assert [source for source, _ in assessed] == ['wave-001/good']
-    assert runner.resume()['status'] == 'WAVE_CLOSED'
-    assert len(selected) == 1 and executed == ['good', 'offline']
-    runner.continue_campaign(3)
-    resumed = build(3)
-    report = resumed.resume()
-    assert report['status'] == 'TARGET_REACHED'
-    assert report['published_projects'] == ['good', 'fresh', 'last']
-    assert len(selected) == 2 and executed == ['good', 'offline', 'fresh', 'last']
-    sources = {source for source, _ in assessed}
-    assert sources == {'wave-001/good', 'wave-002/fresh', 'wave-002/last'}
-    assert len(json.loads(expected['fresh'])['project_memory_base64']) == 1
-    before = list(executed)
-    assert resumed.resume()['published_projects'] == report['published_projects']
-    assert executed == before and len(selected) == 2
