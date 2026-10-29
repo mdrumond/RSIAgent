@@ -161,6 +161,8 @@ class PiCodingSession:
                     raise ValueError("edit must match exactly once")
                 source = self.source.replace(args["old_text"], args["new_text"], 1)
                 name, args = self.write_action(source)
+                if name not in self.allowed or name in {"edit_source", "read_context"}:
+                    raise ValueError("source edit maps to an unavailable host write action")
                 validate(args, self.schemas[name])
             self.pending = (name, args)
             return {"status": "queued", "executed": False, "action": name}

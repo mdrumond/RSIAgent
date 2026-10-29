@@ -309,6 +309,10 @@ class ProjectExecutor:
             "compile_evidence_sha256": compilation.evidence_sha256,
             "compiled_artifact_id": compilation.artifact_id,
         }
+        if compilation.details is not None:
+            if canonical_digest(compilation.details) != compilation.evidence_sha256:
+                raise ValueError("compiler details differ from retained backend evidence")
+            artifact["compiler_output"] = compilation.details
         digest = canonical_digest(artifact)
         self._ledger.append(EvidenceKind.ARTIFACT, {
             "event": "phase1-project-compile-artifact",

@@ -174,7 +174,7 @@ class PiActorDriver(DirectActorDriver):
                         "event": "invalid-action",
                         "description": "The response could not be parsed as an accepted action. No action was executed.",
                         "next_action": "Use one of the advertised allowed tools with arguments matching its schema.",
-                        "allowed_actions": sorted(allowed),
+                        "allowed_actions": sorted(getattr(session, "allowed", allowed)),
                         "reason": action_error or "Selected action does not match the host protocol",
                     }
                     if action_error:

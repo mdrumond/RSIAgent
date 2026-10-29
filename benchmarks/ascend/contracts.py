@@ -20,8 +20,11 @@ class CompileObservation:
     evidence_sha256: str
     diagnostic: str
     artifact_id: str | None
+    details: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
+        if self.details is not None and not isinstance(self.details, dict):
+            raise ValueError('compile details must be an object')
         if type(self.passed) is not bool:
             raise ValueError("compile passed must be boolean")
         _require_digest(self.evidence_sha256)
