@@ -846,6 +846,7 @@ class AdaptivePhase1Coordinator:
                 "schema": STATE_SCHEMA,
                 "objective": self.objective,
                 "initial_memory_sha256": hashlib.sha256(self.initial_memory).hexdigest(),
+                "project_target": self.project_target,
                 "wave_index": 1,
                 "coverage": [],
                 "prior_outcomes": [],

@@ -27,7 +27,7 @@ def completed(tmp_path, *, target_driven=False):
     runner = reviewed_phase1_coordinator(root, 'learn', seed,
         CurriculumAgent(lambda msgs: _wave(msgs[-1]['content'], [_project('new-project', 'simd-vector')])),
         execute, project_target=1)
-    (root / 'initial-memory.bin').write_bytes(runner.initial_memory)
+    assert (root / 'initial-memory.bin').read_bytes() == runner.initial_memory
     (root / 'campaign-identity.json').write_bytes((source / 'campaign-identity.json').read_bytes())
     runner.run()
     return root
