@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field, replace
 import json
 import hashlib
 import time
+import uuid
 from pathlib import Path
 import re
 from typing import Callable, Mapping, Protocol
@@ -214,6 +215,8 @@ class _ProjectActions:
         self.request_timing = request_timing
         self.request_diagnostic = request_diagnostic
         self.actions: list[str] = []
+        self.action_event_namespace = uuid.uuid4().hex
+        self.action_event_turn = None
         self.metered_actions = 0
         self.source: str | None = None
         self.source_sha256: str | None = None
@@ -400,7 +403,9 @@ class _ProjectActions:
             self.request, self.prepared, self.source, self.latest, self.artifacts,
             max(0, self.deadline - time.monotonic()),
             access_event_id=hashlib.sha256(canonical_bytes(dict(
-                branch=str(self.request.branch_root.resolve()), ordinal=len(self.actions), payload=dict(payload)))).hexdigest(),
+                branch=str(self.request.branch_root.resolve()),
+                namespace=self.action_event_namespace if self.action_event_turn is None else 'conversation',
+                ordinal=len(self.actions) if self.action_event_turn is None else self.action_event_turn, payload=dict(payload)))).hexdigest(),
             actor_id=str(self.request.branch_root.resolve()),
         ))
         if not isinstance(result, AdaptiveActionResult):

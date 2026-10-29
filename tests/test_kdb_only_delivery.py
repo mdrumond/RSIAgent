@@ -77,7 +77,7 @@ def campaign(tmp_path):
     return runtime, actor
 
 
-def test_kdb_only_candidate_admission_and_arm_isolation(tmp_path, monkeypatch):
+def test_kdb_only_accepted_memory_retrieval_and_frozen_view_isolation(tmp_path, monkeypatch):
     from benchmarks.a5kernels import phase1_adaptive_actor
     presented = []
     original = phase1_adaptive_actor.memory_presentation
@@ -86,14 +86,15 @@ def test_kdb_only_candidate_admission_and_arm_isolation(tmp_path, monkeypatch):
         return original(raw, artifacts)
     monkeypatch.setattr(phase1_adaptive_actor, 'memory_presentation', presentation)
     runtime, actor = campaign(tmp_path)
-    draft = dict(memory_id='draft', proposal=proposal(runtime.artifacts), provenance={})
     baseline = runtime.memory.snapshot()
-    treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
+    admitted = runtime.memory.accept('lesson', proposal(runtime.artifacts), {})
+    draft = runtime.memory.read(admitted['version'])
+    published = runtime.memory.snapshot()
     item = dict(project_id=_spec().project_id, spec=_spec().as_dict(), repairs=[])
     actor.expected_memory_source = draft['proposal']['after']['sha256']
     from benchmarks.ascend.subject_memory import digest
     actor.expected_memory_document = digest(draft)
-    for name, snapshot, expect in [('control',baseline,False), ('treatment',treatment,True), ('control-after',baseline,False)]:
+    for name, snapshot, expect in [('old-view',baseline,False), ('published',published,True), ('old-view-after',baseline,False)]:
         actor.expected_memory_snapshot = hashlib.sha256(snapshot).hexdigest()
         actor.expect_candidate = expect
         if expect:
@@ -105,11 +106,11 @@ def test_kdb_only_candidate_admission_and_arm_isolation(tmp_path, monkeypatch):
         assert outcome.host_verified
     assert presented == [b'{}'] * 3
     assert [call[:2] for call in actor.calls] == [
-        ('kdb-only', hashlib.sha256(value).hexdigest()) for value in [baseline,treatment,baseline]]
-    assert runtime.memory.records() == []
+        ('kdb-only', hashlib.sha256(value).hexdigest()) for value in [baseline,published,baseline]]
+    assert len(runtime.memory.records()) == 1
     # Checkpoint identity binds the real retrieval view and the delivery route.
     with pytest.raises(ValueError, match='frozen inputs'):
-        runtime.execute(item, baseline, tmp_path/'treatment', remaining_seconds=30)
+        runtime.execute(item, baseline, tmp_path/'published', remaining_seconds=30)
     assert len(actor.calls) == 3
 
 

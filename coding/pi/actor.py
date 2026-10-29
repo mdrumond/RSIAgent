@@ -181,6 +181,8 @@ class PiActorDriver(DirectActorDriver):
                         host["error"] = action_error
                     latest = json.dumps({"host": host})
                 else:
+                    if hasattr(action_executor, "action_event_turn"):
+                        action_executor.action_event_turn = turn
                     outcome = action_executor(action)
                     latest = outcome.observation
                     working.append({"role": "user", "content": latest})

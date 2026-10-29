@@ -37,6 +37,8 @@ class SubjectKnowledge:
         self.database_path, self.embeddings = getattr(paths, 'kdb', None), embeddings
         self.ledger = (MemoryLedger.for_kdb(self.database_path) if self.database_path is not None
                        else MemoryLedger(self.root / 'memory-ledger.sqlite3'))
+        from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+        self.shared_artifacts = ContentAddressedArtifacts(Path(str(self.ledger.path) + '.artifacts'))
         self.reference_query, self.clock = reference_query, clock
         self.contextual_reference_query = contextual_reference_query
         if self.database_path is not None and self.reference_query is None and contextual_reference_query is None:
@@ -44,6 +46,9 @@ class SubjectKnowledge:
             self.reference_query, _ = curriculum_knowledge(paths, embeddings)
 
     def index(self, version, record):
+        self.shared_artifacts.put_bytes(canonical(record))
+        for sha in memory_artifacts(record):
+            self.shared_artifacts.put_bytes(self.read_artifact(sha, remaining_seconds=float('inf')))
         if self.database_path is None:
             return
         from benchmarks.a5kernels.knowledge import KnowledgeDB
@@ -55,7 +60,14 @@ class SubjectKnowledge:
             database.index(directory, [document], collection='subject-memory-' + version, language='memory')
 
     def read_artifact(self, digest, *, remaining_seconds):
-        return self.store.read_bytes(digest)
+        if remaining_seconds <= 0:
+            raise TimeoutError('memory artifact read allocation exhausted')
+        try:
+            return self.store.read_bytes(digest)
+        except FileNotFoundError:
+            content = self.shared_artifacts.read_bytes(digest)
+            self.store.put_bytes(content)
+            return content
 
     def query(self, payload, *, remaining_seconds, snapshot=None, branch_root=None, reference_context=None):
         from benchmarks.a5kernels.knowledge_agent import KnowledgeQuery
@@ -160,13 +172,14 @@ class SubjectKnowledge:
                 for digest in set(memory['artifacts'].values()):
                     if self.clock() - started >= remaining_seconds:
                         raise TimeoutError('Actor knowledge artifact copy elapsed allowance exhausted')
-                    content = self.store.read_bytes(digest)
+                    content = self.read_artifact(digest, remaining_seconds=remaining_seconds - (self.clock() - started))
                     if hashlib.sha256(content).hexdigest() != digest:
                         raise ValueError('memory artifact bytes differ from their identity')
                     retain(content)
         observation = knowledge_presentation(action.query, selected, retain)
+        delivered = {row['citation']['collection'] for row in observation['results']}
         for memory in result['memories']:
-            if 'subject-memory-' + memory['version'] not in collections:
+            if 'subject-memory-' + memory['version'] not in delivered:
                 continue
             event_id = context.access_event_id
             if not event_id:

@@ -303,3 +303,35 @@ def test_shared_record_read_rejects_changed_immutable_content(tmp_path):
         db.execute('UPDATE memory_versions SET record=? WHERE version=?', (json.dumps(record(summary='Changed bytes')), version))
     with pytest.raises(ValueError, match='content changed'):
         ledger.record(version)
+
+
+def test_cross_campaign_actor_delivery_keeps_sources_when_origin_is_unavailable(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.ascend.subject_knowledge import SubjectKnowledge
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from test_a5_knowledge import FakeEmbeddings
+    service, memory, store, kdb = setup(tmp_path/'origin')
+    admitted = memory.accept('shared-lesson', proposal(store), {})
+    source = memory.read(admitted['version'])['proposal']['after']['sha256']
+    other_store = ContentAddressedArtifacts(tmp_path/'consumer/artifacts')
+    other = SubjectKnowledge(tmp_path/'consumer', other_store, lambda: other_memory,
+        paths=SimpleNamespace(kdb=kdb), embeddings=FakeEmbeddings(),
+        reference_query=lambda *a, **kw: ())
+    other_memory = SubjectMemory(tmp_path/'consumer/memory', ledger=other.ledger)
+    store.root.rename(tmp_path/'origin-offline')
+    actor = context(tmp_path/'consumer/actor', other_memory.snapshot())
+    result = other.actor_query({'query':'vector','limit':1}, actor, remaining_seconds=60)
+    assert source in result.admitted_artifacts
+    assert actor.artifacts.read_bytes(source).startswith(b'def kernel')
+    assert other.ledger.stats('shared-lesson')['accesses'] == 1
+
+
+def test_compacted_query_counts_inline_memories_not_unread_index_entries(tmp_path):
+    service, memory, store, _ = setup(tmp_path)
+    versions = [memory.accept('lesson-'+str(i), proposal(store, 'Vector increment '+str(i)), {})['version'] for i in range(8)]
+    actor = context(tmp_path/'actor', memory.snapshot())
+    reply = service.actor_query({'query':'vector','limit':20}, actor, remaining_seconds=60)
+    assert reply.observation['omitted_results'] > 0
+    inline = {row['citation']['collection'] for row in reply.observation['results']}
+    for i,version in enumerate(versions):
+        assert service.ledger.stats('lesson-'+str(i))['accesses'] == int('subject-memory-'+version in inline)

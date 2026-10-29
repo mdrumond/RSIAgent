@@ -969,3 +969,22 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
     assert not result.memory.lessons
     assert result.memory.source_revision == hashlib.sha256(b"fixed source").hexdigest()
     assert len(calls) == 5
+
+
+@pytest.mark.parametrize('durable_turn',[None,43])
+def test_actor_restarts_distinguish_new_queries_and_deduplicate_retained_turn(tmp_path,durable_turn):
+    captured=[]
+    def query(payload,context):
+        captured.append(context.access_event_id)
+        return AdaptiveActionResult({'event':'query','available':True})
+    class Actor(ScriptedActor):
+        def __call__(self,instruction,**kwargs):
+            kwargs['action_executor'].action_event_turn=durable_turn
+            return super().__call__(instruction,**kwargs)
+    executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'evidence.jsonl'))
+    actor=Actor(['{"query-knowledge":{"query":"vector"}}','{"write":{"slot":"kernel","content":"fixed source"}}','{"run":{}}','{"submit":{}}'])
+    adapter=AdaptiveActorProjectExecutor(executor,actor,object(),query_knowledge=query)
+    request=_request(tmp_path,executor)
+    adapter(request);adapter(request)
+    assert len(captured)==2
+    assert (captured[0]==captured[1]) is (durable_turn is not None)
