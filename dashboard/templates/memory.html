@@ -1,11 +1,4 @@
 {% extends "base.html" %}{% block title %}Memory · RSI{% endblock %}{% block body %}
 <h1>Accumulated memory</h1><p class="lede">Published, evidence-linked lessons from completed curriculum projects.</p>
 {% for campaign in view.campaigns %}<h2>{{ campaign.name }}</h2><section class="memory">{% for project in campaign.projects %}{% for lesson in project.memory.lessons %}<article><span class="tag">{{ lesson.category }}</span><h3><a href="{{ url_for('project_page', number=campaign.phase, project_id=project.id) }}">{{ project.id }}</a></h3><p>{{ lesson.claim or lesson.statement }}</p><small>confidence: {{ lesson.confidence }}</small>
-{% for result in lesson.usefulness %}<p>Usefulness: <b>{{ result.outcome }}</b></p>{{ explain(result) }}{% endfor %}</article>{% endfor %}{% endfor %}</section>{% if campaign.usefulness %}<h3>Memory usefulness experiments</h3>
-<p>Record-only evidence. Both arms succeeding does not establish that memory is useless. Inconclusive means usefulness was not established.</p>
-{% for result in campaign.usefulness %}<article class="card"><h4>{{ result.lesson.claim or result.lesson.statement or result.lesson_id }}</h4>
-<p>{{ result.source_id }} · <b>{{ result.outcome }}</b> · {{ result.arm_seconds }} active seconds per arm</p>
-{{ explain(result) }}{% if result.reason %}<p>{{ result.reason }}</p>{% endif %}{% if result.interpretation %}<p>{{ result.interpretation }}</p>{% endif %}
-{% if result.project %}<details><summary>Frozen project</summary><pre>{{ result.project|tojson(indent=2) }}</pre></details>{% endif %}
-{% for arm, outcome in result.arms.items() %}<details class="trace-event" data-trace-url="{{ url_for('usefulness_evidence', phase=campaign.phase, identifier=result.experiment_id, arm=arm) }}"><summary>{{ arm }}: {{ outcome.classification or outcome.verified }} · evidence</summary>{{ explain(outcome) }}<pre class="trace-payload"></pre></details>{% endfor %}</article>{% endfor %}{% endif %}
-{% endfor %}{% endblock %}
+</article>{% endfor %}{% endfor %}</section>{% endfor %}{% endblock %}

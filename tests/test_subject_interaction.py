@@ -42,7 +42,6 @@ def setup(tmp_path):
 
 def campaign_builder(root, scheduler, artifacts, calls):
     class Campaign:
-        memory_gate = None
         def __init__(self):
             self.root, self.scheduler, self.artifacts = root, scheduler, artifacts
             self.state = json.loads((root/'subject-campaign.json').read_text())

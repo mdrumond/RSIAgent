@@ -32,8 +32,6 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     register_optimizer(app, config_path, csrf_token, optimizer_launcher)
     from .feedback import register_feedback
     register_feedback(app, controls, csrf_token)
-    from .usefulness import register_usefulness
-    register_usefulness(app, controls)
     from .presentation import register_presentation
     register_presentation(app)
     from .subjects import register_subjects
@@ -41,8 +39,6 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
     from .curriculum_controls import register_curriculum_controls
     register_curriculum_controls(app, config_path, controls, csrf_token,
                                  binder=curriculum_binder, restart=curriculum_restart, status=curriculum_status)
-    from .memory_controls import register_memory_controls
-    register_memory_controls(app, config_path, csrf_token)
     from .knowledge import register_knowledge
     register_knowledge(app, config_path, csrf_token)
     last = [0.0]

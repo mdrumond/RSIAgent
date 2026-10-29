@@ -86,34 +86,31 @@ def test_kdb_only_candidate_admission_and_arm_isolation(tmp_path, monkeypatch):
         return original(raw, artifacts)
     monkeypatch.setattr(phase1_adaptive_actor, 'memory_presentation', presentation)
     runtime, actor = campaign(tmp_path)
-    try:
-        draft = dict(memory_id='draft', proposal=proposal(runtime.artifacts), provenance={})
-        baseline = runtime.memory.snapshot()
-        treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
-        item = dict(project_id=_spec().project_id, spec=_spec().as_dict(), repairs=[])
-        actor.expected_memory_source = draft['proposal']['after']['sha256']
-        from benchmarks.ascend.subject_memory import digest
-        actor.expected_memory_document = digest(draft)
-        for name, snapshot, expect in [('control',baseline,False), ('treatment',treatment,True), ('control-after',baseline,False)]:
-            actor.expected_memory_snapshot = hashlib.sha256(snapshot).hexdigest()
-            actor.expect_candidate = expect
-            if expect:
-                retained = ContentAddressedArtifacts(tmp_path/name/'artifacts')
-                retained.put_bytes(snapshot)
-                retained.put_bytes(SOURCE)
-                retained.put_json(draft)
-            outcome = runtime.execute(item, snapshot, tmp_path/name, remaining_seconds=30)
-            assert outcome.host_verified
-        assert presented == [b'{}'] * 3
-        assert [call[:2] for call in actor.calls] == [
-            ('kdb-only', hashlib.sha256(value).hexdigest()) for value in [baseline,treatment,baseline]]
-        assert runtime.memory.records() == []
-        # Checkpoint identity binds the real retrieval view and the delivery route.
-        with pytest.raises(ValueError, match='frozen inputs'):
-            runtime.execute(item, baseline, tmp_path/'treatment', remaining_seconds=30)
-        assert len(actor.calls) == 3
-    finally:
-        runtime.memory_gate.close()
+    draft = dict(memory_id='draft', proposal=proposal(runtime.artifacts), provenance={})
+    baseline = runtime.memory.snapshot()
+    treatment = json.dumps(dict(schema='subject-memory-snapshot-v1', initial_memory='', memories=[draft])).encode()
+    item = dict(project_id=_spec().project_id, spec=_spec().as_dict(), repairs=[])
+    actor.expected_memory_source = draft['proposal']['after']['sha256']
+    from benchmarks.ascend.subject_memory import digest
+    actor.expected_memory_document = digest(draft)
+    for name, snapshot, expect in [('control',baseline,False), ('treatment',treatment,True), ('control-after',baseline,False)]:
+        actor.expected_memory_snapshot = hashlib.sha256(snapshot).hexdigest()
+        actor.expect_candidate = expect
+        if expect:
+            retained = ContentAddressedArtifacts(tmp_path/name/'artifacts')
+            retained.put_bytes(snapshot)
+            retained.put_bytes(SOURCE)
+            retained.put_json(draft)
+        outcome = runtime.execute(item, snapshot, tmp_path/name, remaining_seconds=30)
+        assert outcome.host_verified
+    assert presented == [b'{}'] * 3
+    assert [call[:2] for call in actor.calls] == [
+        ('kdb-only', hashlib.sha256(value).hexdigest()) for value in [baseline,treatment,baseline]]
+    assert runtime.memory.records() == []
+    # Checkpoint identity binds the real retrieval view and the delivery route.
+    with pytest.raises(ValueError, match='frozen inputs'):
+        runtime.execute(item, baseline, tmp_path/'treatment', remaining_seconds=30)
+    assert len(actor.calls) == 3
 
 
 def test_delivery_mode_change_cannot_reuse_graph_checkpoint(tmp_path):
@@ -154,16 +151,13 @@ def test_kdb_only_rejects_campaign_seed_before_composition(tmp_path):
 
 def test_kdb_only_rejects_external_snapshot_seed_before_execution(tmp_path):
     runtime, actor = campaign(tmp_path)
-    try:
-        item = dict(project_id=_spec().project_id, spec=_spec().as_dict(), repairs=[])
-        snapshot = json.dumps(dict(schema='subject-memory-snapshot-v1',
-            initial_memory='prior lessons', memories=[])).encode()
-        with pytest.raises(ValueError, match='nonempty initial memory'):
-            runtime.execute(item, snapshot, tmp_path/'branch', remaining_seconds=30)
-        assert actor.calls == []
-        assert not (tmp_path/'branch').exists()
-    finally:
-        runtime.memory_gate.close()
+    item = dict(project_id=_spec().project_id, spec=_spec().as_dict(), repairs=[])
+    snapshot = json.dumps(dict(schema='subject-memory-snapshot-v1',
+        initial_memory='prior lessons', memories=[])).encode()
+    with pytest.raises(ValueError, match='nonempty initial memory'):
+        runtime.execute(item, snapshot, tmp_path/'branch', remaining_seconds=30)
+    assert actor.calls == []
+    assert not (tmp_path/'branch').exists()
 
 
 def test_direct_delivery_seed_guard_preserves_indexed_default(tmp_path, monkeypatch):

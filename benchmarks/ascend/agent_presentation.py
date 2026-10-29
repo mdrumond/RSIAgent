@@ -244,8 +244,6 @@ def memory_presentation(raw, artifacts):
     except (ValueError, UnicodeDecodeError):
         result["preview"] = raw[:2048].decode("utf-8", errors="replace")
         return result
-    if isinstance(value, dict) and "usefulness_lesson" in value:
-        result["usefulness_lesson"] = value["usefulness_lesson"]
     if isinstance(value, dict) and isinstance(value.get("memory_entries"), list):
         result["memory_entries"] = []
         remaining = 8192

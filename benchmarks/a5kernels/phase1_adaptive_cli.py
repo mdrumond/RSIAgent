@@ -49,8 +49,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-target", type=int)
     parser.add_argument("--max-projects", type=int, help="Deprecated metadata; does not limit execution")
     parser.add_argument("--max-seconds", type=float, default=7200)
-    parser.add_argument("--verify-memory-usefulness", action="store_true")
-    parser.add_argument("--usefulness-pair-seconds", type=float, default=600)
     parser.add_argument("--profiling-guidance-skill", type=Path)
     parser.add_argument("--curriculum-kdb", action="store_true")
     parser.add_argument("--kdb", type=Path)
@@ -138,8 +136,6 @@ def main(
         max_parallel=args.max_parallel,
         project_target=args.project_target,
         max_seconds=args.max_seconds,
-        usefulness_enabled=args.verify_memory_usefulness,
-        usefulness_pair_seconds=args.usefulness_pair_seconds,
         **({"max_projects": args.max_projects} if args.max_projects is not None else {}),
         **({"profiling_guidance_text": guidance_text} if guidance_text is not None else {}),
     )

@@ -6,8 +6,6 @@ import pytest
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 from benchmarks.ascend.arm_evidence import interrupted_outcome, interruption_reason, timing_summary
-from benchmarks.ascend.memory_verifier import MemoryVerifier
-from test_memory_verifier_agent import Harness, evaluate
 
 
 def evidence(tmp_path):
@@ -79,23 +77,6 @@ def test_legacy_provider_seconds_are_not_invented_as_timestamped_spans():
     assert result['unattributed_seconds'] == 10 and result['attributed_seconds'] == 0
 
 
-@pytest.mark.parametrize('stage', ['compile', 'execute'])
-def test_interrupted_arm_holds_peer_and_caches_portable_partial_result(tmp_path, stage):
-    h = Harness()
-    calls = []
-    def interrupted(task, memory, directory, **kwargs):
-        calls.append(stage)
-        evidence(directory)
-        raise TimeoutError('allocation exhausted during '+stage)
-    h.verifier.execute_arm = interrupted
-    first = evaluate(h, tmp_path)
-    assert first['validity'] == {'control': False} and first['decision'] == 'inconclusive'
-    assert first['arms']['control']['observations']['interruption_reason'] == 'deadline-exhausted'
-    assert first['arms']['control']['source_sha256']
-    assert not (tmp_path/'treatment').exists() and not h.requests
-    assert evaluate(h, tmp_path) == first and calls == [stage]
-    store = ContentAddressedArtifacts(tmp_path/'artifacts')
-    assert all(store.read_bytes(h) for h in first['artifacts'].values())
 
 
 @pytest.mark.parametrize('wrapped', [False, True])
@@ -153,23 +134,6 @@ def test_actual_environment_report_contributes_timestamped_span(tmp_path, monkey
     assert report['status']=='passed' and report['started_epoch']==100 and report['ended_epoch']==105
 
 
-@pytest.mark.parametrize('kind', ['provider', 'cancelled', 'operator-stop'])
-def test_actual_pi_error_arm_is_invalid_and_never_starts_peer(tmp_path, kind):
-    from coding.pi.rpc import PiProviderError, PiCancelled
-    h = Harness()
-    calls = []
-    def execute(task, memory, directory, **kwargs):
-        calls.append(directory.name)
-        error = PiProviderError('provider failed') if kind=='provider' else PiCancelled('aborted')
-        if kind=='operator-stop':error.interruption_reason='operator-stop'
-        raise error
-    h.verifier.execute_arm=execute
-    result = evaluate(h, tmp_path)
-    assert result['decision']=='inconclusive' and result['validity']=={'control':False}
-    expected = 'provider-failure' if kind=='provider' else kind
-    assert result['arms']['control']['observations']['interruption_reason']==expected
-    assert evaluate(h, tmp_path)==result and calls==['control']
-    assert not h.requests and not (tmp_path/'treatment').exists()
 
 
 def test_project_timing_includes_shared_health_and_environment_but_not_other_actor(tmp_path):

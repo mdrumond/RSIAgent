@@ -347,7 +347,7 @@ def test_production_editor_checks_actual_runtime_and_rechecks_qualification_on_a
     composed = bound(tmp_path)
     composed['actor'].executor.runtime_identity = dict(RUNTIME)
     composed['coordinator'].curriculum.target_policy = a3_curriculum_policy()
-    campaign = build_subject_campaign(dict(memory_verification=False), target='a3', root=tmp_path / 'campaign',
+    campaign = build_subject_campaign({}, target='a3', root=tmp_path / 'campaign',
         subjects=[Subject('current', 'Current')], initial_memory=b'', compose=lambda *a, **k: composed)
     editor = campaign.curriculum_edits
     editor.complete = lambda *a, **k: json.dumps([dict(subject_id='current', item=plan)])

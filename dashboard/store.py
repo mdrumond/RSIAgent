@@ -614,8 +614,28 @@ def _load_campaign(entry):
 
 
 def _campaign(entry):
-    from .usefulness import enrich
-    return enrich(_load_campaign(entry))
+    campaign = _load_campaign(entry)
+    root = Path(campaign['root'])
+    state = _json(root / 'state.json', {})
+    clock = _json(root / 'time-budget.json', {})
+    if clock:
+        campaign['time_budget'] = dict(seconds=clock.get('identity', {}).get('max_seconds'),
+            elapsed_seconds=clock.get('elapsed_seconds', 0), practice_seconds=clock.get('practice_seconds'))
+    elif 'max_seconds' in state and 'elapsed_seconds' in state:
+        campaign['time_budget'] = dict(seconds=state['max_seconds'], elapsed_seconds=state['elapsed_seconds'])
+    else:
+        campaign['time_budget'] = _json(root / 'active-time.json')
+    campaign['remediation'] = _json(root / 'remediation.json', {})
+    kinds = {}
+    for row in _json(root / 'failure-investigations.json', []):
+        for key, role in (('project_id', 'remedial probe'), ('control_project_id', 'remedial control')):
+            if row.get(key):
+                kinds[row[key]] = dict(kind=role, feedback_id=row.get('feedback_id'))
+    for project in campaign['projects']:
+        source = kinds.get(project.get('project_id', project['id']), {})
+        project['kind'] = source.get('kind', project.get('kind', 'new'))
+        project['feedback_id'] = source.get('feedback_id')
+    return campaign
 
 
 class DashboardStore:

@@ -253,8 +253,6 @@ def run_request(config_path, campaign_id, identifier, *, builder=build_campaign)
             request.update(status='observation-required' if request.get('phase') == 'executing' else 'failed',
                            error=type(error).__name__, finished=time.time())
         finally:
-            if campaign is not None and campaign.memory_gate is not None:
-                campaign.memory_gate.close()
             if budget is not None:
                 budget.close()
             with _lock(path.parent / '.lock'):
@@ -332,14 +330,6 @@ def _execute(campaign, request, original, directory, request_path):
             from optimizer.jobs import JobStore
             JobStore(job_path.parent.parent).continue_with_feedback(job_path.parent.name,
                 additional_seconds=request['additional_seconds'], key=request['id'])
-    for job_path in (root / 'memory-reviews').glob('*/job.json'):
-        job = _read(job_path)
-        if job.get('provenance', {}).get('project_id') == request['project_id'] and job['status'] != 'accepted':
-            job.setdefault('original_status', job['status'])
-            job.update(status='superseded', superseded_by=request['id'])
-            atomic(job_path, canonical(job))
-            campaign.scheduler.supersede_review(job['review_id'], dict(request_id=request['id'],
-                project_id=request['project_id'], admission_job=str(job_path.relative_to(root))))
     directory.mkdir(parents=True, exist_ok=True)
     attempt_id = pid+'-manual-'+request['id']
     if item.get('task', {}).get('kind') == 'optimizer':
@@ -381,9 +371,13 @@ def _execute(campaign, request, original, directory, request_path):
     _finish_linked_siblings(campaign, record, snapshot, request, request_path)
     if not record.get('review'):
         campaign._review(pid, record)
-    # A distinct review identity preserves earlier A/B decisions and receipts.
+    # A distinct review identity preserves earlier source reviews and receipts.
     review_id = pid + '-manual-' + request['id']
     record['manual_review_id'] = review_id
+    previous_review = original.get('manual_review_id', request['project_id'])
+    if previous_review in campaign.scheduler.state()['reviews']:
+        campaign.scheduler.supersede_review(previous_review, dict(request_id=request['id'],
+            replacement_review=review_id))
     review = record['review']
     _settle_manual_repairs(campaign, pid, record, review_id)
     if review.get('memory') is not None and review['decision'] == 'accept':
@@ -391,15 +385,8 @@ def _execute(campaign, request, original, directory, request_path):
         provenance = dict(project_id=pid,
             subject_id=subject_id, request=record['review_request'],
             review_sha256=record['review_sha256'])
-        if campaign.memory_gate is None:
-            campaign.memory.accept(review_id, review['memory'], provenance)
-            campaign.scheduler.resolve_review(review_id, 'accepted')
-        else:
-            campaign.memory_gate.submit(review_id, review['memory'], provenance,
-                record['review_request'], remaining_seconds=campaign._remaining())
-            while campaign.memory_gate.future is not None and campaign._remaining() > 0:
-                campaign._settle_reviews()
-                time.sleep(.1)
+        campaign.memory.accept(review_id, review['memory'], provenance)
+        campaign.scheduler.resolve_review(review_id, 'accepted')
     campaign._save()
     return dict(project_id=pid, review_id=review_id, directory=str(directory.relative_to(root)))
 

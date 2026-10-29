@@ -49,8 +49,6 @@ class SubjectViews:
         published_projects = {memory.get('provenance', {}).get('project_id')
             for version in active.get('active', {}).values()
             if (memory := _json(root / 'memory/versions' / (version + '.json'), {}))}
-        jobs = {_json(path, {}).get('review_id'): _json(path, {})
-                for path in (root / 'memory-reviews').glob('*/job.json')}
         waves = subjects.get('waves', {})
         running = False
         lock_path = root / '.campaign.lock'
@@ -81,8 +79,6 @@ class SubjectViews:
                 kind=plan.get('task', {}).get('kind', plan.get('kind', 'graph')),
                 objective=row.get('objective', plan.get('spec', {}).get('hypothesis', '')),
                 execution=execution, project_review=review.get('decision', 'pending'),
-                memory_admission=('manually-accepted' if review_id in active.get('manual_overrides', {})
-                                  else jobs.get(review_id, {}).get('status', 'not-submitted')),
                 publication='published' if published else 'unpublished', merged=published,
                 directory=row.get('directory'), restart_of=row.get('restart_of'), superseded_by=row.get('superseded_by'),
                 plan=plan, review=review, outcome=outcome,

@@ -58,7 +58,7 @@ class SubjectMemory:
             return all(state['active'].get(row['memory_id']) == row['version']
                        for row in proposal['base_versions'])
 
-    def accept(self, review_id, proposal, provenance, *, check_remaining=None, manual=None):
+    def accept(self, review_id, proposal, provenance, *, check_remaining=None):
         """Index first, then switch accepted pointers in one locked publication."""
         with self.transaction() as state:
             if review_id in state['admissions']:
@@ -82,8 +82,6 @@ class SubjectMemory:
                 state['active'].pop(row['memory_id'])
             state['active'][memory_id] = version
             state['admissions'][review_id] = dict(memory_id=memory_id, version=version)
-            if manual is not None:
-                state.setdefault('manual_overrides', {})[review_id] = dict(manual, admission=state['admissions'][review_id])
             return state['admissions'][review_id]
 
     def search(self, query):

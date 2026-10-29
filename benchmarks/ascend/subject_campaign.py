@@ -56,7 +56,7 @@ class ObservationRequired(RuntimeError):
 
 class SubjectCampaign:
     def __init__(self, root, subjects, initial_memory, *, select_wave, execute, verifier,
-                 complete, max_seconds=7200, memory_gate=None, index_memory=None,
+                 complete, max_seconds=7200, index_memory=None,
                  clock=time.monotonic):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
@@ -65,7 +65,7 @@ class SubjectCampaign:
         self.artifacts = ContentAddressedArtifacts(self.root / 'artifacts')
         self.select_wave, self.execute, self.verifier = select_wave, execute, verifier
         self.policy = SubjectCurriculumAgent(complete)
-        self.seconds, self.clock, self.memory_gate = max_seconds, clock, memory_gate
+        self.seconds, self.clock = max_seconds, clock
         self.path = self.root / 'subject-campaign.json'
         self.state = json.loads(self.path.read_bytes()) if self.path.exists() else dict(
             schema='ascend-subject-campaign-v1', waves=[], projects={}, pending=None,
@@ -81,9 +81,7 @@ class SubjectCampaign:
         return available
 
     def report(self):
-        reviews = (self.memory_gate.report() if self.memory_gate is not None
-                   and hasattr(self.memory_gate, 'report') else {})
-        return dict(review_report(self.state, reviews), subjects=self.scheduler.context(),
+        return dict(review_report(self.state), subjects=self.scheduler.context(),
                     accepted_memory=self.memory.records())
 
     def _decision_context(self):
@@ -100,15 +98,6 @@ class SubjectCampaign:
             accepted[subject] = dict(memory_id=record['memory_id'], version=digest(record),
                 subject_id=subject, wave_index=wave, **{key:str(proposal[key])[:256] for key in
                     ('summary','applicability','preconditions','expectations','limitations')})
-        reviews, rejected = {}, {}
-        for key, row in self.state.get('memory_reviews', {}).items():
-            subject = row.get('subject_id', 'seed')
-            if row['outcome']=='rejected': rejected[subject]=rejected.get(subject,0)+1
-            judgment = row.get('judgment') or {}
-            if subject in reviews and reviews[subject][1].get('sequence',0) > row.get('sequence',0):
-                continue
-            reviews[subject] = (key, dict(row, judgment={field:(str(value)[:1024] if isinstance(value,str) else value)
-                for field,value in judgment.items()}))
         projects = {}
         recent=sorted(self.state['projects'].items(),key=lambda pair:(pair[1].get('wave_index',0),pair[0]))[-4:]
         for key, row in recent:
@@ -116,40 +105,11 @@ class SubjectCampaign:
             projects[key] = dict(objective=row['objective'][:1024], review_sha256=row.get('review_sha256'),
                 review={field:review.get(field) for field in ('decision','reason','evidence','repair')})
         return dict(accepted=list(accepted.values()), accepted_counts=counts,
-            rejected_counts=rejected, memory_reviews=dict(reviews.values()), projects=projects,
+            projects=projects,
             initial_memory=self.memory.initial[:2048],
             initial_memory_sha256=hashlib.sha256(self.memory.initial.encode()).hexdigest(),
             decision_error=self.state.get('decision_error'))
 
-    def _settle_reviews(self):
-        if self.memory_gate is None:
-            return
-        remaining = max(0, self.budget.deadline-self.clock())
-        for result in self.memory_gate.poll(remaining_seconds=remaining):
-            if result.get('manual_override'):
-                self.scheduler.override_review(result['review_id'], result['manual_override'])
-            else:
-                self.scheduler.resolve_review(result['review_id'], result['outcome'])
-            rows=self.state.setdefault('memory_reviews',{})
-            if result['review_id'] not in rows or result.get('manual_override') and not rows[result['review_id']].get('manual_override'):
-                prior = rows.get(result['review_id'])
-                rows[result['review_id']] = dict(outcome=result['outcome'], judgment=result.get('judgment'),
-                    assessment=result.get('assessment'),
-                    rewrites=result.get('rewrites'), subject_id=result['provenance'].get('subject_id'),
-                    sequence=max((row.get('sequence',0) for row in rows.values()),default=0)+1)
-                if result.get('manual_override'):
-                    rows[result['review_id']].update(manual_override=result['manual_override'], original_review=prior)
-                if result['outcome']=='rejected':
-                    self.state['needs_decision']=True
-                if result.get('repair'):
-                    provenance = result['provenance']
-                    review = result['repair']
-                    self.scheduler.add_repair(result['review_id']+'-memory', provenance['subject_id'],
-                        provenance['project_id'], review['reason']+' '+json.dumps(review.get('repair'),sort_keys=True), review['evidence'])
-                    self.state['needs_decision'] = True
-                self._save()
-            if hasattr(self.memory_gate, 'acknowledge'):
-                self.memory_gate.acknowledge(result.get('delivery_id', result['review_id']))
 
     def _review(self, project_id, record):
         if record.get('review') is not None:
@@ -247,21 +207,17 @@ class SubjectCampaign:
                 continue
             provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
                 review_sha256=record['review_sha256'], request=record['review_request'])
-            if self.memory_gate is None:
-                try:
-                    self.memory.accept(pid, review['memory'], provenance)
-                except StaleMemory as error:
-                    record.setdefault('prior_reviews', []).append(review)
-                    record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'],
-                        current_memories=self.memory.records())
-                    record['review'] = None
-                    self._save()
-                    self._review(pid, record)
-                    return self._publish_wave(pending)
-                self.scheduler.resolve_review(pid, 'accepted')
-            else:
-                self.memory_gate.submit(pid, review['memory'], provenance,
-                    record['review_request'], remaining_seconds=self._remaining())
+            try:
+                self.memory.accept(pid, review['memory'], provenance)
+            except StaleMemory as error:
+                record.setdefault('prior_reviews', []).append(review)
+                record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'],
+                    current_memories=self.memory.records())
+                record['review'] = None
+                self._save()
+                self._review(pid, record)
+                return self._publish_wave(pending)
+            self.scheduler.resolve_review(pid, 'accepted')
         linked_repairs = {}
         effective = dict(_effective_project(self.state['projects'], pid) for pid in pending['projects'])
         for record in effective.values():
@@ -323,14 +279,11 @@ class SubjectCampaign:
         self.budget = AttemptTimeBudget(self.root / 'elapsed.json', self.seconds, clock=self.clock)
         try:
             self._require_observed_pending()
-            if self.memory_gate is not None and hasattr(self.memory_gate, 'start_session'):
-                self.memory_gate.start_session()
             while True:
                 self._require_observed_pending()
                 self._remaining()
                 if (self.root / 'manual-pause.json').exists():
                     raise TimeoutError('manual interaction queued at campaign checkpoint')
-                self._settle_reviews()
                 if self.state['pending'] is None and self.scheduler.prioritize_projects():
                     self.state.update(needs_decision=False, terminal=None)
                     self._save()
@@ -358,11 +311,7 @@ class SubjectCampaign:
                     continue
                 context = self.scheduler.context()
                 if context['current_subject'] is None:
-                    if self.memory_gate is None:
-                        raise RuntimeError('unfinished obligations require a curriculum revisit')
-                    self.memory_gate.wait(remaining_seconds=self._remaining())
-                    self.state['needs_decision'] = bool(self.scheduler.context()['repairs'])
-                    continue
+                    raise RuntimeError('unfinished obligations require a curriculum revisit')
                 snapshot = self.memory.snapshot()
                 wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
                 items = self.scheduler.claim_projects(wave_id)
@@ -388,13 +337,7 @@ class SubjectCampaign:
             self._save()
             return self.report()
         finally:
-            try:
-                if self.memory_gate is not None:
-                    self.memory_gate.close()
-                    if not self.state.get('observation_required'):
-                        self._settle_reviews()
-            finally:
-                self.budget.close()
+            self.budget.close()
 
     def run(self):
         with (self.root / '.campaign.lock').open('a+b') as lock:

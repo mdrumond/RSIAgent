@@ -69,14 +69,6 @@ _DESCRIPTIONS = {
     'awaiting-approval': ('The proposal requires approval before execution.', 'Review the proposed projects and record approval or rejection.'),
     'observation-unavailable': ('The worker could not obtain a usable observation of the running work.',
                                 'Recover observation of the existing handle before deciding whether to resume.'),
-    'both-succeeded': ('Both memory and no-memory runs passed. This does not establish that the memory is useless.',
-                       'Retain both results as usefulness evidence; do not infer a causal memory benefit from this experiment.'),
-    'memory-only-succeeded': ('Only the run with the new memory passed this paired experiment.',
-                             'Retain the paired evidence as support for usefulness on this task, without claiming general causality.'),
-    'without-memory-only-succeeded': ('Only the run without the new memory passed this paired experiment.',
-                                     'Inspect both traces and retain the result as possible regression evidence.'),
-    'neither-succeeded': ('Neither paired run passed, so this experiment did not demonstrate a successful repair.',
-                          'Inspect both failures and retain the outcome without declaring the memory useless.'),
     'inconclusive': ('The available evidence does not establish the requested conclusion.',
                      'Read the missing evidence or failed checks; record uncertainty rather than assigning a stronger result.'),
     'performance-study': ('This item concerns elapsed-time measurements of candidate performance.',
@@ -92,10 +84,6 @@ _DESCRIPTIONS = {
 _DESCRIPTIONS['observed-compile'] = _DESCRIPTIONS['observed-compile-failure']
 
 _DESCRIPTIONS.update({
-    'demonstrated-benefit': ('The memory treatment passed while the paired no-memory control failed.',
-                             'Retain both traces as evidence of benefit for this experiment, without inferring universal usefulness.'),
-    'treatment-regressed': ('The memory treatment failed while the paired no-memory control passed.',
-                           'Inspect both traces and record possible regression evidence without changing memory admission automatically.'),
     'READY': ('The Phase 2 curriculum declared readiness after a verified target attempt and no further useful practice.',
               'Inspect the target attempt evidence and curriculum reason; readiness does not establish correctness on other targets.'),
     'disabled-by-treatment': ('This tool is intentionally unavailable in the selected experimental treatment.',

@@ -16,7 +16,7 @@ from test_a5_phase1_curriculum_selector import context as selection_context
 from test_subject_runtime import selection_context as subject_selection_context
 
 
-def composed_campaign(tmp_path, *, memory_verification=False, transport=None):
+def composed_campaign(tmp_path, *, transport=None):
     cfg, calls, bindings = config(tmp_path), [], []
     profile = direct_profile(MODEL_IDENTITIES[0])
     def compose(settings, **options):
@@ -32,7 +32,7 @@ def composed_campaign(tmp_path, *, memory_verification=False, transport=None):
             paths=replace(cfg, root=options['root']), embeddings=Embeddings())
     worker=tmp_path/'worker.json'
     worker.write_text(json.dumps(dict(execution='local', workspace=str(tmp_path/'device'), physical_device=0)))
-    campaign=build_subject_campaign(dict(memory_verification=memory_verification, verifier_engine='completion',
+    campaign=build_subject_campaign(dict(verifier_engine='completion',
         phase1_arguments=['--worker-config',str(worker)]), target='a3', root=tmp_path/'subject',
         subjects=[Subject('copy','Find useful native copy evidence')], initial_memory=b'', compose=compose)
     return campaign, calls, bindings
@@ -52,35 +52,33 @@ def test_fresh_child_actor_queries_before_any_curriculum_selection(tmp_path, mon
     monkeypatch.setattr(subject_runtime,'SubjectExecutor',Execution)
     campaign,calls,bindings=composed_campaign(tmp_path)
     item=dict(project_id='transfer',spec=_project('transfer','gm-ub-movement'))
-    first=campaign.execute_trial_arm(item,campaign.memory.snapshot(),tmp_path/'control',remaining_seconds=30)
-    second=campaign.execute_trial_arm(item,campaign.memory.snapshot(),tmp_path/'treatment',remaining_seconds=30)
+    first=campaign.execute(item,campaign.memory.snapshot(),tmp_path/'first-project',remaining_seconds=30)
+    second=campaign.execute(item,campaign.memory.snapshot(),tmp_path/'second-project',remaining_seconds=30)
     assert first.citations[0].collection==second.citations[0].collection=='refs'
     assert [p['role'] for p in packets(calls)]==['writer','writer']
     assert all(p['context']['project']['project_id']=='transfer' for p in packets(calls))
     assert all(seconds<=30 for _,seconds in calls)
-    roots=list(tmp_path.glob('*/project/reference-librarian/librarian-budget.json'))
+    roots=list(tmp_path.glob('*/reference-librarian/librarian-budget.json'))
     assert len(roots)==2 and roots[0]!=roots[1]
-    assert len(bindings)==3
+    assert len(bindings)==1
 
 
 def test_source_and_rewrite_reviews_bind_independent_request_contexts(tmp_path, monkeypatch):
-    campaign,calls,bindings=composed_campaign(tmp_path,memory_verification=True)
+    campaign,calls,bindings=composed_campaign(tmp_path)
     # A previous curriculum selection must not become either verifier's task.
     bindings[0].curriculum.query_knowledge.begin_selection(selection_context())
     def review(self,request,**options):
         result=self.query_knowledge({'query':'pipeline','limit':1},remaining_seconds=20)
         return dict(project=request.project_id,citations=result['citations'])
     monkeypatch.setattr(ProjectVerifierAgent,'review',review)
-    try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            a=pool.submit(campaign.verifier.review,ProjectReview('source',None,False,{}),max_seconds=20)
-            b=pool.submit(campaign.memory_gate.rewrite,ProjectReview('rewrite',None,False,{}),feedback={},max_seconds=20)
-            assert a.result()['citations'] and b.result()['citations']
-        received=packets(calls)
-        assert {p['context']['project_id'] for p in received}=={'source','rewrite'}
-        assert all(p['role']=='verifier' and p['task'].endswith(p['context']['project_id']) for p in received)
-        assert len(list((campaign.root/'verifier-librarian').glob('*/librarian-budget.json')))==2
-    finally:campaign.memory_gate.close()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a=pool.submit(campaign.verifier.review,ProjectReview('source',None,False,{}),max_seconds=20)
+        b=pool.submit(campaign.verifier.review,ProjectReview('rewrite',None,False,{}),feedback={},max_seconds=20)
+        assert a.result()['citations'] and b.result()['citations']
+    received=packets(calls)
+    assert {p['context']['project_id'] for p in received}=={'source','rewrite'}
+    assert all(p['role']=='verifier' and p['task'].endswith(p['context']['project_id']) for p in received)
+    assert len(list((campaign.root/'verifier-librarian').glob('*/librarian-budget.json')))==2
 
 
 def test_subject_curriculum_uses_its_current_objective_not_native_selection_state(tmp_path):

@@ -56,18 +56,12 @@ def test_superseded_pending_review_settles_and_campaign_can_complete(tmp_path):
     scheduler.register_manual_review('one', 'study')
     scheduler.decide(dict(action='advance', reason='minimum complete', evidence=['wave-3']))
     assert not scheduler.is_complete()
-    job = root/'memory-reviews/old/job.json'
-    job.parent.mkdir(parents=True)
-    atomic(job, canonical(dict(review_id='one', provenance={'project_id': 'one'},
-        status='pending', evaluations=[{'decision': 'inconclusive'}])))
     operation = request(config)
     builder = real_builder(root, scheduler, artifacts)
     assert interaction.run_request(config, 'campaign', operation['id'], builder=builder)['status'] == 'succeeded'
     settled = scheduler.state()['reviews']['one']
     assert settled['status'] == 'rejected' and settled['original_status'] == 'pending'
     assert settled['supersession']['request_id'] == operation['id']
-    old_job = json.loads(job.read_bytes())
-    assert old_job['status'] == 'superseded' and old_job['evaluations'] == [{'decision': 'inconclusive'}]
     assert scheduler.is_complete()
     # Exercise the ordinary campaign owner after the manual worker has settled.
     campaign = builder()

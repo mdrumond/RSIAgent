@@ -28,7 +28,6 @@ def campaign(tmp_path):
     write(root / 'subjects.json', dict(subjects=[dict(subject_id='tails', objective='Tail handling')],
         waves={'wave-1': dict(subject_id='tails'), 'wave-2': dict(subject_id='tails')}))
     write(root / 'memory/active.json', dict(admissions={'copy': dict(version='a' * 64)}))
-    write(root / 'memory-reviews/job/job.json', dict(review_id='copy', status='accepted'))
     live = root / 'waves/wave-2/live'
     live.mkdir(parents=True)
     config = tmp_path / 'config.json'
@@ -44,7 +43,6 @@ def test_subject_projection_distinguishes_pending_stopped_verified_and_publicati
     assert rows['live']['execution'] == 'stopped'
     assert rows['copy']['execution'] == 'verified'
     assert rows['copy']['project_review'] == 'accept'
-    assert rows['copy']['memory_admission'] == 'accepted'
     assert rows['copy']['merged'] is True
     assert rows['copy']['wave_id'] == 'wave-1'
     with (root / '.campaign.lock').open('wb') as lock:

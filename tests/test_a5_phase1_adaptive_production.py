@@ -552,9 +552,8 @@ def test_resume_and_report_delegate_to_same_retained_coordinator(tmp_path, monke
 
 
 @pytest.mark.parametrize("action", ["run", "resume"])
-@pytest.mark.parametrize("usefulness", [False, True])
 def test_cli_wires_each_action_to_the_production_factory(
-    tmp_path, capsys, action, usefulness,
+    tmp_path, capsys, action,
 ):
     guide_path = tmp_path / "guide.md"
     guide_path.write_bytes(GUIDE_BYTES)
@@ -587,13 +586,11 @@ def test_cli_wires_each_action_to_the_production_factory(
         "--device", "3",
         "--max-parallel", "2",
         "--env-file", str(tmp_path / ".env"),
-    ] + (["--verify-memory-usefulness", "--usefulness-pair-seconds", "120"] if usefulness else []),
+    ],
         a5_main=lambda argv: cli_main(argv, builder=builder,
             environment_loader=lambda **_kwargs: {"loaded": "env"}))
 
     assert json.loads(capsys.readouterr().out) == {"action": action, "status": "ok"}
-    assert captured["usefulness_enabled"] is usefulness
-    assert captured["usefulness_pair_seconds"] == (120 if usefulness else 600)
     assert captured["guide_bytes"] == GUIDE_BYTES
     assert captured["initial_memory"] == b'{"prior":1}'
     assert captured["environment"] == {"loaded": "env"}

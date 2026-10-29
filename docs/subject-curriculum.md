@@ -51,13 +51,6 @@ supported with the A3 Ascend C binding. An A5 Catlass optimizer subject is rejec
 before composition; no Catlass optimizer backend is implied. A5 qualified graph
 and graph performance subjects continue through their existing Catlass binding.
 
-Memory evaluation can use `campaign.select_trial` and `campaign.execute_trial_arm`.
-Every arm receives a fresh production Actor/session and isolated execution/cache
-workspace while retaining the configured model, runtime and physical device.
-Actor KDB retrieval follows the arm's frozen memory versions, even when the live
-accepted catalog changes. `role_complete`, `model_identity` and `runtime_identity`
-are used by the default memory verifier and admission composition.
-
 Optimizer subjects retain the initial seed as a readable memory entry and export
 accepted memory documents plus reachable code/evidence in authenticated optimizer
 snapshot files. The existing `read-memory` and `read-artifact` tools can follow
@@ -74,60 +67,15 @@ lesson summaries, preconditions and expectations, together with initial-guidance
 preview and immutable hashes for the complete seed/snapshot. With KDB enabled,
 the curriculum can retrieve reference and learned-memory evidence from that
 same snapshot. Long result text is previewed; exact full text remains available
-in retained artifacts, referenced by the query's search details. Background
-memory admission cannot change an in-progress selection's memory view.
+in retained artifacts, referenced by the query's search details. Publication cannot change an in-progress selection's memory view.
 
-## Memory usefulness admission
+## Memory publication
 
-New subject campaigns enable memory verification by default. The independent
-memory verifier selects one small transfer project, freezes its host acceptance
-contract, and runs fresh control and treatment Actors. The control sees accepted
-memory; the treatment differs only by the proposed new or replacement memory.
-The verifier reads retained results and Actor/tool logs before judging usefulness.
-Equal scores may still support acceptance when logs demonstrate useful transfer;
-invalid or incomplete runs never establish benefit.
-
-A valid but inconclusive comparison can request a targeted follow-up with
-`next_probe: {"question": "specific uncertainty and needed contrast"}`. The
-curriculum selector authors a different neutral host contract; it does not put
-the lesson's implementation advice into either Actor's task. Each probe has a
-persisted ordinal, fresh arm directories and counterbalanced order. The judge
-can read all earlier results and artifacts, including unfavorable evidence and
-prior candidate revisions. Passing host checks does not preclude rejection.
-Probes share the original admission elapsed allocation; there is no probe-count
-stopping limit. A completed inconclusive result is cached and does not repeat
-Actor or provider work when reopened.
-
-Drafts stay outside accepted memory and ordinary KDB retrieval. Other waves may
-start against the older accepted snapshot while verification runs. Acceptance
-publishes a new immutable version for later waves. Appends and merges replace
-specified accepted versions only after testing; history remains readable. A
-concurrent replacement triggers reconciliation and a new comparison.
-
-Unhelpful drafts return to the project verifier for up to two rewrites, using the
-same frozen transfer task. Rejection after those opportunities leaves existing
-memory untouched. Missing underlying evidence can instead send the original
-project back to curriculum repair. Infrastructure failures remain inconclusive
-and retain elapsed allocations and operation identities. An invalid trial is
-held unpublished by default, including missing receipts and interrupted Actors.
-An invalid or interrupted first arm also holds its unstarted peer.
-Programmatic adapters can inject `MemoryAdmission(..., retry_ready=callback)`;
-only a literal `True` certifying that all owned operations have settled and a
-fresh trial is eligible permits a new isolated comparison. The callback receives
-`(result, trial_directory, remaining_seconds=...)`. Default campaign composition
-does not supply this certification, so it never blindly retries native work.
-An unchanged completed uncertainty without a requested probe also stays held.
-
-Optional settings are `memory_verifier_model` (defaults to the campaign model),
-`memory_review_seconds` (3600), `memory_trial_seconds` (1800), and
-`memory_arm_seconds` (600). Limits measure elapsed work and inherit the remaining
-campaign allowance. `memory_verification: false` is available for project-review
-smokes; ordinary campaigns should keep the default admission gate.
-
-The `memory-reviews` directory retains draft versions, paired execution evidence,
-judgments, and rewrite feedback. Accepted memory provenance contains the matched
-evaluation identity and verifier trace hash. Full code and examples remain in
-content-addressed artifact storage; snippets preserve exact source lines.
+Source-approved reusable memories publish immediately as immutable versions in
+accepted memory and the KDB. Appends and merges replace specified active versions;
+historical source and evidence remain readable. Concurrent replacement requires
+source-review reconciliation before publication. No separate admission experiment
+or usefulness gate runs, and no removed A/B configuration is supported.
 
 Project source audits and memory rewrites use the pinned Pi runtime for standard
 live providers. Verifier reads, artifact listings, KDB queries and context reads
@@ -161,7 +109,7 @@ custom composition. Effective engine/model and native loop/context identities
 are persisted in `project-verifier-runtime.json`; changed identities fail resume.
 Historical directories without this metadata retain completion delivery, including
 subsequent resumes. New Pi policies require a new runtime directory. Pi does not
-change remote job queues or independent A/B publication gates.
+change remote job queues.
 
 ## Retrospective native runs
 
