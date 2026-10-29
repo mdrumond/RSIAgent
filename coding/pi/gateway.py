@@ -12,6 +12,8 @@ import time
 
 import requests
 
+from .context import ContextLimitError
+
 
 PROVIDERS = {
     "openai": {"model": "gpt-5.6-sol", "url": "https://api.openai.com/v1/chat/completions",
@@ -136,7 +138,7 @@ class Gateway:
                     owner.stop_reason = owner.stop_reason or "deadline"
                     return self.error(408, str(exc))
                 except (ValueError, TypeError, AttributeError) as error:
-                    if "hard byte" in str(error):
+                    if isinstance(error, ContextLimitError) or "hard byte" in str(error):
                         owner.stop_reason = "context-limit"
                         owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes})
                         return self.error(413, "request context exceeds the configured byte limit")

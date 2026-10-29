@@ -133,3 +133,32 @@ def test_memory_assessments_and_retirement_history_page_losslessly():
     reference=packed['host']['project']['project']['memory_exposures']
     assert json.loads(reconstruct(records,reference))==rows
     assert packed['host']['review_state']==context['host']['review_state']
+
+
+def test_accumulated_read_metadata_pages_without_hiding_decision_controls():
+    digests = [hashlib.sha256(str(i).encode()).hexdigest() for i in range(60)]
+    state = dict(read_artifacts=digests, allowed_evidence=digests,
+        fully_read_artifacts=digests, readable_artifacts=digests,
+        missing_required_artifacts=[], host_checks_passed=True,
+        knowledge_queried=True, ready_for_decision=True)
+    context = dict(host=dict(review_state=state,
+        validation_feedback=dict(error_code='invalid-snippet',
+            readable_artifacts={f'original:{i}':sha for i,sha in enumerate(digests[:16])})))
+    with pytest.raises(ContextLimitError):
+        ContextRecords().snapshot(context, target=12000)
+    records = ReviewContextRecords()
+    packed = records.snapshot(context, target=12000)
+    assert len(encoded(packed)) <= 12000
+    visible = packed['host']['review_state']
+    assert visible['allowed_evidence'] == digests
+    assert visible['missing_required_artifacts'] == []
+    assert visible['ready_for_decision'] and visible['host_checks_passed']
+    recovered = []
+    for key in ('read_artifacts', 'fully_read_artifacts', 'readable_artifacts'):
+        value = visible[key]
+        if isinstance(value, dict):
+            value = json.loads(reconstruct(records, value))
+            recovered.append(key)
+        assert value == digests
+    assert recovered
+    assert packed['host']['validation_feedback']['error_code'] == 'invalid-snippet'
