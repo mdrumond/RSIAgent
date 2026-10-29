@@ -70,8 +70,21 @@ class SubjectCampaign:
         self.state = json.loads(self.path.read_bytes()) if self.path.exists() else dict(
             schema='ascend-subject-campaign-v1', waves=[], projects={}, pending=None,
             needs_decision=False, terminal=None)
+        from .memory_maintenance import MemoryMaintenance
+        self.memory_maintenance = MemoryMaintenance(self, memory_ledger) if memory_ledger is not None else None
+        if self.memory_maintenance is not None:
+            index = self.memory.index
+            def archive_index(version, record):
+                self.memory_maintenance.archive(record)
+                if index is not None:
+                    index(version, record)
+            self.memory.index = archive_index
+            for record in self.memory.records():
+                self.memory_maintenance.archive(record)
 
     def _save(self):
+        if self.memory_maintenance is not None:
+            self.state['memory_maintenance'] = self.memory_maintenance.report()
         atomic(self.path, canonical(self.state))
 
     def _remaining(self):
@@ -82,7 +95,8 @@ class SubjectCampaign:
 
     def report(self):
         return dict(review_report(self.state), subjects=self.scheduler.context(),
-                    accepted_memory=self.memory.records())
+                    accepted_memory=self.memory.records(),
+                    memory_maintenance=self.memory_maintenance.report() if self.memory_maintenance else None)
 
     def _decision_context(self):
         # Policy sees coverage and concise evidence, not repeated source/log bodies.
@@ -155,6 +169,8 @@ class SubjectCampaign:
             host_verified=outcome['host_verified'], artifacts=artifacts,
             host_facts=tuple(outcome['observations'].get('host_facts', ())),
             objective=objective)
+        if self.memory_maintenance is not None:
+            request = self.memory_maintenance.prepare(request, record.get('repairs', []))
         try:
             review = self.verifier.review(request, max_seconds=self._remaining(),
                 feedback=record.get('rewrite_feedback'))
@@ -171,6 +187,9 @@ class SubjectCampaign:
         record['review_request'] = asdict(request)
         record['review_sha256'] = self.artifacts.put_json(review)
         self._save()
+        if self.memory_maintenance is not None:
+            self.memory_maintenance.observe(project_id, record)
+            self._save()
 
     def _publish_wave(self, pending):
         review_ids = pending.get('review_ids')
@@ -201,30 +220,40 @@ class SubjectCampaign:
                     self.scheduler.resolve_review(pid, 'rejected')
                 self.scheduler.add_repair(pid, subject, pid, review['reason'], evidence)
                 continue
+            if self.memory_maintenance is not None and review['memory'] is None:
+                try:
+                    self.memory_maintenance.validate_resolution(record)
+                except StaleMemory as error:
+                    return self._refresh_publication(pid, record, pending, error)
             if review['memory'] is None:
+                if self.memory_maintenance is not None:
+                    self.memory_maintenance.resolve(pid, record)
                 if pid in review_ids:
                     self.scheduler.resolve_review(pid, 'accepted')
                 continue
             provenance = dict(project_id=pid, subject_id=subject, wave_index=len(self.state['waves'])+1,
-                review_sha256=record['review_sha256'], request=record['review_request'])
+                review_sha256=record['review_sha256'], request=record['review_request'],
+                observed_retirements=[row['tombstone_id'] for row in record['review_request'].get('retired_memories', [])],
+                memory_maintenance_revisions=self.memory_maintenance.revisions(record) if self.memory_maintenance else [],
+                retirement_resolutions=[dict(tombstone_id=row['tombstone_id'], evidence=row['evidence'], reason=row['reason'])
+                    for row in review.get('retirement_checks', []) if row['relation'] == 'reconciles'])
             try:
                 self.memory.accept(pid, review['memory'], provenance)
             except StaleMemory as error:
-                record.setdefault('prior_reviews', []).append(review)
-                record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'],
-                    current_memories=self.memory.records())
-                record['review'] = None
-                self._save()
-                self._review(pid, record)
-                return self._publish_wave(pending)
+                return self._refresh_publication(pid, record, pending, error)
             self.scheduler.resolve_review(pid, 'accepted')
+            if self.memory_maintenance is not None:
+                self.memory_maintenance.resolve(pid, record)
         linked_repairs = {}
         effective = dict(_effective_project(self.state['projects'], pid) for pid in pending['projects'])
         for record in effective.values():
             for repair_id in record.get('repairs', []):
                 linked_repairs.setdefault(repair_id, []).append(record)
         obligations = self.scheduler.state()['repairs']
+        memory_repairs = {row['repair_id'] for row in self.memory_maintenance.obligations(open_only=False)} if self.memory_maintenance else set()
         for repair_id, records in linked_repairs.items():
+            if repair_id in memory_repairs:
+                continue  # Explicit memory resolutions, never host success alone, settle these.
             if (obligations[repair_id]['status'] == 'open'
                     and all(row['review']['decision'] == 'accept' for row in records)):
                 self.scheduler.resolve_repair(repair_id, [row['review_sha256'] for row in records])
@@ -232,6 +261,15 @@ class SubjectCampaign:
             self.state['waves'].append(pending['wave_id'])
         self.state.update(pending=None, needs_decision=True)
         self._save()
+
+    def _refresh_publication(self, pid, record, pending, error):
+        record.setdefault('prior_reviews', []).append(record['review'])
+        record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=record['review']['memory'],
+            current_memories=self.memory.records())
+        record['review'] = None
+        self._save()
+        self._review(pid, record)
+        return self._publish_wave(pending)
 
     def _require_observed_pending(self):
         pending = self.state.get('pending')
@@ -284,7 +322,14 @@ class SubjectCampaign:
                 self._remaining()
                 if (self.root / 'manual-pause.json').exists():
                     raise TimeoutError('manual interaction queued at campaign checkpoint')
-                if self.state['pending'] is None and self.scheduler.prioritize_projects():
+                maintenance_repair = None
+                if self.memory_maintenance is not None:
+                    self.memory_maintenance.reconcile()
+                    if self.state['pending'] is None:
+                        maintenance_repair = self.memory_maintenance.prioritize()
+                        if maintenance_repair:
+                            self.state.update(needs_decision=False, terminal=None)
+                if maintenance_repair is None and self.state['pending'] is None and self.scheduler.prioritize_projects():
                     self.state.update(needs_decision=False, terminal=None)
                     self._save()
                 if self.scheduler.is_complete() and not self.state['needs_decision']:
@@ -314,10 +359,20 @@ class SubjectCampaign:
                     raise RuntimeError('unfinished obligations require a curriculum revisit')
                 snapshot = self.memory.snapshot()
                 wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
-                items = self.scheduler.claim_projects(wave_id)
+                if maintenance_repair:
+                    context['repairs'] = [maintenance_repair]
+                    context['selection_artifacts'] = maintenance_repair['memory_context']['artifacts']
+                items = [] if maintenance_repair else self.scheduler.claim_projects(wave_id)
                 if not items:
                     items = self.select_wave(context, snapshot, self.state['projects'],
                                              remaining_seconds=self._remaining())
+                if maintenance_repair and any(maintenance_repair['repair_id'] not in item.get('repairs', []) for item in items):
+                    self.state['decision_error'] = 'Every imposed memory-maintenance project must address its selected repair obligation'
+                    self._save()
+                    continue
+                if maintenance_repair:
+                    for item in items:
+                        item['memory_maintenance'] = maintenance_repair['memory_context']
                 if not items or len({i['project_id'] for i in items}) != len(items):
                     raise ValueError('wave must contain unique projects')
                 if set(i['project_id'] for i in items) & self.state['projects'].keys():

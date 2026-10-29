@@ -85,6 +85,9 @@ class ProjectReview:
     artifacts: Mapping[str, str]
     host_facts: tuple = ()
     objective: str = ''
+    memory_exposures: tuple = ()
+    memory_repairs: tuple = ()
+    retired_memories: tuple = ()
 
     def __post_init__(self):
         _text(self.project_id, 'project_id')
@@ -125,6 +128,10 @@ Return one JSON action per reply:
 {"knowledge_query":{"query":"..."}}
 {"request_check":{"hypothesis":"...","check":{...}}}
 or terminal {"decision":"accept"|"repair","reason":"...","evidence":["sha"],
+"memory_judgments":[{"exposure_id":"...","usefulness":"useful|not-useful|unknown",
+"correctness":"supported|contradicted|unknown","investigate":false,"reason":"...","evidence":["sha"]}],
+"memory_resolutions":[{"repair_id":"...","action":"replace|restore|retire|confirm","reason":"...","evidence":["sha"]}],
+"retirement_checks":[{"tombstone_id":"...","relation":"unrelated|duplicate|reconciles","reason":"...","evidence":["sha"]}],
 "repair":null|{"instructions":"...","expected_evidence":"..."},"memory":null|{
 "operation":"create"|"append"|"merge","base_versions":[{"memory_id":"...","version":"..."}],
 "summary":"...","applicability":"...","preconditions":"...","expectations":"...",
@@ -158,9 +165,21 @@ can still warrant a new host-validated example. An empty KDB result is a reason
 to CREATE relevant memory, never a prerequisite failure for writing memory.
 Acceptance may have null memory only when existing accepted memory already covers
 the learning or the project yielded no reusable learning; explain that specific
-reason. Usefulness will be tested independently, so do not suppress useful
+reason. Usefulness is assessed from ordinary project evidence, so do not suppress useful
 verified examples merely because the API is familiar. Repair must have null memory.
-Evidence must reference actually read artifacts; no unsupported causal claims.'''
+Evidence must reference actually read artifacts; no unsupported causal claims.
+Judge EVERY supplied memory_exposure independently for usefulness and correctness.
+Use unknown when traces/results cannot establish either; unknown is not negative evidence.
+Set investigate=true only for an explicit cited correctness concern; ordinary uncertainty
+from missing evidence is not an investigation request.
+Read its exact document before deciding correctness; contradiction must cite separate
+project evidence. A correct memory can be unhelpful, and an incorrect memory can appear
+helpful. Resolve assigned memory_repairs explicitly: replace with a corrected/merged
+memory, restore an unjustified quarantine, confirm an active investigation, or retire with evidence. A passing kernel
+alone never resolves a memory repair. Compare proposed memories against all supplied
+retired_memories; duplicate retired claims cannot be republished. Reconciliation needs
+fresh project evidence explicitly resolving the recorded retirement evidence.
+All three memory arrays are required; use [] when no entries apply.'''
 
 REVIEW_INSTRUCTIONS = SYSTEM
 SYSTEM = REVIEW_INSTRUCTIONS + ACTION_FORMAT + EVIDENCE_INSTRUCTIONS
@@ -249,11 +268,13 @@ class ProjectVerifierAgent:
             messages.append({'role': 'user', 'content': json.dumps(observation, sort_keys=True)})
 
     def _validate_decision(self, value, request, read, required, host_ok, queried,
-                           versions, citations, remaining, observed):
-        if set(value) != {'decision', 'reason', 'evidence', 'repair', 'memory'} or value['decision'] not in {'accept', 'repair'}:
+                           versions, citations, remaining, observed, fully_read):
+        if set(value) != {'decision', 'reason', 'evidence', 'repair', 'memory', 'memory_judgments', 'memory_resolutions', 'retirement_checks'} or value['decision'] not in {'accept', 'repair'}:
             raise ValueError('invalid terminal decision')
         _text(value['reason'], 'reason')
         self._evidence(value['evidence'], read)
+        from .memory_review import validate_memory_review
+        validate_memory_review(value, request, read, self._evidence, fully_read)
         if value['decision'] == 'repair':
             if request.source_sha256 is None and required - read:
                 raise ValueError('read execution result/log evidence for a project without source')
@@ -368,8 +389,15 @@ class ReviewState:
         self.registry = dict(request.artifacts)
         if request.source_sha256 is not None:
             self.registry['source'] = request.source_sha256
+        for group in (request.memory_exposures, request.memory_repairs, request.retired_memories):
+            for row in group:
+                self.registry['memory-document:' + row['version']] = row['document_sha256']
+                for index, sha in enumerate({*row.get('evidence', []), *row.get('artifact_sha256', [])}):
+                    self.registry['memory-evidence:' + row['version'] + ':' + str(index)] = sha
         self.known = set(self.registry.values())
         self.read, self.observed, self.versions, self.citations = set(), {}, set(), []
+        for row in (*request.memory_repairs, *request.retired_memories):
+            self.versions.add((row['memory_id'], row['version']))
         self.sizes = {}
         original = request.artifacts.get('original-source')
         self.complete_required = {original} if original is not None and original != request.source_sha256 else set()
@@ -563,7 +591,8 @@ class ReviewState:
                         'follow missing_required_artifacts.next_read to read every missing page')
                 decision_required = self.execution_required if value.get('decision') == 'repair' else required
                 self.agent._validate_decision(value, request, read, decision_required, host_ok,
-                                        queried, versions, citations, remaining, observed)
+                                        queried, versions, citations, remaining, observed,
+                                        {sha for sha in read if not self.missing_ranges(sha)})
                 remaining()
                 self.agent._record('decision', value)
                 self.decision = value

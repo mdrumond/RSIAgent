@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
+from .subject_memory import StaleMemory
 import math
 import os
 from pathlib import Path
@@ -379,14 +380,38 @@ def _execute(campaign, request, original, directory, request_path):
         campaign.scheduler.supersede_review(previous_review, dict(request_id=request['id'],
             replacement_review=review_id))
     review = record['review']
+    maintenance = getattr(campaign, 'memory_maintenance', None)
+    if maintenance is not None and review['decision'] == 'accept' and review.get('memory') is None:
+        try:
+            maintenance.validate_resolution(record)
+        except StaleMemory as error:
+            record.setdefault('prior_reviews', []).append(review)
+            record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'])
+            record['review'] = None
+            campaign._save()
+            return _execute(campaign, request, original, directory, request_path)
     _settle_manual_repairs(campaign, pid, record, review_id)
     if review.get('memory') is not None and review['decision'] == 'accept':
         campaign.scheduler.register_manual_review(review_id, subject_id)
         provenance = dict(project_id=pid,
             subject_id=subject_id, request=record['review_request'],
-            review_sha256=record['review_sha256'])
-        campaign.memory.accept(review_id, review['memory'], provenance)
+            review_sha256=record['review_sha256'],
+            observed_retirements=[row['tombstone_id'] for row in record['review_request'].get('retired_memories', [])],
+            memory_maintenance_revisions=maintenance.revisions(record) if maintenance else [],
+            retirement_resolutions=[dict(tombstone_id=row['tombstone_id'],evidence=row['evidence'],reason=row['reason'])
+                for row in review.get('retirement_checks', []) if row['relation']=='reconciles'])
+        try:
+            campaign.memory.accept(review_id, review['memory'], provenance)
+        except StaleMemory as error:
+            record.setdefault('prior_reviews', []).append(review)
+            record['rewrite_feedback'] = dict(reason=str(error), previous_proposal=review['memory'])
+            record['review'] = None
+            campaign._save()
+            return _execute(campaign, request, original, directory, request_path)
         campaign.scheduler.resolve_review(review_id, 'accepted')
+    maintenance = getattr(campaign, 'memory_maintenance', None)
+    if maintenance is not None:
+        maintenance.resolve(pid, record)
     campaign._save()
     return dict(project_id=pid, review_id=review_id, directory=str(directory.relative_to(root)))
 
@@ -430,7 +455,11 @@ def _settle_manual_repairs(campaign, pid, record, review_id):
             key, row = _effective_project(campaign.state['projects'], item['project_id'])
             siblings.setdefault(key, row or dict(repairs=item.get('repairs', [])))
     obligations = campaign.scheduler.state()['repairs']
+    maintenance = getattr(campaign, 'memory_maintenance', None)
+    memory_repairs = {row['repair_id'] for row in maintenance.obligations(open_only=False)} if maintenance else set()
     for repair_id in record.get('repairs', []):
+        if repair_id in memory_repairs:
+            continue
         if obligations.get(repair_id, {}).get('status') != 'open':
             continue
         linked = [row for row in siblings.values()

@@ -301,6 +301,10 @@ class SubjectKnowledge:
                 chosen = [payload['action']['index']] if payload['action']['index'] in records else []
             else:
                 sha = payload['action']['sha256']
+                assigned = {value for entry in snapshot['memory_entries'] if entry.get('kind') == 'memory-maintenance'
+                            for value in entry['artifacts'].values()}
+                if sha in assigned:
+                    return payload['result']  # Explicit untrusted assigned repair evidence is not ordinary retrieval.
                 chosen = [i for i,record in records.items()
                           if sha in {memory_digest(record), *memory_artifacts(record)}]
             unavailable = {i for i in chosen if not self.ledger.available(memory_digest(records[i]))}

@@ -72,3 +72,23 @@ def test_impossible_latest_batch_is_held_before_provider_dispatch():
     with pytest.raises(ValueError):
         gateway.prepare(dict(model='deepseek-flash', messages=rows))
     assert gateway.calls == 0
+
+
+def test_gateway_reports_context_exhaustion_before_dispatch(monkeypatch):
+    from http.client import HTTPConnection
+    from coding.pi.context import ContextLimitError
+    def project(*args, **kwargs):
+        raise ContextLimitError('mandatory review controls exceed target byte budget')
+    monkeypatch.setattr('coding.pi.gateway.requests.post',
+        lambda *a, **kw: pytest.fail('a context failure must not reach the provider'))
+    with Gateway('deepseek', 'private-test', RequestAccounting(), 'context-limit',
+                 request_projector=project) as gateway:
+        connection = HTTPConnection('127.0.0.1', gateway.server.server_port, timeout=5)
+        connection.request('POST', '/v1/chat/completions',
+            body=json.dumps(dict(model='deepseek-flash', messages=[dict(role='user', content='Review')])).encode(),
+            headers={'Authorization':'Bearer '+gateway.token, 'Content-Type':'application/json'})
+        response = connection.getresponse()
+        assert response.status == 413
+        response.read();connection.close()
+        assert gateway.stop_reason == 'context-limit'
+        assert gateway.calls == 0
