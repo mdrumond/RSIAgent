@@ -19,7 +19,8 @@ def setup(tmp_path):
     plan = dict(project_id='one', spec={'project_id': 'one'})
     record = dict(plan=plan, objective='study', wave_index=1,
                   outcome={'host_verified': False}, review={'decision': 'repair'})
-    state = dict(projects={'one': record}, waves=['wave-1'], pending=None)
+    state = dict(schema='ascend-subject-campaign-v2', projects={'one': record},
+                 waves=['wave-1'], pending=None, needs_decision=False, terminal=None)
     atomic(root / 'subject-campaign.json', canonical(state))
     artifacts = ContentAddressedArtifacts(root / 'artifacts')
     snapshot = artifacts.put_bytes(b'frozen memory')
