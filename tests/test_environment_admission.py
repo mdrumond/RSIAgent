@@ -26,6 +26,16 @@ def setup(tmp_path, monkeypatch, *, device=1, cache=None, clock=None):
     return admission,health,probes,transport
 
 
+@pytest.fixture(autouse=True)
+def remote_clock_sample(monkeypatch):
+    from pathlib import Path
+    import time
+    from benchmarks.ascend.cpl_native import CplNativeCandidateBackend
+    monkeypatch.setattr(CplNativeCandidateBackend, '_sample_remote_clock',
+        lambda self, key, expires_at, cwd: dict(remote_deadline=time.monotonic()+expires_at-self.wall_clock(),
+            remote_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip()))
+
+
 def test_cache_shared_across_arms_but_health_is_fresh(tmp_path,monkeypatch):
     cache=tmp_path/'cache'
     parent,health,probes,_=setup(tmp_path/'parent',monkeypatch,cache=cache)

@@ -35,9 +35,12 @@ def unsettled_operations(root):
                 and quarantine.get('destination') == arguments[-1]
                 and quarantine.get('workspace') == identity.get('workspace')):
             continue
-        if 'result' in row or row.get('state') in TERMINAL:
+        if 'result' in row:
             continue
-        if row.get('handle') and observed.get(row['handle']) in TERMINAL:
+        if row.get('state') in TERMINAL and not row.get('requires_terminal_result'):
+            continue
+        if (row.get('handle') and observed.get(row['handle']) in TERMINAL
+                and not row.get('requires_terminal_result')):
             continue
         if row.get('state') not in ('new', None):
             pending.append(row.get('handle') or str(path))

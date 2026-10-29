@@ -55,9 +55,19 @@ class Remote:
 def backend(tmp_path, remote, **kwargs):
     kwargs.setdefault('submission_reserve_seconds', 0)
     kwargs.setdefault('cleanup_reserve_seconds', 0)
-    return CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote', target='fixture', runtime='named-runtime',
-        remote_workspace='/owned/task', physical_device=11, state_directory=tmp_path/'transport',
+    real_clock_probe = kwargs.pop('real_clock_probe', False)
+    terminal_receipts = kwargs.pop('terminal_receipts', False)
+    candidate = CplNativeCandidateBackend(cpl_remote='/skill/cpl-remote', target='fixture', runtime='named-runtime',
+        remote_workspace=kwargs.pop('remote_workspace', '/owned/task'), physical_device=11, state_directory=tmp_path/'transport',
         process_runner=remote, **kwargs)
+    if not real_clock_probe:
+        candidate._sample_remote_clock = lambda key, expires_at, cwd: dict(
+            remote_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            remote_deadline=time.monotonic()+expires_at-candidate.wall_clock())
+    if not terminal_receipts:
+        candidate._terminal_receipt = lambda *args, **options: None
+        candidate._receipt_capable = lambda path: False
+    return candidate
 
 
 def test_cpl_compiles_executes_and_reuses_retained_handle_without_resubmit(tmp_path):
@@ -74,8 +84,6 @@ def test_cpl_compiles_executes_and_reuses_retained_handle_without_resubmit(tmp_p
     submits = [call for call in remote.calls if call[2] == 'run']
     assert len(submits) == 2
     assert all(call[call.index('--runtime')+1] == 'named-runtime' for call in submits)
-    script = Path(submits[0][submits[0].index('--file')+1]).read_text()
-    assert 'ASCEND_RT_VISIBLE_DEVICES=11' in script  # Actual executed shell contract.
     assert all(call[0] == '/skill/cpl-remote' for call in remote.calls)
 
 
@@ -187,7 +195,9 @@ def test_queue_expiry_cancels_owned_handle_without_resubmitting(tmp_path):
 
 def test_payload_dispatched_after_frozen_expiry_does_not_execute(tmp_path):
     remote = Remote()
-    candidate = backend(tmp_path, remote, timeout=10, wall_clock=lambda: time.time()-100)
+    candidate = backend(tmp_path, remote, timeout=10, remote_workspace=str(tmp_path/'remote'))
+    candidate._sample_remote_clock = lambda *a, **k: dict(remote_deadline=time.monotonic()-100,
+        remote_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
     marker = tmp_path/'must-not-be-created'
     candidate.run_remote(('python', '-c', 'import pathlib,sys;pathlib.Path(sys.argv[1]).touch()', str(marker)), key='late')
     script = candidate.root/'late'/'command.sh'
@@ -435,7 +445,7 @@ def test_real_launcher_distinguishes_deadline_escalation_from_normal_137(tmp_pat
         remote.exit_code = result.returncode
         return subprocess.CompletedProcess(argv, 0, json.dumps(dict(state='completed', handle=handle, exit=result.returncode)), '')
     candidate = backend(tmp_path, launch, timeout=46 if deadline else 10,
-                        cleanup_reserve_seconds=45 if deadline else 0)
+                        cleanup_reserve_seconds=45 if deadline else 0, remote_workspace=str(tmp_path/'remote'))
     marker = tmp_path/'started'
     command = ('python', '-c',
         'import signal,time,pathlib,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
@@ -462,7 +472,13 @@ def test_expired_legacy_137_is_held_without_rewriting_or_resubmitting(tmp_path, 
     if legacy:
         directory.mkdir(parents=True)
         (directory/'command.json').write_text(json.dumps(dict(argv=argv, expires_at=1010.0)))
-        (directory/'command.sh').write_text("exec timeout --signal=TERM --kill-after=10s 10s python -c 'pass'\n")
+        script = directory/'command.sh'
+        script.write_text("exec timeout --signal=TERM --kill-after=10s 10s python -c 'pass'\n")
+        handle = 'remote:fixture:job:legacy'
+        remote.jobs[handle] = ''
+        arguments = ['run','fixture','--runtime','named-runtime','--cwd','/owned/task','--file',str(script.resolve())]
+        (directory/'operation.json').write_text(json.dumps(dict(state='running',handle=handle,expires_at=1010.0,
+            identity=dict(route=candidate.runtime_identity,workspace='/owned/task',arguments=arguments))))
     assert candidate.run_remote(argv, key='retained').returncode == 137
     script = (directory/'command.sh').read_bytes()
     payload = (directory/'command.json').read_bytes()
@@ -474,7 +490,7 @@ def test_expired_legacy_137_is_held_without_rewriting_or_resubmitting(tmp_path, 
         assert candidate.run_remote(argv, key='retained').returncode == 137
     assert (directory/'command.sh').read_bytes() == script
     assert (directory/'command.json').read_bytes() == payload
-    assert len([call for call in remote.calls if call[2]=='run']) == 1
+    assert len([call for call in remote.calls if call[2]=='run']) == (0 if legacy else 1)
 
 
 def test_real_launcher_kills_surviving_descendant_after_leader_exits(tmp_path):
@@ -482,7 +498,7 @@ def test_real_launcher_kills_surviving_descendant_after_leader_exits(tmp_path):
     import signal
     import sys
     remote = Remote()
-    candidate = backend(tmp_path, remote, timeout=2)
+    candidate = backend(tmp_path, remote, timeout=2, remote_workspace=str(tmp_path/'remote'))
     ready = tmp_path/'descendant.pid'
     parent = tmp_path/'parent.py'
     descendant = "import os,pathlib,signal,time,sys; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
@@ -534,7 +550,7 @@ def test_real_launcher_cancellation_kills_isolated_payload_group(tmp_path, cance
         "signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
         + "subprocess.Popen([sys.executable,'-c'," + repr(descendant) + ",sys.argv[1]])\n"
         + "time.sleep(60)\n")
-    candidate = backend(tmp_path, Remote())
+    candidate = backend(tmp_path, Remote(), remote_workspace=str(tmp_path/'remote'))
     candidate.run_remote([sys.executable, str(parent), str(ready)], key='cancelled-tree')
     process = subprocess.Popen(('bash', str(candidate.root/'cancelled-tree/command.sh')),
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)

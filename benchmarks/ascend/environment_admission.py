@@ -174,7 +174,8 @@ def recover_campaign_operations(root, transports, *, seconds=30, remaining=lambd
     deadline = time.monotonic() + seconds
     for path in Path(root).rglob('operation.json'):
         record = json.loads(path.read_bytes())
-        if 'result' in record or record.get('state') in ('new', 'cancelled', 'quarantined'):
+        if ('result' in record or record.get('state') in ('new', 'quarantined')
+                or record.get('state') == 'cancelled' and not record.get('requires_terminal_result')):
             continue
         identity = record.get('identity', {})
         route = identity.get('route', {})

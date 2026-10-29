@@ -6,6 +6,7 @@ from pathlib import Path, PurePosixPath
 from statistics import median
 import subprocess
 import time
+import uuid
 
 from benchmarks.a3kernels.candidate import CandidateCompilation, _parse_output
 from benchmarks.a3kernels.native_candidate import NativeCandidatePlan
@@ -14,6 +15,8 @@ from benchmarks.a3kernels.phase1_evidence import canonical_digest
 from benchmarks.a3kernels.phase1_protocol import ExecutionReceipt, FailedEvidence, attest
 from benchmarks.a3kernels.profiling import parse_timing_output
 from .actor_time import preparation, current_budget
+from .remote_command import (LAUNCHER, clock_source, launcher_source, payload_digest,
+                             receipt_reader_source, validate_clock, validate_receipt)
 from benchmarks.a3kernels.remote_candidate import GZA3RemoteCandidateBackend, _COMPILE_SCRIPT, _EXECUTE_SCRIPT, _PendingObservation
 from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
 
@@ -97,13 +100,13 @@ class CplNativeCandidateBackend:
             raise ProjectInfrastructureError('CPL response must be an object')
         return value
 
-    def _operation(self, key, arguments, *, kind, expires_at=None):
+    def _operation(self, key, arguments, *, kind, expires_at=None, controller_deadline=None):
         stage = key.rsplit('/', 1)[-1]
         if stage not in {'upload', 'stage', 'compile', 'execute'}:
             stage = 'transport'
         try:
             return self._timed(stage, lambda: self._operation_inner(key, arguments,
-                kind=kind, expires_at=expires_at), key=key)
+                kind=kind, expires_at=expires_at, controller_deadline=controller_deadline), key=key)
         except _PendingObservation as error:
             path = self.root / key / 'operation.json'
             diagnostic = getattr(error, 'transport_diagnostic', None)
@@ -114,7 +117,7 @@ class CplNativeCandidateBackend:
             # CLI failure is diagnostic evidence, not proof of remote termination.
             raise
 
-    def _operation_inner(self, key, arguments, *, kind, expires_at=None):
+    def _operation_inner(self, key, arguments, *, kind, expires_at=None, controller_deadline=None):
         """Never submit again after an uncertain submission or observable handle."""
         path = self.root / key / 'operation.json'
         identity = dict(route=self.runtime_identity, workspace=str(self._workspace), arguments=list(arguments))
@@ -127,6 +130,10 @@ class CplNativeCandidateBackend:
             if record['state'] != 'new':
                 raise ProjectInfrastructureError('retained operation lacks frozen elapsed expiry; inspect its handle')
             record['expires_at'] = expires_at if expires_at is not None else self.wall_clock()+self._allowance()
+            record['controller_deadline'] = controller_deadline if controller_deadline is not None else (
+                self.clock()+record['expires_at']-self.wall_clock())
+            record['controller_boot_id'] = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            if self._receipt_capable(path): record['requires_terminal_result'] = True
         terminal = ('completed', 'failed', 'cancelled')
         receipt = path.with_name('submission-receipt.json')
         self._restore_receipt(path, record, receipt, kind)
@@ -134,10 +141,17 @@ class CplNativeCandidateBackend:
             self._quarantine_upload(path, record)
         if record.get('state') == 'quarantined':
             raise self._pending('CPL upload namespace quarantined; do not resubmit')
+        if ('controller_deadline' in record and record.get('controller_boot_id') !=
+                Path('/proc/sys/kernel/random/boot_id').read_text().strip()):
+            raise ProjectInfrastructureError('controller boot changed; retained work requires read-only reconciliation')
         work_expiry = record['expires_at'] - self.cleanup_reserve
+        work_remaining = (record['controller_deadline']-self.cleanup_reserve-self.clock()
+            if 'controller_deadline' in record else work_expiry-self.wall_clock())
+        available = self.timeout if self.remaining_seconds is None else min(self.timeout, max(0, self.remaining_seconds()))
+        deadline = self.clock() + max(0, min(available, work_remaining))
 
         def expired():
-            return (self.wall_clock() >= work_expiry or
+            return (self.clock() >= deadline or
                     self.remaining_seconds is not None and self.remaining_seconds() <= 0)
 
         def recover_expiry():
@@ -162,7 +176,7 @@ class CplNativeCandidateBackend:
                 _save(path, record)
                 if record['state'] in ('completed', 'failed'):
                     return self._finish_operation(path, record, observed, kind)
-                if record['state'] != 'cancelled':
+                if record['state'] != 'cancelled' and not record.get('cancel_requested'):
                     cancelled = cleanup_call(('cancel', record['handle']))
                     if cancelled.get('handle') != record['handle']:
                         raise ProjectInfrastructureError('CPL cancellation returned a foreign handle')
@@ -172,13 +186,18 @@ class CplNativeCandidateBackend:
                         return self._finish_operation(path, record, cancelled, kind)
             elif record['state'] in ('completed', 'failed'):
                 return self._finish_operation(path, record, dict(state=record['state'], handle=record.get('handle')), kind)
+            if kind == 'job' and record.get('handle'):
+                recovered = self._terminal_receipt(path, record, seconds=cleanup_deadline-self.clock())
+                if recovered is not None: return recovered
+            if record.get('requires_terminal_result'):
+                record['remote_state'] = record['state']
+                record['state'] = 'observation-unavailable'
             record['expired'] = True
             _save(path, record)
             raise self._pending('CPL elapsed allocation expired; retained handle '+str(record.get('handle')), 'deadline-exhausted')
 
         if expired():
             return recover_expiry()
-        deadline = self.clock() + min(self._allowance(), work_expiry-self.wall_clock())
         if not record.get('handle'):
             if record['state'] != 'new':
                 raise self._pending('CPL submission outcome is ambiguous; do not resubmit')
@@ -235,6 +254,7 @@ class CplNativeCandidateBackend:
         return self._finish_operation(path, record, value, kind)
 
     def _finish_operation(self, path, record, value, kind, *, collection_expires_at=None):
+        if 'result' in record: return record['result']
         with preparation('collect terminal logs and authenticated result'):
             return self._timed('cleanup', lambda: self._collect_operation(
                 path, record, value, kind, collection_expires_at=collection_expires_at))
@@ -259,7 +279,18 @@ class CplNativeCandidateBackend:
                 raise ProjectInfrastructureError('CPL upload did not complete')
             result = value
         else:
+            needs_receipt = self._receipt_capable(path) and value.get('exit') != 0
+            if type(value.get('exit')) is not int or needs_receipt or value.get('state') == 'cancelled':
+                recovered = self._terminal_receipt(path, record, seconds=max(0, deadline-self.clock()))
+                if recovered is not None: return recovered
+                if needs_receipt:
+                    record.update(state='observation-unavailable', remote_observation=value)
+                    _save(path, record)
+                    raise self._pending('RSI command terminal receipt is pending')
             if value.get('state') == 'cancelled':
+                if record.get('requires_terminal_result'):
+                    record.update(state='observation-unavailable', remote_observation=value)
+                    _save(path, record)
                 raise self._pending('CPL elapsed allocation expired; retained cancelled handle '+str(record.get('handle')), 'deadline-exhausted')
             result = record.setdefault('terminal_result', dict(handle=record.get('handle')))
             if type(value.get('exit')) is int:
@@ -278,10 +309,15 @@ class CplNativeCandidateBackend:
                 if value.get('handle') != record.get('handle'):
                     raise ProjectInfrastructureError('CPL result returned a foreign handle')
                 if type(value.get('exit')) is not int:
+                    record.update(state='observation-unavailable', remote_observation=value)
+                    _save(path, record)
                     raise self._pending('CPL terminal result lacks its authenticated exit status')
                 result['returncode'] = value['exit']
                 _save(path, record)
         record['result'] = result
+        record.setdefault('result_received_epoch', self.wall_clock())
+        record.setdefault('result_received_monotonic', self.clock())
+        record.setdefault('result_controller_boot_id', Path('/proc/sys/kernel/random/boot_id').read_text().strip())
         _save(path, record)
         return result
 
@@ -290,7 +326,8 @@ class CplNativeCandidateBackend:
         deadline = self.clock() + min(seconds, self.timeout)
         for path in Path(getattr(self, 'recovery_root', self.root)).rglob('operation.json'):
             record = json.loads(path.read_text())
-            if ('result' in record or record.get('state') in ('new', 'cancelled', 'quarantined')
+            if ('result' in record or record.get('state') in ('new', 'quarantined')
+                    or record.get('state') == 'cancelled' and not self._receipt_capable(path)
                     or record.get('state') == 'failed' and record.get('terminal_failure')):
                 continue
             identity = record.get('identity', {})
@@ -316,6 +353,15 @@ class CplNativeCandidateBackend:
                 record['terminal_failure'] = observed
                 _save(path, record)
                 continue
+            if record['state'] not in ('completed', 'failed') and kind == 'job':
+                left = min(deadline-self.clock(), remaining_seconds() if remaining_seconds else float('inf'))
+                try:
+                    if self._terminal_receipt(path, record, seconds=max(0, left)) is not None: continue
+                except _PendingObservation: pass
+                if record.get('requires_terminal_result'):
+                    record['remote_state'] = record['state']
+                    record['state'] = 'observation-unavailable'
+                    _save(path, record)
             if record['state'] in ('completed', 'failed'):
                 # Explicit read-only recovery has its own bounded allocation; it
                 # never extends the frozen execution deadline or submits work.
@@ -372,47 +418,151 @@ class CplNativeCandidateBackend:
     def remote_candidate_directory(self, plan):
         return self._workspace / 'candidates' / plan.execution_id
 
+    def _readonly_operation(self, key, body, *, seconds, cwd=None, expires_at=None, cleanup=False):
+        """Own read helpers separately; exhausted Actor work cannot prevent cleanup."""
+        if seconds <= 0:
+            raise self._pending('RSI read-only recovery allocation exhausted')
+        deadline = self.clock()+seconds
+        stopped = getattr(self.remaining_seconds, 'stop_requested', lambda: False)
+        def remaining():
+            return 0 if stopped() and not cleanup else max(0, deadline-self.clock())
+        remaining.stop_requested = stopped
+        helper = CplNativeCandidateBackend(cpl_remote=self._cpl, target=self.target,
+            runtime=self.runtime, remote_workspace=str(self._workspace), physical_device=self._device,
+            state_directory=self.root, profile=self.profile, timeout=max(.001, seconds),
+            remaining_seconds=remaining, registry_workspace=self.registry_workspace,
+            process_runner=self._run, clock=self.clock, wall_clock=self.wall_clock,
+            submission_reserve_seconds=0, cleanup_reserve_seconds=0)
+        directory = self.root / key
+        directory.mkdir(parents=True, exist_ok=True)
+        script = directory / 'read-command.sh'
+        if script.exists() and script.read_text() != body:
+            raise ProjectInfrastructureError('retained read-only command changed')
+        if not script.exists(): script.write_text(body)
+        arguments = ('run', self.target, '--runtime', self.runtime,
+            '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
+        with preparation('remote clock admission and terminal receipt recovery'):
+            return helper._operation(key, arguments, kind='job', expires_at=expires_at)
+
+    def _sample_remote_clock(self, key, *, expires_at, cwd):
+        payload = json.loads((self.root/key/'command.json').read_text())
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        if payload['controller_boot_id'] != boot:
+            raise ProjectInfrastructureError('controller boot changed before remote command admission')
+        local_deadline = payload['controller_deadline']
+        seconds = max(0, local_deadline-self.clock())
+        value = self._readonly_operation(key+'/clock', clock_source(), seconds=seconds,
+            cwd=cwd)
+        if value['returncode']:
+            raise ProjectInfrastructureError('remote clock probe failed')
+        try:
+            sample = validate_clock(json.loads(value['stdout']))
+            recorded = json.loads((self.root/key/'clock/operation.json').read_text())
+            # Remaining time is measured when the clock sample was received, not
+            # when it was requested. Probe queue, execution and collection count.
+            boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+            if recorded['result_controller_boot_id'] != boot:
+                raise ValueError('controller boot changed before command admission')
+            remaining = max(0, local_deadline-recorded['result_received_monotonic'])
+            return dict(remote_boot_id=sample['boot_id'],
+                        remote_deadline=sample['monotonic']+remaining)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProjectInfrastructureError('remote clock admission is invalid') from error
+
+    @staticmethod
+    def _receipt_capable(path):
+        command = path.with_name('command.json')
+        return command.exists() and json.loads(command.read_text()).get('launcher') == LAUNCHER
+
+    def _terminal_receipt(self, path, record, *, seconds):
+        command = path.with_name('command.json')
+        if not command.exists(): return None
+        payload = json.loads(command.read_text())
+        if payload.get('launcher') != LAUNCHER: return None
+        index = record.get('receipt_reads', 0)
+        key = str(path.parent.relative_to(self.root))+'/receipt-read-'+str(index)
+        try:
+            value = self._readonly_operation(key, receipt_reader_source(payload['result_directory']),
+                seconds=seconds, cleanup=True)
+        except _PendingObservation:
+            helper_path = self.root/key/'operation.json'
+            helper = json.loads(helper_path.read_text()) if helper_path.exists() else {}
+            if helper.get('state') == 'cancelled':
+                record['receipt_reads'] = index+1
+                _save(path, record)
+            raise
+        record['receipt_reads'] = index+1
+        _save(path, record)
+        try:
+            if value['returncode']:
+                raise ValueError('terminal receipt reader failed')
+            envelope = json.loads(value['stdout'])
+            result = validate_receipt(envelope, payload)
+        except (KeyError, TypeError, ValueError) as error:
+            record.update(state='observation-unavailable', receipt_error=str(error))
+            _save(path, record)
+            raise ProjectInfrastructureError('RSI terminal receipt is invalid') from error
+        if result is not None:
+            result['handle'] = record['handle']
+            record.update(result=result, state='completed' if result['returncode'] == 0 else 'failed',
+                command_receipt=dict(path=payload['result_directory']+'/terminal.json',
+                    payload_sha256=payload['payload_sha256'], binding=payload['binding'],
+                    termination=envelope['receipt']['termination']), result_received_epoch=self.wall_clock())
+            _save(path, record)
+        return result
+
     def run_remote(self, argv, *, key, cwd=None):
         directory = self.root / key
         directory.mkdir(parents=True, exist_ok=True)
-        script = directory / 'command.sh'
-        command = directory / 'command.json'
-        payload = json.loads(command.read_text()) if command.exists() else dict(
-            argv=[str(arg) for arg in argv], expires_at=self.wall_clock()+self._allowance()-self.cleanup_reserve,
-            allocation_expires_at=self.wall_clock()+self._allowance(),
-            launcher='process-group-v1')
+        script, command = directory/'command.sh', directory/'command.json'
+        if command.exists():
+            payload = json.loads(command.read_text())
+        else:
+            allowance = self._allowance()
+            allocation = self.wall_clock()+allowance
+            local_allocation = self.clock()+allowance
+            nonce = uuid.uuid4().hex
+            payload = dict(argv=[str(arg) for arg in argv],
+                expires_at=allocation-self.cleanup_reserve, allocation_expires_at=allocation,
+                controller_deadline=local_allocation-self.cleanup_reserve,
+                allocation_controller_deadline=local_allocation,
+                controller_boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                launcher=LAUNCHER, binding=dict(route=self.runtime_identity,
+                    workspace=str(self._workspace), argv=[str(arg) for arg in argv], operation_nonce=nonce),
+                result_directory=str(self._workspace/'.rsi-results'/nonce))
+            # Freeze the allocation before a potentially queued clock probe.
+            _save(command, payload)
         if payload['argv'] != [str(arg) for arg in argv]:
             raise ProjectInfrastructureError('retained CPL command changed')
-        _save(command, payload)
-        body = 'set -eu\nexport ASCEND_RT_VISIBLE_DEVICES='+str(self._device)+'\n'
-        body += 'export ASCEND_VISIBLE_DEVICES='+str(self._device)+"\nexec python - <<'CPL_PAYLOAD'\n"
-        body += 'import json,os,signal,subprocess,sys,time\nremaining='+repr(payload['expires_at'])+'-time.time()\n'
-        body += 'if remaining <= 0: sys.exit(124)\n'
-        body += 'command=json.loads('+repr(json.dumps(payload['argv']))+')\n'
-        # Own the process group so deadline escalation has an unambiguous exit
-        # contract. GNU timeout returns 137 for both escalation and ordinary kills.
-        body += "child=subprocess.Popen(command,start_new_session=True)\n"
-        body += "def cancelled(signum,frame):\n"
-        body += " signal.signal(signal.SIGTERM,signal.SIG_IGN)\n signal.signal(signal.SIGINT,signal.SIG_IGN)\n"
-        body += " try: os.killpg(child.pid,signal.SIGKILL)\n except ProcessLookupError: pass\n"
-        body += " child.wait(timeout=1)\n sys.exit(124)\n"
-        body += "signal.signal(signal.SIGTERM,cancelled)\nsignal.signal(signal.SIGINT,cancelled)\n"
-        body += "try: code=child.wait(timeout=max(0, " + repr(payload['expires_at']) + "-time.time()))\n"
-        body += "except subprocess.TimeoutExpired:\n"
-        body += " try: os.killpg(child.pid,signal.SIGTERM)\n except ProcessLookupError: pass\n"
-        body += " grace=time.monotonic()+10\n while True:\n"
-        body += "  child.poll()\n  try: os.killpg(child.pid,0)\n  except ProcessLookupError: break\n"
-        body += "  if time.monotonic()>=grace:\n"
-        body += "   try: os.killpg(child.pid,signal.SIGKILL)\n   except ProcessLookupError: pass\n   break\n"
-        body += "  time.sleep(min(0.05,max(0,grace-time.monotonic())))\n child.wait()\n"
-        body += " sys.exit(124)\nsys.exit(code if code>=0 else 128-code)\nCPL_PAYLOAD\n"
+        if payload.get('launcher') != LAUNCHER:
+            operation = directory/'operation.json'
+            retained = json.loads(operation.read_text()) if operation.exists() else {}
+            if not retained.get('handle') and 'result' not in retained and not (directory/'submission-receipt.json').exists():
+                raise ProjectInfrastructureError('unmapped legacy command has no authenticated handle; start a fresh operation')
+        if payload.get('launcher') == LAUNCHER and 'remote_deadline' not in payload:
+            if (directory/'operation.json').exists():
+                raise ProjectInfrastructureError('submitted command has no frozen remote deadline')
+            payload.update(self._sample_remote_clock(key, expires_at=payload['expires_at'], cwd=cwd))
+            payload['payload_sha256'] = payload_digest(payload)
+            _save(command, payload)
+        if payload.get('launcher') == LAUNCHER:
+            body = {name: value for name, value in payload.items() if name != 'payload_sha256'}
+            if (payload_digest(body) != payload.get('payload_sha256')
+                    or payload['binding']['route'] != self.runtime_identity
+                    or payload['binding']['workspace'] != str(self._workspace)
+                    or payload['binding']['argv'] != payload['argv']):
+                raise ProjectInfrastructureError('retained command payload identity changed')
         if not script.exists():
-            script.write_text(body)
+            if payload.get('launcher') != LAUNCHER:
+                raise ProjectInfrastructureError('retained legacy command script is unavailable')
+            script.write_text(launcher_source(payload))
         arguments = ('run', self.target, '--runtime', self.runtime,
                      '--cwd', self._wire_path(cwd or self._workspace), '--file', str(script.resolve()))
-        value = self._operation(key, arguments, kind='job', expires_at=payload.get('allocation_expires_at', payload['expires_at']))
+        value = self._operation(key, arguments, kind='job',
+            expires_at=payload.get('allocation_expires_at', payload['expires_at']),
+            controller_deadline=payload.get('allocation_controller_deadline'))
         if (value['returncode'] == 124 or
-                value['returncode'] == 137 and payload.get('launcher') != 'process-group-v1'
+                value['returncode'] == 137 and payload.get('launcher') not in ('process-group-v1', LAUNCHER)
                 and self.wall_clock() >= payload['expires_at']):
             raise self._pending('CPL command execution allocation expired; retained handle '+value['handle'], 'deadline-exhausted')
         result = subprocess.CompletedProcess(argv, value['returncode'], value['stdout'], value['stderr'])
