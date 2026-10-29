@@ -19,6 +19,8 @@ class MemoryMaintenance:
             db.execute('''CREATE TABLE IF NOT EXISTS memory_maintenance (
                 repair_id TEXT PRIMARY KEY, version TEXT NOT NULL, kind TEXT NOT NULL,
                 payload TEXT NOT NULL, resolution TEXT, UNIQUE(version,kind))''')
+            db.execute('''CREATE TABLE IF NOT EXISTS memory_maintenance_reviews (
+                exposure_id TEXT PRIMARY KEY, payload TEXT NOT NULL, applied INTEGER NOT NULL)''')
 
     def read_artifact(self, sha, *, remaining_seconds):
         if remaining_seconds <= 0:
@@ -95,7 +97,7 @@ class MemoryMaintenance:
     def observe(self, project_id, record):
         """Replay saved reviews to recover judge/quarantine/enqueue crash gaps."""
         review = record.get('review')
-        if review is None:
+        if review is None or not review.get('memory_judgments'):
             return
         subject = next((s.subject_id for s in self.campaign.scheduler.subjects
                         if s.objective == record['objective']), self.campaign.scheduler.subjects[0].subject_id)
@@ -106,25 +108,51 @@ class MemoryMaintenance:
             for sha in judgment['evidence']:
                 self.retain(sha)
             self.retain(record['review_sha256'])
-            self.ledger.judge(judgment['exposure_id'], **{key: judgment[key] for key in
-                ('usefulness', 'correctness', 'reason', 'evidence')})
-            version = row['version']
-            if judgment['correctness'] == 'contradicted':
-                self.ledger.transition(version, 'quarantined', event_id='contradiction-' + judgment['exposure_id'],
-                    reason=judgment['reason'], evidence=judgment['evidence'])
-                self._ensure(version, 'correct', project_id=project_id, subject_id=subject,
-                    reason=judgment['reason'], evidence=judgment['evidence'])
-            elif judgment.get('investigate'):
-                self._ensure(version, 'investigate', project_id=project_id, subject_id=subject,
-                    reason=judgment['reason'], evidence=judgment['evidence'])
-            stats = self.ledger.stats(row['memory_id'], version)
-            if stats['needs_rewrite'] and self.ledger.status(version) == 'active':
-                self._ensure(version, 'rewrite', project_id=project_id, subject_id=subject,
-                    reason='Frequently accessed current version is useful in fewer than 30% of decided exposures. ' + json.dumps(stats),
-                    evidence=[record['review_sha256']])
+            payload = dict(exposure=row, judgment=judgment, project_id=project_id,
+                           subject_id=subject, review_sha256=record['review_sha256'])
+            with sqlite3.connect(self.ledger.path) as db:
+                previous = db.execute('SELECT payload FROM memory_maintenance_reviews WHERE exposure_id=?',
+                                      (judgment['exposure_id'],)).fetchone()
+                if previous and json.loads(previous[0]) != payload:
+                    # Delivery counters can grow, but the verifier's decision is immutable.
+                    if json.loads(previous[0])['judgment'] != judgment:
+                        raise ValueError('memory exposure already has a different assessment')
+                db.execute('INSERT OR IGNORE INTO memory_maintenance_reviews VALUES (?,?,0)',
+                           (judgment['exposure_id'], canonical(payload).decode()))
+        self._apply_pending()
         self.project_obligations()
 
+    def _apply_pending(self):
+        with sqlite3.connect(self.ledger.path) as db:
+            pending = db.execute('SELECT exposure_id,payload FROM memory_maintenance_reviews WHERE applied=0').fetchall()
+        for exposure_id, raw in pending:
+            payload = json.loads(raw)
+            row, judgment = payload['exposure'], payload['judgment']
+            self.ledger.judge(exposure_id, **{key: judgment[key] for key in
+                ('usefulness', 'correctness', 'reason', 'evidence')})
+            version = row['version']
+            kind = 'correct' if judgment['correctness'] == 'contradicted' else 'investigate' if judgment['investigate'] else None
+            if kind == 'correct':
+                self.ledger.transition(version, 'quarantined', event_id='contradiction-' + exposure_id,
+                    reason=judgment['reason'], evidence=judgment['evidence'])
+            if kind:
+                self._ensure(version, kind, project_id=payload['project_id'], subject_id=payload['subject_id'],
+                    reason=judgment['reason'], evidence=judgment['evidence'])
+            with sqlite3.connect(self.ledger.path) as db:
+                db.execute('UPDATE memory_maintenance_reviews SET applied=1 WHERE exposure_id=?', (exposure_id,))
+        for row in self.ledger.report():
+            stats = row['current']
+            if row['status'] == 'active' and stats['needs_rewrite']:
+                proof = dict(memory_id=row['memory_id'], version=row['version'],
+                             statistics={key:value for key,value in stats.items() if key != 'by_actor'})
+                evidence = self.shared.put_json(proof)
+                self._ensure(row['version'], 'rewrite', project_id='memory-statistics-' + row['version'],
+                    subject_id=self.campaign.scheduler.subjects[0].subject_id,
+                    reason='Frequently accessed current version is useful in fewer than 30% of decided exposures.',
+                    evidence=[evidence])
+
     def reconcile(self):
+        self._apply_pending()
         for project_id, record in self.campaign.state['projects'].items():
             self.observe(project_id, record)
         self.project_obligations()
@@ -165,7 +193,7 @@ class MemoryMaintenance:
                 reviewed = next(item for item in record['review_request']['memory_repairs'] if item['repair_id'] == row['repair_id'])
                 if status != reviewed['status']:
                     raise ValueError('memory lifecycle changed after review; reconcile its repair')
-                if resolution['action'] == 'restore' and status != 'quarantined':
+                if resolution['action'] == 'restore' and (status != 'quarantined' or self.ledger.replacements(row['version'])):
                     raise ValueError('only a quarantined current version may be restored')
                 wanted = 'retired' if resolution['action'] == 'retire' else 'active'
                 self.ledger.transition(row['version'], wanted,
@@ -176,7 +204,7 @@ class MemoryMaintenance:
             with sqlite3.connect(self.ledger.path) as db:
                 # An explicit correction of this version also settles older maintenance
                 # reasons for the same bytes; the replacement starts fresh counters.
-                if resolution['action'] == 'replace':
+                if resolution['action'] in {'replace', 'retire'}:
                     db.execute('UPDATE memory_maintenance SET resolution=? WHERE version=? AND resolution IS NULL',
                                (canonical(outcome).decode(), row['version']))
                 else:
@@ -185,4 +213,6 @@ class MemoryMaintenance:
         self.reconcile()
 
     def report(self):
-        return dict(memories=self.ledger.report(), obligations=self.obligations(open_only=False))
+        return dict(memories=self.ledger.report(), obligations=self.obligations(open_only=False),
+            retirements=[{key:row[key] for key in ('tombstone_id','memory_id','version','reason','evidence')}
+                         for row in self.ledger.retired()])

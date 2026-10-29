@@ -277,6 +277,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 allowance = min(allowance, campaign._remaining())
             return knowledge.actor_query(payload, context, remaining_seconds=allowance)
         actor.query_knowledge = actor_knowledge
+        actor.observe_knowledge_read = knowledge.actor_read
 
     def execute(item, snapshot, directory, *, remaining_seconds):
         if memory_delivery == 'kdb-only' and json.loads(snapshot).get('initial_memory'):
@@ -298,7 +299,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             for record in envelope['memories']:
                 files['memories/' + memory_digest(record) + '.json'] = canonical(record)
                 for digest in memory_artifacts(record):
-                    files['artifacts/' + digest] = store.read_bytes(digest)
+                    files['artifacts/' + digest] = knowledge.read_artifact(digest, remaining_seconds=remaining_seconds)
             entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
                             artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
             frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
@@ -312,7 +313,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         if memory_delivery == 'indexed':
             for memory in envelope['memories']:
                 for digest in memory_artifacts(memory):
-                    branch_artifacts.put_bytes(store.read_bytes(digest))
+                    branch_artifacts.put_bytes(knowledge.read_artifact(digest, remaining_seconds=remaining_seconds))
         inputs = materialize_inputs(spec)
         request = AdaptiveProjectRequest(spec, ordinal, snapshot, directory, inputs,
             evaluate_reference(spec, inputs), memory_root=root, remaining_seconds=remaining_seconds,
@@ -338,7 +339,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         if 'before-source' in recovery['artifacts']:
             request = replace(request, initial_source=store.read_bytes(recovery['artifacts']['before-source']).decode('utf-8'))
         for digest in set(recovery['artifacts'].values()):
-            branch_artifacts.put_bytes(store.read_bytes(digest))
+            branch_artifacts.put_bytes(knowledge.read_artifact(digest, remaining_seconds=remaining_seconds))
         registry = branch_artifacts.put_bytes(canonical(recovery))
         from .project_verifier import artifact_preview
         preview = dict(reason=recovery['reason'][:1024], artifacts=artifact_preview(recovery['artifacts']),
@@ -470,6 +471,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     campaign = SubjectCampaign(root, subjects, initial_memory, select_wave=select_wave,
         execute=execute, verifier=verifier, complete=curriculum_complete,
         max_seconds=max_seconds, index_memory=knowledge.index, memory_ledger=knowledge.ledger)
+    verifier.read_artifact = campaign.memory_maintenance.read_artifact
     def review_retained(item, request, **options):
         if item.get('project_id') != request.project_id or 'spec' not in item:
             raise ValueError('retained review requires its original graph project')
@@ -480,7 +482,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         plans[request.project_id] = dict(item, _ordinal=(previous or {}).get('_ordinal',
             max((row.get('_ordinal', 0) for row in plans.values()), default=0) + 1))
         atomic(plans_path, canonical(plans))
-        return verifier.review(request, **options)
+        return verifier.review(campaign.memory_maintenance.prepare(request), **options)
 
     campaign.review_retained = review_retained
     if 'check_environment' in bound:

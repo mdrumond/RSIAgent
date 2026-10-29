@@ -86,6 +86,7 @@ class SubjectViews:
         return dict(id=key, name=config.get('name', key), target=config.get('target'),
                     terminal=state.get('terminal'), subjects=subjects.get('subjects', []),
                     projects=projects, pending=pending, project_queue=subjects.get('project_queue', []),
+                    memory_maintenance=state.get('memory_maintenance') or {},
                     stats=dict(projects=len(projects),
                     verified=sum(p['execution'] == 'verified' for p in projects),
                     published=sum(p['merged'] for p in projects)))

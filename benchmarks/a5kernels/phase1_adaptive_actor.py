@@ -200,12 +200,15 @@ class _ProjectActions:
         request_profile: ActionDependency,
         request_timing: ActionDependency,
         request_diagnostic: ActionDependency = disabled_diagnostic_action,
+        observe_knowledge_read=None,
+        actor_role='writer',
     ) -> None:
         self.executor = executor
         self.request = request
         self.prepared = prepared
         self.artifacts = artifacts
         self.read_artifacts = artifacts
+        self.observe_knowledge_read, self.actor_role = observe_knowledge_read, actor_role
         self.max_actions = max_actions
         from benchmarks.ascend.time_budget import deadline_after
         self.deadline = deadline_after(max_seconds)
@@ -260,6 +263,8 @@ class _ProjectActions:
         if action.kind == "read-artifact":
             try:
                 page = artifact_page_presentation(action.payload, self.read_artifacts)
+                if self.admitted.get(action.payload['sha256']) == 'knowledge' and self.observe_knowledge_read is not None:
+                    self.observe_knowledge_read(action.payload, self._action_context(action.payload), page)
             except (ValueError, FileNotFoundError) as exc:
                 return self._observation({"error": str(exc)})
             return ActionOutcome(canonical_bytes({"host": page}).decode("ascii"),
@@ -396,25 +401,29 @@ class _ProjectActions:
             })
         return self._dependency(dependency, payload)
 
-    def _dependency(
-        self, dependency: ActionDependency, payload: Mapping[str, object],
-    ) -> ActionOutcome:
-        result = dependency(payload, AdaptiveActionContext(
-            self.request, self.prepared, self.source, self.latest, self.artifacts,
+    def _action_context(self, payload):
+        return AdaptiveActionContext(self.request, self.prepared, self.source, self.latest, self.artifacts,
             max(0, self.deadline - time.monotonic()),
             access_event_id=hashlib.sha256(canonical_bytes(dict(
                 branch=str(self.request.branch_root.resolve()),
                 namespace=self.action_event_namespace if self.action_event_turn is None else 'conversation',
                 ordinal=len(self.actions) if self.action_event_turn is None else self.action_event_turn, payload=dict(payload)))).hexdigest(),
-            actor_id=str(self.request.branch_root.resolve()),
-        ))
+            actor_id=str(self.request.branch_root.resolve()), actor_role=self.actor_role)
+
+    def _dependency(
+        self, dependency: ActionDependency, payload: Mapping[str, object],
+    ) -> ActionOutcome:
+        result = dependency(payload, self._action_context(payload))
         if not isinstance(result, AdaptiveActionResult):
             raise TypeError("adaptive action dependency must return AdaptiveActionResult")
         for digest, role in result.admitted_artifacts.items():
             self.artifacts.read_bytes(digest)
             existing = self.admitted.get(digest)
             if existing is not None and existing not in {role, "comparison-" + role}:
-                raise ValueError("adaptive action changed an admitted artifact role")
+                if role == 'knowledge':
+                    continue  # Retrieval never revokes independent project evidence authority.
+                if existing != 'knowledge':
+                    raise ValueError("adaptive action changed an admitted artifact role")
             self.admitted[digest] = role
         for citation in result.citations:
             if citation not in self.citations:
@@ -555,6 +564,8 @@ class AdaptiveActorProjectExecutor:
             disabled_diagnostic_action if request_diagnostic is None else request_diagnostic
         )
         self.immutable_context = immutable_context
+        self.observe_knowledge_read = None
+        self.actor_role = 'writer'
         self.diagnostic_instructions = diagnostic_instructions
         self.trace_recorder_factory = trace_recorder_factory
         self.retain_semantic_failure = retain_semantic_failure
@@ -613,6 +624,7 @@ class AdaptiveActorProjectExecutor:
             request_profile=self.request_profile,
             request_timing=self.request_timing,
             request_diagnostic=self.request_diagnostic,
+            observe_knowledge_read=self.observe_knowledge_read, actor_role=self.actor_role,
         )
         actions.deadline = min(actions.deadline, started+max_seconds)
         from benchmarks.ascend.agent_presentation import MemoryArtifactReader

@@ -152,7 +152,7 @@ class SubjectKnowledge:
         reference_context = None
         if self.contextual_reference_query is not None:
             reference_context = dict(root=Path(context.request.branch_root) / 'reference-librarian',
-                role='writer', task=context.prepared.instruction,
+                role=context.actor_role, task=context.prepared.instruction,
                 context=dict(project=context.request.spec.as_dict()))
         result = self.query({'query': action.query, 'limit': action.limit}, remaining_seconds=remaining_seconds,
             snapshot=context.request.pre_wave_memory, branch_root=context.request.branch_root,
@@ -191,3 +191,22 @@ class SubjectKnowledge:
         return AdaptiveActionResult(observation,
             citations=tuple(Citation.from_mapping(hit['citation']) for hit in selected),
             admitted_artifacts=admitted)
+
+    def actor_read(self, payload, context, page):
+        """Count returned linked content only for versions this actor retrieved."""
+        sha = payload['sha256']
+        versions = {row['version'] for row in self.ledger.artifact_versions(sha)}
+        delivered = [row for row in self.ledger.exposures(str(self.root.resolve()), context.request.spec.project_id)
+                     if row['actor_id'] == context.actor_id and row['actor_role'] == context.actor_role
+                     and row['version'] in versions]
+        if not delivered:
+            return  # Reference/project bytes do not inherit unrelated memory authority.
+        available = [row for row in delivered if self.ledger.available(row['version'])]
+        if not available:
+            raise ValueError('memory artifact withdrawn pending evidence-backed resolution')
+        if not page.get('text_available') or not page.get('page_bytes'):
+            return
+        for row in available:
+            self.ledger.require_actor_artifact(sha, row['version'])
+            self.ledger.access(context.access_event_id + ':' + row['version'],
+                **{key: row[key] for key in ('memory_id','version','campaign_id','project_id','actor_id','actor_role')})
