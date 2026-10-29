@@ -69,12 +69,17 @@ def arm_evidence(directory, store, *, project_root=None, binding_root=None, proj
                 spans.append(dict(value, stage='provider'))
     binding = Path(binding_root) if binding_root is not None else directory / 'runtime' / 'binding'
     transport = binding / 'transport-state'
+    reports = sorted((binding / 'environment-checks').rglob('report.json'))
+    probe_ids = {worker.get('execution_id') for path in reports
+        for worker in json.loads(path.read_bytes()).get('workers', [])}
+    shared = {path.parent for path in transport.rglob('candidate.json')
+        if path.parent.name in probe_ids}
     owned = None if project_id is None else {path.parent
         for path in transport.rglob('candidate.json')
         if json.loads(path.read_bytes()).get('project_id') == project_id}
     operations = []
     for path in sorted((binding / 'transport-state').rglob('operation.json')):
-        if owned is not None and not any(candidate in path.parents for candidate in owned):
+        if owned is not None and not any(candidate in path.parents for candidate in owned | shared) and 'health' not in path.parts:
             continue
         record = json.loads(path.read_bytes())
         refs['operation:'+path.relative_to(binding).as_posix()] = store.put_bytes(path.read_bytes())
@@ -83,14 +88,13 @@ def arm_evidence(directory, store, *, project_root=None, binding_root=None, proj
     for path in sorted(binding.rglob('timing.jsonl')):
         rows = [json.loads(line) for line in path.read_bytes().splitlines()]
         if owned is not None:
-            rows = [row for row in rows if path.parent / str(row.get('key', '')).split('/')[0] in owned]
+            rows = [row for row in rows if path.parent / str(row.get('key', '')).split('/')[0] in owned | shared
+                    or str(row.get('key', '')).startswith('health/')]
         if rows:
             data = path.read_bytes() if owned is None else ''.join(json.dumps(row)+'\n' for row in rows).encode()
             refs['timing:'+path.relative_to(binding).as_posix()] = store.put_bytes(data)
             spans.extend(rows)
-    for path in sorted((binding / 'environment-checks').rglob('report.json')):
-        if owned is not None:
-            continue  # Campaign environment probes are not project-owned operations.
+    for path in reports:
         report = json.loads(path.read_bytes())
         refs['environment:'+path.relative_to(binding).as_posix()] = store.put_bytes(path.read_bytes())
         spans.append(dict(report, stage='environment'))

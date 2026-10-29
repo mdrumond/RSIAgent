@@ -309,3 +309,16 @@ def test_bound_original_or_remedial_case_keeps_admission_and_exact_inputs(tmp_pa
     pending.write_text(json.dumps(dict(state='completed',handle='remote:registry-target:job:trial')))
     assert getattr(selected,operation)(spec,'candidate') == inputs
     assert dispatched == [(operation,inputs)]
+
+
+@pytest.mark.parametrize('error', [ValueError('candidate compile failed'), TimeoutError('transport unavailable')])
+def test_candidate_failure_retains_environment_lease(tmp_path, monkeypatch, error):
+    bound,calls=compose(tmp_path,monkeypatch)
+    executor=bound['actor'].executor
+    def fail(*args):raise error
+    executor._executor.execute=fail
+    with pytest.raises(type(error)):
+        executor.execute('bad candidate')
+    executor._executor.execute=lambda *args:'host-verified'
+    assert executor.execute('repaired candidate')=='host-verified'
+    assert calls.count('probe-compile')==1

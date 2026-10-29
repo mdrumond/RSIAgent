@@ -16,12 +16,6 @@ from .wave_environment import NativeWaveEnvironmentCheck
 from .environment_admission import EnvironmentAdmission, native_reservation
 
 
-def _runtime_failed(result):
-    evidence = getattr(result, 'evidence', None)
-    classification = getattr(evidence, 'classification', None)
-    return getattr(classification, 'value', classification) == 'runtime-failure'
-
-
 def _allocation_error(message, remaining):
     error = TimeoutError(message)
     error.interruption_reason = 'operator-stop' if getattr(remaining, 'stop_requested', lambda: False)() else 'deadline-exhausted'
@@ -41,14 +35,9 @@ class _CheckedExecutor:
     def _call(self, name, *args, **kwargs):
         with self._check.reserve():
             self._check()
-            try:
-                result = getattr(self._executor, name)(*args, **kwargs)
-                if _runtime_failed(result):
-                    self._check.invalidate()
-                return result
-            except Exception:
-                self._check.invalidate()
-                raise
+            # A candidate failure does not establish a broken environment.
+            # Fresh health remains mandatory at the next dispatch.
+            return getattr(self._executor, name)(*args, **kwargs)
 
     def execute(self, *args, **kwargs):
         return self._call('execute', *args, **kwargs)
@@ -87,10 +76,7 @@ class _CheckedActor:
                 if (isinstance(error, (PiCancelled, TimeoutError)) and self._remaining.stop_requested()
                         and not getattr(error, 'interruption_reason', None)):
                     error.interruption_reason = 'operator-stop'
-                self._check.invalidate()
                 raise
-            if _runtime_failed(result):
-                self._check.invalidate()
             return result
 
 
@@ -160,11 +146,7 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
         def measure(*args, **kwargs):
             with ensure_environment.reserve():
                 ensure_environment()
-                try:
-                    return callback(*args, **kwargs)
-                except Exception:
-                    admission.invalidate()
-                    raise
+                return callback(*args, **kwargs)
         return measure
     for name in ('request_timing', 'request_profile'):
         callback = getattr(actor, name, None)
