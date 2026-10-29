@@ -96,3 +96,28 @@ def test_late_selection_never_executes_host_action(monkeypatch, tmp_path, backen
         context=None, turn_parser=parse_trial_action,
         action_executor=lambda _: pytest.fail('expired selection executed'))
     assert result.status == 'time-budget-exhausted'
+
+
+def test_direct_terminal_distillation_separates_host_result_from_user_feedback(tmp_path):
+    requests = []
+    feedback = 'Inspect the padded tail before completing the task.'
+    terminal = json.dumps({'host': {'event': 'submitted', 'passed': True,
+                                   'source_sha256': 'a' * 64}})
+    ActorControl(tmp_path).send('tail-feedback', feedback)
+    def transport(**options):
+        requests.append(options['request'])
+        return DirectCompletion('{"submit":{}}' if len(requests) == 1 else
+            '{"distillation":{"no_new_knowledge":true,"lessons":[]}}', 1)
+    actor = DirectActorDriver(DirectCompletionProvider(
+        {'OPENAI_API_KEY': 'fake', 'DEEPSEEK_API_KEY': 'fake'}, transport=transport))
+    outcome = actor('Implement and verify the kernel.', profile=direct_profile(MODEL_IDENTITIES[0]),
+        workspace=tmp_path, context=None, turn_parser=parse_trial_action,
+        action_executor=lambda action: ActionOutcome(terminal, True, 'host-verified'))
+    assert outcome.continuation.messages[-1] == {'role': 'user', 'content': terminal}
+    distilled = actor.distill(outcome)
+    assert distilled.distillation is not None
+    messages = requests[1]['messages']
+    distillation_context = json.loads(messages[-1]['content'].split('\n')[-1])
+    assert distillation_context['terminal_host_observation'] == terminal
+    assert {'role': 'user', 'content': feedback} in messages
+    assert distillation_context['terminal_host_observation'] != feedback
