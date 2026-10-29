@@ -305,6 +305,11 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                     files['artifacts/' + digest] = knowledge.read_artifact(digest, remaining_seconds=remaining_seconds)
             entries = [dict(kind='initial-memory', text=envelope['initial_memory'],
                             artifact_sha256=hashlib.sha256(seed).hexdigest()), *envelope['memories']]
+            if item.get('memory_maintenance'):
+                assigned = item['memory_maintenance']
+                entries.append(dict(kind='memory-maintenance', **assigned))
+                for sha in assigned['artifacts'].values():
+                    files['memory-maintenance/' + sha] = knowledge.read_artifact(sha, remaining_seconds=remaining_seconds)
             frozen = optimizer_snapshot(entries, files=files, source_identity={'target': target})
             manual = Path(directory) / 'manual-execution.json'
             attempt_id = json.loads(manual.read_bytes())['attempt_id'] if manual.exists() else item['project_id']
@@ -332,7 +337,13 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
                 store.put_bytes(qualification.read_bytes(digest))
         else:
             target_contract = None
+        maintenance = item.get('memory_maintenance')
         recovery = item.get('recovery')
+        if maintenance is not None:
+            assigned = dict(maintenance['artifacts'])
+            request = replace(request, memory_maintenance_artifacts=tuple(assigned.values()))
+            recovery = dict(reason=maintenance['reason'] + ' Claim under review: ' + json.dumps(maintenance['claim']),
+                artifacts={**assigned, **(recovery or {}).get('artifacts', {})})
         if recovery is None:
             return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
                 binding_root=root / 'binding')
@@ -376,7 +387,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         def complete_wave(messages):
             wire = list(messages)
             while True:
-                working = bounded_review_messages(wire, {'history_sha256':context['selection_artifacts']['history']}) if context.get('selection_artifacts') else wire
+                working = bounded_review_messages(wire, {'selection_artifacts':context['selection_artifacts']}) if context.get('selection_artifacts') else wire
                 response = curriculum_complete(working, remaining_seconds=available())
                 if context.get('selection_artifacts'):
                     try:

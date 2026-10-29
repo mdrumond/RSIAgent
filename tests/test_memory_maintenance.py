@@ -262,3 +262,102 @@ def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
         {'action':{'index':0},'result':memory.read(base['version'])},'withdrawn-read')
     assert result['status']=='tool-error'
     assert service.ledger.stats('lesson')['accesses']==3
+
+
+@pytest.mark.parametrize('action',['restore','retire'])
+def test_resolution_replays_after_lifecycle_committed_before_obligation_checkpoint(tmp_path,monkeypatch,action):
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    current=observe(campaign,ledger,base)
+    repair=campaign.memory_maintenance.prioritize()
+    source=current['outcome']['source_sha256']
+    request=campaign.memory_maintenance.prepare(ProjectReview('resolve',source,True,{'source':source}),[repair['repair_id']])
+    review=dict(decision='accept',memory=None,memory_resolutions=[dict(repair_id=repair['repair_id'],
+        action=action,reason='New project resolves dispute',evidence=[source])])
+    record=dict(review=review,review_request=asdict(request),review_sha256=campaign.artifacts.put_json(review))
+    transition=ledger.transition
+    def interrupted(*args,**kwargs):
+        transition(*args,**kwargs)
+        raise KeyboardInterrupt('simulated death after lifecycle commit')
+    monkeypatch.setattr(ledger,'transition',interrupted)
+    with pytest.raises(KeyboardInterrupt):campaign.memory_maintenance.resolve('resolve',record)
+    assert campaign.memory_maintenance.obligations()
+    monkeypatch.setattr(ledger,'transition',transition)
+    campaign.memory_maintenance.resolve('resolve',record)
+    assert campaign.memory_maintenance.obligations()==[]
+    assert ledger.status(base['version'])==('active' if action=='restore' else 'retired')
+
+
+def test_new_contradiction_after_restore_creates_new_repair_episode(tmp_path):
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    current=observe(campaign,ledger,base)
+    old=campaign.memory_maintenance.prioritize()
+    source=current['outcome']['source_sha256']
+    request=campaign.memory_maintenance.prepare(ProjectReview('restore',source,True,{'source':source}),[old['repair_id']])
+    review=dict(decision='accept',memory=None,memory_resolutions=[dict(repair_id=old['repair_id'],
+        action='restore',reason='Counterexample outside documented applicability',evidence=[source])])
+    campaign.memory_maintenance.resolve('restore',dict(review=review,review_request=asdict(request),review_sha256=campaign.artifacts.put_json(review)))
+    observe(campaign,ledger,base,project_id='new-consumer',number=1)
+    fresh=campaign.memory_maintenance.prioritize()
+    assert fresh['repair_id']!=old['repair_id']
+    assert ledger.status(base['version'])=='quarantined'
+    history=campaign.memory_maintenance.obligations(open_only=False)
+    assert len(history)==2 and sum(row['resolution'] is None for row in history)==1
+    campaign.memory_maintenance.reconcile()
+    assert campaign.memory_maintenance.obligations()[0]['repair_id']==fresh['repair_id']
+
+
+def test_stale_source_publication_rereview_preserves_original_exposure_judgment(tmp_path):
+    from benchmarks.ascend.subject_memory import digest
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    record=observe(campaign,ledger,base,correctness='supported',usefulness='useful')
+    source=record['outcome']['source_sha256']
+    record.update(repairs=[],review_request={})
+    record['review']['memory']=dict(proposal(source),operation='append',base_versions=[base])
+    campaign.memory.accept('concurrent',dict(proposal(source),operation='append',base_versions=[base]),{})
+    calls=[]
+    class Reviewer:
+        last_trace=[]
+        def review(self,request,**kwargs):
+            calls.append(request)
+            current=ledger.records()[0]
+            return dict(decision='accept',reason='Reconcile current base',evidence=[source],repair=None,
+                memory=dict(proposal(source),operation='append',base_versions=[dict(memory_id=current['memory_id'],version=digest(current))]),
+                memory_judgments=[],memory_resolutions=[],retirement_checks=[])
+    campaign.verifier=Reviewer()
+    campaign.budget=SimpleNamespace(deadline=campaign.clock()+30)
+    campaign.scheduler.start_wave('wave','a'*64)
+    campaign._publish_wave(dict(wave_id='wave',subject={'subject_id':'s'},projects=['consumer']))
+    assert len(calls)==1 and calls[0].memory_exposures==()
+    assert ledger.stats(base['memory_id'])['decided']==1
+    assert ledger.stats(base['memory_id'])['useful']==1
+
+
+@pytest.mark.parametrize('withdraw_first',[False,True])
+def test_omitted_knowledge_index_access_counts_and_checks_unexposed_memory(tmp_path,withdraw_first):
+    from test_subject_knowledge import setup as knowledge_setup,proposal as knowledge_proposal,context
+    service,memory,store,_=knowledge_setup(tmp_path/'knowledge')
+    for number in range(8):memory.accept('lesson-'+str(number),knowledge_proposal(store,'Vector increments '+str(number)),{})
+    actor=context(tmp_path/'actor',memory.snapshot())
+    actor.request.actor_memory_delivery='kdb-only'
+    result=service.actor_query({'query':'vector','limit':10},actor,remaining_seconds=60)
+    observation=result.observation
+    assert observation['omitted_results']>0
+    index_sha=observation['results_index_sha256']
+    raw=actor.artifacts.read_bytes(index_sha)
+    entries=json.loads(raw)['results']
+    inline={row['citation']['collection'] for row in observation['results']}
+    target=next(row for row in entries if row['citation']['collection'] not in inline)
+    version=target['citation']['collection'].removeprefix('subject-memory-')
+    memory_id=service.ledger.record(version)['memory_id']
+    assert service.ledger.stats(memory_id,version)['accesses']==0
+    encoded=json.dumps(target,ensure_ascii=True,separators=(',',':')).encode('ascii')
+    page=dict(offset=raw.find(encoded),page_bytes=len(encoded),text_available=True)
+    actor.access_event_id='read-omitted-index'
+    if withdraw_first:
+        service.ledger.transition(version,'quarantined',event_id='conflict',reason='Contradictory project',evidence=['e'*64])
+        with pytest.raises(ValueError,match='withdrawn'):service.actor_read({'sha256':index_sha},actor,page)
+        assert service.ledger.stats(memory_id,version)['accesses']==0
+    else:
+        service.actor_read({'sha256':index_sha},actor,page)
+        service.actor_read({'sha256':index_sha},actor,page)
+        assert service.ledger.stats(memory_id,version)['accesses']==1

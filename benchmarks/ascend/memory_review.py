@@ -1,6 +1,14 @@
 """Host validation for evidence-driven memory judgments and repairs."""
 from __future__ import annotations
 
+from .subject_memory import digest
+
+
+def content_identity(proposal):
+    values = {key:proposal.get(key) for key in ('summary','applicability','preconditions','expectations','limitations','before_unavailable_reason')}
+    values.update({key:None if proposal.get(key) is None else {field:proposal[key][field] for field in ('sha256','start_line','end_line')} for key in ('before','after')})
+    return digest(values)
+
 
 def validate_memory_review(value, request, read, evidence, fully_read):
     """Memory claims require explicit judgments, exact versions and read evidence."""
@@ -39,7 +47,7 @@ def validate_memory_review(value, request, read, evidence, fully_read):
     if any(row.get('repair_id') not in repairs for row in resolutions):
         raise ValueError('memory resolution names an unassigned repair')
     for row in resolutions:
-        if set(row) != {'repair_id', 'action', 'reason', 'evidence'} or row['action'] not in {'replace', 'restore', 'retire'}:
+        if set(row) != {'repair_id', 'action', 'reason', 'evidence'} or row['action'] not in {'replace', 'restore', 'retire', 'confirm'}:
             raise ValueError('invalid memory repair resolution')
         evidence(row['evidence'], read)
         repair = repairs[row['repair_id']]
@@ -54,6 +62,10 @@ def validate_memory_review(value, request, read, evidence, fully_read):
             base = {'memory_id': repair['memory_id'], 'version': repair['version']}
             if memory is None or base not in memory['base_versions']:
                 raise ValueError('a replacement must explicitly replace the repaired memory version')
+            if repair.get('content_identity') == content_identity(memory):
+                raise ValueError('a replacement must change consumable memory content, not merely reset counters')
+        if row['action'] == 'confirm' and (repair.get('kind') != 'investigate' or repair.get('status') != 'active'):
+            raise ValueError('only an active investigation can be confirmed without changing memory')
     if value['decision'] == 'accept' and {row['repair_id'] for row in resolutions} != set(repairs):
         raise ValueError('a passing project must explicitly resolve every assigned memory repair')
     if value['decision'] == 'repair' and resolutions:

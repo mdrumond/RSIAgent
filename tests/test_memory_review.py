@@ -101,3 +101,21 @@ def test_historical_memory_evidence_cannot_prove_a_new_contradiction():
     req = replace(request(), memory_exposures=(dict(EXPOSURE, artifact_sha256=[R]),))
     with pytest.raises(ValueError, match='independent'):
         validate_memory_review(value, req, {S,R,L,D}, ProjectVerifierAgent._evidence, {S,R,L,D})
+
+
+def test_evidence_backed_restoration_can_replace_retired_base_without_active_query_hit():
+    old_version='f'*64
+    proposed=dict(memory(),operation='append',base_versions=[dict(memory_id='lesson',version=old_version)])
+    identity=[' '.join(str(proposed.get(k,'')).casefold().split()) for k in
+              ('summary','applicability','preconditions','expectations','limitations')]
+    retired=dict(tombstone_id='retirement',memory_id='lesson',version=old_version,document_sha256=D,
+                 evidence=[L],artifact_sha256=[D],claim_identity=identity)
+    terminal=decision(proposed)
+    terminal['retirement_checks']=[dict(tombstone_id='retirement',relation='reconciles',
+        reason='New result resolves previously observed boundary',evidence=[R])]
+    from test_project_verifier_agent import B
+    h=Harness([*prerequisites(),read(D),read(B),terminal],knowledge={'memories':[],'citations':[]})
+    h.artifacts[D]=DOCUMENT
+    retired['artifact_sha256'].append(B)
+    result=h.agent.review(replace(request(),retired_memories=(retired,)))
+    assert result['memory']['base_versions']==[dict(memory_id='lesson',version=old_version)]

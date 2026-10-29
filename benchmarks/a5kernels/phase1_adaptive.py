@@ -108,6 +108,7 @@ class AdaptiveProjectRequest:
     failure_context: Mapping[str, object] | None = None
     actor_memory_delivery: str = "indexed"
     initial_source: str | None = None
+    memory_maintenance_artifacts: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

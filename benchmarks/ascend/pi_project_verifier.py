@@ -59,7 +59,7 @@ SCHEMAS = {
             'correctness': {'type':'string','enum':['supported','contradicted','unknown']},
             'investigate': {'type':'boolean'}, 'reason': STRING, 'evidence': {'type':'array','items':SHA256}})},
         'memory_resolutions': {'type': 'array', 'items': obj({'repair_id': STRING,
-            'action': {'type':'string','enum':['replace','restore','retire']},
+            'action': {'type':'string','enum':['replace','restore','retire','confirm']},
             'reason':STRING, 'evidence':EVIDENCE})},
         'retirement_checks': {'type':'array','items':obj({'tombstone_id':STRING,
             'relation':{'type':'string','enum':['unrelated','duplicate','reconciles']},

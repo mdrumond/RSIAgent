@@ -225,7 +225,7 @@ class _ProjectActions:
         self.source_sha256: str | None = None
         self.latest: ProjectExecutionResult | None = None
         self.latest_source_sha256: str | None = None
-        self.admitted: dict[str, str] = {}
+        self.admitted: dict[str, str] = {sha:'memory-maintenance' for sha in request.memory_maintenance_artifacts}
         self.citations: list[Citation] = []
         self.host_facts: list[HostFact] = []
         self.observed_failures: dict[FailureMode, int] = {}

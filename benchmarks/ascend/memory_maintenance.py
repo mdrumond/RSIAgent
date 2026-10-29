@@ -87,9 +87,10 @@ class MemoryMaintenance:
         def document(row):
             record = row.pop('record', None) or self.ledger.record(row['version'])
             from .subject_knowledge import memory_artifacts
+            from .memory_review import content_identity
             for sha in {*memory_artifacts(record), *row.get('evidence', [])}:
                 self.read_artifact(sha, remaining_seconds=float('inf'))
-            return dict(row, artifact_sha256=sorted(memory_artifacts(record)), status=self.ledger.status(row['version']),
+            return dict(row, content_identity=content_identity(record['proposal']), artifact_sha256=sorted(memory_artifacts(record)), status=self.ledger.status(row['version']),
                 claim_identity=[' '.join(str(record['proposal'].get(key, '')).casefold().split()) for key in
                     ('summary','applicability','preconditions','expectations','limitations')],
                 document_sha256=self.campaign.artifacts.put_bytes(canonical(record)))
@@ -101,15 +102,7 @@ class MemoryMaintenance:
         for obligation in self.obligations():
             if obligation['repair_id'] not in repair_ids:
                 continue
-            with sqlite3.connect(self.ledger.path) as db:
-                triggers = db.execute('SELECT trigger_id FROM memory_maintenance_triggers WHERE repair_id=?',
-                                      (obligation['repair_id'],)).fetchall()
-                assessments = [db.execute('SELECT payload FROM memory_maintenance_reviews WHERE exposure_id=?',
-                               (trigger[0].split(':',1)[1],)).fetchone() for trigger in triggers]
-            evidence = set(obligation['evidence'])
-            for assessment in assessments:
-                if assessment:
-                    evidence.update(json.loads(assessment[0])['judgment']['evidence'])
+            evidence = self.counterevidence(obligation)
             repairs.append(document(dict(obligation, evidence=sorted(evidence))))
         # All retired claim metadata is visible; exact documents/evidence are paged by hash.
         retired = [document(dict(row)) for row in self.ledger.retired()]
@@ -200,7 +193,33 @@ class MemoryMaintenance:
         local = self.campaign.scheduler.state()['repairs'][row['repair_id']]
         self.campaign.scheduler.decide(dict(action='repair', repair_id=row['repair_id'],
             reason='Memory maintenance precedes ordinary curriculum work', evidence=row['evidence']))
-        return local
+        return dict(local, memory_context=self.repair_context(row))
+
+    def counterevidence(self, obligation):
+        with sqlite3.connect(self.ledger.path) as db:
+            triggers = db.execute('SELECT trigger_id FROM memory_maintenance_triggers WHERE repair_id=?',
+                                  (obligation['repair_id'],)).fetchall()
+            assessments = [db.execute('SELECT payload FROM memory_maintenance_reviews WHERE exposure_id=?',
+                           (trigger[0].split(':',1)[1],)).fetchone() for trigger in triggers]
+        evidence = set(obligation['evidence'])
+        for assessment in assessments:
+            if assessment:
+                evidence.update(json.loads(assessment[0])['judgment']['evidence'])
+        return sorted(evidence)
+
+    def repair_context(self, obligation):
+        record = self.ledger.record(obligation['version'])
+        from .subject_knowledge import memory_artifacts
+        document = self.campaign.artifacts.put_bytes(canonical(record))
+        artifacts = {'disputed-memory': document}
+        artifacts.update({'memory-evidence:' + str(i):sha for i,sha in enumerate(sorted(memory_artifacts(record)))})
+        artifacts.update({'counterevidence:' + str(i):sha for i,sha in enumerate(self.counterevidence(obligation))})
+        for sha in artifacts.values():
+            self.read_artifact(sha, remaining_seconds=float('inf'))
+        return dict(reason='Assigned untrusted memory maintenance; investigate the claim rather than treating it as guidance. ' + obligation['reason'],
+            memory_id=record['memory_id'], version=obligation['version'],
+            claim={key:record['proposal'][key] for key in ('summary','applicability','preconditions','expectations','limitations')},
+            artifacts=artifacts)
 
     def resolve(self, project_id, record):
         """Only explicit reviewed resolutions close obligations after publication."""
@@ -218,6 +237,9 @@ class MemoryMaintenance:
             if resolution['action'] == 'replace':
                 if not self.ledger.replacements(row['version']):
                     raise ValueError('memory correction must publish its replacement before resolving repair')
+            elif resolution['action'] == 'confirm':
+                if row['kind'] != 'investigate' or status != 'active' or not self.ledger.bases_current([{'memory_id':row['memory_id'],'version':row['version']}]):
+                    raise ValueError('confirmation requires an unchanged active investigated memory')
             else:
                 reviewed = next(item for item in record['review_request']['memory_repairs'] if item['repair_id'] == row['repair_id'])
                 event_id = 'resolution-' + row['repair_id'] + '-' + record['review_sha256']

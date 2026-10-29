@@ -130,7 +130,7 @@ Return one JSON action per reply:
 or terminal {"decision":"accept"|"repair","reason":"...","evidence":["sha"],
 "memory_judgments":[{"exposure_id":"...","usefulness":"useful|not-useful|unknown",
 "correctness":"supported|contradicted|unknown","investigate":false,"reason":"...","evidence":["sha"]}],
-"memory_resolutions":[{"repair_id":"...","action":"replace|restore|retire","reason":"...","evidence":["sha"]}],
+"memory_resolutions":[{"repair_id":"...","action":"replace|restore|retire|confirm","reason":"...","evidence":["sha"]}],
 "retirement_checks":[{"tombstone_id":"...","relation":"unrelated|duplicate|reconciles","reason":"...","evidence":["sha"]}],
 "repair":null|{"instructions":"...","expected_evidence":"..."},"memory":null|{
 "operation":"create"|"append"|"merge","base_versions":[{"memory_id":"...","version":"..."}],
@@ -175,7 +175,7 @@ from missing evidence is not an investigation request.
 Read its exact document before deciding correctness; contradiction must cite separate
 project evidence. A correct memory can be unhelpful, and an incorrect memory can appear
 helpful. Resolve assigned memory_repairs explicitly: replace with a corrected/merged
-memory, restore an unjustified quarantine, or retire with evidence. A passing kernel
+memory, restore an unjustified quarantine, confirm an active investigation, or retire with evidence. A passing kernel
 alone never resolves a memory repair. Compare proposed memories against all supplied
 retired_memories; duplicate retired claims cannot be republished. Reconciliation needs
 fresh project evidence explicitly resolving the recorded retirement evidence.

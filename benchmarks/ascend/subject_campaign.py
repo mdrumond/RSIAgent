@@ -350,6 +350,7 @@ class SubjectCampaign:
                 wave_id = f"wave-{len(self.state['waves']) + 1:05d}"
                 if maintenance_repair:
                     context['repairs'] = [maintenance_repair]
+                    context['selection_artifacts'] = maintenance_repair['memory_context']['artifacts']
                 items = [] if maintenance_repair else self.scheduler.claim_projects(wave_id)
                 if not items:
                     items = self.select_wave(context, snapshot, self.state['projects'],
@@ -358,6 +359,9 @@ class SubjectCampaign:
                     self.state['decision_error'] = 'Every imposed memory-maintenance project must address its selected repair obligation'
                     self._save()
                     continue
+                if maintenance_repair:
+                    for item in items:
+                        item['memory_maintenance'] = maintenance_repair['memory_context']
                 if not items or len({i['project_id'] for i in items}) != len(items):
                     raise ValueError('wave must contain unique projects')
                 if set(i['project_id'] for i in items) & self.state['projects'].keys():
