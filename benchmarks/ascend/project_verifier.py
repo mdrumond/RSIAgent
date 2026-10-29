@@ -374,8 +374,9 @@ class ReviewState:
         original = request.artifacts.get('original-source')
         self.complete_required = {original} if original is not None and original != request.source_sha256 else set()
         self.queried, self.host_ok = agent.query_knowledge is None, request.host_verified
-        self.required = {digest for role, digest in request.artifacts.items()
+        self.execution_required = {digest for role, digest in request.artifacts.items()
             if any(part in role.lower() for part in ('result', 'log', 'evidence', 'execution'))}
+        self.required = set(self.execution_required)
         if request.source_sha256 is not None:
             self.required.add(request.source_sha256)
         self.required.update(self.complete_required)
@@ -546,6 +547,7 @@ class ReviewState:
                                  for role, digest in observation.get('artifacts', {}).items()})
                 for digest in observation.get('artifacts', {}).values():
                     required.add(_digest(digest))
+                    self.execution_required.add(digest)
                     known.add(digest)
                 observation = dict(host_verified=observation['host_verified'],
                                    artifacts=artifact_preview(registry), artifact_count=len(registry))
@@ -554,7 +556,8 @@ class ReviewState:
                     raise EvidenceReferenceError('incomplete-original-source',
                         'read the complete distinct original-source before acceptance; '
                         'follow missing_required_artifacts.next_read to read every missing page')
-                self.agent._validate_decision(value, request, read, required, host_ok,
+                decision_required = self.execution_required if value.get('decision') == 'repair' else required
+                self.agent._validate_decision(value, request, read, decision_required, host_ok,
                                         queried, versions, citations, remaining, observed)
                 remaining()
                 self.agent._record('decision', value)

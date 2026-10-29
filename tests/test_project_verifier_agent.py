@@ -548,3 +548,21 @@ def test_passing_original_is_preserved_as_history_without_relabeling_it_failed()
     initial = next(e['payload'] for e in h.agent.last_trace if e['kind']=='request')
     assert initial['project']['host_facts'][0]['host_verified'] is True
     assert not [e for e in h.agent.last_trace if e['kind']=='feedback']
+
+
+def test_source_less_repair_needs_execution_evidence_not_unavailable_historical_source():
+    req = ProjectReview('current-source-lost',None,False,
+                        {'original-source':B,'execution':R,'actor-log':L})
+    h = Harness([read(B),read(R),repair(),read(L),repair()])
+    original_reader = h.agent.read_artifact
+    def unavailable(digest, **options):
+        if digest==B:raise FileNotFoundError('historical source object missing')
+        return original_reader(digest, **options)
+    h.agent.read_artifact = unavailable
+    assert h.agent.review(req)==repair()
+    feedback = [e['payload'] for e in h.agent.last_trace if e['kind']=='feedback']
+    assert feedback[0]['error_code']=='artifact-unavailable'
+    assert len(feedback)==2  # The first repair still needs its unread Actor log.
+    assert all(B not in e['allowed_evidence'] for e in feedback)
+    assert [digest for digest,_ in h.reads]==[R,L]
+    assert h.agent.last_trace[-1]['kind']=='decision'
