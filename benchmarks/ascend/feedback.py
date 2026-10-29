@@ -126,12 +126,9 @@ class FeedbackStore:
 
     @staticmethod
     def _present(record):
-        # Before generic feedback, every stored observation was Phase 2. Supply
-        # additive dispatch metadata on reads without rewriting immutable history.
         outcome = record['outcome']
-        outcome.setdefault('source_type', 'phase2')
-        if outcome['source_type'] == 'phase2':
-            outcome.setdefault('original_spec', outcome['task'])
+        if outcome.get('source_type') not in {'phase1', 'optimizer', 'optimizer-task'}:
+            raise ValueError('unsupported feedback source')
         control = record['outcome']['category'] in {'verified-success', 'verified-timing-unknown'}
         record['lifecycle'] = None if control else {
             'resolved': 'fixed', 'ready-to-retry': 'remediated'
@@ -460,8 +457,8 @@ class FeedbackStore:
                 if job['status'] not in {'failed', 'stopped', 'budget-exhausted', 'completed'}:
                     continue
                 events = store.events(job['job_id'])
-                # Phase 2 owns these observations and their established identities.
-                if any(event['kind'].startswith('phase2-') for event in events):
+                # Task attempts carry authenticated result artifacts.
+                if any(event['kind'].startswith('task-attempt-') for event in events):
                     continue
                 state = next((event['payload'] for event in reversed(events)
                               if event['kind'] == 'optimizer-state'), {})
@@ -570,7 +567,7 @@ class FeedbackStore:
 
     @staticmethod
     def _original_retry(original, retry):
-        if original.get('source_type') == 'optimizer' and retry.get('source_type') == 'phase2':
+        if original.get('source_type') == 'optimizer' and retry.get('source_type') == 'optimizer-task' and retry.get('evidence', {}).get('result_artifact'):
             return FeedbackStore._optimizer_campaign_retry(original, retry)
         if (not retry.get('verified') or original.get('source_type') != retry.get('source_type')
                 or (original.get('source_type') != 'optimizer'
@@ -603,11 +600,12 @@ class FeedbackStore:
                     evaluation = artifact(retry, 'evaluation')
                 measured = score(baseline, evaluation)
                 return measured is not None and measured >= 1.0
-            if original['source_type'] == 'phase2':
+            if original['source_type'] == 'optimizer-task':
                 baseline = _baseline_identity(original)
                 return (baseline is not None and baseline == _baseline_identity(retry)
                         and _verified_retry(retry)
-                        and _category(original['task'], retry['result']) == 'verified-success')
+                        and (original['category'] != 'verified-slow'
+                             or _category(original['task'], retry['result']) == 'verified-success'))
             plan_ref = retry['evidence']['plan']
             plan_data = Path(plan_ref['retained_path']).read_bytes()
             if sha(plan_data) != plan_ref['sha256']:
@@ -667,7 +665,7 @@ class FeedbackStore:
             return updates
         return self.update_investigation(feedback_id, merge=merge)
 
-    def import_campaign(self, root):
+    def import_task_results(self, root):
         root = Path(root).resolve()
         report = dict(source_root=str(root), imported=0, existing=0, warnings=[])
         if not root.is_dir():
@@ -682,7 +680,7 @@ class FeedbackStore:
             qualification = path.name == 'qualification.json'
             if qualification and (path.parent / 'state.json').exists() and not state.get('active'):
                 continue
-            if state.get('phase') != 'optimizer-phase2':
+            if state.get('phase') != 'optimizer-task':
                 continue
             supported += 1
             campaign = path.parent
@@ -735,7 +733,7 @@ class FeedbackStore:
                         job = store.get(manifest.parent.name)
                         events = store.events(job['job_id'])
                         completed = next((event['payload'] for event in reversed(events)
-                            if event['kind'] == 'phase2-attempt-result'
+                            if event['kind'] == 'task-attempt-result'
                             and event['payload'].get('attempt_id') == pending['attempt_id']), None)
                     except (ValueError, OSError) as error:
                         report['warnings'].append(f'{manifest}: retained job unreadable: {error}')
@@ -751,7 +749,7 @@ class FeedbackStore:
                     boundary = None
                     if pending.get('kind') not in {'qualification', 'practice-qualification'}:
                         boundary = next((event['sequence'] for event in reversed(events)
-                            if event['kind'] in {'phase2-attempt-request', 'phase2-prepare-request'}
+                            if event['kind'] in {'task-attempt-request', 'task-prepare-request'}
                             and event['payload'].get('attempt_id') == pending['attempt_id']), None)
                         terminal = next((event['sequence'] for event in reversed(events)
                             if event['payload'].get('manifest', {}).get('status') == job['status']), -1)
@@ -764,7 +762,7 @@ class FeedbackStore:
                     evaluated = [item for item in prepared.get('history', [])
                                  if 'result' in item and 'candidate_sha256' in item]
                     consumed = sum(event['payload'].get('result') is not None for event in events
-                                   if event['kind'] == 'phase2-attempt-result')
+                                   if event['kind'] == 'task-attempt-result')
                     candidate = prepared.get('pending', {})
                     if (len(evaluated) > consumed or
                             (candidate.get('evaluation') and not candidate.get('history_recorded'))):
@@ -775,7 +773,7 @@ class FeedbackStore:
                     source = prepared.get('candidate')
                     if source:
                         source_boundary = next((event['sequence'] for event in events
-                            if event['kind'] == 'phase2-attempt-request'
+                            if event['kind'] == 'task-attempt-request'
                             and event['payload'].get('attempt_id') == pending['attempt_id']), boundary)
                         if source_boundary is not None and any(event['kind'] == 'artifact'
                                 and event['sequence'] > source_boundary and event['payload'] == source for event in events):
@@ -792,7 +790,7 @@ class FeedbackStore:
                                    else 'interrupted', job_status=job)
                     report['imported' if self._put(outcome, report['warnings']) else 'existing'] += 1
         if not supported:
-            report['warnings'].append('no supported optimizer Phase 2 state found; legacy layouts are not imported')
+            report['warnings'].append('no supported optimizer optimizer task state found; legacy layouts are not imported')
         return report
 
     def _outcome(self, campaign, row, metadata, report):
@@ -805,7 +803,7 @@ class FeedbackStore:
             try:
                 events = JobStore(directory / 'jobs').events(job_id)
                 incarnation = events[0]['sha256'] if events else None
-                runtime = next((e['payload']['runtime'] for e in events if e['kind'] == 'phase2-task'), {})
+                runtime = next((e['payload']['runtime'] for e in events if e['kind'] == 'optimizer-task'), {})
             except (ValueError, OSError, KeyError) as error:
                 report['warnings'].append(f'{directory}: runtime evidence unreadable: {error}')
         evidence = {}
@@ -827,7 +825,7 @@ class FeedbackStore:
         if target not in {'a3', 'a5'}:
             target = {'ascend-a3': 'a3', 'ascend-a5': 'a5'}.get(metadata.get('benchmark'), 'unknown')
         return dict(source_root=str(campaign), attempt_id=row['attempt_id'],
-            kind=row.get('kind', 'target'), source_type='phase2', original_spec=row['task'], target=target,
+            kind=row.get('kind', 'target'), source_type='optimizer-task', original_spec=row['task'], target=target,
             language=metadata.get('language', runtime.get('language', 'unknown')),
             runtime=runtime, job_incarnation=incarnation, task=row['task'], verified=result.get('verified') is True,
             result=result, evidence=evidence, interpretation='Observation, not verified reusable knowledge')

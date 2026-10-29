@@ -59,6 +59,10 @@ class SubjectCampaign:
                  complete, max_seconds=7200, index_memory=None, memory_ledger=None,
                  clock=time.monotonic):
         self.root = Path(root)
+        self.path = self.root / 'subject-campaign.json'
+        retained = json.loads(self.path.read_bytes()) if self.path.exists() else None
+        if retained is not None and retained.get('schema') != 'ascend-subject-campaign-v2':
+            raise ValueError('unsupported subject campaign; use a fresh root')
         self.root.mkdir(parents=True, exist_ok=True)
         self.scheduler = SubjectScheduler(self.root, subjects)
         self.memory = SubjectMemory(self.root / 'memory', initial_memory, index=index_memory, ledger=memory_ledger)
@@ -67,8 +71,8 @@ class SubjectCampaign:
         self.policy = SubjectCurriculumAgent(complete)
         self.seconds, self.clock = max_seconds, clock
         self.path = self.root / 'subject-campaign.json'
-        self.state = json.loads(self.path.read_bytes()) if self.path.exists() else dict(
-            schema='ascend-subject-campaign-v1', waves=[], projects={}, pending=None,
+        self.state = retained if retained is not None else dict(
+            schema='ascend-subject-campaign-v2', waves=[], projects={}, pending=None,
             needs_decision=False, terminal=None)
         from .memory_maintenance import MemoryMaintenance
         self.memory_maintenance = MemoryMaintenance(self, memory_ledger) if memory_ledger is not None else None

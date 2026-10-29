@@ -4,15 +4,15 @@ import json
 
 import pytest
 
-import benchmarks.a5kernels.phase2_attention_bz as attention_bz
+import benchmarks.a5kernels.attention_bz as attention_bz
 from benchmarks.a5kernels.bz import CommandResult
-from benchmarks.a5kernels.phase2_attention import (
+from benchmarks.a5kernels.attention import (
     ATTENTION_CASES,
     AttentionInfrastructureError,
     AttentionTargetVerifier,
     build_execution,
 )
-from benchmarks.a5kernels.phase2_attention_bz import (
+from benchmarks.a5kernels.attention_bz import (
     ATTENTION_CANDIDATE_FIXTURE,
     MAX_OBSERVED_BYTES,
     OUTPUT_MARKER,

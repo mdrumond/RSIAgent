@@ -8,9 +8,6 @@ from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 from benchmarks.ascend.qualified_targets import TargetContract, qualify_target
-from benchmarks.ascend.phase2_target_selector import (
-    TargetCurriculumAgent, TargetCurriculumContext, target_curriculum_prompt,
-)
 from benchmarks.ascend.targets import a3_curriculum_policy
 from test_a5_phase1_project_executor import FakeBackend, _compile, _runtime, _spec
 
@@ -95,47 +92,10 @@ def practice_wire():
         "evidence": "host compare full physical output", "retry_plan": "apply verified tail bounds"})
 
 
-def test_phase2_prompt_is_target_specific_and_keeps_reference_private(tmp_path):
-    target, _, _ = qualified(tmp_path)
-    prompt = target_curriculum_prompt(context(target), a3_curriculum_policy())
-    assert "private working reference" not in prompt
-    assert "reference_sha256" not in prompt
-    payload = json.loads(prompt.rsplit("\n", 1)[-1])
-    assert payload["target"]["target_id"] == target.target_id
-    assert payload["target"]["correctness"]["atol_and_rtol"] == 1e-5
-    assert payload["latest_target_attempt"]["diagnostic"] == "host mismatch on padded output"
 
 
-def test_practice_requires_concrete_fields_budget_and_fixed_target(tmp_path):
-    target, _, _ = qualified(tmp_path)
-    agent = TargetCurriculumAgent(lambda _: practice_wire(), target_policy=a3_curriculum_policy())
-    decision, session = agent.select(context(target))
-    assert decision.action == "practice" and session.turns == 1
-    assert decision.project.project_id != target.spec.project_id
-    assert decision.as_dict()["retry_plan"] == "apply verified tail bounds"
-    with pytest.raises(ValueError, match="practice budget"):
-        agent.parse(practice_wire(), replace(context(target), practice_seconds_remaining=0))
-    with pytest.raises(ValueError, match="retry budget"):
-        agent.parse(practice_wire(), replace(context(target), remaining_seconds=0))
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    value["project"] = target.spec.as_dict()
-    with pytest.raises(ValueError, match="replace the target"):
-        agent.parse("DECISION: PRACTICE\n" + json.dumps(value), context(target))
 
 
-def test_failed_target_cannot_be_ready_and_invalid_proposal_is_corrected(tmp_path):
-    target, _, _ = qualified(tmp_path)
-    replies = iter(['DECISION: READY\n{"reason":"practice passed"}',
-                    'DECISION: RETRY_TARGET\n{"reason":"test learned repair"}'])
-    calls = []
-    agent = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
-    decision, session = agent.select(context(target))
-    assert decision.action == "retry-target" and session.turns == 2
-    assert "host-verified target" in calls[1][-1]["content"]
-    assert agent.parse('DECISION: READY\n{"reason":"target passed; no useful practice"}',
-                       context(target, True)).action == "ready"
-    with pytest.raises(ValueError, match="fields"):
-        agent.parse('DECISION: READY\n{"reason":"done","target":{}}', context(target, True))
 
 
 def test_compile_success_without_numerical_runtime_is_not_feasibility(tmp_path):
@@ -160,142 +120,18 @@ def test_reference_input_changes_are_rejected_even_when_saved_output_matches(tmp
         replace(target, reference_sha256=store.put_json(reference)).verify(store, RUNTIME)
 
 
-@pytest.mark.parametrize("field", ["project_id", "hypothesis", "graph-input", "graph-node"])
-def test_practice_rejects_held_out_names(tmp_path, field):
-    target, _, _ = qualified(tmp_path)
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    project = value["project"]
-    if field == "project_id":
-        project["project_id"] = "practice-bsa"
-    elif field == "hypothesis":
-        project["hypothesis"] = "Reconstruct the held-out GDN kernel from this target failure."
-    elif field == "graph-input":
-        old = project["graph"]["inputs"][0]["name"]
-        project["graph"]["inputs"][0]["name"] = "bsa"
-        for node in project["graph"]["nodes"]:
-            node["operands"] = ["bsa" if name == old else name for name in node["operands"]]
-    else:
-        project["graph"]["nodes"][-1]["name"] = "gdn"
-        project["graph"]["output"] = "gdn"
-    with pytest.raises(ValueError, match="held-out benchmark name"):
-        TargetCurriculumAgent(lambda _: "").parse(
-            "DECISION: PRACTICE\n" + json.dumps(value), context(target))
 
 
-def test_configured_held_out_signatures_apply_only_to_practice(tmp_path):
-    from benchmarks.a5kernels.phase1_curriculum_selector import project_information_sha256
-    from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
-    target, _, _ = qualified(tmp_path)
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    digest = project_information_sha256(ProjectSpec.from_mapping(value["project"]))
-    agent = TargetCurriculumAgent(lambda _: "", held_out_information_sha256=(digest,))
-    # Learning focus and new IDs cannot evade executable held-out matching.
-    value["project"]["learning_focus"] = ["pipe-vector"]
-    with pytest.raises(ValueError, match="held-out contract"):
-        agent.parse("DECISION: PRACTICE\n" + json.dumps(value), context(target))
-    assert agent.parse('DECISION: RETRY_TARGET\n{"reason":"retry unchanged goal"}',
-                       context(target)).action == "retry-target"
-    with pytest.raises(ValueError, match="SHA-256"):
-        TargetCurriculumAgent(lambda _: "", held_out_information_sha256=("invalid",))
 
 
-@pytest.mark.parametrize("focus,tool", [("tool-msprof", "request-profile"),
-    ("tool-msdebug", "request-debug"), ("tool-mssanitizer", "request-sanitizer"),
-    ("debug-print", "debug-print")])
-def test_practice_tool_focus_requires_available_route(tmp_path, focus, tool):
-    target, _, _ = qualified(tmp_path)
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    value["project"]["learning_focus"] = [focus]
-    wire = "DECISION: PRACTICE\n" + json.dumps(value)
-    agent = TargetCurriculumAgent(lambda _: wire)
-    absent = replace(context(target), available_tools=())
-    with pytest.raises(ValueError, match="unavailable tools"):
-        agent.parse(wire, absent)
-    assert agent.parse(wire, replace(absent, available_tools=(tool,))).action == "practice"
-    grammar = json.loads(target_curriculum_prompt(absent).rsplit("\n", 1)[-1])["project_grammar"]
-    assert focus not in grammar["optional_project_fields"]["learning_focus"]
 
 
-@pytest.mark.parametrize("capability,tool", [("profiling", "request-profile"),
-                                           ("timing-sweep", "request-timing")])
-def test_tool_dependent_capabilities_are_rejected_and_model_can_repair(tmp_path, capability, tool):
-    target, _, _ = qualified(tmp_path)
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    project = value["project"]
-    project["capabilities"].append(capability)
-    if capability == "profiling":
-        project["profile_metric"] = "pipe-utilization"
-    else:
-        # Timing sweeps require unpadded, one-dimensional graph inputs.
-        project["capabilities"].remove("padded-tail")
-        project["shape"] = [16]
-        project["padding_multiple"] = 1
-        project["timing_lengths"] = [16, 32]
-        for item in project["graph"]["inputs"]:
-            item["shape"] = [16]
-    wire = "DECISION: PRACTICE\n" + json.dumps(value)
-    absent = replace(context(target), available_tools=())
-    agent = TargetCurriculumAgent(lambda _: wire)
-    with pytest.raises(ValueError, match="unavailable tools"):
-        agent.parse(wire, absent)
-    assert agent.parse(wire, replace(absent, available_tools=(tool,))).action == "practice"
-    replies = iter([wire, practice_wire()])
-    decision, session = TargetCurriculumAgent(lambda _: next(replies)).select(absent)
-    assert decision.action == "practice" and session.turns == 2
-    grammar = json.loads(target_curriculum_prompt(absent).rsplit("\n", 1)[-1])["project_grammar"]
-    assert capability not in grammar["capabilities"]
-    assert grammar["profile_metrics"] == []
 
 
-@pytest.mark.parametrize("field", ["reason", "weakness", "control", "evidence", "retry_plan"])
-def test_practice_rationale_rejects_held_out_names_and_can_be_corrected(tmp_path, field):
-    target, _, _ = qualified(tmp_path)
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    value[field] = "Reconstruct the held-out BSA benchmark with this practice."
-    invalid = "DECISION: PRACTICE\n" + json.dumps(value)
-    replies = iter([invalid, practice_wire()])
-    calls = []
-    agent = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
-    with pytest.raises(ValueError, match="held-out benchmark name"):
-        agent.parse(invalid, context(target))
-    decision, session = agent.select(context(target))
-    assert decision.action == "practice" and session.turns == 2
-    assert "held-out benchmark name" in calls[1][-1]["content"]
 
 
-@pytest.mark.parametrize("runtime_target,policy_target", [("a3", "a5"), ("a5", "a3")])
-def test_curriculum_rejects_wrong_target_policy_before_completion_and_direct_parse(
-        tmp_path, runtime_target, policy_target):
-    target, _, _ = qualified(tmp_path)
-    target = replace(target, runtime={**target.runtime, "target": runtime_target})
-    policy = replace(a3_curriculum_policy(), target=policy_target)
-    calls = []
-    agent = TargetCurriculumAgent(lambda messages: calls.append(messages), target_policy=policy)
-    with pytest.raises(ValueError, match="target policy and runtime differ"):
-        target_curriculum_prompt(context(target), policy)
-    with pytest.raises(ValueError, match="target policy and runtime differ"):
-        agent.select(context(target))
-    assert calls == []
-    with pytest.raises(ValueError, match="target policy and runtime differ"):
-        agent.parse(practice_wire(), context(target))
-    with pytest.raises(ValueError, match="target policy and runtime differ"):
-        agent.parse('DECISION: RETRY_TARGET\n{"reason":"retry unchanged goal"}', context(target))
 
 
-@pytest.mark.parametrize("capability,op,axis", [
-    ("vector-reduction", "reduce-sum", 1), ("vector-mask", "mask-positive", None)])
-def test_native_vector_practice_requires_explicit_native_policy(tmp_path, capability, op, axis):
-    target, _, _ = qualified(tmp_path)
-    value = json.loads(practice_wire().split("\n", 1)[1])
-    value["project"]["capabilities"] = ["gm-ub-movement", capability]
-    value["project"]["graph"]["nodes"][-1].update(op=op, axis=axis)
-    wire = "DECISION: PRACTICE\n" + json.dumps(value)
-    with pytest.raises(ValueError, match="native vector capability requires an explicit target policy"):
-        TargetCurriculumAgent(lambda _: "").parse(wire, context(target))
-    agent = TargetCurriculumAgent(lambda _: wire, target_policy=a3_curriculum_policy())
-    decision, session = agent.select(context(target))
-    assert decision.action == "practice" and session.turns == 1
-    assert capability in {item.value for item in decision.project.capabilities}
 
 
 @pytest.mark.parametrize("changed", [None, *RUNTIME])
@@ -309,26 +145,6 @@ def test_reference_runtime_must_match_observed_executor_before_backend_work(tmp_
     assert not backend.compile_requests and not backend.run_requests
 
 
-def test_selector_retains_previous_practice_rationale_with_latest_result(tmp_path):
-    target, _, _ = qualified(tmp_path)
-    calls = []
-    invalid = json.loads(practice_wire().split("\n", 1)[1])
-    invalid["reason"] = "Reconstruct held-out BSA"
-    replies = iter(["DECISION: PRACTICE\n" + json.dumps(invalid), practice_wire(),
-                    'DECISION: RETRY_TARGET\n{"reason":"apply learned tail ownership"}'])
-    agent = TargetCurriculumAgent(lambda messages: (calls.append(messages), next(replies))[1])
-    decision, session = agent.select(context(target))
-    latest = replace(context(target), lessons=({"project_id": decision.project.project_id,
-        "verified": True, "host_feedback": "padded output now matches"},))
-    followup, updated = agent.select(latest, session)
-    assert followup.action == "retry-target" and updated.turns == 3
-    assert len(calls[-1]) == 2
-    prompt = calls[-1][-1]["content"]
-    assert practice_wire() in prompt
-    assert "compare tail ownership with one fixed launch" in prompt
-    assert "padded output now matches" in prompt
-    assert "BSA" not in prompt and "Invalid proposal" not in prompt
-    assert "BSA" in json.dumps(session.messages)
 
 
 @pytest.mark.parametrize("stage", ["qualify", "reverify"])

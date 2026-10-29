@@ -15,7 +15,6 @@ Optional settings:
   "feedback_root": "/configured/feedback",
   "feedback_sources": [
     {"type": "phase1", "root": "/retained/phase1"},
-    {"type": "phase2", "root": "/retained/phase2"},
     {"type": "optimizer", "root": "/retained/jobs"}
   ],
   "optimizer_worker_config": "/configured/optimizer.json"
@@ -39,7 +38,7 @@ of the unchanged original specification. Successful remedial projects alone neve
 mark an original failure fixed. Failed original retries retain their evidence
 and return the original observation to failed for further investigation.
 
-A3 external optimizer/Phase 2 retries require `optimizer_worker_config` and
+A3 external optimizer retries require `optimizer_worker_config` and
 retained frozen suite/comparison-policy evidence. They use authenticated committed
 Phase 1 memory, explicitly labeled `committed-phase1`; this does not manufacture
 a human review or change the existing reviewed handoff. The configured worker's

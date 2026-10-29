@@ -47,7 +47,7 @@ _ROOT_FILES = {"state.json", "pending.json", "campaign-identity.json",
                "project-evidence.jsonl", "initial-memory.bin", "memory.jsonl",
                "terminal.json", "protocol.json", "review.json", "snapshot.json",
                "phase1-memory.jsonl", "phase1-terminal.json", "seed-memory.json",
-               "phase2-feedback.json", "failure-investigations.json", "qualification.json", "remediation.json"}
+               "failure-feedback.json", "failure-investigations.json", "qualification.json", "remediation.json"}
 _TREES = {"waves", "native-evidence", "measurements", "cells", "attempts",
           "provider", "provider-evidence", "source-evidence", "artifacts", "traces",
           "sft-traces", "snapshot", "project-bundles", "measurement-evidence", "tasks", "curriculum", "feedback", "failure-budgets", "original-retries"}
@@ -175,21 +175,6 @@ def _verify_wave(root, *, closed_failure=False):
         raise ValueError("publication differs from retained committed evidence")
 
 
-def _verify_memory_attempt(root, relative, memory):
-    parent = Path(relative).parent / "attempts" / f"attempt-{memory['attempt']:02d}"
-    attempt = json.loads((root / parent / "attempt.json").read_bytes())
-    evidence = json.loads((root / parent / "evidence.json").read_bytes())
-    source = next(root / parent / name for name in ("candidate.py", "candidate.cpp")
-                  if (root / parent / name).is_file())
-    for record, field in ((attempt, "attempt_sha256"), (evidence, "evidence_sha256")):
-        if record[field] != _sha(_json({k: v for k, v in record.items() if k != field})):
-            raise ValueError("committed attempt record digest mismatch")
-    if (memory["attempt_identity_sha256"] != attempt["attempt_sha256"]
-            or memory["evidence_sha256"] != evidence["evidence_sha256"]
-            or memory["candidate_sha256"] != evidence["candidate_sha256"]
-            or memory["candidate_sha256"] != _sha(source.read_bytes())
-            or memory["passed"] is not evidence["passed"]):
-        raise ValueError("committed memory differs from retained attempt")
 
 
 def _project_memory(branch):
@@ -211,18 +196,14 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None, reviewe
     """Bind the published state to ordered deltas and every pre-wave snapshot."""
     from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA, retained_failure_outcome
     from benchmarks.a5kernels.phase1_curriculum import WaveSpec
+    if state.get("phase"):
+        raise ValueError("unsupported campaign state")
     seed = root / "initial-memory.bin"
     initial = (Path(external_initial_memory).read_bytes() if external_initial_memory else
                seed.read_bytes() if seed.is_file() else None)
-    if state.get("phase") in {"adaptive-phase2", "target-driven-phase2"}:
-        from .phase2_curriculum import reviewed_seed
-        initial, _ = reviewed_seed(reviewed_seed_root or root, state["snapshot_id"])
     if initial is not None and state["initial_memory_sha256"] != _sha(initial):
         raise ValueError("initial seed differs from adaptive state")
-    if state.get("phase") == "target-driven-phase2" and len(state["attempts"]) != len(state["completed_waves"]):
-        raise ValueError("target attempt count differs from completed waves")
     memories, outcomes, failures = [], [], []
-    target_attempts = practice_since_target = 0
     for ordinal, wave_id in enumerate(state["completed_waves"]):
         wave_root = root / "waves" / wave_id
         wave = WaveSpec.from_mapping(json.loads((wave_root / "plan.json").read_bytes())["wave"])
@@ -230,8 +211,6 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None, reviewe
             snapshot = {"schema": MEMORY_SCHEMA,
                         "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
                         "project_memory_base64": memories}
-            if state.get("phase") == "target-driven-phase2":
-                snapshot["feedback"] = state["attempts"][max(0, ordinal - 2):ordinal]
             if wave.pre_wave_memory_sha256 != _sha(_json(snapshot)):
                 raise ValueError("published pre-wave memory chain differs")
         publication = json.loads((wave_root / "published.json").read_bytes())
@@ -248,41 +227,9 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None, reviewe
             outcomes.append({"project_id": project.spec.project_id,
                              "spec": project.spec.as_dict(), "verified": True,
                              "summary": delta["summary"]})
-        if state.get("phase") == "target-driven-phase2":
-            from .phase2_target_loop import TargetDrivenPhase2Coordinator
-            if len(wave.projects) != 1:
-                raise ValueError("target attempts must contain one project")
-            project = wave.projects[0].spec
-            branch = wave_root / "branches" / project.project_id
-            verified = json.loads((branch / "outcome.json").read_bytes())["verified"]
-            retained = (outcomes if verified else failures)[-1]
-            kind = "target" if project.as_dict() == state["goal_identity"]["target"]["spec"] else "practice"
-            expected_attempt = {**retained, "kind": kind, "wave_id": wave_id,
-                                "host_feedback": TargetDrivenPhase2Coordinator._host_feedback(branch)}
-            recorded_attempt = {key: value for key, value in state["attempts"][ordinal].items()
-                                if key != "attempt_root"}
-            if recorded_attempt != expected_attempt:
-                raise ValueError("target attempt differs from retained host outcome")
-            if kind == "target":
-                target_attempts += 1
-                practice_since_target = 0
-            else:
-                practice_since_target += 1
-    if state.get("phase") == "target-driven-phase2" and (
-            state["target_attempts"] != target_attempts
-            or state["practice_since_target"] != practice_since_target):
-        raise ValueError("target budget counters differ from retained completed attempts")
-    if state.get("phase") == "target-driven-phase2" and state["next_kind"] != (
-            "review" if state["attempts"] else "target"):
-        raise ValueError("next attempt kind differs from retained completed attempts")
-    if (state.get("phase") == "target-driven-phase2"
-            and (state.get("terminal") or {}).get("status") == "READY"
-            and (not state["attempts"] or state["attempts"][-1]["kind"] != "target"
-                 or state["attempts"][-1]["verified"] is not True)):
-        raise ValueError("READY requires a final host-verified target attempt")
     if memories != state["memory_bytes_base64"] or outcomes != state["prior_outcomes"]:
         raise ValueError("adaptive state differs from ordered published deltas")
-    if state.get("phase") != "adaptive-phase2" and failures != state.get("failed_outcomes", []):
+    if failures != state.get("failed_outcomes", []):
         raise ValueError("curriculum failures differ from retained completed attempts")
 
 
@@ -367,14 +314,8 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
                 reports.append(descriptor)
 
     state = documents.get("state.json", [{}])[0]
-    if state.get("phase") == "optimizer-phase2":
-        from .optimizer_evidence import verify_campaign
-        try:
-            verify_campaign(root)
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            issues.append({"kind": "invalid-optimizer-phase2-evidence", "reason": str(error)})
     identity = documents.get("campaign-identity.json", [{}])[0]
-    if not state and not any(p.endswith("protocol.json") for p in documents):
+    if not state:
         issues.append({"kind": "missing-campaign-state"})
     pending = [p for p in documents if p.endswith("pending.json")]
     # Phase 1 publications are the memory commit boundary, not mere outcomes.
@@ -388,10 +329,7 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
                 issues.append({"kind": "invalid-wave-publication", "wave": wave})
     from benchmarks.a5kernels.phase1_adaptive import STATE_SCHEMA
     if state.get("schema") == STATE_SCHEMA:
-        # Phase 2 uses its separately authenticated reviewed snapshot as seed;
-        # this file is the Phase 1 launcher's portable seed convention.
-        if (state.get("phase") not in {"adaptive-phase2", "target-driven-phase2"}
-                and not (root / "initial-memory.bin").is_file() and external_initial_memory is None):
+        if not (root / "initial-memory.bin").is_file() and external_initial_memory is None:
             issues.append({"kind": "missing-initial-memory"})
         try:
             _verify_adaptive_state(root, state, external_initial_memory=external_initial_memory)
@@ -425,30 +363,6 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
                 else:
                     pending.append(wave_root)
     for relative in documents:
-        if relative == "memory.jsonl" or relative.endswith("/memory.jsonl"):
-            for memory in documents[relative]:
-                if "attempt_identity_sha256" in memory:
-                    try:
-                        _verify_memory_attempt(root, relative, memory)
-                    except (OSError, ValueError, KeyError, TypeError, StopIteration):
-                        issues.append({"kind": "missing-or-corrupt-committed-attempt",
-                                       "origin": relative, "attempt": memory.get("attempt")})
-        if relative.endswith("attempt.json"):
-            parent = relative.rsplit("/", 1)[0]
-            cell = parent.split("/attempts/", 1)[0] if "/attempts/" in parent else ""
-            memories = documents.get((cell + "/" if cell else "") + "memory.jsonl", [])
-            attempt = documents[relative][0]
-            evidence = documents.get(parent + "/evidence.json", [{}])[0]
-            committed = any(m.get("attempt_identity_sha256") == attempt.get("attempt_sha256")
-                            and m.get("evidence_sha256") == evidence.get("evidence_sha256")
-                            and m.get("attempt_identity_sha256") for m in memories)
-            if not evidence or not committed:
-                pending.append(parent)
-            source = next((root / parent / name for name in ("candidate.py", "candidate.cpp")
-                           if (root / parent / name).is_file()), None)
-            expected = evidence.get("candidate_sha256")
-            if expected and (source is None or _sha(source.read_bytes()) != expected):
-                issues.append({"kind": "missing-or-corrupt-source", "origin": relative})
         if relative.endswith("snapshot.json"):
             snapshot = documents[relative][0]
             expected_files = dict(snapshot.get("files", {}))

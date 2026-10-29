@@ -52,62 +52,38 @@ def _harness_revision(root=None):
 
 
 def _snapshot(job, options):
-    """Read the frozen copy on resume, never recopy a growing Phase 1."""
-    from benchmarks.a5kernels.phase2_adaptive_memory import (
-        AdaptivePhase1Snapshot, adaptive_destination, admit_adaptive_snapshot,
-    )
-    from .phase2 import NativePhase1Snapshot, NativePhase2Cell, admit_native_snapshot
-    control = Path(job["control"])
-    retained = control / "snapshot-location.json"
+    """Read the frozen reviewed Phase 1 seed used by an original-project retry."""
+    from .reviewed_memory import NativePhase1Snapshot, ReviewedMemoryIdentity, admit_native_snapshot
+    from .reviewed_catlass import AdaptivePhase1Snapshot, adaptive_destination, admit_adaptive_snapshot
+    retained = Path(job["control"]) / "snapshot-location.json"
     if retained.exists():
         root = Path(_read(retained)["path"])
         manifest = _read(root / "snapshot.json")
         if job["target"] == "a3":
             identity = manifest["destination_identity"]
-            cell = NativePhase2Cell(identity["source_identity"], identity["qualification_sha256"])
-            snapshot = NativePhase1Snapshot(root, cell, manifest)
+            snapshot = NativePhase1Snapshot(root, ReviewedMemoryIdentity(
+                identity["source_identity"], identity["qualification_sha256"]), manifest)
         else:
-            cell = adaptive_destination(options["cell"], _read(root / "review.json"))
-            snapshot = AdaptivePhase1Snapshot(root, cell, manifest)
+            snapshot = AdaptivePhase1Snapshot(root,
+                adaptive_destination(options["cell"], _read(root / "review.json")), manifest)
         snapshot.verify()
         return snapshot
     memory = (Path(job["root"]) / "initial-memory.bin").read_bytes()
     if job["target"] == "a3":
         snapshot = admit_native_snapshot(job["phase1_root"], memory, job["review"], job["root"])
     else:
-        snapshot = admit_adaptive_snapshot(job["phase1_root"], memory, job["review"],
-                                           options["cell"], job["root"])
+        snapshot = admit_adaptive_snapshot(job["phase1_root"], memory, job["review"], options["cell"], job["root"])
     _write(retained, {"path": str(snapshot.root)})
     return snapshot
 
 
-def _target_available_tools(actor):
-    """Advertise composed routes, never tools invented by campaign settings."""
-    from benchmarks.a5kernels.phase1_adaptive_actor import (
-        disabled_profile_action, disabled_diagnostic_action,
-    )
-    tools = list(getattr(getattr(actor, "executor", None), "supported_tools", ()))
-    for attribute, disabled, names in (
-        ("request_profile", disabled_profile_action, ("request-profile",)),
-        ("request_timing", disabled_profile_action, ("request-timing",)),
-        ("request_diagnostic", disabled_diagnostic_action, ("request-debug", "request-sanitizer")),
-    ):
-        route = getattr(actor, attribute, None)
-        if callable(route) and route is not disabled:
-            tools.extend(names)
-    return tuple(tools)
 
 
-def _composed_target_runtime(actor, declared):
-    actual = getattr(getattr(actor, "executor", None), "runtime_identity", None)
-    if actual is None:
-        raise ValueError("target goals require observed compiler/runtime identity on the composed executor")
-    if dict(actual) != declared:
-        raise ValueError("qualified target runtime differs from the composed executor")
-    return dict(actual)
 
 
 def _validate_remediation_settings(settings, *, phase, target, approval):
+    if any(row.get('type') not in {'phase1', 'optimizer'} for row in settings.get('feedback_sources', [])):
+        raise ValueError('unsupported feedback source type')
     obsolete = {'verify_memory_usefulness', 'usefulness_pair_seconds'} & settings.keys()
     if obsolete:
         raise ValueError('Removed memory A/B settings: ' + ', '.join(sorted(obsolete)))
@@ -115,7 +91,7 @@ def _validate_remediation_settings(settings, *, phase, target, approval):
         return
     if approval:
         raise ValueError('automatic remediation does not support approval mode')
-    external = any(row.get('type') in {'phase2', 'optimizer'} for row in settings.get('feedback_sources', []))
+    external = any(row.get('type') == 'optimizer' for row in settings.get('feedback_sources', []))
     if target != 'a3' and (settings.get('optimizer_worker_config') or external):
         raise ValueError('external automatic remediation requires an A3 campaign')
     if external and not settings.get('optimizer_worker_config'):
@@ -130,6 +106,8 @@ def build_controller(job):
     from benchmarks.a5kernels.phase1_adaptive_production import build_adaptive_phase1
     from .training_traces import recorder_factory
 
+    if job.get("phase") != 1:
+        raise ValueError("unsupported campaign phase")
     config_bytes = Path(job["config"]).read_bytes()
     if hashlib.sha256(config_bytes).hexdigest() != job["config_sha256"]:
         raise ValueError("runtime settings changed; use a new campaign configuration")
@@ -146,7 +124,7 @@ def build_controller(job):
         model = (options["profile"].identity if job["target"] == "a3" else options["cell"].model)
         if model.backend_model.value != job["model"]:
             raise ValueError("configured model label differs from selected provider")
-        if job["phase"] == 2 or job.get("phase1_original_retry"):
+        if job.get("phase1_original_retry"):
             snapshot = _snapshot(job, options)
             if job["target"] == "a3":
                 source = snapshot.destination.source_identity
@@ -168,19 +146,12 @@ def build_controller(job):
         )
         built = (build_native_adaptive_phase1 if job["target"] == "a3"
                  else build_adaptive_phase1)(**options)
-        if job["phase"] == 2 and job["target"] == "a3":
-            identity_path = Path(job["root"]) / "campaign-identity.json"
-            if identity_path.exists():
-                current = _read(identity_path)
-                for key, value in snapshot.destination.source_identity.items():
-                    if key not in {"schema", "runtime_budget"} and current.get(key) != value:
-                        raise ValueError("native treatment changed reviewed Phase 1: " + key)
         coordinator = getattr(built, "coordinator", built)
         if job.get('feedback_root') and job['phase'] == 1 and not job.get('phase1_original_retry'):
             from .failure_curriculum import FailureCurriculum
-            data = (Path(job['root']) / 'phase2-feedback.json').read_bytes()
+            data = (Path(job['root']) / 'failure-feedback.json').read_bytes()
             if hashlib.sha256(data).hexdigest() != job['feedback_selection_sha256']:
-                raise ValueError('frozen Phase 2 feedback changed')
+                raise ValueError('frozen failure feedback changed')
             feedback = FailureCurriculum(job['root'], job['feedback_root'], json.loads(data))
             coordinator.failure_feedback = feedback
             coordinator.curriculum.failure_feedback = feedback
@@ -196,44 +167,10 @@ def build_controller(job):
                     load_config(settings['optimizer_worker_config']))
         if job.get('phase1_original_retry'):
             from .manual_retry import ManualPhase1Retry
-            data = (Path(job['root']) / 'phase2-feedback.json').read_bytes()
+            data = (Path(job['root']) / 'failure-feedback.json').read_bytes()
             if hashlib.sha256(data).hexdigest() != job['feedback_selection_sha256']:
                 raise ValueError('Frozen original retry selection changed')
             coordinator = ManualPhase1Retry(coordinator, job, json.loads(data))
-        elif job.get("optimizer_goal"):
-            coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
-        elif job.get("target_goal") is not None or job.get("autonomous_goal"):
-            from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-            from .qualified_targets import TargetContract
-            from .phase2_target_selector import TargetCurriculumAgent
-            from .phase2_target_loop import TargetDrivenPhase2Coordinator
-            if job.get("autonomous_goal"):
-                from .phase2_goal_bootstrap import bootstrap_goal
-                from .campaign_time import CampaignTimeBudget
-                budget = CampaignTimeBudget(job["root"], job["phase2_max_seconds"],
-                                          job["practice_max_seconds"])
-                with budget.active():
-                    goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
-                        private_root=Path(job["control"]) / "bootstrap", objective=job["objective"],
-                        available_tools=_target_available_tools(coordinator.execute_project),
-                        remaining_seconds=lambda: budget.remaining)
-                runtime = goal.runtime
-            else:
-                goal = TargetContract.from_mapping(job["target_goal"])
-                artifacts = ContentAddressedArtifacts(Path(job["target_artifact_store"]))
-                runtime = _composed_target_runtime(coordinator.execute_project, settings["target_runtime"])
-            coordinator = TargetDrivenPhase2Coordinator(
-                job["root"], job["objective"], snapshot,
-                TargetCurriculumAgent(coordinator.curriculum._complete,
-                                      target_policy=coordinator.curriculum.target_policy),
-                coordinator.execute_project,
-                target=goal, artifacts=artifacts, runtime=runtime,
-                target_policy=coordinator.curriculum.target_policy,
-                max_seconds=job["phase2_max_seconds"],
-                max_practice_seconds=job["practice_max_seconds"],
-                available_tools=_target_available_tools(coordinator.execute_project),
-                trace_hook=coordinator.trace_hook,
-            )
         captured.append(coordinator)
         # The old CLI calls run() after composing. Capture without executing it.
         return type("Deferred", (), {"run": lambda self: {"deferred": True}})()
@@ -256,53 +193,6 @@ def build_controller(job):
     return captured[0]
 
 
-def _optimizer_controller(job, settings, snapshot, composed, native):
-    """Bind the merged optimizer worker to the reviewed native campaign lineage."""
-    from optimizer.memory import freeze_reviewed_phase1
-    from optimizer.worker import load_config, knowledge_query
-    from .optimizer_execution import OptimizerTaskExecutor
-    from .phase2_optimizer_campaign import OptimizerPhase2Coordinator
-    from .phase2_optimizer_continuation import campaign_seed
-
-    path = settings.get("optimizer_worker_config")
-    if not path:
-        raise ValueError("optimizer Phase 2 requires optimizer_worker_config in ignored campaign settings")
-    data = Path(path).read_bytes()
-    if hashlib.sha256(data).hexdigest() != job["optimizer_worker_config_sha256"]:
-        raise ValueError("optimizer worker configuration changed on resume")
-    config = load_config(path, job.get("worker_config"))
-    runtime = getattr(getattr(composed.execute_project, "executor", None), "runtime_identity", None)
-    if (("local" if config.get("execution") == "local" else config["profile"]) != native.execution_profile or config["arch"] != native.arch
-            or runtime is None or str(config["physical_device"]) != str(runtime["device"])
-            or hashlib.sha256(Path(config["guide"]).read_bytes()).hexdigest() != native.guide_sha256
-            or config.get("model_profile", "deepseek-flash") != job["model"]):
-        raise ValueError("optimizer runtime, device, guide or model differs from reviewed composition")
-    selected = config.get("knowledge")
-    if bool(selected) != bool(native.collection) or (selected and selected.get("collection") != native.collection):
-        raise ValueError("optimizer KDB treatment differs from reviewed composition")
-    if selected:
-        reviewed = snapshot.destination.source_identity
-        if ("manifest" not in selected or "kdb_manifest" not in reviewed
-                or selected["manifest"] != reviewed["kdb_manifest"]):
-            raise ValueError("optimizer KDB manifest differs from reviewed Phase 1")
-    query = knowledge_query(config, Path(job["root"]) / "curriculum")
-    seed = campaign_seed(job["root"], freeze_reviewed_phase1(snapshot),
-                         settings.get("optimizer_prior_campaigns", []))
-    retry = job.get('retry_spec')
-    if retry and config.get('max_cases', 24) != retry['max_cases']:
-        raise ValueError('retry max_cases differs from original frozen suite')
-    def executor(directory, task, memory):
-        return OptimizerTaskExecutor(directory, task, memory, config,
-            expected_baseline=retry if retry and task == retry['task'] else None)
-    return OptimizerPhase2Coordinator(job["root"], job["objective"], seed,
-        composed.curriculum._complete,
-        executor,
-        query_knowledge=(lambda text: {"results": query(text)}) if query else None,
-        max_seconds=job["phase2_max_seconds"],
-        max_practice_seconds=job["practice_max_seconds"],
-        feedback_root=job.get('feedback_root', settings.get("feedback_root")),
-        fixed_task=retry['task'] if retry else None,
-        )
 
 
 def _approval_path(job):
@@ -639,8 +529,6 @@ def approve_curriculum(job, project_ids, proposal_id, *, builder=build_controlle
         raise ValueError("terminal approval requires zero project IDs")
     if not terminal and not selected:
         raise ValueError("wave approval requires at least one project ID")
-    if not terminal and job["phase"] == 2 and len(selected) != 1:
-        raise ValueError("Phase 2 approval requires exactly one project")
     approved = builder(job).approve_wave(record["proposal"], selected)
     record = {**record, "status": "approved", "selected_project_ids": list(selected),
               **({"approved_wave": approved["wave"]} if "wave" in approved else {
@@ -851,10 +739,6 @@ def status(job):
     outcomes = [_read(p) for p in root.glob("waves/*/branches/*/outcome.json")]
     published = len(state.get("prior_outcomes", []))
     attempted = len(list(root.glob("waves/*/branches/*")))
-    if state.get("phase") == "optimizer-phase2":
-        outcomes = state.get("attempts", [])
-        attempted = len(outcomes)
-        published = len(state.get("memory_entries", []))
     elapsed = max(time.time() - job["created"], 1) / 3600
     inventory = inventory_campaign(root, artifact_store=control / "reports", **_annex_options(job))
     return describe_statuses({"phase": job["phase"], "target": job["target"], "project_target": job["project_target"],
@@ -868,9 +752,9 @@ def status(job):
 def main(argv=None, *, screen=start_screen):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    feedback = commands.add_parser('feedback', aliases=['feedback-phase2'], help='import retained failure observations without running agents')
+    feedback = commands.add_parser('feedback', help='import retained failure observations without running agents')
     feedback.add_argument('--feedback-root', type=Path, required=True)
-    feedback.add_argument('--source-type', choices=('all', 'phase1', 'phase2', 'optimizer'), default='phase2')
+    feedback.add_argument('--source-type', choices=('all', 'phase1', 'optimizer'), default='phase1')
     sources = feedback.add_mutually_exclusive_group(required=True)
     sources.add_argument('--source-root', type=Path, action='append')
     sources.add_argument('--dashboard-config', type=Path)
@@ -882,16 +766,13 @@ def main(argv=None, *, screen=start_screen):
         if command == "start":
             sub.add_argument("--root", type=Path, required=True)
             sub.add_argument("--target", choices=("a3", "a5"), required=True)
-            sub.add_argument("--phase", type=int, choices=(1, 2), required=True)
+            sub.add_argument("--phase", type=int, choices=(1,), required=True)
             sub.add_argument("--objective", required=True)
             sub.add_argument("--initial-memory", type=Path, required=True)
             sub.add_argument("--config", type=Path, required=True)
             sub.add_argument("--worker-config", type=Path)
             sub.add_argument("--project-target", type=int, required=True)
-            sub.add_argument("--target-goal", type=Path,
-                             help="host-qualified TargetContract JSON; omission lets curriculum author and qualify a new goal")
-            sub.add_argument("--phase2-max-seconds", type=float, default=7200)
-            sub.add_argument("--practice-max-seconds", type=float, default=1800)
+            sub.add_argument("--retry-max-seconds", type=float, default=7200)
             sub.add_argument("--phase1-root", type=Path)
             sub.add_argument("--review", type=Path)
             sub.add_argument("--approval-mode", action="store_true")
@@ -922,16 +803,14 @@ def main(argv=None, *, screen=start_screen):
         if command == "approve":
             sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
-    if args.command in {'feedback', 'feedback-phase2'}:
+    if args.command == 'feedback':
         from .feedback import FeedbackStore
         store = FeedbackStore(args.feedback_root)
-        importers = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
-                     'optimizer': store.import_optimizer}
+        importers = {'phase1': store.import_phase1, 'optimizer': store.import_optimizer}
         sources = []
         if args.dashboard_config:
             config = _read(args.dashboard_config)
-            sources = [('phase1' if str(row.get('phase')) == '1' else 'phase2', row['root'])
-                       for row in config.get('campaigns', []) if str(row.get('phase')) in {'1', '2'}]
+            sources = [('phase1', row['root']) for row in config.get('campaigns', []) if str(row.get('phase')) == '1']
             optimizer = config.get('optimizer', {})
             if optimizer.get('root'):
                 sources.append(('optimizer', optimizer['root']))
@@ -953,31 +832,17 @@ def main(argv=None, *, screen=start_screen):
                                         env_file=args.env_file)))
         return
     if args.command == "start":
-        if args.phase == 2:
-            parser.error('new Ascend Phase 2 launches are retired; use run_ascend_subjects.py')
         from benchmarks.a5kernels.sft_dataset import SourceManifest
         if args.project_target < 1:
             parser.error("--project-target must be positive")
-        if args.phase == 2 and (args.phase1_root is None or args.review is None):
-            parser.error("phase 2 requires --phase1-root and --review")
-        if args.phase == 1 and args.target_goal is not None:
-            parser.error("--target-goal is only supported for phase 2")
-        if args.phase == 2 and args.approval_mode:
-            parser.error("target-driven phase 2 does not support --approval-mode")
-        if args.phase == 2 and args.project_target != 1:
-            parser.error("new phase 2 starts exactly one goal; use --project-target 1")
-        if any(not math.isfinite(value) or value <= 0 for value in (args.phase2_max_seconds, args.practice_max_seconds)):
-            parser.error("Phase 2 and practice budgets must be finite positive seconds")
+        if not math.isfinite(args.retry_max_seconds) or args.retry_max_seconds <= 0:
+            parser.error("retry budget must be finite positive seconds")
         if (args.failure_id or args.retry_feedback_id) and not args.feedback_root:
             parser.error('feedback selection requires --feedback-root')
         if args.retry_feedback_id and (args.failure_id or args.approval_mode or args.project_target != 1):
             parser.error('original retry requires one project, no failure IDs and no approval mode')
         if args.retry_feedback_id and (args.phase1_root is None or args.review is None):
             parser.error('original retry requires --phase1-root and --review')
-        if args.phase == 2 and args.feedback_root and not args.retry_feedback_id:
-            parser.error('Phase 2 feedback requires --retry-feedback-id')
-        if args.retry_feedback_id and args.target_goal:
-            parser.error('feedback retry already pins its original target')
         root = args.root.resolve()
         if root == control or root in control.parents or control in root.parents:
             parser.error("campaign and control directories must be separate")
@@ -995,15 +860,6 @@ def main(argv=None, *, screen=start_screen):
             parser.error("phase1_arguments must be a string list")
         if any(a.split("=", 1)[0] in reserved for a in arguments):
             parser.error("phase1_arguments cannot override campaign identity/budget")
-        goal = None
-        if args.target_goal is not None:
-            from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-            from .qualified_targets import TargetContract
-            goal = TargetContract.from_mapping(_read(args.target_goal))
-            goal.verify(ContentAddressedArtifacts(Path(settings["target_artifact_store"])),
-                        settings["target_runtime"])
-            if goal.runtime["target"] != args.target:
-                parser.error("goal runtime target differs from --target")
         source_path = Path(settings["source_manifest"])
         source = SourceManifest.load(source_path)
         revision = _harness_revision()
@@ -1019,7 +875,7 @@ def main(argv=None, *, screen=start_screen):
                     ProjectSpec.from_mapping(original)
                     retry = dict(source_type='phase1', original_spec=original)
                 elif args.retry_feedback_id:
-                    parser.error('only original Phase 1 project retries are supported; Phase 2 launches remain retired')
+                    parser.error('only original Phase 1 project retries are supported')
             except (ValueError, KeyError, OSError) as error:
                 parser.error(str(error))
         control.mkdir(parents=True, exist_ok=False)
@@ -1031,25 +887,17 @@ def main(argv=None, *, screen=start_screen):
                   "objective": args.objective, "project_target": args.project_target,
                   "model": settings["model"], "source_manifest_sha256": source.sha256,
                   "harness_revision": revision, "created": time.time(), "round_id": control.name}
-        if goal is not None:
-            public.update(target_goal=goal.as_dict(), phase2_max_seconds=args.phase2_max_seconds,
-                          practice_max_seconds=args.practice_max_seconds)
-        elif args.phase == 2:
-            public.update(autonomous_goal=True, phase2_max_seconds=args.phase2_max_seconds,
-                          practice_max_seconds=args.practice_max_seconds)
-            if args.target == "a3":
-                public["optimizer_goal"] = True
         if args.approval_mode:
             public["approval_mode"] = True
         if selection is not None:
-            _write(root / 'phase2-feedback.json', selection)
+            _write(root / 'failure-feedback.json', selection)
             public.update(feedback_root=str(args.feedback_root.resolve()),
                 failure_ids=[r['feedback_id'] for r in selection['selected']],
-                feedback_selection_sha256=hashlib.sha256((root / 'phase2-feedback.json').read_bytes()).hexdigest())
+                feedback_selection_sha256=hashlib.sha256((root / 'failure-feedback.json').read_bytes()).hexdigest())
             if retry:
                 public.update(retry_feedback_id=args.retry_feedback_id, retry_spec=retry)
                 if retry.get('source_type') == 'phase1':
-                    public.update(phase1_original_retry=True, phase2_max_seconds=args.phase2_max_seconds)
+                    public.update(phase1_original_retry=True, retry_max_seconds=args.retry_max_seconds)
                     public.pop('optimizer_goal', None)
                     public.pop('autonomous_goal', None)
         _write(root / "campaign-run.json", public)
@@ -1060,25 +908,14 @@ def main(argv=None, *, screen=start_screen):
         if args.worker_config is not None:
             job["worker_config"] = str(args.worker_config.resolve(strict=True))
             job["worker_config_sha256"] = hashlib.sha256(args.worker_config.read_bytes()).hexdigest()
-        if (job.get("optimizer_goal") or args.phase == 1 and settings.get("automatic_remediation")) and settings.get("optimizer_worker_config"):
+        if settings.get("automatic_remediation") and settings.get("optimizer_worker_config"):
             job["optimizer_worker_config_sha256"] = hashlib.sha256(
                 Path(settings["optimizer_worker_config"]).read_bytes()).hexdigest()
-        if goal is not None:
-            source_store = ContentAddressedArtifacts(Path(settings["target_artifact_store"]))
-            pinned_store = ContentAddressedArtifacts(control / "target-artifacts")
-            reference = source_store.read_json(goal.reference_sha256)
-            digests = [goal.reference_sha256, reference["source_sha256"],
-                       *reference["artifacts"].values(),
-                       *(row["evidence_sha256"] for row in reference["timings"])]
-            for digest in digests:
-                pinned_store.put_bytes(source_store.read_bytes(digest))
-            job["target_artifact_store"] = str(pinned_store.root)
         _write(control / "job.json", job)
     else:
         job = _read(control / "job.json")
-    if job.get('phase') in (2, '2') and args.command in {
-            'resume', 'continue', 'sample', 'approve', 'reject', 'run-approved', '_campaign'}:
-        parser.error('Ascend Phase 2 execution is retired; use run_ascend_subjects.py; historical status, collection and packaging remain available')
+    if job.get('phase') != 1:
+        parser.error('unsupported campaign phase')
     if args.command in {"start", "resume", "continue"}:
         with (control / "campaign.lock").open("a") as lock:
             try:
@@ -1086,8 +923,6 @@ def main(argv=None, *, screen=start_screen):
             except BlockingIOError:
                 parser.error("campaign is already running; use status")
         if args.command == "continue":
-            if job.get("target_goal") is not None or job.get("autonomous_goal"):
-                parser.error("target-driven budgets are fixed; start a new campaign to change them")
             adoption = (_read(control / "adoption.json") if job.get("adopted")
                         and (control / "adoption.json").exists() else {})
             reconciling = (job.get("adopted") is True

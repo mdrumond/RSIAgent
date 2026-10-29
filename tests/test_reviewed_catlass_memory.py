@@ -1,30 +1,40 @@
 from __future__ import annotations
 
 import base64
+
 from dataclasses import replace
+
 import hashlib
+
 import json
 
 import pytest
 
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-from benchmarks.a5kernels.evidence import canonical_bytes
-from benchmarks.a5kernels.phase1_adaptive import DELTA_SCHEMA, MEMORY_SCHEMA, STATE_SCHEMA
-from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveProject, WaveSpec
-from benchmarks.a5kernels.phase1_experiments import build_cells
-from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
-from benchmarks.a5kernels.phase1_provider import DirectCompletion
-from benchmarks.a5kernels.phase1_project import EvidenceClassification, ExecutionEvidence
-from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
-from benchmarks.a5kernels.phase2_adaptive_memory import (
-    REVIEW_SCHEMA, admit_adaptive_snapshot, adaptive_destination,
-)
-from benchmarks.a5kernels.phase2_live import DEFAULT_MAX_SECONDS, Phase2AttemptRequest
-from benchmarks.a5kernels.phase2_production import Phase2ProductionConfig, build_phase2_production
-from tests.test_a5_phase1_adaptive import _project
-from tests.test_a5_phase2_source_provider import GUIDE, GUIDE_ID, ENVIRONMENT
-from tests.test_a5_phase2_production import FakeExecutor, CopyVBackend
 
+from benchmarks.a5kernels.evidence import canonical_bytes
+
+from benchmarks.a5kernels.phase1_adaptive import DELTA_SCHEMA, MEMORY_SCHEMA, STATE_SCHEMA
+
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveProject, WaveSpec
+
+from benchmarks.a5kernels.phase1_experiments import build_cells
+
+from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
+
+from benchmarks.a5kernels.phase1_provider import DirectCompletion
+
+from benchmarks.a5kernels.phase1_project import EvidenceClassification, ExecutionEvidence
+
+from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
+
+from tests.test_a5_phase1_adaptive import _project
+
+from benchmarks.ascend.reviewed_catlass import REVIEW_SCHEMA, admit_adaptive_snapshot, adaptive_destination
+from benchmarks.a5kernels.phase1_experiments import GUIDE_SCHEMA, ProgrammingGuideIdentity, PINNED_CATLASS_REVISION
+GUIDE = "Use host verification for every candidate."
+GUIDE_ID = ProgrammingGuideIdentity(GUIDE_SCHEMA, hashlib.sha256(GUIDE.encode()).hexdigest(), "1" * 40, PINNED_CATLASS_REVISION)
+ENVIRONMENT = {"OPENAI_API_KEY": "one", "DEEPSEEK_API_KEY": "two"}
 
 def _source(tmp_path, *, new=False, historical_citation=False, partial=False):
     profiling_guide = None
@@ -92,11 +102,10 @@ def _source(tmp_path, *, new=False, historical_citation=False, partial=False):
     review_path.write_bytes(canonical_bytes(review))
     return root, source, review_path, memory
 
-
 def test_snapshot_copies_exact_memory_and_evidence_and_survives_source_removal(tmp_path):
     root, source, review, memory = _source(tmp_path)
     before = (root / "state.json").read_bytes()
-    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
     assert snapshot.memory_entries() == (memory,)
     assert (snapshot.root / "state.json").read_bytes() == before
     assert (root / "state.json").read_bytes() == before
@@ -109,7 +118,6 @@ def test_snapshot_copies_exact_memory_and_evidence_and_survives_source_removal(t
     with pytest.raises(ValueError, match="bytes changed"):
         snapshot.verify()
 
-
 @pytest.mark.parametrize("representation", [True, "empty-provenance", "populated-provenance"])
 def test_historical_nonempty_citation_resumes_and_hands_off_exact_bytes(tmp_path, representation):
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
@@ -119,10 +127,9 @@ def test_historical_nonempty_citation_resumes_and_hands_off_exact_bytes(tmp_path
     delta = coordinator._read_delta("wave-01", "copy")
     original = base64.b64decode(delta["memory_base64"])
     assert json.loads(original)["kdb_citations"] == memory["kdb_citations"]
-    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
     assert snapshot.memory_entries() == (memory,)
     assert snapshot.memory_path.read_bytes() == original + b"\n"
-
 
 @pytest.mark.parametrize("failure", ["running", "pending", "rejected", "wrong-memory", "missing-evidence"])
 def test_admission_rejects_incomplete_or_unreviewed_memory(tmp_path, failure):
@@ -141,8 +148,7 @@ def test_admission_rejects_incomplete_or_unreviewed_memory(tmp_path, failure):
         digest = memory["host_facts"][0]["evidence_sha256"]
         next((root / "waves").glob(f"**/objects/{digest[:2]}/{digest[2:]}" )).unlink()
     with pytest.raises((ValueError, FileNotFoundError)):
-        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
-
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
 
 @pytest.mark.parametrize("status", ["PROJECT_LIMIT_REACHED", "TARGET_REACHED"])
 def test_completed_terminal_is_admitted(tmp_path, status):
@@ -150,8 +156,7 @@ def test_completed_terminal_is_admitted(tmp_path, status):
     state = json.loads((root / "state.json").read_bytes())
     state["terminal"]["status"] = status
     (root / "state.json").write_bytes(canonical_bytes(state))
-    admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2").verify()
-
+    admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory").verify()
 
 @pytest.mark.parametrize("name", ["outcome.json", "memory-delta.bin", "execution-evidence.bin"])
 @pytest.mark.parametrize("mutation", ["missing", "stale"])
@@ -163,56 +168,15 @@ def test_admission_requires_actual_published_branch_evidence(tmp_path, name, mut
     else:
         path.write_bytes(b'{}')
     with pytest.raises(ValueError):
-        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
-
-
-def test_new_guidance_reaches_phase2_and_current_qualification_is_required(tmp_path):
-    root, source, review, memory = _source(tmp_path, new=True)
-    destination = adaptive_destination(source, json.loads(review.read_bytes()))
-    guide_path = tmp_path / "guide.md"
-    guide_path.write_text(GUIDE)
-    initial = tmp_path / "initial.bin"
-    initial.write_bytes(b"")
-    phase2 = tmp_path / "phase2"
-    config = Phase2ProductionConfig(
-        root, None, guide_path, phase2, phase2 / "cells" / destination.cell_id / "snapshot",
-        destination.cell_id, tmp_path, "/remote/catlass", 0,
-        adaptive_review=review, initial_memory=initial,
-        profiling_guidance_text="New profiler instructions",
-    )
-    executor = FakeExecutor(source.guide.catlass_revision)
-    with pytest.raises(ValueError, match="9.3"):
-        build_phase2_production(config, environment=ENVIRONMENT, transport=lambda **_: None,
-                                executor=executor, backend=CopyVBackend())
-    executor.runtime_provenance = tuple((key, "9.3.0-weekly" if key == "cann_version" else value)
-                                        for key, value in executor.runtime_provenance)
-    calls = []
-    def transport(**kwargs):
-        calls.append(kwargs)
-        return DirectCompletion('{"candidate_source":{"source":"candidate"}}', 1)
-    snapshot, dependencies = build_phase2_production(
-        config, environment=ENVIRONMENT, transport=transport,
-        executor=executor, backend=CopyVBackend(),
-    )
-    request = Phase2AttemptRequest(destination, "3" * 64, 1, "req-1", "attempt-1", (memory,), ())
-    assert dependencies.source(request) == "candidate"
-    assert "New profiler instructions" in json.dumps(calls)
-    assert snapshot.memory_entries() == (memory,)
-    assert DEFAULT_MAX_SECONDS == 7200
-    with pytest.raises(ValueError):
-        build_phase2_production(replace(config, profiling_guidance_text="wrong"),
-                                environment=ENVIRONMENT, transport=transport,
-                                executor=executor, backend=CopyVBackend())
-
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")
-
 
 def test_partial_publication_transfers_verified_memory_and_interruption_only_branch(tmp_path):
     root, source, review, memory = _source(tmp_path, partial=True)
     branch = "waves/wave-01/branches/offline"
     retained = (root / branch / "interruption.json").read_bytes()
-    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
     assert snapshot.memory_entries() == (memory,)
     assert (snapshot.root / branch / "interruption.json").read_bytes() == retained
     assert not (snapshot.root / branch / "outcome.json").exists()
@@ -222,7 +186,6 @@ def test_partial_publication_transfers_verified_memory_and_interruption_only_bra
     (snapshot.root / branch / "interruption.json").write_bytes(b"{}")
     with pytest.raises(ValueError, match="bytes changed"):
         snapshot.verify()
-
 
 @pytest.mark.parametrize("mutation", ["missing", "wrong-wave"])
 def test_partial_snapshot_rejects_missing_or_mismatched_interruption(tmp_path, mutation):
@@ -235,4 +198,5 @@ def test_partial_snapshot_rejects_missing_or_mismatched_interruption(tmp_path, m
         value["wave_fingerprint"] = "0" * 64
         path.write_bytes(canonical_bytes(value))
     with pytest.raises((ValueError, FileNotFoundError)):
-        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "phase2")
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+

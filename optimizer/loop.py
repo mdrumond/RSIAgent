@@ -112,7 +112,7 @@ class OptimizationLoop:
                 close()
 
     def _run_owned(self, *, prepare_only=False, single_evaluation=False, memory_snapshot=None, context=None):
-        """Optionally stop at Phase 2's preparation or single-evaluation boundary.
+        """Optionally stop at task's preparation or single-evaluation boundary.
 
         These boundaries reuse this job's durable state, reference and pending
         native operation. They do not create a fresh optimizer search.
@@ -396,7 +396,7 @@ class OptimizationLoop:
                     baseline['profiling'] = {'artifact': self._artifact('baseline-profiling', profiling),
                         'preview': json.dumps(profiling, ensure_ascii=True)[:1500], 'truncated': True}
                 context['baseline'] = baseline
-            for key in ('best', 'phase2'):
+            for key in ('best', 'optimizer_task'):
                 if key in context and len(rendered := json.dumps(context[key], ensure_ascii=True)) > 12000:
                     record = self._artifact('context-' + key, context[key])
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}

@@ -14,7 +14,7 @@ from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
 from benchmarks.ascend.subject_execution import SubjectExecutor, optimizer_snapshot
 from test_a5_phase1_adaptive_actor import SourceBackend, ScriptedActor, _request
 from test_ascend_qualified_targets import qualified, RUNTIME
-from test_optimizer_execution import Agent, Backend, candidate
+from test_optimizer_task_execution import Agent, Backend, candidate
 
 
 def graph_actor(tmp_path, replies):
@@ -177,7 +177,7 @@ def test_optimizer_reuses_real_job_baseline_and_publishes_no_learning(tmp_path):
     events = json.loads(passed.read_artifact(passed.artifacts['log:optimizer-events']))
     assert any(event['kind'] == 'model-request' for event in events)
     assert backend.prepares == 1 and [s for s, _ in backend.evaluations] == ['bad', 'good']
-    assert actor.contexts[-1][1]['phase2']['feedback'] == {'repair': 'tails'}
+    assert actor.contexts[-1][1]['optimizer_task']['feedback'] == {'repair': 'tails'}
     assert not (tmp_path / 'state.json').exists()
 
 
@@ -210,7 +210,7 @@ def test_optimizer_reconstruction_uses_new_attempt_memory_without_recreating_job
         {'index': 0, 'summary': str(current['memory_entries'][0])}]
     assert json.loads((directory / 'subject-optimizer-initial-memory.json').read_bytes()) == initial
     events = json.loads(second.read_artifact(second.artifacts['log:optimizer-events']))
-    requests = [row['payload'] for row in events if row['kind'] == 'phase2-attempt-request']
+    requests = [row['payload'] for row in events if row['kind'] == 'task-attempt-request']
     assert requests[-1]['memory_snapshot']['sha256'] == sha(canonical(current))
     assert reconstructed.optimizer(**options, memory_snapshot=current, attempt_id='second').as_dict() == second.as_dict()
     with pytest.raises(ValueError, match='original memory'):

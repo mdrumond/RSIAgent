@@ -42,8 +42,8 @@ def campaign(root, *, result=None, task=None, attempt='attempt-001', baseline=Tr
         row['result'].update(attempt_id=attempt, task_id=task['task_id'])
         result_ref = jobs.put_artifact(job['job_id'], 'result.json', canonical(row['result']))
         row['result']['result_artifact'] = result_ref
-        jobs.add_event(job['job_id'], 'phase2-attempt-result', row['result'])
-    write(root / 'state.json', dict(phase='optimizer-phase2', target=task, attempts=[row]))
+        jobs.add_event(job['job_id'], 'task-attempt-result', row['result'])
+    write(root / 'state.json', dict(phase='optimizer-task', target=task, attempts=[row]))
     write(root / 'seed-memory.json', dict(source_identity=dict(target='a3', language='ascend-c')))
     return row
 
@@ -62,7 +62,7 @@ def test_outcomes_are_observations(tmp_path, result, category):
     source = tmp_path / 'source'
     campaign(source, result=result)
     store = FeedbackStore(tmp_path / 'feedback')
-    assert store.import_campaign(source)['imported'] == 1
+    assert store.import_task_results(source)['imported'] == 1
     record = store.records()[0]
     assert record['outcome']['category'] == category
     assert record['outcome']['target'] == 'a3'
@@ -77,11 +77,11 @@ def test_numeric_goal_preserved_and_dedup_does_not_reset_investigation(tmp_path)
     task = dict(task_id='relu', performance_goal={'speedup': 2})
     campaign(source, task=task, result={'verified': True, 'speedup': 1.5})
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(source)
+    store.import_task_results(source)
     record = store.records()[0]
     assert record['outcome']['category'] == 'verified-slow'
     store.update_investigation(record['feedback_id'], status='investigating', projects=['probe-1'])
-    assert store.import_campaign(source)['existing'] == 1
+    assert store.import_task_results(source)['existing'] == 1
     assert store.records()[0]['investigation']['projects'] == ['probe-1']
     assert store.records()[0]['outcome'] == record['outcome']
 
@@ -90,7 +90,7 @@ def test_resolution_requires_successful_original_task_retry(tmp_path):
     store = FeedbackStore(tmp_path / 'feedback')
     task = {'task_id': 'relu', 'submission': {'source': 'original'}}
     campaign(tmp_path / 'failed', task=task, result={'verified': False})
-    store.import_campaign(tmp_path / 'failed')
+    store.import_task_results(tmp_path / 'failed')
     failed = store.records()[0]['feedback_id']
     with pytest.raises(ValueError, match='evidence'):
         store.update_investigation(failed, status='ready-to-retry')
@@ -101,7 +101,7 @@ def test_resolution_requires_successful_original_task_retry(tmp_path):
         store.update_investigation(failed, status='resolved')
     campaign(tmp_path / 'retry', task=task, result={'verified': True, 'speedup': 1.2},
              baseline=dict(suite_sha256='1' * 64, policy=dict(name='host-policy', rtol=.01)))
-    store.import_campaign(tmp_path / 'retry')
+    store.import_task_results(tmp_path / 'retry')
     retry = next(r['feedback_id'] for r in store.records() if r['outcome']['verified'])
     store.update_investigation(failed, status='resolved', retries=[retry])
     assert next(r for r in store.records() if r['feedback_id'] == failed)['investigation']['status'] == 'resolved'
@@ -111,16 +111,16 @@ def test_pending_job_import_is_not_completed_attempt(tmp_path):
     from optimizer.jobs import JobStore
     source = tmp_path / 'source'
     row = campaign(source)
-    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'state.json', dict(phase='optimizer-task', attempts=[]))
     write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
     relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
     jobs = JobStore(source / relative / 'jobs')
     job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
     jobs.retain_handle(job['job_id'], 'remote:exact', operation='evaluate')
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
+    jobs.add_event(job['job_id'], 'task-attempt-request', dict(attempt_id=row['attempt_id']))
     jobs.transition(job['job_id'], 'stopped')
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(source)
+    store.import_task_results(source)
     outcome = store.records()[0]['outcome']
     assert outcome['completed'] is False
     assert outcome['category'] == 'interrupted'
@@ -132,19 +132,19 @@ def test_pending_import_replays_terminal_event_over_stale_manifest(tmp_path, sta
     from optimizer.jobs import JobStore
     source = tmp_path / 'source'
     row = campaign(source)
-    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'state.json', dict(phase='optimizer-task', attempts=[]))
     write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
     relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
     jobs = JobStore(source / relative / 'jobs')
     job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
     jobs.transition(job['job_id'], 'running')
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
+    jobs.add_event(job['job_id'], 'task-attempt-request', dict(attempt_id=row['attempt_id']))
     path = jobs.root / job['job_id'] / 'manifest.json'
     stale = path.read_bytes()
     jobs.transition(job['job_id'], status)
     path.write_bytes(stale)  # Event committed, process crashed before cache replacement.
     store = FeedbackStore(tmp_path / 'feedback')
-    assert store.import_campaign(source)['imported'] == 1
+    assert store.import_task_results(source)['imported'] == 1
     outcome = store.records()[0]['outcome']
     assert outcome['completed'] is False
     assert outcome['job_status']['status'] == status
@@ -156,7 +156,7 @@ def test_completed_attempt_event_precedes_interruption_synthesis(tmp_path, verif
     from optimizer.jobs import JobStore
     source = tmp_path / 'source'
     row = campaign(source)
-    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(source / 'state.json', dict(phase='optimizer-task', attempts=[]))
     write(source / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
     relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
     jobs = JobStore(source / relative / 'jobs')
@@ -165,14 +165,14 @@ def test_completed_attempt_event_precedes_interruption_synthesis(tmp_path, verif
     jobs.transition(job['job_id'], 'budget-exhausted')
     result = dict(attempt_id=row['attempt_id'], job_id=job['job_id'], verified=verified,
                   speedup=1.1, source_sha256='actual-candidate')
-    jobs.add_event(job['job_id'], 'phase2-attempt-result', result)
+    jobs.add_event(job['job_id'], 'task-attempt-result', result)
     store = FeedbackStore(tmp_path / 'feedback')
-    assert store.import_campaign(source)['imported'] == 1
+    assert store.import_task_results(source)['imported'] == 1
     outcome = store.records()[0]['outcome']
     assert outcome['completed'] is True
     assert outcome['verified'] is verified
     assert outcome['category'] == ('verified-success' if verified else 'incorrect')
-    assert store.import_campaign(source)['existing'] == 1
+    assert store.import_task_results(source)['existing'] == 1
 
 
 @pytest.mark.parametrize('retry_policy', ['matching', 'different-suite', 'different-policy'])
@@ -180,7 +180,7 @@ def test_prepared_interruption_retains_frozen_baseline_for_retry_resolution(tmp_
     from optimizer.jobs import JobStore
     root = tmp_path / 'interrupted'
     row = campaign(root, baseline=False)
-    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(root / 'state.json', dict(phase='optimizer-task', attempts=[]))
     write(root / 'pending.json', dict(attempt_id=row['attempt_id'], kind='target', task=row['task']))
     relative = 'tasks/relu-' + sha(canonical(row['task']))[:12]
     jobs = JobStore(root / relative / 'jobs')
@@ -188,12 +188,12 @@ def test_prepared_interruption_retains_frozen_baseline_for_retry_resolution(tmp_
     baseline = dict(suite_sha256='1' * 64, cases=[dict(case='case-0')],
                     manifest=dict(policy=dict(name='host-policy', rtol=.01)))
     baseline_ref = jobs.put_artifact(job['job_id'], 'baseline.json', canonical(baseline))
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id=row['attempt_id']))
+    jobs.add_event(job['job_id'], 'task-attempt-request', dict(attempt_id=row['attempt_id']))
     candidate_ref = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('unfinished candidate'))
     jobs.add_event(job['job_id'], 'optimizer-state', dict(baseline=baseline_ref, candidate=candidate_ref))
     jobs.transition(job['job_id'], 'stopped')
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(root)
+    store.import_task_results(root)
     original = store.records()[0]
     assert original['outcome']['completed'] is False
     assert original['outcome']['verified'] is False
@@ -204,7 +204,7 @@ def test_prepared_interruption_retains_frozen_baseline_for_retry_resolution(tmp_
     if retry_policy == 'different-policy':
         baseline['manifest']['policy']['rtol'] = .5
     campaign(tmp_path / 'retry', task=row['task'], result={'verified': True}, baseline=baseline)
-    store.import_campaign(tmp_path / 'retry')
+    store.import_task_results(tmp_path / 'retry')
     retry = next(record for record in store.records() if record['outcome']['verified'])
     if retry_policy == 'matching':
         assert store.update_investigation(original['feedback_id'], status='resolved',
@@ -220,37 +220,17 @@ def test_missing_artifact_unknown_target_and_unsupported_layout(tmp_path):
                                      candidate={'sha256': 'b' * 64, 'name': 'candidate'}))
     (source / 'seed-memory.json').unlink()
     store = FeedbackStore(tmp_path / 'feedback')
-    report = store.import_campaign(source)
+    report = store.import_task_results(source)
     assert any('missing candidate evidence' in message for message in report['warnings'])
     assert store.records()[0]['outcome']['target'] == 'unknown'
     assert store.records()[0]['outcome']['evidence']['candidate']['sha256'] == 'b' * 64
     assert not (source / 'jobs').exists()  # Backfill never mutates the source tree.
     write(tmp_path / 'legacy' / 'state.json', dict(phase='a5-phase2'))
-    assert 'legacy' in store.import_campaign(tmp_path / 'legacy')['warnings'][0]
+    assert 'legacy' in store.import_task_results(tmp_path / 'legacy')['warnings'][0]
 
 
-def test_backfill_nested_roots_cli_and_recovery_publication(tmp_path, capsys):
-    from benchmarks.ascend.campaign_cli import main
-    source = tmp_path / 'source'
-    row = campaign(source / 'goal-0001')
-    write(source / 'goal-0001' / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
-    write(source / 'goal-0001' / 'attempts' / 'attempt-001.json', row)
-    config = tmp_path / 'dashboard.json'
-    write(config, dict(campaigns=[dict(root=str(source), phase=2),
-                                 dict(root='/ignore-phase1', phase=1)]))
-    main(['feedback-phase2', '--feedback-root', str(tmp_path / 'feedback'), '--dashboard-config', str(config)])
-    assert json.loads(capsys.readouterr().out)['reports'][0]['imported'] == 1
-    main(['feedback-phase2', '--feedback-root', str(tmp_path / 'feedback'), '--source-root', str(source)])
-    assert json.loads(capsys.readouterr().out)['reports'][0]['existing'] == 1
 
 
-def test_coordinator_automatically_retains_failures(tmp_path):
-    from test_ascend_phase2_optimizer_campaign import setup
-    build, _, _, _ = setup(tmp_path, verdicts=(False, True), decisions=('retry-target', 'ready'))
-    assert build().resume()['status'] == 'READY'
-    records = FeedbackStore(tmp_path / 'feedback').records()
-    assert len(records) == 2
-    assert {r['outcome']['verified'] for r in records} == {False, True}
 
 
 def test_correctness_retry_needs_no_timing_but_performance_retry_meets_goal(tmp_path):
@@ -261,7 +241,7 @@ def test_correctness_retry_needs_no_timing_but_performance_retry_meets_goal(tmp_
                          ('unknown', {'verified': True}),
                          ('fast', {'verified': True, 'speedup': 2})]:
         campaign(tmp_path / name, task=task, result=result)
-        store.import_campaign(tmp_path / name)
+        store.import_task_results(tmp_path / name)
     records = {Path(r['outcome']['source_root']).name: r for r in store.records()}
     store.update_investigation(records['incorrect']['feedback_id'], status='resolved',
                                retries=[records['unknown']['feedback_id']])
@@ -277,14 +257,14 @@ def test_runtime_and_candidate_provenance_from_retained_job(tmp_path):
     source = tmp_path / 'source'
     jobs = JobStore(source / 'tasks' / 'retained' / 'jobs')
     job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='test')
-    jobs.add_event(job['job_id'], 'phase2-task', dict(runtime=dict(target='bz-a3-1', arch='actual')))
+    jobs.add_event(job['job_id'], 'optimizer-task', dict(runtime=dict(target='bz-a3-1', arch='actual')))
     write(source / 'campaign-run.json', dict(target='a3'))
     ref = jobs.put_artifact(job['job_id'], 'candidate.cpp', b'actual candidate source')
     row = campaign(source, result=dict(verified=False, job_id=job['job_id'], candidate=ref))
     row['execution_directory'] = 'tasks/retained'
-    write(source / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    write(source / 'state.json', dict(phase='optimizer-task', attempts=[row]))
     store = FeedbackStore(tmp_path / 'feedback')
-    assert store.import_campaign(source)['warnings'] == []
+    assert store.import_task_results(source)['warnings'] == []
     outcome = store.records()[0]['outcome']
     assert outcome['runtime']['arch'] == 'actual'
     assert outcome['target'] == 'a3'
@@ -302,9 +282,9 @@ def test_changed_source_is_reported_without_overwriting_observation(tmp_path):
     root = tmp_path / 'source'
     campaign(root, result={'verified': False})
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(root)
+    store.import_task_results(root)
     campaign(root, result={'verified': True})
-    assert 'source outcome changed' in store.import_campaign(root)['warnings'][0]
+    assert 'source outcome changed' in store.import_task_results(root)['warnings'][0]
     assert store.records()[0]['outcome']['verified'] is False
 
 
@@ -314,7 +294,7 @@ def test_compiler_diagnostics_classify_native_incorrect_report(tmp_path):
         dict(error='CalledProcessError: bisheng exited 1', compiler_diagnostics='invalid syntax')
     ])))
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(root)
+    store.import_task_results(root)
     assert store.records()[0]['outcome']['category'] == 'compile-failure'
 
 
@@ -327,7 +307,7 @@ def test_unknown_identity_cannot_resolve_even_when_equal(tmp_path, unknown):
         identity = dict(target='a3', language='ascend-c')
         identity[unknown] = 'unknown'
         write(root / 'seed-memory.json', dict(source_identity=identity))
-        store.import_campaign(root)
+        store.import_task_results(root)
     records = {r['outcome']['verified']: r for r in store.records()}
     with pytest.raises(ValueError, match='known target and language'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
@@ -350,8 +330,8 @@ def test_resolution_requires_same_authenticated_frozen_suite_policy(tmp_path, mu
         path.unlink()
     if mutation == 'corrupt':
         path.write_bytes(b'corrupt')
-    store.import_campaign(tmp_path / 'failure')
-    store.import_campaign(tmp_path / 'retry')
+    store.import_task_results(tmp_path / 'failure')
+    store.import_task_results(tmp_path / 'retry')
     records = {r['outcome']['verified']: r for r in store.records()}
     with pytest.raises(ValueError, match='successful original-task retry'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
@@ -363,8 +343,8 @@ def test_resolution_rejects_missing_original_baseline_but_keeps_observation(tmp_
     store = FeedbackStore(tmp_path / 'feedback')
     campaign(tmp_path / 'failure', result={'verified': False}, baseline=False)
     campaign(tmp_path / 'retry', result={'verified': True})
-    store.import_campaign(tmp_path / 'failure')
-    store.import_campaign(tmp_path / 'retry')
+    store.import_task_results(tmp_path / 'failure')
+    store.import_task_results(tmp_path / 'retry')
     records = {r['outcome']['verified']: r for r in store.records()}
     with pytest.raises(ValueError, match='authenticated frozen suite'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
@@ -375,9 +355,9 @@ def test_resolution_requires_retry_record_in_same_store(tmp_path):
     store = FeedbackStore(tmp_path / 'feedback')
     campaign(tmp_path / 'failure', result={'verified': False})
     campaign(tmp_path / 'retry', result={'verified': True})
-    store.import_campaign(tmp_path / 'failure')
+    store.import_task_results(tmp_path / 'failure')
     elsewhere = FeedbackStore(tmp_path / 'another-store')
-    elsewhere.import_campaign(tmp_path / 'retry')
+    elsewhere.import_task_results(tmp_path / 'retry')
     failure = store.records()[0]['feedback_id']
     retry = elsewhere.records()[0]['feedback_id']
     with pytest.raises(ValueError, match='successful original-task retry'):
@@ -389,7 +369,7 @@ def test_restored_campaign_preserves_old_feedback_id_and_investigation(tmp_path)
     root = tmp_path / 'original'
     campaign(root, result={'verified': False})
     store = FeedbackStore(root / 'feedback')
-    store.import_campaign(root)
+    store.import_task_results(root)
     record = store.records()[0]
     # Simulate a pre-migration ID generated from the absolute source path.
     old_id = sha(canonical({key: record['outcome'][key]
@@ -401,25 +381,25 @@ def test_restored_campaign_preserves_old_feedback_id_and_investigation(tmp_path)
     restored = tmp_path / 'restored'
     shutil.copytree(root, restored)
     imported = FeedbackStore(restored / 'feedback')
-    report = imported.import_campaign(restored)
+    report = imported.import_task_results(restored)
     assert report['imported'] == 0
     assert report['existing'] == 1
     assert report['warnings'] == []
     assert imported.records() == [record]
     # An independent execution of the same authored task is not a duplicate.
     campaign(tmp_path / 'independent', result={'verified': False})
-    assert imported.import_campaign(tmp_path / 'independent')['imported'] == 1
+    assert imported.import_task_results(tmp_path / 'independent')['imported'] == 1
 
 
 def test_stable_reimport_does_not_scan_feedback_records(tmp_path, monkeypatch):
     root = tmp_path / 'campaign'
     campaign(root, result={'verified': False})
     store = FeedbackStore(tmp_path / 'feedback')
-    assert store.import_campaign(root)['imported'] == 1
+    assert store.import_task_results(root)['imported'] == 1
     def unexpected_scan():
         raise AssertionError('stable existing identity must use direct lookup')
     monkeypatch.setattr(store, 'records', unexpected_scan)
-    assert store.import_campaign(root)['existing'] == 1
+    assert store.import_task_results(root)['existing'] == 1
 
 
 def test_recreated_campaign_same_path_job_id_is_distinct_incarnation(tmp_path):
@@ -427,11 +407,11 @@ def test_recreated_campaign_same_path_job_id_is_distinct_incarnation(tmp_path):
     root = tmp_path / 'campaign'
     store = FeedbackStore(tmp_path / 'external-feedback')
     first = campaign(root, result={'verified': False})
-    store.import_campaign(root)
+    store.import_task_results(root)
     shutil.rmtree(root)
     second = campaign(root, result={'verified': True})
     assert first['result']['job_id'] == second['result']['job_id']
-    assert store.import_campaign(root)['imported'] == 1
+    assert store.import_task_results(root)['imported'] == 1
     records = store.records()
     assert len(records) == 2
     assert len({row['outcome']['job_incarnation'] for row in records}) == 2
@@ -450,11 +430,11 @@ def test_retry_resolution_authenticates_retained_native_verdict(tmp_path, mismat
         jobs = JobStore(root / 'execution' / 'jobs')
         body = {key: value for key, value in result.items() if key != 'result_artifact'}
         result['result_artifact'] = jobs.put_artifact(result['job_id'], 'result.json', canonical(body))
-        jobs.add_event(result['job_id'], 'phase2-attempt-result', result)
-    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+        jobs.add_event(result['job_id'], 'task-attempt-result', result)
+    write(root / 'state.json', dict(phase='optimizer-task', attempts=[row]))
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(tmp_path / 'failure')
-    store.import_campaign(root)
+    store.import_task_results(tmp_path / 'failure')
+    store.import_task_results(root)
     records = {r['outcome']['verified']: r for r in store.records()}
     with pytest.raises(ValueError, match='successful original-task retry'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
@@ -469,22 +449,22 @@ def test_new_pending_does_not_own_previous_attempt_terminal_status(tmp_path):
     jobs = JobStore(root / relative / 'jobs')
     job = jobs.create('def f(x): return x', 'f', {}, {}, idempotency_key='pending')
     jobs.transition(job['job_id'], 'running')
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id='attempt-001'))
+    jobs.add_event(job['job_id'], 'task-attempt-request', dict(attempt_id='attempt-001'))
     jobs.transition(job['job_id'], 'budget-exhausted')
     old.update(execution_directory=relative)
     old['result'].update(job_id=job['job_id'], attempt_id='attempt-001')
-    jobs.add_event(job['job_id'], 'phase2-attempt-result', old['result'])
-    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[old]))
+    jobs.add_event(job['job_id'], 'task-attempt-result', old['result'])
+    write(root / 'state.json', dict(phase='optimizer-task', attempts=[old]))
     write(root / 'pending.json', dict(attempt_id='attempt-002', kind='target', task=old['task']))
     store = FeedbackStore(tmp_path / 'feedback')
-    assert store.import_campaign(root)['imported'] == 1
+    assert store.import_task_results(root)['imported'] == 1
     assert len(store.records()) == 1
-    jobs.add_event(job['job_id'], 'phase2-prepare-request', dict(attempt_id='attempt-002'))
-    assert store.import_campaign(root)['imported'] == 0  # Old terminal predates this preparation boundary.
+    jobs.add_event(job['job_id'], 'task-prepare-request', dict(attempt_id='attempt-002'))
+    assert store.import_task_results(root)['imported'] == 0  # Old terminal predates this preparation boundary.
     jobs.resume(job['job_id'], additional_attempts=1, additional_seconds=60)
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id='attempt-002'))
+    jobs.add_event(job['job_id'], 'task-attempt-request', dict(attempt_id='attempt-002'))
     jobs.transition(job['job_id'], 'failed')
-    assert store.import_campaign(root)['imported'] == 1
+    assert store.import_task_results(root)['imported'] == 1
     interrupted = next(row for row in store.records() if row['outcome']['attempt_id'] == 'attempt-002')
     assert interrupted['outcome']['completed'] is False
 
@@ -500,11 +480,11 @@ def test_resolution_rejects_misattached_frozen_task_submission(tmp_path, field, 
     changed_task = json.loads(canonical(row['task']))
     changed_task['submission'][field] = value
     row['task'] = changed_task  # Ordinary stale/misattached campaign row, same task ID.
-    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[row]))
+    write(root / 'state.json', dict(phase='optimizer-task', attempts=[row]))
     campaign(tmp_path / 'failure', task=changed_task, result={'verified': False})
     store = FeedbackStore(tmp_path / 'feedback')
-    store.import_campaign(tmp_path / 'failure')
-    store.import_campaign(root)
+    store.import_task_results(tmp_path / 'failure')
+    store.import_task_results(root)
     records = {record['outcome']['verified']: record for record in store.records()}
     with pytest.raises(ValueError, match='successful original-task retry'):
         store.update_investigation(records[False]['feedback_id'], status='resolved',
@@ -515,8 +495,8 @@ def test_resolution_rejects_misattached_frozen_task_submission(tmp_path, field, 
 def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, monkeypatch, window):
     from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from optimizer.loop import OptimizationLoop
-    from test_optimizer_execution import Agent, Backend, snapshot, candidate
-    from test_ascend_phase2_optimizer_tasks import proposal
+    from test_optimizer_task_execution import Agent, Backend, snapshot, candidate
+    from reviewed_fixtures import proposal
     root = tmp_path / 'campaign'
     task = proposal()
     relative = 'tasks/' + task['task_id'] + '-' + sha(canonical(task))[:12]
@@ -525,12 +505,12 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
     config = dict(target='bz-a3-1', physical_device=14, validation_wrapper=str(tmp_path / 'validation.sh'), max_cases=1)
     execution = OptimizerTaskExecutor(root / relative, task, snapshot(), config, agent=agent, backend=backend)
     execution.prepare()
-    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[]))
+    write(root / 'state.json', dict(phase='optimizer-task', attempts=[]))
     write(root / 'pending.json', dict(attempt_id='attempt-001', kind='target', task=task))
     if window == 'result-event':
         original = execution.store.add_event
         def crash(kind_key, kind, payload):
-            if kind == 'phase2-attempt-result':
+            if kind == 'task-attempt-result':
                 raise RuntimeError('checkpoint crash')
             return original(kind_key, kind, payload)
         monkeypatch.setattr(execution.store, 'add_event', crash)
@@ -546,7 +526,7 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
         execution.attempt('attempt-001')
     calls = (len(agent.contexts), len(backend.evaluations))
     store = FeedbackStore(tmp_path / 'feedback')
-    report = store.import_campaign(root)
+    report = store.import_task_results(root)
     assert report['imported'] == 0
     if execution.store.get(execution.job_id)['status'] == 'running':
         # A result-event interruption leaves an active job; only terminal jobs
@@ -560,7 +540,7 @@ def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, mo
         monkeypatch.setattr(OptimizationLoop, '_save', original)
     assert execution.attempt('attempt-001')['verified'] is True
     assert (len(agent.contexts), len(backend.evaluations)) == calls
-    assert store.import_campaign(root)['imported'] == 1
+    assert store.import_task_results(root)['imported'] == 1
     assert len(store.records()) == 1 and store.records()[0]['outcome']['completed'] is True
 
 
@@ -576,17 +556,17 @@ def test_interrupted_retry_does_not_inherit_previous_candidate(tmp_path, new_can
     baseline = jobs.put_artifact(job['job_id'], 'baseline.json', canonical({'suite_sha256': '1' * 64}))
     old.update(execution_directory=relative)
     old['result'].update(job_id=job['job_id'], attempt_id='attempt-001', candidate=previous)
-    jobs.add_event(job['job_id'], 'phase2-attempt-result', old['result'])
-    write(root / 'state.json', dict(phase='optimizer-phase2', attempts=[old]))
+    jobs.add_event(job['job_id'], 'task-attempt-result', old['result'])
+    write(root / 'state.json', dict(phase='optimizer-task', attempts=[old]))
     write(root / 'pending.json', dict(attempt_id='attempt-002', kind='target', task=old['task']))
-    jobs.add_event(job['job_id'], 'phase2-attempt-request', dict(attempt_id='attempt-002'))
+    jobs.add_event(job['job_id'], 'task-attempt-request', dict(attempt_id='attempt-002'))
     source = jobs.put_artifact(job['job_id'], 'candidate.cpp', canonical('new interrupted candidate')) if new_candidate else previous
     # A newer state checkpoint alone does not establish ownership of a persistent old candidate.
     jobs.add_event(job['job_id'], 'optimizer-state', dict(baseline=baseline, candidate=source))
-    jobs.add_event(job['job_id'], 'phase2-prepare-request', dict(attempt_id='attempt-002'))
+    jobs.add_event(job['job_id'], 'task-prepare-request', dict(attempt_id='attempt-002'))
     jobs.transition(job['job_id'], 'stopped')
     store = FeedbackStore(tmp_path / 'feedback')
-    report = store.import_campaign(root)
+    report = store.import_task_results(root)
     interrupted = next(row['outcome'] for row in store.records() if not row['outcome']['completed'])
     assert interrupted['evidence']['baseline']['sha256'] == baseline['sha256']
     if new_candidate:
@@ -594,26 +574,3 @@ def test_interrupted_retry_does_not_inherit_previous_candidate(tmp_path, new_can
     else:
         assert 'candidate' not in interrupted['evidence']
         assert any('candidate ownership' in warning for warning in report['warnings'])
-
-
-def test_multisource_cli_reports_corrupt_copies_and_imports_valid_outcomes(tmp_path, capsys):
-    from benchmarks.ascend.campaign_cli import main
-    first, second = tmp_path / 'first', tmp_path / 'second'
-    campaign(first, result={'verified': False})
-    campaign(second, result={'verified': True})
-    malformed = first / 'attempts' / 'truncated.json'
-    malformed.parent.mkdir()
-    malformed.write_text('{"attempt_id":')
-    write(first / 'attempts' / 'wrong-shape.json', {'unexpected': 'copied partial metadata'})
-    (first / 'campaign-run.json').write_text('{')
-    (first / 'pending.json').write_text('{')
-    main(['feedback-phase2', '--feedback-root', str(tmp_path / 'feedback'),
-          '--source-root', str(first), '--source-root', str(second)])
-    reports = json.loads(capsys.readouterr().out)['reports']
-    assert [report['imported'] for report in reports] == [1, 1]
-    warnings = reports[0]['warnings']
-    assert any('truncated.json' in warning for warning in warnings)
-    assert any('wrong-shape.json' in warning for warning in warnings)
-    assert any('campaign-run.json' in warning for warning in warnings)
-    assert any('pending.json' in warning for warning in warnings)
-    assert len(FeedbackStore(tmp_path / 'feedback').records()) == 2

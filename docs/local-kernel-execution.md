@@ -13,7 +13,7 @@ Select local execution in a shared worker JSON file:
 ```
 
 Pass that file with `--worker-config /absolute/path/to/worker.json` to the Pi
-smoke, shared Ascend campaign/Phase 1/Phase 2 entrypoints, or fixed A3/A5 launchers.
+smoke, shared Ascend campaign/Phase 1/subject entrypoints, or fixed A3/A5 launchers.
 The optimizer worker accepts this spelling and its existing `--config` spelling.
 The dashboard uses its existing `optimizer.worker_config` setting. Workflow
 configuration still describes model selection, curriculum, guides, and memory;

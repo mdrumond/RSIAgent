@@ -48,7 +48,7 @@ def spec(tmp_path: Path) -> dict[str, object]:
         "campaigns": [
             {
                 "id": "phase2-openai-kdb",
-                "phase": "phase2",
+                "phase": "phase1",
                 "root": str(phase2),
                 "model": "openai",
                 "treatments": {"kdb": "enabled", "profiling": "disabled"},

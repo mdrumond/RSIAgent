@@ -208,15 +208,15 @@ def test_factory_binds_registered_direct_actor_checked_backend_and_coordinator(t
     assert campaign.coordinator.curriculum.unavailable_capabilities == ()
 
 
-def test_phase2_factory_pins_seed_and_uses_distinct_identity(tmp_path):
-    from test_ascend_phase2_curriculum import snapshot
-    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+def test_reviewed_factory_pins_seed_and_uses_distinct_identity(tmp_path):
+    from reviewed_fixtures import snapshot
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
     campaign = _build(tmp_path, _cell(), reviewed_snapshot=snapshot())
-    assert isinstance(campaign.coordinator, AdaptivePhase2Coordinator)
+    assert isinstance(campaign.coordinator, AdaptivePhase1Coordinator)
     assert campaign.project_actor.retain_semantic_failure
     identity = json.loads((_paths(tmp_path).root / "campaign-identity.json").read_bytes())
-    assert identity["phase"] == "adaptive-phase2"
-    assert identity["snapshot_id"] == "reviewed-seed"
+    assert identity["reviewed_snapshot_id"] == "reviewed-seed"
+    assert "phase" not in identity
     assert json.loads(campaign.coordinator.initial_memory)["phase1_memory"]
     with pytest.raises(ValueError, match="different treatment"):
         _build(tmp_path, _cell(), reviewed_snapshot=snapshot("changed-review"))

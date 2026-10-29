@@ -183,14 +183,14 @@ def test_historical_artifact_reads_follow_current_memory_without_copying(tmp_pat
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.a5kernels.evidence import canonical_bytes
     from benchmarks.a5kernels.phase1_adaptive import MEMORY_SCHEMA
-    from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
-    from tests.test_a5_phase2_adaptive_memory import _source
+    from benchmarks.ascend.reviewed_catlass import admit_adaptive_snapshot
+    from tests.test_reviewed_catlass_memory import _source
     root, source, review, memory = _source(tmp_path)
     initial, entries = b"", [base64.b64encode(canonical_bytes(memory)).decode()]
     if reviewed:
         root = tmp_path / "phase2"
         snapshot = admit_adaptive_snapshot(tmp_path / "adaptive", b"", review, source, root)
-        initial = canonical_bytes({"schema": "ascend-phase2-curriculum-seed-v1",
+        initial = canonical_bytes({"schema": "ascend-reviewed-memory-seed-v1",
                                   "snapshot_id": snapshot.snapshot_id, "phase1_memory": [memory]})
         entries = []
     current = ContentAddressedArtifacts((tmp_path / "control/bootstrap/reference" if private

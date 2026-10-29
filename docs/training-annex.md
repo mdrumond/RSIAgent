@@ -2,7 +2,7 @@
 
 `benchmarks.ascend.training_annex` inventories retained adaptive Phase 1 waves,
 CAS objects and provider ledgers, native host evidence and measurements, and
-existing Phase 2 cells, attempts, memory and snapshots. It preserves failed
+current Phase 1 projects, memory and reviewed snapshots. It preserves failed
 attempts and infrastructure records as recorded; absent host evidence is a gap,
 never an inferred kernel failure. It does not generate SFT examples from prose
 summaries. Exact source versions, input/host verification records, trajectories,

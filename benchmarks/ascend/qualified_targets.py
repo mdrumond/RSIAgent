@@ -1,4 +1,4 @@
-"""Fixed Phase 2 goals qualified by executing a reference with the host oracle."""
+"""Fixed task goals qualified by executing a reference with the host oracle."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -93,7 +93,7 @@ class TargetContract:
                 raise ValueError("target policy and runtime differ")
             policy.admit(self.spec)
         reference = artifacts.read_json(self.reference_sha256)
-        if (reference["schema"] != "ascend-phase2-target-reference-v1"
+        if (reference["schema"] != "ascend-qualified-target-reference-v1"
                 or reference["spec"] != self.spec.as_dict()
                 or reference["runtime"] != dict(self.runtime)):
             raise ValueError("working reference does not match target contract")
@@ -135,7 +135,7 @@ def qualify_target(spec: ProjectSpec, reference_source: str, runtime: Mapping[st
     result = executor.execute(spec, reference_source)
     if result.prepared.spec != spec or not result.evidence.verified:
         raise ValueError("target reference must execute and pass the host oracle")
-    reference = {"schema": "ascend-phase2-target-reference-v1", "spec": spec.as_dict(),
+    reference = {"schema": "ascend-qualified-target-reference-v1", "spec": spec.as_dict(),
         "runtime": runtime, "source_sha256": artifacts.put_bytes(reference_source.encode()),
         "artifacts": {name: artifacts.put_json(payload) for name, payload in result.artifacts.items()},
         "timings": _timings(timings)}

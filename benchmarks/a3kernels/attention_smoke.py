@@ -12,7 +12,7 @@ from pathlib import Path
 from benchmarks.ascend.attention import (
     ATTENTION_CASES, AttentionReceipt, _grade, attention_reference, build_execution,
 )
-from .phase2_attention import build_plan
+from .attention import build_plan
 
 
 def main(argv=None):

@@ -1,6 +1,6 @@
 # Failure-directed Phase 1
 
-Explicitly investigate retained Phase 2 observations without promoting failures
+Explicitly investigate retained failure observations without promoting failures
 to verified knowledge. Existing campaigns and non-feedback starts are unchanged.
 
 ```
@@ -12,7 +12,7 @@ python run_ascend_campaign.py start --phase 1 --feedback-root FEEDBACK \
 
 Omitting `--failure-id` selects unresolved observations; successful siblings are
 context, not extra tasks. Target/language mismatches are rejected. The selection
-is pinned in `phase2-feedback.json`. Curriculum sees bounded summaries and can
+is pinned in `failure-feedback.json`. Curriculum sees bounded summaries and can
 page authenticated task/source/host artifacts. Profiling report trees stay remote.
 
 The ordinary wave JSON can include `failure_investigations` outside its kernel
@@ -26,7 +26,7 @@ Successful probes remain `investigating`. A subsequent curriculum decision can
 recommend `ready-to-retry` only with committed host-evidenced probes and verified
 controls. Phase 1 never resolves an original task. Explicit deferrals must explain
 why further kernel experiments are inappropriate. Lineage and evidence accumulate
-across investigation rounds; immutable Phase 2 outcomes never change.
+across investigation rounds; immutable failure outcomes never change.
 
 ```
 python run_ascend_campaign.py start --phase 2 --feedback-root FEEDBACK \

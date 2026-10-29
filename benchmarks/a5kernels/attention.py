@@ -1,4 +1,4 @@
-"""Host-owned dense forward-prefill attention target for A5 Phase 2.
+"""Host-owned dense forward-prefill attention target for A5 task.
 
 The execution backend is deliberately untrusted: it receives immutable inputs and
 returns only raw output.  This module owns the cases, FP32 reference, tolerances,
@@ -29,8 +29,8 @@ from benchmarks.ascend.attention import (
     verify_cases,
 )
 
-TARGET_ID = "a5-phase2-dense-forward-attention-v1"
-SCHEMA = "a5-phase2-attention-evidence-v2"
+TARGET_ID = "a5-dense-forward-attention-v1"
+SCHEMA = "a5-attention-evidence-v2"
 
 CANDIDATE_ABI = (
     ("module_import", "import catlass.tla as tla"),

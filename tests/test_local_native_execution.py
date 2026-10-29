@@ -99,7 +99,7 @@ def test_local_report_collection_copies_digest_checked_tree_without_transport(tm
     assert entry["expected_sha256"] == report_digest(source)
 
 
-@pytest.mark.parametrize("entrypoint", ["run_a3_phase1", "run_a3_phase2"])
+@pytest.mark.parametrize("entrypoint", ["run_a3_phase1"])
 def test_fixed_a3_entrypoint_accepts_worker_config_without_remote_arguments(tmp_path, entrypoint):
     import importlib
     from run_a3_phase1 import _worker_settings

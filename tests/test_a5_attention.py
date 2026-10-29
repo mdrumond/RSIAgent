@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from benchmarks.a5kernels.phase2_attention import (
+from benchmarks.a5kernels.attention import (
     ATTENTION_CASES,
     CANDIDATE_ABI,
     CANDIDATE_ABI_SHA256,

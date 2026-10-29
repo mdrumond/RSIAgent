@@ -1,4 +1,4 @@
-"""Checked BZ-A5 execution backend for the Phase 2 attention target.
+"""Checked BZ-A5 execution backend for the task attention target.
 
 Candidate modules may define compile-time constants and synchronous helpers around
 one TLA kernel.  Case constants, tensors, launch policy, retained-session
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from benchmarks.a5kernels.bz import BZCommandExecutor, CommandInvocation
 from benchmarks.a5kernels.fixtures import _CATLASS_DRIVER
-from benchmarks.a5kernels.phase2_attention import (
+from benchmarks.a5kernels.attention import (
     AttentionExecution,
     AttentionInfrastructureError,
     AttentionReceipt,

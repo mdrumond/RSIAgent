@@ -14,7 +14,7 @@ Long diagnostics show beginning and end; omitted material remains readable.
 Pre-wave memory is a readable lesson preview and complete project-artifact index,
 not a base64 copy of every historical memory. Lesson preview text has a shared
 8 KiB budget; the index includes every project even when its preview is omitted.
-Reviewed Phase 1 seed memories remain visible to adaptive Phase 2. Stored memories
+Reviewed Phase 1 seed memories remain visible to seeded Phase 1 retries. Stored memories
 are neither curated nor rewritten. The original snapshot and initial seed also
 have artifact hashes.
 

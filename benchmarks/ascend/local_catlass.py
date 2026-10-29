@@ -14,9 +14,9 @@ from benchmarks.a5kernels.bz import BZSessionAdapter, _parse_output
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.fixtures import _CATLASS_DRIVER
 from benchmarks.a5kernels.phase1_project_bz import CatlassProjectBackend, PROJECT_RESULT_MARKER, ProjectInfrastructureError
-from benchmarks.a5kernels.phase2_attention_bz import (CatlassAttentionBackend, _ATTENTION_DRIVER,
+from benchmarks.a5kernels.attention_bz import (CatlassAttentionBackend, _ATTENTION_DRIVER,
     _ATTENTION_COMPILE_DRIVER, _input_payload, _parse_output as attention_output, validate_attention_candidate)
-from benchmarks.a5kernels.phase2_attention import AttentionReceipt, AttentionInfrastructureError
+from benchmarks.a5kernels.attention import AttentionReceipt, AttentionInfrastructureError
 from benchmarks.a5kernels.protocol import ExecutionReceipt
 from benchmarks.a5kernels.profiling import EvidenceArchive, ProfileCapture, ProfileMetric
 from benchmarks.a5kernels.profiling_bz import BZProfileBackend, _archive_entries, _read_metric_archive

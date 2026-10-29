@@ -1,4 +1,4 @@
-"""Native A3 attention binding for the shared host-owned Phase 2 suite.
+"""Native A3 attention binding for the shared host-owned task suite.
 
 This is a new target; the historical A3 tiled-vector-add identity is unchanged.
 Candidates supply device source only. The host binds inputs, case constants,
@@ -23,8 +23,8 @@ from .remote_candidate import _PendingObservation
 from .native_candidate import native_infrastructure_failure
 
 
-TARGET_ID = "a3-phase2-dense-forward-attention-v1"
-SCHEMA = "a3-phase2-attention-evidence-v1"
+TARGET_ID = "a3-dense-forward-attention-v1"
+SCHEMA = "a3-attention-evidence-v1"
 CANDIDATE_ABI = (
     ("kernel_export", 'extern "C" __global__ __aicore__ void dense_attention(GM_ADDR gm_q, GM_ADDR gm_k, GM_ADDR gm_v, GM_ADDR gm_output)'),
     ("physical_layout", "flat-contiguous-row-major [B,H,S,D]"),

@@ -1,6 +1,6 @@
 # Pi for Ascend coding
 
-Pi 1.3.0 is the production coding engine for the older A3 trial loop, shared Ascend/A5 campaign actors, Phase 2 source generation, and the optimizer. RSI still owns curriculum, knowledge permissions, memory, native execution, numerical verification, and profiling. Desktop and OSWorld agents are unchanged. There is no automatic fallback to the former direct coding loop.
+Pi 1.3.0 is the production coding engine for the older A3 trial loop, shared Ascend/A5 campaign actors, and the optimizer. RSI still owns curriculum, knowledge permissions, memory, native execution, numerical verification, and profiling. Desktop and OSWorld agents are unchanged. There is no automatic fallback to the former direct coding loop.
 
 ## Installation and use
 

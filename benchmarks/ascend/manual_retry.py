@@ -14,7 +14,7 @@ class ManualPhase1Retry:
         ProjectSpec.from_mapping(self.row['outcome']['original_spec'])
         self.root = Path(job['root'])
         self.store = FeedbackStore(job['feedback_root'])
-        self.time = CampaignTimeBudget(self.root, job['phase2_max_seconds'])
+        self.time = CampaignTimeBudget(self.root, job['retry_max_seconds'])
         runner._remaining_seconds = lambda: self.time.remaining
         # Reuse the same original-spec execution and evidence import as automatic remediation.
         self.retry = object.__new__(AutomaticRemediation)

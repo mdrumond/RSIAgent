@@ -21,7 +21,7 @@ def coordinator(tmp_path, initial, complete=lambda _: ''):
 
 def seed_bytes():
     memory = _memory(ProjectSpec.from_mapping(_project('seed-copy', 'gm-ub-movement')))
-    return canonical_bytes({'schema': 'ascend-phase2-curriculum-seed-v1',
+    return canonical_bytes({'schema': 'ascend-reviewed-memory-seed-v1',
         'snapshot_id': 'authenticated', 'phase1_memory': [memory.as_dict()]})
 
 
@@ -31,7 +31,7 @@ def test_seed_augments_future_context_only(tmp_path, monkeypatch):
     def authenticate(root, snapshot_id):
         calls.append((root, snapshot_id))
         return seed, root / 'snapshot'
-    monkeypatch.setattr('benchmarks.ascend.phase2_curriculum.reviewed_seed', authenticate)
+    monkeypatch.setattr('benchmarks.ascend.reviewed_memory.reviewed_seed', authenticate)
     runner = coordinator(tmp_path, seed)
     state = runner._load_state()
     before = deepcopy(state)
@@ -70,7 +70,7 @@ def test_seed_authentication_is_required(tmp_path, monkeypatch, failure):
         if failure == 'missing':
             raise ValueError('reviewed snapshot is missing or ambiguous')
         return b'{}', tmp_path
-    monkeypatch.setattr('benchmarks.ascend.phase2_curriculum.reviewed_seed', authenticate)
+    monkeypatch.setattr('benchmarks.ascend.reviewed_memory.reviewed_seed', authenticate)
     runner = coordinator(tmp_path, seed_bytes())
     state = runner._load_state()
     with pytest.raises(ValueError, match='reviewed'):
@@ -78,7 +78,7 @@ def test_seed_authentication_is_required(tmp_path, monkeypatch, failure):
 
 
 def test_legacy_initial_memory_does_not_authenticate(tmp_path, monkeypatch):
-    monkeypatch.setattr('benchmarks.ascend.phase2_curriculum.reviewed_seed',
+    monkeypatch.setattr('benchmarks.ascend.reviewed_memory.reviewed_seed',
         lambda *_: pytest.fail('legacy memory is not a portable seed'))
     runner = coordinator(tmp_path, b'ordinary old memory')
     state = runner._load_state()

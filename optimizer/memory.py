@@ -1,4 +1,4 @@
-"""Pin published native Phase 2 learning using the campaign's production readers."""
+"""Pin published native learning using authenticated production readers."""
 from __future__ import annotations
 
 import base64
@@ -9,13 +9,13 @@ from .jobs import canonical, sha
 
 
 def freeze_phase1_source(source_root, initial_memory, review_path, *, snapshot_root):
-    """Admit reviewed Phase 1 directly, without fabricating a completed Phase 2.
+    """Admit reviewed Phase 1 directly.
 
     The existing admission reader authenticates publication, review, treatment,
     and every retained source/evidence object. snapshot_root is the destination
     for that immutable portable admission, not a legacy campaign state root.
     """
-    from benchmarks.ascend.phase2 import admit_native_snapshot
+    from benchmarks.ascend.reviewed_memory import admit_native_snapshot
     admitted = admit_native_snapshot(source_root, initial_memory, review_path, snapshot_root)
     return freeze_reviewed_phase1(admitted)
 
@@ -52,118 +52,24 @@ def _read(root, relative):
     return resolved.read_bytes()
 
 
+
+
 def freeze_source(root, *, snapshot_roots=()):
-    """Authenticate and return a self-contained snapshot, never just a terminal flag.
-
-    Only configured roots are passed here; discovery never scans parent folders.
-    Profiler report trees are not needed to consume learning and are not copied.
-    """
-    from benchmarks.ascend.phase2_curriculum import reviewed_seed
-    from benchmarks.ascend.phase2 import _native_identity
-    from benchmarks.ascend.training_annex import _verify_adaptive_state, _verify_wave
-    from benchmarks.a5kernels.phase1_memory import Phase1ProjectMemory
-
+    """Freeze a completed current native Phase 1 source with its exact seed."""
     root = Path(root).absolute()
-    state_bytes = _read(root, 'state.json')
-    state = json.loads(state_bytes)
-    phase = state.get('phase')
-    if phase == 'optimizer-phase2':
-        from benchmarks.ascend.optimizer_evidence import freeze_campaign
-        return freeze_campaign(root)
-    if phase not in {'adaptive-phase2', 'target-driven-phase2'}:
-        raise ValueError('unsupported legacy Phase 2 format; native reviewed adaptive lineage required')
+    state = json.loads(_read(root, 'state.json'))
+    if state.get('schema') != 'a5-phase1-adaptive-state-v2' or state.get('phase'):
+        raise ValueError('unsupported source; current committed Phase 1 memory required')
     if (root / 'pending.json').exists():
-        raise ValueError('Phase 2 has a pending attempt')
-    terminal = (state.get('terminal') or {}).get('status')
-    if phase == 'target-driven-phase2':
-        if (terminal != 'READY' or not state.get('goal_identity')
-                or not state.get('attempts') or state['attempts'][-1].get('kind') != 'target'
-                or state['attempts'][-1].get('verified') is not True):
-            raise ValueError('target-driven Phase 2 has not reached READY')
-    elif (not state.get('prior_outcomes') or not (
-            len(state['prior_outcomes']) >= state.get('project_target', float('inf'))
-            or terminal == 'SATURATED')):
-        raise ValueError('adaptive Phase 2 has no compatible completed boundary')
-
-    # Validate all snapshot references before invoking the production reader.
-    matches = []
-    for seed_root in dict.fromkeys([root, *(Path(path).absolute() for path in snapshot_roots)]):
-        for path in seed_root.glob('cells/*/snapshot/snapshot.json'):
-            relative = path.relative_to(seed_root).as_posix()
-            manifest = json.loads(_read(seed_root, relative))
-            if manifest.get('snapshot_id') == state['snapshot_id']:
-                for name in manifest['files']:
-                    _read(path.parent, name)
-                matches.append((seed_root, path.parent, manifest))
-    if len(matches) != 1:
-        raise ValueError('reviewed seed missing or ambiguous')
-    seed_root, directory, manifest = matches[0]
-    destination = manifest['destination_identity']
-    identity = destination['source_identity']
-    _native_identity(identity)
-    if destination.get('language') != 'ascend-c' or destination.get('target') != 'a3':
-        raise ValueError('Phase 2 reviewed source is not compatible A3 Ascend C memory')
-    seed, checked_directory = reviewed_seed(seed_root, state['snapshot_id'])
-    assert directory == checked_directory
-    _verify_adaptive_state(root, state, reviewed_seed_root=seed_root)
-    files = {'state.json': state_bytes}
-    prefix = 'reviewed-seed'
-    for name in [*manifest['files'], 'snapshot.json']:
-        data = _read(directory, name)
-        if name in manifest['files'] and sha(data) != manifest['files'][name]:
-            raise ValueError('reviewed memory changed during snapshot')
-        files[f'{prefix}/{name}'] = data
-
-    entries = json.loads(seed)['phase1_memory']
-    for wave_id in state['completed_waves']:
-        wave_root = root / 'waves' / wave_id
-        _verify_wave(wave_root)
-        plan = json.loads(_read(root, f'waves/{wave_id}/plan.json'))
-        for name in ('plan.json', 'published.json', 'consolidated-memory.json'):
-            relative = f'waves/{wave_id}/{name}'
-            files[relative] = _read(root, relative)
-        for project in plan['wave']['projects']:
-            # WaveProject's wire form nests the project spec.
-            project_id = project['spec']['project_id']
-            branch = f'waves/{wave_id}/branches/{project_id}'
-            for name in ('outcome.json', 'memory-delta.bin', 'execution-evidence.bin'):
-                relative = f'{branch}/{name}'
-                files[relative] = _read(root, relative)
-            outcome = json.loads(files[f'{branch}/outcome.json'])
-            if not outcome['verified']:
-                continue
-            delta = json.loads(files[f'{branch}/memory-delta.bin'])
-            entry = json.loads(base64.b64decode(delta['memory_base64'], validate=True))
-            memory = Phase1ProjectMemory.from_mapping(entry)
-            digests = {memory.source_revision, *memory.admitted_artifact_sha256,
-                       *(fact.evidence_sha256 for fact in memory.host_facts)}
-            for digest in digests:
-                relative = f'{branch}/{memory.artifact_store or "artifacts"}/objects/{digest[:2]}/{digest[2:]}'
-                data = _read(root, relative)
-                if sha(data) != digest:
-                    raise ValueError('published memory artifact digest mismatch')
-                files[relative] = data
-    entries += [json.loads(base64.b64decode(payload, validate=True))
-                for payload in state['memory_bytes_base64']]
-    # Authenticate seed CAS as well as manifest hashes; all memory references travel.
-    for entry in json.loads(seed)['phase1_memory']:
-        memory = Phase1ProjectMemory.from_mapping(entry)
-        for digest in {memory.source_revision, *memory.admitted_artifact_sha256,
-                       *(fact.evidence_sha256 for fact in memory.host_facts)}:
-            data = _read(directory, f'artifacts/objects/{digest[:2]}/{digest[2:]}')
-            if sha(data) != digest:
-                raise ValueError('reviewed memory artifact digest mismatch')
-    if _read(root, 'state.json') != state_bytes or (root / 'pending.json').exists():
-        raise ValueError('Phase 2 changed during snapshot')
-    body = dict(schema='optimizer-memory-snapshot-v1', source_identity=identity,
-                phase=phase, terminal=state.get('terminal'),
-                phase1_snapshot_id=state['snapshot_id'], memory_entries=entries,
-                files={name: {'sha256': sha(data), 'base64': base64.b64encode(data).decode()}
-                       for name, data in sorted(files.items())})
-    return {**body, 'snapshot_id': sha(canonical(body))}
+        raise ValueError('memory source has pending work')
+    if not state.get('terminal') and len(state.get('prior_outcomes', [])) < state.get('project_target', float('inf')):
+        raise ValueError('memory source has not completed its project target')
+    return freeze_committed_phase1(root, _read(root, 'initial-memory.bin'), snapshot_roots=snapshot_roots)
 
 
 def verify_snapshot(snapshot):
+    if snapshot.get('phase') not in {None, 'reviewed-phase1', 'committed-phase1', 'subject-curriculum'}:
+        raise ValueError('unsupported optimizer memory source')
     body = {key: value for key, value in snapshot.items() if key != 'snapshot_id'}
     if sha(canonical(body)) != snapshot.get('snapshot_id'):
         raise ValueError('optimizer memory snapshot digest mismatch')
@@ -190,9 +96,9 @@ def discover_sources(configured_roots, *, snapshot_roots=()):
     return result
 
 
-def freeze_committed_phase1(root, initial_memory):
+def freeze_committed_phase1(root, initial_memory, *, snapshot_roots=()):
     """Export committed host-authenticated learning without claiming human review."""
-    from benchmarks.ascend.phase2 import _native_identity
+    from benchmarks.ascend.reviewed_memory import _native_identity
     from benchmarks.ascend.training_annex import _verify_adaptive_state, _verify_wave, _project_memory
     root = Path(root).absolute()
     state_bytes = _read(root, 'state.json')
@@ -210,7 +116,7 @@ def freeze_committed_phase1(root, initial_memory):
         seed.write(initial_memory)
         seed.flush()
         _verify_adaptive_state(root, state, external_initial_memory=seed.name)
-    from benchmarks.a5kernels.phase2_adaptive_memory import _published_evidence
+    from benchmarks.ascend.reviewed_memory import _published_evidence
     _published_evidence(root, state, initial_memory)
     files = {'state.json': state_bytes, 'campaign-identity.json': canonical(identity),
              'initial-memory.bin': initial_memory}
@@ -219,9 +125,15 @@ def freeze_committed_phase1(root, initial_memory):
         inherited = json.loads(initial_memory)
     except (ValueError, UnicodeDecodeError):
         inherited = None
-    if isinstance(inherited, dict) and inherited.get('schema') == 'ascend-phase2-curriculum-seed-v1':
-        from benchmarks.ascend.phase2_curriculum import reviewed_seed
-        authenticated, directory = reviewed_seed(root, inherited['snapshot_id'])
+    if isinstance(inherited, dict) and inherited.get('schema') == 'ascend-reviewed-memory-seed-v1':
+        from benchmarks.ascend.reviewed_memory import reviewed_seed
+        candidates = list(dict.fromkeys([root, *(Path(path) for path in snapshot_roots)]))
+        matching = [candidate for candidate in candidates
+                    if any(json.loads(path.read_bytes()).get('snapshot_id') == inherited['snapshot_id']
+                           for path in candidate.glob('cells/*/snapshot/snapshot.json'))]
+        if len(matching) != 1:
+            raise ValueError('reviewed seed missing or ambiguous')
+        authenticated, directory = reviewed_seed(matching[0], inherited['snapshot_id'])
         if json.loads(authenticated) != inherited:
             raise ValueError('reviewed seed differs from committed initial memory')
         entries.extend(inherited['phase1_memory'])

@@ -80,7 +80,7 @@ def test_prepare_and_single_attempts_reuse_baseline_and_authenticated_results(tm
     assert backend.prepares == 1
     assert [source for source, _ in backend.evaluations] == ['bad', 'good']
     assert execution.store.get(execution.job_id)['attempts'] == 2
-    assert agent.contexts[-1][1]['phase2']['feedback'] == {'failure': 'strides'}
+    assert agent.contexts[-1][1]['optimizer_task']['feedback'] == {'failure': 'strides'}
     assert 'repair strides' in str(agent.contexts[-1][1]['memory_summary'])
     assert execution.store.submission(execution.job_id)['memory_snapshot'] == snapshot()
     content = json.loads(execution.store.read_artifact(execution.job_id, passed['result_artifact']['sha256']))
@@ -119,7 +119,7 @@ def test_crash_after_evaluation_before_phase2_commit_does_not_evaluate_again(tmp
     execution, agent, backend = executor(tmp_path, [candidate('good')])
     original = execution.store.add_event
     def crash(job_id, kind, payload):
-        if kind == 'phase2-attempt-result':
+        if kind == 'task-attempt-result':
             raise RuntimeError('process stopped before result commit')
         return original(job_id, kind, payload)
     monkeypatch.setattr(execution.store, 'add_event', crash)
@@ -177,7 +177,7 @@ def test_large_memory_and_feedback_are_bounded_but_artifacts_remain_readable(tmp
     assert len(canonical(context)) < 60000
     assert len(context['memory_summary']) == 218
     assert context['memory_summary'][-1]['index'] == 217
-    feedback_record = context['phase2']['artifact']
+    feedback_record = context['optimizer_task']['artifact']
     assert b'huge compiler diagnostics' in execution.store.read_artifact(execution.job_id, feedback_record['sha256'])
     assert result['verified']
 
@@ -256,7 +256,7 @@ def test_attempt_input_events_contain_only_hash_references_not_bulk_memory(tmp_p
     memory = snapshot([{'lesson': 'x' * 1000000}])
     feedback = {'error': 'y' * 1000000}
     execution.attempt('target-001', memory_snapshot=memory, feedback=feedback)
-    request = execution._event('phase2-attempt-request')
+    request = execution._event('task-attempt-request')
     assert len(canonical(request)) < 1000
     for key, expected in [('memory_snapshot', memory), ('feedback', feedback)]:
         assert json.loads(execution.store.read_artifact(execution.job_id, request[key]['sha256'])) == expected
@@ -289,7 +289,7 @@ def test_optional_profile_honors_stop_and_uncertain_observation(tmp_path, failur
     with pytest.raises(WorkerStopped if failure == 'explicit-stop' else ObservationUnavailable):
         execution.attempt('target-001')
     assert 'evaluation' in execution._state()['pending']
-    assert execution._event('phase2-attempt-result') is None
+    assert execution._event('task-attempt-result') is None
 
 
 def test_failed_evaluation_checkpoint_recovers_same_attempt_without_new_allocation(tmp_path, monkeypatch):
@@ -378,5 +378,5 @@ def test_real_transport_interruption_after_evaluation_preserves_only_settled_bud
         with pytest.raises(WorkerStopped if boundary == 'user-stop' else ObservationUnavailable):
             execution.attempt('target-001')
         assert 'evaluation' in execution._state()['pending']
-        assert execution._event('phase2-attempt-result') is None
+        assert execution._event('task-attempt-result') is None
     assert len(backend.evaluations) == 1

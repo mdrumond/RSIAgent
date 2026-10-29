@@ -1,4 +1,4 @@
-"""Durable elapsed-time admission for resumable Phase 2 campaigns."""
+"""Durable elapsed-time admission for resumable task campaigns."""
 from contextlib import contextmanager
 import json
 import math
@@ -28,7 +28,7 @@ class CampaignTimeBudget:
         if self.path.exists():
             self.state = json.loads(self.path.read_bytes())
             if self.state['identity'] != self.identity:
-                raise ValueError('retained Phase 2 time budgets changed')
+                raise ValueError('retained task time budgets changed')
             reservation = self.state.get('inflight_seconds', 0)
             owner = self.state.get('owner_pid')
             alive = False

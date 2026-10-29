@@ -23,7 +23,7 @@ def real_builder(root, scheduler, artifacts, *, decision='accept', reviewed=None
     atomic(root/'subject-campaign.json', canonical(state))
     def build(*args):
         state = json.loads((root/'subject-campaign.json').read_bytes())
-        state.update(schema='ascend-subject-campaign-v1', needs_decision=True, terminal=None)
+        state.update(schema='ascend-subject-campaign-v2', needs_decision=True, terminal=None)
         atomic(root/'subject-campaign.json', canonical(state))
         def execute(item, snapshot, directory, **options):
             source = artifacts.put_bytes(item['project_id'].encode())
@@ -165,7 +165,7 @@ def test_manual_review_waits_for_linked_sibling_execution_and_preserves_obligati
 
 
 def test_unfinished_optimizer_attempt_retains_its_identity_in_manual_worker(tmp_path):
-    from test_optimizer_execution import executor, candidate, snapshot
+    from test_optimizer_task_execution import executor, candidate, snapshot
     from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from optimizer.control import ObservationUnavailable
     config, root, directory, scheduler, artifacts = setup(tmp_path)

@@ -1,4 +1,4 @@
-"""One frozen optimizer task, with Phase 2-owned semantic attempt boundaries.
+"""One frozen optimizer task, with host-owned semantic attempt boundaries.
 
 The same retained optimizer job is used for every retry. RemoteBackend owns
 native execution and exact-handle observation; this module never resubmits an
@@ -26,6 +26,12 @@ class OptimizerTaskExecutor:
     def __init__(self, directory, task, memory_snapshot, config, *, agent=None, backend=None,
                  expected_baseline=None, memory_observer=None):
         self.directory = Path(directory)
+        if any(key.startswith('phase2_') for key in config):
+            raise ValueError('unsupported task configuration')
+        for journal in self.directory.glob('jobs/*/events.jsonl'):
+            if any(json.loads(line).get('kind', '').startswith('phase2-')
+                   for line in journal.read_bytes().splitlines() if line.strip()):
+                raise ValueError('unsupported task journal; use a fresh directory')
         config = apply_worker_config(config)
         self.task, self.config = task, config
         self.expected_baseline = expected_baseline
@@ -36,8 +42,8 @@ class OptimizerTaskExecutor:
         job = self.store.create(spec['source'], spec['entrypoint'], {'signatures': spec['signatures']},
             memory_snapshot, name=task['task_id'], init_args=spec.get('init_args'),
             init_kwargs=spec.get('init_kwargs'),
-            idempotency_key='phase2-task:' + str(self.directory.resolve()),
-            max_seconds=config.get('phase2_attempt_seconds', 7200))
+            idempotency_key='optimizer-task:' + str(self.directory.resolve()),
+            max_seconds=config.get('attempt_seconds', 7200))
         self.job_id = job['job_id']
         self.job_directory = self.store.root / self.job_id
         from .actor_control import ActorControl
@@ -53,17 +59,17 @@ class OptimizerTaskExecutor:
             identity['runtime'].update(local_identity(config))
         if config.get('guide'):
             identity['guide_sha256'] = sha(Path(config['guide']).read_bytes())
-        previous = self._event('phase2-task')
+        previous = self._event('optimizer-task')
         if previous is not None and previous != identity:
             raise ValueError('frozen task or execution configuration changed')
         if previous is None:
-            self.store.add_event(self.job_id, 'phase2-task', identity)
+            self.store.add_event(self.job_id, 'optimizer-task', identity)
         self._agent, self._backend = agent, backend
         self.deadline = None
 
     def set_remaining_seconds(self, remaining_seconds):
         if remaining_seconds <= 0:
-            raise WorkerStopped('Phase 2 elapsed-time budget exhausted')
+            raise WorkerStopped('Task elapsed-time budget exhausted')
         self.deadline = time.monotonic() + remaining_seconds
 
     def _event(self, kind):
@@ -138,7 +144,7 @@ class OptimizerTaskExecutor:
         """Return one evaluated candidate, or an explicit no-candidate failure.
 
         Retry an interrupted call with the SAME attempt_id. Only start a new id
-        after committing its result in the Phase 2 coordinator. Compile actions
+        after committing its result in the subject scheduler. Compile actions
         do not reserve evaluated revisions; infrastructure exceptions propagate.
         """
         if not isinstance(attempt_id, str) or not attempt_id:
@@ -148,18 +154,18 @@ class OptimizerTaskExecutor:
         with exclusive(self.job_directory / 'worker.lock'), exclusive(self._device_lock(), wait=True,
                 stopped=lambda: self.store.get(self.job_id)['stop_requested']):
             events = self.store.events(self.job_id)
-            results = [event['payload'] for event in events if event['kind'] == 'phase2-attempt-result']
+            results = [event['payload'] for event in events if event['kind'] == 'task-attempt-result']
             request = {'attempt_id': attempt_id,
-                'memory_snapshot': self._input_reference('phase2-attempt-memory', memory_snapshot),
-                'feedback': self._input_reference('phase2-attempt-feedback', feedback)}
-            recorded = next((event['payload'] for event in events if event['kind'] == 'phase2-attempt-request'
+                'memory_snapshot': self._input_reference('task-attempt-memory', memory_snapshot),
+                'feedback': self._input_reference('task-attempt-feedback', feedback)}
+            recorded = next((event['payload'] for event in events if event['kind'] == 'task-attempt-request'
                              and event['payload']['attempt_id'] == attempt_id), None)
             if recorded is not None and recorded != request:
                 raise ValueError('resume the pending attempt with its original memory and feedback')
             completed = next((row for row in results if row['attempt_id'] == attempt_id), None)
             if completed is not None:
                 return completed
-            active = self._event('phase2-attempt-request')
+            active = self._event('task-attempt-request')
             if active is not None and active['attempt_id'] not in {row['attempt_id'] for row in results}:
                 if active != request:
                     raise ValueError('resume the pending attempt with its original memory and feedback')
@@ -169,16 +175,16 @@ class OptimizerTaskExecutor:
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'} and 'pending' not in self._state():
                     evaluated = [item for item in self._state().get('history', []) if 'result' in item and 'candidate_sha256' in item]
                     if len(evaluated) <= sum(item.get('result') is not None for item in results):
-                        self.store.resume(self.job_id, additional_attempts=1, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                        self.store.resume(self.job_id, additional_attempts=1, additional_seconds=self.config.get('attempt_seconds', 7200))
             else:
                 row = self.store.get(self.job_id)
                 if row['status'] in {'failed', 'stopped', 'budget-exhausted'}:
-                    self.store.resume(self.job_id, additional_attempts=1, additional_seconds=self.config.get('phase2_attempt_seconds', 7200))
+                    self.store.resume(self.job_id, additional_attempts=1, additional_seconds=self.config.get('attempt_seconds', 7200))
                 for record, value in ((request['memory_snapshot'], memory_snapshot),
                                       (request['feedback'], feedback)):
                     if record is not None:
                         self.store.put_artifact(self.job_id, record['name'], canonical(value))
-                self.store.add_event(self.job_id, 'phase2-attempt-request', request)
+                self.store.add_event(self.job_id, 'task-attempt-request', request)
             loop = self._loop()
             # A crash after evaluation but before this result checkpoint is
             # recovered from optimizer history without another model/native call.
@@ -186,7 +192,7 @@ class OptimizerTaskExecutor:
             evaluations_completed = sum(row.get('result') is not None for row in results)
             if len(evaluated) <= evaluations_completed or 'pending' in loop.state:
                 loop.run(single_evaluation=True, memory_snapshot=memory_snapshot,
-                         context={'phase2': {'single_evaluation': True, 'feedback': feedback}})
+                         context={'optimizer_task': {'single_evaluation': True, 'feedback': feedback}})
                 evaluated = [row for row in loop.state.get('history', []) if 'candidate_sha256' in row and 'result' in row]
             state = loop.state
             candidate = evaluated[-1] if len(evaluated) > evaluations_completed else None
@@ -210,6 +216,6 @@ class OptimizerTaskExecutor:
                     state.get('best', {}).get('candidate_sha256') == candidate['candidate_sha256'] else None),
                 'handles': self.store.get(self.job_id)['handles']}
             result['result_artifact'] = self.store.put_artifact(self.job_id,
-                'phase2-attempt-result.json', canonical(result))
-            self.store.add_event(self.job_id, 'phase2-attempt-result', result)
+                'task-attempt-result.json', canonical(result))
+            self.store.add_event(self.job_id, 'task-attempt-result', result)
             return result

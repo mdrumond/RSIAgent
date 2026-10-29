@@ -7,40 +7,33 @@ from optimizer.memory import discover_sources, freeze_source, verify_snapshot
 
 
 def completed(tmp_path, *, target_driven=False):
-    from tests.test_a3_reviewed_phase2 import native_source
+    from tests.test_reviewed_memory import native_source
     from tests.test_a5_phase1_adaptive import _project, _result, _wave
-    from benchmarks.ascend.phase2 import admit_native_snapshot
-    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+    from benchmarks.ascend.reviewed_memory import admit_native_snapshot, reviewed_phase1_coordinator
     from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     source, review, _ = native_source(tmp_path)
-    root = tmp_path / 'phase2'
+    root = tmp_path / 'learning'
     seed = admit_native_snapshot(source, b'', review, root)
     def execute(request):
         result = _result(request.spec, True, 'verified')
         objects = ContentAddressedArtifacts(request.branch_root / 'artifacts')
         src = objects.put_bytes(b'source')
-        evidence = objects.put_bytes(result.evidence_payload)
-        return replace(result, memory=replace(result.memory, source_revision=src,
+        evidence = objects.put_bytes(b'host verified')
+        payload = json.dumps(dict(classification='host-verified', source_sha256=src, artifacts=dict(classification=evidence))).encode()
+        return replace(result, evidence_payload=payload, memory=replace(result.memory, source_revision=src,
             admitted_artifact_sha256=(evidence,), lessons=(), no_new_knowledge=True,
             host_facts=tuple(replace(f, evidence_sha256=evidence) for f in result.memory.host_facts)))
-    if target_driven:
-        from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
-        from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-        from tests.test_ascend_qualified_targets import qualified, RUNTIME
-        target, artifacts, _ = qualified(tmp_path / 'reference')
-        runner = TargetDrivenPhase2Coordinator(root, 'learn', seed,
-            TargetCurriculumAgent(lambda _: 'DECISION: READY\n{"reason":"target verified"}'),
-            execute, target=target, artifacts=artifacts, runtime=RUNTIME)
-    else:
-        runner = AdaptivePhase2Coordinator(root, 'learn', seed,
-            CurriculumAgent(lambda msgs: _wave(msgs[-1]['content'], [_project('phase2', 'simd-vector')])),
-            execute, project_target=1)
+    runner = reviewed_phase1_coordinator(root, 'learn', seed,
+        CurriculumAgent(lambda msgs: _wave(msgs[-1]['content'], [_project('new-project', 'simd-vector')])),
+        execute, project_target=1)
+    (root / 'initial-memory.bin').write_bytes(runner.initial_memory)
+    (root / 'campaign-identity.json').write_bytes((source / 'campaign-identity.json').read_bytes())
     runner.run()
     return root
 
 
-def test_snapshot_is_portable_authenticated_and_contains_both_phases(tmp_path):
+def test_snapshot_is_portable_authenticated_and_contains_reviewed_and_new_learning(tmp_path):
     root = completed(tmp_path)
     result = discover_sources([root])
     assert len(result) == 1 and result[0]['available']
@@ -88,15 +81,6 @@ def test_explicit_external_reviewed_snapshot_root(tmp_path):
     verify_snapshot(freeze_source(root, snapshot_roots=[external]))
 
 
-def test_target_ready_requires_published_verified_target(tmp_path):
-    root = completed(tmp_path, target_driven=True)
-    snapshot = freeze_source(root)
-    assert snapshot['terminal']['status'] == 'READY'
-    path = root / 'state.json'
-    state = json.loads(path.read_bytes())
-    state['attempts'][-1]['verified'] = False
-    path.write_text(json.dumps(state))
-    assert not discover_sources([root])[0]['available']
 
 
 def test_cli_discover_create_inspect_runtime(tmp_path, capsys):
@@ -117,9 +101,9 @@ def test_cli_discover_create_inspect_runtime(tmp_path, capsys):
 
 
 def test_committed_phase1_export_keeps_authenticated_inherited_reviewed_memory(tmp_path):
-    from tests.test_a3_reviewed_phase2 import native_source
-    from benchmarks.ascend.phase2 import admit_native_snapshot
-    from benchmarks.ascend.phase2_curriculum import reviewed_seed
+    from tests.test_reviewed_memory import native_source
+    from benchmarks.ascend.reviewed_memory import admit_native_snapshot
+    from benchmarks.ascend.reviewed_memory import reviewed_seed
     from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
     from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
     from optimizer.memory import freeze_committed_phase1
@@ -150,7 +134,7 @@ def test_committed_partial_wave_export_retains_authenticated_interruption_and_is
     import base64
     import copy
     import shutil
-    from tests.test_a3_reviewed_phase2 import native_source
+    from tests.test_reviewed_memory import native_source
     from optimizer.memory import freeze_committed_phase1
     root, _, memory = native_source(tmp_path, partial=True)
     from benchmarks.a5kernels.phase1_adaptive import retained_failure_outcome
