@@ -261,3 +261,45 @@ def test_lifecycle_change_during_indexing_rejects_publication(tmp_path):
     with pytest.raises(StaleMemory, match='lifecycle changed'):
         memory.accept('correction', dict(record()['proposal'], base_versions=[base], summary='New version'), {})
     assert ledger.status(base['version']) == 'quarantined' and ledger.records() == []
+
+
+@pytest.mark.parametrize('superseded', [False, True])
+def test_resume_recovers_shared_publication_after_local_receipt_write_failure(tmp_path, monkeypatch, superseded):
+    import benchmarks.ascend.subject_memory as module
+    ledger = MemoryLedger(tmp_path/'ledger.sqlite3'); memory = SubjectMemory(tmp_path/'a', ledger=ledger)
+    base = memory.accept('lesson', record()['proposal'], {})
+    changed = dict(record()['proposal'], base_versions=[base], summary='Source-approved correction')
+    proposed = dict(memory_id='lesson', proposal=changed, provenance={})
+    version = digest(proposed)
+    original_atomic = module.atomic
+    index_calls = []
+    memory.index = lambda *args: index_calls.append(args[0])
+    def fail_local_receipt(path, content):
+        if path == memory.root/'active.json':
+            raise OSError('simulated process death before local receipt replacement')
+        return original_atomic(path, content)
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'atomic', fail_local_receipt)
+        with pytest.raises(OSError, match='simulated process death'):
+            memory.accept('correction', changed, {})
+    assert ledger.records() == [proposed] and index_calls == [version]
+    assert 'correction' not in json.loads((memory.root/'active.json').read_bytes())['admissions']
+    if superseded:
+        other = SubjectMemory(tmp_path/'b', ledger=MemoryLedger(ledger.path))
+        latest = other.accept('next', dict(changed, base_versions=[dict(memory_id='lesson', version=version)], summary='Later approved revision'), {})
+    resumed = SubjectMemory(memory.root, ledger=MemoryLedger(ledger.path), index=memory.index)
+    receipt = resumed.accept('correction', changed, {})
+    assert receipt == dict(memory_id='lesson', version=version)
+    assert index_calls == [version]
+    assert json.loads((memory.root/'active.json').read_bytes())['admissions']['correction'] == receipt
+    assert len(ledger.report()) == (3 if superseded else 2)
+    assert digest(ledger.records()[0]) == (latest['version'] if superseded else version)
+
+
+def test_shared_record_read_rejects_changed_immutable_content(tmp_path):
+    import sqlite3
+    ledger = MemoryLedger(tmp_path/'ledger.sqlite3'); version = ledger.publish(record())
+    with sqlite3.connect(ledger.path) as db:
+        db.execute('UPDATE memory_versions SET record=? WHERE version=?', (json.dumps(record(summary='Changed bytes')), version))
+    with pytest.raises(ValueError, match='content changed'):
+        ledger.record(version)

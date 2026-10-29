@@ -165,7 +165,10 @@ class MemoryLedger:
             row = db.execute('SELECT record FROM memory_versions WHERE version=?', (version,)).fetchone()
         if row is None:
             raise KeyError(version)
-        return json.loads(row['record'])
+        record = json.loads(row['record'])
+        if digest(record) != version:
+            raise ValueError('immutable shared memory version content changed')
+        return record
 
     def status(self, version):
         with self._transaction() as db:

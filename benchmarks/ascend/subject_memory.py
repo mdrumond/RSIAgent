@@ -77,14 +77,26 @@ class SubjectMemory:
             bases = proposal['base_versions']
             if len({row['memory_id'] for row in bases}) != len(bases):
                 raise ValueError('memory bases must identify distinct memories')
+            memory_id = bases[0]['memory_id'] if bases else review_id
+            record = dict(memory_id=memory_id, proposal=proposal, provenance=provenance)
+            version = digest(record)
+            if self.ledger is not None:
+                try:
+                    published = self.ledger.record(version)
+                except KeyError:
+                    published = None
+                if published is not None:
+                    if published != record:
+                        raise ValueError('published memory receipt differs from proposed content')
+                    # The shared transaction can survive a failed local receipt write.
+                    # Recover only its receipt, never republish an old global head.
+                    state['admissions'][review_id] = dict(memory_id=memory_id, version=version)
+                    return state['admissions'][review_id]
             if not (self.ledger.bases_current(bases) if self.ledger is not None else all(
                     state['active'].get(row['memory_id']) == row['version'] for row in bases)):
                 raise StaleMemory('memory replacement base changed; reconcile and reevaluate')
             expected_statuses = ({base['version']: self.ledger.status(base['version']) for base in bases}
                                  if self.ledger is not None else None)
-            memory_id = bases[0]['memory_id'] if bases else review_id
-            record = dict(memory_id=memory_id, proposal=proposal, provenance=provenance)
-            version = digest(record)
             directory = self.root / 'versions'
             directory.mkdir(exist_ok=True)
             atomic(directory / (version + '.json'), canonical(record))
