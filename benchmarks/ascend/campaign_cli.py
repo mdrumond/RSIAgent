@@ -204,13 +204,13 @@ def build_controller(job):
             coordinator = _optimizer_controller(job, settings, snapshot, coordinator, options["config"])
         elif job.get("target_goal") is not None or job.get("autonomous_goal"):
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-            from .phase2_targets import TargetContract
+            from .qualified_targets import TargetContract
             from .phase2_target_selector import TargetCurriculumAgent
             from .phase2_target_loop import TargetDrivenPhase2Coordinator
             if job.get("autonomous_goal"):
                 from .phase2_goal_bootstrap import bootstrap_goal
-                from .phase2_time import Phase2TimeBudget
-                budget = Phase2TimeBudget(job["root"], job["phase2_max_seconds"],
+                from .campaign_time import CampaignTimeBudget
+                budget = CampaignTimeBudget(job["root"], job["phase2_max_seconds"],
                                           job["practice_max_seconds"])
                 with budget.active():
                     goal, artifacts = bootstrap_goal(coordinator, root=job["root"],
@@ -260,7 +260,7 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
     """Bind the merged optimizer worker to the reviewed native campaign lineage."""
     from optimizer.memory import freeze_reviewed_phase1
     from optimizer.worker import load_config, knowledge_query
-    from .phase2_optimizer_execution import OptimizerTaskExecutor
+    from .optimizer_execution import OptimizerTaskExecutor
     from .phase2_optimizer_campaign import OptimizerPhase2Coordinator
     from .phase2_optimizer_continuation import campaign_seed
 
@@ -300,7 +300,7 @@ def _optimizer_controller(job, settings, snapshot, composed, native):
         query_knowledge=(lambda text: {"results": query(text)}) if query else None,
         max_seconds=job["phase2_max_seconds"],
         max_practice_seconds=job["practice_max_seconds"],
-        feedback_root=job.get('feedback_root', settings.get("phase2_feedback_root")),
+        feedback_root=job.get('feedback_root', settings.get("feedback_root")),
         fixed_task=retry['task'] if retry else None,
         )
 
@@ -923,7 +923,7 @@ def main(argv=None, *, screen=start_screen):
             sub.add_argument("--project-id", action="append", default=[])
     args = parser.parse_args(argv)
     if args.command in {'feedback', 'feedback-phase2'}:
-        from .phase2_feedback import FeedbackStore
+        from .feedback import FeedbackStore
         store = FeedbackStore(args.feedback_root)
         importers = {'phase1': store.import_phase1, 'phase2': store.import_campaign,
                      'optimizer': store.import_optimizer}
@@ -998,7 +998,7 @@ def main(argv=None, *, screen=start_screen):
         goal = None
         if args.target_goal is not None:
             from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-            from .phase2_targets import TargetContract
+            from .qualified_targets import TargetContract
             goal = TargetContract.from_mapping(_read(args.target_goal))
             goal.verify(ContentAddressedArtifacts(Path(settings["target_artifact_store"])),
                         settings["target_runtime"])

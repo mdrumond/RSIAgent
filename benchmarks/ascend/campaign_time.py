@@ -15,7 +15,7 @@ def seconds(value):
     return value
 
 
-class Phase2TimeBudget:
+class CampaignTimeBudget:
     def __init__(self, root, maximum, practice=None, *, clock=time.monotonic):
         self.path = Path(root) / 'time-budget.json'
         self.maximum = seconds(maximum)

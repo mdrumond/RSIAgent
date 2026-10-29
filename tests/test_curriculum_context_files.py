@@ -98,7 +98,7 @@ def test_multiple_reads_keep_full_audit_but_only_latest_page_on_wire(tmp_path):
 
 def test_native_phase2_reads_and_more_than_three_corrections_share_time(tmp_path):
     from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-    from test_ascend_phase2_targets import qualified, context as target_context
+    from test_ascend_qualified_targets import qualified, context as target_context
     target, _, _ = qualified(tmp_path/'reference')
     files = ContextFiles(tmp_path/'context')
     ref = files.put('observed-failure', {'actual':'mismatch', 'details':['a','b']})
@@ -132,7 +132,7 @@ def test_read_audit_survives_provider_interruption(tmp_path, native):
         raise OSError('provider disconnected')
     if native:
         from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-        from test_ascend_phase2_targets import qualified, context as target_context
+        from test_ascend_qualified_targets import qualified, context as target_context
         target, _, _ = qualified(tmp_path/'reference')
         context = replace(target_context(target), context_files=(ref,), artifact_reader=files.read)
         agent = TargetCurriculumAgent(complete)

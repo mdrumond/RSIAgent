@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from benchmarks.ascend.optimizer_phase2_artifacts import freeze_campaign, verify_campaign
+from benchmarks.ascend.optimizer_evidence import freeze_campaign, verify_campaign
 from benchmarks.ascend.training_annex import inventory_campaign, package_campaign
 from optimizer.jobs import JobStore, canonical, sha
 from optimizer.memory import verify_snapshot
@@ -160,7 +160,7 @@ def test_result_candidate_suite_binding_is_checked(tmp_path):
 
 
 def test_real_execution_bridge_results_are_consumable(tmp_path):
-    bridge = pytest.importorskip("benchmarks.ascend.phase2_optimizer_execution")
+    bridge = pytest.importorskip("benchmarks.ascend.optimizer_execution")
     root = tmp_path / "campaign"
     state, _, _ = campaign(root)
     # Replace the hand-built publication with the public execution bridge's output.

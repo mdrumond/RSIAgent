@@ -231,7 +231,7 @@ def _verify_adaptive_state(root, state, *, external_initial_memory=None, reviewe
                         "initial_memory_base64": base64.b64encode(initial).decode("ascii"),
                         "project_memory_base64": memories}
             if state.get("phase") == "target-driven-phase2":
-                snapshot["phase2_feedback"] = state["attempts"][max(0, ordinal - 2):ordinal]
+                snapshot["feedback"] = state["attempts"][max(0, ordinal - 2):ordinal]
             if wave.pre_wave_memory_sha256 != _sha(_json(snapshot)):
                 raise ValueError("published pre-wave memory chain differs")
         publication = json.loads((wave_root / "published.json").read_bytes())
@@ -368,7 +368,7 @@ def inventory_campaign(root, *, artifact_store=None, external_initial_memory=Non
 
     state = documents.get("state.json", [{}])[0]
     if state.get("phase") == "optimizer-phase2":
-        from .optimizer_phase2_artifacts import verify_campaign
+        from .optimizer_evidence import verify_campaign
         try:
             verify_campaign(root)
         except (OSError, ValueError, KeyError, TypeError) as error:

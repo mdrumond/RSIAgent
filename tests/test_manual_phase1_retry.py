@@ -5,7 +5,7 @@ import pytest
 
 from benchmarks.ascend import campaign_cli as cli
 from benchmarks.ascend.manual_retry import ManualPhase1Retry
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
 from test_a5_phase1_adaptive import _project, _result
@@ -24,7 +24,7 @@ def test_dashboard_import_routes_all_configured_source_types(tmp_path, monkeypat
             imports.append(('phase2', root)); return {}
         def import_optimizer(self, root):
             imports.append(('optimizer', root)); return {}
-    monkeypatch.setattr('benchmarks.ascend.phase2_feedback.FeedbackStore', Store)
+    monkeypatch.setattr('benchmarks.ascend.feedback.FeedbackStore', Store)
     config = tmp_path / 'dashboard.json'
     config.write_text(json.dumps(dict(campaigns=[dict(phase=1, root='/p1'), dict(phase=2, root='/p2')],
                                      optimizer=dict(root='/jobs'))))

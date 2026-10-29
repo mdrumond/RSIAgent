@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 from optimizer.jobs import canonical, sha
 
 
@@ -513,9 +513,9 @@ def test_resolution_rejects_misattached_frozen_task_submission(tmp_path, field, 
 
 @pytest.mark.parametrize('window', ['result-event', 'pending-evaluation'])
 def test_evaluated_recovery_defers_import_until_real_attempt_result(tmp_path, monkeypatch, window):
-    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from optimizer.loop import OptimizationLoop
-    from test_phase2_optimizer_execution import Agent, Backend, snapshot, candidate
+    from test_optimizer_execution import Agent, Backend, snapshot, candidate
     from test_ascend_phase2_optimizer_tasks import proposal
     root = tmp_path / 'campaign'
     task = proposal()

@@ -8,7 +8,7 @@ import json
 import time
 from pathlib import Path
 
-from .phase2_time import Phase2TimeBudget
+from .campaign_time import CampaignTimeBudget
 
 from benchmarks.a5kernels.evidence import canonical_bytes
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator, PENDING_SCHEMA
@@ -79,7 +79,7 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         target.verify(artifacts, runtime, target_policy)
         self.target, self.artifacts, self.runtime = target, artifacts, dict(runtime)
         self.target_policy = target_policy
-        self.time = Phase2TimeBudget(root, max_seconds, max_practice_seconds, clock=clock)
+        self.time = CampaignTimeBudget(root, max_seconds, max_practice_seconds, clock=clock)
         self.available_tools = tuple(available_tools)
         super().__init__(root, objective, reviewed_snapshot, CurriculumAgent(lambda _: None),
                          execute_project, project_target=1, trace_hook=trace_hook)
@@ -110,7 +110,7 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
 
     def _memory_snapshot(self, state):
         value = json.loads(super()._memory_snapshot(state))
-        value["phase2_feedback"] = state.get("attempts", [])[-2:]
+        value["feedback"] = state.get("attempts", [])[-2:]
         return canonical_bytes(value)
 
 
@@ -123,7 +123,7 @@ class TargetDrivenPhase2Coordinator(AdaptivePhase2Coordinator):
         from .agent_presentation import _preview
         files = ContextFiles(self.root / 'curriculum' / 'context')
         observed = files.put('latest-target-attempt', targets[-1])
-        from .phase2_feedback import FeedbackStore
+        from .feedback import FeedbackStore
         cases, raw_refs = [], {}
         for attempt in state['attempts']:
             branch = self.root / 'waves' / attempt['wave_id'] / 'branches' / attempt['project_id']

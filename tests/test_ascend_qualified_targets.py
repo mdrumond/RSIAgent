@@ -7,7 +7,7 @@ import pytest
 from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
-from benchmarks.ascend.phase2_targets import TargetContract, qualify_target
+from benchmarks.ascend.qualified_targets import TargetContract, qualify_target
 from benchmarks.ascend.phase2_target_selector import (
     TargetCurriculumAgent, TargetCurriculumContext, target_curriculum_prompt,
 )

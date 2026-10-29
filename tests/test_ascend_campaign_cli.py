@@ -1105,7 +1105,7 @@ def test_retained_goal_launches_target_controller_and_checks_runtime(tmp_path, m
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
     from benchmarks.ascend import phase1_cli, production
     from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
-    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_ascend_qualified_targets import qualified, RUNTIME
     from test_ascend_phase2_curriculum import snapshot
     goal, store, _ = qualified(tmp_path / "reference")
     contract = write(tmp_path / "goal.json", goal.as_dict())

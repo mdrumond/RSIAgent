@@ -256,7 +256,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
     if isinstance(optimizer_config, str):
         optimizer_config = json.loads(Path(optimizer_config).read_bytes())
     if optimizer_config is not None:
-        from .phase2_optimizer_execution import OptimizerTaskExecutor
+        from .optimizer_execution import OptimizerTaskExecutor
         def optimizer_factory(directory, task, snapshot):
             runtime = getattr(actor.executor, 'runtime_identity', None)
             if (runtime is None or optimizer_config.get('arch') != runtime.get('architecture', getattr(paths, 'arch', None))
@@ -328,7 +328,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             publish_learning=False, actor_memory_delivery=memory_delivery)
         contract = item.get('task', {}).get('contract')
         if contract is not None:
-            from .phase2_targets import TargetContract
+            from .qualified_targets import TargetContract
             qualification = ContentAddressedArtifacts(Path(item['task']['artifact_root']))
             target_contract = TargetContract.from_mapping(contract)
             reference = qualification.read_json(target_contract.reference_sha256)

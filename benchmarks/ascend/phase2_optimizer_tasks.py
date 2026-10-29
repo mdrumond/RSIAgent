@@ -72,9 +72,9 @@ def select_optimizer_task(*, complete, snapshot, objective, root, kind='goal',
                           remaining_seconds=None, max_seconds=7200, clock=None):
     """Select within elapsed time; max_proposals is deprecated and ignored."""
     if remaining_seconds is None:
-        from .phase2_time import Phase2TimeBudget
+        from .campaign_time import CampaignTimeBudget
         import time
-        budget = Phase2TimeBudget(Path(root) / "selection-time", max_seconds, clock=clock or time.monotonic)
+        budget = CampaignTimeBudget(Path(root) / "selection-time", max_seconds, clock=clock or time.monotonic)
         with budget.active():
             return select_optimizer_task(complete=complete, snapshot=snapshot, objective=objective,
                 root=root, kind=kind, context=context, query_knowledge=query_knowledge,

@@ -602,7 +602,7 @@ class AdaptiveActorProjectExecutor:
         executor = self.executor
         if request.failure_context is not None and request.failure_context.get('original_retry'):
             from benchmarks.ascend.failure_handoff import original_retry_inputs
-            from benchmarks.ascend.phase2_feedback import FeedbackStore
+            from benchmarks.ascend.feedback import FeedbackStore
             inputs = original_retry_inputs(FeedbackStore(request.failure_context['root']),
                 request.failure_context['feedback_ids'][0], request.spec)
             if inputs is not None:

@@ -8,7 +8,7 @@ import json
 import os
 import time
 
-from benchmarks.ascend.phase2_time import Phase2TimeBudget
+from benchmarks.ascend.campaign_time import CampaignTimeBudget
 from pathlib import Path
 from typing import Callable, Mapping
 
@@ -136,7 +136,7 @@ class Phase2LiveRunner:
                 raise ValueError("unrecognized Phase 2 execution profile")
             self.execution_profile = dependencies.execution_profile
         self.root = self.phase2_root / "cells" / dependencies.cell.cell_id
-        self.time = Phase2TimeBudget(self.root, max_seconds, clock=clock)
+        self.time = CampaignTimeBudget(self.root, max_seconds, clock=clock)
         if snapshot.root.resolve() != self.root / "snapshot":
             raise ValueError("snapshot path does not match the Phase 2 cell root")
 

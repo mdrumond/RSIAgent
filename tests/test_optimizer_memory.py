@@ -27,7 +27,7 @@ def completed(tmp_path, *, target_driven=False):
     if target_driven:
         from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
         from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-        from tests.test_ascend_phase2_targets import qualified, RUNTIME
+        from tests.test_ascend_qualified_targets import qualified, RUNTIME
         target, artifacts, _ = qualified(tmp_path / 'reference')
         runner = TargetDrivenPhase2Coordinator(root, 'learn', seed,
             TargetCurriculumAgent(lambda _: 'DECISION: READY\n{"reason":"target verified"}'),

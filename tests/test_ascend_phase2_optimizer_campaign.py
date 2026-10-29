@@ -101,7 +101,7 @@ def test_infrastructure_keeps_pending_without_semantic_charge(tmp_path):
 
 
 def test_prepare_stop_imports_feedback_before_propagating(tmp_path):
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from benchmarks.ascend.feedback import FeedbackStore
     from optimizer.control import WorkerStopped
     from optimizer.jobs import JobStore
     prepared = []
@@ -129,7 +129,7 @@ def test_prepare_stop_imports_feedback_before_propagating(tmp_path):
 
 
 def test_initial_qualification_stop_is_retained_and_historically_importable(tmp_path):
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from benchmarks.ascend.feedback import FeedbackStore
     from optimizer.control import WorkerStopped
     from optimizer.jobs import JobStore
     root = tmp_path / 'campaign'
@@ -155,7 +155,7 @@ def test_initial_qualification_stop_is_retained_and_historically_importable(tmp_
 
 @pytest.mark.parametrize('status', ['stopped', 'failed'])
 def test_practice_qualification_failure_is_retained_before_pending(tmp_path, status):
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from benchmarks.ascend.feedback import FeedbackStore
     from optimizer.control import WorkerStopped
     from optimizer.jobs import JobStore
     root = tmp_path / 'campaign'
@@ -237,7 +237,7 @@ def test_stalled_is_explicit_not_ready(tmp_path):
 
 
 def test_completed_optimizer_phase2_is_discoverable(tmp_path):
-    from test_optimizer_phase2_artifacts import campaign
+    from test_optimizer_evidence import campaign
     from optimizer.memory import discover_sources, freeze_source
     campaign(tmp_path)
     assert freeze_source(tmp_path)["phase"] == "optimizer-phase2"
@@ -245,7 +245,7 @@ def test_completed_optimizer_phase2_is_discoverable(tmp_path):
 
 
 def test_retry_memory_includes_practice_source_and_frozen_evidence(tmp_path):
-    from test_optimizer_phase2_artifacts import campaign
+    from test_optimizer_evidence import campaign
     state, store, key = campaign(tmp_path)
     coordinator = object.__new__(OptimizerPhase2Coordinator)
     coordinator.root = tmp_path
@@ -335,8 +335,8 @@ def test_curriculum_sees_optimizer_learning_after_large_phase1_index(tmp_path):
 
 
 def test_export_authenticates_job_once_not_once_per_profile_artifact(tmp_path, monkeypatch):
-    from test_optimizer_phase2_artifacts import campaign
-    from benchmarks.ascend.optimizer_phase2_artifacts import verify_campaign
+    from test_optimizer_evidence import campaign
+    from benchmarks.ascend.optimizer_evidence import verify_campaign
     from optimizer.jobs import JobStore
     state, store, key = campaign(tmp_path)
     for i in range(20):

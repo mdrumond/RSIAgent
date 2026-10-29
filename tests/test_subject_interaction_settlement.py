@@ -165,8 +165,8 @@ def test_manual_review_waits_for_linked_sibling_execution_and_preserves_obligati
 
 
 def test_unfinished_optimizer_attempt_retains_its_identity_in_manual_worker(tmp_path):
-    from test_phase2_optimizer_execution import executor, candidate, snapshot
-    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from test_optimizer_execution import executor, candidate, snapshot
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from optimizer.control import ObservationUnavailable
     config, root, directory, scheduler, artifacts = setup(tmp_path)
     template, agent, backend = executor(tmp_path/'template', [candidate('good')])

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 from benchmarks.ascend.failure_curriculum import FailureCurriculum
 from optimizer.jobs import JobStore, canonical, sha
 
@@ -109,7 +109,7 @@ def test_feedback_refresh_drops_fixed_items(tmp_path):
 
 def test_legacy_ready_phase2_retains_history_and_dispatches_original_retry(tmp_path):
     from benchmarks.ascend.failure_curriculum import retry_spec, select_feedback
-    from test_phase2_feedback import campaign
+    from test_feedback import campaign
 
     source = tmp_path / 'phase2'
     task = dict(task_id='original', submission=dict(source='reference', entrypoint='forward', signatures=[]))
@@ -225,7 +225,7 @@ def test_optimizer_failed_candidate_survives_successful_best(tmp_path):
     assert any(row['outcome']['verified'] for row in records)
     assert store.failure_cases(failed['feedback_id'])[0]['availability']['complete']
     from benchmarks.ascend.failure_curriculum import retry_spec
-    from benchmarks.ascend.phase2_feedback import _baseline_identity
+    from benchmarks.ascend.feedback import _baseline_identity
     retry = retry_spec({'selected': [failed]}, 'a3')
     assert retry['suite_sha256'] == frozen['suite_sha256']
     assert retry['policy'] == frozen['manifest']['policy']
@@ -266,7 +266,7 @@ def test_legacy_exact_execution_reproducer_imports_without_index(tmp_path):
 
 
 def test_phase2_failure_payload_roundtrip(tmp_path):
-    from test_phase2_feedback import campaign
+    from test_feedback import campaign
     root = tmp_path / 'phase2'
     row = campaign(root, result=dict(verified=False, result=dict(status='incorrect',
         failure_case=dict(schema='failure-case-v1', classification='host-mismatch', description='zero differs',
@@ -347,7 +347,7 @@ def test_feedback_cli_imports_retained_sources_without_dispatch(tmp_path, capsys
     if source_type == 'phase1':
         phase1(root)
     elif source_type == 'phase2':
-        from test_phase2_feedback import campaign
+        from test_feedback import campaign
         campaign(root)
     else:
         jobs = JobStore(root)

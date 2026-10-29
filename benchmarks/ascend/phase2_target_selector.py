@@ -11,7 +11,7 @@ from benchmarks.a5kernels.phase1_curriculum import Capability, ProjectSpec
 from benchmarks.a5kernels.phase1_curriculum_selector import (
     CurriculumSession, _grammar, _HELD_OUT_WORDS, _digest, project_information_sha256,
 )
-from benchmarks.ascend.phase2_targets import TargetContract
+from benchmarks.ascend.qualified_targets import TargetContract
 from benchmarks.ascend.targets import CurriculumPolicy, METRIC_SWEEP_GUIDANCE
 
 

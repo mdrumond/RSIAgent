@@ -197,7 +197,7 @@ class CurriculumContext:
     prior_outcomes: tuple[PriorOutcome, ...]
     remaining_projects: int = 64
     curriculum_memory: tuple[Mapping[str, object], ...] = ()
-    phase2_feedback: tuple[Mapping[str, object], ...] = ()
+    feedback: tuple[Mapping[str, object], ...] = ()
     remaining_seconds: float = 3600
     context_files: tuple[Mapping[str, object], ...] = ()
     artifact_reader: Callable | None = None
@@ -405,9 +405,9 @@ def curriculum_prompt(
             _grammar() if target_policy is None else target_policy.grammar(_grammar())
         ),
     }
-    if context.phase2_feedback:
+    if context.feedback:
         from benchmarks.ascend.failure_curriculum import GUIDANCE
-        payload['phase2_feedback'] = list(context.phase2_feedback)
+        payload['feedback'] = list(context.feedback)
         payload['failure_investigation_guidance'] = GUIDANCE
     if unavailable_capabilities:
         payload["unavailable_capabilities"] = [
@@ -444,7 +444,7 @@ def curriculum_prompt(
             "Do not select unavailable capabilities or their associated project "
             "fields; this execution factory cannot collect their required evidence.\n"
         )
-    if context.phase2_feedback:
+    if context.feedback:
         instructions += (
             "First review eligible original failures against current memory. When an "
             "applicable cause/repair lesson and host-backed probe/control exist, recommend "
@@ -724,7 +724,7 @@ class CurriculumAgent:
                 item.verified for item in context.prior_outcomes
             ):
                 raise ValueError("saturation requires host-verified prior evidence")
-            if status == "STALLED" and not context.prior_outcomes and not context.phase2_feedback:
+            if status == "STALLED" and not context.prior_outcomes and not context.feedback:
                 raise ValueError("stall requires an observed prior attempt")
             if self.failure_feedback is not None:
                 metadata = self.failure_feedback.admit(investigations, None, context)

@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 import time
 
-from benchmarks.ascend.phase2_time import Phase2TimeBudget
+from benchmarks.ascend.campaign_time import CampaignTimeBudget
 from typing import Any
 
 from benchmarks.a3_experiments import (
@@ -260,7 +260,7 @@ class A3Phase2Adapter:
         time_root = Path(evidence_path).with_suffix(".time")
         if self.evidence.entries and not (time_root / "time-budget.json").exists():
             raise ValueError("legacy Phase 2 evidence requires an explicit time-budget migration")
-        self.time = Phase2TimeBudget(time_root, max_seconds, clock=clock)
+        self.time = CampaignTimeBudget(time_root, max_seconds, clock=clock)
 
     def _require_identity(self, value: Any, label: str) -> None:
         if getattr(value, "identity", None) != self.identity:

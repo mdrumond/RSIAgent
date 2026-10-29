@@ -13,7 +13,7 @@ from benchmarks.a5kernels.phase1_curriculum import Capability, FailureMode, Proj
 from benchmarks.a5kernels.phase1_curriculum_selector import _grammar, _HELD_OUT_WORDS
 from benchmarks.a5kernels.phase1_project import materialize_inputs, evaluate_reference
 from benchmarks.a5kernels.phase1_wave_runtime import SemanticProjectFailure
-from .phase2_targets import TargetContract, qualify_target
+from .qualified_targets import TargetContract, qualify_target
 from .agent_presentation import MemoryArtifactReader, memory_presentation, compact_observation, artifact_page_presentation
 
 
@@ -32,9 +32,9 @@ def executable_identity(spec):
 def bootstrap_goal(coordinator, *, root, private_root, objective, available_tools,
                    remaining_seconds=None, max_seconds=7200, clock=None):
     if remaining_seconds is None:
-        from .phase2_time import Phase2TimeBudget
+        from .campaign_time import CampaignTimeBudget
         import time
-        budget = Phase2TimeBudget(Path(private_root) / "bootstrap-time", max_seconds,
+        budget = CampaignTimeBudget(Path(private_root) / "bootstrap-time", max_seconds,
                                   clock=clock or time.monotonic)
         with budget.active():
             return bootstrap_goal(coordinator, root=root, private_root=private_root,

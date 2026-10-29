@@ -10,11 +10,11 @@ from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
 from benchmarks.a5kernels.evidence import EvidenceLedger
 from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
-from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
 from benchmarks.ascend.subject_execution import SubjectExecutor, optimizer_snapshot
 from test_a5_phase1_adaptive_actor import SourceBackend, ScriptedActor, _request
-from test_ascend_phase2_targets import qualified, RUNTIME
-from test_phase2_optimizer_execution import Agent, Backend, candidate
+from test_ascend_qualified_targets import qualified, RUNTIME
+from test_optimizer_execution import Agent, Backend, candidate
 
 
 def graph_actor(tmp_path, replies):

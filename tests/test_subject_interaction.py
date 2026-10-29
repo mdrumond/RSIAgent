@@ -143,7 +143,7 @@ def test_feedback_http_guards_and_receipts(tmp_path):
 
 
 def test_optimizer_restart_instruction_reaches_production_job_context(tmp_path):
-    from test_phase2_optimizer_execution import executor, candidate
+    from test_optimizer_execution import executor, candidate
     ActorControl(tmp_path/'task/actor').send('approved', 'Use the reviewed repair direction')
     execution, agent, backend = executor(tmp_path, [candidate('good')])
     execution.prepare()

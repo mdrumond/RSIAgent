@@ -138,7 +138,7 @@ def test_public_campaign_build_controller_keeps_reviewed_retries_serial(tmp_path
     measurement_bindings.clear()
     reviewed_job = {**job, "phase": 1 if original_retry else 2, "root": str(phase2_root)}
     if original_retry:
-        from benchmarks.ascend.phase2_feedback import FeedbackStore
+        from benchmarks.ascend.feedback import FeedbackStore
         from benchmarks.ascend.manual_retry import ManualPhase1Retry
         from test_generic_failure_feedback import phase1 as failed_campaign
         from test_a5_phase1_adaptive import _project, _result

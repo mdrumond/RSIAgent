@@ -73,7 +73,7 @@ def _baseline_identity(outcome):
 
 
 def _verified_retry(outcome):
-    from .optimizer_phase2_artifacts import verify_attempt_result
+    from .optimizer_evidence import verify_attempt_result
     try:
         ref = outcome['evidence']['result_artifact']
         if not Path(ref['job_root']).is_dir():

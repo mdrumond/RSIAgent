@@ -149,8 +149,8 @@ def test_a5_collector_uses_worker_config_from_workflow_arguments(tmp_path):
 
 
 def test_phase2_optimizer_selects_local_backend_without_wrapper_config(tmp_path, monkeypatch):
-    from tests.test_phase2_optimizer_execution import executor, snapshot
-    import benchmarks.ascend.phase2_optimizer_execution as module
+    from tests.test_optimizer_execution import executor, snapshot
+    import benchmarks.ascend.optimizer_execution as module
     example, agent, _backend = executor(tmp_path / 'example', [])
     settings = config(tmp_path)
     calls = []

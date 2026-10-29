@@ -14,7 +14,7 @@ from benchmarks.ascend.phase2_goal_bootstrap import bootstrap_goal, executable_i
 from benchmarks.ascend.targets import a3_curriculum_policy
 from test_a5_phase1_project_executor import FakeBackend, _compile, _runtime
 from test_ascend_phase2_curriculum import snapshot, project
-from test_ascend_phase2_targets import RUNTIME
+from test_ascend_qualified_targets import RUNTIME
 
 
 def setup(tmp_path, responses, *, failure=None, query=None, clock=None, max_seconds=7200):
@@ -241,7 +241,7 @@ def test_actual_reference_actor_can_submit_profile_timing_goal_without_measureme
 
 
 def test_autonomous_goal_and_reference_share_campaign_time_allocation(tmp_path):
-    from benchmarks.ascend.phase2_time import Phase2TimeBudget
+    from benchmarks.ascend.campaign_time import CampaignTimeBudget
     now = [0.0]
     def select(_):
         now[0] += 2
@@ -254,13 +254,13 @@ def test_autonomous_goal_and_reference_share_campaign_time_allocation(tmp_path):
         now[0] += 1
         return original_run(request, compilation)
     backend.run = native_run
-    budget = Phase2TimeBudget(root, 10, 2, clock=lambda: now[0])
+    budget = CampaignTimeBudget(root, 10, 2, clock=lambda: now[0])
     with budget.active():
         bootstrap_goal(run.coordinator, root=root, private_root=tmp_path / 'control/bootstrap',
             objective='goal', available_tools=(), remaining_seconds=lambda: budget.remaining)
     assert calls[0].remaining_seconds == 8
     # The learner opens the same campaign ledger after goal qualification.
-    assert Phase2TimeBudget(root, 10, 2, clock=lambda: now[0]).remaining == 4
+    assert CampaignTimeBudget(root, 10, 2, clock=lambda: now[0]).remaining == 4
 
 
 def test_autonomous_goal_can_correct_more_than_three_proposals(tmp_path):

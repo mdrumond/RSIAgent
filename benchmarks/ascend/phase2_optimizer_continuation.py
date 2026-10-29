@@ -61,7 +61,7 @@ def compose_prior_campaigns(reviewed_seed, predecessors):
     Each predecessor's seed already contains its history, so normally only the
     latest root is needed. The original reviewed Phase 1 remains authoritative.
     """
-    from .optimizer_phase2_artifacts import verify_campaign
+    from .optimizer_evidence import verify_campaign
 
     verify_snapshot(reviewed_seed)
     if not predecessors:

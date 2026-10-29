@@ -6,7 +6,7 @@ import pytest
 
 from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
 from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-from test_ascend_phase2_targets import qualified, RUNTIME
+from test_ascend_qualified_targets import qualified, RUNTIME
 from test_ascend_phase2_curriculum import snapshot
 from test_a5_phase1_adaptive import _result
 
@@ -148,8 +148,8 @@ def test_no_practice_novelty_gate_on_repeated_target_spec(tmp_path):
     from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
     from benchmarks.ascend.agent_presentation import memory_presentation
     view = memory_presentation(requests[1].pre_wave_memory, ContentAddressedArtifacts(tmp_path / "view"))
-    assert view["phase2_feedback"][0]["kind"] == "target"
-    assert view["phase2_feedback"][0]["host_feedback"]
+    assert view["feedback"][0]["kind"] == "target"
+    assert view["feedback"][0]["host_feedback"]
 
 
 def test_host_diagnostics_reach_curriculum_and_private_reference_does_not(tmp_path):
@@ -205,7 +205,7 @@ def test_semantic_actor_failure_preserves_actual_summary_and_host_facts(tmp_path
     assert actual["host_facts"][0]["statement"] == "compiler: expected event before Vector load"
     presented = memory_presentation(requests[-1].pre_wave_memory,
                                    ContentAddressedArtifacts(tmp_path / "view"))
-    assert presented["phase2_feedback"][0]["host_feedback"] == actual
+    assert presented["feedback"][0]["host_feedback"] == actual
 
 
 @pytest.mark.parametrize("field", ["kind", "verified", "spec", "host_feedback"])

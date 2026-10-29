@@ -119,10 +119,10 @@ def test_unrelated_projects_do_not_consume_failure_budget(tmp_path):
 def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(tmp_path, monkeypatch, standalone, failed_retry, retry_latency):
     from types import SimpleNamespace
     from tests.test_a3_reviewed_phase2 import native_source
-    from tests.test_phase2_optimizer_execution import Agent, Backend, candidate, snapshot
-    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from tests.test_optimizer_execution import Agent, Backend, candidate, snapshot
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     from benchmarks.ascend.automatic_remediation import optimizer_retry_adapter
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from benchmarks.ascend.feedback import FeedbackStore
     from optimizer.jobs import atomic, canonical
     source, _, _ = native_source(tmp_path/'learning')
     state = json.loads((source/'state.json').read_bytes())
@@ -189,7 +189,7 @@ def test_external_phase2_retry_uses_frozen_suite_with_updated_committed_memory(t
         child.prepare = charged_prepare
         children.append(child)
         return child
-    monkeypatch.setattr('benchmarks.ascend.phase2_optimizer_execution.OptimizerTaskExecutor', factory)
+    monkeypatch.setattr('benchmarks.ascend.optimizer_execution.OptimizerTaskExecutor', factory)
     runner = SimpleNamespace(root=source, initial_memory=b'', clock=lambda: now[0])
     retry = optimizer_retry_adapter(runner, store, dict(config, max_cases=1))
     from optimizer.control import ObservationUnavailable, WorkerStopped
@@ -375,7 +375,7 @@ def test_nested_original_retry_reads_parent_memory_artifacts_and_reviewed_seed(t
     from benchmarks.a5kernels.evidence import canonical_bytes
     from benchmarks.a5kernels.phase2_adaptive_memory import admit_adaptive_snapshot
     from benchmarks.ascend.agent_presentation import MemoryArtifactReader
-    from benchmarks.ascend.phase2_feedback import FeedbackStore
+    from benchmarks.ascend.feedback import FeedbackStore
     from tests.test_a5_phase2_adaptive_memory import _source
     source_root, source, review, memory = _source(tmp_path/'history')
     parent = tmp_path/'parent'

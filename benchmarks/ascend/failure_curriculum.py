@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from optimizer.jobs import JobStore, atomic, canonical, sha
-from .phase2_feedback import FeedbackStore
+from .feedback import FeedbackStore
 from .status_descriptions import describe_statuses
 
 

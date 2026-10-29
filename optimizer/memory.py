@@ -68,7 +68,7 @@ def freeze_source(root, *, snapshot_roots=()):
     state = json.loads(state_bytes)
     phase = state.get('phase')
     if phase == 'optimizer-phase2':
-        from benchmarks.ascend.optimizer_phase2_artifacts import freeze_campaign
+        from benchmarks.ascend.optimizer_evidence import freeze_campaign
         return freeze_campaign(root)
     if phase not in {'adaptive-phase2', 'target-driven-phase2'}:
         raise ValueError('unsupported legacy Phase 2 format; native reviewed adaptive lineage required')

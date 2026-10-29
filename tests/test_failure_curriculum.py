@@ -5,11 +5,11 @@ from dataclasses import replace
 import pytest
 
 from benchmarks.ascend.failure_curriculum import FailureCurriculum, select_feedback, retry_spec, link_retry
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
 from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent, CurriculumContext
 from optimizer.jobs import canonical, sha
-from test_phase2_feedback import campaign, write
+from test_feedback import campaign, write
 from test_a5_phase1_adaptive import _project, _wave, _result
 
 
@@ -188,7 +188,7 @@ def test_feedback_artifact_reads_preserve_selection_turn_accounting(tmp_path):
     agent.failure_feedback = feedback
     from benchmarks.a5kernels.phase1_curriculum_selector import PriorOutcome, ProjectInformation
     prior = PriorOutcome('working', ProjectInformation.from_project(_project('working', 'gm-ub-movement')), True, 'passed')
-    context = CurriculumContext('learn', 1, 'a'*64, (), (prior,), phase2_feedback=feedback.context({}))
+    context = CurriculumContext('learn', 1, 'a'*64, (), (prior,), feedback=feedback.context({}))
     _, session = agent.select(context)
     assert session.turns == 2
 
@@ -226,7 +226,7 @@ def test_fixed_task_retry_skips_goal_selection_and_qualifies_original(tmp_path):
 
 
 def test_retry_freezes_original_expanded_cases_and_rejects_changed_suite(tmp_path):
-    from test_phase2_optimizer_execution import executor
+    from test_optimizer_execution import executor
     execution, agent, backend = executor(tmp_path, [])
     frozen = dict(execution.task['submission'])
     expected = dict(frozen_submission=frozen, suite_sha256='suite', policy={'name':'frozen'})
@@ -241,7 +241,7 @@ def test_retry_freezes_original_expanded_cases_and_rejects_changed_suite(tmp_pat
 
 
 def test_retry_reads_actual_retained_baseline_and_refuses_missing_original(tmp_path):
-    from test_phase2_optimizer_execution import executor
+    from test_optimizer_execution import executor
     execution, _, backend = executor(tmp_path, [])
     original = backend.prepare
     frozen = dict(execution.task['submission'])
@@ -353,8 +353,8 @@ def test_proposals_and_rejections_do_not_commit_failure_feedback(tmp_path, termi
 
 
 def test_retry_normalizes_omitted_max_cases_in_retained_runtime(tmp_path):
-    from test_phase2_optimizer_execution import executor, snapshot
-    from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+    from test_optimizer_execution import executor, snapshot
+    from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
     fixture, agent, backend = executor(tmp_path, [])
     config = {k:v for k,v in fixture.config.items() if k != 'max_cases'}
     source = tmp_path/'original-campaign'
@@ -569,7 +569,7 @@ def test_all_infrastructure_feedback_beyond_first_page_can_defer_without_project
         calls.append(messages)
         if len(calls) == 1:
             payload = json.loads(messages[-1]['content'].rsplit('\n', 1)[-1])
-            manifest.extend(next(row['selected'] for row in payload['phase2_feedback']
+            manifest.extend(next(row['selected'] for row in payload['feedback']
                                  if row['role'] == 'selection-index'))
             assert len(manifest) == 10
         else:

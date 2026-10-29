@@ -5,7 +5,7 @@ import pytest
 from benchmarks.ascend.phase2_optimizer_continuation import campaign_seed, compose_prior_campaigns
 from optimizer.jobs import canonical, sha
 from optimizer.memory import verify_snapshot
-from test_optimizer_phase2_artifacts import campaign, write
+from test_optimizer_evidence import campaign, write
 
 
 def pin(root):

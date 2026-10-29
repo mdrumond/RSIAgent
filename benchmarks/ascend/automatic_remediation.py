@@ -10,7 +10,7 @@ from pathlib import Path
 
 from optimizer.jobs import atomic, canonical, sha
 from .failure_curriculum import FailureCurriculum
-from .phase2_feedback import FeedbackStore
+from .feedback import FeedbackStore
 
 
 class FailureTimeBudget:
@@ -243,7 +243,7 @@ class AutomaticRemediation:
 def optimizer_retry_adapter(runner, store, config):
     """Retry external frozen acceptance using current committed Phase 1 knowledge."""
     from .failure_curriculum import retry_spec
-    from .phase2_optimizer_execution import OptimizerTaskExecutor
+    from .optimizer_execution import OptimizerTaskExecutor
     from optimizer.memory import freeze_committed_phase1
 
     def retry(row, directory, seconds):
@@ -289,7 +289,7 @@ def optimizer_retry_adapter(runner, store, config):
         outcome = store._outcome(directory, attempt, dict(target='a3', language='ascend-c'), report)
         outcome.update(source_type=row['outcome']['source_type'],
             original_spec=row['outcome']['original_spec'], completed=True)
-        from .phase2_feedback import _category
+        from .feedback import _category
         outcome['category'] = _category(outcome['task'], result)
         store._put(outcome, report['warnings'])
         refs = {}

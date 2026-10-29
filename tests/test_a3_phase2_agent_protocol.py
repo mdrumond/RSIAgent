@@ -20,7 +20,7 @@ from benchmarks.a3kernels.phase2_protocol import (
     OwnedAgent,
     PracticeResult,
 )
-from benchmarks.ascend.phase2_time import Phase2TimeBudget
+from benchmarks.ascend.campaign_time import CampaignTimeBudget
 from core.self_evolving_loop import TargetVerdict
 
 
@@ -194,7 +194,7 @@ def test_elapsed_time_stops_new_target_admission(tmp_path):
     )
 
     now = [0.]
-    adapter.time = Phase2TimeBudget(
+    adapter.time = CampaignTimeBudget(
         tmp_path / 'test-time', 9, clock=lambda: now[0])
     work = adapter.hooks.actor_work
     def timed_work(*args):

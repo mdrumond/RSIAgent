@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from benchmarks.ascend.phase2_optimizer_execution import OptimizerTaskExecutor
+from benchmarks.ascend.optimizer_execution import OptimizerTaskExecutor
 from optimizer.control import ObservationUnavailable, WorkerStopped
 from optimizer.jobs import canonical, sha
 

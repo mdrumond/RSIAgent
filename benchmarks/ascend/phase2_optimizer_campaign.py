@@ -5,7 +5,7 @@ import base64
 import json
 import time
 
-from .phase2_time import Phase2TimeBudget
+from .campaign_time import CampaignTimeBudget
 from pathlib import Path
 
 from optimizer.jobs import JobStore, atomic, canonical, sha
@@ -23,12 +23,12 @@ class OptimizerPhase2Coordinator:
         verify_snapshot(snapshot)
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        from .phase2_feedback import FeedbackStore
+        from .feedback import FeedbackStore
         self.feedback = FeedbackStore(feedback_root or self.root / 'feedback')
         self.objective, self.seed, self.complete = objective, snapshot, complete
         self.factory, self.knowledge, self.selector = execution_factory, query_knowledge, selector
         self.fixed_task = fixed_task
-        self.time = Phase2TimeBudget(self.root, max_seconds, max_practice_seconds, clock=clock)
+        self.time = CampaignTimeBudget(self.root, max_seconds, max_practice_seconds, clock=clock)
         seed_path = self.root / "seed-memory.json"
         if seed_path.exists():
             if json.loads(seed_path.read_bytes()) != snapshot:
