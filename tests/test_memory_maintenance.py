@@ -27,7 +27,7 @@ def seed(campaign):
 
 
 def observe(campaign, ledger, base, *, project_id='consumer', number=0,
-            usefulness='not-useful', correctness='contradicted', investigate=False, result_bytes=b'new host result\n'):
+            usefulness='not-useful', correctness='contradicted', investigate=False, result_bytes=b'new host result\n', objective='learn tails'):
     source = campaign.artifacts.put_bytes(b'new source\n')
     result = campaign.artifacts.put_bytes(result_bytes)
     exposure = ledger.access('access-' + str(number), **base, campaign_id=str(campaign.root.resolve()),
@@ -36,7 +36,7 @@ def observe(campaign, ledger, base, *, project_id='consumer', number=0,
         usefulness=usefulness, correctness=correctness, investigate=investigate,
         reason='Current project provides independent evidence', evidence=[result])],
         memory_resolutions=[], retirement_checks=[])
-    record = dict(objective='learn tails', review=review, review_sha256=campaign.artifacts.put_json(review),
+    record = dict(objective=objective, review=review, review_sha256=campaign.artifacts.put_json(review),
         outcome=dict(host_verified=True,source_sha256=source,artifacts={'source':source,'result':result},observations={}))
     campaign.state['projects'][project_id] = record
     campaign.memory_maintenance.observe(project_id,record)
@@ -622,3 +622,26 @@ def test_retirement_commit_retains_new_proof_before_origin_disappears(tmp_path,m
     prepared=other.memory_maintenance.prepare(ProjectReview('next',src,True,{'source':src}))
     assert prepared.retired_memories[0]['evidence']==[proof]
     assert other.memory_maintenance.read_artifact(proof,remaining_seconds=1)==b'new retirement-only independent evidence\n'
+
+
+def test_shared_later_subject_repair_runs_at_the_consumers_reachable_frontier(tmp_path):
+    subjects=[Subject('early','learn tails',1),Subject('later','learn reductions',1)]
+    ledger=MemoryLedger(tmp_path/'shared.sqlite3')
+    def make(name):
+        return SubjectCampaign(tmp_path/name,subjects,b'',select_wave=lambda *a,**kw:[],
+            execute=lambda *a,**kw:None,verifier=None,complete=lambda *a,**kw:None,
+            memory_ledger=ledger)
+    origin=make('advanced');base=seed(origin)
+    origin.scheduler.start_wave('early-wave','a'*64)
+    origin.scheduler.complete_wave('early-wave',[])
+    origin.scheduler.decide(dict(action='advance',reason='Initial subject complete',evidence=['a'*64]))
+    observe(origin,ledger,base,objective='learn reductions')
+    consumer=make('beginner')
+    consumer.memory_maintenance.reconcile()
+    local=consumer.memory_maintenance.prioritize()
+    assert consumer.scheduler.state()['frontier']==0
+    assert local['subject_id']=='early'
+    assert consumer.scheduler.context()['current_subject']['subject_id']=='early'
+    assert consumer.memory_maintenance.obligations()[0]['subject_id']=='later'
+    consumer.memory_maintenance.reconcile()
+    assert consumer.scheduler.state()['repairs'][local['repair_id']]['subject_id']=='early'

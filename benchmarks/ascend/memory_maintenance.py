@@ -76,8 +76,14 @@ class MemoryMaintenance:
     def project_obligations(self):
         """Any campaign can resume shared work; an abandoned owner holds no lease."""
         scheduler = self.campaign.scheduler
+        state = scheduler.state()
         for row in self.obligations():
-            subject = row['subject_id'] if row['subject_id'] in scheduler.index else scheduler.subjects[0].subject_id
+            projected = state['repairs'].get(row['repair_id'])
+            subject = projected['subject_id'] if projected else row['subject_id']
+            if subject not in scheduler.index or scheduler.index[subject] > state['frontier']:
+                current = state['current']
+                reachable = current if current is not None else min(state['frontier'], len(scheduler.subjects)-1)
+                subject = scheduler.subjects[reachable].subject_id
             scheduler.add_repair(row['repair_id'], subject, row['project_id'],
                 row['reason'] + ' Resolve memory maintenance explicitly: ' + json.dumps(dict(
                     kind=row['kind'], memory_id=row['memory_id'], version=row['version']), sort_keys=True),
