@@ -155,7 +155,7 @@ def test_semantic_memory_candidate_is_selected_without_query_token_overlap(tmp_p
     assert 'prismatic' not in json.dumps(record).casefold()
     result = service.query({'query': 'prismatic', 'limit': 1}, remaining_seconds=60,
         **({'snapshot': memory.snapshot(), 'branch_root': tmp_path / 'actor'} if frozen else {}))
-    assert [row['memory_id'] for row in result['memories']] == ['target']
+    assert [row['memory_id'] for row in result['memories']] == [selected['memory_id']]
     assert result['hits'][0]['citation']['collection'] == 'subject-memory-' + selected['version']
 
 

@@ -117,7 +117,7 @@ def test_quarantine_filters_live_and_frozen_queries_and_keeps_repair_base(tmp_pa
     frozen = memory.snapshot()
     service.ledger.transition(admitted['version'], 'quarantined', event_id='q', reason='Conflicting result', evidence=[EVIDENCE])
     assert memory.records() == [] and json.loads(memory.snapshot())['memories'] == []
-    assert memory.read(admitted['version'])['memory_id'] == 'lesson'
+    assert memory.read(admitted['version'])['memory_id'] == admitted['memory_id']
     assert service.query({'query':'vector'}, remaining_seconds=60, snapshot=frozen, branch_root=tmp_path/'old-actor')['memories'] == []
     replacement = memory.accept('fixed', dict(proposal(store), operation='append', base_versions=[admitted]), {})
     assert [digest(row) for row in memory.records()] == [replacement['version']]
@@ -130,7 +130,7 @@ def test_only_selected_actor_delivery_is_counted_and_replay_is_idempotent(tmp_pa
     admitted = memory.accept('lesson', proposal(store), {})
     memory.accept('other', proposal(store, 'Vector other increment'), {})
     service.query({'query':'vector', 'limit':1}, remaining_seconds=60)
-    assert service.ledger.stats('lesson')['accesses'] == 0
+    assert service.ledger.stats(admitted['memory_id'])['accesses'] == 0
     actor = context(tmp_path/'actor', memory.snapshot())
     reply = service.actor_query({'query':'vector', 'limit':1}, actor, remaining_seconds=60)
     service.actor_query({'query':'vector', 'limit':1}, actor, remaining_seconds=60)
@@ -175,7 +175,7 @@ def test_existing_accepted_catalog_initializes_zero_counters_without_restoring_r
     service.ledger.transition(admitted['version'], 'retired', event_id='r', reason='Unsupported claim', evidence=[EVIDENCE])
     reopened = SubjectMemory(tmp_path/'memory', b'initial guidance', ledger=service.ledger)
     assert reopened.records() == []
-    assert service.ledger.stats('lesson')['accesses'] == 0
+    assert service.ledger.stats(admitted['memory_id'])['accesses'] == 0
     assert service.ledger.status(admitted['version']) == 'retired'
 
 
@@ -269,7 +269,7 @@ def test_resume_recovers_shared_publication_after_local_receipt_write_failure(tm
     ledger = MemoryLedger(tmp_path/'ledger.sqlite3'); memory = SubjectMemory(tmp_path/'a', ledger=ledger)
     base = memory.accept('lesson', record()['proposal'], {})
     changed = dict(record()['proposal'], base_versions=[base], summary='Source-approved correction')
-    proposed = dict(memory_id='lesson', proposal=changed, provenance={})
+    proposed = dict(memory_id=base['memory_id'], proposal=changed, provenance={})
     version = digest(proposed)
     original_atomic = module.atomic
     index_calls = []
@@ -286,10 +286,10 @@ def test_resume_recovers_shared_publication_after_local_receipt_write_failure(tm
     assert 'correction' not in json.loads((memory.root/'active.json').read_bytes())['admissions']
     if superseded:
         other = SubjectMemory(tmp_path/'b', ledger=MemoryLedger(ledger.path))
-        latest = other.accept('next', dict(changed, base_versions=[dict(memory_id='lesson', version=version)], summary='Later approved revision'), {})
+        latest = other.accept('next', dict(changed, base_versions=[dict(memory_id=base['memory_id'], version=version)], summary='Later approved revision'), {})
     resumed = SubjectMemory(memory.root, ledger=MemoryLedger(ledger.path), index=memory.index)
     receipt = resumed.accept('correction', changed, {})
-    assert receipt == dict(memory_id='lesson', version=version)
+    assert receipt == dict(memory_id=base['memory_id'], version=version)
     assert index_calls == [version]
     assert json.loads((memory.root/'active.json').read_bytes())['admissions']['correction'] == receipt
     assert len(ledger.report()) == (3 if superseded else 2)
@@ -323,15 +323,48 @@ def test_cross_campaign_actor_delivery_keeps_sources_when_origin_is_unavailable(
     result = other.actor_query({'query':'vector','limit':1}, actor, remaining_seconds=60)
     assert source in result.admitted_artifacts
     assert actor.artifacts.read_bytes(source).startswith(b'def kernel')
-    assert other.ledger.stats('shared-lesson')['accesses'] == 1
+    assert other.ledger.stats(admitted['memory_id'])['accesses'] == 1
 
 
 def test_compacted_query_counts_inline_memories_not_unread_index_entries(tmp_path):
     service, memory, store, _ = setup(tmp_path)
-    versions = [memory.accept('lesson-'+str(i), proposal(store, 'Vector increment '+str(i)), {})['version'] for i in range(8)]
+    receipts = [memory.accept('lesson-'+str(i), proposal(store, 'Vector increment '+str(i)), {}) for i in range(8)]
+    versions = [row['version'] for row in receipts]
     actor = context(tmp_path/'actor', memory.snapshot())
     reply = service.actor_query({'query':'vector','limit':20}, actor, remaining_seconds=60)
     assert reply.observation['omitted_results'] > 0
     inline = {row['citation']['collection'] for row in reply.observation['results']}
     for i,version in enumerate(versions):
-        assert service.ledger.stats('lesson-'+str(i))['accesses'] == int('subject-memory-'+version in inline)
+        assert service.ledger.stats(receipts[i]['memory_id'])['accesses'] == int('subject-memory-'+version in inline)
+
+
+def test_campaign_project_ids_do_not_collide_in_shared_memory_catalog(tmp_path):
+    ledger = MemoryLedger(tmp_path/'ledger.sqlite3')
+    first = SubjectMemory(tmp_path/'one', ledger=ledger)
+    second = SubjectMemory(tmp_path/'two', ledger=MemoryLedger(ledger.path))
+    a = first.accept('proj-001', record(summary='Vector tails')['proposal'], {})
+    b = second.accept('proj-001', record(summary='Reduction widths')['proposal'], {})
+    assert a['memory_id'] != b['memory_id']
+    assert len(first.records()) == len(second.records()) == 2
+    assert second.accept('proj-001', record(summary='Reduction widths')['proposal'], {}) == b
+
+
+def test_existing_accepted_memory_archives_evidence_before_shared_bootstrap(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.ascend.subject_knowledge import SubjectKnowledge
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from test_a5_knowledge import FakeEmbeddings
+    store = ContentAddressedArtifacts(tmp_path/'origin/artifacts')
+    legacy = SubjectMemory(tmp_path/'origin/memory')
+    receipt = legacy.accept('existing', proposal(store), {})
+    kdb = tmp_path/'shared.sqlite3'
+    service = SubjectKnowledge(tmp_path/'origin', store, lambda: upgraded,
+        paths=SimpleNamespace(kdb=kdb), embeddings=FakeEmbeddings(), reference_query=lambda *a, **kw: ())
+    upgraded = SubjectMemory(legacy.root, index=service.index, ledger=service.ledger)
+    consumer_store = ContentAddressedArtifacts(tmp_path/'consumer/artifacts')
+    other = SubjectKnowledge(tmp_path/'consumer', consumer_store, lambda: consumer,
+        paths=SimpleNamespace(kdb=kdb), embeddings=FakeEmbeddings(), reference_query=lambda *a, **kw: ())
+    consumer = SubjectMemory(tmp_path/'consumer/memory', ledger=other.ledger)
+    store.root.rename(tmp_path/'origin-unavailable')
+    reply = other.actor_query({'query':'vector','limit':1}, context(tmp_path/'consumer/actor', consumer.snapshot()), remaining_seconds=60)
+    assert consumer.read(receipt['version'])['proposal']['after']['sha256'] in reply.admitted_artifacts

@@ -31,7 +31,10 @@ class SubjectMemory:
                 raise ValueError('initial memory changed')
             if self.ledger is not None:
                 for version in state['active'].values():
-                    self.ledger.bootstrap(self.read(version))
+                    record = self.read(version)
+                    if self.ledger.status(version) is None and self.index is not None:
+                        self.index(version, record)
+                    self.ledger.bootstrap(record)
 
     @contextmanager
     def transaction(self):
@@ -77,7 +80,9 @@ class SubjectMemory:
             bases = proposal['base_versions']
             if len({row['memory_id'] for row in bases}) != len(bases):
                 raise ValueError('memory bases must identify distinct memories')
-            memory_id = bases[0]['memory_id'] if bases else review_id
+            memory_id = (bases[0]['memory_id'] if bases else
+                         digest(dict(memory_root=str(self.root.resolve()), review_id=review_id))
+                         if self.ledger is not None else review_id)
             record = dict(memory_id=memory_id, proposal=proposal, provenance=provenance)
             version = digest(record)
             if self.ledger is not None:
