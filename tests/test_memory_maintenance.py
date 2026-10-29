@@ -167,14 +167,14 @@ def test_linked_memory_reads_count_only_returned_content_and_enforce_revocation(
     page={'text_available':True,'page_bytes':10}
     service.actor_read({'sha256':source},actor,page)
     service.actor_read({'sha256':source},actor,page)
-    assert service.ledger.stats('lesson',base['version'])['accesses']==2
-    assert service.ledger.stats('lesson',base['version'])['exposures']==1
+    assert service.ledger.stats(base['memory_id'],base['version'])['accesses']==2
+    assert service.ledger.stats(base['memory_id'],base['version'])['exposures']==1
     service.ledger.transition(base['version'],'quarantined',event_id='conflict',reason='Conflicting evidence',evidence=['e'*64])
     with pytest.raises(ValueError,match='withdrawn'):
         service.actor_read({'sha256':source},actor,page)
     unrelated=store.put_bytes(b'unrelated reference')
     service.actor_read({'sha256':unrelated},actor,page)
-    assert service.ledger.stats('lesson',base['version'])['accesses']==2
+    assert service.ledger.stats(base['memory_id'],base['version'])['accesses']==2
 
 
 def test_project_source_read_keeps_independent_authority_when_memory_is_withdrawn(tmp_path):
@@ -230,13 +230,13 @@ def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
     driver.observe_memory_delivery=service.actor_delivery
     driver.observe_knowledge_read=service.actor_read
     driver(request)
-    assert service.ledger.stats('lesson')['accesses']==1
+    assert service.ledger.stats(base['memory_id'])['accesses']==1
     service.ledger.transition(base['version'],'quarantined',event_id='bad',reason='Conflict',evidence=['e'*64])
     filtered=service.actor_snapshot(frozen)
     assert json.loads(filtered)['memories']==[]
     actor.expected_memory=filtered
     driver(request)
-    assert service.ledger.stats('lesson')['accesses']==1
+    assert service.ledger.stats(base['memory_id'])['accesses']==1
 
 
 def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
@@ -261,7 +261,7 @@ def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
     result=service.optimizer_observer(tmp_path/'optimizer-project')('read-memory',snapshot,
         {'action':{'index':0},'result':memory.read(base['version'])},'withdrawn-read')
     assert result['status']=='tool-error'
-    assert service.ledger.stats('lesson')['accesses']==3
+    assert service.ledger.stats(base['memory_id'])['accesses']==3
 
 
 @pytest.mark.parametrize('action',['restore','retire'])

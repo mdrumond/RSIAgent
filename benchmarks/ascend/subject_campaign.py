@@ -249,8 +249,9 @@ class SubjectCampaign:
             for repair_id in record.get('repairs', []):
                 linked_repairs.setdefault(repair_id, []).append(record)
         obligations = self.scheduler.state()['repairs']
+        memory_repairs = {row['repair_id'] for row in self.memory_maintenance.obligations(open_only=False)} if self.memory_maintenance else set()
         for repair_id, records in linked_repairs.items():
-            if repair_id.startswith('memory-'):
+            if repair_id in memory_repairs:
                 continue  # Explicit memory resolutions, never host success alone, settle these.
             if (obligations[repair_id]['status'] == 'open'
                     and all(row['review']['decision'] == 'accept' for row in records)):
