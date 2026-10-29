@@ -263,7 +263,7 @@ class _ProjectActions:
         if action.kind == "read-artifact":
             try:
                 page = artifact_page_presentation(action.payload, self.read_artifacts)
-                if self.admitted.get(action.payload['sha256']) == 'knowledge' and self.observe_knowledge_read is not None:
+                if self.admitted.get(action.payload['sha256']) in {None, 'knowledge'} and self.observe_knowledge_read is not None:
                     self.observe_knowledge_read(action.payload, self._action_context(action.payload), page)
             except (ValueError, FileNotFoundError) as exc:
                 return self._observation({"error": str(exc)})
@@ -565,6 +565,8 @@ class AdaptiveActorProjectExecutor:
         )
         self.immutable_context = immutable_context
         self.observe_knowledge_read = None
+        self.prepare_memory = None
+        self.observe_memory_delivery = None
         self.actor_role = 'writer'
         self.diagnostic_instructions = diagnostic_instructions
         self.trace_recorder_factory = trace_recorder_factory
@@ -588,7 +590,8 @@ class AdaptiveActorProjectExecutor:
             raise ValueError("kdb-only Actor memory delivery does not support nonempty initial memory")
         # The host keeps the retrieval snapshot on request. Only this presentation
         # is admitted into the Actor's context/artifact namespace before a query.
-        presented_memory = b"{}" if request.actor_memory_delivery == "kdb-only" else request.pre_wave_memory
+        presented_memory = b"{}" if request.actor_memory_delivery == "kdb-only" else (
+            self.prepare_memory(request.pre_wave_memory) if self.prepare_memory is not None else request.pre_wave_memory)
         started = time.monotonic()
         remaining = getattr(request, "remaining_seconds", None)
         if remaining is not None and remaining <= 0:
@@ -678,8 +681,11 @@ class AdaptiveActorProjectExecutor:
                         "read-artifact. A compatible attached case satisfies the negative-example "
                         "requirement; repair it and host-verify your current source. Do not invent "
                         "a new mismatch. Incompatible cases are context only.\n")
+        memory_view = memory_presentation(presented_memory, artifacts)
+        if self.observe_memory_delivery is not None:
+            self.observe_memory_delivery(memory_view, actions._action_context({'opening_memory': memory_sha256}))
         opening += prepared.instruction + "\nPre-wave memory (immutable, readable index): " + json.dumps(
-            memory_presentation(presented_memory, artifacts),
+            memory_view,
             sort_keys=True, separators=(",", ":"))
         opening += ('\nInspect full retained evidence or memory with '
                     '{"read-artifact":{"sha256":"<hash>","offset":0,"limit":8192}}. '

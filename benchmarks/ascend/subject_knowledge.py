@@ -192,21 +192,55 @@ class SubjectKnowledge:
             citations=tuple(Citation.from_mapping(hit['citation']) for hit in selected),
             admitted_artifacts=admitted)
 
+    def actor_snapshot(self, snapshot):
+        envelope = json.loads(snapshot)
+        if envelope.get('schema') == 'subject-memory-snapshot-v1':
+            envelope['memories'] = [row for row in envelope['memories'] if self.ledger.available(memory_digest(row))]
+        encoded = canonical(envelope)
+        self.store.put_bytes(encoded)
+        return encoded
+
+    def actor_delivery(self, presentation, context):
+        for row in presentation.get('memories', []):
+            self.ledger.access(context.access_event_id + ':' + row['version'],
+                memory_id=row['memory_id'], version=row['version'], campaign_id=str(self.root.resolve()),
+                project_id=context.request.spec.project_id, actor_id=context.actor_id, actor_role=context.actor_role)
+
     def actor_read(self, payload, context, page):
-        """Count returned linked content only for versions this actor retrieved."""
+        """Guard/count actual query-linked or indexed memory bytes, never pool hits."""
         sha = payload['sha256']
-        versions = {row['version'] for row in self.ledger.artifact_versions(sha)}
-        delivered = [row for row in self.ledger.exposures(str(self.root.resolve()), context.request.spec.project_id)
-                     if row['actor_id'] == context.actor_id and row['actor_role'] == context.actor_role
-                     and row['version'] in versions]
-        if not delivered:
+        candidates = {row['version']: row for row in self.ledger.exposures(str(self.root.resolve()), context.request.spec.project_id)
+                      if row['actor_id'] == context.actor_id and row['actor_role'] == context.actor_role
+                      and row['version'] in {item['version'] for item in self.ledger.artifact_versions(sha)}}
+        envelope = json.loads(context.request.pre_wave_memory)
+        indexed = getattr(context.request, 'actor_memory_delivery', 'indexed') == 'indexed'
+        snapshot = canonical(envelope)
+        if indexed:
+            try:
+                retained = self.store.read_bytes(sha)
+                candidate = json.loads(retained)
+                if isinstance(candidate, dict) and candidate.get('schema') == 'subject-memory-snapshot-v1':
+                    snapshot, envelope = retained, candidate
+            except (FileNotFoundError, ValueError, UnicodeDecodeError):
+                pass
+        bundle = sha == hashlib.sha256(snapshot).hexdigest()
+        offset = page.get('offset', 0)
+        for record in envelope.get('memories', []) if indexed else []:
+            version = memory_digest(record)
+            encoded = canonical(record)
+            position = snapshot.find(encoded)
+            overlaps = bundle and position >= 0 and offset < position + len(encoded) and offset + page.get('page_bytes', 0) > position
+            if sha in {version, hashlib.sha256(canonical(record['proposal'])).hexdigest(), *memory_artifacts(record)} or overlaps:
+                candidates[version] = dict(memory_id=record['memory_id'], version=version,
+                    campaign_id=str(self.root.resolve()), project_id=context.request.spec.project_id,
+                    actor_id=context.actor_id, actor_role=context.actor_role)
+        if not candidates:
             return  # Reference/project bytes do not inherit unrelated memory authority.
-        available = [row for row in delivered if self.ledger.available(row['version'])]
-        if not available:
+        available = [row for row in candidates.values() if self.ledger.available(row['version'])]
+        if not available or bundle and len(available) != len(candidates):
             raise ValueError('memory artifact withdrawn pending evidence-backed resolution')
         if not page.get('text_available') or not page.get('page_bytes'):
             return
         for row in available:
-            self.ledger.require_actor_artifact(sha, row['version'])
             self.ledger.access(context.access_event_id + ':' + row['version'],
                 **{key: row[key] for key in ('memory_id','version','campaign_id','project_id','actor_id','actor_role')})

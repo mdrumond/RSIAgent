@@ -278,6 +278,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             return knowledge.actor_query(payload, context, remaining_seconds=allowance)
         actor.query_knowledge = actor_knowledge
         actor.observe_knowledge_read = knowledge.actor_read
+    actor.prepare_memory = knowledge.actor_snapshot
+    actor.observe_memory_delivery = knowledge.actor_delivery
 
     def execute(item, snapshot, directory, *, remaining_seconds):
         if memory_delivery == 'kdb-only' and json.loads(snapshot).get('initial_memory'):
