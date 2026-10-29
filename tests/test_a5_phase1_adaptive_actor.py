@@ -972,7 +972,8 @@ def test_subject_lesson_reaches_actual_actor_and_linked_artifact_tools_under_har
 
 
 @pytest.mark.parametrize('durable_turn',[None,43])
-def test_actor_restarts_distinguish_new_queries_and_deduplicate_retained_turn(tmp_path,durable_turn):
+@pytest.mark.parametrize('traced',[False,True])
+def test_actor_restarts_distinguish_new_queries_and_deduplicate_retained_turn(tmp_path,durable_turn,traced):
     captured=[]
     def query(payload,context):
         captured.append(context.access_event_id)
@@ -983,7 +984,9 @@ def test_actor_restarts_distinguish_new_queries_and_deduplicate_retained_turn(tm
             return super().__call__(instruction,**kwargs)
     executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'evidence.jsonl'))
     actor=Actor(['{"query-knowledge":{"query":"vector"}}','{"write":{"slot":"kernel","content":"fixed source"}}','{"run":{}}','{"submit":{}}'])
-    adapter=AdaptiveActorProjectExecutor(executor,actor,object(),query_knowledge=query)
+    from benchmarks.ascend.training_traces import recorder_factory
+    trace = recorder_factory(phase='phase1',round_id='memory-event',model='fixture',source_manifest_sha256='a'*64) if traced else None
+    adapter=AdaptiveActorProjectExecutor(executor,actor,object(),query_knowledge=query,trace_recorder_factory=trace)
     request=_request(tmp_path,executor)
     adapter(request);adapter(request)
     assert len(captured)==2

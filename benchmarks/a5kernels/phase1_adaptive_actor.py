@@ -498,6 +498,14 @@ class _ObservedActions:
     def __getattr__(self, name):
         return getattr(self.actions, name)
 
+    @property
+    def action_event_turn(self):
+        return self.actions.action_event_turn
+
+    @action_event_turn.setter
+    def action_event_turn(self, value):
+        self.actions.action_event_turn = value
+
     def __call__(self, action):
         return self.observe(action)
 
