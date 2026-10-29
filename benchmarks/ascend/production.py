@@ -145,7 +145,8 @@ class NativeProjectPool:
     manages_actor_time = True
     """Exclusive slots; quarantine uncertain workers without poisoning healthy peers."""
 
-    def __init__(self, actors):
+    def __init__(self, actors, *, stopped=lambda: False):
+        self.stopped = stopped
         self.actors = Queue()
         self.failure = None
         self.lock = Lock()
@@ -160,17 +161,25 @@ class NativeProjectPool:
         from benchmarks.a5kernels.phase1_wave_runtime import (
             ProjectAdmissionTimeout, SemanticProjectFailure,
         )
-        import time
         if getattr(request, 'remaining_seconds', None) is not None and request.remaining_seconds <= 0:
             raise TimeoutError('actor work allocation exhausted before worker admission')
         from .actor_time import preparation
+        from .actor_control import ActorControl
+        branch = getattr(request, 'branch_root', None)
+        control = ActorControl(Path(branch) / 'actor' if branch is not None else None)
         with preparation('waiting for a native worker'):
             with self.condition:
-                while self.actors.empty():
+                while True:
+                    if self.stopped() or control.status()['stop_requested']:
+                        error = TimeoutError('operator stopped native worker admission')
+                        error.interruption_reason = 'operator-stop'
+                        raise error
+                    if not self.actors.empty():
+                        actor = self.actors.get_nowait()
+                        break
                     if not self.live:
                         raise RuntimeError("native worker pool interrupted; settle retained operations before resume") from self.failure
                     self.condition.wait(timeout=.1)
-                actor = self.actors.get_nowait()
         reusable = True
         called = False
         try:

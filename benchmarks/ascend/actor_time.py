@@ -50,9 +50,13 @@ class ActorWorkBudget:
             raise ValueError('attempt time allocation changed')
         self.seconds = state.get('max_seconds', seconds)
         self.elapsed = state.get('elapsed_seconds', 0)
-        if state.get('active_since') is not None:
-            self.elapsed += max(0, wall_clock() - state['active_since'])
+        recovered = max(0, wall_clock()-state['active_since']) if state.get('active_since') is not None else 0
+        self.elapsed += recovered
         self.actors = state.get('actors', {})
+        for actor in self.actors.values():
+            if actor.get('state') == 'working':
+                actor['work_seconds'] = actor.get('work_seconds', 0) + recovered
+                actor.update(state='blocked', reason='interrupted work requires observation')
         self.preparation = state.get('preparation_seconds', 0)
         self.wall = state.get('wall_seconds', 0)
         self.workers, self.lock = {}, RLock()
@@ -145,7 +149,7 @@ class WorkLease:
     def remaining(self):
         remaining = self.budget.remaining()
         used = self.budget.actors.get(self.name, {}).get('work_seconds', 0)-self.baseline
-        return max(0, min(remaining, self.limit-used))
+        return max(0, min(remaining, self.limit-used, *(tag.remaining() for tag in self.tags)))
 
     @contextmanager
     def scope(self, *, work=False, reason=None):
@@ -237,6 +241,12 @@ def prepare_until_ready(callback, *, stopped=lambda: False, sleep=time.sleep):
                  }
     while True:
         if stopped(): raise TimeoutError('operator stopped preparation')
+        worker, budget = current_worker(), current_budget()
+        remaining = worker.remaining() if worker is not None else budget.remaining() if budget is not None else float('inf')
+        if remaining <= 0:
+            error = TimeoutError('actor work allocation exhausted during preparation')
+            error.interruption_reason = 'deadline-exhausted'
+            raise error
         try:
             return callback()
         except ProjectInfrastructureError as error:
@@ -260,3 +270,29 @@ def linked_work_budget(budget):
                 if not any(budget in worker.tags for worker in owner.workers.values()):
                     owner._save()
                     owner.linked_budgets.discard(budget)
+
+
+def current_worker(): return _lease.get()
+
+
+def actor_clock():
+    worker = current_worker()
+    if worker is None: return time.time()
+    worker.budget.remaining()
+    return worker.budget.actors.get(worker.name, {}).get('work_seconds', 0)
+
+
+def preparing(reason):
+    def decorate(callback):
+        @wraps(callback)
+        def call(*args, **kwargs):
+            with preparation(reason): return callback(*args, **kwargs)
+        return call
+    return decorate
+
+
+def detach_actor_budget():
+    """Forked provider supervisors must not become owners of controller ledgers."""
+    _current.set(None)
+    _lease.set(None)
+    _linked.set(())

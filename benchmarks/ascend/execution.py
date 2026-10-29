@@ -193,6 +193,9 @@ class LocalProcessRunner:
     def run(self, argv, directory, *, cwd=None, env=None, stdin=None):
         process = None
         deadline = min(self.deadline, _deadline.get(), time.monotonic() + self.config.get('max_seconds', 600))
+        # A dispatched process owns a fixed numeric expiry, not a live controller view.
+        if hasattr(deadline, 'endpoint'):
+            deadline = deadline.endpoint()
         directory = Path(directory).resolve()
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / 'transport.json'

@@ -10,7 +10,7 @@ from coding.pi.rpc import PiCancelled
 
 from .cpl_native import CplNativeCandidateBackend, CplNativeMeasurements
 from .execution import _deadline, process_deadline
-from .actor_time import current_budget, preparation, preparation_active, prepare_until_ready
+from .actor_time import current_budget, preparation, preparation_active, prepare_until_ready, current_worker
 from .phase1_cli import load_native_config
 from .subject_runtime import compose_production
 from .wave_environment import NativeWaveEnvironmentCheck
@@ -101,9 +101,11 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     def remaining():
         if stop is not None and stop.exists():
             return 0
+        budget, worker = current_budget(), current_worker()
+        if budget is not None and (worker.remaining() if worker is not None else budget.remaining()) <= 0:
+            return 0
         if preparation_active():
             return float('inf')
-        budget = current_budget()
         return max(0, min(budget.remaining() if budget else max_seconds,
                           _deadline.get() - time.monotonic()))
     remaining.stop_requested = lambda: stop is not None and stop.exists()
@@ -142,6 +144,8 @@ def compose_cpl_production(settings, *, target, root, initial_memory, max_second
     ensure_environment.invalidate = admission.invalidate
     ensure_environment.reserve = lambda: native_reservation(operation_root, remaining)
     actor = bound['actor']
+    if hasattr(actor, 'stopped'):
+        actor.stopped = remaining.stop_requested
     actor.executor = _CheckedExecutor(actor.executor, ensure_environment)
     def checked_measurement(callback):
         def measure(*args, **kwargs):

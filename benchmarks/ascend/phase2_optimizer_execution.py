@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from contextlib import contextmanager, ExitStack
 import time
 
 from optimizer.agent import OptimizerAgent
@@ -64,7 +65,8 @@ class OptimizerTaskExecutor:
     def set_remaining_seconds(self, remaining_seconds):
         if remaining_seconds <= 0:
             raise WorkerStopped('Phase 2 elapsed-time budget exhausted')
-        self.deadline = time.monotonic() + remaining_seconds
+        from .actor_time import live_deadline
+        self.deadline = live_deadline(time.monotonic() + remaining_seconds)
 
     def _event(self, kind):
         return next((event['payload'] for event in reversed(self.store.events(self.job_id))
@@ -84,15 +86,24 @@ class OptimizerTaskExecutor:
 
     def _loop(self):
         config = self.config
-        if execution_mode(config) == 'local' and self._backend is None:
-            preflight_local(config)
-        backend = self._backend or (LocalBackend(self.store, self.job_id, config)
-            if execution_mode(config) == 'local' else RemoteBackend(self.store, self.job_id, config))
-        if self.deadline is not None:
+        from .actor_time import preparation
+        with preparation('optimizer backend runtime admission'):
+            if execution_mode(config) == 'local' and self._backend is None:
+                preflight_local(config)
+            backend = self._backend or (LocalBackend(self.store, self.job_id, config)
+                if execution_mode(config) == 'local' else RemoteBackend(self.store, self.job_id, config))
+        from .actor_time import current_worker, live_deadline, WorkDeadline, actor_clock
+        worker = current_worker()
+        if worker is not None:
+            # Reference setup is uncharged but each operation remains bounded.
+            backend.deadline = (live_deadline(float('inf')) if worker.working else
+                WorkDeadline(lambda: config.get('transport_timeout_seconds', 600)))
+        elif self.deadline is not None:
             backend.deadline = min(getattr(backend, "deadline", self.deadline), self.deadline)
+        if worker is not None or self.deadline is not None:
             transport = getattr(backend, "transport", None)
             if transport is not None:
-                transport.deadline = min(getattr(transport, "deadline", self.deadline), self.deadline)
+                transport.deadline = backend.deadline if worker is not None else min(getattr(transport, "deadline", self.deadline), self.deadline)
         agent = self._agent
         if agent is None:
             if config.get('env_file'):
@@ -106,17 +117,26 @@ class OptimizerTaskExecutor:
                                  stopped=lambda: self.store.get(self.job_id)['stop_requested'])
         return OptimizationLoop(self.store, self.job_id, agent, backend,
             knowledge=knowledge_query(config, self.job_directory), max_cases=config.get('max_cases', 24),
-            memory_observer=self.memory_observer)
+            memory_observer=self.memory_observer, **({'clock': actor_clock} if worker is not None else {}))
 
     def _device_lock(self):
         directory = self.config.get('lock_directory')
         base = Path(directory) if directory else Path(self.config['validation_wrapper']).parent / '.optimizer-locks'
         return base / f'{self.config["target"]}-{self.config["physical_device"]}.lock'
 
+    @contextmanager
+    def _admitted(self):
+        from .actor_time import preparation
+        with ExitStack() as stack:
+            with preparation('optimizer worker and device admission'):
+                stack.enter_context(exclusive(self.job_directory / 'worker.lock'))
+                stack.enter_context(exclusive(self._device_lock(), wait=True,
+                    stopped=lambda: self.store.get(self.job_id)['stop_requested']))
+            yield
+
     def prepare(self):
         """Execute and freeze the reference once, retaining baseline measurements."""
-        with exclusive(self.job_directory / 'worker.lock'), exclusive(self._device_lock(), wait=True,
-                stopped=lambda: self.store.get(self.job_id)['stop_requested']):
+        with self._admitted():
             if 'baseline' not in self._state():
                 loop = self._loop()
                 if self.expected_baseline and 'spec' not in loop.state:
@@ -145,8 +165,7 @@ class OptimizerTaskExecutor:
             raise ValueError('attempt_id must be a nonempty string')
         if memory_snapshot is not None:
             verify_snapshot(memory_snapshot)
-        with exclusive(self.job_directory / 'worker.lock'), exclusive(self._device_lock(), wait=True,
-                stopped=lambda: self.store.get(self.job_id)['stop_requested']):
+        with self._admitted():
             events = self.store.events(self.job_id)
             results = [event['payload'] for event in events if event['kind'] == 'phase2-attempt-result']
             request = {'attempt_id': attempt_id,

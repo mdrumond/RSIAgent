@@ -195,6 +195,22 @@ class SubjectExecutor:
         if (isinstance(remaining_seconds, bool) or not isinstance(remaining_seconds, (int, float))
                 or not math.isfinite(remaining_seconds) or remaining_seconds <= 0):
             raise ValueError('subject remaining seconds must be finite and positive')
+        from .actor_time import current_budget
+        budget = current_budget()
+        if budget is not None:
+            if budget.remaining() <= 0:
+                raise TimeoutError('subject optimizer actor work allocation exhausted')
+            with budget.actor(str(Path(directory)) + ':' + attempt_id, remaining_seconds):
+                return self._optimizer(directory, task, memory_snapshot, attempt_id=attempt_id,
+                    remaining_seconds=remaining_seconds, feedback=feedback, artifacts=artifacts)
+        return self._optimizer(directory, task, memory_snapshot, attempt_id=attempt_id,
+            remaining_seconds=remaining_seconds, feedback=feedback, artifacts=artifacts)
+
+    def _optimizer(self, directory, task, memory_snapshot, *, attempt_id,
+                   remaining_seconds, feedback=None, artifacts=None):
+        from .actor_time import current_worker, preparation
+        from contextlib import nullcontext
+        worker = current_worker()
         verify_snapshot(memory_snapshot)
         started = self.clock()
         directory = Path(directory)
@@ -204,18 +220,22 @@ class SubjectExecutor:
         # JobStore creation is immutable, while each attempt independently pins
         # the currently accepted learning. Reconstruct with the creation snapshot
         # so task/config/reference compatibility checks still run in the factory.
-        execution = self.optimizer_factory(directory, task, initial)
+        with preparation('optimizer factory and input staging'):
+            execution = self.optimizer_factory(directory, task, initial)
         if not initial_path.exists():
             atomic(initial_path, canonical(initial))
         def bind():
-            remaining = remaining_seconds - (self.clock() - started)
+            remaining = worker.remaining() if worker is not None else remaining_seconds - (self.clock() - started)
             if remaining <= 0:
                 raise TimeoutError('subject optimizer elapsed allocation exhausted')
             execution.set_remaining_seconds(remaining)
+        if worker is None:
+            bind()
+        with preparation('optimizer frozen reference and runtime preparation'):
+            baseline = execution.prepare()
         bind()
-        baseline = execution.prepare()
-        bind()
-        result = execution.attempt(attempt_id, memory_snapshot=memory_snapshot, feedback=feedback)
+        with worker.scope(work=True, reason='optimizer Actor work') if worker is not None else nullcontext():
+            result = execution.attempt(attempt_id, memory_snapshot=memory_snapshot, feedback=feedback)
         store = artifacts or ContentAddressedArtifacts(Path(directory) / 'artifacts')
         refs = {}
         for index, ref in enumerate(execution.store.artifacts(execution.job_id)):

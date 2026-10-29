@@ -79,27 +79,38 @@ class RemoteBackend:
         request = {'operation': operation, 'directory': str(remote_directory),
                    'baseline': str(remote_directory / 'frozen') if operation == 'prepare' else reference or str(self.remote / 'execution' / 'baseline' / 'frozen'),
                    'arch': self.config['arch'], 'max_cases': self.config.get('max_cases', 24), **payload}
-        archive_path = directory / 'package.tar.gz'
-        source_root = Path(__file__).resolve().parents[1]
-        with tarfile.open(archive_path, 'w:gz') as archive:
-            for family in ('optimizer', 'benchmarks'):
-                for path in (source_root / family).rglob('*.py'):
-                    archive.add(path, arcname=str(Path('source') / path.relative_to(source_root)))
-            data = canonical(request)
-            item = tarfile.TarInfo('request.json')
-            item.size = len(data)
-            archive.addfile(item, io.BytesIO(data))
-        # Parent workspace is registry-configured and must already exist.
-        upload = Path(self.config['remote_workspace']) / f'{self.job_id}-{sha(str(relative).encode())[:12]}.tar.gz'
-        state_path = directory / 'transport.json'
-        if not state_path.exists():
-            self.transport.transfer('upload', archive_path, upload)
+        from benchmarks.ascend.actor_time import preparation, current_budget
+        with preparation('optimizer candidate packaging and upload'):
+            archive_path = directory / 'package.tar.gz'
+            source_root = Path(__file__).resolve().parents[1]
+            with tarfile.open(archive_path, 'w:gz') as archive:
+                for family in ('optimizer', 'benchmarks'):
+                    for path in (source_root / family).rglob('*.py'):
+                        archive.add(path, arcname=str(Path('source') / path.relative_to(source_root)))
+                data = canonical(request)
+                item = tarfile.TarInfo('request.json')
+                item.size = len(data)
+                archive.addfile(item, io.BytesIO(data))
+            # Parent workspace is registry-configured and must already exist.
+            upload = Path(self.config['remote_workspace']) / f'{self.job_id}-{sha(str(relative).encode())[:12]}.tar.gz'
+            state_path = directory / 'transport.json'
+            if not state_path.exists():
+                self.transport.transfer('upload', archive_path, upload)
         quoted = shlex.quote
         command = (f'test -d {quoted(self.config["remote_workspace"])} && mkdir -p {quoted(str(remote_directory))} '
                    f'&& tar -xzf {quoted(str(upload))} -C {quoted(str(remote_directory))} '
                    f'&& cd {quoted(str(remote_directory / "source"))} '
                    f'&& timeout --foreground --signal=TERM {max(1, int(self.deadline - time.monotonic()))} '
                    f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
+        if current_budget() is not None and not state_path.exists():
+            # The candidate command starts only after remote extraction is ready.
+            staged = (f'test -d {quoted(self.config["remote_workspace"])} && mkdir -p {quoted(str(remote_directory))} '
+                      f'&& tar -xzf {quoted(str(upload))} -C {quoted(str(remote_directory))}')
+            with preparation('optimizer remote input staging'):
+                self.transport.execute(directory / 'staging', ['bash', '-c', staged])
+            command = (f'cd {quoted(str(remote_directory / "source"))} '
+                       f'&& timeout --foreground --signal=TERM {max(1, int(self.deadline-time.monotonic()))} '
+                       f'python -m optimizer.remote_worker {quoted(str(remote_directory / "request.json"))}')
         failure = None
         try:
             self.transport.execute(directory, ['bash', '-c', command])

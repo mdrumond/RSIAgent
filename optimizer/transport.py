@@ -1,5 +1,6 @@
 """Checked retained operations. An uncertain dispatch is never replayed."""
 from contextlib import contextmanager
+from benchmarks.ascend.actor_time import preparing
 import fcntl
 import json
 import math
@@ -101,6 +102,7 @@ class CheckedTransport:
         state['state'] = 'cancelled'
         atomic(path, canonical(state))
 
+    @preparing('optimizer file transfer')
     def transfer(self, action, source, destination):
         # Transfer sentinels also prevent duplicate uncertain submission.
         local = Path(source if action == 'upload' else destination)

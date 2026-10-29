@@ -14,7 +14,11 @@ def _serve(agent, pipe, inherited_parent, parent_pid, deadline):
     os.setsid()
     # Pi joins this supervisor's group so Stop covers descendants as well.
     agent.own_process_group = False
-    agent.deadline = deadline
+    live = callable(getattr(deadline, 'endpoint', None))
+    if live:
+        from benchmarks.ascend.actor_time import detach_actor_budget
+        detach_actor_budget()
+    agent.deadline = None if live else deadline
     def watch_parent():
         while os.getppid() == parent_pid:
             time.sleep(.2)
@@ -24,14 +28,20 @@ def _serve(agent, pipe, inherited_parent, parent_pid, deadline):
     pipe.send(('ready',))
     try:
         while True:
-            if time.monotonic() >= deadline:
+            if not live and time.monotonic() >= deadline:
                 break
             if not pipe.poll(.2):
                 continue
             command = pipe.recv()
             if command is None:
                 break
-            stage, context = command
+            stage, context = command[:2]
+            if live:
+                agent.deadline = command[2]
+                session = getattr(agent, 'session', None)
+                if session is not None:
+                    session.deadline = command[2]
+                    session.gateway.deadline = command[2]
             try:
                 value = agent.complete(stage, context, lambda kind, data: pipe.send(('record', kind, data)))
                 pipe.send(('result', value))
@@ -83,7 +93,8 @@ class BoundedAgent:
                 if self._receive() != ('ready',):
                     raise RuntimeError('invalid provider supervisor handshake')
                 self.ready = True
-            self.pipe.send((stage, context))
+            endpoint = getattr(self.deadline, 'endpoint', None)
+            self.pipe.send((stage, context, endpoint()) if callable(endpoint) else (stage, context))
             while True:
                 message = self._receive()
                 if message[0] == 'record':

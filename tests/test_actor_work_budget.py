@@ -294,3 +294,74 @@ def test_repair_budget_multiple_scopes_keep_charged_time(tmp_path):
                 now[0] += 3
         assert failure.elapsed_seconds == 6
     assert json.loads(failure.path.read_bytes())['elapsed_seconds'] == 6
+
+
+def test_work_lease_stops_when_parallel_partner_exhausts_linked_repair_budget(tmp_path):
+    from benchmarks.ascend.actor_time import linked_work_budget
+    b, now, _ = budget(tmp_path, 100)
+    failure = ActorWorkBudget(tmp_path/'failure.json', 20, clock=lambda:now[0])
+    with b.bind(), linked_work_budget(failure), b.actor('one',100) as one:
+        with b.actor('two',100) as two, two.scope(work=True):
+            with one.scope(work=True), preparation('one waits for staging'):
+                now[0] += 20
+                assert one.remaining() == 0
+                assert now[0] >= one.deadline
+    assert b.remaining() == 80 and failure.remaining() == 0
+
+
+def test_crash_work_recovery_is_attributed_to_only_persisted_working_actor(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.ascend.actor_time import actor_attempt, actor_work
+    now, wall = [0.], [100.]
+    path = tmp_path/'elapsed.json'
+    path.write_text(json.dumps(dict(max_seconds=100, elapsed_seconds=0, active_since=100,
+        actors={str(tmp_path/'writer'):dict(state='working',work_seconds=0,preparation_seconds=0,allocation_seconds=10),
+                'waiting':dict(state='preparing',work_seconds=0,preparation_seconds=0,allocation_seconds=10)})))
+    wall[0] += 6
+    b = ActorWorkBudget(path,100,clock=lambda:now[0],wall_clock=lambda:wall[0])
+    class Executor:
+        max_seconds = 10
+        @actor_attempt
+        def __call__(self, request): return self.run()
+        @actor_work
+        def run(self): return live_deadline(0)-now[0]
+    with b.bind():
+        assert Executor()(SimpleNamespace(branch_root=tmp_path/'writer',remaining_seconds=94)) == 4
+    assert b.report()['elapsed_seconds'] == 6
+    assert b.report()['actors']['waiting']['work_seconds'] == 0
+
+
+def test_optimizer_supervisor_survives_uncharged_idle_between_provider_requests(tmp_path):
+    import time
+    from optimizer.provider import BoundedAgent
+    b = ActorWorkBudget(tmp_path/'elapsed.json', 1)
+    class Agent:
+        identity = {}
+        def complete(self, stage, context, record):
+            from benchmarks.ascend.actor_time import current_budget
+            assert current_budget() is None
+            return {'stage':stage}
+    with b.bind(), b.actor('writer',1) as writer, writer.scope(work=True):
+        supervised = BoundedAgent(Agent(),deadline=writer.deadline,stopped=lambda:False)
+        try:
+            assert supervised.complete('first',{},lambda *a:None) == {'stage':'first'}
+            with preparation('device migration'):
+                time.sleep(1.1)
+            assert supervised.complete('second',{},lambda *a:None) == {'stage':'second'}
+        finally: supervised.close()
+
+
+def test_preparation_retry_stops_if_parallel_actor_exhausts_shared_work(tmp_path):
+    from benchmarks.ascend.actor_time import prepare_until_ready
+    from benchmarks.a5kernels.phase1_project_bz import ProjectInfrastructureError
+    b, now, _ = budget(tmp_path,20)
+    calls = []
+    def busy():
+        calls.append(1)
+        raise ProjectInfrastructureError('device is not idle')
+    with b.bind(), b.actor('working',20) as working, working.scope(work=True):
+        with b.actor('preparing',20), preparation('health'):
+            with pytest.raises(TimeoutError, match='actor work allocation') as error:
+                prepare_until_ready(busy,sleep=lambda _:now.__setitem__(0,now[0]+20))
+            assert error.value.interruption_reason == 'deadline-exhausted'
+    assert calls == [1]
