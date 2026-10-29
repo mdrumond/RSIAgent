@@ -123,17 +123,22 @@ def test_time_allocation_stops_before_next_selection_and_survives_resume(tmp_pat
                                   lambda _: None, max_parallel=1, max_seconds=6).resume()
 
 
-def test_slow_selection_cannot_admit_execution_after_deadline(tmp_path):
+def test_slow_selection_preserves_full_actor_work_allocation(tmp_path):
     now, executed = [0.0], []
     def complete(messages):
-        now[0] += 6
+        now[0] += 600
         return _wave(messages[-1]["content"], [_project("one", "gm-ub-movement")])
+    def execute(request):
+        executed.append(request.remaining_seconds)
+        now[0] += 2
+        return _result(request.spec, True, "verified")
     report = AdaptivePhase1Coordinator(tmp_path, "Learn.", b"", CurriculumAgent(complete),
-        lambda request: executed.append(request), max_parallel=1,
+        execute, max_parallel=1, project_target=1,
         max_seconds=5, clock=lambda: now[0]).run()
-    assert report["status"] == "TIME_BUDGET_EXHAUSTED"
-    assert report["elapsed_seconds"] == 6
-    assert executed == []
+    assert report["status"] == "TARGET_REACHED"
+    assert report["elapsed_seconds"] == 2
+    assert report["remaining_seconds"] == 3
+    assert executed == [5]
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")

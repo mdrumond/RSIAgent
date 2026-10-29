@@ -229,6 +229,12 @@ class AdaptivePhase1Coordinator:
         from benchmarks.ascend.actor_time import ActorWorkBudget
         path = self.root / "actor-time.json"
         if not path.exists():
+            # Preserve a killed legacy controller's unknown-spend reservation.
+            # Without an Actor ledger there is no proof the interval was setup.
+            if state.get("allocation_active"):
+                state.update(elapsed_seconds=max(self.max_seconds, state["elapsed_seconds"]),
+                             allocation_active=False, allocation_interrupted=True)
+                self._atomic_json(self.root / "state.json", state)
             self._atomic_json(path, dict(max_seconds=self.max_seconds,
                 elapsed_seconds=state.get("elapsed_seconds", 0)))
         self.budget = ActorWorkBudget(path, self.max_seconds, clock=self.clock)
@@ -247,7 +253,7 @@ class AdaptivePhase1Coordinator:
             self._deadline = None
         result["elapsed_seconds"] = current["elapsed_seconds"]
         result["remaining_seconds"] = self.budget.remaining()
-        result["timing"] = self.budget.report()
+        result["timing"] = current["timing"]
         return result
 
     def _remaining_seconds(self):
@@ -434,7 +440,7 @@ class AdaptivePhase1Coordinator:
             "deadline" if state["terminal"] and state["terminal"]["status"] == "TIME_BUDGET_EXHAUSTED" else "recovery"))
 
     def propose_wave(self):
-        """Charge curriculum selection to the campaign allocation."""
+        """Select curriculum without consuming the Actor work allocation."""
         return self._with_allocation(self._propose_wave)
 
     def _propose_wave(self):
@@ -948,6 +954,7 @@ class AdaptivePhase1Coordinator:
             "memory": memory,
             "memory_sha256": hashlib.sha256(snapshot).hexdigest(),
             "pending_wave": pending,
+            **({"timing": state["timing"]} if "timing" in state else {}),
         }
 
     @classmethod

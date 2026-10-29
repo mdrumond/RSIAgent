@@ -42,7 +42,7 @@ def report_digest(root):
 _EXCLUDED = {".git", "__pycache__", "reference_repos", "weights", "private",
              "profiles", "private-config", ".ssh", "credentials.json",
              "credentials", "secrets.json"}
-_ROOT_FILES = {"state.json", "pending.json", "campaign-identity.json",
+_ROOT_FILES = {"state.json", "actor-time.json", "pending.json", "campaign-identity.json",
                "campaign-run.json", "goal-selection.json",
                "project-evidence.jsonl", "initial-memory.bin", "memory.jsonl",
                "terminal.json", "protocol.json", "review.json", "snapshot.json",

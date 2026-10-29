@@ -649,11 +649,11 @@ def test_exception_time_is_retained_and_resume_receives_only_remaining_time(tmp_
             execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
     with pytest.raises(RuntimeError, match="failed before verification"):
         make().run()
-    assert json.loads((tmp_path / "state.json").read_text())["elapsed_seconds"] == 3
+    assert json.loads((tmp_path / "state.json").read_text())["elapsed_seconds"] == 2
     clock.now += 100  # Downtime is not active runtime.
     report = make().resume()
-    assert observed == [9, 7]
-    assert report["elapsed_seconds"] == 5
+    assert observed == [10, 8]
+    assert report["elapsed_seconds"] == 4
     assert report["status"] == "TARGET_REACHED"
 
 
@@ -674,7 +674,7 @@ def test_legacy_state_remains_reportable_but_cannot_reset_unknown_spend(tmp_path
     assert path.read_bytes() == original
 
 
-def test_approved_selection_and_execution_share_elapsed_allocation(tmp_path):
+def test_approved_selection_preserves_actor_work_allocation(tmp_path):
     clock, observed = _BudgetClock(), []
     def select(messages):
         clock.now += 2
@@ -686,11 +686,11 @@ def test_approved_selection_and_execution_share_elapsed_allocation(tmp_path):
     coordinator = AdaptivePhase1Coordinator(tmp_path, "Learn", SEED, CurriculumAgent(select),
         execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
     proposal = coordinator.propose_wave()
-    assert proposal["elapsed_seconds"] == 2
+    assert proposal["elapsed_seconds"] == 0
     coordinator.approve_wave(proposal, ["approved"])
     report = coordinator.run_approved_wave()
-    assert observed == [8]
-    assert report["elapsed_seconds"] == 5
+    assert observed == [10]
+    assert report["elapsed_seconds"] == 3
 
 
 def test_unobserved_interruption_keeps_remaining_allocation_reserved(tmp_path):
@@ -758,13 +758,18 @@ def test_live_report_is_read_only_and_duplicate_admission_is_rejected(tmp_path):
 
 @pytest.mark.parametrize('manual', [False, True])
 @pytest.mark.parametrize('terminal', [False, True])
-def test_late_curriculum_result_cannot_admit_wave_or_claim_terminal(tmp_path, manual, terminal):
+def test_slow_curriculum_does_not_expire_actor_work_or_terminal_decision(tmp_path, manual, terminal):
     clock = _BudgetClock()
     def select(messages):
         clock.now += 11
         return _wave(messages[-1]['content'], [_project('late', 'gm-ub-movement')])
+    observed = []
+    def execute(request):
+        observed.append(request.remaining_seconds)
+        clock.now += 3
+        return _result(request.spec, True, 'verified')
     coordinator = AdaptivePhase1Coordinator(tmp_path, 'Learn', SEED, CurriculumAgent(select),
-        lambda _: pytest.fail('expired project executed'), max_parallel=1, max_seconds=10, clock=clock)
+        execute, max_parallel=1, project_target=1, max_seconds=10, clock=clock)
     if terminal:
         from benchmarks.a5kernels.phase1_curriculum_selector import TerminalDecision
         def select_terminal(*args, **kwargs):
@@ -772,5 +777,16 @@ def test_late_curriculum_result_cannot_admit_wave_or_claim_terminal(tmp_path, ma
             return TerminalDecision('STALLED', 'finished'), args[1]
         coordinator._select = select_terminal
     report = coordinator.propose_wave() if manual else coordinator.run()
-    assert (report['terminal']['status'] if manual else report['status']) == 'TIME_BUDGET_EXHAUSTED'
+    if terminal:
+        assert (report['terminal']['status'] if manual else report['status']) == 'STALLED'
+        assert observed == []
+        assert report['elapsed_seconds'] == 0
+    else:
+        if manual:
+            assert report['elapsed_seconds'] == 0
+            coordinator.approve_wave(report, ['late'])
+            report = coordinator.run_approved_wave()
+        assert report['status'] == 'TARGET_REACHED'
+        assert report['elapsed_seconds'] == 3
+        assert observed == [10]
     assert not (tmp_path / 'pending.json').exists()

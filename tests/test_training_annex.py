@@ -221,6 +221,20 @@ def test_adaptive_archive_keeps_memory_only_objects_without_mutating_evidence(ad
                 continue
             assert archive.extractfile("campaign/" + path.relative_to(adaptive_campaign).as_posix()).read() == payload
     assert all(path.read_bytes() == payload for path, payload in before.items())
+    # Restoring the portable ledger must retain spent work and each Actor's
+    # counters; otherwise an archived campaign could receive a fresh budget.
+    from benchmarks.ascend.actor_time import ActorWorkBudget
+    ledger = json.loads(before[adaptive_campaign / "actor-time.json"])
+    restored = tmp_path / "restored-actor-time.json"
+    with tarfile.open(destination) as archive:
+        manifest = json.load(archive.extractfile("manifest.json"))
+        row = next(row for row in manifest["files"] if row["path"] == "actor-time.json")
+        payload = archive.extractfile("campaign/actor-time.json").read()
+    assert row["sha256"] == hashlib.sha256(payload).hexdigest()
+    restored.write_bytes(payload)
+    budget = ActorWorkBudget(restored, ledger["max_seconds"], clock=lambda: 0)
+    assert budget.remaining() == ledger["max_seconds"] - ledger["elapsed_seconds"]
+    assert budget.report()["actors"] == ledger["actors"]
 
 
 def test_consolidated_memory_cannot_disagree_with_ordered_deltas(campaign):
