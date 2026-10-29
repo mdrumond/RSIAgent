@@ -25,7 +25,7 @@ def knowledge(tmp_path):
     store = ContentAddressedArtifacts(tmp_path / 'artifacts')
     source = store.put_bytes(b'copy all vector values\n')
     service = SubjectKnowledge(tmp_path, store, lambda: memory, paths=paths, embeddings=embeddings)
-    memory = SubjectMemory(tmp_path / 'memory', b'initial', index=service.index)
+    memory = SubjectMemory(tmp_path / 'memory', b'initial', index=service.index, ledger=service.ledger)
     proposal = dict(operation='create', base_versions=[], summary='Vector copies preserve tails',
         applicability='Vector tails', preconditions='Bounded size', expectations='Equal values', limitations='One shape',
         before=None, before_unavailable_reason='First copy',

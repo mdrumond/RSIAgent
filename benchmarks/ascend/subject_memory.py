@@ -13,6 +13,17 @@ def digest(value):
     return hashlib.sha256(canonical(value)).hexdigest()
 
 
+def actor_memory_identity(branch_root):
+    root = Path(branch_root).resolve()
+    marker = root / 'manual-execution.json'
+    if marker.exists():
+        attempt_id = json.loads(marker.read_bytes())['attempt_id']
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise ValueError('manual actor memory identity requires its retained attempt_id')
+        return str(root) + '#attempt=' + attempt_id
+    return str(root)
+
+
 class StaleMemory(ValueError):
     pass
 

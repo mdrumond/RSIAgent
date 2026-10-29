@@ -24,11 +24,12 @@ from .execution import apply_worker_config, execution_mode, local_identity, pref
 
 class OptimizerTaskExecutor:
     def __init__(self, directory, task, memory_snapshot, config, *, agent=None, backend=None,
-                 expected_baseline=None):
+                 expected_baseline=None, memory_observer=None):
         self.directory = Path(directory)
         config = apply_worker_config(config)
         self.task, self.config = task, config
         self.expected_baseline = expected_baseline
+        self.memory_observer = memory_observer
         verify_snapshot(memory_snapshot)
         spec = validate_submission(task['submission'])
         self.store = JobStore(self.directory / 'jobs')
@@ -104,7 +105,8 @@ class OptimizerTaskExecutor:
             agent = BoundedAgent(agent, deadline=getattr(backend, 'deadline', time.monotonic() + remaining),
                                  stopped=lambda: self.store.get(self.job_id)['stop_requested'])
         return OptimizationLoop(self.store, self.job_id, agent, backend,
-            knowledge=knowledge_query(config, self.job_directory), max_cases=config.get('max_cases', 24))
+            knowledge=knowledge_query(config, self.job_directory), max_cases=config.get('max_cases', 24),
+            memory_observer=self.memory_observer)
 
     def _device_lock(self):
         directory = self.config.get('lock_directory')
