@@ -304,6 +304,17 @@ def reviewed_phase1_coordinator(root, objective, reviewed_snapshot, curriculum, 
     coordinator = AdaptivePhase1Coordinator(root, objective, initial, curriculum,
         execute_project, max_parallel=1, project_target=project_target, max_seconds=max_seconds,
         allow_partial=True)
+    seed_path = coordinator.root / "initial-memory.bin"
+    state_path = coordinator.root / "state.json"
+    if state_path.exists():
+        state = json.loads(state_path.read_bytes())
+        if (state.get("initial_memory_sha256") != hashlib.sha256(initial).hexdigest()
+                or not seed_path.is_file() or seed_path.read_bytes() != initial):
+            raise ValueError("retained reviewed seed differs from admitted memory")
+    else:
+        from optimizer.jobs import atomic
+        coordinator.root.mkdir(parents=True, exist_ok=True)
+        atomic(seed_path, initial)
     coordinator.snapshot = reviewed_snapshot
     coordinator.trace_hook = trace_hook
     return coordinator

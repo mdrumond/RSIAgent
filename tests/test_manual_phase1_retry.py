@@ -78,3 +78,79 @@ def test_phase1_feedback_start_pins_spec_and_skips_optimizer_goal(tmp_path, phas
     assert job['phase1_original_retry'] is True
     assert job['retry_spec']['original_spec'] == original_spec
     assert not job.get('optimizer_goal') and not job.get('autonomous_goal')
+
+
+@pytest.mark.parametrize('damage', ['seed-bytes', 'missing-seed', 'state-seed'])
+def test_original_retry_persists_reviewed_seed_for_evidence_exports_and_resume(tmp_path, damage):
+    from dataclasses import replace
+    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+    from benchmarks.a5kernels.evidence import canonical_bytes
+    from benchmarks.ascend.training_annex import _verify_adaptive_state, inventory_campaign, package_campaign
+    from optimizer.memory import freeze_source, verify_snapshot
+    from test_reviewed_memory import native_source
+
+    source, review, _ = native_source(tmp_path/'reviewed')
+    original_spec = _project('original', 'gm-ub-movement')
+    phase1(tmp_path/'failed', spec=original_spec)
+    store = FeedbackStore(tmp_path/'feedback')
+    store.import_phase1(tmp_path/'failed', target='a3', language='ascend-c')
+    original, = store.records()
+    root, control = tmp_path/'retry', tmp_path/'control'
+    root.mkdir()
+    control.mkdir()
+    seed_path = root/'initial-memory.bin'
+    seed_path.write_bytes(b'')  # The launcher copies the source campaign's initial seed.
+    job = dict(root=str(root), control=str(control), target='a3',
+        phase1_root=str(source), review=str(review), feedback_root=str(store.root), retry_max_seconds=30)
+    admitted = cli._snapshot(job, {})
+    requests = []
+
+    def execute(request):
+        requests.append(request)
+        result = _result(request.spec, True, 'host verified original repair')
+        objects = ContentAddressedArtifacts(request.branch_root/'artifacts')
+        source_sha = objects.put_bytes(b'fixed original source')
+        fact = objects.put_json(dict(passed=True, source_sha256=source_sha))
+        payload = canonical_bytes(dict(classification='host-verified', source_sha256=source_sha,
+                                       artifacts=dict(classification=fact)))
+        memory = replace(result.memory, source_revision=source_sha, admitted_artifact_sha256=(fact,),
+            lessons=(), no_new_knowledge=True,
+            host_facts=tuple(replace(item, evidence_sha256=fact) for item in result.memory.host_facts))
+        return replace(result, memory=memory, evidence_payload=payload)
+
+    def compose():
+        return reviewed_phase1_coordinator(root, 'Retry frozen original', cli._snapshot(job, {}),
+            CurriculumAgent(lambda _: pytest.fail('original retry must not select another project')),
+            execute, project_target=1)
+
+    runner = compose()
+    expected = runner.initial_memory
+    assert seed_path.read_bytes() == expected != b''
+    (root/'campaign-identity.json').write_bytes(canonical_bytes(admitted.destination.source_identity))
+    retry = ManualPhase1Retry(runner, job, dict(selected=[original]))
+    assert retry.resume()['status'] == 'FIXED'
+    state = json.loads((root/'state.json').read_bytes())
+    assert state['project_target'] == 1
+    _verify_adaptive_state(root, state)
+    assert inventory_campaign(root)['complete']
+    assert package_campaign(root, tmp_path/'retry.tar.gz')['complete']
+    exported = freeze_source(root)
+    verify_snapshot(exported)
+    assert len(exported['memory_entries']) == 2
+    assert base64.b64decode(exported['files']['initial-memory.bin']['base64']) == expected
+    assert len(requests) == 1
+    stamp = seed_path.stat().st_mtime_ns
+    assert ManualPhase1Retry(compose(), job, dict(selected=[original])).resume()['status'] == 'FIXED'
+    assert len(requests) == 1 and seed_path.stat().st_mtime_ns == stamp
+
+    if damage == 'seed-bytes':
+        seed_path.write_bytes(b'changed seed')
+    elif damage == 'missing-seed':
+        seed_path.unlink()
+    else:
+        state['initial_memory_sha256'] = '0'*64
+        (root/'state.json').write_bytes(canonical_bytes(state))
+    before = {path: path.read_bytes() for path in root.rglob('*') if path.is_file()}
+    with pytest.raises(ValueError, match='retained reviewed seed'):
+        compose()
+    assert {path: path.read_bytes() for path in root.rglob('*') if path.is_file()} == before

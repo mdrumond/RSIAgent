@@ -546,7 +546,10 @@ class DirectActorDriver:
         pass
 
     def _terminal_context(self, working, profile):
-        return working.messages()
+        # Pinned user feedback follows recent exchanges in the model view; it
+        # must never replace the host result consumed by terminal distillation.
+        terminal = working.recent[-1]
+        return [message for message in working.messages() if message is not terminal] + [terminal]
 
     @actor_lease
     def __call__(self, instruction: str, *, profile: DirectModelProfile,
