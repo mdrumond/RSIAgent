@@ -75,7 +75,7 @@ class MemoryVerifierAgent:
     def __init__(self, complete, *, clock=time.monotonic):
         self.complete, self.clock, self.last_trace = complete, clock, []
 
-    def review(self, proposal, arms, read_artifact, *, max_seconds, check_remaining=None, history=()):
+    def review(self, proposal, arms, read_artifact, *, max_seconds, check_remaining=None, history=(), focused=False):
         deadline = self.clock() + _seconds(max_seconds)
         self.last_trace = []
         proposal_bytes = canonical(proposal)
@@ -148,6 +148,32 @@ class MemoryVerifierAgent:
             'in that question; a separate curriculum selector will author the neutral host contract. '
             'A different project ID alone is not a new workload. Otherwise omit next_probe. '
             'No fixed number of probes is required; use existing evidence before requesting more.')
+        if focused:
+            messages[0]['content'] = (
+                'You are the independent focused memory admission judge. These are NOT two Actor A/B arms. '
+                'control is a deterministic replay of retained before-source, treatment is a deterministic '
+                'replay of retained after-source against the SAME frozen host oracle, and transfer is one '
+                'fresh Actor on a different frozen related contract, with the lesson available through KDB. '
+                'A reproducible semantic control failure is expected and does not invalidate this repair test. '
+                'Inspect all supplied source, result and Actor/tool log evidence using the read/list actions. '
+                'Require a specific actionable claim, applicability, preconditions, evidence and limitations. '
+                'Reject vague advice and unsupported causal claims. Transfer success alone is insufficient: '
+                'verify an explicit KDB lookup and correct application of this lesson in the Actor log. '
+                'Repair evidence establishes narrowly scoped correctness, never speed or optimization benefit. '
+                'Set claim_kind to repair only if ALL claims in the proposal are supported repair/correctness '
+                'claims. If it asserts performance, set claim_kind to performance; acceptance then requires '
+                'the supplied repeated paired device measurements plus correctness and relevant scope. '
+                'Otherwise rewrite to remove unsupported claims or return inconclusive; do not silently '
+                'downgrade a performance proposal to repair. A passing original before-source fails to '
+                'reproduce the repair claim. Host correctness is authoritative; never accept a failed '
+                'treatment or transfer. Use {"list_artifacts":{"offset":0,"limit":20}} or '
+                '{"read_artifact":{"sha256":"...","offset":0,"limit":8192}}. '
+                'Terminal JSON has exactly decision (accept|rewrite|reject|inconclusive), reason, evidence '
+                '(actually read SHA256 hashes), instructions (concrete text for rewrite, otherwise null), '
+                'and claim_kind (repair|performance). Inspect full proposal and current result/log evidence '
+                'before judgment. No additional experiment requests: report uncertainty explicitly.')
+            required.update(arm.source_sha256 for arm in arms.values() if arm.source_sha256)
+            required.add(proposal_sha)
         context = json.loads(messages[1]['content'])
         context.update(history_count=len(history), history=[dict(index=i,
             evaluation_sha256=_hash(canonical(prior)), decision=prior.get('decision'),
@@ -206,7 +232,11 @@ class MemoryVerifierAgent:
                     self.last_trace.append(dict(kind='read', request=request, observation=observation))
                 else:
                     keys = {'decision', 'reason', 'evidence', 'instructions'}
-                    if set(value) not in (keys, keys | {'next_probe'}) or value['decision'] not in {'accept', 'rewrite', 'reject', 'inconclusive'}:
+                    if focused:
+                        keys.add('claim_kind')
+                        if value.get('claim_kind') not in {'repair', 'performance'}:
+                            raise ValueError('focused judgment requires repair or performance claim_kind')
+                    if set(value) not in ((keys,) if focused else (keys, keys | {'next_probe'})) or value['decision'] not in {'accept', 'rewrite', 'reject', 'inconclusive'}:
                         raise ValueError('invalid memory judgment')
                     if not isinstance(value['reason'], str) or not value['reason'].strip():
                         raise ValueError('judgment requires an evidence-based reason')
@@ -219,6 +249,13 @@ class MemoryVerifierAgent:
                         raise ValueError('substantive judgment requires actually read evidence references')
                     if value['decision'] == 'accept' and not arms['treatment'].host_verified:
                         raise ValueError('failed treatment cannot support memory acceptance')
+                    if focused and value['decision'] == 'accept':
+                        if value['claim_kind'] == 'repair' and arms['control'].host_verified:
+                            raise ValueError('passing before-source does not reproduce the claimed repair')
+                        if not arms['transfer'].host_verified:
+                            raise ValueError('failed transfer cannot support memory acceptance')
+                        if value['claim_kind'] == 'performance' and (not arms['control'].host_verified or 'measurement' not in arms):
+                            raise ValueError('performance acceptance needs a correct baseline and repeated paired device measurements')
                     if value['decision'] == 'rewrite':
                         if not isinstance(value['instructions'], str) or not value['instructions'].strip():
                             raise ValueError('rewrite requires concrete instructions')

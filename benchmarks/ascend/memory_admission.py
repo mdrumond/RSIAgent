@@ -97,12 +97,17 @@ class MemoryAdmission:
             return
         if self.future is not None:
             return
-        for path in sorted(self.root.glob('*/job.json')):
+        pending = []
+        for path in self.root.glob('*/job.json'):
             job = json.loads(path.read_bytes())
             if job['status'] == 'pending':
-                self.active = job['review_id']
-                self.future = self.pool.submit(self._work, job)
-                return
+                # Retained retry directories are hashes, not submission order.
+                # Legacy jobs without a sequence retain stable path ordering.
+                pending.append((job.get('sequence', float('inf')), str(path), job))
+        if pending:
+            _, _, job = min(pending, key=lambda row: row[:2])
+            self.active = job['review_id']
+            self.future = self.pool.submit(self._work, job)
 
     def _work(self, job):
         directory = self._path(job['review_id']).parent
@@ -149,6 +154,8 @@ class MemoryAdmission:
                 shared = ContentAddressedArtifacts(self.memory.root.parent / 'artifacts')
                 history = job['evaluations'][:job.get('trial_history_length', 0)]
                 options = dict(check_remaining=remaining)
+                if getattr(self.verifier, 'mode', None) == 'focused':
+                    options['source_request'] = job['request']
                 if history or job.get('probe_request') is not None:
                     options.update(history=history, probe_request=job.get('probe_request'),
                         prior_task=job.get('prior_task'), read_history_artifact=shared.read_bytes)
@@ -193,6 +200,8 @@ class MemoryAdmission:
                             job['provenance'], memory_verification=dict(
                                 evaluation_id=result.get('evaluation_id',digest(result)),
                                 decision=result['decision'], evidence=result['evidence'],
+                                **({key: result[key] for key in ('mode', 'claim_kind', 'evidence_stages')}
+                                   if result.get('mode') == 'focused' else {}),
                                 trace_sha256=job['trace_sha256'][-1], rewrites=job['rewrites'],
                                 evaluations=[row.get('evaluation_id', digest(row)) for row in job['evaluations']],
                                 traces=job['trace_sha256'])),

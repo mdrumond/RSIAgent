@@ -26,6 +26,11 @@ def evaluation_assessment(result):
         if any('infrastructure' in str(value).lower() or value in
                {'transport-unresolved', 'provider-failure'} for value in fields):
             return assessment('infrastructure-blocked', 'transfer', 'arm-infrastructure')
+    if result.get('mode') == 'focused':
+        stages = result.get('evidence_stages', {})
+        if any(stages.get(name, {}).get('status') != 'completed' for name in ('control', 'treatment', 'transfer')):
+            return assessment('benefit-unproven', 'focused-evidence', 'focused-incomplete')
+        return assessment('benefit-unproven', 'focused-evidence', 'focused-inconclusive')
     if result.get('validity') != {'control': True, 'treatment': True}:
         return assessment('benefit-unproven', 'transfer', 'pair-incomplete')
     if result.get('error_type'):

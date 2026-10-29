@@ -328,3 +328,58 @@ def test_rewrite_provider_outage_retains_inconclusive_job_for_resume(tmp_path):
         assert len(memory.records()) == 1
     finally:
         resumed.close()
+
+
+def test_resumed_device_retries_follow_submission_order_not_hashed_directories(tmp_path):
+    from benchmarks.ascend.subject_memory import digest
+    memory = SubjectMemory(tmp_path / 'memory', b'')
+    earlier, later = sorted(['reduce-axis', 'mask-positive'], key=digest, reverse=True)
+    gate = MemoryAdmission(tmp_path / 'gate', memory, Evaluation([]), None)
+    gate.stop_requested.set()
+    try:
+        for sequence, review_id in enumerate((earlier, later), start=2):
+            gate.submit(review_id, dict(draft(), summary=review_id), {}, request(), remaining_seconds=100)
+            path = gate._path(review_id)
+            job = json.loads(path.read_bytes())
+            job.update(sequence=sequence, status='inconclusive', error_type='InfrastructureFailure')
+            path.write_text(json.dumps(job))
+        assert str(gate._path(later)) < str(gate._path(earlier))
+    finally:
+        gate.close()
+    evaluation = Evaluation(['accept', 'accept'])
+    resumed = MemoryAdmission(tmp_path / 'gate', memory, evaluation, None)
+    try:
+        resumed.wait(remaining_seconds=5)
+        assert evaluation.calls[0][0]['summary'] == earlier
+        resumed.poll(remaining_seconds=5)
+        resumed.wait(remaining_seconds=5)
+        assert [call[0]['summary'] for call in evaluation.calls] == [earlier, later]
+        assert {row['memory_id'] for row in memory.records()} == {earlier, later}
+    finally:
+        resumed.close()
+
+
+def test_legacy_pending_jobs_without_sequence_have_stable_resume_order(tmp_path):
+    from benchmarks.ascend.subject_memory import digest
+    memory = SubjectMemory(tmp_path / 'memory', b'')
+    gate = MemoryAdmission(tmp_path / 'gate', memory, Evaluation([]), None)
+    gate.stop_requested.set()
+    ids = ['legacy-first', 'legacy-second']
+    try:
+        for review_id in ids:
+            gate.submit(review_id, dict(draft(), summary=review_id), {}, request(), remaining_seconds=100)
+            path = gate._path(review_id)
+            job = json.loads(path.read_bytes())
+            job.pop('sequence')
+            path.write_text(json.dumps(job))
+    finally:
+        gate.close()
+    evaluation = Evaluation(['accept', 'accept'])
+    resumed = MemoryAdmission(tmp_path / 'gate', memory, evaluation, None)
+    try:
+        resumed.wait(remaining_seconds=5)
+        resumed.poll(remaining_seconds=5)
+        resumed.wait(remaining_seconds=5)
+        assert [call[0]['summary'] for call in evaluation.calls] == sorted(ids, key=digest)
+    finally:
+        resumed.close()
