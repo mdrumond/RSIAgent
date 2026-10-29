@@ -978,12 +978,13 @@ def test_actor_restarts_distinguish_new_queries_and_deduplicate_retained_turn(tm
     def query(payload,context):
         captured.append(context.access_event_id)
         return AdaptiveActionResult({'event':'query','available':True})
-    class Actor(ScriptedActor):
+    class Actor(TracedScriptedActor):
         def __call__(self,instruction,**kwargs):
             kwargs['action_executor'].action_event_turn=durable_turn
             return super().__call__(instruction,**kwargs)
     executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'evidence.jsonl'))
     actor=Actor(['{"query-knowledge":{"query":"vector"}}','{"write":{"slot":"kernel","content":"fixed source"}}','{"run":{}}','{"submit":{}}'])
+    actor.trace_event=lambda *args: None
     from benchmarks.ascend.training_traces import recorder_factory
     trace = recorder_factory(phase='phase1',round_id='memory-event',model='fixture',source_manifest_sha256='a'*64) if traced else None
     adapter=AdaptiveActorProjectExecutor(executor,actor,object(),query_knowledge=query,trace_recorder_factory=trace)
