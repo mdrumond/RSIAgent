@@ -396,7 +396,7 @@ class ReviewState:
                     self.registry['memory-evidence:' + row['version'] + ':' + str(index)] = sha
         self.known = set(self.registry.values())
         self.read, self.observed, self.versions, self.citations = set(), {}, set(), []
-        for row in request.memory_repairs:
+        for row in (*request.memory_repairs, *request.retired_memories):
             self.versions.add((row['memory_id'], row['version']))
         self.sizes = {}
         original = request.artifacts.get('original-source')

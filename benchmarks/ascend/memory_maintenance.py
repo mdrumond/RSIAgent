@@ -18,7 +18,11 @@ class MemoryMaintenance:
         with sqlite3.connect(ledger.path) as db:
             db.execute('''CREATE TABLE IF NOT EXISTS memory_maintenance (
                 repair_id TEXT PRIMARY KEY, version TEXT NOT NULL, kind TEXT NOT NULL,
-                payload TEXT NOT NULL, resolution TEXT, UNIQUE(version,kind))''')
+                payload TEXT NOT NULL, resolution TEXT)''')
+            db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS open_memory_maintenance
+                ON memory_maintenance(version,kind) WHERE resolution IS NULL''')
+            db.execute('''CREATE TABLE IF NOT EXISTS memory_maintenance_triggers (
+                trigger_id TEXT PRIMARY KEY, repair_id TEXT NOT NULL)''')
             db.execute('''CREATE TABLE IF NOT EXISTS memory_maintenance_reviews (
                 exposure_id TEXT PRIMARY KEY, payload TEXT NOT NULL, applied INTEGER NOT NULL)''')
 
@@ -50,14 +54,24 @@ class MemoryMaintenance:
         return [dict(json.loads(payload), resolution=json.loads(resolution) if resolution else None)
                 for payload, resolution in rows if not open_only or resolution is None]
 
-    def _ensure(self, version, kind, *, project_id, subject_id, reason, evidence):
-        repair_id = 'memory-' + kind + '-' + version
-        payload = dict(repair_id=repair_id, memory_id=self.ledger.record(version)['memory_id'],
-            version=version, kind=kind, project_id=project_id, subject_id=subject_id,
-            reason=reason, evidence=sorted(set(evidence)))
+    def _ensure(self, version, kind, *, project_id, subject_id, reason, evidence, trigger):
+        # A new counterexample after restoration creates a new episode. Replaying
+        # an old assessment returns its original episode, even after resolution.
+        memory_id = self.ledger.record(version)['memory_id']
         with sqlite3.connect(self.ledger.path) as db:
-            db.execute('INSERT OR IGNORE INTO memory_maintenance VALUES (?,?,?,?,NULL)',
-                       (repair_id, version, kind, canonical(payload).decode()))
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM memory_maintenance_triggers WHERE trigger_id=?', (trigger,)).fetchone():
+                return
+            old = db.execute('SELECT repair_id FROM memory_maintenance WHERE version=? AND kind=? AND resolution IS NULL',
+                             (version, kind)).fetchone()
+            repair_id = old[0] if old else 'memory-' + kind + '-' + version + '-' + digest(trigger)[:12]
+            if old is None:
+                payload = dict(repair_id=repair_id, memory_id=memory_id,
+                    version=version, kind=kind, project_id=project_id, subject_id=subject_id,
+                    reason=reason, evidence=sorted(set(evidence)))
+                db.execute('INSERT INTO memory_maintenance VALUES (?,?,?,?,NULL)',
+                           (repair_id, version, kind, canonical(payload).decode()))
+            db.execute('INSERT INTO memory_maintenance_triggers VALUES (?,?)', (trigger, repair_id))
 
     def project_obligations(self):
         """Any campaign can resume shared work; an abandoned owner holds no lease."""
@@ -79,11 +93,24 @@ class MemoryMaintenance:
                 claim_identity=[' '.join(str(record['proposal'].get(key, '')).casefold().split()) for key in
                     ('summary','applicability','preconditions','expectations','limitations')],
                 document_sha256=self.campaign.artifacts.put_bytes(canonical(record)))
-        exposures = [document(dict(row)) for row in self.ledger.exposures(self.campaign_id, request.project_id)]
+        exposures = [document(dict(row)) for row in self.ledger.exposures(self.campaign_id, request.project_id) if row['judgment'] is None]
         for row in exposures:
             row['statistics'] = {key:value for key,value in self.ledger.stats(row['memory_id'], row['version']).items() if key != 'by_actor'}
             row['lifetime_statistics'] = {key:value for key,value in self.ledger.stats(row['memory_id']).items() if key != 'by_actor'}
-        repairs = [document(dict(row)) for row in self.obligations() if row['repair_id'] in repair_ids]
+        repairs = []
+        for obligation in self.obligations():
+            if obligation['repair_id'] not in repair_ids:
+                continue
+            with sqlite3.connect(self.ledger.path) as db:
+                triggers = db.execute('SELECT trigger_id FROM memory_maintenance_triggers WHERE repair_id=?',
+                                      (obligation['repair_id'],)).fetchall()
+                assessments = [db.execute('SELECT payload FROM memory_maintenance_reviews WHERE exposure_id=?',
+                               (trigger[0].split(':',1)[1],)).fetchone() for trigger in triggers]
+            evidence = set(obligation['evidence'])
+            for assessment in assessments:
+                if assessment:
+                    evidence.update(json.loads(assessment[0])['judgment']['evidence'])
+            repairs.append(document(dict(obligation, evidence=sorted(evidence))))
         # All retired claim metadata is visible; exact documents/evidence are paged by hash.
         retired = [document(dict(row)) for row in self.ledger.retired()]
         artifacts = dict(request.artifacts)
@@ -132,12 +159,14 @@ class MemoryMaintenance:
                 ('usefulness', 'correctness', 'reason', 'evidence')})
             version = row['version']
             kind = 'correct' if judgment['correctness'] == 'contradicted' else 'investigate' if judgment['investigate'] else None
+            if kind == 'correct' and self.ledger.status(version) == 'retired':
+                kind = None  # Already withdrawn permanently; retain the new judgment only.
             if kind == 'correct':
                 self.ledger.transition(version, 'quarantined', event_id='contradiction-' + exposure_id,
                     reason=judgment['reason'], evidence=judgment['evidence'])
             if kind:
                 self._ensure(version, kind, project_id=payload['project_id'], subject_id=payload['subject_id'],
-                    reason=judgment['reason'], evidence=judgment['evidence'])
+                    reason=judgment['reason'], evidence=judgment['evidence'], trigger=kind + ':' + exposure_id)
             with sqlite3.connect(self.ledger.path) as db:
                 db.execute('UPDATE memory_maintenance_reviews SET applied=1 WHERE exposure_id=?', (exposure_id,))
         for row in self.ledger.report():
@@ -149,7 +178,7 @@ class MemoryMaintenance:
                 self._ensure(row['version'], 'rewrite', project_id='memory-statistics-' + row['version'],
                     subject_id=self.campaign.scheduler.subjects[0].subject_id,
                     reason='Frequently accessed current version is useful in fewer than 30% of decided exposures.',
-                    evidence=[evidence])
+                    evidence=[evidence], trigger='rewrite:' + row['version'])
 
     def reconcile(self):
         self._apply_pending()
@@ -191,14 +220,14 @@ class MemoryMaintenance:
                     raise ValueError('memory correction must publish its replacement before resolving repair')
             else:
                 reviewed = next(item for item in record['review_request']['memory_repairs'] if item['repair_id'] == row['repair_id'])
-                if status != reviewed['status']:
-                    raise ValueError('memory lifecycle changed after review; reconcile its repair')
-                if resolution['action'] == 'restore' and (status != 'quarantined' or self.ledger.replacements(row['version'])):
+                event_id = 'resolution-' + row['repair_id'] + '-' + record['review_sha256']
+                with sqlite3.connect(self.ledger.path) as db:
+                    receipt = db.execute('SELECT 1 FROM memory_lifecycle WHERE event_id=?', (event_id,)).fetchone()
+                if not receipt and resolution['action'] == 'restore' and (status != 'quarantined' or self.ledger.replacements(row['version'])):
                     raise ValueError('only a quarantined current version may be restored')
                 wanted = 'retired' if resolution['action'] == 'retire' else 'active'
-                self.ledger.transition(row['version'], wanted,
-                    event_id='resolution-' + row['repair_id'] + '-' + record['review_sha256'],
-                    reason=resolution['reason'], evidence=resolution['evidence'], expected_status=status)
+                self.ledger.transition(row['version'], wanted, event_id=event_id,
+                    reason=resolution['reason'], evidence=resolution['evidence'], expected_status=reviewed['status'])
             for sha in resolution['evidence']:
                 self.retain(sha)
             with sqlite3.connect(self.ledger.path) as db:

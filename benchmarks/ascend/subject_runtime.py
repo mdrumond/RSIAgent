@@ -262,7 +262,8 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
             if (runtime is None or optimizer_config.get('arch') != runtime.get('architecture', getattr(paths, 'arch', None))
                     or str(optimizer_config.get('physical_device')) != runtime.get('device')):
                 raise ValueError('optimizer worker must match the composed target architecture and device')
-            return OptimizerTaskExecutor(directory, task, snapshot, optimizer_config)
+            return OptimizerTaskExecutor(directory, task, snapshot, optimizer_config,
+                memory_observer=knowledge.optimizer_observer(directory))
     else:
         optimizer_factory = None
     executor = SubjectExecutor(actor, optimizer_factory)

@@ -191,3 +191,74 @@ def test_project_source_read_keeps_independent_authority_when_memory_is_withdraw
     assert current.admitted[source]=='candidate-source'
     assert host(current,'read-artifact',sha256=source)['text']=='fixed source'
     assert host(current,'read-artifact',sha256=document)['error']=='memory withdrawn'
+
+
+def test_cross_campaign_imposed_repair_publishes_against_global_base(tmp_path):
+    origin,ledger=setup(tmp_path);base=seed(origin)
+    observe(origin,ledger,base)
+    other,_=setup(tmp_path,ledger=ledger,name='repair-campaign')
+    other.memory_maintenance.reconcile()
+    repair=other.memory_maintenance.prioritize()
+    source=other.artifacts.put_bytes(b'new independently verified correction\n')
+    request=other.memory_maintenance.prepare(ProjectReview('fix',source,True,{'source':source}),[repair['repair_id']])
+    fixed=dict(proposal(source),operation='append',base_versions=[base])
+    published=other.memory.accept('fix',fixed,{})
+    review=dict(decision='accept',memory=fixed,memory_resolutions=[dict(repair_id=repair['repair_id'],
+        action='replace',reason='Independent corrected example',evidence=[source])])
+    other.memory_maintenance.resolve('fix',dict(review=review,review_request=asdict(request),
+        review_sha256=other.artifacts.put_json(review)))
+    assert [row['memory_id'] for row in origin.memory.records()]==[base['memory_id']]
+    assert origin.memory.read(published['version'])['proposal']['after']['sha256']==source
+    assert other.memory_maintenance.obligations()==[]
+
+
+def test_indexed_prompt_delivery_counts_only_shown_available_memories(tmp_path):
+    from dataclasses import replace
+    from test_subject_knowledge import setup as knowledge_setup, proposal as knowledge_proposal
+    from test_a5_phase1_adaptive_actor import SourceBackend,ScriptedActor,_request
+    from benchmarks.a5kernels.evidence import EvidenceLedger
+    from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
+    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
+    service,memory,store,_=knowledge_setup(tmp_path/'knowledge')
+    base=memory.accept('lesson',knowledge_proposal(store),{})
+    frozen=memory.snapshot()
+    executor=ProjectExecutor(SourceBackend(),EvidenceLedger(tmp_path/'evidence.jsonl'))
+    request=replace(_request(tmp_path,executor),pre_wave_memory=frozen,publish_learning=False)
+    actor=ScriptedActor(['{"write":{"slot":"kernel","content":"fixed source"}}','{"run":{}}','{"submit":{}}'],memory=frozen)
+    driver=AdaptiveActorProjectExecutor(executor,actor,object())
+    driver.prepare_memory=service.actor_snapshot
+    driver.observe_memory_delivery=service.actor_delivery
+    driver.observe_knowledge_read=service.actor_read
+    driver(request)
+    assert service.ledger.stats('lesson')['accesses']==1
+    service.ledger.transition(base['version'],'quarantined',event_id='bad',reason='Conflict',evidence=['e'*64])
+    filtered=service.actor_snapshot(frozen)
+    assert json.loads(filtered)['memories']==[]
+    actor.expected_memory=filtered
+    driver(request)
+    assert service.ledger.stats('lesson')['accesses']==1
+
+
+def test_optimizer_counts_actual_memory_presentation_and_read(tmp_path):
+    from optimizer.jobs import JobStore,canonical,sha
+    from optimizer.loop import OptimizationLoop
+    from test_optimizer_loop import Agent,Backend,candidate
+    from test_subject_knowledge import setup as knowledge_setup,proposal as knowledge_proposal
+    service,memory,store,_=knowledge_setup(tmp_path/'knowledge')
+    base=memory.accept('lesson',knowledge_proposal(store),{})
+    snapshot={'files':{},'memory_entries':memory.records()}
+    snapshot['snapshot_id']=sha(canonical(snapshot))
+    jobs=JobStore(tmp_path/'jobs')
+    key=jobs.create('def forward(x): return x','forward',{'args':[{'shape':[5],'dtype':'float32'}]},snapshot,max_seconds=60)['job_id']
+    loop=OptimizationLoop(jobs,key,Agent([{'action':'cases','signatures':[],'summary':''},
+        {'action':'read-memory','index':0},candidate('fast')]),Backend(),
+        memory_observer=service.optimizer_observer(tmp_path/'optimizer-project'))
+    loop.run(single_evaluation=True)
+    rows=service.ledger.exposures(str(service.root.resolve()),'optimizer-project')
+    assert len(rows)==1 and rows[0]['actor_role']=='optimizer'
+    assert rows[0]['accesses']==3  # prompt, full read, next prompt
+    service.ledger.transition(base['version'],'quarantined',event_id='bad',reason='Conflict',evidence=['e'*64])
+    result=service.optimizer_observer(tmp_path/'optimizer-project')('read-memory',snapshot,
+        {'action':{'index':0},'result':memory.read(base['version'])},'withdrawn-read')
+    assert result['status']=='tool-error'
+    assert service.ledger.stats('lesson')['accesses']==3

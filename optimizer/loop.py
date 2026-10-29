@@ -43,12 +43,13 @@ def score(baseline, result):
 
 class OptimizationLoop:
     def __init__(self, store, job_id, agent, backend, *, knowledge=None, clock=time.time,
-                 max_cases=24):
+                 max_cases=24, memory_observer=None):
         if type(max_cases) is not int or not 1 <= max_cases <= 24:
             raise ValueError('max_cases must be between one and 24')
         self.max_cases = max_cases
         self.store, self.key, self.agent, self.backend = store, job_id, agent, backend
         self.knowledge, self.clock = knowledge, clock
+        self.memory_observer = memory_observer
         self.directory = store.root / job_id / 'execution'
         self.directory.mkdir(exist_ok=True)
         self.state = next((copy.deepcopy(e['payload']) for e in reversed(store.events(job_id))
@@ -127,6 +128,7 @@ class OptimizationLoop:
         if memory_snapshot is not None:
             verify_snapshot(memory_snapshot)
             submission = {**submission, 'memory_snapshot': memory_snapshot}
+        self.memory_snapshot = submission['memory_snapshot']
         identity = self.agent.identity
         if 'model' in self.state and self.state['model'] != identity:
             raise ValueError('optimizer model identity changed')
@@ -400,6 +402,9 @@ class OptimizationLoop:
                     context[key] = {'artifact': record, 'preview': rendered[:12000], 'truncated': True}
         from benchmarks.ascend.status_descriptions import describe_statuses
         presentation = describe_statuses(context)
+        if self.memory_observer is not None:
+            presentation = self.memory_observer('presentation', self.memory_snapshot, presentation,
+                self.key + ':turn:' + str(self.state['turn']))
         value = self._action(stage, lambda: self.agent.complete(stage, presentation, self._record))
         if value is not None and control.pending():
             # A redirection arriving in flight supersedes this unexecuted action.
@@ -413,6 +418,7 @@ class OptimizationLoop:
         # Model request mistakes are feedback, not evidence/transport failures.
         # Validate before accessing storage so corruption exceptions still escape.
         error = None
+        memory_file = False
         if action['action'] == 'read-artifact':
             if set(action) != {'action', 'sha256', 'offset'}:
                 error = 'read-artifact requires exactly action, sha256 and offset'
@@ -453,6 +459,7 @@ class OptimizationLoop:
                         'artifact is absent from job and authenticated memory snapshot; use an exact retained reference or read-memory index'})
                     return
                 data = base64.b64decode(record['base64'], validate=True)
+                memory_file = True
             raw = data.decode('utf-8')
             result = {'offset': offset, 'text': raw[offset:offset + 1500],
                       'next_offset': offset + 1500 if len(raw) > offset + 1500 else None}
@@ -470,6 +477,9 @@ class OptimizationLoop:
             result = self._action('knowledge', query)
         else:
             raise ValueError('invalid tool action')
+        if self.memory_observer is not None and (action['action'] == 'read-memory' or memory_file):
+            result = self.memory_observer(action['action'], snapshot, dict(action=action, result=result),
+                self.key + ':turn:' + str(self.state['turn']))
         self._tool_result(action, result)
 
     def _tool_result(self, action, result):

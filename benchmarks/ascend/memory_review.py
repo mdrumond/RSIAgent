@@ -43,6 +43,8 @@ def validate_memory_review(value, request, read, evidence, fully_read):
             raise ValueError('invalid memory repair resolution')
         evidence(row['evidence'], read)
         repair = repairs[row['repair_id']]
+        if not set(repair.get('evidence', [])) <= read:
+            raise ValueError('read the recorded counterevidence before resolving a memory repair')
         if repair['document_sha256'] not in fully_read:
             raise ValueError('read the disputed memory before resolving its repair')
         if not row['reason'].strip() or not project_evidence.intersection(row['evidence']):

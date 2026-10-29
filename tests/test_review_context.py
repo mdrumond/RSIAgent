@@ -119,3 +119,17 @@ def test_large_readable_registry_keeps_original_read_controls_within_native_budg
         recovered.update(page['artifacts']);offset=page['next_offset']
     assert recovered==state.registry
     assert set(extra.values())<=set(recovered.values())
+
+
+def test_memory_assessments_and_retirement_history_page_losslessly():
+    context=fixture()
+    context['host']['project']['rewrite_feedback'].pop('prior_draft')
+    rows=[dict(exposure_id=str(i),memory_id='lesson',version='a'*64,
+        statistics={'reason':'exact retained counterevidence '*100}) for i in range(20)]
+    context['host']['project']['project']['memory_exposures']=rows
+    records=ReviewContextRecords()
+    packed=records.snapshot(context,target=16384)
+    assert len(encoded(packed))<=16384
+    reference=packed['host']['project']['project']['memory_exposures']
+    assert json.loads(reconstruct(records,reference))==rows
+    assert packed['host']['review_state']==context['host']['review_state']

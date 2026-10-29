@@ -6,6 +6,7 @@ from itertools import zip_longest
 from pathlib import Path
 import re
 import time
+import sqlite3
 
 from optimizer.jobs import atomic, canonical
 from .subject_memory import digest as memory_digest
@@ -142,6 +143,13 @@ class SubjectKnowledge:
         return dict(memories=memories, citations=[asdict(hit.citation) for hit in hits],
                     hits=[dict(citation=asdict(hit.citation), text=hit.text, score=hit.score) for hit in hits])
 
+    def _delivery_bindings(self, context, bindings=()):
+        with sqlite3.connect(self.ledger.path) as db:
+            db.execute('CREATE TABLE IF NOT EXISTS memory_delivery_bindings (actor_id TEXT, artifact TEXT, version TEXT, PRIMARY KEY(actor_id,artifact,version))')
+            db.executemany('INSERT OR IGNORE INTO memory_delivery_bindings VALUES (?,?,?)',
+                           [(context.actor_id, artifact, version) for artifact,version in bindings])
+            return db.execute('SELECT artifact,version FROM memory_delivery_bindings WHERE actor_id=?', (context.actor_id,)).fetchall()
+
     def actor_query(self, payload, context, *, remaining_seconds):
         """Present and retain exact results from this Actor's pinned memory view."""
         from core.knowledge_presentation import knowledge_presentation
@@ -178,6 +186,16 @@ class SubjectKnowledge:
                     retain(content)
         observation = knowledge_presentation(action.query, selected, retain)
         delivered = {row['citation']['collection'] for row in observation['results']}
+        index = json.loads(context.artifacts.read_bytes(observation['results_index_sha256']))
+        bindings = []
+        for memory in result['memories']:
+            collection = 'subject-memory-' + memory['version']
+            if collection in collections:
+                bindings.extend((sha, memory['version']) for sha in memory['artifacts'].values())
+                bindings.extend((row['artifact_sha256'], memory['version']) for row in index['results']
+                                if row['citation']['collection'] == collection)
+                bindings.append((observation['results_index_sha256'], memory['version']))
+        self._delivery_bindings(context, bindings)
         for memory in result['memories']:
             if 'subject-memory-' + memory['version'] not in delivered:
                 continue
@@ -212,6 +230,30 @@ class SubjectKnowledge:
         candidates = {row['version']: row for row in self.ledger.exposures(str(self.root.resolve()), context.request.spec.project_id)
                       if row['actor_id'] == context.actor_id and row['actor_role'] == context.actor_role
                       and row['version'] in {item['version'] for item in self.ledger.artifact_versions(sha)}}
+        binding_versions = {version for artifact,version in self._delivery_bindings(context) if artifact == sha}
+        indexed_document = None
+        try:
+            raw = context.artifacts.read_bytes(sha)
+            indexed_document = json.loads(raw)
+        except (FileNotFoundError, ValueError, UnicodeDecodeError):
+            pass
+        if isinstance(indexed_document, dict) and indexed_document.get('summary_kind') == 'query-focused source excerpts':
+            overlapping = set()
+            cursor, offset = 0, page.get('offset', 0)
+            for entry in indexed_document.get('results', []):
+                encoded = json.dumps(entry, ensure_ascii=True, separators=(',', ':')).encode('ascii')
+                start = raw.find(encoded, cursor)
+                cursor = start + len(encoded)
+                if start >= 0 and offset < cursor and offset + page.get('page_bytes',0) > start:
+                    collection = entry['citation']['collection']
+                    if collection.startswith('subject-memory-'):
+                        overlapping.add(collection.removeprefix('subject-memory-'))
+            binding_versions &= overlapping
+            candidates = {version:row for version,row in candidates.items() if version in overlapping}
+        for version in binding_versions:
+            candidates[version] = dict(memory_id=self.ledger.record(version)['memory_id'], version=version,
+                campaign_id=str(self.root.resolve()), project_id=context.request.spec.project_id,
+                actor_id=context.actor_id, actor_role=context.actor_role)
         envelope = json.loads(context.request.pre_wave_memory)
         indexed = getattr(context.request, 'actor_memory_delivery', 'indexed') == 'indexed'
         snapshot = canonical(envelope)
@@ -223,13 +265,13 @@ class SubjectKnowledge:
                     snapshot, envelope = retained, candidate
             except (FileNotFoundError, ValueError, UnicodeDecodeError):
                 pass
-        bundle = sha == hashlib.sha256(snapshot).hexdigest()
+        bundle = sha == hashlib.sha256(snapshot).hexdigest() or bool(isinstance(indexed_document,dict) and indexed_document.get('summary_kind') == 'query-focused source excerpts')
         offset = page.get('offset', 0)
         for record in envelope.get('memories', []) if indexed else []:
             version = memory_digest(record)
             encoded = canonical(record)
             position = snapshot.find(encoded)
-            overlaps = bundle and position >= 0 and offset < position + len(encoded) and offset + page.get('page_bytes', 0) > position
+            overlaps = sha == hashlib.sha256(snapshot).hexdigest() and position >= 0 and offset < position + len(encoded) and offset + page.get('page_bytes', 0) > position
             if sha in {version, hashlib.sha256(canonical(record['proposal'])).hexdigest(), *memory_artifacts(record)} or overlaps:
                 candidates[version] = dict(memory_id=record['memory_id'], version=version,
                     campaign_id=str(self.root.resolve()), project_id=context.request.spec.project_id,
@@ -244,3 +286,34 @@ class SubjectKnowledge:
         for row in available:
             self.ledger.access(context.access_event_id + ':' + row['version'],
                 **{key: row[key] for key in ('memory_id','version','campaign_id','project_id','actor_id','actor_role')})
+
+    def optimizer_observer(self, directory):
+        """Observe actual optimizer prompt/read delivery without changing its contract."""
+        actor_id = str(Path(directory).resolve())
+        def observe(kind, snapshot, payload, event_id):
+            records = {i:entry for i,entry in enumerate(snapshot['memory_entries'])
+                       if isinstance(entry, dict) and {'memory_id','proposal','provenance'} <= entry.keys()}
+            if kind == 'presentation':
+                rows = payload.get('memory_summary', [])
+                chosen = [row['index'] for row in rows if row['index'] in records]
+            elif kind == 'read-memory':
+                chosen = [payload['action']['index']] if payload['action']['index'] in records else []
+            else:
+                sha = payload['action']['sha256']
+                chosen = [i for i,record in records.items()
+                          if sha in {memory_digest(record), *memory_artifacts(record)}]
+            unavailable = {i for i in chosen if not self.ledger.available(memory_digest(records[i]))}
+            if kind == 'presentation':
+                payload = dict(payload, memory_summary=[row for row in payload.get('memory_summary', [])
+                                                       if row['index'] not in unavailable])
+            elif unavailable:
+                return dict(status='tool-error', error='Memory version withdrawn pending evidence-backed resolution')
+            if kind == 'read-artifact' and not payload['result'].get('text'):
+                return payload['result']
+            for index in set(chosen) - unavailable:
+                record = records[index]
+                self.ledger.access(kind + ':' + event_id + ':' + memory_digest(record),
+                    memory_id=record['memory_id'], version=memory_digest(record), campaign_id=str(self.root.resolve()),
+                    project_id=Path(directory).name, actor_id=actor_id, actor_role='optimizer')
+            return payload if kind == 'presentation' else payload['result']
+        return observe
