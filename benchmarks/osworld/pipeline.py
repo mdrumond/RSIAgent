@@ -34,10 +34,6 @@ TASKS = tuple(f"task_{index:03d}" for index in range(1, 109))
 TASK_RELEASES = {
     "osworld-v2-2026.08.08": frozenset(),
 }
-BENCHMARK_PROVENANCE_PROFILES = {
-    "osworld-v2-2026.08.08": (
-        RSIAGENT_ROOT / "config/osworld/baseline.lock.json"),
-}
 _SAFE_NAME = re.compile(r"[A-Za-z0-9_.-]+\Z")
 _ACK = {
     "phase1": "RUN-RECURSIVE-IMPROVEMENT-PHASE1",

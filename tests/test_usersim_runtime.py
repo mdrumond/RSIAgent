@@ -48,8 +48,6 @@ def make_study(tmp_path, monkeypatch, *, name="first", route=ROUTE):
         "evaluator": {"website_host_suffix": "site.invalid"},
         "user_simulator": route,
     }))
-    monkeypatch.setattr(pipeline, "BENCHMARK_PROVENANCE_PROFILES", {
-        "osworld-v2-2026.08.08": lock})
     return {
         "run_name": name,
         "task_release": "osworld-v2-2026.08.08",
