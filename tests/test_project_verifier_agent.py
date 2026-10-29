@@ -434,3 +434,117 @@ def test_typed_context_deduplicates_repeated_pages_and_keeps_current_feedback():
     feedback = session.contexts[-1]['validation_feedback']
     assert feedback['missing_required_artifacts'] == []
     assert set(feedback['allowed_evidence']) == {S, R, L}
+
+
+def retained_request(original=B):
+    from dataclasses import replace
+    req = request()
+    return replace(req, artifacts={**req.artifacts, 'original-source': original})
+
+
+def contrasted_memory(original=B, text=BEFORE.decode()):
+    proposal = memory()
+    proposal.update(before=snippet(original, text), before_unavailable_reason=None)
+    return proposal
+
+
+@pytest.mark.parametrize('rewrite_feedback', [None, {'instructions':'Preserve the retained code contrast'}])
+def test_distinct_original_requires_full_read_and_real_before_including_rewrite(rewrite_feedback):
+    partial = {'read_artifact': {'sha256':B,'offset':0,'limit':4}}
+    rest = {'read_artifact': {'sha256':B,'offset':4}}
+    h = Harness([*prerequisites(), decision(memory()), partial, decision(memory()),
+                 rest, decision(memory()), decision(contrasted_memory())])
+    result = h.agent.review(retained_request(), feedback=rewrite_feedback)
+    assert result['memory']['before']['sha256'] == B
+    feedback = [e['payload'] for e in h.agent.last_trace if e['kind']=='feedback']
+    assert [e['error_code'] for e in feedback] == [
+        'incomplete-original-source','incomplete-original-source','retained-before-required']
+    first = next(row for row in feedback[0]['missing_required_artifacts'] if row['sha256']==B)
+    assert first['complete_read_required'] is True and first['next_read']['offset'] == 0
+    second = next(row for row in feedback[1]['missing_required_artifacts'] if row['sha256']==B)
+    assert second['missing_ranges'] == [{'offset':4,'end':len(BEFORE)}]
+    assert second['next_read']['offset'] == 4
+    assert B in feedback[0]['readable_artifacts'] and B not in feedback[0]['allowed_evidence']
+    assert B in feedback[1]['allowed_evidence']  # Compatibility: one observed page remains citable.
+    assert feedback[2]['missing_required_artifacts'] == []
+
+
+def test_coverage_requires_gap_read_even_if_last_original_page_was_read():
+    from benchmarks.ascend.project_verifier import ReviewState
+    h = Harness([])
+    state = ReviewState(h.agent, retained_request(), lambda:10, None)
+    state.execute({'read_artifact': {'sha256':B,'offset':8}})
+    state.execute({'read_artifact': {'sha256':B,'offset':0,'limit':4}})
+    summary = state.summary()
+    assert B in summary['readable_artifacts'] and B in summary['read_artifacts']
+    assert B not in summary['fully_read_artifacts']
+    missing = next(row for row in summary['missing_required_artifacts'] if row['sha256']==B)
+    assert missing['missing_ranges'] == [{'offset':4,'end':8}]
+    state.execute({'read_artifact': {'sha256':B,'offset':4,'limit':4}})
+    assert B in state.summary()['fully_read_artifacts']
+    assert B not in {row['sha256'] for row in state.summary()['missing_required_artifacts']}
+
+
+@pytest.mark.parametrize('original', [None, S])
+def test_null_before_remains_valid_for_absent_or_identical_original(original):
+    req = request() if original is None else retained_request(original)
+    h = Harness([*prerequisites(), decision(memory())])
+    result = h.agent.review(req)
+    assert result['memory']['before'] is None
+    assert not [e for e in h.agent.last_trace if e['kind']=='feedback']
+
+
+@pytest.mark.parametrize('original', [None, S, B])
+def test_identical_before_after_rejected_without_inventing_distinct_source(original):
+    bad = memory()
+    bad.update(before=snippet(), before_unavailable_reason=None)
+    corrected = contrasted_memory() if original == B else memory()
+    req = request() if original is None else retained_request(original)
+    h = Harness([*prerequisites(), *([read(B)] if original==B else []),
+                 decision(bad), decision(corrected)])
+    assert h.agent.review(req)['memory'] == corrected
+    feedback = [e['payload'] for e in h.agent.last_trace if e['kind']=='feedback']
+    assert len(feedback)==1 and feedback[0]['error_code']=='identical-before-after'
+
+
+def test_other_kdb_source_cannot_replace_this_projects_original():
+    other = b'def kernel(x):\n    return 0\n'
+    digest = sha(other)
+    base = {'memory_id':'other','version':'v1','artifacts':{'before-source':digest}}
+    h = Harness([*prerequisites(),read(B),read(digest),decision(contrasted_memory(digest,other.decode())),
+                 decision(contrasted_memory())],knowledge={'memories':[base],'citations':[]})
+    h.artifacts[digest] = other
+    assert h.agent.review(retained_request())['memory']['before']['sha256']==B
+    assert any(e['kind']=='feedback' and e['payload']['error_code']=='wrong-before-source' for e in h.agent.last_trace)
+
+
+def test_unreadable_retained_original_is_not_evidence_of_absence():
+    h = Harness([*prerequisites(),read(B),decision(memory()),repair()])
+    original_reader = h.agent.read_artifact
+    def unavailable(digest, **options):
+        if digest==B:raise FileNotFoundError('retained object temporarily unavailable')
+        return original_reader(digest, **options)
+    h.agent.read_artifact = unavailable
+    assert h.agent.review(retained_request())==repair()
+    feedback = [e['payload'] for e in h.agent.last_trace if e['kind']=='feedback']
+    assert [e['error_code'] for e in feedback]==['artifact-unavailable','incomplete-original-source']
+    assert all(B in e['readable_artifacts'] and B not in e['allowed_evidence'] for e in feedback)
+    assert all(B in {row['sha256'] for row in e['missing_required_artifacts']} for e in feedback)
+
+
+def test_passing_original_is_preserved_as_history_without_relabeling_it_failed():
+    from dataclasses import replace
+    passing = b'{"role":"original-control","host_verified":true}'
+    p = sha(passing)
+    req = retained_request()
+    req = replace(req, artifacts={**req.artifacts,'original-result':p},
+                  host_facts=({'category':'host-verification','source_sha256':B,'host_verified':True,'evidence_sha256':p},))
+    proposal = contrasted_memory()
+    proposal.update(summary='Two host-verified increment implementations',limitations='Both versions passed; no failure reproduction or repair attribution is established')
+    h = Harness([*prerequisites(),read(B),read(p),decision(proposal)])
+    h.artifacts[p] = passing
+    result = h.agent.review(req)
+    assert result['memory']==proposal and result['memory']['before']['sha256']==B
+    initial = next(e['payload'] for e in h.agent.last_trace if e['kind']=='request')
+    assert initial['project']['host_facts'][0]['host_verified'] is True
+    assert not [e for e in h.agent.last_trace if e['kind']=='feedback']

@@ -90,3 +90,32 @@ def test_small_review_and_actor_default_keep_existing_direct_views():
     assert ReviewContextRecords().snapshot(context, target=16384) == ContextRecords().snapshot(context, target=16384)
     with pytest.raises(ContextLimitError):
         ContextRecords().snapshot(fixture(), target=16384)
+
+
+def test_large_readable_registry_keeps_original_read_controls_within_native_budget():
+    from dataclasses import replace
+    from benchmarks.ascend.project_verifier import ReviewState
+    from test_project_verifier_agent import Harness, retained_request, decision, memory, B
+    req = retained_request()
+    extra = {f'retained:{i:04d}':hashlib.sha256(f'large-{i}'.encode()).hexdigest() for i in range(300)}
+    req = replace(req,artifacts={**req.artifacts,**extra})
+    h = Harness([])
+    state = ReviewState(h.agent,req,lambda:60,None)
+    state.native = True
+    feedback = state.execute(decision(memory()))
+    controls = state.summary()
+    assert controls['readable_artifact_count']==304
+    assert len(controls['readable_artifacts'])<=16
+    assert len(feedback['readable_artifacts'])<=16
+    assert B in {row['sha256'] for row in controls['missing_required_artifacts']}
+    context = fixture()
+    context['host'].update(project=state.context,review_state=controls,validation_feedback=feedback)
+    packed = ReviewContextRecords().snapshot(context,target=16384)
+    assert len(encoded(packed))<=16384
+    assert packed['host']['review_state']['missing_required_artifacts']==controls['missing_required_artifacts']
+    recovered,offset={},0
+    while offset is not None:
+        page = state.execute({'list_artifacts':{'offset':offset,'limit':50}})
+        recovered.update(page['artifacts']);offset=page['next_offset']
+    assert recovered==state.registry
+    assert set(extra.values())<=set(recovered.values())

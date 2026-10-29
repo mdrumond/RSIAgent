@@ -141,7 +141,15 @@ end_line from source you have read, and the host will extract those exact lines.
 Do not double-escape code or guess line endings. If text is supplied it must
 match exactly. A snippet formatting failure is not a reason to discard an
 otherwise useful lesson; correct its range or omit text. Use a null before plus
-a reason if no retained before-code exists.
+a reason if no distinct retained before-code exists. When original-source differs
+from current source, read its complete contents using missing_required_artifacts
+and returned next_offset, then preserve an exact snippet from that original as
+before. Never substitute current source or an unrelated KDB example for it.
+An original-source artifact is historical code, not proof of failure. Preserve
+known passing outcomes and distinguish untested code from a reproduced failure;
+do not invent a failed-before or causal repair claim. Readable artifacts are
+available to read; allowed_evidence contains only artifacts actually observed,
+while fully_read_artifacts distinguishes complete reads from partial pages.
 Append/merge bases must be exact versions returned by KDB. An append has one
 base; a merge has one or more. A create has none. For an accepted project, normally compose a reusable memory with the verified
 example, its expected behavior, applicability and preconditions. New means not
@@ -285,7 +293,13 @@ class ProjectVerifierAgent:
         self._evidence(memory['evidence'], read)
         if not isinstance(memory['citations'], list) or any(item not in citations for item in memory['citations']):
             raise ValueError('memory citation was not returned by KDB')
+        original = request.artifacts.get('original-source')
+        distinct_original = original is not None and original != request.source_sha256
         if memory['before'] is None:
+            if distinct_original:
+                raise EvidenceReferenceError('retained-before-required',
+                    f'retained original-source {original} exists; preserve its exact before snippet '
+                    'and set before_unavailable_reason to null; do not claim it is absent')
             _text(memory['before_unavailable_reason'], 'before_unavailable_reason')
         elif memory['before_unavailable_reason'] is not None:
             raise ValueError('before snippet cannot have an unavailable reason')
@@ -294,6 +308,15 @@ class ProjectVerifierAgent:
         self._snippet(memory['after'], read, remaining, observed)
         if memory['after']['sha256'] != request.source_sha256:
             raise ValueError('after snippet must reference reviewed current source')
+        if memory['before'] is not None:
+            if memory['before']['sha256'] == memory['after']['sha256']:
+                raise EvidenceReferenceError('identical-before-after',
+                    'before and after reference identical source; use the distinct retained '
+                    'original-source, or null before with an honest reason when none exists')
+            if distinct_original and memory['before']['sha256'] != original:
+                raise EvidenceReferenceError('wrong-before-source',
+                    f"before must reference this project's retained original-source {original}, "
+                    'not a different example returned by KDB')
 
     @staticmethod
     def _evidence(items, read):
@@ -347,11 +370,15 @@ class ReviewState:
             self.registry['source'] = request.source_sha256
         self.known = set(self.registry.values())
         self.read, self.observed, self.versions, self.citations = set(), {}, set(), []
+        self.sizes = {}
+        original = request.artifacts.get('original-source')
+        self.complete_required = {original} if original is not None and original != request.source_sha256 else set()
         self.queried, self.host_ok = agent.query_knowledge is None, request.host_verified
         self.required = {digest for role, digest in request.artifacts.items()
             if any(part in role.lower() for part in ('result', 'log', 'evidence', 'execution'))}
         if request.source_sha256 is not None:
             self.required.add(request.source_sha256)
+        self.required.update(self.complete_required)
         project = asdict(request)
         project.update(artifacts=artifact_preview(self.registry), artifact_count=len(self.registry))
         self.context = dict(project=project, rewrite_feedback=feedback,
@@ -369,11 +396,38 @@ class ReviewState:
             ['knowledge_query'] if self.agent.query_knowledge is not None else []) + (
             ['request_check'] if self.agent.request_check is not None else [])
 
+    def missing_ranges(self, digest):
+        size = self.sizes.get(digest)
+        if size is None:
+            return [dict(offset=0, end=None)]
+        position, gaps = 0, []
+        for start, end in sorted(self.observed.get(digest, [])):
+            if start > position:
+                gaps.append(dict(offset=position, end=start))
+            position = max(position, end)
+        if position < size:
+            gaps.append(dict(offset=position, end=size))
+        return gaps
+
+    def missing_required(self):
+        missing = self.required - self.read
+        missing |= {digest for digest in self.complete_required if self.missing_ranges(digest)}
+        return [dict(sha256=digest, roles=self.roles(digest),
+            complete_read_required=digest in self.complete_required,
+            missing_ranges=self.missing_ranges(digest),
+            next_read=dict(sha256=digest, offset=self.missing_ranges(digest)[0]['offset'],
+                           limit=2048 if self.native else 8192)) for digest in sorted(missing)]
+
+    def readable_preview(self):
+        return sorted(set(artifact_preview(self.registry).values()))
+
     def summary(self):
-        ready = not (self.required - self.read) and self.queried
+        missing = self.missing_required()
+        ready = not missing and self.queried
         return dict(read_artifacts=sorted(self.read), allowed_evidence=sorted(self.read),
-            missing_required_artifacts=[dict(sha256=digest, roles=self.roles(digest))
-                                        for digest in sorted(self.required - self.read)],
+            readable_artifacts=self.readable_preview(), readable_artifact_count=len(self.known),
+            fully_read_artifacts=sorted(digest for digest in self.read if not self.missing_ranges(digest)),
+            missing_required_artifacts=missing,
             observed_versions=sorted(self.versions), citations=self.citations,
             host_checks_passed=self.host_ok, knowledge_queried=self.queried,
             ready_for_decision=ready,
@@ -381,7 +435,8 @@ class ReviewState:
                 requests=sum(n for (digest, _, _), n in self.read_requests.items() if digest == h))
                 for h in sorted(self.read)] if self.native else [],
             guidance=('Evidence prerequisites are complete; submit a justified accept or repair when ready. '
-                      'Further reads remain available.' if ready else 'Read the missing evidence and query related memory.'))
+                      'Further reads remain available; list_artifacts pages the complete readable registry.' if ready else
+                      'Read the missing evidence and query related memory; list_artifacts pages the complete readable registry.'))
 
     def execute(self, value, *, raw_response=None):
         self.remaining()
@@ -403,7 +458,14 @@ class ReviewState:
                 if digest not in known:
                     raise ValueError('artifact is not admitted by the project or observed tools')
                 cached = self.native and digest in self.cache
-                data = self.cache[digest] if cached else self.agent.read_artifact(digest, remaining_seconds=remaining())
+                try:
+                    data = self.cache[digest] if cached else self.agent.read_artifact(digest, remaining_seconds=remaining())
+                except OSError as error:
+                    if isinstance(error, TimeoutError):
+                        raise
+                    raise EvidenceReferenceError('artifact-unavailable',
+                        f'admitted artifact {digest} is unreadable ({type(error).__name__}); '
+                        'restore its retained bytes or request repair; this is not evidence of absence') from error
                 if not isinstance(data, bytes) or hashlib.sha256(data).hexdigest() != digest:
                     raise ValueError('artifact bytes do not match their identity')
                 if self.native:
@@ -420,6 +482,7 @@ class ReviewState:
                     if end == offset and offset < len(data):
                         raise ValueError('page limit is too small for the next UTF-8 character')
                 page = data[offset:end]
+                self.sizes[digest] = len(data)
                 if self.native:
                     # Keep escaped JSON page envelopes bounded as well as bytes.
                     while len(json.dumps(dict(text=page.decode('utf-8', errors='replace')),
@@ -487,6 +550,10 @@ class ReviewState:
                 observation = dict(host_verified=observation['host_verified'],
                                    artifacts=artifact_preview(registry), artifact_count=len(registry))
             else:
+                if value.get('decision') == 'accept' and any(self.missing_ranges(h) for h in self.complete_required):
+                    raise EvidenceReferenceError('incomplete-original-source',
+                        'read the complete distinct original-source before acceptance; '
+                        'follow missing_required_artifacts.next_read to read every missing page')
                 self.agent._validate_decision(value, request, read, required, host_ok,
                                         queried, versions, citations, remaining, observed)
                 remaining()
@@ -507,7 +574,8 @@ class ReviewState:
             return observation
         except (ValueError, KeyError, TypeError, UnicodeDecodeError) as error:
             observation = dict(error=str(error), error_code=getattr(error, 'code', 'invalid-review-action'),
-                missing_required_artifacts=[dict(sha256=h, roles=self.roles(h)) for h in sorted(required-read)],
+                missing_required_artifacts=self.missing_required(), readable_artifacts=self.readable_preview(),
+                readable_artifact_count=len(known),
                 knowledge_query_required=not queried, allowed_evidence=sorted(read), allowed_citations=citations,
                 correction='Use exact allowed evidence hashes/citations, 1-based source lines, and read missing evidence.')
             self.feedback = observation

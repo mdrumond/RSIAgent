@@ -202,3 +202,29 @@ def test_native_rpc_abort_is_typed_cancellation_without_verdict(monkeypatch):
     with pytest.raises(TimeoutError):
         h.agent.review(request(), max_seconds=10)
     assert not any(e['kind'] == 'decision' for e in h.agent.last_trace)
+
+
+@pytest.mark.parametrize('rewrite_feedback', [None, {'instructions':'Preserve the actual retained original'}])
+def test_native_original_source_coverage_and_before_contract_match_completion(monkeypatch, rewrite_feedback):
+    from test_project_verifier_agent import B, BEFORE, read, retained_request, contrasted_memory, snippet
+    h = Harness([])
+    bad = memory()
+    bad.update(before=snippet(),before_unavailable_reason=None)
+    calls = native(h, monkeypatch, [
+        [*prerequisites(),{'read_artifact':{'sha256':B,'offset':0,'limit':4}}],
+        [decision(memory())],
+        [{'read_artifact':{'sha256':B,'offset':4}}],
+        [decision(memory())],
+        [decision(bad)],
+        [decision(contrasted_memory())]])
+    result = h.agent.review(retained_request(),max_seconds=30,feedback=rewrite_feedback)
+    assert result['memory']['before']['sha256']==B
+    feedback = [e['payload'] for e in h.agent.last_trace if e['kind']=='feedback']
+    assert [e['error_code'] for e in feedback]==[
+        'incomplete-original-source','retained-before-required','identical-before-after']
+    missing = next(row for row in feedback[0]['missing_required_artifacts'] if row['sha256']==B)
+    assert missing['missing_ranges']==[{'offset':4,'end':len(BEFORE)}]
+    assert missing['next_read']=={'sha256':B,'offset':4,'limit':2048}
+    assert B in feedback[0]['allowed_evidence'] and B in feedback[0]['readable_artifacts']
+    assert len(calls)==6
+    assert len([e for e in h.agent.last_trace if e['kind']=='decision'])==1
