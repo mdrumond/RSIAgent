@@ -444,173 +444,55 @@ def _project(branch: Path, spec: dict, failed=None):
             "transitions": transitions}
 
 
-def _goal_selection(root):
-    """Only publish the bootstrap's public metadata, never reference artifacts."""
-    value = _json(root / "goal-selection.json")
-    if not isinstance(value, dict) or value.get("stage") not in {
-            "selection", "qualification", "qualified", "failed"}:
-        return None
-    candidate = value.get("candidate")
-    candidate = candidate if isinstance(candidate, dict) else {}
-    return {"stage": value["stage"], "proposal_count": value.get("proposal_count"),
-            "candidate": {key: candidate[key] for key in ("spec", "task_id", "submission", "rationale", "citations")
-                          if key in candidate},
-            "diagnostic": value.get("diagnostic"),
-            "qualified_target_id": value.get("qualified_target_id")}
-
-
-def _attempt_id(wave, project):
-    return f"{wave}--{project}"
-
-
-def _optimizer_attempt_events(store, key, result):
-    selected = []
-    for event in store.events(key):
-        selected.append(event)
-        if event["kind"] == "phase2-attempt-result":
-            if event["payload"] == result:
-                return selected
-            selected = []
-    return []
-
-
-def _optimizer_projects(root, state):
-    from optimizer.jobs import JobStore
-    from .optimizer_results import projection
-    from types import SimpleNamespace
-    projects = []
-    for row in state.get("attempts", []):
-        task = row["task"]
-        result = row.get("result", {})
-        directory = root / row["execution_directory"]
-        store = JobStore(directory / "jobs")
-        key = result["job_id"]
-        events = _optimizer_attempt_events(store, key, result)
-        artifacts = [e["payload"] for e in events if e["kind"] == "artifact"]
-        if result.get("candidate") and not any(
-                a["sha256"] == result["candidate"]["sha256"] for a in artifacts):
-            artifacts.append(result["candidate"])
-        revisions = []
-        for artifact in artifacts:
-            if artifact["name"] not in {"candidate.cpp", "candidate.py"}:
-                continue
-            source = json.loads(store.read_artifact(key, artifact["sha256"]))
-            revisions.append({"sha256": artifact["sha256"], "source": source})
-        measured_row = {"candidate_sha256": result.get("source_sha256"),
-            "content": result.get("result") or {}, "speedup": result.get("speedup"),
-            "summary": result.get("summary"), "source": result.get("candidate"),
-            "profiling": result.get("profiling")}
-        # Reuse the optimizer projection, but bind it to this committed attempt,
-        # not the latest best state of a shared task's subsequent retries.
-        view = SimpleNamespace(get=store.get, read_artifact=store.read_artifact,
-            artifacts=lambda _: artifacts,
-            events=lambda _: [{"kind": "optimizer-state", "payload": {
-                "baseline": result.get("baseline"), "history": [measured_row],
-                "best": measured_row}}])
-        measured = projection(view, key)
-        description = task.get("rationale", "Optimizer reference task")
-        projects.append({"id": row["attempt_id"], "project_id": row["task_id"],
-            "attempt": row["attempt_id"], "kind": row["kind"], **_description(description),
-            "summary": result.get("summary", result.get("status", "Attempt completed")),
-            "verified": row.get("verified") is True,
-            "classification": result.get("classification", "unknown"),
-            "spec": task, "performance": [], "optimizer_results": measured,
-            "memory": {"actions": [], "facts": [], "lessons": [*result.get("lessons", []), *[entry for entry in state.get("memory_entries", [])
-                           if entry.get("attempt_id") == row["attempt_id"]]],
-                       "interpretations": []},
-            "revisions": revisions, "source": revisions[-1]["source"] if revisions else "",
-            "transitions": [{"from": a["sha256"], "to": b["sha256"], "diff": "".join(
-                difflib.unified_diff(a["source"].splitlines(True), b["source"].splitlines(True)))}
-                for a, b in zip(revisions, revisions[1:])]})
-    return projects
+def dashboard_configuration(path):
+    config = json.loads(Path(path).read_text())
+    entries = [*config.get("campaigns", []), *config.get("controls", {}).get("presets", [])]
+    if any(type(entry.get("phase")) is not int or entry["phase"] != 1 for entry in entries):
+        raise ValueError("dashboard campaigns and presets support Phase 1 only")
+    return config
 
 
 def _load_campaign(entry):
     root = Path(entry["root"])
+    if entry.get("phase") != 1:
+        raise ValueError("unsupported campaign phase")
     if not root.is_dir():
         raise FileNotFoundError(f"campaign root unavailable: {root}")
     state = _json(root / "state.json")
-    bootstrap = _goal_selection(root) if int(entry["phase"]) == 2 else None
-    if not isinstance(state, dict) and bootstrap is not None:
-        state = {}
     if not isinstance(state, dict):
         raise ValueError(f"campaign state unavailable: {root / 'state.json'}")
-    if state.get("phase") == "optimizer-phase2":
-        projects = _optimizer_projects(root, state)
-        terminal = state.get("terminal") or {}
-        pending = _json(root / "pending.json", {}) or {}
-        control = Path(entry["control"]) if entry.get("control") else root.parent / "control"
-        worker = _json(control / "worker.json")
-        return {"phase": int(entry["phase"]), "name": entry.get("name", "Phase 2"),
-            "status": terminal.get("status") or (worker or {}).get("status") or "running",
-            "terminal": terminal, "bootstrap": bootstrap,
-            "learner_stage": pending.get("kind", state.get("next_kind")),
-            "root": str(root), "available": True, "worker": worker,
-            "stats": {"attempted": len(projects), "verified": sum(p["verified"] for p in projects),
-                      "published": len(state.get("memory_entries", []))},
-            "projects": projects, "planned": []}
-    target_driven = state.get("phase") == "target-driven-phase2"
-    pending = _json(root / "pending.json", {}) or {}
+    if state.get("phase") not in (None, 1, "phase1"):
+        raise ValueError("unsupported campaign state")
     specs = {}
-    attempts = {row["wave_id"]: row for row in state.get("attempts", [])}
     for plan_path in sorted(root.glob("waves/*/plan.json")):
         plan = _json(plan_path, {}) or {}
         for item in plan.get("wave", {}).get("projects", []):
             spec = item.get("spec", item)
             if spec.get("project_id"):
-                identity = (_attempt_id(plan_path.parent.name, spec["project_id"])
-                            if target_driven else spec["project_id"])
-                specs[identity] = spec
+                specs[spec["project_id"]] = spec
     failures = {row.get("project_id"): row for row in state.get("failed_outcomes", [])}
-    branches = {}
-    for branch in sorted(root.glob("waves/*/branches/*")):
-        if branch.is_dir():
-            identity = (_attempt_id(branch.parent.parent.name, branch.name)
-                        if target_driven else branch.name)
-            branches[identity] = branch
-    if target_driven:
-        failures = {_attempt_id(wave, row["project_id"]): row
-                    for wave, row in attempts.items() if not row.get("verified")}
-    executed = set(branches) | {project_id for project_id in failures if project_id}
-    projects = []
-    for project_id, spec in specs.items():
-        if project_id in executed:
-            project = _project(branches.get(project_id, root), spec, failures.get(project_id))
-            if target_driven:
-                wave = project_id.split("--", 1)[0]
-                kind = attempts.get(wave, {}).get("kind")
-                if kind is None and pending.get("wave", {}).get("wave_id") == wave:
-                    kind = pending.get("kind")
-                project.update(id=project_id, project_id=spec["project_id"],
-                               attempt=wave, kind=kind or "pending")
-            projects.append(project)
-    # Retain failures even if their old plan is temporarily unavailable.
-    for project_id, failure in failures.items():
-        if project_id and project_id not in specs:
-            project = _project(branches.get(project_id, root),
-                               failure.get("spec", {"project_id": project_id}), failure)
-            if target_driven:
-                project.update(id=project_id, project_id=failure["project_id"],
-                               attempt=failure["wave_id"], kind=failure["kind"])
-            projects.append(project)
+    branches = {branch.name: branch for branch in sorted(root.glob("waves/*/branches/*"))
+                if branch.is_dir()}
+    executed = set(branches) | {identity for identity in failures if identity}
+    projects = [_project(branches.get(identity, root), spec, failures.get(identity))
+                for identity, spec in specs.items() if identity in executed]
+    for identity, failure in failures.items():
+        if identity and identity not in specs:
+            projects.append(_project(branches.get(identity, root),
+                failure.get("spec", {"project_id": identity}), failure))
     control = Path(entry["control"]) if entry.get("control") else root.parent / "control"
     worker = _json(control / "worker.json")
-    published = (len(state["prior_outcomes"]) if "prior_outcomes" in state else
-                 sum(1 for project in projects if project["verified"]))
-    planned = [{"id": project_id, **_description(spec.get("hypothesis", "")), "spec": spec}
-               for project_id, spec in specs.items() if project_id not in executed]
     terminal = state.get("terminal") or {}
-    learner_stage = ((pending.get("kind") or state.get("next_kind", "target"))
-                     if target_driven and not terminal else None)
-    status = terminal.get("status") or (worker or {}).get("status") or (
-        bootstrap["stage"] if bootstrap and not target_driven else learner_stage or "idle")
-    return {"phase": int(entry["phase"]), "name": entry.get("name", f"Phase {entry['phase']}"),
-            "status": status, "terminal": terminal, "bootstrap": bootstrap,
-            "learner_stage": learner_stage,
-            "root": str(root), "available": root.is_dir(), "worker": worker,
+    published = (len(state["prior_outcomes"]) if "prior_outcomes" in state else
+                 sum(project["verified"] for project in projects))
+    return {"phase": 1, "name": entry.get("name", "Phase 1"),
+            "status": terminal.get("status") or (worker or {}).get("status") or "idle",
+            "terminal": terminal, "root": str(root), "available": True, "worker": worker,
             "stats": {"attempted": len(projects),
                       "verified": sum(project["verified"] for project in projects),
-                      "published": published}, "projects": projects, "planned": planned}
+                      "published": published}, "projects": projects,
+            "planned": [{"id": identity, **_description(spec.get("hypothesis", "")), "spec": spec}
+                        for identity, spec in specs.items() if identity not in executed]}
 
 
 def _campaign(entry):
@@ -641,6 +523,7 @@ def _campaign(entry):
 class DashboardStore:
     def __init__(self, config_path, cache_path):
         self.config_path, self.cache_path = Path(config_path), Path(cache_path)
+        dashboard_configuration(self.config_path)
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
         with self._db() as db:
             db.execute("CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL)")
@@ -659,7 +542,9 @@ class DashboardStore:
     def cached(self):
         with self._db() as db:
             row = db.execute("SELECT body FROM snapshots WHERE id=1").fetchone()
-        return json.loads(row[0]) if row else {"generated_at": None, "stale": True, "campaigns": []}
+        view = json.loads(row[0]) if row else {"generated_at": None, "stale": True, "campaigns": []}
+        view["campaigns"] = [entry for entry in view["campaigns"] if entry.get("phase") == 1]
+        return view
 
     def performance(self, project):
         return _performance(project)
@@ -671,7 +556,7 @@ class DashboardStore:
 
     def refresh(self):
         try:
-            config = json.loads(self.config_path.read_text())
+            config = dashboard_configuration(self.config_path)
             view = {"generated_at": time.time(), "stale": False,
                     "campaigns": [_campaign(entry) for entry in config["campaigns"]]}
             self._save(view)
@@ -684,7 +569,7 @@ class DashboardStore:
 
     def _project_sources(self, phase, project_id):
         try:
-            config = json.loads(self.config_path.read_text())
+            config = dashboard_configuration(self.config_path)
         except (OSError, ValueError):
             return None
         if not isinstance(config, dict) or not isinstance(config.get("campaigns"), list):
@@ -697,21 +582,11 @@ class DashboardStore:
             root = Path(entry["root"])
         except (KeyError, TypeError):
             return None
-        state = _json(root / "state.json", {}) or {}
-        if state.get("phase") == "optimizer-phase2":
-            row = next((row for row in state.get("attempts", [])
-                        if row["attempt_id"] == project_id), None)
-            if row:
-                return root, root / "attempts" / (project_id + ".json"), root / row[
-                    "execution_directory"] / "jobs" / row["result"]["job_id"], row["task"]
-            return None
         for plan_path in sorted(root.glob("waves/*/plan.json")):
             plan = _json(plan_path, {}) or {}
             for item in plan.get("wave", {}).get("projects", []):
                 spec = item.get("spec", item)
                 identity = spec.get("project_id")
-                if state.get("phase") == "target-driven-phase2":
-                    identity = _attempt_id(plan_path.parent.name, identity)
                 if identity == project_id:
                     branch = plan_path.parent / "branches" / spec["project_id"]
                     if branch.is_dir():
@@ -902,9 +777,6 @@ class DashboardStore:
         if located is None:
             return None
         root, plan_path, branch, _ = located
-        if (_json(root / "state.json", {}) or {}).get("phase") == "optimizer-phase2":
-            return hashlib.sha256(json.dumps({"attempt": self._metadata(plan_path),
-                "events": self._metadata(branch / "events.jsonl")}, sort_keys=True).encode()).hexdigest()
         ledger = branch / "evidence.jsonl"
         manifest = {"root": str(root), "files": {
             "plan": self._metadata(plan_path),
@@ -930,27 +802,6 @@ class DashboardStore:
         if located is None:
             return None
         root, plan_path, branch, spec = located
-        if (_json(root / "state.json", {}) or {}).get("phase") == "optimizer-phase2":
-            from optimizer.jobs import JobStore
-            store = JobStore(branch.parent)
-            result = _json(plan_path)["result"]
-            retained = _optimizer_attempt_events(store, branch.name, result)
-            events = [self._inline_event("Committed Phase 2 attempt", "outcome", plan_path.read_bytes())]
-            for row in retained:
-                events.append(self._inline_event(row["kind"], "actor", json.dumps(row)))
-            artifacts = [row["payload"] for row in retained if row["kind"] == "artifact"]
-            artifacts += [result[name] for name in ("candidate", "baseline", "profiling", "result_artifact")
-                          if result.get(name)]
-            seen = set()
-            for artifact in artifacts:
-                if artifact["sha256"] in seen:
-                    continue
-                seen.add(artifact["sha256"])
-                events.append(self._inline_event(artifact["name"], "verification",
-                    store.read_artifact(branch.name, artifact["sha256"])))
-            for index, event in enumerate(events):
-                event.update(id=f"{event['sha256']}-{index}", sequence=index)
-            return events
         plan = _json(plan_path, {}) or {}
         expected_wave = {"wave_id": plan_path.parent.name, **plan.get("wave", {})}
         pending = _json(root / "pending.json", {}) or {}
@@ -1017,14 +868,7 @@ class DashboardStore:
                 event = self._artifact_event(labels[role], "actor", source, digest,
                                              stage=payload.get("stage"), turn=payload.get("turn"))
                 events.append(event)
-        if state.get("phase") == "target-driven-phase2":
-            # The root ledger is keyed by project, not attempt: repeated target
-            # retries cannot safely be attributed from it. The branch verifier
-            # result below remains the authoritative attempt-specific evidence.
-            events.append(self._event("Shared host ledger", "verification",
-                                     reason="project-wide ledger; see attempt verifier result"))
-        else:
-            events.extend(self._host_evidence(root, project_id))
+        events.extend(self._host_evidence(root, project_id))
         events.append(self._event("Verifier prompt", "verification", reason=(
             "unavailable: verification is deterministic and host-owned")))
         events.append(self._event("Verifier result", "verification", branch / "execution-evidence.bin"))

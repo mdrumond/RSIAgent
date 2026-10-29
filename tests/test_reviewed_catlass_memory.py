@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import base64
+
+from dataclasses import replace
+
+import hashlib
+
+import json
+
+import pytest
+
+from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
+
+from benchmarks.a5kernels.evidence import canonical_bytes
+
+from benchmarks.a5kernels.phase1_adaptive import DELTA_SCHEMA, MEMORY_SCHEMA, STATE_SCHEMA
+
+from benchmarks.a5kernels.phase1_curriculum import ProjectSpec, WaveProject, WaveSpec
+
+from benchmarks.a5kernels.phase1_experiments import build_cells
+
+from benchmarks.a5kernels.phase1_memory import HostFact, Phase1ProjectMemory
+
+from benchmarks.a5kernels.phase1_provider import DirectCompletion
+
+from benchmarks.a5kernels.phase1_project import EvidenceClassification, ExecutionEvidence
+
+from benchmarks.a5kernels.phase1_wave_runtime import LiveWaveCoordinator, WaveProjectResult
+
+from tests.test_a5_phase1_adaptive import _project
+
+from benchmarks.ascend.reviewed_catlass import REVIEW_SCHEMA, admit_adaptive_snapshot, adaptive_destination
+from benchmarks.a5kernels.phase1_experiments import GUIDE_SCHEMA, ProgrammingGuideIdentity, PINNED_CATLASS_REVISION
+GUIDE = "Use host verification for every candidate."
+GUIDE_ID = ProgrammingGuideIdentity(GUIDE_SCHEMA, hashlib.sha256(GUIDE.encode()).hexdigest(), "1" * 40, PINNED_CATLASS_REVISION)
+ENVIRONMENT = {"OPENAI_API_KEY": "one", "DEEPSEEK_API_KEY": "two"}
+
+def _source(tmp_path, *, new=False, historical_citation=False, partial=False):
+    profiling_guide = None
+    if new:
+        from benchmarks.a5kernels.profiling_guidance import ProfilingGuidanceIdentity
+        profiling_guide = ProfilingGuidanceIdentity(
+            "a5-new-profiling-guidance-v1", hashlib.sha256(b"New profiler instructions").hexdigest(), "1" * 40,
+        )
+    source = next(cell for cell in build_cells(GUIDE_ID, profiling_guide=profiling_guide)
+                  if cell.knowledge.value == "without-kdb"
+                  and cell.profiling.value == ("new" if new else "without-profiling-guidance"))
+    root = tmp_path / "adaptive"
+    artifacts = ContentAddressedArtifacts(root / "waves/wave-01/branches/copy/artifacts")
+    evidence = artifacts.put_json({"host": "verified", "runtime": "9.3-weekly"})
+    source_sha = artifacts.put_bytes(b"actual candidate source")
+    spec = ProjectSpec.from_mapping(_project("copy", "gm-ub-movement"))
+    memory = Phase1ProjectMemory(
+        spec, source_sha, ("run",), (HostFact("host-verification", "passed", evidence),),
+        admitted_artifact_sha256=(evidence,), artifact_store="artifacts",
+    ).as_dict()
+    if historical_citation:
+        memory["kdb_citations"] = [dict(collection="docs", path="guide.py", start_line=1,
+                                       end_line=2, chunk_hash="c" * 64)]
+        if historical_citation == "empty-provenance":
+            memory["kdb_citations"][0].update(repository=None, revision=None,
+                                            source_sha256=None, reference_exposed=False)
+        elif historical_citation == "populated-provenance":
+            memory["kdb_citations"][0].update(repository="https://example.invalid/repo",
+                revision="d" * 40, source_sha256="e" * 64, reference_exposed=True)
+    encoded = base64.b64encode(canonical_bytes(memory)).decode()
+    pre_memory = canonical_bytes({
+        "schema": MEMORY_SCHEMA, "initial_memory_base64": "", "project_memory_base64": [],
+    })
+    projects = (WaveProject(spec),)
+    if partial:
+        projects += (WaveProject(ProjectSpec.from_mapping(_project("offline", "simd-vector"))),)
+    wave = WaveSpec("wave-01", hashlib.sha256(pre_memory).hexdigest(), (), projects)
+    def execute(request):
+        if request.assignment.project_id == "offline":
+            raise OSError("retained remote observation unavailable")
+        return WaveProjectResult(
+        canonical_bytes({"schema": DELTA_SCHEMA, "project_id": "copy", "summary": "host verified",
+                         "memory_base64": encoded}),
+        ExecutionEvidence(EvidenceClassification.HOST_VERIFIED, "test fixture"),
+        canonical_bytes({"classification": "host-verified", "source_sha256": source_sha,
+                         "artifacts": {"classification": evidence}}),
+    )
+    LiveWaveCoordinator(root / "waves/wave-01", wave, pre_memory, execute, 1,
+                        allow_partial=partial).run()
+    state = {
+        "schema": STATE_SCHEMA, "initial_memory_sha256": hashlib.sha256(b"").hexdigest(),
+        "terminal": {"status": "SATURATED", "reason": "done"},
+        "memory_bytes_base64": [encoded], "completed_waves": ["wave-01"],
+        "prior_outcomes": [{"project_id": "copy", "spec": spec.as_dict(), "verified": True}],
+    }
+    (root / "state.json").write_bytes(canonical_bytes(state) + b"\n")
+    (root / "campaign-identity.json").write_bytes(canonical_bytes({"cell": source.as_dict()}))
+    memory_sha = hashlib.sha256(canonical_bytes({
+        "schema": MEMORY_SCHEMA, "initial_memory_base64": "", "project_memory_base64": [encoded],
+    })).hexdigest()
+    review = {"schema": REVIEW_SCHEMA, "cell_id": source.cell_id, "memory_sha256": memory_sha,
+              "accepted": True, "useful": True, "diverse": True,
+              "profiler_guidance_observed": True, "rationale": "Human-reviewed fixture, not NPU evidence."}
+    review_path = tmp_path / "review.json"
+    review_path.write_bytes(canonical_bytes(review))
+    return root, source, review_path, memory
+
+def test_snapshot_copies_exact_memory_and_evidence_and_survives_source_removal(tmp_path):
+    root, source, review, memory = _source(tmp_path)
+    before = (root / "state.json").read_bytes()
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+    assert snapshot.memory_entries() == (memory,)
+    assert (snapshot.root / "state.json").read_bytes() == before
+    assert (root / "state.json").read_bytes() == before
+    retained = ContentAddressedArtifacts(snapshot.root / "artifacts")
+    assert retained.read_bytes(memory["source_revision"]) == b"actual candidate source"
+    assert retained.read_json(memory["host_facts"][0]["evidence_sha256"])["host"] == "verified"
+    (root / "state.json").unlink()
+    snapshot.verify()
+    snapshot.memory_path.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="bytes changed"):
+        snapshot.verify()
+
+@pytest.mark.parametrize("representation", [True, "empty-provenance", "populated-provenance"])
+def test_historical_nonempty_citation_resumes_and_hands_off_exact_bytes(tmp_path, representation):
+    from benchmarks.a5kernels.phase1_adaptive import AdaptivePhase1Coordinator
+    root, source, review, memory = _source(tmp_path, historical_citation=representation)
+    coordinator = object.__new__(AdaptivePhase1Coordinator)
+    coordinator.root = root
+    delta = coordinator._read_delta("wave-01", "copy")
+    original = base64.b64decode(delta["memory_base64"])
+    assert json.loads(original)["kdb_citations"] == memory["kdb_citations"]
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+    assert snapshot.memory_entries() == (memory,)
+    assert snapshot.memory_path.read_bytes() == original + b"\n"
+
+@pytest.mark.parametrize("failure", ["running", "pending", "rejected", "wrong-memory", "missing-evidence"])
+def test_admission_rejects_incomplete_or_unreviewed_memory(tmp_path, failure):
+    root, source, review, memory = _source(tmp_path)
+    if failure == "running":
+        state = json.loads((root / "state.json").read_bytes())
+        state["terminal"] = None
+        (root / "state.json").write_bytes(canonical_bytes(state))
+    elif failure == "pending":
+        (root / "pending.json").write_text("{}")
+    elif failure in {"rejected", "wrong-memory"}:
+        value = json.loads(review.read_bytes())
+        value["accepted" if failure == "rejected" else "memory_sha256"] = False
+        review.write_bytes(canonical_bytes(value))
+    else:
+        digest = memory["host_facts"][0]["evidence_sha256"]
+        next((root / "waves").glob(f"**/objects/{digest[:2]}/{digest[2:]}" )).unlink()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+
+@pytest.mark.parametrize("status", ["PROJECT_LIMIT_REACHED", "TARGET_REACHED"])
+def test_completed_terminal_is_admitted(tmp_path, status):
+    root, source, review, _ = _source(tmp_path)
+    state = json.loads((root / "state.json").read_bytes())
+    state["terminal"]["status"] = status
+    (root / "state.json").write_bytes(canonical_bytes(state))
+    admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory").verify()
+
+@pytest.mark.parametrize("name", ["outcome.json", "memory-delta.bin", "execution-evidence.bin"])
+@pytest.mark.parametrize("mutation", ["missing", "stale"])
+def test_admission_requires_actual_published_branch_evidence(tmp_path, name, mutation):
+    root, source, review, _ = _source(tmp_path)
+    path = root / "waves/wave-01/branches/copy" / name
+    if mutation == "missing":
+        path.unlink()
+    else:
+        path.write_bytes(b'{}')
+    with pytest.raises(ValueError):
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+
+pytestmark = pytest.mark.usefixtures("scripted_pi")
+
+def test_partial_publication_transfers_verified_memory_and_interruption_only_branch(tmp_path):
+    root, source, review, memory = _source(tmp_path, partial=True)
+    branch = "waves/wave-01/branches/offline"
+    retained = (root / branch / "interruption.json").read_bytes()
+    snapshot = admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+    assert snapshot.memory_entries() == (memory,)
+    assert (snapshot.root / branch / "interruption.json").read_bytes() == retained
+    assert not (snapshot.root / branch / "outcome.json").exists()
+    assert not (snapshot.root / branch / "memory-delta.bin").exists()
+    (root / "state.json").unlink()
+    snapshot.verify()
+    (snapshot.root / branch / "interruption.json").write_bytes(b"{}")
+    with pytest.raises(ValueError, match="bytes changed"):
+        snapshot.verify()
+
+@pytest.mark.parametrize("mutation", ["missing", "wrong-wave"])
+def test_partial_snapshot_rejects_missing_or_mismatched_interruption(tmp_path, mutation):
+    root, source, review, _ = _source(tmp_path, partial=True)
+    path = root / "waves/wave-01/branches/offline/interruption.json"
+    if mutation == "missing":
+        path.unlink()
+    else:
+        value = json.loads(path.read_bytes())
+        value["wave_fingerprint"] = "0" * 64
+        path.write_bytes(canonical_bytes(value))
+    with pytest.raises((ValueError, FileNotFoundError)):
+        admit_adaptive_snapshot(root, b"", review, source, tmp_path / "reviewed-memory")
+

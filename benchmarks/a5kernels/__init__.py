@@ -128,10 +128,10 @@ from benchmarks.a5kernels.phase1_project_bz import (
     CatlassProjectBackend,
     ProjectInfrastructureError,
 )
-from benchmarks.a5kernels.phase2_attention import (
+from benchmarks.a5kernels.attention import (
     ATTENTION_CASES,
-    CANDIDATE_ABI_SHA256 as PHASE2_ATTENTION_CANDIDATE_ABI_SHA256,
-    SUITE_SHA256 as PHASE2_ATTENTION_SUITE_SHA256,
+    CANDIDATE_ABI_SHA256 as ATTENTION_CANDIDATE_ABI_SHA256,
+    SUITE_SHA256 as ATTENTION_SUITE_SHA256,
     AttentionBackend,
     AttentionCase,
     AttentionExecution,
@@ -142,7 +142,7 @@ from benchmarks.a5kernels.phase2_attention import (
     attention_reference,
     build_execution,
 )
-from benchmarks.a5kernels.phase2_attention_bz import (
+from benchmarks.a5kernels.attention_bz import (
     ATTENTION_CANDIDATE_FIXTURE,
     CatlassAttentionBackend,
     validate_attention_candidate,
@@ -220,8 +220,8 @@ __all__ = [
     "ProjectInfrastructureError",
     "PROJECT_REGISTRY",
     "PHASE1_BRIEF",
-    "PHASE2_ATTENTION_CANDIDATE_ABI_SHA256",
-    "PHASE2_ATTENTION_SUITE_SHA256",
+    "ATTENTION_CANDIDATE_ABI_SHA256",
+    "ATTENTION_SUITE_SHA256",
     "AgentInterpretation",
     "HostFact",
     "HarnessContract",

@@ -38,7 +38,7 @@ def validate_project(item, *, runtime=None, policy=None):
         if spec.project_id != identifier and task.get('kind') != 'target':
             raise ValueError('project and spec identifiers differ')
         if task:
-            from .phase2_targets import TargetContract
+            from .qualified_targets import TargetContract
             if task.get('kind') != 'target' or TargetContract.from_mapping(task['contract']).spec != spec:
                 raise ValueError('target contract differs from project spec')
             if not isinstance(task.get('artifact_root'), str) or not task['artifact_root'].strip():

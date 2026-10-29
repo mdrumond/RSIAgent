@@ -85,7 +85,7 @@ def load_archive_spec(value: Mapping[str, object]) -> ArchiveSpec:
         campaign_id = _metadata_text(item["id"], "campaign id")
         phase = _text(item["phase"], "phase")
         model = _metadata_text(item["model"], "model")
-        if not _ID.fullmatch(campaign_id) or phase not in {"phase1", "phase2"}:
+        if not _ID.fullmatch(campaign_id) or phase not in {"phase1"}:
             raise ValueError("campaign id or phase is invalid")
         treatments = item["treatments"]
         if not isinstance(treatments, Mapping):

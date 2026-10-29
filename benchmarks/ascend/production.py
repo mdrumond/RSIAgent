@@ -74,10 +74,10 @@ def compose_adaptive_controller(
             allow_partial=True,
         )
     else:
-        from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
+        from benchmarks.ascend.reviewed_memory import reviewed_phase1_coordinator
         if max_parallel != 1 or max_projects is not None:
-            raise ValueError("adaptive Phase 2 uses serial selection and verified project_target")
-        coordinator = AdaptivePhase2Coordinator(
+            raise ValueError("reviewed Phase 1 retries require serial selection and verified project_target")
+        coordinator = reviewed_phase1_coordinator(
             root, objective, reviewed_snapshot, curriculum, project_actor,
             project_target=project_target, trace_hook=trace_hook,
         )
@@ -217,11 +217,11 @@ def build_native_adaptive_phase1(
     from benchmarks.a5kernels.phase1_adaptive_production import _knowledge_action
     from benchmarks.a5kernels.phase1_provider import DirectCompletionProvider
     from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
-    from benchmarks.a5kernels.trial import _SYSTEM_PROMPT
+    from benchmarks.a5kernels.trial import actor_system_prompt
     from benchmarks.a5kernels.phase1_adaptive_actor import AdaptiveActorProjectExecutor
 
     if project_workers and reviewed_snapshot is not None:
-        raise ValueError("adaptive Phase 2 remains serial")
+        raise ValueError("reviewed Phase 1 retries remain serial")
     if project_workers:
         request_profile = project_workers[0].request_profile
         request_timing = project_workers[0].request_timing
@@ -257,8 +257,8 @@ def build_native_adaptive_phase1(
         identity["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": max_seconds}
     if reviewed_snapshot is not None:
         reviewed_snapshot.verify()
-        identity.update(schema="ascend-native-adaptive-phase2-identity-v1",
-                        phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
+        identity.update(schema="ascend-native-reviewed-phase1-identity-v1",
+                        reviewed_snapshot_id=reviewed_snapshot.snapshot_id)
     query, adaptive = None, None
     if config.kdb is not None:
         if embeddings is None or not config.collection:
@@ -331,7 +331,7 @@ def build_native_adaptive_phase1(
     provider = DirectCompletionProvider(environment, **(
         {"transport": provider_transport} if provider_transport is not None else {}
     ))
-    actor = PiActorDriver(provider, system_prompt=_SYSTEM_PROMPT.replace("one A5 kernel", "one A3 Ascend C kernel"))
+    actor = PiActorDriver(provider, system_prompt=actor_system_prompt("A3 Ascend C", typed=True))
     executor = None
     if not project_workers:
         backend = NativeProjectBackend(native_transport, root / "native-evidence",

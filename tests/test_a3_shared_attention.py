@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 
 from benchmarks.ascend import attention as shared
-from benchmarks.a5kernels import phase2_attention as a5
-from benchmarks.a3kernels.phase2_attention import (
+from benchmarks.a5kernels import attention as a5
+from benchmarks.a3kernels.attention import (
     AttentionTargetEvidence, AttentionTargetVerifier, NativeAttentionBackend, build_plan, TARGET_ID,
 )
 from benchmarks.a3kernels.phase1_protocol import FailedEvidence

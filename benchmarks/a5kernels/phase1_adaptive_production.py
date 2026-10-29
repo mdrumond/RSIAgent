@@ -350,8 +350,8 @@ def _bind_campaign_identity(root: Path, cell: A5Phase1Cell, reviewed_snapshot=No
         identity["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": max_seconds}
     if reviewed_snapshot is not None:
         reviewed_snapshot.verify()
-        identity.update(schema="ascend-catlass-adaptive-phase2-identity-v1",
-                        phase="adaptive-phase2", snapshot_id=reviewed_snapshot.snapshot_id)
+        identity.update(schema="ascend-catlass-reviewed-phase1-identity-v1",
+                        reviewed_snapshot_id=reviewed_snapshot.snapshot_id)
     expected = canonical_bytes(identity) + b"\n"
     try:
         root.mkdir(parents=True, exist_ok=True)

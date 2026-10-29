@@ -96,94 +96,10 @@ def test_multiple_reads_keep_full_audit_but_only_latest_page_on_wire(tmp_path):
     assert session.turns == 3
 
 
-def test_native_phase2_reads_and_more_than_three_corrections_share_time(tmp_path):
-    from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-    from test_ascend_phase2_targets import qualified, context as target_context
-    target, _, _ = qualified(tmp_path/'reference')
-    files = ContextFiles(tmp_path/'context')
-    ref = files.put('observed-failure', {'actual':'mismatch', 'details':['a','b']})
-    context = replace(target_context(target), remaining_seconds=20, context_files=(ref,), artifact_reader=files.read)
-    calls, now = [], [0]
-    def complete(messages):
-        calls.append(messages)
-        now[0] += 1
-        if len(calls)==1:
-            return json.dumps({'read_artifact':ref['read_artifact']})
-        if len(calls)<6:
-            return 'DECISION: READY\n{"reason":"incorrect proposal"}'
-        return 'DECISION: RETRY_TARGET\n{"reason":"apply observed repair"}'
-    decision, session = TargetCurriculumAgent(complete, clock=lambda:now[0]).select(context)
-    assert decision.action=='retry-target' and len(calls)==6 and session.turns==6
-    assert json.loads(calls[1][-1]['content'])['text'] == canonical({'actual':'mismatch','details':['a','b']}).decode()
-    now[0]=0
-    with pytest.raises(ValueError, match='elapsed-time budget exhausted'):
-        TargetCurriculumAgent(complete, clock=lambda:now[0]).select(replace(context, remaining_seconds=.5))
 
 
-@pytest.mark.parametrize('native', [False, True])
-def test_read_audit_survives_provider_interruption(tmp_path, native):
-    files = ContextFiles(tmp_path/'context')
-    ref = files.put('observed-case', {'expected': [3, 7], 'observed': [0, 0]})
-    calls = []
-    def complete(messages):
-        calls.append(messages)
-        if len(calls) == 1:
-            return json.dumps({'read_artifact': ref['read_artifact']})
-        raise OSError('provider disconnected')
-    if native:
-        from benchmarks.ascend.phase2_target_selector import TargetCurriculumAgent
-        from test_ascend_phase2_targets import qualified, context as target_context
-        target, _, _ = qualified(tmp_path/'reference')
-        context = replace(target_context(target), context_files=(ref,), artifact_reader=files.read)
-        agent = TargetCurriculumAgent(complete)
-    else:
-        context = CurriculumContext('Learn.', 1, 'a'*64, (), (),
-            context_files=(ref,), artifact_reader=files.read)
-        agent = CurriculumAgent(complete)
-    with pytest.raises(OSError, match='provider disconnected'):
-        agent.select(context)
-    pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
-    assert len(pages) == 1
-    assert json.loads(pages[0]['text']) == {'expected': [3, 7], 'observed': [0, 0]}
-    now = [0]
-    def read_then_expire(messages):
-        return json.dumps({'read_artifact': ref['read_artifact']})
-    def read_and_expire(**payload):
-        page = files.read(**payload)
-        now[0] += 1
-        return page
-    agent = (TargetCurriculumAgent if native else CurriculumAgent)(
-        read_then_expire, clock=lambda: now[0])
-    with pytest.raises(ValueError, match='budget exhausted'):
-        agent.select(replace(context, remaining_seconds=.5, artifact_reader=read_and_expire))
-    pages = [json.loads(line) for line in (files.root/'read-pages.jsonl').read_bytes().splitlines()]
-    assert len(pages) == 2 and pages[1] == pages[0]
 
 
-def test_optimizer_context_pages_resume_without_resending_prior_page_bodies(tmp_path):
-    from test_ascend_phase2_optimizer_tasks import seed, proposal
-    from benchmarks.ascend.phase2_optimizer_tasks import select_optimizer_task
-    memory = {'task_id':'prior-knowledge', 'statement':'m'*24000, 'interpretation':'recorded'}
-    snapshot = seed([memory])
-    calls = []
-    def interrupted(messages):
-        calls.append(messages)
-        if len(calls)==3:
-            raise OSError('provider unavailable')
-        presentation = json.loads(messages[1]['content'])['memory']
-        ref = presentation['projects'][0]
-        return json.dumps({'read_artifact':dict(sha256=ref['sha256'], offset=(len(calls)-1)*8192, limit=8192)})
-    options = dict(snapshot=snapshot, objective='Learn.', root=tmp_path/'selection', remaining_seconds=lambda:100)
-    with pytest.raises(OSError):
-        select_optimizer_task(complete=interrupted, **options)
-    audit = json.loads((options['root']/'selection.json').read_bytes())['messages']
-    assert sum('text' in json.loads(row['content']) for row in audit[2:]
-               if row['role']=='user')==2
-    resumed = []
-    selected = select_optimizer_task(complete=lambda messages:(resumed.append(messages), json.dumps(proposal()))[1], **options)
-    assert selected['task_id']==proposal()['task_id']
-    pages = [json.loads(row['content']) for row in resumed[0][2:] if row['role']=='user']
-    assert len(pages)==2 and 'text' not in pages[0] and pages[1]['text']
 
 
 def test_large_context_indexes_every_memory_without_inlining_all_references(tmp_path):

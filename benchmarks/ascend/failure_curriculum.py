@@ -1,4 +1,4 @@
-"""Explicit Phase 2 observations guiding small Phase 1 experiments, not facts."""
+"""Explicit task observations guiding small Phase 1 experiments, not facts."""
 from __future__ import annotations
 
 import base64
@@ -6,11 +6,11 @@ import json
 from pathlib import Path
 
 from optimizer.jobs import JobStore, atomic, canonical, sha
-from .phase2_feedback import FeedbackStore
+from .feedback import FeedbackStore
 from .status_descriptions import describe_statuses
 
 
-GUIDANCE = '''Investigate the supplied Phase 1, Phase 2 and optimizer observations, which are failures or
+GUIDANCE = '''Investigate the supplied Phase 1, task and optimizer observations, which are failures or
 working controls, NOT verified reusable knowledge. Distinguish learnable kernel,
 numerical, compilation and performance issues from infrastructure/provider errors,
 invalid specifications and suspected unsupported/impossible requirements. A budget
@@ -379,7 +379,7 @@ def link_retry(job):
     if not job.get('retry_feedback_id'):
         return
     store = FeedbackStore(job['feedback_root'])
-    store.import_campaign(job['root'])
+    store.import_task_results(job['root'])
     original = next(r for r in store.records() if r['feedback_id'] == job['retry_feedback_id'])
     if original['outcome'].get('source_type') == 'optimizer':
         for row in store.records():

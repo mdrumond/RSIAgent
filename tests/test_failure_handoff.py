@@ -11,7 +11,7 @@ from benchmarks.a5kernels.phase1_curriculum import ProjectSpec
 from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
 from benchmarks.ascend.failure_curriculum import FailureCurriculum, select_feedback
 from benchmarks.ascend.failure_handoff import FailureContext
-from benchmarks.ascend.phase2_feedback import FeedbackStore
+from benchmarks.ascend.feedback import FeedbackStore
 from test_a5_phase1_adaptive_actor import SourceBackend, ScriptedActor, _request, _special_spec
 from test_generic_failure_feedback import phase1
 

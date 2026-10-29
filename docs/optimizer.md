@@ -5,9 +5,9 @@ artifacts, budgets, and remote handles independently of the dashboard process.
 These commands create and inspect jobs; the execution worker is a separate layer.
 
 ```sh
-python -m optimizer discover --memory-root /configured/completed-phase2
+python -m optimizer discover --memory-root /configured/completed-phase1
 python -m optimizer create --store /configured/optimizer-jobs \
-  --memory-root /configured/completed-phase2 --source reference.py \
+  --memory-root /configured/completed-phase1 --source reference.py \
   --entrypoint forward --signature signatures.json --idempotency-key demo-1
 python -m optimizer inspect --store /configured/optimizer-jobs JOB_ID
 python -m optimizer events --store /configured/optimizer-jobs JOB_ID
@@ -28,7 +28,7 @@ unavailable. A READY string alone never admits memory. Native target-driven
 sources require READY plus the final published verified target; reviewed adaptive
 sources require their successful-project target or SATURATED with published memory.
 
-Snapshots freeze reviewed Phase 1 and published Phase 2 memory, publication chain,
+Snapshots freeze reviewed or committed Phase 1 memory, publication chain,
 source identity, and referenced content-addressed artifacts as portable bytes with
 SHA-256 identities. Full profiler reports are not needed to consume memory.
 

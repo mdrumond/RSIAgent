@@ -35,8 +35,8 @@ class MemoryArtifactReader:
             seed = json.loads(base64.b64decode(envelope["initial_memory_base64"], validate=True))
         except (ValueError, UnicodeDecodeError):
             seed = None
-        if isinstance(seed, dict) and seed.get("schema") == "ascend-phase2-curriculum-seed-v1":
-            from .phase2_curriculum import reviewed_seed
+        if isinstance(seed, dict) and seed.get("schema") == "ascend-reviewed-memory-seed-v1":
+            from .reviewed_memory import reviewed_seed
             authenticated, snapshot_root = reviewed_seed(root, seed["snapshot_id"])
             if json.loads(authenticated) != seed:
                 raise ValueError("reviewed seed differs from current memory")
@@ -263,8 +263,8 @@ def memory_presentation(raw, artifacts):
         if len(canonical_bytes(result)) > 8192:
             result.pop("preview")
         return result
-    if "phase2_feedback" in value:
-        result["phase2_feedback"] = _preview(value["phase2_feedback"])
+    if "feedback" in value:
+        result["feedback"] = _preview(value["feedback"])
     initial = base64.b64decode(value["initial_memory_base64"], validate=True)
     result["initial_memory_sha256"] = artifacts.put_bytes(initial)
     try:
@@ -293,7 +293,7 @@ def memory_presentation(raw, artifacts):
                        "interpretation": str(project.get("interpretation", ""))[:800]}
             size = len(canonical_bytes(summary))
             if size <= optimizer_remaining:
-                row.update(summary, origin="optimizer-phase2")
+                row.update(summary, origin="optimizer-task")
                 optimizer_remaining -= size
         lessons = _preview(project.get("agent_lessons", []))
         size = len(canonical_bytes(lessons))

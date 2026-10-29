@@ -21,11 +21,6 @@ A5_SCHEMAS = {
                           "limit": {"type": "integer", "minimum": 1, "maximum": 8192}}, ["sha256"]),
     "request-sanitizer": obj({"tool": {"type": "string", "enum": ["memcheck", "racecheck", "initcheck", "synccheck"]}}),
 }
-SOURCE_SCHEMAS = {
-    "candidate_source": obj({"source": STRING}),
-    "compile_probe": obj({"source": STRING}),
-    "knowledge_query": A5_SCHEMAS["query-knowledge"],
-}
 OPTIMIZER_SCHEMAS = {
     **{name: obj({"source": STRING, "block_count": {"type": "integer", "minimum": 1, "maximum": 65535},
                  "summary": STRING}) for name in ("candidate", "compile")},
@@ -56,11 +51,12 @@ class A3Actor:
         try:
             name, args = self.session.next_action(state, allowed, source=source, record=self.record,
                 write_action=(lambda s: ("write_source", {"source": s})) if "write_source" in allowed else None)
-            text = json.dumps({"action": name, **args})
+            selected = {"action": name, **args}
+            text = json.dumps(selected)
         except ActionError:
-            text = "{}"  # Existing host records/charges invalid actions.
+            text, selected = "{}", {}  # Existing host records invalid actions.
         return A3Completion(text, self.session.completion_tokens-before,
-                            {"profile_sha256": profile.fingerprint, **ENGINE_IDENTITY})
+                            {"profile_sha256": profile.fingerprint, **ENGINE_IDENTITY}, selected_action=selected)
 
     def close(self):
         self.session.close()

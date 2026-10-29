@@ -127,8 +127,8 @@ class TraceRecorder:
                              ("operator_family", operator_family)):
             if not _SAFE_ID.fullmatch(value):
                 raise ValueError(f"invalid {label}")
-        if phase not in {"phase1", "phase2"}:
-            raise ValueError("phase must be phase1 or phase2")
+        if phase not in {"phase1"}:
+            raise ValueError("phase must be phase1")
         if not _SHA256.fullmatch(source_manifest_sha256):
             raise ValueError("invalid source manifest digest")
         self.path = Path(path)

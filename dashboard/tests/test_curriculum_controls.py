@@ -314,7 +314,7 @@ def test_restart_status_uses_authoritative_accessor_without_dispatch(setup):
 def test_target_preview_checks_observed_runtime_before_accepting_qualification(setup, monkeypatch):
     from pathlib import Path
     monkeypatch.syspath_prepend(str(Path(__file__).parents[2] / 'tests'))
-    from test_ascend_phase2_targets import qualified, RUNTIME
+    from test_ascend_qualified_targets import qualified, RUNTIME
     from benchmarks.ascend.targets import a3_curriculum_policy
     from copy import deepcopy
     config, root, _ = setup

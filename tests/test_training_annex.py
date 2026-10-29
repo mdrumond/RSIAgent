@@ -71,7 +71,7 @@ def test_package_preserves_feedback_and_investigation_lineage(campaign, tmp_path
                                   'retries': ['original-target-retry']}}
     phase1_feedback = {'selected_ids': ['observation'], 'source_root': '/original/feedback'}
     investigations = {'projects': [{'project_id': 'probe-1', 'feedback_id': 'observation'}]}
-    files = {'feedback/observation.json': feedback, 'phase2-feedback.json': phase1_feedback,
+    files = {'feedback/observation.json': feedback, 'failure-feedback.json': phase1_feedback,
              'failure-investigations.json': investigations}
     for path, value in files.items():
         write(campaign, path, value)
@@ -276,42 +276,6 @@ def test_raw_report_descriptor_and_verified_package(campaign, tmp_path, direct_d
     assert inventory_campaign(campaign, artifact_store=store)["remote_reports"][0]["status"] == "digest-mismatch"
 
 
-@pytest.mark.parametrize("artifact,mutation", [
-    ("candidate.cpp", "remove"), ("candidate.cpp", "corrupt"),
-    ("attempt.json", "remove"), ("attempt.json", "corrupt"),
-    ("evidence.json", "remove"), ("evidence.json", "corrupt"),
-    ("directory", "remove"),
-])
-def test_phase2_uncommitted_attempt_is_pending(tmp_path, artifact, mutation):
-    root = tmp_path / "phase2"
-    write(root, "cells/cell/protocol.json", {"schema": "phase2-protocol"})
-    attempt = {"attempt_id": "one"}
-    canonical = lambda value: hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    attempt["attempt_sha256"] = canonical(attempt)
-    write(root, "cells/cell/attempts/attempt-01/attempt.json", attempt)
-    assert inventory_campaign(root)["boundary"]["pending"]
-    source = root / "cells/cell/attempts/attempt-01/candidate.cpp"
-    source.write_text("source")
-    evidence = {"passed": False, "candidate_sha256": hashlib.sha256(b"source").hexdigest()}
-    evidence["evidence_sha256"] = canonical(evidence)
-    write(root, "cells/cell/attempts/attempt-01/evidence.json", evidence)
-    assert inventory_campaign(root)["boundary"]["pending"]
-    write(root, "cells/cell/memory.jsonl", {
-        "attempt": 1, "attempt_identity_sha256": attempt["attempt_sha256"],
-        "evidence_sha256": evidence["evidence_sha256"],
-        "candidate_sha256": evidence["candidate_sha256"], "passed": False})
-    assert inventory_campaign(root)["complete"]
-    if artifact == "directory":
-        source.parent.rename(tmp_path / "removed-attempt")
-    else:
-        target = source.parent / artifact
-        if mutation == "remove":
-            target.unlink()
-        else:
-            target.write_text("corrupt" if artifact == "candidate.cpp" else '{"changed":true}')
-    assert "missing-or-corrupt-committed-attempt" in {i["kind"] for i in inventory_campaign(root)["issues"]}
-    with pytest.raises(ValueError, match="incomplete"):
-        package_campaign(root, tmp_path / "missing-commit.tar.gz")
 
 
 @pytest.mark.parametrize("artifact,mutation", [

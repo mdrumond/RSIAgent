@@ -1,17 +1,34 @@
 {
-  "feedback_root": "/path/to/phase2-feedback",
+  "feedback_root": "/path/to/feedback",
   "subject_campaigns": [
-    {"id": "subjects", "target": "a3", "name": "Subject research", "root": "/path/to/subject-campaign", "config": "/path/to/subject-runtime-settings.json", "initial_memory": "/path/to/initial-memory.bin"}
+    {
+      "id": "subjects",
+      "target": "a3",
+      "name": "Subject research",
+      "root": "/path/to/subject-campaign",
+      "config": "/path/to/subject-runtime-settings.json",
+      "initial_memory": "/path/to/initial-memory.bin"
+    }
   ],
   "campaigns": [
-    {"id": "phase1", "target": "a3", "phase": 1, "name": "A3 Phase 1", "root": "/path/to/phase1/campaign", "control": "/path/to/phase1/control"},
-    {"id": "phase2", "target": "a3", "phase": 2, "name": "A3 Phase 2", "root": "/path/to/phase2/campaign", "control": "/path/to/phase2/control"}
+    {
+      "id": "phase1",
+      "target": "a3",
+      "phase": 1,
+      "name": "A3 Phase 1",
+      "root": "/path/to/phase1/campaign",
+      "control": "/path/to/phase1/control"
+    }
   ],
   "optimizer": {
     "enabled": false,
     "root": "/path/to/optimizer/jobs",
-    "memory_roots": ["/path/to/completed-native-a3-phase2"],
-    "snapshot_roots": ["/path/to/reviewed-phase1"],
+    "memory_roots": [
+      "/path/to/reviewed-a3-memory"
+    ],
+    "snapshot_roots": [
+      "/path/to/reviewed-phase1"
+    ],
     "worker_config": "/path/to/ignored-optimizer-worker.json"
   },
   "controls": {
@@ -19,8 +36,17 @@
     "runner": "/path/to/RSIAgent/run_ascend_campaign.py",
     "extension_step": 8,
     "presets": [
-      {"id": "phase1", "target": "a3", "phase": 1, "root": "/path/to/new-phase1", "control": "/path/to/new-phase1-control", "config": "/path/to/runtime.json", "initial_memory": "/path/to/initial-memory.bin", "objective": "Learn A3 kernels", "project_target": 64},
-      {"id": "phase2", "target": "a3", "phase": 2, "root": "/path/to/new-phase2", "control": "/path/to/new-phase2-control", "config": "/path/to/runtime.json", "initial_memory": "/path/to/initial-memory.bin", "objective": "Extend reviewed A3 learning", "project_target": 1, "phase1_root": "/path/to/reviewed-phase1", "review": "/path/to/review.json"}
+      {
+        "id": "phase1",
+        "target": "a3",
+        "phase": 1,
+        "root": "/path/to/new-phase1",
+        "control": "/path/to/new-phase1-control",
+        "config": "/path/to/runtime.json",
+        "initial_memory": "/path/to/initial-memory.bin",
+        "objective": "Learn A3 kernels",
+        "project_target": 64
+      }
     ]
   }
 }

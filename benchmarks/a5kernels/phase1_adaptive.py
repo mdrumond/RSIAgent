@@ -496,7 +496,7 @@ class AdaptivePhase1Coordinator:
         if not set(selected) <= available:
             raise ValueError("approved project ID is not in the proposal")
         if getattr(self, "approval_cardinality", None) is not None and len(selected) != self.approval_cardinality:
-            raise ValueError("Phase 2 approval requires exactly one project")
+            raise ValueError("task approval requires exactly one project")
         approved = {**proposal, "wave": {**wave, "projects": [
             row for row in wave["projects"] if row["spec"]["project_id"] in selected
         ]}}
@@ -744,15 +744,13 @@ class AdaptivePhase1Coordinator:
 
     def _seed_context_state(self, state):
         """Authenticate portable copied memory; never publish it as new attempts."""
-        if state.get("phase") == "adaptive-phase2":
-            return state  # Phase 2 owns its authenticated seed outcomes already.
         try:
             seed = json.loads(self.initial_memory)
         except (ValueError, UnicodeDecodeError):
             return state
-        if not isinstance(seed, dict) or seed.get("schema") != "ascend-phase2-curriculum-seed-v1":
+        if not isinstance(seed, dict) or seed.get("schema") != "ascend-reviewed-memory-seed-v1":
             return state
-        from benchmarks.ascend.phase2_curriculum import reviewed_seed
+        from benchmarks.ascend.reviewed_memory import reviewed_seed
 
         authenticated, _ = reviewed_seed(self.root, seed["snapshot_id"])
         if json.loads(authenticated) != seed:

@@ -21,6 +21,11 @@ def create_app(config_path, cache_path, *, refresh_seconds=30, command_runner=No
                optimizer_launcher=None, curriculum_binder=None, curriculum_restart=None,
                curriculum_status=None, actor_launcher=None):
     app = Flask(__name__)
+    @app.url_value_preprocessor
+    def supported_phase(_endpoint, values):
+        if values is not None and "number" in values and values["number"] != 1:
+            abort(404)
+
     store = DashboardStore(config_path, cache_path)
     controls = ControlManager(config_path, cache_path, **(
         {"runner": command_runner} if command_runner is not None else {}))

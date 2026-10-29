@@ -10,7 +10,7 @@ from pathlib import Path
 
 from optimizer.jobs import atomic, canonical, sha
 from .failure_curriculum import FailureCurriculum
-from .phase2_feedback import FeedbackStore
+from .feedback import FeedbackStore
 
 
 class FailureTimeBudget:
@@ -87,8 +87,7 @@ class AutomaticRemediation:
             language='ascend-c' if self.target == 'a3' else 'catlass-dsl')
         for source in self.sources:
             kind, root = source['type'], source['root']
-            {'phase1': self.store.import_phase1, 'phase2': self.store.import_campaign,
-             'optimizer': self.store.import_optimizer}[kind](root)
+            {'phase1': self.store.import_phase1, 'optimizer': self.store.import_optimizer}[kind](root)
         self.feedback.refresh(self.target)
         retry_parent = (self.runner.root / 'original-retries').resolve()
         excluded = set(self.state['retry_feedback_ids']) | {
@@ -243,7 +242,7 @@ class AutomaticRemediation:
 def optimizer_retry_adapter(runner, store, config):
     """Retry external frozen acceptance using current committed Phase 1 knowledge."""
     from .failure_curriculum import retry_spec
-    from .phase2_optimizer_execution import OptimizerTaskExecutor
+    from .optimizer_execution import OptimizerTaskExecutor
     from optimizer.memory import freeze_committed_phase1
 
     def retry(row, directory, seconds):
@@ -274,7 +273,7 @@ def optimizer_retry_adapter(runner, store, config):
             atomic(allocation_path, canonical(dict(seconds=allocation)))
         expected = retry_spec(dict(selected=[row]), 'a3')
         task = expected['task']
-        bound = dict(config, phase2_attempt_seconds=allocation, max_cases=expected['max_cases'])
+        bound = dict(config, attempt_seconds=allocation, max_cases=expected['max_cases'])
         remaining()
         executor = OptimizerTaskExecutor(directory, task, memory, bound, expected_baseline=expected)
         executor.set_remaining_seconds(remaining())
@@ -283,13 +282,13 @@ def optimizer_retry_adapter(runner, store, config):
         result = executor.attempt('original-retry', memory_snapshot=memory)
         attempt = dict(attempt_id='original-retry', task=row['outcome']['task'], result=result,
                        execution_directory='', kind='target')
-        atomic(directory / 'state.json', canonical(dict(phase='optimizer-phase2', attempts=[attempt])))
+        atomic(directory / 'state.json', canonical(dict(phase='optimizer-task', attempts=[attempt])))
         atomic(directory / 'campaign-identity.json', canonical(dict(target='a3', language='ascend-c')))
         report = dict(warnings=[])
         outcome = store._outcome(directory, attempt, dict(target='a3', language='ascend-c'), report)
         outcome.update(source_type=row['outcome']['source_type'],
             original_spec=row['outcome']['original_spec'], completed=True)
-        from .phase2_feedback import _category
+        from .feedback import _category
         outcome['category'] = _category(outcome['task'], result)
         store._put(outcome, report['warnings'])
         refs = {}

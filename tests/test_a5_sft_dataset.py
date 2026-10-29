@@ -43,7 +43,7 @@ def _trace(
     recorder = TraceRecorder(
         root / f"{trace_id}.jsonl",
         trace_id=trace_id,
-        phase="phase2",
+        phase="phase1",
         round_id=round_id,
         operator_family=family,
         model=model,
@@ -194,7 +194,7 @@ def test_fireworks_export_preserves_tools_and_masks_repair_history(tmp_path):
     recorder = TraceRecorder(
         path,
         trace_id="tool-repair",
-        phase="phase2",
+        phase="phase1",
         round_id="round-01",
         operator_family="attention",
         model="deepseek-v4-flash",
@@ -305,7 +305,7 @@ def test_dataset_provenance_rejects_mixed_manifests_and_persists_round_metrics(t
     )
     _trace(traces, "r3", "attention", "source three", round_id="round-03")
     manifest = build_dataset(traces, tmp_path / "dataset")
-    assert manifest["phases"] == ["phase2"]
+    assert manifest["phases"] == ["phase1"]
     assert manifest["models"] == ["deepseek-v4-flash"]
     assert manifest["source_manifest_sha256"] == "a" * 64
     assert manifest["rounds"] == [

@@ -429,48 +429,6 @@ def test_start_retains_public_provenance_not_private_settings_and_separate_worke
         start(tmp_path)
 
 
-@pytest.mark.parametrize("legacy_seed", [False, True])
-def test_phase2_cli_start_complete_and_strict_package_uses_reviewed_seed(tmp_path, legacy_seed):
-    from dataclasses import replace
-    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
-    from benchmarks.a5kernels.phase1_memory import HostFact
-    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
-    from tests.test_a3_reviewed_phase2 import native_source
-    from tests.test_a5_phase1_adaptive import _project, _result, _wave
-    source, review, _ = native_source(tmp_path)
-    source.rename(tmp_path / "old")
-    job = start(tmp_path, phase=2, seed=b"")
-    root = Path(job["root"])
-    snapshot = cli._snapshot(job, {})
-    # Older launchers retained the Phase 1 input, not the reviewed Phase 2 seed.
-    if legacy_seed:
-        (root / "initial-memory.bin").write_bytes(b"old unrelated launch input")
-    original = (root / "initial-memory.bin").read_bytes()
-    counter = 0
-    def select(messages):
-        nonlocal counter
-        counter += 1
-        spec = _project(f"phase2-{counter}", "gm-ub-movement")
-        spec["learning_focus"] = ["pipe-mte2" if counter == 1 else "pipe-mte3"]
-        return _wave(messages[-1]["content"], [spec])
-    def execute(request):
-        objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
-        source = objects.put_bytes(b"source")
-        host = objects.put_bytes(b"host verification")
-        result = _result(request.spec, True, "verified")
-        return replace(result, memory=replace(result.memory, source_revision=source,
-            host_facts=(HostFact("host-verification", "host passed", host),),
-            lessons=(), no_new_knowledge=True, admitted_artifact_sha256=(host,), artifact_store="artifacts"))
-    coordinator = AdaptivePhase2Coordinator(root, job["objective"], snapshot,
-        CurriculumAgent(select), execute, project_target=2)
-    assert coordinator.run()["successful_projects"] == 2
-    output = tmp_path / "phase2.tar.gz"
-    cli.main(["package", "--control", job["control"], "--output", str(output)])
-    assert output.is_file()
-    assert (root / "initial-memory.bin").read_bytes() == original
-    with tarfile.open(output) as archive:
-        assert archive.extractfile("campaign/initial-memory.bin").read() == original
 
 
 def test_optional_collector_start_failure_does_not_prevent_compute(tmp_path):
@@ -571,26 +529,6 @@ def test_approval_lifecycle_rejects_stale_or_wrong_proposal(tmp_path):
         cli.reject_curriculum(job, sampled["proposal_id"], builder=lambda _job: Coordinator())
 
 
-def test_phase2_approval_requires_exactly_one_project(tmp_path):
-    job = start(tmp_path, phase=2)
-    job["approval_mode"] = True
-    cli._write(Path(job["control"]) / "job.json", job)
-    proposal = {"base_wave_index": 1, "base_memory_sha256": "a" * 64,
-                "wave": {"projects": [{"spec": {"project_id": "one"}},
-                                        {"spec": {"project_id": "two"}}]},
-                "session": {"messages": [], "turns": 0}}
-
-    class Coordinator:
-        def propose_wave(self):
-            return proposal
-        def approve_wave(self, proposal, selected):
-            assert len(selected) == 1
-            return proposal
-
-    sampled = cli.sample_curriculum(job, builder=lambda _job: Coordinator())
-    with pytest.raises(ValueError, match="exactly one"):
-        cli.approve_curriculum(job, ["one", "two"], sampled["proposal_id"],
-                               builder=lambda _job: Coordinator())
 
 
 def test_run_approved_recovers_after_wave_published_before_control_update(tmp_path):
@@ -872,7 +810,7 @@ def test_live_collector_reloads_continuation_target_and_preserves_old_archive(tm
 
 
 @pytest.mark.parametrize("target", ["a3", "a5"])
-@pytest.mark.parametrize("phase", [1, 2])
+@pytest.mark.parametrize("phase", [1])
 def test_shared_builder_dispatch_and_phase2_snapshot(tmp_path, monkeypatch, target, phase):
     from benchmarks.ascend import phase1_cli, production
     from benchmarks.a5kernels import phase1_adaptive_production as a5production
@@ -920,24 +858,6 @@ def test_edited_configuration_refused_and_status_separates_verified_from_publish
     assert result["published_per_hour"] > 0
 
 
-def test_optimizer_phase2_status_counts_committed_attempts_and_learning(tmp_path, monkeypatch):
-    root, control = tmp_path / "campaign", tmp_path / "control"
-    root.mkdir()
-    control.mkdir()
-    job = dict(root=str(root), control=str(control), phase=2, target="a3",
-               project_target=1, created=cli.time.time() - 3600)
-    monkeypatch.setattr(cli, "inventory_campaign", lambda *a, **k: {"remote_reports": []})
-    state = dict(phase="optimizer-phase2", attempts=[], memory_entries=[])
-    for kind, verified, counts in (("target", False, (1, 0, 0)),
-                                   ("practice", True, (2, 1, 1)),
-                                   ("target", True, (3, 2, 2))):
-        state["attempts"].append(dict(kind=kind, verified=verified))
-        if verified:
-            state["memory_entries"].append(dict(category="host-verification"))
-        write(root / "state.json", state)
-        result = cli.status(job)
-        assert tuple(result[key] for key in ("attempted", "verified", "published")) == counts
-        assert (result["published_per_hour"] > 0) is bool(counts[2])
 
 
 def test_invalid_phase2_or_identity_override_fails_before_start(tmp_path):
@@ -1009,41 +929,6 @@ def test_real_native_composition_runs_actor_host_verification_trace_and_package(
     assert manifest["complete"] and archive.exists()
 
 
-def test_phase2_closed_semantic_failure_and_success_are_strictly_packaged(tmp_path):
-    from dataclasses import replace
-    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.ascend.phase2_curriculum import AdaptivePhase2Coordinator
-    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
-    from test_ascend_phase2_curriculum import project
-    from tests.test_a3_reviewed_phase2 import native_source
-    from benchmarks.ascend.phase2 import admit_native_snapshot
-    from test_a5_phase1_adaptive import _result, _wave
-    calls, executions = [], []
-    def select(messages):
-        calls.append(messages)
-        return _wave(messages[-1]["content"], [project(len(calls))])
-    def execute(request):
-        executions.append(request)
-        result = _result(request.spec, len(executions) > 1, "host outcome")
-        objects = ContentAddressedArtifacts(request.branch_root / "artifacts")
-        source = objects.put_bytes(b"retained candidate source")
-        evidence = objects.put_bytes(result.evidence_payload)
-        memory = replace(result.memory, source_revision=source,
-            host_facts=tuple(replace(fact, evidence_sha256=evidence) for fact in result.memory.host_facts),
-            admitted_artifact_sha256=(evidence,), lessons=(), no_new_knowledge=True)
-        return replace(result, memory=memory)
-    root = tmp_path / "phase2"
-    source, review, _ = native_source(tmp_path)
-    reviewed = admit_native_snapshot(source, b"", review, root)
-    coordinator = AdaptivePhase2Coordinator(root, "Learn from failures and success", reviewed,
-        CurriculumAgent(select), execute, project_target=1)
-    result = coordinator.run()
-    assert result["successful_projects"] == 1 and result["failed_projects"] == 1
-    manifest = cli.package_campaign(root, tmp_path / "phase2.tar.gz")
-    assert manifest["complete"]
-    assert any(row["path"].endswith("closed-failure.json") for row in manifest["files"])
-    assert sum(row["path"].startswith("waves/") and row["path"].endswith("outcome.json")
-               for row in manifest["files"]) == 2
 
 
 @pytest.mark.parametrize('extra', [[], ['--approval-mode'], ['--target-goal', 'absent']])
@@ -1083,131 +968,12 @@ def test_retained_phase2_control_cannot_dispatch_new_work(tmp_path, monkeypatch,
                       for path in base.rglob('*') if path.is_file()}
 
 
-def test_retained_phase2_control_status_reads_without_runtime_or_screen(tmp_path, monkeypatch, capsys):
-    job = start(tmp_path, phase=2)
-    capsys.readouterr()
-    def no_dispatch(*args, **kwargs):
-        pytest.fail('historical status composed runtime or Screen')
-    monkeypatch.setattr(cli, 'build_controller', no_dispatch)
-    before = Path(job['control'], 'job.json').read_bytes()
-    cli.main(['status', '--control', job['control']], screen=no_dispatch)
-    report = json.loads(capsys.readouterr().out)
-    assert report['phase'] == 2
-    assert report['attempted'] == report['verified'] == report['published'] == 0
-    assert Path(job['control'], 'job.json').read_bytes() == before
 
 
-def test_retained_goal_launches_target_controller_and_checks_runtime(tmp_path, monkeypatch):
-    historical_job = start(tmp_path, phase=2)
-    import hashlib
-    from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
-    from benchmarks.a5kernels.phase1_curriculum_selector import CurriculumAgent
-    from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
-    from benchmarks.ascend import phase1_cli, production
-    from benchmarks.ascend.phase2_target_loop import TargetDrivenPhase2Coordinator
-    from test_ascend_phase2_targets import qualified, RUNTIME
-    from test_ascend_phase2_curriculum import snapshot
-    goal, store, _ = qualified(tmp_path / "reference")
-    contract = write(tmp_path / "goal.json", goal.as_dict())
-    manifest = write(tmp_path / "sources.json", {"schema": "ascend-sft-sources-v2", "sources": [{
-        "name": "native", "repository": "https://example.invalid/native", "revision": "a" * 40,
-        "license": "Apache-2.0", "include": ["**/*.cpp"]}]})
-    model = MODEL_IDENTITIES[0]
-    config = write(tmp_path / "settings.json", {"model": model.backend_model.value,
-        "phase1_arguments": [], "source_manifest": str(manifest),
-        "target_artifact_store": str(store.root), "target_runtime": RUNTIME,
-        "target_available_tools": ["msprof", "msdebug", "mssanitizer"]})
-    memory = tmp_path / "seed"
-    memory.write_bytes(b"seed")
-    control, root = tmp_path / "control", tmp_path / "campaign"
-    job = dict(historical_job, config=str(config), config_sha256=hashlib.sha256(config.read_bytes()).hexdigest(),
-               project_target=1, target_goal=goal.as_dict(), phase2_max_seconds=7200,
-               practice_max_seconds=1800)
-    pinned = ContentAddressedArtifacts(root / 'historical-reference')
-    shutil.copytree(store.root, pinned.root)
-    job['target_artifact_store'] = str(pinned.root)
-    cli._write(control / 'job.json', job)
-    shutil.rmtree(store.root)
-    goal.verify(pinned, RUNTIME)
-    source = dict(target="native", arch="arch", execution_profile="bz-a3-1", guide_sha256="a" * 64,
-                  cpl_skills_revision="b" * 40, environment_identity={}, model=model.as_dict(),
-                  profiling_mode="without-profiling-guidance")
-    source["runtime_budget"] = {"policy": "elapsed-time-v1", "max_seconds": 900}
-    reviewed = snapshot()
-    reviewed.destination = SimpleNamespace(source_identity=source)
-    monkeypatch.setattr(cli, "_snapshot", lambda *args: reviewed)
-    native = SimpleNamespace(**{k: v for k, v in source.items() if k != "model"}, collection=None)
-    monkeypatch.setattr(phase1_cli, "main", lambda argv, **kw: kw["native_builder"](
-        config=native, profile=SimpleNamespace(identity=model)))
-    write(root / "campaign-identity.json", {key: value for key, value in source.items()
-                                             if key != "runtime_budget"})
-    def execute(request):
-        return None
-    execute.executor = SimpleNamespace(runtime_identity=RUNTIME)
-    monkeypatch.setattr(production, "build_native_adaptive_phase1", lambda **kw: SimpleNamespace(
-        curriculum=CurriculumAgent(lambda _: 'DECISION: READY\n{"reason":"done"}'),
-        execute_project=execute, trace_hook=None))
-    controller = cli.build_controller(job)
-    assert isinstance(controller, TargetDrivenPhase2Coordinator)
-    assert controller.target.target_id == goal.target_id
-    assert controller.available_tools == ()
-    execute.executor.runtime_identity = {**RUNTIME, "device": "another-selected-device"}
-    with pytest.raises(ValueError, match="differs from the composed executor"):
-        cli.build_controller(job)
-    assert hashlib.sha256(config.read_bytes()).hexdigest() == job["config_sha256"]
 
 
-@pytest.mark.parametrize("profile,timing,diagnostic", [(False, False, False), (True, False, False),
-                                                      (False, True, False), (False, False, True)])
-def test_target_tools_come_from_bound_actions_not_settings(profile, timing, diagnostic):
-    from benchmarks.a5kernels.phase1_adaptive_actor import disabled_profile_action, disabled_diagnostic_action
-    def active(*args):
-        return None
-    actor = SimpleNamespace(request_profile=active if profile else disabled_profile_action,
-                            request_timing=active if timing else disabled_profile_action,
-                            request_diagnostic=active if diagnostic else disabled_diagnostic_action)
-    tools = cli._target_available_tools(actor)
-    assert ("request-profile" in tools) is profile
-    assert ("request-timing" in tools) is timing
-    assert ("request-debug" in tools) is diagnostic
-    assert ("request-sanitizer" in tools) is diagnostic
-    assert cli._target_available_tools(lambda _: None) == ()
 
 
-def test_binding_print_capability_and_native_runtime_observations(tmp_path):
-    from benchmarks.a5kernels.evidence import EvidenceLedger
-    from benchmarks.a5kernels.phase1_project_executor import ProjectExecutor
-    from benchmarks.ascend.production import NativeProjectBinding, native_target_runtime
-    from benchmarks.a5kernels.phase1_adaptive_production import catlass_target_runtime
-    catlass = ProjectExecutor(None, EvidenceLedger(tmp_path / "a5.jsonl"))
-    native = ProjectExecutor(None, EvidenceLedger(tmp_path / "a3.jsonl"), binding=NativeProjectBinding())
-    assert "debug-print" in cli._target_available_tools(SimpleNamespace(executor=catlass))
-    assert "debug-print" not in cli._target_available_tools(SimpleNamespace(executor=native))
-    config = SimpleNamespace(target="observed-product", arch="observed-arch",
-        environment_identity={"cann_version": "observed-cann", "compiler_version": "observed-compiler"})
-    transport = SimpleNamespace(_device=3, profile="bz-a3-2")
-    actual = native_target_runtime(config, transport)
-    assert actual == {"target": "a3", "runtime": "py311-torch", "device": "3", "product": "observed-product",
-        "architecture": "observed-arch", "execution_profile": "bz-a3-2",
-        "toolchain": "observed-cann", "compiler": "observed-compiler"}
-    actor = SimpleNamespace(executor=SimpleNamespace(runtime_identity=actual))
-    assert cli._composed_target_runtime(actor, actual) == actual
-    for field in actual:
-        with pytest.raises(ValueError, match="composed executor"):
-            cli._composed_target_runtime(actor, {**actual, field: "stale"})
-    config.environment_identity.pop("compiler_version")
-    assert native_target_runtime(config, transport) is None
-    config.compiler_version = "independently-observed-compiler"
-    assert native_target_runtime(config, transport)["compiler"] == "independently-observed-compiler"
-    assert "compiler_version" not in config.environment_identity
-    with pytest.raises(ValueError, match="require observed"):
-        cli._composed_target_runtime(SimpleNamespace(executor=native), actual)
-    a5 = catlass_target_runtime(SimpleNamespace(device=5), SimpleNamespace(runtime_provenance=(
-        ("execution_profile", "bz-a5"), ("cann_version", "observed-cann"),
-        ("ascendnpu_ir_install_commit", "a" * 40), ("catlass_revision", "b" * 40),
-        ("manifest_sha256", "c" * 64))))
-    assert a5["device"] == "5" and a5["product"] == "Ascend950"
-    assert a5["compiler"] == "a" * 40 and a5["catlass_revision"] == "b" * 40
 
 
 pytestmark = pytest.mark.usefixtures("scripted_pi")

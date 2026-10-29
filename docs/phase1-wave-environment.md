@@ -18,4 +18,4 @@ observe those handles when the outcome is unavailable. A failed check does not
 reset allocations, retry commands or publish project memory. Fix the selected
 environment before explicitly resuming within the remaining campaign allocation.
 Read-only reports and retained-wave finalization do not execute probes. Reviewed
-Phase 2 and A5 compositions keep their existing admission behavior.
+Reviewed-memory and A5 compositions keep their existing admission behavior.

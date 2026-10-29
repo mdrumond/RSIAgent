@@ -58,9 +58,9 @@ def test_native_backend_rejects_source_error_without_device_launch(tmp_path):
     assert not hasattr(transport, "plan")
 
 
-@pytest.mark.parametrize("phase2", [False, True])
+@pytest.mark.parametrize("reviewed", [False, True])
 @pytest.mark.parametrize("selector", [None, "native", ["native", "triton"]])
-def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, selector, phase2):
+def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, selector, reviewed):
     from benchmarks.a5kernels.phase1_experiments import MODEL_IDENTITIES
     from benchmarks.a5kernels.phase1_provider import direct_profile
     guide = b"Native Ascend C programming guide"
@@ -87,22 +87,22 @@ def test_native_composition_uses_target_policy_and_pinned_guide(tmp_path, select
                   objective="Learn native kernels", initial_memory=b"",
                   environment={"OPENAI_API_KEY": "test", "DEEPSEEK_API_KEY": "test"},
                   embeddings=embeddings)
-    if phase2:
-        from test_ascend_phase2_curriculum import snapshot
+    if reviewed:
+        from reviewed_fixtures import snapshot
         kwargs["reviewed_snapshot"] = snapshot()
     controller = build_native_adaptive_phase1(**kwargs)
     assert controller.curriculum.target_policy.target == "a3"
     assert controller.project_target == 64
     assert controller.execute_project.retain_semantic_failure is True
     identity = json.loads((tmp_path / "campaign-identity.json").read_bytes())
-    if phase2:
-        assert identity["phase"] == "adaptive-phase2"
-        assert identity["snapshot_id"] == "reviewed-seed"
+    if reviewed:
+        assert identity["reviewed_snapshot_id"] == "reviewed-seed"
+        assert "phase" not in identity
     assert build_native_adaptive_phase1(**kwargs).project_target == 64
     # New goal qualification may observe a compiler without changing reviewed seed pins.
     observed = build_native_adaptive_phase1(**dict(kwargs, config=replace(config, compiler_version="observed-compiler")))
     assert json.loads((tmp_path / "campaign-identity.json").read_bytes()) == identity
-    assert observed.snapshot.snapshot_id == "reviewed-seed" if phase2 else True
+    assert observed.snapshot.snapshot_id == "reviewed-seed" if reviewed else True
     from benchmarks.ascend.training_traces import recorder_factory
     factory = recorder_factory(phase="phase1", round_id="native-builder-round",
                                model="fixture", source_manifest_sha256="b" * 64)

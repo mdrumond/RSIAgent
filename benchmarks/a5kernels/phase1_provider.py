@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from copy import copy, deepcopy
+from contextlib import nullcontext
 import json
 import logging
 import math
@@ -427,6 +428,15 @@ class _ActorContinuation:
     deadline: float | None = None
 
 
+@dataclass(frozen=True)
+class _ActorSelection:
+    action: TrialAction | None
+    text: str
+    tokens: int
+    invalid_observation: str | None = None
+    exhausted: bool = False
+
+
 from benchmarks.ascend.actor_control import actor_lease
 
 
@@ -517,104 +527,97 @@ class DirectActorDriver:
                 options['max_seconds'] = remaining
         return self.provider.complete(profile, messages, **options)
 
+    def _action_session(self, profile, action_executor, deadline):
+        return nullcontext(None)
+
+    def _select_action(self, session, *, working, profile, recorder, turn,
+                       feedback, action_executor, turn_parser, deadline):
+        messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
+        self._request(recorder, profile, messages, stage="action", turn=turn)
+        try:
+            completion = self._complete(recorder, profile, messages, stage="action", turn=turn)
+        except Exception as exc:
+            recorder.failure(exc, stage="action", turn=turn)
+            raise
+        return _ActorSelection(turn_parser(completion.text), completion.text,
+                               summary_tokens + completion.completion_tokens)
+
+    def _observed_action(self, session, action, observation, action_executor):
+        pass
+
+    def _terminal_context(self, working, profile):
+        return working.messages()
+
     @actor_lease
-    def __call__(
-        self,
-        instruction: str,
-        *,
-        profile: DirectModelProfile,
-        workspace,
-        context,
-        turn_parser: Callable[[str], TrialAction | None],
-        action_executor: Callable[[TrialAction], ActionOutcome],
-    ) -> ActorOutcome:
-        del context
+    def __call__(self, instruction: str, *, profile: DirectModelProfile,
+                 workspace, context, turn_parser: Callable[[str], TrialAction | None],
+                 action_executor: Callable[[TrialAction], ActionOutcome]) -> ActorOutcome:
         recorder = _ProviderEvidenceRecorder(workspace)
-        messages: list[dict[str, str]] = [
+        working = WorkingContext([
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": instruction},
-        ]
-        for message in messages:
-            self._trace("message", message)
-        working = WorkingContext(messages)
+        ])
         from benchmarks.ascend.actor_control import ActorConversation, ActorStopped
         conversation = ActorConversation(workspace, instruction, working, action_executor)
-        tokens = 0
-        turn = conversation.turn
-        ordinary_turns = 0
+        for message in working.fixed:
+            self._trace("message", message)
+        tokens, turn = 0, conversation.turn
         deadline = min(self.clock() + self.max_seconds,
                        getattr(action_executor, 'deadline', float('inf')))
-        while self.clock() < deadline:
-            try:
-                conversation.boundary()
-            except ActorStopped:
-                return ActorOutcome('user-stopped', turn, tokens)
-            turn += 1
-            messages, summary_tokens = self._prepare_context(working, profile, recorder, turn=turn)
-            tokens += summary_tokens
-            self._request(recorder, profile, messages, stage="action", turn=turn)
-            try:
-                completion = self._complete(recorder, profile, messages, stage="action", turn=turn)
-            except Exception as exc:
-                recorder.failure(exc, stage="action", turn=turn)
-                raise
-            recorder.response(completion.text, stage="action", turn=turn)
-            tokens += completion.completion_tokens
-            messages.append({"role": "assistant", "content": completion.text})
-            working.append(messages[-1])
-            self._trace("message", messages[-1])
-            if conversation.control.pending():
-                working.append({'role': 'user', 'content':
-                    'The preceding proposed action was not executed because user input arrived.'})
-                conversation.save(turn)
-                continue
-            action = turn_parser(completion.text)
-            if action is None:
-                observation = json.dumps({
-                    "host": {"event": "invalid-action", "required": _ACTION_NUDGE}
-                }, sort_keys=True, separators=(",", ":"))
-                recorder.observation(observation, turn=turn)
-            else:
-                outcome = action_executor(action)
-                observation = outcome.observation
-                if not outcome.budget_exempt:
-                    ordinary_turns += 1
+        with self._action_session(profile, action_executor, deadline) as session:
+            while self.clock() < deadline:
                 try:
-                    host = json.loads(observation).get("host", {})
-                except (AttributeError, json.JSONDecodeError):
-                    host = {}
-                failed = (
-                    host.get("passed") is False
-                    or host.get("status") in {"failed", "error"}
-                    or "fail" in str(host.get("event", "")).lower()
-                )
-                self._trace("tool", {
-                    "name": action.kind,
-                    "status": "failed" if failed else "observed",
-                    "observation": observation,
-                })
-                if outcome.terminal:
-                    messages.append({"role": "user", "content": observation})
-                    working.append(messages[-1])
-                    self._trace("message", messages[-1])
+                    feedback = conversation.boundary()
+                except ActorStopped:
+                    return ActorOutcome('user-stopped', turn, tokens)
+                turn += 1
+                selection = self._select_action(session, working=working, profile=profile,
+                    recorder=recorder, turn=turn, feedback=feedback, action_executor=action_executor,
+                    turn_parser=turn_parser, deadline=deadline)
+                tokens += selection.tokens
+                if selection.exhausted or self.clock() >= deadline:
+                    break
+                recorder.response(selection.text, stage="action", turn=turn)
+                message = {"role": "assistant", "content": selection.text}
+                working.append(message)
+                self._trace("message", message)
+                if conversation.control.pending():
+                    working.append({'role': 'user', 'content':
+                        'The preceding proposed action was not executed because user input arrived.'})
                     conversation.save(turn)
-                    self._trace("terminal", {
-                        "status": outcome.status,
-                        "admitted_artifacts": dict(outcome.admitted_artifacts),
-                    })
-                    return ActorOutcome(
-                        outcome.status, turn, tokens,
+                    continue
+                action, outcome = selection.action, None
+                if action is None:
+                    observation = selection.invalid_observation or json.dumps({
+                        "host": {"event": "invalid-action", "required": _ACTION_NUDGE}
+                    }, sort_keys=True, separators=(",", ":"))
+                else:
+                    if hasattr(action_executor, "action_event_turn"):
+                        action_executor.action_event_turn = turn
+                    outcome = action_executor(action)
+                    observation = outcome.observation
+                    self._observed_action(session, action, observation, action_executor)
+                    try:
+                        host = json.loads(observation).get("host", {})
+                    except (AttributeError, json.JSONDecodeError):
+                        host = {}
+                    failed = (host.get("passed") is False or host.get("status") in {"failed", "error"}
+                              or "fail" in str(host.get("event", "")).lower())
+                    self._trace("tool", {"name": action.kind,
+                        "status": "failed" if failed else "observed", "observation": observation})
+                message = {"role": "user", "content": observation}
+                working.append(message)
+                self._trace("message", message)
+                conversation.save(turn)
+                if outcome is not None and outcome.terminal:
+                    self._trace("terminal", {"status": outcome.status,
+                        "admitted_artifacts": dict(outcome.admitted_artifacts)})
+                    retained = self._terminal_context(working, profile)
+                    return ActorOutcome(outcome.status, turn, tokens,
                         admitted_artifacts=dict(outcome.admitted_artifacts),
-                        continuation=_ActorContinuation(
-                            profile, tuple(dict(item) for item in messages), recorder, working, turn, deadline
-                        ),
-                    )
-            messages.append({"role": "user", "content": observation})
-            working.append(messages[-1])
-            self._trace("message", messages[-1])
-            conversation.save(turn)
-            if action is None:
-                ordinary_turns += 1
+                        continuation=_ActorContinuation(profile, tuple(retained), recorder,
+                                                        working, turn, deadline))
+                recorder.observation(observation, turn=turn)
         self._trace("terminal", {"status": "time-budget-exhausted"})
         return ActorOutcome("time-budget-exhausted", turn, tokens)
 

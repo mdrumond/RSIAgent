@@ -50,9 +50,9 @@ binding accepts repeated `--collection` options for the equivalent selection.
 KDB-off configurations stay off.
 
 Do not retrofit an existing experiment: its collection selection and manifest
-fingerprints are part of its identity. Historical Phase 2 handoffs retain their
+fingerprints are part of its identity. Historical reviewed-memory snapshots retain their
 reviewed collection list and fingerprints for evidence inspection; new separate
-Phase 2 launches are [retired](phase2-retirement.md).
+
 
 Validate retrieval through the existing read-only Knowledge Agent gate:
 

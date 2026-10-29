@@ -1,6 +1,6 @@
 # A5 SFT trace and dataset contract
 
-This host-side pipeline retains new Phase 1/2 interactions for supervised
+This host-side pipeline retains new Phase 1 interactions for supervised
 training without treating model output as correctness evidence. A trace is an
 ordered, hash-chained JSONL stream containing the full redacted conversation,
 tool activity, candidate source, and host validation provenance. Capture starts
@@ -45,7 +45,7 @@ vendor those repositories, authorize redistribution, or make CANNBench golden
 implementations eligible as labels. Review each source license before sending
 derived data to an external service.
 
-Phase 2 production wires `TraceRecorder` across its provider/verifier seam so
+Phase 1 production wires `TraceRecorder` across its provider/verifier seam so
 raw messages are retained and the trace is sealed only after host validation.
 Legacy provider records created before prospective messages were added remain
 resumable but deliberately produce no SFT trace.
@@ -54,7 +54,7 @@ buffers every exact message without sharing state across projects, and seals the
 trace with the final candidate and host-evidence digest only after verification.
 Both phases add an explicit supervised user/assistant boundary containing the
 exact verified source. Phase 1 distillation stays available for research memory
-but is excluded from that training target. Host actions and prior failed Phase 2
+but is excluded from that training target. Host actions and prior failed project
 attempts are retained as structured failure evidence so successful repairs are
 classified from production traces, not inferred from prose.
 Declare the provider tool schema in the trace

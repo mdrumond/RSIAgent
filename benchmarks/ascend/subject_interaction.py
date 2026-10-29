@@ -337,9 +337,9 @@ def _execute(campaign, request, original, directory, request_path):
         from optimizer.jobs import JobStore
         for manifest in (directory / 'jobs').glob('*/manifest.json'):
             events = JobStore(manifest.parent.parent).events(manifest.parent.name)
-            completed = {row['payload']['attempt_id'] for row in events if row['kind'] == 'phase2-attempt-result'}
+            completed = {row['payload']['attempt_id'] for row in events if row['kind'] == 'task-attempt-result'}
             unfinished = [row['payload']['attempt_id'] for row in events
-                          if row['kind'] == 'phase2-attempt-request' and row['payload']['attempt_id'] not in completed]
+                          if row['kind'] == 'task-attempt-request' and row['payload']['attempt_id'] not in completed]
             if unfinished:
                 attempt_id = unfinished[-1]
     atomic(directory / 'manual-execution.json', canonical(dict(attempt_id=attempt_id)))
