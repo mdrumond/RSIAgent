@@ -3,8 +3,8 @@
 <p>Observations are not verified reusable knowledge. Original results remain immutable; investigation status and linked retries are separate.</p>
 {% if not controls.feedback.root %}<p>Configure <code>feedback_root</code> to view imported outcomes.</p>{% endif %}
 {% if controls.enabled and controls.feedback.root %}<section class="control-panel">
-<button data-action="import-feedback" data-subject="phase2">Import configured failures</button>
-<p>Use a fresh Phase 1 destination for an investigation. New Phase 2 launches and retries are retired; request new work through the subject curriculum. Historical results remain available below.</p>
+<button data-action="import-feedback" data-subject="feedback">Import configured failures</button>
+<p>Use a fresh Phase 1 destination for an investigation. Request new work through the subject curriculum.</p>
 
 <form data-feedback-form>
 <label>Destination <select name="preset_id">{% for preset in controls.presets.values() %}{% if preset.target == 'a3' and preset.phase == 1 %}<option value="{{ preset.id }}">{{ preset.id }} (Phase {{ preset.phase }})</option>{% endif %}{% endfor %}</select></label>
@@ -15,7 +15,7 @@
 <article class="card" id="{{ row.feedback_id }}">
 {% if controls.enabled and controls.feedback.root and state.status not in ['resolved', 'deferred'] and outcome.category not in ['interrupted', 'verified-success', 'verified-timing-unknown'] and state.classification not in ['infrastructure', 'provider'] %}<label><input name="feedback_id" type="checkbox" value="{{ row.feedback_id }}"> Select failure</label>{% endif %}
 <h2>{{ outcome.task.task_id or outcome.attempt_id }}</h2>
-<p><b>Lifecycle:</b> {{ row.lifecycle or "successful control" }} · <b>Source:</b> {{ outcome.source_type or "phase2" }}</p>
+<p><b>Lifecycle:</b> {{ row.lifecycle or "successful control" }} · <b>Source:</b> {{ outcome.source_type }}</p>
 <p>{{ outcome.target }} / {{ outcome.language }} · {{ outcome.category }} · original attempt {{ outcome.attempt_id }}{% if not outcome.completed %} (interrupted, not completed){% endif %}</p>
 <p><b>Host correctness:</b> {{ 'verified' if outcome.verified else 'not verified' }}. <b>Performance:</b> {% if outcome.category == 'verified-slow' %}shortfall{% elif outcome.category == 'verified-success' %}goal met{% else %}unknown / not established{% endif %}{% if outcome.result.speedup is defined %} ({{ outcome.result.speedup }}×){% endif %}.</p>
 <p><b>Investigation:</b> {{ state.status }}{% if state.classification %} · {{ state.classification }}{% endif %}{% if state.reason %} — {{ state.reason }}{% endif %}</p>

@@ -37,7 +37,7 @@
       if (eligible) select.value = eligible.root;
       const describe = () => {
         const source = sources.find(row => row.root === select.value);
-        document.querySelector('#optimizer-memory-status').textContent = source?.available ? `Completed compatible A3 memory · snapshot ${source.snapshot_id}` : 'No completed compatible Phase 2 memory is available. Complete and configure a native A3 Phase 2 source first.';
+        document.querySelector('#optimizer-memory-status').textContent = source?.available ? `Completed compatible A3 memory · snapshot ${source.snapshot_id}` : 'No compatible reviewed memory is available. Configure an admitted A3 memory source first.';
       };
       select.addEventListener('change', describe); describe();
     }).catch(error => {message.textContent = error.message;});

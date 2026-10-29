@@ -73,12 +73,8 @@ def campaign(tmp_path):
     control = tmp_path / "control"
     write(control / "worker.json", {"status": "running", "started": 10})
     config = tmp_path / "dashboard.json"
-    phase2 = tmp_path / "phase2"
-    write(phase2 / "state.json", {"completed_waves": [], "prior_outcomes": []})
     write(config, {"campaigns": [{"phase": 1, "name": "A3 Phase 1", "root": str(root),
-                                   "control": str(control)},
-                                  {"phase": 2, "name": "A3 Phase 2",
-                                   "root": str(phase2)}]})
+                                   "control": str(control)}]})
     return config
 
 
@@ -1463,36 +1459,14 @@ def test_explanations_are_visible_and_trace_bytes_remain_exact(campaign, tmp_pat
         app.extensions['dashboard_controls'].close()
 
 
-@pytest.mark.parametrize('action', ['start', 'sample', 'approve', 'reject', 'run-approved', 'extend'])
-def test_retired_phase2_mutations_refuse_before_runner_or_campaign_changes(tmp_path, action):
-    from html.parser import HTMLParser
-    config, root, control = controlled_config(tmp_path, phase=2)
-    write(root / 'state.json', dict(wave_index=1, coverage=[], prior_outcomes=[]))
-    write(control / 'curriculum-approval.json', dict(status='approved', proposal_id='historical',
-        proposal=dict(base_wave_index=1, wave=dict(projects=[]))))
-    before = {path: path.read_bytes() for directory in (root, control) for path in directory.rglob('*') if path.is_file()}
-    calls = []
-    app = create_app(config, tmp_path / 'retired.sqlite', command_runner=lambda *a, **k: calls.append(a))
-    client = app.test_client()
-    try:
-        subject = 'phase2' if action in {'start', 'sample', 'extend'} else 'historical'
-        payload = dict(campaign_id='phase2', preset_id='phase2', proposal_id='historical',
-                       project_ids=[], confirmation=action + ':' + subject)
-        response = client.post('/api/control/' + action, json=payload, headers={
-            'X-CSRF-Token': client.get('/api/csrf').get_json()['token'], 'Idempotency-Key': action})
-        assert response.status_code == 409 and calls == []
-        assert {path: path.read_bytes() for directory in (root, control) for path in directory.rglob('*') if path.is_file()} == before
-        assert app.extensions['dashboard_controls'].recent() == []
-        assert client.get('/api/status').get_json()['controls']['proposals'][0]['controls_available'] is False
-        class Buttons(HTMLParser):
-            def __init__(self, html):
-                super().__init__()
-                self.actions = []
-                self.feed(html)
-            def handle_starttag(self, tag, attrs):
-                values = dict(attrs)
-                if tag == 'button':
-                    self.actions.extend(values[key] for key in ('data-action', 'data-proposal-action') if key in values)
-        assert Buttons(client.get('/').get_data(as_text=True)).actions == []
-    finally:
-        app.extensions['dashboard_controls'].close()
+@pytest.mark.parametrize("section", ["campaigns", "presets"])
+def test_unsupported_campaign_configuration_rejected_before_cache_writes(tmp_path, section):
+    config = tmp_path / "dashboard.json"
+    row = dict(id="old", phase=2, target="a3", root=str(tmp_path / "old-run"))
+    write(config, {"campaigns": [row]} if section == "campaigns" else
+          {"campaigns": [], "controls": {"presets": [row]}})
+    cache = tmp_path / "cache" / "dashboard.sqlite"
+    with pytest.raises(ValueError):
+        create_app(config, cache)
+    assert not cache.parent.exists()
+    assert not (tmp_path / "old-run").exists()

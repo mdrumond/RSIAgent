@@ -29,19 +29,19 @@ def raw_fields(value):
 def feedback(tmp_path):
     root = tmp_path / 'feedback'
     row = dict(feedback_id='a' * 64, outcome=dict(
-        source_root=str(tmp_path / 'old-phase2'), attempt_id='attempt-001',
+        source_root=str(tmp_path / 'subject-run'), attempt_id='attempt-001',
         target='a3', language='ascend-c', runtime={}, task={'task_id': 'relu'},
         verified=True, completed=True, category='verified-slow',
         result={'speedup': .4}, evidence={}), investigation=dict(
             status='open', classification=None, reason=None, projects=[], retries=[], evidence=[]))
-    row['outcome'].update(source_type='phase2', original_spec=row['outcome']['task'])
+    row['outcome'].update(source_type='optimizer', original_spec=row['outcome']['task'])
     row['lifecycle'] = 'failed'
     write(root / (row['feedback_id'] + '.json'), row)
     presets = [dict(id=f'phase{phase}', phase=phase, target='a3',
                     root=str(tmp_path / f'new{phase}'), control=str(tmp_path / f'control{phase}'),
                     config='/runtime.json', initial_memory='/memory.bin', objective='Investigate',
                     project_target=4, phase1_root='/reviewed-phase1', review='/review.json')
-               for phase in (1, 2)]
+               for phase in (1,)]
     config = tmp_path / 'dashboard.json'
     write(config, dict(feedback_root=str(root), campaigns=[], controls=dict(
         enabled=True, runner='/repo/run_ascend_campaign.py', presets=presets)))
@@ -59,12 +59,12 @@ def feedback(tmp_path):
 
 def presented(row):
     return describe_statuses({**row, 'lifecycle': 'failed', 'outcome': {
-        **row['outcome'], 'source_type': 'phase2', 'original_spec': row['outcome']['task']}})
+        **row['outcome'], 'source_type': 'optimizer', 'original_spec': row['outcome']['task']}})
 
 
 def submit(client, action, body):
     csrf = client.get('/api/csrf').get_json()['token']
-    body['confirmation'] = f"{action}:{body.get('preset_id', 'phase2')}"
+    body['confirmation'] = f"{action}:{body.get('preset_id', 'feedback')}"
     return client.post('/api/control/' + action, json=body,
                        headers={'X-CSRF-Token': csrf, 'Idempotency-Key': json.dumps(body)})
 
@@ -117,10 +117,10 @@ def test_import_and_bounded_phase1_use_existing_async_runner(feedback):
                         '--failure-id', row['feedback_id']]
 
 
-def test_retired_retry_is_refused_before_runner_and_preserves_history(feedback):
+def test_removed_action_is_refused_before_runner(feedback):
     client, app, config, row, calls = feedback
     response = submit(client, 'retry-feedback', dict(
-        preset_id='phase2', feedback_ids=[row['feedback_id']]))
+        preset_id='missing', feedback_ids=[row['feedback_id']]))
     assert response.status_code == 409
     assert calls == []
     assert not (config.parent / 'new2').exists()
@@ -136,12 +136,12 @@ def test_deferred_and_resolved_visible_but_not_selected(feedback, status):
     write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
     assert 'unsupported dtype' in client.get('/feedback').get_data(as_text=True)
     assert submit(client, 'retry-feedback', dict(
-        preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
+        preset_id='missing', feedback_ids=[row['feedback_id']])).status_code == 409
     assert not calls
 
 
 @pytest.mark.parametrize('classification', ['infrastructure', 'provider'])
-def test_classified_infrastructure_is_readable_but_no_retired_retry_or_investigation(feedback, classification):
+def test_classified_infrastructure_is_readable_but_not_investigated(feedback, classification):
     client, app, config, row, calls = feedback
     row['outcome'].update(category='incorrect', verified=False)
     row['investigation'].update(classification=classification, reason='not a kernel defect')
@@ -152,7 +152,7 @@ def test_classified_infrastructure_is_readable_but_no_retired_retry_or_investiga
         feedback_ids=[row['feedback_id']], project_target=2)).status_code == 409
     assert not calls
     assert submit(client, 'retry-feedback', dict(
-        preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
+        preset_id='missing', feedback_ids=[row['feedback_id']])).status_code == 409
     assert calls == []
 
 
@@ -290,7 +290,7 @@ def test_phase1_original_missing_native_acceptance_rejected(feedback):
     client, app, config, row, calls = feedback
     row['outcome'].update(source_type='phase1', original_spec=None)
     write(config.parent / 'feedback' / (row['feedback_id'] + '.json'), row)
-    assert submit(client, 'retry-feedback', dict(preset_id='phase2', feedback_ids=[row['feedback_id']])).status_code == 409
+    assert submit(client, 'retry-feedback', dict(preset_id='missing', feedback_ids=[row['feedback_id']])).status_code == 409
     assert not calls
 
 
@@ -337,7 +337,7 @@ def test_failure_case_paging_download_and_legacy_unavailability(feedback):
     assert (root / (identifier + '.json')).read_bytes() == before and not calls
 
 
-def test_feedback_destinations_and_actions_exclude_retired_phase2(feedback):
+def test_feedback_destinations_and_actions_expose_current_investigations(feedback):
     from html.parser import HTMLParser
     class Controls(HTMLParser):
         def __init__(self, html):
@@ -354,39 +354,3 @@ def test_feedback_destinations_and_actions_exclude_retired_phase2(feedback):
     controls = Controls(client.get('/feedback').get_data(as_text=True))
     assert controls.destinations == ['phase1']
     assert controls.actions == ['investigate']
-
-
-@pytest.mark.parametrize('status,category,lifecycle', [
-    ('open', 'verified-slow', 'failed'),
-    ('ready-to-retry', 'verified-slow', 'remediated'),
-    ('resolved', 'verified-slow', 'fixed'),
-    ('open', 'verified-success', None),
-    ('open', 'verified-timing-unknown', None),
-])
-def test_legacy_feedback_metadata_is_derived_without_rewriting_history(feedback, status, category, lifecycle):
-    client, app, config, row, calls = feedback
-    legacy = json.loads(json.dumps(row))
-    legacy.pop('lifecycle')
-    legacy['outcome'].pop('source_type')
-    legacy['outcome'].pop('original_spec')
-    legacy['outcome']['category'] = category
-    legacy['investigation']['status'] = status
-    path = config.parent / 'feedback' / (row['feedback_id'] + '.json')
-    write(path, legacy)
-    retained = path.read_bytes()
-    response = client.get('/api/feedback')
-    assert response.status_code == 200
-    actual, = response.get_json()
-    assert actual['outcome']['source_type'] == 'phase2'
-    assert actual['outcome']['original_spec'] == legacy['outcome']['task']
-    assert actual['lifecycle'] == lifecycle
-    # Every original field remains identical, including investigation state and
-    # retained host evidence; the defaults exist only in the public read view.
-    original = raw_fields(actual)
-    original.pop('lifecycle')
-    original['outcome'].pop('source_type')
-    original['outcome'].pop('original_spec')
-    assert original == legacy
-    assert client.get('/feedback').status_code == 200
-    assert path.read_bytes() == retained
-    assert calls == []
