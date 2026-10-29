@@ -384,9 +384,14 @@ def _execute(campaign, request, original, directory, request_path):
         campaign.scheduler.register_manual_review(review_id, subject_id)
         provenance = dict(project_id=pid,
             subject_id=subject_id, request=record['review_request'],
-            review_sha256=record['review_sha256'])
+            review_sha256=record['review_sha256'],
+            retirement_resolutions=[dict(tombstone_id=row['tombstone_id'],evidence=row['evidence'],reason=row['reason'])
+                for row in review.get('retirement_checks', []) if row['relation']=='reconciles'])
         campaign.memory.accept(review_id, review['memory'], provenance)
         campaign.scheduler.resolve_review(review_id, 'accepted')
+    maintenance = getattr(campaign, 'memory_maintenance', None)
+    if maintenance is not None:
+        maintenance.resolve(pid, record)
     campaign._save()
     return dict(project_id=pid, review_id=review_id, directory=str(directory.relative_to(root)))
 
@@ -430,7 +435,11 @@ def _settle_manual_repairs(campaign, pid, record, review_id):
             key, row = _effective_project(campaign.state['projects'], item['project_id'])
             siblings.setdefault(key, row or dict(repairs=item.get('repairs', [])))
     obligations = campaign.scheduler.state()['repairs']
+    maintenance = getattr(campaign, 'memory_maintenance', None)
+    memory_repairs = {row['repair_id'] for row in maintenance.obligations(open_only=False)} if maintenance else set()
     for repair_id in record.get('repairs', []):
+        if repair_id in memory_repairs:
+            continue
         if obligations.get(repair_id, {}).get('status') != 'open':
             continue
         linked = [row for row in siblings.values()

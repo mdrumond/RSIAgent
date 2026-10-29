@@ -119,3 +119,30 @@ def test_evidence_backed_restoration_can_replace_retired_base_without_active_que
     retired['artifact_sha256'].append(B)
     result=h.agent.review(replace(request(),retired_memories=(retired,)))
     assert result['memory']['base_versions']==[dict(memory_id='lesson',version=old_version)]
+
+
+def test_rewrite_cannot_reset_counters_without_changing_consumable_content():
+    from benchmarks.ascend.memory_review import content_identity
+    proposed=memory()
+    repair=dict(repair_id='rewrite',memory_id='lesson',version=D,document_sha256=D,
+                evidence=[L],kind='rewrite',status='active',content_identity=content_identity(proposed))
+    req=replace(request(),memory_repairs=(repair,))
+    proposed=dict(proposed,operation='append',base_versions=[dict(memory_id='lesson',version=D)],evidence=[R,S])
+    value=decision(proposed)
+    value['memory_resolutions']=[dict(repair_id='rewrite',action='replace',reason='Rewrite weak memory',evidence=[R])]
+    with pytest.raises(ValueError,match='change consumable'):
+        validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})
+    value['memory']['preconditions']+='; explicitly handle strided tails'
+    validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})
+
+
+def test_confirm_is_only_for_active_investigations():
+    repair=dict(repair_id='investigate',memory_id='lesson',version=D,document_sha256=D,
+                evidence=[L],kind='investigate',status='active')
+    req=replace(request(),memory_repairs=(repair,))
+    value=decision()
+    value['memory_resolutions']=[dict(repair_id='investigate',action='confirm',reason='New evidence confirms applicability',evidence=[R])]
+    validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})
+    repair['kind']='rewrite'
+    with pytest.raises(ValueError,match='only an active investigation'):
+        validate_memory_review(value,req,{S,R,L,D},ProjectVerifierAgent._evidence,{S,R,L,D})

@@ -361,3 +361,100 @@ def test_omitted_knowledge_index_access_counts_and_checks_unexposed_memory(tmp_p
         service.actor_read({'sha256':index_sha},actor,page)
         service.actor_read({'sha256':index_sha},actor,page)
         assert service.ledger.stats(memory_id,version)['accesses']==1
+
+
+def test_investigation_can_confirm_correct_memory_without_version_or_counter_reset(tmp_path):
+    campaign,ledger=setup(tmp_path);base=seed(campaign)
+    current=observe(campaign,ledger,base,usefulness='unknown',correctness='unknown',investigate=True)
+    repair=campaign.memory_maintenance.prioritize()
+    source=current['outcome']['source_sha256']
+    request=campaign.memory_maintenance.prepare(ProjectReview('confirm',source,True,{'source':source}),[repair['repair_id']])
+    review=dict(decision='accept',memory=None,memory_resolutions=[dict(repair_id=repair['repair_id'],
+        action='confirm',reason='Observed behavior is consistent with the documented preconditions',evidence=[source])])
+    campaign.memory_maintenance.resolve('confirm',dict(review=review,review_request=asdict(request),review_sha256=campaign.artifacts.put_json(review)))
+    assert campaign.memory_maintenance.obligations()==[]
+    assert ledger.status(base['version'])=='active'
+    assert ledger.stats(base['memory_id'],base['version'])['accesses']==1
+    assert ledger.records()[0]==ledger.record(base['version'])
+
+
+def test_ordinary_memory_named_project_repair_still_resolves(tmp_path):
+    campaign,_=setup(tmp_path)
+    campaign.scheduler.add_repair('memory-copy-001','s','original','Repair the project',['a'*64])
+    review=dict(decision='accept',memory=None,reason='Repair passed',memory_resolutions=[])
+    campaign.state['projects']['fixed']=dict(review=review,review_sha256='b'*64,repairs=['memory-copy-001'])
+    campaign.scheduler.start_wave('wave','c'*64)
+    campaign._publish_wave(dict(wave_id='wave',subject={'subject_id':'s'},projects=['fixed']))
+    assert campaign.scheduler.state()['repairs']['memory-copy-001']['status']=='resolved'
+
+
+@pytest.mark.parametrize('action',['replace','retire','confirm'])
+def test_manual_continuation_applies_explicit_memory_resolution(tmp_path,action):
+    from test_subject_interaction import setup as interaction_setup
+    from benchmarks.ascend import subject_interaction as interaction
+    from benchmarks.ascend.subject_execution import SubjectOutcome
+    _,root,directory,scheduler,artifacts=interaction_setup(tmp_path)
+    ledger=MemoryLedger(tmp_path/'shared.sqlite')
+    campaign=SubjectCampaign(root,[Subject('study','study')],b'',select_wave=None,execute=None,
+        verifier=None,complete=None,memory_ledger=ledger)
+    campaign.budget=SimpleNamespace(deadline=campaign.clock()+30)
+    base=seed(campaign)
+    observe(campaign,ledger,base,project_id='one',correctness='unknown' if action=='confirm' else 'contradicted',
+            usefulness='unknown',investigate=action=='confirm')
+    repair=campaign.memory_maintenance.prioritize()
+    original=campaign.state['projects']['one']
+    original.update(plan=dict(project_id='one',spec={'project_id':'one'},repairs=[repair['repair_id']]),
+        wave_index=1,origin_wave_id='wave-1',subject_id='study',repairs=[repair['repair_id']])
+    source=artifacts.put_bytes(b'manually corrected source\n')
+    result=artifacts.put_bytes(b'manually observed host result\n')
+    campaign.execute=lambda *a,**kw:SubjectOutcome(True,source,{'source':source,'result':result},{},artifacts.root)
+    def review(pid,record):
+        request=campaign.memory_maintenance.prepare(ProjectReview(pid,source,True,{'source':source,'result':result}),record['repairs'])
+        proposed=dict(proposal(source),operation='append',base_versions=[base]) if action=='replace' else None
+        decision=dict(decision='accept',memory=proposed,memory_judgments=[],retirement_checks=[],
+            memory_resolutions=[dict(repair_id=repair['repair_id'],action=action,reason='Manual project resolves dispute',evidence=[result])])
+        record.update(review=decision,review_request=asdict(request),review_sha256=artifacts.put_json(decision))
+    campaign._review=review
+    request=dict(id='manual-resolution',kind='continue',project_id='one',feedback_key='repair',text='Resolve memory',additional_seconds=30)
+    path=root/'request.json'
+    interaction._execute(campaign,request,dict(original),directory,path)
+    assert campaign.memory_maintenance.obligations()==[]
+    assert scheduler.state()['repairs'][repair['repair_id']]['status']=='resolved'
+    assert ledger.status(base['version'])==('quarantined' if action=='replace' else 'retired' if action=='retire' else 'active')
+
+
+def test_cross_campaign_author_and_actor_can_read_only_assigned_disputed_context(tmp_path):
+    from test_actor_compiler_diagnostics import actions,host
+    from test_a5_phase1_adaptive_actor import SourceBackend
+    from benchmarks.ascend.subject_knowledge import SubjectKnowledge
+    origin,ledger=setup(tmp_path);base=seed(origin)
+    observe(origin,ledger,base)
+    other,_=setup(tmp_path,ledger=ledger,name='repair-project')
+    other.memory_maintenance.reconcile()
+    selected=other.memory_maintenance.prioritize()
+    assigned=selected['memory_context']
+    document=assigned['artifacts']['disputed-memory']
+    assert json.loads(other.artifacts.read_bytes(document))==ledger.record(base['version'])
+    assert any(other.artifacts.read_bytes(sha)==b'new host result\n' for sha in assigned['artifacts'].values())
+    # The curriculum receives exact claim metadata and admitted artifact pointers.
+    calls=[]
+    def author(context,*args,**kwargs):
+        assert context['repairs'][0]['memory_context']['claim']==assigned['claim']
+        assert document in context['selection_artifacts'].values()
+        return [dict(project_id='assigned-project',repairs=[selected['repair_id']])]
+    def actor(item,snapshot,directory,**kwargs):
+        assert item['memory_maintenance']==assigned
+        current=actions(directory,SourceBackend())
+        for sha in assigned['artifacts'].values():
+            current.artifacts.put_bytes(other.artifacts.read_bytes(sha))
+            current.admitted[sha]='memory-maintenance'
+        current.observe_knowledge_read=lambda *a:pytest.fail('assigned repair evidence is not ordinary memory retrieval')
+        page=host(current,'read-artifact',sha256=document)
+        assert json.loads(page['text'])==ledger.record(base['version'])
+        calls.append('read')
+        raise TimeoutError('stop after inspecting actor repair context')
+    other.select_wave=author;other.execute=actor
+    other.run()
+    assert calls==['read']
+    assert ledger.status(base['version'])=='quarantined'
+    assert ledger.stats(base['memory_id'])['accesses']==1  # only the original ordinary actor exposure
