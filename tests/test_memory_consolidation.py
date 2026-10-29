@@ -1,10 +1,9 @@
 import hashlib
 import json
-from types import SimpleNamespace
 
 import pytest
 
-from benchmarks.ascend.memory_consolidation import MemoryConsolidator, discover, submit_consolidation
+from benchmarks.ascend.memory_consolidation import MemoryConsolidator, discover
 from benchmarks.ascend.subject_memory import SubjectMemory, StaleMemory
 
 
@@ -44,7 +43,7 @@ def prepare(tmp_path, rows, artifacts, provider=None, memory=None):
     return result
 
 
-def test_preserves_variants_evidence_and_routes_admission(tmp_path):
+def test_preserves_variants_and_evidence(tmp_path):
     artifacts = {}
     rows = [candidate('a', artifacts), candidate('b', artifacts, applicability='float16 tail')]
     original = json.loads(json.dumps(rows))
@@ -55,12 +54,6 @@ def test_preserves_variants_evidence_and_routes_admission(tmp_path):
     assert [claim['fields']['applicability'] for claim in claims] == ['float32 tail', 'float16 tail']
     assert result['provenance']['consolidation']['members'] == original
     assert rows == original
-    calls = []
-    gate = SimpleNamespace(memory=SubjectMemory(tmp_path/'empty'),
-                           submit=lambda *args, **kwargs: calls.append((args, kwargs)))
-    with pytest.raises(ValueError, match='admit every member'):
-        submit_consolidation(gate, result, {'project': 'a'}, remaining_seconds=30)
-    assert calls == []
 
 
 def test_conflicts_stay_separate_and_pairwise_check_prevents_bridge(tmp_path):
@@ -72,12 +65,11 @@ def test_conflicts_stay_separate_and_pairwise_check_prevents_bridge(tmp_path):
     assert any(row['relation'] == 'conflict' for row in result['comparisons'])
 
 
-def test_no_merge_has_no_submission(tmp_path):
+def test_unrelated_memories_have_no_merge_proposal(tmp_path):
     artifacts = {}
     rows = [candidate(name, artifacts) for name in ['a', 'b']]
     result = prepare(tmp_path, rows, artifacts, Provider({frozenset(['a', 'b']): 'unrelated'}))
     assert result['proposal'] is None
-    assert submit_consolidation(None, result, {}, remaining_seconds=1) is None
 
 
 def test_accepted_replacement_retains_history_and_detects_stale_base(tmp_path):
@@ -146,23 +138,6 @@ def test_bounded_discovery_and_comparison_cache(tmp_path):
     assert second == first
     assert len(provider.contexts) == 1
 
-
-def test_submission_requires_current_admitted_members_and_uses_normal_gate(tmp_path):
-    artifacts = {}
-    rows = [candidate(name, artifacts) for name in ['a', 'b']]
-    memory = SubjectMemory(tmp_path/'memory')
-    for row in rows:
-        memory.accept(row['id'], row['proposal'], row['provenance'])
-    result = prepare(tmp_path, rows, artifacts, memory=memory)
-    calls = []
-    gate = SimpleNamespace(memory=memory, submit=lambda *args, **kw: calls.append((args, kw)))
-    identity = submit_consolidation(gate, result, {'project': 'a'}, remaining_seconds=30)
-    assert calls[0][0] == (identity, result['proposal'], result['provenance'], {'project': 'a'})
-    assert calls[0][1] == {'remaining_seconds': 30}
-    assert len(memory.records()) == 2
-    memory.accept('replacement', result['proposal'], result['provenance'])
-    with pytest.raises(ValueError, match='admit every member'):
-        submit_consolidation(gate, result, {}, remaining_seconds=30)
 
 
 def test_published_kdb_view_excludes_old_versions_and_exposes_variant_sources(tmp_path):
@@ -241,11 +216,7 @@ def test_reconsolidation_targets_only_current_versions_after_prior_update(tmp_pa
     lineage_a = next(row for row in result['provenance']['consolidation']['members'] if row['id'] == 'a')
     assert lineage_a['proposal']['base_versions'] == historical
     assert lineage_a['base'] == current_a
-    calls = []
-    gate = SimpleNamespace(memory=memory, submit=lambda *args, **kw: calls.append((args, kw)))
-    identity = submit_consolidation(gate, result, {}, remaining_seconds=30)
-    assert calls[0][0][0] == identity
-    final = memory.accept(identity, result['proposal'], result['provenance'])
+    final = memory.accept('reconsolidated', result['proposal'], result['provenance'])
     assert [digest(row) for row in memory.records()] == [final['version']]
     assert memory.read(old_a['version'])['proposal'] == a['proposal']
     if prior_operation == 'merge':

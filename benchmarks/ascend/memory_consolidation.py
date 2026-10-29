@@ -1,4 +1,4 @@
-"""Evidence-preserving proposals; publication still belongs to memory admission."""
+"""Evidence-preserving proposals; publication follows source review."""
 from copy import deepcopy
 import base64
 import hashlib
@@ -241,26 +241,3 @@ class MemoryConsolidator:
                 for f in FIELDS}, artifacts=sorted(_artifacts(row))) for row in selected])
         return dict(proposal=proposal, provenance=provenance,
                     members=[row['id'] for row in selected], comparisons=comparisons, discovery=discovery)
-
-
-def submit_consolidation(admission, prepared, request, *, remaining_seconds):
-    """Stage accepted-member consolidation for normal admission.
-
-    Draft groups are useful review proposals, but each member must first pass
-    admission independently. A primary example cannot validate other variants.
-    """
-    if prepared['proposal'] is None:
-        return None
-    members = prepared['provenance']['consolidation']['members']
-    current = {digest(record): record for record in admission.memory.records()}
-    for member in members:
-        base = member.get('base', {})
-        record = current.get(base.get('version'))
-        if (record is None or record['memory_id'] != base.get('memory_id')
-                or record['proposal'] != member['proposal']
-                or record['provenance'] != member['provenance']):
-            raise ValueError('admit every member independently before submitting consolidation')
-    identity = 'consolidation-' + digest(dict(proposal=prepared['proposal'], members=prepared['members']))
-    admission.submit(identity, prepared['proposal'], prepared['provenance'], request,
-                     remaining_seconds=remaining_seconds)
-    return identity
