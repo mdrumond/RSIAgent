@@ -411,6 +411,82 @@ def test_recovery_context_is_readable_and_restored_without_changing_memory(tmp_p
     assert not campaign.memory.records()
 
 
+@pytest.fixture
+def interrupted_maintenance_project(tmp_path, monkeypatch):
+    from benchmarks.ascend import subject_runtime
+    from benchmarks.ascend.actor_control import ActorConversation
+    from benchmarks.ascend.agent_context import WorkingContext
+    from test_a5_phase1_adaptive import _project
+
+    observed = []
+    class Execution:
+        def __init__(self, actor, *args): self.actor = actor
+        def graph(self, request, **options):
+            instruction = self.actor.immutable_context.decode()
+            working = WorkingContext([dict(role='user', content=instruction)])
+            actions = SimpleNamespace(source=None)
+            actions.restore_source = lambda source: setattr(actions, 'source', source)
+            conversation = ActorConversation(request.branch_root/'actor', instruction, working, actions)
+            observed.append(dict(turn=conversation.turn, source=actions.source,
+                                 work_log=working.work_log, host_state=dict(working.host_state)))
+            if conversation.turn == 0:
+                actions.source = 'retained candidate source'
+                working.work_log = 'Inspected padding and retained the candidate.'
+                working.host_state = {'host-verified': {'passed': True}}
+                conversation.save(7)
+                raise RuntimeError('interrupted after checkpoint')
+            return request
+    monkeypatch.setattr(subject_runtime, 'SubjectExecutor', Execution)
+
+    def compose(*args, **options):
+        config = bound(options['root'])
+        config['actor'].immutable_context = b'base'
+        return config
+    def build():
+        return build_subject_campaign({}, target='a3', root=tmp_path,
+            subjects=[Subject('s', 'copies')], initial_memory=b'', compose=compose)
+    campaign = build()
+    digest = campaign.artifacts.put_bytes(b'Independent counterevidence')
+    item = dict(project_id='retry', spec=_project('retry', 'gm-ub-movement'),
+                memory_maintenance=dict(reason='Investigate the disputed claim',
+                    concerns=[dict(reason='A padded row contradicts the claim', evidence=[digest])],
+                    claim=dict(summary='Rows are packed', applicability='padded tensors',
+                               preconditions='padding multiple sixteen'),
+                    artifacts={'counterevidence:0': digest}))
+    # First execution receives authored insertion order; the retained plan is
+    # canonical JSON, so a later controller sees a different dictionary order.
+    snapshot = campaign.memory.snapshot()
+    with pytest.raises(RuntimeError, match='interrupted after checkpoint'):
+        campaign.execute(item, snapshot, tmp_path/'retry', remaining_seconds=30)
+    retained = json.loads((tmp_path/'project-plans.json').read_bytes())['retry']
+    retained.pop('_ordinal')
+    assert list(item['memory_maintenance']['claim']) != list(retained['memory_maintenance']['claim'])
+    return build, retained, snapshot, observed, tmp_path/'retry'
+
+
+def test_maintenance_actor_resumes_after_canonical_plan_reload(interrupted_maintenance_project):
+    build, item, snapshot, observed, directory = interrupted_maintenance_project
+    request = build().execute(item, snapshot, directory, remaining_seconds=20)
+    assert request.spec.project_id == 'retry'
+    assert len(observed) == 2
+    assert observed[1] == dict(turn=7, source='retained candidate source',
+        work_log='Inspected padding and retained the candidate.', host_state={})
+
+
+@pytest.mark.parametrize('change', ['claim', 'artifact', 'spec'])
+def test_changed_maintenance_contract_cannot_resume_checkpoint(interrupted_maintenance_project, change):
+    build, item, snapshot, observed, directory = interrupted_maintenance_project
+    if change == 'claim':
+        item['memory_maintenance']['claim']['summary'] = 'A different disputed claim'
+    elif change == 'artifact':
+        item['memory_maintenance']['artifacts']['counterevidence:0'] = 'f'*64
+    else:
+        item['spec']['hypothesis'] = 'A changed project contract'
+    with pytest.raises(ValueError, match='retained project plan changed'):
+        build().execute(item, snapshot, directory, remaining_seconds=20)
+    assert len(observed) == 1
+
+
 @pytest.mark.parametrize('setting', [
     'memory_admission_mode', 'memory_verification', 'memory_review_seconds',
     'memory_trial_seconds', 'memory_arm_seconds', 'memory_verifier_model',

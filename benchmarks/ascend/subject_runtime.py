@@ -342,7 +342,7 @@ def build_subject_campaign(settings, *, target, root, subjects, initial_memory,
         if maintenance is not None:
             assigned = dict(maintenance['artifacts'])
             request = replace(request, memory_maintenance_artifacts=tuple(assigned.values()))
-            recovery = dict(reason=maintenance['reason'] + ' Current concerns: ' + json.dumps(maintenance.get('concerns', [])) + ' Claim under review: ' + json.dumps(maintenance['claim']),
+            recovery = dict(reason=maintenance['reason'] + ' Current concerns: ' + json.dumps(maintenance.get('concerns', []), sort_keys=True) + ' Claim under review: ' + json.dumps(maintenance['claim'], sort_keys=True),
                 artifacts={**assigned, **(recovery or {}).get('artifacts', {})})
         if recovery is None:
             return executor.graph(request, target=target_contract, artifacts=store, policy=policy, allow_device_migration=True,
