@@ -105,10 +105,15 @@ def test_native_launcher_runs_fake_provider_through_host_oracle_and_profile(tmp_
         from benchmarks.a5kernels.artifacts import ContentAddressedArtifacts
         import hashlib
         store = ContentAddressedArtifacts(root / "waves/wave-001/branches/profile-copy/artifacts")
-        payloads = [json.loads(path.read_bytes()) for path in store.objects.glob("*/*")
-                    if path.read_bytes().startswith(b'{')]
-        assert {hashlib.sha256(value.encode()).hexdigest() for value in (source, source + " // variant")} <= {
-            row.get("candidate_sha256") for row in payloads}
+        profiling_receipts = [store.read_json(digest)
+            for session in sessions
+            for digest, role in session.runner.backend.host.actions.admitted.items()
+            if role in {"profiling", "comparison-profiling"}]
+        source_bound_profiles = [row for row in profiling_receipts if "candidate_sha256" in row]
+        assert len(source_bound_profiles) == 2
+        assert all(row["summary"]["actual_metric"] == "PipeUtilization" for row in source_bound_profiles)
+        assert {row["candidate_sha256"] for row in source_bound_profiles} == {
+            hashlib.sha256(value.encode()).hexdigest() for value in (source, source + " // variant")}
     identity = json.loads((root / "campaign-identity.json").read_text())
     assert identity["language"] == "ascend-c"
     assert identity["runtime_budget"] == {"policy": "elapsed-time-v1", "max_seconds": 300}
