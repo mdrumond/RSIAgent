@@ -372,15 +372,38 @@ def test_candidate_failure_retains_structured_attestation_in_context_and_ledger(
 
 
 def test_deterministic_failure_requires_changed_source_without_backend_reentry(tmp_path):
-    from canonical_a3_fixtures import make_trial, recording_candidate
+    from canonical_a3_fixtures import A3Session, make_trial, recording_candidate
+
+    class UnchangedThenRepair(A3Session):
+        attempted_unchanged = False
+        genuinely_edited = False
+
+        def next_action(self, context, allowed, **kwargs):
+            name, args = super().next_action(context, allowed, **kwargs)
+            if name == 'perform' and context['stage'] == 'debug' and not self.attempted_unchanged:
+                assert [name for name, _, _ in candidate.calls] == ['compile']
+                self.attempted_unchanged = True
+                args['edit']['source'] = context['source']['text']
+            elif name == 'perform' and self.attempted_unchanged and not self.genuinely_edited:
+                assert context['stage'] == 'implementation'
+                assert context['source']['text'] == SOURCE
+                assert [(name, source) for name, source, _ in candidate.calls] == [('compile', SOURCE)]
+                self.genuinely_edited = True
+                args['edit'] = dict(path=context['source']['path'], sha256=context['source']['sha256'],
+                                    source=self.repaired)
+            return name, args
+
     detail = ('noise one\nERROR: primary failure\n\n error:   primary   failure \nFatal: secondary\n'
               + '\"\\\n' * 10000)
     candidate = recording_candidate(compile_failures=1, compile_detail=detail)
-    owner, session = make_trial(tmp_path, candidate=candidate)
+    session = UnchangedThenRepair(initial=SOURCE, repaired=SOURCE + '\n// repaired')
+    owner, session = make_trial(tmp_path, candidate=candidate, session=session)
     result = owner.run()
     assert result.status == 'passed'
     compiled = [source for name, source, _ in candidate.calls if name == 'compile']
     assert len(compiled) == 2 and compiled[0] != compiled[1]
+    assert session.attempted_unchanged and session.genuinely_edited
+    assert compiled == [SOURCE, session.repaired]
     assert candidate.runs == 2
     assert any(context['stage'] == 'debug' for context in session.contexts)
     assert len(owner.memory.read()) == 1
@@ -769,12 +792,43 @@ def test_submit_gates_source_identity_verification_and_required_profile(tmp_path
 
 
 def test_failed_recompile_invalidates_stale_verification_and_can_recover(tmp_path):
+    from dataclasses import replace
     from canonical_a3_fixtures import make_trial, recording_candidate, RevisionSession
+
+    class InspectFailedRecompile(RevisionSession):
+        prior_verified = None
+        inspected_failure = False
+
+        def next_action(self, context, allowed, **kwargs):
+            host = self.runner.backend.host
+            if context['stage'] == 'optimisation' and host.verified is not None:
+                self.prior_verified = host.verified
+            if context['stage'] == 'debug' and candidate.compiles == 2:
+                assert isinstance(host.compilation, FailedEvidence)
+                assert host.compilation.stage == 'compile'
+                assert self.prior_verified is not None and self.prior_verified.passed
+                assert host.verified is None and host.profile is None
+                assert host.compilation.source_fingerprint != self.prior_verified.source_fingerprint
+                assert not host.accepted_checkpoint_valid()
+                assert owner._submit_gate(host.source, host.compilation, self.prior_verified, host.profile) is not None
+                assert self.runner.workflow.outcome != 'accepted'
+                assert owner.memory.read() == ()
+                self.inspected_failure = True
+            return super().next_action(context, allowed, **kwargs)
+
     candidate = recording_candidate(compile_failure_at=(2,))
-    session = RevisionSession(initial=SOURCE, repaired=SOURCE + '\n// repair after failed recompile')
+    session = InspectFailedRecompile(initial=SOURCE, repaired=SOURCE + '\n// repair after failed recompile')
     owner, _ = make_trial(tmp_path, candidate=candidate, session=session,
                         cell=_cell(profiling=ProfilingGuidance.WITH_GUIDANCE))
+    build = owner.canonical.build
+
+    def capture_runner(*args, **kwargs):
+        session.runner = build(*args, **kwargs)
+        return session.runner
+
+    owner.canonical = replace(owner.canonical, build=capture_runner)
     result = owner.run()
+    assert session.inspected_failure
     assert result.status == 'passed' and candidate.compiles == 3
     assert any(row.payload.get('failed_evidence', {}).get('stage') == 'compile' for row in owner.evidence.entries)
     assert candidate.compiled_results[-1].plan.source_fingerprint == result.verified.source_fingerprint
