@@ -247,3 +247,75 @@ def test_crash_before_dispatch_requires_confirmed_absence(tmp_path):
     restored.reconcile(operation, not_dispatched=True)
     assert restored.stage == Stage.PREFLIGHT
     assert restored.begin() != operation
+
+
+def test_offline_source_change_cannot_reuse_acceptance_verification(tmp_path):
+    flow = make(tmp_path)
+    for _ in range(8):
+        finish(flow)
+    assert flow.stage == Stage.ACCEPTANCE
+    assert flow.verified_source == "v1"
+    with pytest.raises(WorkflowError):
+        Workflow(tmp_path / "state.json", resolver, source_hash="v2")
+    restored = make(tmp_path)
+    restored.source_changed("v2")
+    assert restored.stage == Stage.TEST
+    assert restored.verified_source is None
+
+
+def test_failed_debug_after_passing_test_returns_to_implementation(tmp_path):
+    flow = make(tmp_path)
+    for _ in range(5):
+        finish(flow)
+    assert flow.stage == Stage.DEBUG
+    finish(flow, False)
+    assert flow.stage == Stage.IMPLEMENTATION
+    assert flow.state["tested"] is None
+    finish(flow)
+    assert flow.stage == Stage.TEST
+
+
+@pytest.mark.parametrize("changed", [None, "v2"])
+def test_failed_optimisation_returns_through_debug_to_implementation(tmp_path, changed):
+    flow = make(tmp_path)
+    for _ in range(6):
+        finish(flow)
+    assert flow.stage == Stage.OPTIMISATION
+    finish(flow, False, changed=changed)
+    assert flow.stage == Stage.DEBUG
+    assert flow.state["tested"] is None
+    finish(flow)
+    assert flow.stage == Stage.IMPLEMENTATION
+    finish(flow)
+    assert flow.stage == Stage.TEST
+
+
+@pytest.mark.parametrize("target", [Stage.DESIGN, Stage.IMPLEMENTATION, Stage.TEST])
+def test_confirmed_absence_restores_cap_one_reservation(tmp_path, target):
+    flow = make(tmp_path, limits=BudgetLimits(design_iterations=1,
+                     implementation_iterations=1, execution_tries=1))
+    while flow.stage != target:
+        finish(flow)
+    before = {key: flow.state[key] for key in ("design", "implementation", "executions")}
+    operation = flow.begin(execution=True)
+    restored = make(tmp_path)
+    restored.reconcile(operation, not_dispatched=True)
+    assert {key: restored.state[key] for key in before} == before
+    assert restored.begin(execution=True) != operation
+
+
+def test_absent_redesign_restores_previous_implementation_count(tmp_path):
+    flow = make(tmp_path)
+    for _ in range(5):
+        finish(flow)
+    operation = flow.begin()
+    flow.complete(evidence(Stage.DEBUG, operation), redesign=True)
+    assert flow.state["implementation"] == 1
+    operation = flow.begin(execution=True)
+    assert flow.state["implementation"] == 0
+    restored = make(tmp_path)
+    restored.reconcile(operation, not_dispatched=True)
+    assert restored.state["implementation"] == 1
+    assert restored.state["design"] == 1
+    assert restored.state["executions"] == 0
+    assert restored.begin(execution=True)
