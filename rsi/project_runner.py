@@ -603,7 +603,7 @@ class ProjectRunner:
                     or observed.get('provider_settled') is not True):
                 raise WorkflowError('actor/provider closure was not observed')
             effects = self._completed_effects(observed.get('completed_query_refs', ()))
-            return dict(kind='rsi-terminal-failure-v1', classification=result['classification'],
+            packet = dict(kind='rsi-terminal-failure-v1', classification=result['classification'],
                 outcome='failed', error=result['error'], failed_stage=result['stage'], pending=self.workflow.pending,
                 correctness=result.get('correctness'), performance=result.get('performance'),
                 stage_initial_source=self.workflow.source_hash, **effects,
@@ -611,6 +611,7 @@ class ProjectRunner:
                 frozen_skill_hash=self.bundle.digest, result_ref=event['reference'], closure_ref=ref,
                 accounting_snapshot=outcome['workflow_state_ref'], created=self.workflow.state['created'],
                 limits=self.workflow.state['limits'], stage_completion_claim=False, replay_allowed=False)
+            return json.loads(json.dumps(packet, allow_nan=False))  # No mutable state aliases.
 
     def run(self):
         status, error, classification, closure_ref = None, None, None, None
