@@ -135,11 +135,14 @@ class Gateway:
             def log_message(self, *_args):
                 pass
 
-            def error(self, status, message):
+            def error(self, status, message, *, context_overflow=False):
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"error": {"message": message, "type": "smoke_gateway"}}).encode())
+                error = {"message": message, "type": "invalid_request_error" if context_overflow else "smoke_gateway"}
+                if context_overflow:
+                    error["code"] = "context_length_exceeded"
+                self.wfile.write(json.dumps({"error": error}).encode())
 
             def do_POST(self):
                 if self.path not in ("/v1/chat/completions", "/v1/responses") or self.headers.get("Authorization") != "Bearer " + owner.token:
@@ -167,7 +170,7 @@ class Gateway:
                     if isinstance(error, ContextLimitError) or "hard byte" in str(error):
                         owner.stop_reason = "context-limit"
                         owner.on_record("pi-context-limit", {"hard_bytes": owner.hard_bytes, **getattr(error,"details",{})})
-                        return self.error(413, "request context exceeds the configured byte limit")
+                        return self.error(413, "context_length_exceeded: request exceeds the context window byte budget", context_overflow=True)
                     return self.error(400, "invalid smoke request")
                 row = {"reservation_id": rid, "usage": None, "status": "unknown", "request_bytes": len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode())}
                 owner.records.append(row)
